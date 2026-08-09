@@ -61,6 +61,7 @@ import em_player
 import em_recordings
 import em_scenes
 import em_shadow
+import em_sounds
 import em_support
 from version import VERSION as CONTROLLER_VERSION
 from version import compare as _compare_versions
@@ -293,6 +294,11 @@ async def create_app() -> web.Application:
     app.router.add_get("/api/oww_models",             _get_oww_models)
     app.router.add_post("/api/oww_models/upload",     _post_oww_model_upload)
     app.router.add_delete("/api/oww_models/{file}",   _delete_oww_model)
+    app.router.add_get("/api/sounds",                 _get_sounds)
+    app.router.add_post("/api/sounds/upload",         _post_sound_upload)
+    app.router.add_delete("/api/sounds/{id}",         _delete_sound)
+    app.router.add_post("/api/devices/{id}/sounds/test", _post_sound_test)
+    app.router.add_post("/api/devices/{id}/sounds/stop", _post_sound_stop)
     app.router.add_get("/api/devices/{id}/shell",         _ws_shell)
     app.router.add_get("/api/devices/{id}/oww_assets",    _get_oww_assets)
     app.router.add_post("/api/devices/{id}/oww_assets",   _post_oww_assets)
@@ -860,6 +866,14 @@ async def _apply_live_config(device_id: str, live, effective: dict) -> None:
         live.oww_on_device = em_shadow.effective_mode(
             effective["owwOnDevice"], live.oww_trigger_capable
         )
+    if "timerSound" in effective:
+        live.timer_sound = effective["timerSound"] or None
+    if "timerRingSeconds" in effective:
+        live.timer_ring_seconds = int(effective["timerRingSeconds"])
+    if "timerRingGapSeconds" in effective:
+        live.timer_ring_gap = float(effective["timerRingGapSeconds"])
+    if "timerRingBurstSeconds" in effective:
+        live.timer_ring_burst = float(effective["timerRingBurstSeconds"])
     if "eqBands" in effective:
         live.eq_bands = effective["eqBands"]
     if "eqLoudness" in effective:
@@ -1334,6 +1348,165 @@ async def _delete_oww_model(request: web.Request) -> web.Response:
     path.unlink()
     log.info(f"[api] Wake model deleted: {fname}")
     return _ok({"deleted": fname})
+
+
+# ─── Notification sounds (timer ring) ─────────────────────────────────────────
+
+
+@auth.require_auth
+async def _get_sounds(request: web.Request) -> web.Response:
+    """
+    GET /api/sounds
+
+    Uploaded ring sounds in the data volume's sounds/ dir. `id` is the
+    value to store in timerSound config. The built-in chime is reported
+    separately: it has no file, and offering it as a deletable row would
+    invite someone to try.
+    """
+    return _ok({
+        "sounds":    em_sounds.scan(),
+        "dir":       str(em_sounds.sounds_dir()),
+        "default_id": em_sounds.DEFAULT_ID,
+        "formats":   list(em_sounds.ALLOWED_SUFFIXES),
+        "max_bytes": em_sounds.MAX_UPLOAD_BYTES,
+    })
+
+
+@auth.require_admin
+async def _post_sound_upload(request: web.Request) -> web.Response:
+    """
+    POST /api/sounds/upload (multipart: field "sound", optional field "id")
+
+    Stores a ring sound and decodes it once so the first ring is not the
+    slow one. A decode failure is a 400, not a 500: the usual cause is a
+    file that is not really audio, and the user needs ffmpeg's reason.
+    """
+    try:
+        reader = await request.multipart()
+        sound_id = None
+        data = None
+        suffix = None
+        while True:
+            field = await reader.next()
+            if field is None:
+                break
+            if field.name == "id":
+                sound_id = (await field.read(decode=True)).decode("utf-8", "replace").strip()
+            elif field.name == "sound":
+                suffix = em_sounds.safe_upload_suffix(field.filename or "")
+                if suffix is None:
+                    return _error(
+                        "invalid_filename",
+                        "Sound must be one of: "
+                        + ", ".join(em_sounds.ALLOWED_SUFFIXES),
+                        400,
+                    )
+                data = await field.read()
+        if data is None:
+            return _error("invalid_upload", "Expected multipart field 'sound'", 400)
+        if not data:
+            return _error("empty_upload", "Uploaded sound is empty", 400)
+        if len(data) > em_sounds.MAX_UPLOAD_BYTES:
+            return _error(
+                "too_large",
+                f"Sound exceeds {em_sounds.MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit",
+                413,
+            )
+
+        sid = em_sounds.safe_sound_id(sound_id or em_sounds.DEFAULT_ID)
+        if sid is None:
+            return _error("invalid_id",
+                          "Sound id must be letters, digits, _ - . only", 400)
+
+        loop = asyncio.get_event_loop()
+        dest = await loop.run_in_executor(
+            None, lambda: em_sounds.store(sid, suffix, data)
+        )
+        # Decode now so the failure surfaces here, at upload, rather than at
+        # 6am when the timer goes off and the ring silently falls back.
+        try:
+            pcm = await em_sounds.decode(dest)
+        except Exception as e:
+            em_sounds.delete(sid)
+            return _error("decode_failed", f"Could not decode audio: {e}", 400)
+        await loop.run_in_executor(
+            None, lambda: em_sounds.cache_path(dest).write_bytes(pcm)
+        )
+        await loop.run_in_executor(
+            None, lambda: em_sounds._write_cache_stamp(dest, em_sounds.cache_path(dest))
+        )
+        log.info(
+            f"[api] Ring sound installed: {dest.name} ({len(data):,} bytes, "
+            f"{em_sounds.duration_seconds(len(pcm)):.1f}s)"
+        )
+        entry = next((s for s in em_sounds.scan() if s["id"] == sid), None)
+        return _ok({"sound": entry}, status=201)
+    except Exception as e:
+        log.error(f"[api] Sound upload error: {e}")
+        return _error("upload_failed", str(e), 500)
+
+
+@auth.require_admin
+async def _delete_sound(request: web.Request) -> web.Response:
+    """
+    DELETE /api/sounds/{id}
+
+    Refuses (409) while any device or the fleet default still selects it.
+    Unlike a wake model, a dangling reference here would not break — the
+    ring falls back to the built-in chime — but silently changing what a
+    user's alarm sounds like is worse than making them clear it first.
+    """
+    sid = em_sounds.safe_sound_id(request.match_info["id"])
+    if sid is None:
+        return _error("invalid_id", "Bad sound id", 400)
+    if em_sounds.source_path(sid) is None:
+        return _error("not_found", "No such sound", 404)
+
+    configs: dict[str, dict] = {"global": db.get_global_device_config()}
+    for row in db.get_all_devices():
+        configs[row["device_id"]] = db.get_device_config(row["device_id"])
+    users = em_sounds.in_use_by(sid, configs)
+    if users:
+        return _error("sound_in_use",
+                      f"Sound is selected by: {', '.join(users)}", 409)
+
+    em_sounds.delete(sid)
+    log.info(f"[api] Ring sound deleted: {sid}")
+    return _ok({"deleted": sid})
+
+
+@auth.require_auth
+async def _post_sound_test(request: web.Request) -> web.Response:
+    """
+    POST /api/devices/{id}/sounds/test
+
+    Ring this device now, exactly as an expired timer would — same loop,
+    same wake-word stop. "Play it once quietly" would test a code path
+    nobody ever hits; what the user wants to know is whether they can live
+    with this sound going off, and whether they can make it stop.
+    """
+    device_id = request.match_info["id"]
+    live = _devices.get(device_id)
+    if live is None:
+        return _error("device_offline", "Device is not connected", 409)
+    if live.timer_ringing:
+        return _error("already_ringing", "Device is already ringing", 409)
+
+    import em_controller
+    await em_controller.start_timer_ring(live, "test")
+    return _ok({"ringing": True, "sound": live.timer_sound or "built-in"})
+
+
+@auth.require_auth
+async def _post_sound_stop(request: web.Request) -> web.Response:
+    """POST /api/devices/{id}/sounds/stop — silence a ring from the UI."""
+    device_id = request.match_info["id"]
+    live = _devices.get(device_id)
+    if live is None:
+        return _error("device_offline", "Device is not connected", 409)
+    import em_controller
+    stopped = await em_controller.stop_timer_ring(live)
+    return _ok({"stopped": stopped})
 
 
 # ─── OTA background tasks ─────────────────────────────────────────────────────
@@ -4033,6 +4206,7 @@ def _merge_device(row) -> dict:
         "muted":            getattr(live, "muted",     False) if live else False,
         "listening":        getattr(live, "listening", False) if live else False,
         "thinking":         getattr(live, "thinking",  False) if live else False,
+        "ringing":          getattr(live, "timer_ringing", False) if live else False,
         "stats":            live.stats if live else None,
         # Control-plane round trip, controller-measured. The RF counters are
         # structurally zero on this hardware (the MTK driver populates

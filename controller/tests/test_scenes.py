@@ -133,3 +133,37 @@ def test_outcome_cues_are_self_clearing_and_distinct():
         assert 0 < a["ttlSec"] <= 2
     assert ns["periodMs"] != err["periodMs"]
     assert err["periodMs"] < ns["periodMs"]   # error reads as more agitated
+
+
+def test_timer_ring_cue_is_not_self_clearing():
+    """
+    The odd one out among the pulse anims: the outcome cues are flourishes
+    that retire themselves in ~1s, but a firing timer has to stay lit until
+    something stops it. A 1s TTL here would leave the ring dark while the
+    alarm was still sounding, which reads as a fault.
+    """
+    scene = em_scenes.resolve({})
+    ring = scene["ring_anim"]
+    assert ring["pattern"] == "pulse"
+    assert ring["ttlSec"] > scene["nospeech_anim"]["ttlSec"]
+
+
+def test_timer_ring_rhythm_sits_between_the_outcome_cues():
+    """
+    Rhythm carries the meaning (colour is spoken for by mute/link/volume),
+    so an alarm must not be mistakable for either cue: slower than the
+    error blink, faster than the "heard nothing" throb.
+    """
+    scene = em_scenes.resolve({})
+    ring = scene["ring_anim"]["periodMs"]
+    assert scene["error_anim"]["periodMs"] < ring < scene["nospeech_anim"]["periodMs"]
+
+
+def test_ring_ttl_outlasts_the_stop_cap():
+    """
+    The ring's dead-man must never expire while the alarm is still allowed
+    to sound, at any configurable cap (timerRingSeconds tops out at 300).
+    """
+    for cap in (5, 60, 300):
+        assert em_scenes.ring_ttl(cap) > cap
+    assert em_scenes.ring_ttl(1) >= 15   # very short caps still get a floor

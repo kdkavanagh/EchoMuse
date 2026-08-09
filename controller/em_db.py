@@ -193,6 +193,30 @@ DEFAULT_DEVICE_CONFIG = {
     # only (the device never sees the audio again); the key rides the
     # config channel and the device ignores it, same as wakeArbitrationMs.
     "saveUtterances":   False,
+    # timerSound: which uploaded sound (em_sounds id) an expired Home
+    # Assistant timer rings with. Empty means the fleet "default" upload if
+    # there is one, and the synthesised two-tone chime if there is not — a
+    # timer must never fire silently, so the fallback chain has no end that
+    # produces no sound. Controller-side only; the device never stores the
+    # audio (HA pushes the FINISHED event through the controller regardless,
+    # so on-device storage would buy no autonomy).
+    "timerSound":       "",
+    # timerRingSeconds: how long to keep ringing before giving up. This is a
+    # safety cap, not a preference: HA discards the timer as it fires
+    # (TimerManager._timer_finished pops it), so if nobody is home to say
+    # the wake word, nothing else in the system would ever stop the ring.
+    "timerRingSeconds": 60,
+    # The ring's cadence, and the reason it is two keys rather than one.
+    # timerRingGapSeconds is the SILENCE between bursts, which is also the
+    # only window the wake word gets — openWakeWord needs ~1.4s of context
+    # and the ring resets its model each time the sound stops, so dropping
+    # this much below 1.5 trades away the ability to stop the alarm. Buy
+    # urgency with timerRingBurstSeconds instead: a sound shorter than this
+    # repeats to fill it, so one 0.6s chime becomes a burst of two rather
+    # than a lone chirp. Both measured against the first cut, which was a
+    # 0.6s chime every 3.1s and read as "less frequent than before".
+    "timerRingGapSeconds":   2.0,
+    "timerRingBurstSeconds": 1.2,
     # bleProxyEnabled: BLE proxy (device-side passive scan over the raw HCI
     # transport, forwarded to HA as a separate ESPHome bluetooth_proxy
     # device — em_ble_proxy.py). Default off: enabling durably disables the

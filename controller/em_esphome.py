@@ -254,10 +254,27 @@ _MP_STATE = {
 # Voice assistant feature flags advertised to HA.
 # ANNOUNCE is required to trigger VoiceAssistantConfigurationRequest
 # (see session handoff finding #3).
+#
+# TIMERS makes HA register a timer handler for this device
+# (components/esphome/assist_satellite.py) — without it HassStartTimer
+# raises TimersNotSupportedError and "set a timer for 5 minutes" fails
+# outright, however well the sentence matched. HA owns the countdown; all
+# we receive is VoiceAssistantTimerEventResponse on state changes.
+#
+# START_CONVERSATION lets HA open a conversation from an automation. It
+# reuses the announce message with start_conversation set, so it costs one
+# extra field read in the announce handler rather than a new message path.
+#
+# SPEAKER is deliberately absent. Setting it switches HA to streaming raw
+# 16kHz WAV over the API (assist_satellite.py:562); leaving it clear keeps
+# the media-player format negotiation below, which hands us 48kHz mono FLAC
+# already at the device wire rate. Adding it is a downgrade, not an upgrade.
 VOICE_ASSISTANT_FLAGS = int(
     VoiceAssistantFeature.VOICE_ASSISTANT
     | VoiceAssistantFeature.API_AUDIO
     | VoiceAssistantFeature.ANNOUNCE
+    | VoiceAssistantFeature.TIMERS
+    | VoiceAssistantFeature.START_CONVERSATION
 )
 
 # VoiceAssistantRequest flags=0 means "device already detected wake word,
@@ -571,8 +588,20 @@ class EchoMuseSatellite(SatelliteServerProtocol):
             # to confirm the device can reach HA's audio endpoint.
             # Audio fetch+play runs as a background task; state transitions
             # are sent synchronously so the wizard doesn't time out.
-            log.info(f"[{self._log_name}] AnnounceRequest: media_id={msg.media_id!r} text={msg.text!r}")
-            asyncio.create_task(self._fetch_and_play_announce(msg.media_id))
+            #
+            # start_conversation (VoiceAssistantFeature.START_CONVERSATION):
+            # HA is opening a conversation, not just speaking — the satellite
+            # is expected to listen once the prompt has finished playing.
+            # It rides this same message rather than having one of its own
+            # (HA's async_start_conversation is _do_announce with
+            # run_pipeline_after=True), so honouring it is one field read.
+            log.info(
+                f"[{self._log_name}] AnnounceRequest: media_id={msg.media_id!r} "
+                f"text={msg.text!r} start_conversation={msg.start_conversation}"
+            )
+            asyncio.create_task(self._fetch_and_play_announce(
+                msg.media_id, start_conversation=msg.start_conversation,
+            ))
             yield api_pb2.MediaPlayerStateResponse(
                 key=MEDIA_PLAYER_KEY,
                 state=MediaPlayerState.ANNOUNCING,
@@ -586,6 +615,11 @@ class EchoMuseSatellite(SatelliteServerProtocol):
             # made the entity wrong for as long as it took the music to
             # restart.
             yield self._media_state_msg()
+            return
+
+        if isinstance(msg, api_pb2.VoiceAssistantTimerEventResponse):
+            self._handle_timer_event(msg)
+            yield _HANDLED
             return
 
         log.debug(
@@ -714,13 +748,19 @@ class EchoMuseSatellite(SatelliteServerProtocol):
             muted=False,
         )
 
-    async def _fetch_and_play_announce(self, media_id: str) -> None:
+    async def _fetch_and_play_announce(self, media_id: str,
+                                       start_conversation: bool = False) -> None:
         """
         Background task: fetch TTS audio from HA and play it on the device.
 
         Fired after VoiceAssistantAnnounceFinished is already sent, so HA's
         setup wizard doesn't time out waiting for the response. Audio playback
         happens asynchronously — if it fails, the wizard has already passed.
+
+        start_conversation: run a voice turn once the prompt has finished
+        playing. The turn is started only if the audio actually played —
+        opening the mic after a prompt the user never heard would record a
+        reply to nothing.
 
         During a voice turn, _on_announce is set by run_esphome_voice_turn()
         and takes priority — it routes audio to the device's speaker pipeline
@@ -754,8 +794,83 @@ class EchoMuseSatellite(SatelliteServerProtocol):
                 await play_cb(pcm_bytes)
             else:
                 log.info(f"[{self._log_name}] Announce audio fetched ({len(pcm_bytes)}b) — no playback callback set (standalone announce)")
+                return
+
+            if start_conversation:
+                await self._start_conversation_turn()
         except Exception as e:
             log.error(f"[{self._log_name}] Announce fetch/play error: {e}")
+
+    async def _start_conversation_turn(self) -> None:
+        """
+        Open a voice turn straight after a start_conversation prompt.
+
+        preroll_discard=0, for the same reason button turns pass 0 (review
+        C3): the discard exists to drop the "…Jarvis" tail bleeding into a
+        wake-word turn, and there is no wake word here — discarding real
+        audio would clip the first syllable of the user's reply.
+        """
+        server = self._owning_server
+        start_turn = getattr(server, "_start_conversation", None) if server else None
+        if start_turn is None:
+            log.warning(
+                f"[{self._log_name}] start_conversation requested but no turn "
+                f"callback is set — is the physical device connected?"
+            )
+            return
+        log.info(f"[{self._log_name}] Announce finished — starting conversation turn")
+        await start_turn()
+
+    # ── Timer events (inbound) ───────────────────────────────────────────
+
+    def _handle_timer_event(self, msg) -> None:
+        """
+        Dispatch VoiceAssistantTimerEventResponse (msg_type 115) from HA.
+
+        Home Assistant owns the countdown — it runs the clock and pushes an
+        event only when a timer's state changes (started, paused/resumed/
+        extended, cancelled, finished). There is no tick, so nothing here
+        needs to keep time.
+
+        FINISHED is the one that matters, and it is strictly one-shot:
+        HA's TimerManager._timer_finished pops the timer from its registry
+        as it fires, so by the time this arrives the timer no longer exists
+        anywhere in HA. Nothing can cancel it, and no "stop the timer"
+        command can reach us through the pipeline — stopping the ring is
+        entirely ours to handle, which is why the wake word does it locally
+        (see em_controller._run_timer_ring).
+        """
+        from esphome.vendor.api_pb2 import VoiceAssistantTimerEvent as TE
+
+        name = msg.name or "timer"
+        log.info(
+            f"[{self._log_name}] Timer event type={msg.event_type} "
+            f"id={msg.timer_id} name={name!r} total={msg.total_seconds}s "
+            f"left={msg.seconds_left}s active={msg.is_active}"
+        )
+
+        server = self._owning_server
+        if server is None:
+            return
+
+        if msg.event_type == TE.VOICE_ASSISTANT_TIMER_FINISHED:
+            ring = getattr(server, "_ring_start", None)
+            if ring is None:
+                log.warning(
+                    f"[{self._log_name}] Timer {name!r} finished but no ring "
+                    f"callback is set — is the physical device connected?"
+                )
+                return
+            asyncio.create_task(ring(name))
+            return
+
+        if msg.event_type == TE.VOICE_ASSISTANT_TIMER_CANCELLED:
+            # A timer cancelled while an EARLIER one is ringing must not
+            # silence that ring — they are separate timers, and HA has
+            # already forgotten the finished one, so it cannot be the
+            # subject of this event. Ringing is stopped by the wake word,
+            # the ring's own timeout, or a new ring replacing it.
+            return
 
     # ── Voice turn (outbound) ────────────────────────────────────────────
 
@@ -1515,6 +1630,15 @@ class DeviceESPhomeServer:
         # sends a volume_set control-plane message to the physical device.
         # None when no device is connected.
         self._send_volume_set = None
+        # Injected by device_connected() — async callable(timer_name: str)
+        # that rings this device until the wake word stops it. None when no
+        # device is connected, which is why _handle_timer_event checks
+        # rather than assumes: HA can have a live satellite connection for a
+        # device whose physical Echo has dropped off.
+        self._ring_start = None
+        # Injected by device_connected() — async callable() that runs one
+        # voice turn with no wake word, for START_CONVERSATION announces.
+        self._start_conversation = None
         # What the DEVICE says it implements, from its register message.
         # Drives which HA entities are advertised — negotiate by capability,
         # never by version (CLAUDE.md).
@@ -2065,6 +2189,8 @@ async def device_connected(
     host: str = "0.0.0.0",
     standalone_play=None,
     send_volume_set=None,
+    ring_start=None,
+    start_conversation=None,
 ) -> None:
     """
     Called by em_controller.handle_control() when an Echo Dot connects.
@@ -2082,6 +2208,12 @@ async def device_connected(
     control-plane message to the physical device. Provided by the controller
     as a closure over the Device object. Used by the satellite to forward
     HA MediaPlayerCommandRequest volume changes down to the device.
+
+    ring_start: async callable(timer_name: str) — rings the device for an
+    expired HA timer until the wake word or the ring timeout stops it.
+
+    start_conversation: async callable() — runs one voice turn with no wake
+    word, for announces that carry start_conversation.
     """
     server = _servers.get(device_id)
     if server is None:
@@ -2096,8 +2228,10 @@ async def device_connected(
         if row is None or not row["approved"]:
             return
         server = await _register_device_server(device_id, row["label"])
-    server._standalone_play = standalone_play
-    server._send_volume_set = send_volume_set
+    server._standalone_play    = standalone_play
+    server._send_volume_set    = send_volume_set
+    server._ring_start         = ring_start
+    server._start_conversation = start_conversation
     if server._server is not None:
         log.debug(f"[esphome.{device_id[-8:]}] device_connected: port {server.port} already listening")
         return

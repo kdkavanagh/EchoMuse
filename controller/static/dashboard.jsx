@@ -81,10 +81,20 @@ const API = {
   },
 
   async upload(path, file, fieldName = 'binary') {
-    const h = {};
-    if (this.token) h['Authorization'] = `Bearer ${this.token}`;
     const form = new FormData();
     form.append(fieldName, file);
+    return this.postForm(path, form);
+  },
+
+  // Multipart POST for uploads that carry more than the file itself (the
+  // sound upload sends an id alongside it). Content-Type is deliberately
+  // left unset so the browser writes the multipart boundary.
+  async postForm(path, form) {
+    const h = {};
+    if (this.token) h['Authorization'] = `Bearer ${this.token}`;
+    // ingressPath, like every other call in this object: under the HA
+    // Supervisor add-on the dashboard is served from an ingress prefix, and
+    // a bare path posts outside it.
     const r = await fetch(ingressPath(path), { method: 'POST', headers: h, body: form });
     if (r.status === 401) throw { code: 'not_authenticated', status: 401 };
     const data = await r.json();
@@ -1786,6 +1796,9 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                 triggerCapable={!device.connected || !!device.owwTriggerCapable}
                 mixCapable={!device.connected || !!device.audioMixCapable}
                 holdCapable={!device.connected || !!device.buttonHoldCapable}
+                deviceId={device.device_id}
+                deviceConnected={!!device.connected}
+                deviceRinging={!!device.ringing}
                 onScopeChange={(id, local) => {
                   setSections(prev => local
                     ? [...prev, id]
@@ -4778,14 +4791,19 @@ const CONFIG_SECTIONS = {
   "microphones": ["adcMicpga", "adcDigitalGain", "micGainDb", "beamformingEnabled", "beamAngle", "aecEnabled", "aecDelayMs", "aecTailMs", "nsAsr", "saveUtterances"],
   "ring": ["ledScene", "ledListenColor", "ledThinkColor", "meterAttack", "meterDecay", "meterFloor", "meterGamma", "meterRef", "meterCurve"],
   "advanced": ["agcEnabled", "vadThreshold", "vadSpeechMs", "vadSilenceMs", "buttonSingleTapEvent", "buttonMultiTapMs"],
-  "bluetooth": ["bleProxyEnabled"]
+  "bluetooth": ["bleProxyEnabled"],
+  "timers": ["timerSound", "timerRingSeconds", "timerRingGapSeconds", "timerRingBurstSeconds"]
 };
 
 // Display labels for the section ids, and the reverse key -> section index
 // that lets a write be gated by the section owning the key it touches.
+// 'Ring' is the LED ring; 'Timers' is the alarm that rings — unrelated, and
+// kept apart so a device can take its own alarm sound without forking its
+// LED scene too.
 const SECTION_LABELS = {
   playback: 'Playback', wakeword: 'Wake word', microphones: 'Microphones',
   ring: 'Ring', advanced: 'Advanced', bluetooth: 'Bluetooth',
+  timers: 'Timers',
 };
 const KEY_SECTION = {};
 Object.entries(CONFIG_SECTIONS).forEach(([sid, keys]) => {
@@ -4900,7 +4918,12 @@ function onDeviceMode(config) {
 
 function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
                             shadowCapable = true, mixCapable = true,
-                            holdCapable = true, triggerCapable = true }) {
+                            holdCapable = true, triggerCapable = true,
+                            deviceId = null,
+                            deviceConnected = false, deviceRinging = false }) {
+  // deviceId is null in the fleet-config view, where "ring this device now"
+  // has no subject — the Test control is hidden there rather than disabled,
+  // because there is nothing the user could do to enable it.
   // shadowCapable defaults TRUE because this form is also the fleet-config
   // view, where there is no single device whose capability could gate a
   // control. Referencing a `device` here is what blank-screened the Config
@@ -4985,6 +5008,74 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
       await loadCustomModels();
     } catch (e) { alert(e.error || 'Delete failed'); }
   }
+
+  // Timer ring sounds, stored in the same data volume as the wake models.
+  // An empty timerSound means "fleet default, else the built-in chime" —
+  // resolved controller-side (em_sounds.ring_pcm), so the tile for it is
+  // labelled by what it falls back to rather than pretending to be a file.
+  const [sounds, setSounds] = useState([]);
+  // Optimistic local flag, cleared by the real `ringing` state arriving over
+  // the events WebSocket. A ring ends on its own (wake word, or the
+  // timeout), so local state alone would leave the button offering to stop
+  // something that already stopped.
+  const [ringRequested, setRingRequested] = useState(false);
+  const ringing = deviceRinging || ringRequested;
+  useEffect(() => { if (deviceRinging) setRingRequested(false); }, [deviceRinging]);
+  const soundFileRef = useRef(null);
+  const loadSounds = useCallback(async () => {
+    try { setSounds((await API.get('/api/sounds')).sounds || []); }
+    catch (e) { /* endpoint requires auth; list just stays empty */ }
+  }, []);
+  useEffect(() => { loadSounds(); }, [loadSounds]);
+
+  async function uploadSound(file) {
+    if (!file) return;
+    // Named after the file so two uploads don't silently overwrite each
+    // other; sanitised the same way the server will sanitise it, so the
+    // tile that appears is the id that was actually stored.
+    const id = (file.name.replace(/\.[^.]+$/, '') || 'timer')
+      .replace(/[^A-Za-z0-9_.-]/g, '-').slice(0, 64) || 'timer';
+    try {
+      const form = new FormData();
+      form.append('sound', file);
+      form.append('id', id);
+      const resp = await API.postForm('/api/sounds/upload', form);
+      await loadSounds();
+      if (resp.sound?.id) set('timerSound', resp.sound.id);
+    } catch (e) { alert(e.error || 'Sound upload failed'); }
+  }
+
+  async function deleteSound(s) {
+    if (!confirm(`Delete timer sound "${s.id}"?`)) return;
+    try {
+      await API.del(`/api/sounds/${encodeURIComponent(s.id)}`);
+      await loadSounds();
+    } catch (e) { alert(e.error || 'Delete failed'); }
+  }
+
+  // Test rings for real — same loop, same wake-word stop — because what the
+  // user needs to know is whether they can live with it going off and
+  // whether they can make it stop, not whether the file decodes.
+  async function testRing() {
+    if (!deviceId) return;
+    setRingRequested(true);
+    try { await API.post(`/api/devices/${deviceId}/sounds/test`, {}); }
+    catch (e) { alert(e.error || 'Could not ring'); setRingRequested(false); }
+  }
+  async function stopRing() {
+    if (!deviceId) return;
+    try { await API.post(`/api/devices/${deviceId}/sounds/stop`, {}); }
+    catch (e) { /* already stopped is not worth an alert */ }
+    setRingRequested(false);
+  }
+
+  // A selected sound that has since been deleted still needs a visible tile:
+  // silently showing "Built-in" for a config that says otherwise is how you
+  // fail to notice your alarm changed.
+  const orphanSound = (config.timerSound || '')
+    && !sounds.some(s => s.id === config.timerSound)
+    ? { id: config.timerSound, missing: true }
+    : null;
 
   // A selected custom model that no longer exists on disk (or a bare-metal
   // path from before a Docker move) still needs a visible, selected tile.
@@ -5346,6 +5437,77 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
         <div className="em-grid2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0 24px', ...inputStyle }}>
           <Toggle label="Bluetooth proxy" sub="passive BLE scan → HA (Bermuda, BLE sensors)" value={config.bleProxyEnabled ?? false} onChange={v => set('bleProxyEnabled', v)}/>
         </div>
+      </Stage>
+
+      {/* 07 TIMERS */}
+      <Stage n="07" title="Timers"
+        chips={<ScopeChip tone="controller">Controller</ScopeChip>}
+        desc="What this Echo does when a Home Assistant timer runs out. Home Assistant keeps the clock and tells us once, at the moment it expires — it then forgets the timer entirely, so stopping the ring is up to the device: say the wake word and it goes quiet (that wake word is used up stopping it, so say it again to actually ask for something). The cut-off exists because nothing else in the system would ever stop it if the room is empty."
+        scope={scopeEl('timers')} dim={secStyle('timers')}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(140px,1fr))', gap: 8, ...inputStyle }}>
+          <div onClick={() => set('timerSound', '')} style={{
+            background: !config.timerSound
+              ? 'linear-gradient(160deg,var(--accent-tint),var(--accent-line))'
+              : 'linear-gradient(160deg,var(--raised),var(--surface))',
+            border: `1px solid ${!config.timerSound ? 'var(--accent)' : 'var(--border-soft)'}`,
+            borderRadius: 8, padding: '8px 10px',
+            cursor: disabled ? 'default' : 'pointer',
+            transition: 'border-color 0.15s, background 0.15s',
+          }}>
+            <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 12, fontWeight: 600, color: 'var(--lcd-line)' }}>Built-in chime</div>
+            <div style={{ fontFamily: mono, fontSize: 9, color: 'var(--muted)', marginTop: 2 }}>two tones · always available</div>
+          </div>
+          {[...sounds, ...(orphanSound ? [orphanSound] : [])].map(s => (
+            <div key={s.id} onClick={() => set('timerSound', s.id)} style={{
+              background: config.timerSound === s.id
+                ? 'linear-gradient(160deg,var(--accent-tint),var(--accent-line))'
+                : 'linear-gradient(160deg,var(--raised),var(--surface))',
+              border: `1px solid ${config.timerSound === s.id ? 'var(--accent)' : 'var(--border-soft)'}`,
+              borderRadius: 8, padding: '8px 10px', position: 'relative',
+              cursor: disabled ? 'default' : 'pointer',
+              transition: 'border-color 0.15s, background 0.15s',
+            }}>
+              <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 12, fontWeight: 600, color: 'var(--lcd-line)' }}>{s.id}</div>
+              <div style={{ fontFamily: mono, fontSize: 9, color: s.missing ? 'var(--error)' : 'var(--muted)', marginTop: 2 }}>
+                {s.missing ? 'missing file — rings the chime'
+                  : `${s.file}${s.seconds ? ` · ${s.seconds}s` : ''}`}
+              </div>
+              {!disabled && !s.missing && config.timerSound !== s.id && (
+                <div onClick={e => { e.stopPropagation(); deleteSound(s); }}
+                  title="Delete sound"
+                  style={{ position: 'absolute', top: 4, right: 7, fontFamily: mono, fontSize: 11,
+                    color: 'var(--muted)', cursor: 'pointer' }}>×</div>
+              )}
+            </div>
+          ))}
+          <div onClick={() => { if (!disabled) soundFileRef.current?.click(); }} style={{
+            background: 'linear-gradient(160deg,var(--raised),var(--surface))',
+            border: '1px dashed var(--border-hard)', borderRadius: 8, padding: '8px 10px',
+            cursor: disabled ? 'default' : 'pointer', opacity: 0.85,
+          }}>
+            <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 12, fontWeight: 600, color: 'var(--text2)' }}>+ Upload sound</div>
+            <div style={{ fontFamily: mono, fontSize: 9, color: 'var(--muted)', marginTop: 2 }}>mp3, wav, flac, ogg, m4a</div>
+            <input ref={soundFileRef} type="file" accept=".mp3,.wav,.flac,.ogg,.m4a,audio/*" style={{ display: 'none' }}
+              onChange={e => { uploadSound(e.target.files[0]); e.target.value = ''; }}/>
+          </div>
+        </div>
+        <div style={{ marginTop: 16, ...inputStyle }}>
+          <Slider label="Burst length" sub="a shorter sound repeats to fill this — how insistent each round sounds" value={config.timerRingBurstSeconds ?? 1.2} min={0.5} max={6} step={0.1} unit="s" onChange={v => set('timerRingBurstSeconds', v)}/>
+          <Slider label="Gap between bursts" sub="also the only window the wake word gets — below ~1.5s the alarm gets hard to stop, so buy urgency with burst length instead" value={config.timerRingGapSeconds ?? 2.0} min={0.5} max={8} step={0.1} unit="s" onChange={v => set('timerRingGapSeconds', v)}/>
+          <Slider label="Stop ringing after" sub="gives up if nobody says the wake word — Home Assistant has already discarded the timer by then, so nothing else would" value={config.timerRingSeconds ?? 60} min={5} max={300} step={5} unit="s" onChange={v => set('timerRingSeconds', v)}/>
+        </div>
+        {deviceId && (
+          <div style={{ marginTop: 14, display: 'flex', gap: 10, alignItems: 'center' }}>
+            <Pill disabled={!deviceConnected} onClick={ringing ? stopRing : testRing}>
+              {ringing ? 'Stop ringing' : 'Test ring'}
+            </Pill>
+            <span style={{ fontFamily: mono, fontSize: 9, color: 'var(--muted)' }}>
+              {deviceConnected
+                ? 'rings for real — say the wake word to stop it'
+                : 'device offline'}
+            </span>
+          </div>
+        )}
       </Stage>
     </div>
   );

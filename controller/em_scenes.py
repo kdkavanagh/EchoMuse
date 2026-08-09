@@ -97,6 +97,21 @@ METER_TTL_PAD = 20
 # replaces. Keep these two in step if either moves.
 SPIN_TTL = 135
 
+# Seconds added on top of a timer ring's own cap when sizing its dead-man
+# TTL. Unlike the meter's, the duration is known exactly up front
+# (timerRingSeconds), so this only has to cover the gap between arming the
+# ring and the sound starting — the device primes ~1.1s before any audio.
+# A ring whose TTL expired mid-alarm would go dark while still sounding,
+# which reads as a fault rather than as an alarm.
+RING_TTL_PAD = 10
+
+# The timer-ring pulse period. Between nospeech_anim's single slow throb
+# (900ms) and error_anim's agitated blink (220ms): an alarm should look
+# insistent without looking like a fault. Colour stays the scene's, per the
+# rhythm-not-colour rule below — red, orange and cyan are all taken (mute,
+# link down, volume).
+RING_PERIOD_MS = 500
+
 # Meter response-curve config keys → the wire field the device reads, with
 # the range the dashboard offers. The device clamps independently
 # (resolveMeter in animator.go) — this is the UI range, not the guard.
@@ -234,6 +249,14 @@ def resolve(config: dict) -> dict:
             "pattern": "pulse", "colors": outcome_colors,
             "periodMs": 220, "ttlSec": 1,
         },
+        # A timer is going off. Steady insistent pulse for the whole ring —
+        # the one anim here that is not self-clearing, so the caller
+        # overrides ttlSec with ring_ttl(cap) the same way playback
+        # overrides the meter's.
+        "ring_anim":      {
+            "pattern": "pulse", "colors": outcome_colors,
+            "periodMs": RING_PERIOD_MS, "ttlSec": RING_TTL_PAD,
+        },
     }
 
 
@@ -245,3 +268,16 @@ def meter_ttl(audio_seconds: float) -> int:
     the audio duration) cannot trip it mid-response.
     """
     return int(max(30.0, audio_seconds * 2.0 + METER_TTL_PAD))
+
+
+def ring_ttl(cap_seconds: float) -> int:
+    """
+    Dead-man TTL for a timer ring, sized to the ring's own stop cap.
+
+    No doubling as meter_ttl does: a ring's length is decided by the
+    controller (timerRingSeconds), not by how fast audio reaches the
+    device, so the cap is exact and only the arming/prime gap needs
+    covering. The ring is stopped explicitly in every path that ends it —
+    this is purely the "controller died mid-alarm" backstop.
+    """
+    return int(max(15.0, cap_seconds + RING_TTL_PAD))

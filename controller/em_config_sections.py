@@ -62,6 +62,16 @@ SECTIONS: dict[str, dict] = {
         "label": "Bluetooth",
         "keys": ["bleProxyEnabled"],
     },
+    # Not folded into "ring": that section is the LED ring. Sharing one
+    # would mean a device could not take its own alarm sound without
+    # forking its LED scene too.
+    "timers": {
+        "label": "Timers",
+        "keys": [
+            "timerSound", "timerRingSeconds",
+            "timerRingGapSeconds", "timerRingBurstSeconds",
+        ],
+    },
 }
 
 # Keys that live in the config dict but are NOT user-facing settings, and so

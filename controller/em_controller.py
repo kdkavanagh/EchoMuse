@@ -79,6 +79,7 @@ import em_esphome as esphome
 import em_ble_proxy
 import em_oww_models
 import em_player
+import em_sounds
 
 _LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s — %(message)s"
 
@@ -156,6 +157,24 @@ SPEAKER_BYTES  = SPEAKER_PERIOD * 2       # 4096 bytes/period (mono S16)
 # arrives) — primePeriods in pcm_speaker.go. The post-playback drain sleep
 # must allow for the delayed start.
 SPEAKER_PRIME_SECONDS = 1.1
+
+# Timer ring cadence. Two knobs, because the alarm has to do two jobs that
+# pull against each other: sound urgent, and leave the wake word a clear run
+# at the mic.
+#
+# The silent window is the constraint. openWakeWord needs ~1.4s of audio in
+# its rolling context before it can score a word at all, and the ring's
+# listener resets the model when the sound stops (see wake_word_listener), so
+# each window starts from nothing. Shrinking it is what made the first
+# version take ~15s and many attempts to silence (2026-08-09). Tunable per
+# device via timerRingGapSeconds — the right value depends on the room.
+#
+# Urgency is bought on the other side instead: a short sound repeats to fill
+# RING_MIN_BURST_SECONDS so one 0.6s chime becomes a burst of two rather than
+# a lonely chirp every few seconds, which is what the 2.5s-gap first cut
+# sounded like. Denser bursts, same listening window.
+RING_GAP_SECONDS = 2.0
+RING_MIN_BURST_SECONDS = 1.2
 
 # Control-plane RTT probing. 5s rather than the old 30s keepalive cadence:
 # characterising jitter needs samples, and one tiny JSON message per device
@@ -389,6 +408,38 @@ class Device:
         self.barge_detected   = False
         self._barge_model     = None
         self._barge_model_key = None
+
+        # Timer ring (HA VoiceAssistantTimerEvent FINISHED). Unlike a voice
+        # turn the ring keeps the mic streaming to mic_queue — the main
+        # wake_word_listener is what stops it, so oww_paused stays clear and
+        # no second OWW instance is needed. timer_ringing is read there both
+        # to bypass the `device.speaking` guard (the ring IS speaking, and
+        # the whole point is to hear over it) and to route a detection to
+        # ring-stop instead of a voice turn.
+        self.timer_ringing    = False
+        self.timer_ring_stop  = asyncio.Event()
+        self.timer_ring_task: asyncio.Task | None = None
+        # True while the ring sound is actually coming out of the speaker,
+        # as opposed to merely written to the socket — the device primes
+        # SPEAKER_PRIME_SECONDS before any audio is audible, so socket-write
+        # completion says nothing about what the room can hear. The wake
+        # listener skips these frames entirely and rescores from a reset
+        # model once this clears: with AEC off (the fleet default) they are
+        # nothing but chime, and scoring them buries the quiet window's
+        # context in echo.
+        self.timer_ring_audible = False
+        # Config: which stored sound to ring with (em_sounds id), and how
+        # long to keep ringing before giving up. The cap is not a nicety —
+        # HA discards the timer as it fires, so if nobody is home to say the
+        # wake word there is nothing else in the system that would ever stop
+        # this.
+        self.timer_sound: str | None = None
+        self.timer_ring_seconds: int = 60
+        # Silence between bursts. The listening window, so it is a stopping
+        # knob as much as a cadence one — see RING_GAP_SECONDS.
+        self.timer_ring_gap: float = RING_GAP_SECONDS
+        # Minimum length of each burst; a shorter sound repeats to fill it.
+        self.timer_ring_burst: float = RING_MIN_BURST_SECONDS
 
         # Recent voice-turn traces (dicts derived from TurnTrace at emit
         # time in em_esphome) — powers the Status tab's observability panel.
@@ -792,6 +843,10 @@ async def _push_device_state(device: Device) -> None:
             "muted":     device.muted,
             "listening": device.listening,
             "thinking":  device.thinking,
+            # A ring can end without the dashboard asking (wake word, or the
+            # timeout), so the UI has to be told rather than left to assume
+            # its Test button is still the thing that stops it.
+            "ringing":   device.timer_ringing,
         },
     })
 
@@ -855,6 +910,27 @@ async def leds_listening(device: Device):
         await device.send_led_anim(device.led_scene["listening_anim"])
     else:
         await device.set_leds(device.led_scene["listening"], listening=True)
+
+
+async def leds_timer_ring(device: Device, cap_seconds: float):
+    """
+    Pulse the ring for the whole of a firing timer.
+
+    Sized with a real TTL rather than the 1s the outcome cues use: those
+    are self-clearing flourishes, this has to stay lit until something
+    stops it. _run_timer_ring clears it in its finally on every path, so
+    the TTL is only the backstop for a controller that dies mid-alarm —
+    without one the device would pulse until it was power-cycled.
+    """
+    if device.led_anim_capable:
+        anim = dict(device.led_scene["ring_anim"])
+        anim["ttlSec"] = em_scenes.ring_ttl(cap_seconds)
+        await device.send_led_anim(anim)
+    else:
+        # Pre-v2.9 firmware has no local animator, and driving a pulse from
+        # here would mean a frame every ~40ms for up to five minutes. A lit
+        # ring still says "look at me", which is the job.
+        await device.set_leds(device.led_scene["listening"])
 
 
 async def leds_spin_green(device: Device, stop_event: asyncio.Event):
@@ -1065,6 +1141,218 @@ async def _barge_watcher(device: Device, playback_started: asyncio.Event):
             f"rms mean={rms_mean:.4f} max={rms_max:.4f} "
             f"(device noise floor {getattr(device, 'noise_floor', 0.0):.4f})"
         )
+
+
+async def _run_timer_ring(device: Device, timer_name: str = "timer") -> None:
+    """
+    Ring this device for an expired Home Assistant timer, until the wake
+    word or the ring cap stops it.
+
+    Home Assistant is not involved past the FINISHED event: TimerManager
+    pops the timer from its registry as it fires, so it no longer exists to
+    be cancelled and no "stop the timer" utterance can come back to us
+    through the pipeline. Everything about stopping this ring is local.
+
+    Deliberately NOT routed through the announce path (_standalone_play):
+    that stops the mic for the duration of playback to keep TTS out of the
+    wake stream, which for a ring would mean the device could not hear the
+    word that stops it. Instead the mic keeps streaming into mic_queue and
+    wake_word_listener scores it, with two concessions in that loop for the
+    ring case — it ignores its `device.speaking` guard, and it drops to the
+    barge threshold, because the mic hears the ring ~25dB louder than the
+    person and wake scores are depressed accordingly (the same physics
+    barge-in already handles for TTS).
+
+    The stop therefore has to work with AEC OFF, which is the fleet default
+    and what this was first tested against (2026-08-09: the wake word took
+    ~15s and many attempts to land, scoring so low it never even reached the
+    near-miss band). Barge-in gets away with leaning on AEC; a ring cannot,
+    because failing means an alarm nobody can silence. What makes it work
+    instead is a real quiet window: the loop waits for the device to report
+    the sound has actually FINISHED playing, then holds RING_GAP_SECONDS of
+    genuine silence, and the wake listener discards everything before it and
+    rescores from a reset model.
+
+    That distinction is the whole fix. stream_speaker returns when the bytes
+    reach the socket, which on this hardware is ~1.1s (SPEAKER_PRIME_SECONDS)
+    before the room hears anything — the first version slept 1s from socket
+    completion and produced roughly 0.4s of real quiet per cycle, against the
+    ~1.4s rolling context openWakeWord needs. The wake word never had a clean
+    run at the mic.
+
+    Takes voice_lock for the same reason a turn does: both own the speaker,
+    and a ring streaming over an in-flight answer garbles both. It also
+    keeps cancel_event single-owner — the ring sets it to cut playback
+    short, and doing that underneath a live turn would abort the turn.
+    A timer firing mid-conversation therefore rings once the answer
+    finishes, a second or two late rather than on top.
+    """
+    pcm = await em_sounds.ring_pcm(device.timer_sound)
+    # Repeat a short sound into a burst. Whole copies only — cutting one
+    # mid-waveform clicks, and the click is louder than the chime.
+    burst_min = max(0.0, float(device.timer_ring_burst or 0.0))
+    one_s = em_sounds.duration_seconds(len(pcm))
+    if 0 < one_s < burst_min:
+        pcm *= max(1, int(burst_min / one_s + 0.999))
+    sound_s = em_sounds.duration_seconds(len(pcm))
+    gap_s = max(0.5, float(device.timer_ring_gap or RING_GAP_SECONDS))
+    max_s = max(5, int(device.timer_ring_seconds or 60))
+    log.info(
+        f"[{device.device_id}] Timer {timer_name!r} finished — ringing "
+        f"(sound={device.timer_sound or 'built-in'}, burst {sound_s:.1f}s, "
+        f"gap {gap_s:.1f}s, cap {max_s}s, stop with the wake word)"
+    )
+    db.log_device(
+        device.device_id, "info", "controller",
+        f"Timer finished: {timer_name} — ringing",
+    )
+
+    # Outside the lock, as _run_voice_locked does it: taking the speaker
+    # while still queued behind a turn would pause music for the wait.
+    await em_player.interrupt(device.device_id)
+    loop = asyncio.get_event_loop()
+    started = loop.time()
+    try:
+        async with device.voice_lock:
+            device.timer_ring_stop.clear()
+            device.timer_ringing = True
+            device.cancel_event.clear()
+            await _push_device_state(device)
+            await leds_timer_ring(device, max_s)
+            # Mic on for the whole ring — this is what makes the wake word
+            # able to stop it. Ordinary mic_start (no lock_mic): the device
+            # stays on ch6 omni, the same stream wake listening already uses.
+            await device.mic_start()
+            while not device.timer_ring_stop.is_set():
+                if loop.time() - started >= max_s:
+                    log.info(
+                        f"[{device.device_id}] Timer ring hit its {max_s}s cap — "
+                        f"stopping (nobody said the wake word)"
+                    )
+                    break
+
+                device.playback_done.clear()
+                device.timer_ring_audible = True
+                stream  = asyncio.create_task(device.stream_speaker(pcm))
+                stopped = asyncio.create_task(device.timer_ring_stop.wait())
+                done, _ = await asyncio.wait(
+                    [stream, stopped], return_when=asyncio.FIRST_COMPLETED,
+                )
+                if stopped in done:
+                    stream.cancel()
+                    # cancel_event breaks stream_speaker's send loop; without
+                    # it the device plays out what is already buffered and the
+                    # ring looks like it ignored the wake word for a second.
+                    device.cancel_event.set()
+                    await device.send_control({"type": "speaker_flush"})
+                    break
+                stopped.cancel()
+
+                # Socket write is done; the room has heard nothing yet. Wait
+                # for the device's own playback_stats before calling the
+                # sound over — the same signal _run_post_turn_playback uses,
+                # and for the same reason (a wall-clock estimate cleared the
+                # ring up to 6.1s early, 2026-07-24). The timeout is only a
+                # backstop for a report that never arrives (device drop,
+                # pre-v2.9 firmware); ringing on regardless is the safe
+                # failure here, so it is generous.
+                drained = asyncio.create_task(device.playback_done.wait())
+                stopped = asyncio.create_task(device.timer_ring_stop.wait())
+                timeout = asyncio.create_task(
+                    asyncio.sleep(sound_s * 2 + SPEAKER_PRIME_SECONDS + 3.0)
+                )
+                done, _ = await asyncio.wait(
+                    [drained, stopped, timeout], return_when=asyncio.FIRST_COMPLETED,
+                )
+                for t in (drained, stopped, timeout):
+                    t.cancel()
+                device.timer_ring_audible = False
+                if device.timer_ring_stop.is_set():
+                    device.cancel_event.set()
+                    await device.send_control({"type": "speaker_flush"})
+                    break
+
+                # The listening window. Long enough for openWakeWord's rolling
+                # context (~1.4s) to fill with nothing but room, since the
+                # listener resets its model at the edge above and has no
+                # earlier frames to work with. Shortening this is what made
+                # the ring unstoppable the first time round.
+                try:
+                    await asyncio.wait_for(device.timer_ring_stop.wait(),
+                                           timeout=gap_s)
+                    break
+                except asyncio.TimeoutError:
+                    pass
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.error(f"[{device.device_id}] Timer ring error: {e}")
+    finally:
+        device.timer_ringing = False
+        device.timer_ring_audible = False
+        device.timer_ring_stop.set()
+        device.cancel_event.clear()
+        # Drop our own handle so a later ring doesn't report that it is
+        # "replacing" a ring that finished on its own minutes ago. Guarded:
+        # a ring that replaced us already owns this slot.
+        if device.timer_ring_task is asyncio.current_task():
+            device.timer_ring_task = None
+        log.info(f"[{device.device_id}] Timer ring ended after {loop.time() - started:.1f}s")
+        await leds_off(device)
+        await em_player.resume_interrupted(device.device_id)
+        await _push_device_state(device)
+
+
+async def stop_timer_ring(device: Device) -> bool:
+    """
+    Silence a ringing timer. False if it wasn't ringing.
+
+    Awaits the ring task so callers can rely on the speaker being free when
+    this returns — wake_word_listener stops a ring and then may go straight
+    into a voice turn on a later wake.
+
+    Never awaits the calling task: start_timer_ring calls this to replace an
+    existing ring, and by then device.timer_ring_task can already be the new
+    task, which would otherwise wait on itself forever.
+    """
+    if not device.timer_ringing and device.timer_ring_task is None:
+        return False
+    device.timer_ring_stop.set()
+    task = device.timer_ring_task
+    device.timer_ring_task = None
+    current = asyncio.current_task()
+    if task is not None and task is not current and not task.done():
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
+        except asyncio.TimeoutError:
+            log.warning(f"[{device.device_id}] Timer ring did not stop within 5s — cancelling")
+            task.cancel()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+    return True
+
+
+async def start_timer_ring(device: Device, timer_name: str = "timer") -> None:
+    """
+    Kick off a ring as its own task, so the HA message loop isn't held.
+
+    A second timer expiring during a ring replaces it rather than stacking a
+    second playback loop onto one speaker. The old ring is stopped BEFORE
+    the new task exists — stopping it afterwards would mean the new task is
+    already in device.timer_ring_task and stop_timer_ring would target the
+    wrong one.
+    """
+    if device.timer_ringing or device.timer_ring_task is not None:
+        log.info(
+            f"[{device.device_id}] Timer {timer_name!r} fired while already "
+            f"ringing — replacing the ring in progress"
+        )
+        await stop_timer_ring(device)
+    task = asyncio.create_task(_run_timer_ring(device, timer_name))
+    task.add_done_callback(_log_task_exception)
+    device.timer_ring_task = task
 
 
 async def _run_post_turn_playback(device: Device, voice_response: bytes) -> None:
@@ -1678,6 +1966,8 @@ async def wake_word_listener(device: Device):
     nm_pending = 0    # near-misses buffered since the last hourly-rollup flush
     nm_max     = 0.0  # highest buffered near-miss score
     dead_streak = 0   # consecutive 10s mic_queue timeouts (resets on any frame)
+    ring_reset_due = False  # ring audio just stopped; reset before scoring again
+    last_ring_score_log_ts = 0.0  # rate-limit ring-window score logging to 1/s
     try:
         while True:
             if device.oww_model != current_model_name or device.oww_speex_ns != current_speex_ns:
@@ -1784,7 +2074,31 @@ async def wake_word_listener(device: Device):
                 del buf[:CHUNK_BYTES]
                 samples = np.frombuffer(frame, dtype=np.int16)
 
-                if device.speaking:
+                # The speaking guard keeps the device's own TTS out of the
+                # wake stream. A timer ring is the deliberate exception: the
+                # wake word is the only thing that can stop it, since HA
+                # discards the timer as it fires.
+                #
+                # But only during the ring's SILENT window. device.speaking
+                # tracks the socket write, which finishes ~1.1s before the
+                # room hears anything (SPEAKER_PRIME_SECONDS), so it is the
+                # wrong signal for "is the chime audible" — timer_ring_audible
+                # is, because the ring loop clears it on the device's own
+                # playback_stats. With AEC off (the fleet default) the audible
+                # frames are pure chime; scoring them fills openWakeWord's
+                # rolling context with echo and the real word that follows
+                # scores near zero. Drop them, and reset once at the edge so
+                # the quiet window is scored from a clean model.
+                if device.timer_ring_audible:
+                    ring_reset_due = True
+                    buf.clear()
+                    break
+                if ring_reset_due:
+                    ring_reset_due = False
+                    model.reset()
+                    buf.clear()
+                    break
+                if device.speaking and not device.timer_ringing:
                     continue
 
                 # Per-room noise floor tracking (measurement only — the audio
@@ -1833,6 +2147,30 @@ async def wake_word_listener(device: Device):
                 eff_threshold = device.oww_threshold
                 if device.barge_in_enabled and em_player.is_playing(device.device_id):
                     eff_threshold = min(eff_threshold, device.barge_threshold)
+                # A ring is louder at the mic than music is, and unlike
+                # music there is no opt-in to respect — a wake word that
+                # cannot clear the bar leaves the ring unstoppable. Not
+                # gated on barge_in_enabled for that reason.
+                if device.timer_ringing:
+                    eff_threshold = min(eff_threshold, device.barge_threshold)
+
+                    # Ring scoring gets its own log line, on a lower floor
+                    # (0.01) and outside the near-miss counter. When the first
+                    # version of the ring could not be silenced, every failed
+                    # attempt scored BELOW the 0.05 near-miss floor, so 15s of
+                    # trying produced no log lines at all and the absence of
+                    # evidence was the only clue. Rings are rare and short, so
+                    # a rate-limited line here costs nothing and makes the next
+                    # failure state its own cause.
+                    if score > 0.01:
+                        now = asyncio.get_event_loop().time()
+                        if now - last_ring_score_log_ts >= 1.0:
+                            last_ring_score_log_ts = now
+                            log.info(
+                                f"[{device.device_id}] Ring listening: "
+                                f"score={score:.3f} (need {eff_threshold:.2f}, "
+                                f"rms={rms:.4f}, floor={device.noise_floor:.4f})"
+                            )
 
                 if 0.05 < score < eff_threshold:
                     device.oww_near_misses += 1
@@ -1925,6 +2263,39 @@ async def wake_word_listener(device: Device):
                         device.device_id, "info", "device",
                         f"Wake word detected (score={score:.3f}, {source})"
                     )
+                    if device.timer_ringing:
+                        # The wake word is consumed stopping the ring — no
+                        # turn follows. Silencing an alarm should not also
+                        # open the mic, and "Jarvis!" on its own is not a
+                        # command worth transcribing.
+                        log.info(
+                            f"[{device.device_id}] Wake word stopped the timer ring "
+                            f"(score={score:.3f}) — consuming, no turn"
+                        )
+                        db.log_device(
+                            device.device_id, "info", "controller",
+                            "Timer ring stopped by wake word",
+                        )
+                        await stop_timer_ring(device)
+                        model.reset()
+                        buf.clear()
+                        # The ring's own cleanup drains nothing — frames
+                        # queued while the sound was playing are echo, and
+                        # scoring them against a freshly reset model is how
+                        # a stopped ring re-triggers itself.
+                        drained = 0
+                        while not device.mic_queue.empty():
+                            try:
+                                device.mic_queue.get_nowait()
+                                drained += 1
+                            except asyncio.QueueEmpty:
+                                break
+                        if drained:
+                            log.debug(
+                                f"[{device.device_id}] Drained {drained} echo frames "
+                                f"after ring stop"
+                            )
+                        continue
                     if not device.voice_lock.locked():
                         # P0-1: do NOT send mic_stop/mic_start_turn.
                         # The stream stays running continuously. Flipping
@@ -2382,6 +2753,10 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
         device.oww_on_device = em_shadow.effective_mode(
             config.get("owwOnDevice"), device.oww_trigger_capable
         )
+        device.timer_sound   = config.get("timerSound") or None
+        device.timer_ring_seconds = int(config.get("timerRingSeconds", 60))
+        device.timer_ring_gap = float(config.get("timerRingGapSeconds", RING_GAP_SECONDS))
+        device.timer_ring_burst = float(config.get("timerRingBurstSeconds", RING_MIN_BURST_SECONDS))
         device.eq_bands      = config.get("eqBands", [0.0] * 8)
         device.eq_loudness   = bool(config.get("eqLoudness", False))
         device.led_scene     = em_scenes.resolve(config)
@@ -2410,6 +2785,17 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
                 await em_player.resume_interrupted(_d.device_id)
         async def _send_volume_set(level: int, _d=_device_ref) -> None:
             await _d.send_control({"type": "volume_set", "level": level})
+        async def _ring_start(timer_name: str = "timer", _d=_device_ref) -> None:
+            # Deliberately not _standalone_play: that stops the mic, which
+            # would leave the ring with no way to hear the wake word that
+            # stops it. See _run_timer_ring.
+            await start_timer_ring(_d, timer_name)
+        async def _start_conversation(_d=_device_ref) -> None:
+            # HA asked to open a conversation after an announce. Same path
+            # as a button turn — no wake word happened, so no preroll to
+            # discard (review C3).
+            await _run_voice_locked(_d, trigger_label="start_conversation",
+                                    is_wakeword=False)
         # Capabilities before the servers come up: they decide which HA
         # entities are advertised, and advertising is a one-shot at
         # ListEntities time.
@@ -2419,6 +2805,8 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
             SERVER_HOST,
             standalone_play=_standalone_play,
             send_volume_set=_send_volume_set,
+            ring_start=_ring_start,
+            start_conversation=_start_conversation,
         )
         # The ESPHome server object caches the OWW model from server
         # creation — refresh it from the config we just loaded so HA's
