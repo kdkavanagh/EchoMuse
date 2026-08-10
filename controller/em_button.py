@@ -30,6 +30,8 @@ from __future__ import annotations
 # A hold is forwarded to HA as the `long` event. Fires while muted: it is not
 # speech, so the mute has no opinion about it.
 HOLD = "hold"
+# A tap while a timer is ringing. Silences the alarm and is consumed doing it.
+TAP_RING_STOP = "ring_stop"
 # A tap forwarded to HA as an event rather than starting a turn
 # (buttonSingleTapEvent). Ordered before the mute check for the same reason a
 # hold is: it is not speech, so the mute has no opinion about it.
@@ -49,6 +51,7 @@ def decide(
     muted: bool,
     turn_active: bool,
     tap_event: bool = False,
+    ring_active: bool = False,
 ) -> str:
     """
     Classify a dot-button RELEASE.
@@ -62,9 +65,29 @@ def decide(
     by the caller: the event entity is only advertised for a hold-capable
     device, so ungated this would classify taps as events nothing receives —
     and make TURN and CANCEL unreachable. An inert button.
+
+    `ring_active` is a firing timer, and it takes the tap ahead of every
+    other meaning a tap has. Home Assistant discards a timer as it fires, so
+    nothing upstream can cancel a ringing alarm; until this existed the wake
+    word was the only stop, which fails exactly when the room is loud enough
+    to need an alarm in the first place. So the tap outranks:
+
+    - `tap_event`, because an alarm that cannot be silenced is worse than one
+      automation losing its `single` for the seconds a ring lasts, and
+    - `muted`, which is the case that matters. Muting kills the mic, so it
+      also kills the only other stop — a muted device with a ringing timer
+      had NO way to stop it short of the cap. This is not a hole in the mute
+      rule: the rule is that a press must not start a voice TURN, and
+      silencing an alarm is not speech.
+
+    It does not outrank the hold, which keeps its HA meaning — a hold is a
+    deliberate, separately-bound gesture, and a tap is still there to stop
+    the ring immediately afterwards.
     """
     if held_ms >= hold_ms:
         return HOLD
+    if ring_active:
+        return TAP_RING_STOP
     if tap_event:
         return TAP_EVENT
     if muted:

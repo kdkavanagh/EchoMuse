@@ -17,13 +17,15 @@ import em_button
 HOLD_MS = 750
 
 
-def decide(held_ms=0, muted=False, turn_active=False, tap_event=False):
+def decide(held_ms=0, muted=False, turn_active=False, tap_event=False,
+           ring_active=False):
     return em_button.decide(
         held_ms=held_ms,
         hold_ms=HOLD_MS,
         muted=muted,
         turn_active=turn_active,
         tap_event=tap_event,
+        ring_active=ring_active,
     )
 
 
@@ -108,3 +110,52 @@ def test_off_by_default_is_the_old_behaviour():
     rather than emitting to an entity HA was never offered."""
     assert decide(held_ms=10, tap_event=False) == em_button.TURN
     assert decide(held_ms=10, turn_active=True, tap_event=False) == em_button.CANCEL
+
+
+# ── A ringing timer ──────────────────────────────────────────────────────────
+#
+# HA discards a timer as it fires, so nothing upstream can stop a ring. The
+# wake word is the acoustic stop and it is weakest in a loud room, which is
+# the room an alarm rings in — so the button is the stop that always works,
+# and it has to beat every other meaning a tap has.
+
+def test_tap_stops_the_ring():
+    assert decide(held_ms=10, ring_active=True) == em_button.TAP_RING_STOP
+
+
+def test_ring_stop_beats_the_turn_cancel():
+    """
+    A ring holds voice_lock, so without this a tap read as CANCEL: the burst
+    went quiet, the ring never ended, and it held the lock to its cap.
+    """
+    assert decide(held_ms=10, ring_active=True, turn_active=True) == em_button.TAP_RING_STOP
+
+
+def test_ring_stop_beats_mute():
+    """
+    The case that matters. Mute kills the mic and therefore the wake word, so
+    a muted ring has no other stop at all. Silencing an alarm is not speech,
+    which is all the mute rule is about.
+    """
+    assert decide(held_ms=10, ring_active=True, muted=True) == em_button.TAP_RING_STOP
+    assert decide(
+        held_ms=10, ring_active=True, muted=True, turn_active=True
+    ) == em_button.TAP_RING_STOP
+
+
+def test_ring_stop_beats_the_tap_event():
+    """One automation loses its `single` for a few seconds; the alternative
+    is an alarm that cannot be silenced."""
+    assert decide(held_ms=10, ring_active=True, tap_event=True) == em_button.TAP_RING_STOP
+
+
+def test_hold_keeps_its_meaning_during_a_ring():
+    """A hold is a separately-bound gesture, and a tap is still right there
+    to stop the ring."""
+    assert decide(held_ms=800, ring_active=True) == em_button.HOLD
+    assert decide(held_ms=800, ring_active=True, muted=True) == em_button.HOLD
+
+
+def test_no_ring_is_unchanged():
+    assert decide(held_ms=10, ring_active=False) == em_button.TURN
+    assert decide(held_ms=10, ring_active=False, muted=True) == em_button.BLOCKED

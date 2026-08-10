@@ -426,8 +426,16 @@ class Device:
         # listener skips these frames entirely and rescores from a reset
         # model once this clears: with AEC off (the fleet default) they are
         # nothing but chime, and scoring them buries the quiet window's
-        # context in echo.
+        # context in echo. With AEC on it scores them too — see aec_enabled.
         self.timer_ring_audible = False
+        # Device-side echo cancellation (aecEnabled), mirrored here because
+        # it changes what the wake listener may do with audible ring frames:
+        # the AEC far-end reference is tapped at the device's ALSA write, so
+        # it already covers the ring, and with it on the audible window is
+        # worth scoring instead of discarding. Off is the fleet default, and
+        # off is the conservative path (drop the frames), so a device that
+        # connects before its config push behaves as it always has.
+        self.aec_enabled = False
         # Config: which stored sound to ring with (em_sounds id), and how
         # long to keep ringing before giving up. The cap is not a nicety —
         # HA discards the timer as it fires, so if nobody is home to say the
@@ -1146,12 +1154,19 @@ async def _barge_watcher(device: Device, playback_started: asyncio.Event):
 async def _run_timer_ring(device: Device, timer_name: str = "timer") -> None:
     """
     Ring this device for an expired Home Assistant timer, until the wake
-    word or the ring cap stops it.
+    word, the action button, the mute button or the ring cap stops it.
 
     Home Assistant is not involved past the FINISHED event: TimerManager
     pops the timer from its registry as it fires, so it no longer exists to
     be cancelled and no "stop the timer" utterance can come back to us
     through the pipeline. Everything about stopping this ring is local.
+
+    Two of those stops do not go through the room at all, which matters
+    because the acoustic one is at its worst in exactly the conditions an
+    alarm rings in. `em_button.TAP_RING_STOP` takes the dot tap ahead of
+    every other meaning it has, and muting a ringing alarm stops it rather
+    than merely cancelling the turn the ring is impersonating (mute kills the
+    mic, so it would otherwise remove the wake word and leave the cap).
 
     Deliberately NOT routed through the announce path (_standalone_play):
     that stops the mic for the duration of playback to keep TTS out of the
@@ -1172,6 +1187,11 @@ async def _run_timer_ring(device: Device, timer_name: str = "timer") -> None:
     the sound has actually FINISHED playing, then holds RING_GAP_SECONDS of
     genuine silence, and the wake listener discards everything before it and
     rescores from a reset model.
+
+    With AEC ON the wake listener additionally scores the audible window,
+    since the device's far-end reference is tapped downstream of the mix and
+    already contains the chime. That is additive only — the cadence below is
+    unchanged, so a device with AEC off behaves exactly as it always has.
 
     That distinction is the whole fix. stream_speaker returns when the bytes
     reach the socket, which on this hardware is ~1.1s (SPEAKER_PRIME_SECONDS)
@@ -2076,20 +2096,41 @@ async def wake_word_listener(device: Device):
 
                 # The speaking guard keeps the device's own TTS out of the
                 # wake stream. A timer ring is the deliberate exception: the
-                # wake word is the only thing that can stop it, since HA
-                # discards the timer as it fires.
+                # wake word is the only acoustic thing that can stop it, since
+                # HA discards the timer as it fires.
                 #
-                # But only during the ring's SILENT window. device.speaking
-                # tracks the socket write, which finishes ~1.1s before the
-                # room hears anything (SPEAKER_PRIME_SECONDS), so it is the
-                # wrong signal for "is the chime audible" — timer_ring_audible
-                # is, because the ring loop clears it on the device's own
-                # playback_stats. With AEC off (the fleet default) the audible
-                # frames are pure chime; scoring them fills openWakeWord's
-                # rolling context with echo and the real word that follows
-                # scores near zero. Drop them, and reset once at the edge so
-                # the quiet window is scored from a clean model.
-                if device.timer_ring_audible:
+                # What happens during the ring's AUDIBLE window depends on
+                # AEC. device.speaking tracks the socket write, which finishes
+                # ~1.1s before the room hears anything (SPEAKER_PRIME_SECONDS),
+                # so it is the wrong signal for "is the chime audible" —
+                # timer_ring_audible is, because the ring loop clears it on the
+                # device's own playback_stats.
+                #
+                # AEC off (the fleet default): the audible frames are pure
+                # chime. Scoring them fills openWakeWord's rolling context with
+                # echo and the real word that follows scores near zero. Drop
+                # them, and reset once at the edge so the quiet window is
+                # scored from a clean model.
+                #
+                # AEC on: the far-end reference is tapped at the device's ALSA
+                # write, downstream of the mix, so the chime is already in it
+                # and the frames arriving here have had it subtracted. Score
+                # them — at the barge threshold, set below — so a wake word can
+                # land during the burst instead of only in the gap. Purely
+                # additive: the cadence is unchanged and the silent window is
+                # still there, so the worst case is the behaviour above.
+                # No reset at the edge on this path, deliberately — the whole
+                # point is a rolling context that spans the burst/gap boundary,
+                # and resetting would discard the context just built.
+                #
+                # The risk this takes is a chime whose residual scores as the
+                # wake word, which silences the alarm itself. AEC being opt-in
+                # is the gate for now; scoring an uploaded sound against the
+                # model at upload time is the way to retire it properly, and
+                # the ring log line below records which window a score came
+                # from so a self-silencing ring states its own cause.
+                ring_deaf = device.timer_ring_audible and not device.aec_enabled
+                if ring_deaf:
                     ring_reset_due = True
                     buf.clear()
                     break
@@ -2107,8 +2148,16 @@ async def wake_word_listener(device: Device):
                 # 10s time constant at 12.5 chunks/s) so speech bursts don't
                 # drag it up. Feeds the SNR-relative no-speech detection in
                 # em_esphome._stream_mic_audio and the diagnostics below.
+                #
+                # An audible ring frame is excluded: it only reaches here on
+                # the AEC path above, and residual echo is not room noise. The
+                # floor is a per-ROOM measurement that outlives the ring and
+                # feeds no-speech detection on later turns, so letting a 60s
+                # alarm drag it up would answer a question nobody asked.
                 rms = float(np.sqrt(np.mean((samples.astype(np.float64) / 32768.0) ** 2)))
-                if device.noise_floor == 0.0:
+                if device.timer_ring_audible:
+                    pass
+                elif device.noise_floor == 0.0:
                     device.noise_floor = rms
                 elif rms < device.noise_floor:
                     device.noise_floor += 0.3 * (rms - device.noise_floor)
@@ -2166,8 +2215,13 @@ async def wake_word_listener(device: Device):
                         now = asyncio.get_event_loop().time()
                         if now - last_ring_score_log_ts >= 1.0:
                             last_ring_score_log_ts = now
+                            # Which window the score came from is the whole
+                            # diagnostic on the AEC path: a chime silencing
+                            # itself and a person silencing it look identical
+                            # in the stop log, and differ here.
                             log.info(
-                                f"[{device.device_id}] Ring listening: "
+                                f"[{device.device_id}] Ring listening "
+                                f"({'chime audible, AEC' if device.timer_ring_audible else 'silent window'}): "
                                 f"score={score:.3f} (need {eff_threshold:.2f}, "
                                 f"rms={rms:.4f}, floor={device.noise_floor:.4f})"
                             )
@@ -2480,11 +2534,34 @@ async def handle_button_event(device: Device, event: dict):
             tap_event=(
                 device.button_single_tap_event and device.button_hold_capable
             ),
+            ring_active=device.timer_ringing,
         )
 
         if action == em_button.HOLD:
             log.info(f"[{device.device_id}] Dot button held {held_ms}ms → HA event")
             esphome.send_button_event(device.device_id, "long")
+            return
+
+        if action == em_button.TAP_RING_STOP:
+            # The alarm's local stop that does not go through the room. The
+            # wake word is the acoustic path and it is the one that fails
+            # when the room is loud, which is the room an alarm rings in.
+            #
+            # This has to be a real stop_timer_ring, not the CANCEL branch
+            # below. A ring holds voice_lock, so a tap used to classify as
+            # CANCEL and set cancel_event + speaker_flush: the burst went
+            # quiet, timer_ring_stop was never set, and the loop carried on
+            # to its cap re-entering stream_speaker — which returns
+            # immediately on a set cancel_event. Net effect was a silent ring
+            # holding the voice lock for up to timerRingSeconds, so the
+            # button appeared to work and left the device unable to take a
+            # turn.
+            log.info(f"[{device.device_id}] Dot button stopped the timer ring")
+            db.log_device(
+                device.device_id, "info", "controller",
+                "Timer ring stopped by the action button",
+            )
+            await stop_timer_ring(device)
             return
 
         if action == em_button.TAP_EVENT:
@@ -2743,6 +2820,7 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
         device.save_utterances = bool(config.get("saveUtterances", False))
         device.barge_in_enabled = bool(config.get("bargeInEnabled", False))
         device.barge_threshold  = float(config.get("bargeInThreshold", 0.6))
+        device.aec_enabled      = bool(config.get("aecEnabled", False))
         device.button_single_tap_event = bool(
             config.get("buttonSingleTapEvent", False)
         )
@@ -2869,7 +2947,24 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
 
                 elif msg_type == "mute_state":
                     device.muted = msg.get("muted", False)
-                    if device.muted and device.voice_lock.locked():
+                    if device.muted and device.timer_ringing:
+                        # Muting a ringing alarm means stop, and it has to be
+                        # handled here rather than falling into the turn
+                        # cancel below: a ring holds voice_lock, so the cancel
+                        # silenced the burst without ending the ring, and mute
+                        # then removed the only remaining stop by killing the
+                        # mic — leaving a silent ring holding the lock to its
+                        # cap. Same shape as the button, and the same fix.
+                        log.info(
+                            f"[{device_id}] Muted during a timer ring — "
+                            f"stopping the ring"
+                        )
+                        db.log_device(
+                            device_id, "info", "controller",
+                            "Timer ring stopped by mute",
+                        )
+                        await stop_timer_ring(device)
+                    elif device.muted and device.voice_lock.locked():
                         # Mute during an active turn terminates it — same
                         # cancel as the dot button, plus speaker_flush so
                         # any in-flight TTS goes silent immediately (the
