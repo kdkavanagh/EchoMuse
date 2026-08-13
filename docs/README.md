@@ -14,6 +14,12 @@ Deeper technical references live elsewhere:
 
 - [support-bundle.md](support-bundle.md) — what a support bundle contains,
   what it deliberately excludes, and how to check before you share one.
+- [alexa-afe.md](alexa-afe.md) — how the stock Alexa stack does echo
+  cancellation and beamforming on the same hardware, where its tuning lives on
+  the device, and what of it EchoMuse can and cannot reuse. Nothing from Amazon
+  is vendored here; extract from your own Dot.
+- [native-afe-migration.md](native-afe-migration.md) — spec and phased plan for
+  moving device audio onto that native front end. Proposal, not started.
 - [rooting.md](rooting.md) — what a device needs before EchoMuse can use it.
   The exploit itself is R0rt1z2's work on XDA Forums and that thread is canon;
   this covers where EchoMuse picks up, and what the wizard does for you.

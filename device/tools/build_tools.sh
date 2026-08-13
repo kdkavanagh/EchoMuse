@@ -43,9 +43,31 @@ build_module_tool() {
     echo "Output: $BUILD_DIR/$name"
 }
 
+# afe_probe is a module tool like oww_probe (imports internal/opensl — same
+# internal-package constraint) but unlike oww_probe it DOES need -tags
+# server: internal/opensl is itself //go:build server (it dlopens OpenSL ES,
+# which only exists on the device), so building without the tag fails with
+# "build constraints exclude all Go files", the same error cmd/server hits.
+build_module_tool_server() {
+    local name=$1
+
+    echo "Building $name..."
+    mkdir -p "$BUILD_DIR"
+    docker run --rm \
+        --entrypoint bash \
+        -e CGO_LDFLAGS="-Wl,--hash-style=both" \
+        -v "$(pwd)":/sdk \
+        -v "$REPO_ROOT/GoTinyAlsa":/GoTinyAlsa \
+        echomuse-compiler \
+        -c "cd /sdk && go build -tags server -o build/$name ./tools/$name"
+
+    echo "Output: $BUILD_DIR/$name"
+}
+
 build_tool capture_mics
 build_tool bf_capture
 build_module_tool oww_probe
+build_module_tool_server afe_probe
 
 echo ""
 echo "Deploy:"
@@ -70,3 +92,11 @@ echo "  adb shell \"su -c '/data/local/tmp/oww_probe -classifier /data/local/tmp
 echo ""
 echo "Without adb, push over the controller shell plane instead:"
 echo "  python controller/tools/push_file.py <local> <remote>   (resumable)"
+echo ""
+echo "afe_probe is the docs/native-afe-migration.md phase-0 spike — records"
+echo "through OpenSL ES at MIC/VOICE_RECOGNITION/VOICE_COMMUNICATION, plays a"
+echo "known tone for an ERLE estimate, writes WAVs, and prints a go/no-go line:"
+echo "  adb push $BUILD_DIR/afe_probe /sdcard/afe_probe"
+echo "  adb shell \"su -c 'cp /sdcard/afe_probe /data/local/tmp/afe_probe && chmod 755 /data/local/tmp/afe_probe'\""
+echo "  adb shell \"su -c '/data/local/tmp/afe_probe -seconds 8 -out /sdcard'\""
+echo "  adb pull /sdcard/afe_probe_mic.wav /sdcard/afe_probe_voice_recognition.wav /sdcard/afe_probe_voice_communication.wav ."

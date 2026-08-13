@@ -107,6 +107,24 @@ def test_triggering_is_a_separate_capability_from_scoring():
         "the dashboard must gate the 'On device' option on the capability"
 
 
+def test_native_afe_capability_is_surfaced_to_the_dashboard():
+    """
+    docs/native-afe-migration.md's bypass table: beamformingEnabled,
+    aecEnabled, agcEnabled and the mic gain controls do nothing while the
+    native-AFE backend is running, so the dashboard must be able to tell that
+    apart from an ordinary device — the same "cannot vs off" reasoning as
+    oww_shadow, just with the polarity inverted (this capability being present
+    is what DISABLES controls, not what offers a new one).
+    """
+    assert "native_afe_capable" in CONTROLLER.read_text(), \
+        "em_controller must expose the native-AFE capability as a property"
+    assert "nativeAfeCapable" in API.read_text(), \
+        "/api/devices must surface the native-AFE capability"
+    jsx = (ROOT / "controller" / "static" / "dashboard.jsx").read_text()
+    assert "nativeAfeCapable" in jsx and "afeActive" in jsx, \
+        "the dashboard must gate the beamformer/AEC/AGC/gain controls on the capability"
+
+
 def test_capabilities_reported_before_the_server_exists_are_not_lost():
     """
     A device registers BEFORE its ESPHome server is created — the listener

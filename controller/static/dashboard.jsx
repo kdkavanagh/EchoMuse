@@ -1796,6 +1796,7 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                 triggerCapable={!device.connected || !!device.owwTriggerCapable}
                 mixCapable={!device.connected || !!device.audioMixCapable}
                 holdCapable={!device.connected || !!device.buttonHoldCapable}
+                afeActive={!!device.nativeAfeCapable}
                 deviceId={device.device_id}
                 deviceConnected={!!device.connected}
                 deviceRinging={!!device.ringing}
@@ -4919,7 +4920,7 @@ function onDeviceMode(config) {
 function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
                             shadowCapable = true, mixCapable = true,
                             holdCapable = true, triggerCapable = true,
-                            deviceId = null,
+                            afeActive = false, deviceId = null,
                             deviceConnected = false, deviceRinging = false }) {
   // deviceId is null in the fleet-config view, where "ring this device now"
   // has no subject — the Test control is hidden there rather than disabled,
@@ -4928,6 +4929,12 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
   // view, where there is no single device whose capability could gate a
   // control. Referencing a `device` here is what blank-screened the Config
   // tab: the prop does not exist, so `device.connected` threw during render.
+  // afeActive defaults FALSE for the same fleet-view reason, but its polarity
+  // is the opposite of the *Capable props above: those mean "can do X, so
+  // enable"; afeActive means "native AFE is running right now, so DISABLE the
+  // beamformer/AEC/AGC/gain controls it replaces" (docs/native-afe-
+  // migration.md's bypass table) — false is the safe default either way
+  // (fleet view, or a device we don't know is running it yet).
   // sections == null means the fleet-config view: nothing to inherit from, so
   // no per-section switches and every control is live.
   const scoped = Array.isArray(sections);
@@ -5304,16 +5311,41 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
         </div>
         <StageAdvanced open={advMics} onToggle={() => setAdvMics(o => !o)} disabledStyle={inputStyle}>
           <div className="em-grid2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px 24px' }}>
-            <Slider label="MICPGA" sub="analog gain, before the ADC" value={config.adcMicpga ?? 40} min={0} max={59} onChange={v => set('adcMicpga', v)}/>
-            <Slider label="Digital gain" sub="ADC digital gain — affects wake + turns" value={config.adcDigitalGain ?? 88} min={0} max={100} onChange={v => set('adcDigitalGain', v)}/>
-            <Slider label="Mic gain" sub="fixed gain on the 24-bit capture, pre-16-bit stream" value={config.micGainDb ?? 24} min={0} max={42} unit="dB" onChange={v => set('micGainDb', v)}/>
-            <Slider label="Beam angle" sub="-1 = auto (onset-ratio selection)" value={config.beamAngle ?? -1} min={-1} max={359} step={1} onChange={v => set('beamAngle', v)}/>
-            <Toggle label="Beamforming" sub="perimeter mic lock during turns" value={config.beamformingEnabled ?? false} onChange={v => set('beamformingEnabled', v)}/>
-            <Toggle label="Echo cancel (AEC)" sub="subtracts the device's own playback — wake + turns, and lets the wake word land over a ringing timer" value={config.aecEnabled ?? false} onChange={v => set('aecEnabled', v)}/>
-            <Toggle label="Noise suppression" sub="DTLN denoise on speech-to-text audio only — helps fans/hum, not TV speech" value={config.nsAsr ?? false} onChange={v => set('nsAsr', v)}/>
-            <Slider label="AEC delay" sub="playback write-to-ear latency compensation" value={config.aecDelayMs ?? 250} min={0} max={1000} step={10} unit="ms" onChange={v => set('aecDelayMs', v)}/>
-            <Slider label="AEC tail" sub="filter length — residual delay error + room reverb" value={config.aecTailMs ?? 300} min={50} max={500} step={10} unit="ms" onChange={v => set('aecTailMs', v)}/>
+            <Slider label="MICPGA" disabled={afeActive}
+              sub={afeActive ? "gain now comes from the AFE (HAL PGA + AFE output gain) — see native AFE below" : "analog gain, before the ADC"}
+              value={config.adcMicpga ?? 40} min={0} max={59} onChange={v => set('adcMicpga', v)}/>
+            <Slider label="Digital gain" disabled={afeActive}
+              sub={afeActive ? "gain now comes from the AFE (HAL PGA + AFE output gain) — see native AFE below" : "ADC digital gain — affects wake + turns"}
+              value={config.adcDigitalGain ?? 88} min={0} max={100} onChange={v => set('adcDigitalGain', v)}/>
+            <Slider label="Mic gain" disabled={afeActive}
+              sub={afeActive ? "gain now comes from the AFE (HAL PGA + AFE output gain) — see native AFE below" : "fixed gain on the 24-bit capture, pre-16-bit stream"}
+              value={config.micGainDb ?? 24} min={0} max={42} unit="dB" onChange={v => set('micGainDb', v)}/>
+            <Slider label="Beam angle" disabled={afeActive || !(config.beamformingEnabled ?? false)}
+              sub={afeActive ? "the AFE selects its own beam — see native AFE below" : "-1 = auto (onset-ratio selection)"}
+              value={config.beamAngle ?? -1} min={-1} max={359} step={1} onChange={v => set('beamAngle', v)}/>
+            <Toggle label="Beamforming" disabled={afeActive}
+              sub={afeActive ? "replaced by the AFE's fixed+adaptive beamformer and SNR beam selection — see native AFE below" : "perimeter mic lock during turns"}
+              value={afeActive ? false : (config.beamformingEnabled ?? false)} onChange={v => set('beamformingEnabled', v)}/>
+            <Toggle label="Echo cancel (AEC)" disabled={afeActive}
+              sub={afeActive ? "replaced by the AFE's own per-mic AEC — see native AFE below" : "subtracts the device's own playback — wake + turns, and lets the wake word land over a ringing timer"}
+              value={afeActive ? false : (config.aecEnabled ?? false)} onChange={v => set('aecEnabled', v)}/>
+            <Toggle label="Noise suppression" sub={afeActive ? "the mic stream is already denoised by the AFE — this would be a second pass on top of it" : "DTLN denoise on speech-to-text audio only — helps fans/hum, not TV speech"} value={config.nsAsr ?? false} onChange={v => set('nsAsr', v)}/>
+            <Slider label="AEC delay" disabled={afeActive || !(config.aecEnabled ?? false)}
+              sub={afeActive ? "the AFE times its own reference — see native AFE below" : "playback write-to-ear latency compensation"}
+              value={config.aecDelayMs ?? 250} min={0} max={1000} step={10} unit="ms" onChange={v => set('aecDelayMs', v)}/>
+            <Slider label="AEC tail" disabled={afeActive || !(config.aecEnabled ?? false)}
+              sub={afeActive ? "the AFE runs its own filter — see native AFE below" : "filter length — residual delay error + room reverb"}
+              value={config.aecTailMs ?? 300} min={50} max={500} step={10} unit="ms" onChange={v => set('aecTailMs', v)}/>
             <Toggle label="Save utterances" sub="keeps the last 10 turns' mic audio on the server — play or download from Activity" value={config.saveUtterances ?? false} onChange={v => set('saveUtterances', v)}/>
+            {afeActive && (
+              <div style={{ gridColumn: '1 / -1', marginTop: 4, fontFamily: mono, fontSize: 10, color: 'var(--muted)', lineHeight: 1.6 }}>
+                Native AFE is active on this device (docs/native-afe-migration.md):
+                Android's own audio HAL — Amazon's per-mic AEC, fixed+adaptive
+                beamformer and SNR beam selection — is doing capture instead of
+                the controls above. Recovery is a firmware flag flip and a
+                restart, not a setting here.
+              </div>
+            )}
           </div>
         </StageAdvanced>
       </Stage>
@@ -5419,7 +5451,9 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
         </div>
         {subHeader('Turn processing')}
         <div className="em-grid2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0 24px', ...inputStyle }}>
-          <Toggle label="Auto gain (AGC)" sub="levels button-turn speech; never the wake stream" value={config.agcEnabled ?? true} onChange={v => set('agcEnabled', v)}/>
+          <Toggle label="Auto gain (AGC)" disabled={afeActive}
+            sub={afeActive ? "replaced by the AFE's own AGC (native AFE — see Microphones)" : "levels button-turn speech; never the wake stream"}
+            value={afeActive ? false : (config.agcEnabled ?? true)} onChange={v => set('agcEnabled', v)}/>
         </div>
         {subHeader('Speech gate')}
         <div className="em-grid2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '4px 20px', ...inputStyle }}>
