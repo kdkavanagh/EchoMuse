@@ -690,7 +690,17 @@ func (d *DataClient) streamMic(conn *websocket.Conn, stopCh <-chan struct{}, loc
 			// are trained level-diverse and don't need AGC. The config
 			// toggle still governs bounded lockMic turns, which get a fresh
 			// ResetAGC each stream.
-			agcEnabled := lockMic && (snap.AgcEnabled == nil || *snap.AgcEnabled)
+			//
+			// Also forced off under native-AFE passthrough: unlike AEC (which
+			// silently no-ops on a size mismatch — see the aec.Process guard
+			// below), processor.Process has no frame-size assumption and
+			// would actually RUN, stacking our own gain control on top of
+			// the AFE's — the bypass table (docs/native-afe-migration.md)
+			// lists AGC as replaced, not merely redundant, and the dashboard
+			// already shows the config toggle as off while active; the
+			// device disagreeing with that would be the exact "control that
+			// silently does something else" CLAUDE.md warns against.
+			agcEnabled := !d.micPassthrough && lockMic && (snap.AgcEnabled == nil || *snap.AgcEnabled)
 
 			// micGainDb is a pre-truncation gain applied to the raw 24-bit
 			// capture (see internal/beamformer's extractChannel) — meaningless
