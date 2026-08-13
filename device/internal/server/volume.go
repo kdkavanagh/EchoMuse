@@ -10,10 +10,50 @@ import (
 )
 
 const (
-	volumeMin     = 0
-	volumeMax     = 175
-	volumeStep    = 17 // ~10% per press
-	volumeLEDSecs = 2  // how long to show volume ring
+	volumeMin = 0
+
+	// volumeMax is the codec's UNITY gain, not the top of the mixer control's
+	// range. tinymix ctl 61 is the tlv320aic32x4 DAC digital volume: 176
+	// steps of 0.5dB spanning -63.5dB..+24dB, with 0dB at index 127. The 48
+	// steps above 127 apply POSITIVE digital gain to already near-full-scale
+	// PCM, which saturates inside the DAC.
+	//
+	// Measured on hardware 2026-08-13 (1kHz at -6dBFS, recorded through the
+	// mic array): THD 1.5% at 127, 2.3% at 136, 65% at 153, 89% at 170 — with
+	// the output level FLAT from 153 upward, because it had already stopped
+	// being able to get louder. Third harmonic rose to -1.1dB relative to the
+	// fundamental, i.e. very nearly a square wave. The control run that
+	// isolates it: index 170 with the source scaled down to land at the same
+	// acoustic level reads 1.1%, clean — so the codec's gain stage is fine
+	// and it is purely source x gain exceeding full scale.
+	//
+	// Stock FireOS never writes this control at all: it appears in no
+	// /system binary and not once in /system/etc/audio_device.xml, which
+	// leaves the DAC at its 0dB reset default and takes user volume from
+	// AudioFlinger's software attenuation instead. That is why native Alexa
+	// has no such distortion, and why matching it means capping here.
+	//
+	// Do not raise this. The lost headroom cannot be bought back from
+	// Ext_Amp_Gain either — that control is inert on this board (measured
+	// 0.0dB of effect across its whole 6/12/18/24dB range, while still
+	// reading its new value back). "HP Driver Gain Volume" (ctl 62) is the
+	// stage that does work, if more output is ever wanted.
+	volumeMax = 127
+
+	// volumeButtonFloor is the bottom of the band the PHYSICAL buttons
+	// traverse. The scale is dB-linear, so index 0 is -63.5dB and roughly the
+	// bottom third of the control is indistinguishable from silence; stepping
+	// across it spends presses to go nowhere. Silencing the device is the
+	// mute button's job, not the volume button's.
+	//
+	// Explicit Set() calls are deliberately NOT floored — HA's volume 0.0
+	// has to still mean silent. A press from below the floor lands ON the
+	// floor rather than adding a step, so one press always reaches audible.
+	volumeButtonFloor = 47 // -40dB
+
+	// volumeStep is 4dB per press: 10 presses to cross the button band.
+	volumeStep    = 8
+	volumeLEDSecs = 2 // how long to show volume ring
 	numLEDs       = 12
 )
 
@@ -65,23 +105,32 @@ func newVolumeController(ledGetter func() led.Controller) *volumeController {
 	return vc
 }
 
-// readFromDevice reads current tinymix level. Returns volumeMax/2 on failure.
+// readFromDevice reads current tinymix level. Returns the midpoint of the
+// button band on failure — volumeMax/2 is -32dB on this dB-linear scale,
+// which is quiet enough to read as broken.
 func (vc *volumeController) readFromDevice() int {
+	fallback := (volumeButtonFloor + volumeMax) / 2
 	out, err := exec.Command("tinymix", "-D", "0", "61").Output()
 	if err != nil {
 		log.Printf("Volume read failed: %v", err)
-		return volumeMax / 2
+		return fallback
 	}
 	var l, r int
-	// Output: "PCM Playback Volume: 100 100 (range 0->175)"
+	// Output: "PCM Playback Volume: 100 100 (range 0->175)". The control's
+	// own range is 0->175; volumeMax caps us at 127 (unity) — see the
+	// constant. A device that was left above the cap reads back high here
+	// and the next Set() clamps it.
 	if _, err := fmt.Sscanf(string(out), "PCM Playback Volume: %d %d", &l, &r); err != nil {
 		log.Printf("Volume parse failed: %v (output: %s)", err, out)
-		return volumeMax / 2
+		return fallback
+	}
+	if l > volumeMax {
+		l = volumeMax
 	}
 	return l
 }
 
-// Set applies a new volume level (0–175) and updates tinymix. showRing
+// Set applies a new volume level (0–volumeMax) and updates tinymix. showRing
 // paints the cyan volume arc for the 2s display window — physical button
 // presses pass true; remote sets (controller command / HA) and the boot-time
 // SeedVolume pass false so the ring doesn't light when nobody is at the
@@ -147,20 +196,34 @@ func (vc *volumeController) Get() int {
 	return vc.level
 }
 
-// StepUp increases volume by one step.
+// StepUp increases volume by one step, within the button band.
 func (vc *volumeController) StepUp() {
 	vc.mu.Lock()
 	level := vc.level + volumeStep
 	vc.mu.Unlock()
-	vc.Set(level, true)
+	vc.Set(clampToButtonBand(level), true)
 }
 
-// StepDown decreases volume by one step.
+// StepDown decreases volume by one step, within the button band.
 func (vc *volumeController) StepDown() {
 	vc.mu.Lock()
 	level := vc.level - volumeStep
 	vc.mu.Unlock()
-	vc.Set(level, true)
+	vc.Set(clampToButtonBand(level), true)
+}
+
+// clampToButtonBand holds a stepped level inside [volumeButtonFloor,
+// volumeMax]. A device sitting below the floor — HA can put it there, and so
+// can a stored level from before the cap — lands ON the floor from one press
+// instead of creeping up 4dB at a time through inaudible territory.
+func clampToButtonBand(level int) int {
+	if level < volumeButtonFloor {
+		return volumeButtonFloor
+	}
+	if level > volumeMax {
+		return volumeMax
+	}
+	return level
 }
 
 // showLEDs lights N of 12 LEDs in cyan proportional to volume, then clears after 2s.
@@ -170,7 +233,18 @@ func (vc *volumeController) showLEDs(level int) {
 		return
 	}
 
-	lit := level * numLEDs / volumeMax
+	// The arc spans the BUTTON band, not the full control: over 0..volumeMax
+	// the audible range crowds into the top LEDs and a press often moves
+	// nothing. One LED stays lit anywhere above silence so the ring never
+	// reads as "off" when the device is merely quiet.
+	span := volumeMax - volumeButtonFloor
+	lit := (level - volumeButtonFloor) * numLEDs / span
+	if lit < 1 && level > volumeMin {
+		lit = 1
+	}
+	if lit > numLEDs {
+		lit = numLEDs
+	}
 	leds := make([]led.Led, numLEDs)
 	for i := 0; i < numLEDs; i++ {
 		if i < lit {

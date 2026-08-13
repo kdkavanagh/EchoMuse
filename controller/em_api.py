@@ -59,6 +59,7 @@ import em_oww_models
 import em_pki
 import em_player
 import em_recordings
+import em_volume
 import em_scenes
 import em_shadow
 import em_support
@@ -4057,7 +4058,11 @@ def _stored_volume(row):
     if level is None:
         return None
     try:
-        return max(0.0, min(1.0, float(level) / 175.0))
+        # float() first, deliberately: em_volume swallows bad input and
+        # returns 0.0, which is the right answer on the audio path and the
+        # wrong one here — this function's None means "not known", and a
+        # corrupt stored value must not report as "silent".
+        return em_volume.device_level_to_ha(float(level))
     except (TypeError, ValueError):
         return None
 

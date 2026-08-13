@@ -162,7 +162,7 @@ func (s *Server) VolumeStepDown() {
 	s.volume.StepDown()
 }
 
-// SetVolume sets volume to an explicit level (0–175) — called by controller
+// SetVolume sets volume to an explicit level (0–volumeMax) — called by controller
 // command. Remote changes don't paint the volume arc: nobody is at the
 // device, and the ring lighting up unprompted reads as a glitch.
 func (s *Server) SetVolume(level int) {
@@ -191,13 +191,13 @@ func (s *Server) VolumeSeeded() bool {
 	return s.volumeSeeded.Load()
 }
 
-// VolumeLevel returns the current volume level (0–175).
+// VolumeLevel returns the current volume level (0–volumeMax).
 func (s *Server) VolumeLevel() int {
 	return s.volume.Get()
 }
 
 // SetVolumeChangeCallback wires a callback invoked when volume changes.
-// The callback receives the new level (0–175).
+// The callback receives the new level (0–volumeMax).
 func (s *Server) SetVolumeChangeCallback(cb func(level int)) {
 	s.volume.SetOnVolumeChange(cb)
 }

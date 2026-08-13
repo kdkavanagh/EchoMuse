@@ -428,7 +428,8 @@ func (c *ControlClient) connect(ctx context.Context, server *discovery.ServerInf
 
 		case "volume_set":
 			// Controller forwarding a volume command from HA (MediaPlayerCommandRequest).
-			// level is an integer 0–175 matching the device's native tinymix range.
+			// level is an integer in the device's native tinymix range, capped
+			// at the codec's unity gain — see internal/server/volume.go.
 			var msg struct {
 				Level int `json:"level"`
 			}
@@ -846,7 +847,8 @@ func (c *ControlClient) SendAmbientLight(lux int) {
 	})
 }
 
-// SendVolumeState notifies the controller of the current volume level (0–175).
+// SendVolumeState notifies the controller of the current volume level
+// (0–volumeMax, the raw tinymix ctl 61 index).
 // Called on connect (to sync controller state) and after every local change.
 // Safe for concurrent use — silently drops if not connected.
 func (c *ControlClient) SendVolumeState(level int) {

@@ -1105,6 +1105,44 @@ Reverting a section **discards** its stored values (`set_device_config_sections`
 
 ### Volume / mute persistence
 
+**The scale stops at the codec's unity gain, and that ceiling is load-bearing.**
+tinymix ctl 61 is the tlv320aic32x4 DAC *digital* volume: 176 steps of 0.5dB
+spanning −63.5…+24dB, with 0dB at index **127**. The firmware shipped
+`volumeMax = 175` — the control's own maximum — so the top 27% of the range
+applied up to +24dB of digital gain to already near-full-scale PCM and
+saturated inside the DAC. Measured on hardware 2026-08-13 (1kHz at −6dBFS,
+recorded through the mic array): THD 1.5% at index 127, 2.3% at 136, **65% at
+153, 89% at 170**, with the output level *flat* from 153 upward because it had
+stopped being able to get louder, and h3 at −1.1dB relative to the fundamental
+(very nearly a square wave). The control that isolates it: index 170 with the
+source scaled down to land at the same acoustic level reads 1.1% — clean — so
+the gain stage is fine and it is purely source × gain exceeding full scale.
+Stock FireOS never writes this control **at all** (absent from
+`/system/etc/audio_device.xml` and from every `/system` binary), leaving the
+DAC at its 0dB reset default and taking user volume from AudioFlinger's
+software attenuation, which only ever attenuates — that is why native Alexa
+has no such distortion.
+
+Two things not to undo: `DEVICE_VOLUME_MAX`/`volumeMax` stay at 127 (both
+pinned by test), and the conversion lives in **one** place — `em_volume.py`,
+because `level / 175` was copy-pasted into `em_controller`, `em_esphome` and
+`em_api` with no test on any of them, which is how the wrong ceiling survived.
+The lost headroom **cannot** be bought back from `Ext_Amp_Gain` (ctl 13): that
+control is inert on this board — sweeping its full 6/12/18/24dB range moves
+the output 0.0dB while still reading its new value back, the same shape as the
+mute LED being on a different GPIO than Amazon's own HAL believed.
+`HP Driver Gain Volume` (ctl 62) *is* live (+18dB commanded → +18.1dB actual,
+THD 2.25%) if more output is ever wanted, but that is a taste call to make by
+ear, and the speaker's behaviour above stock level is unmeasured.
+
+The **physical buttons** traverse `volumeButtonFloor`(47, −40dB)…127 in 4dB
+steps rather than the whole control: the scale is dB-linear, so the bottom
+third is indistinguishable from silence and stepping across it spends presses
+to go nowhere. Silencing the device is the mute button's job. Explicit `Set()`
+calls are deliberately **not** floored — HA's volume 0.0 must still mean
+silent — and a press from below the floor lands *on* it, so one press always
+reaches audible.
+
 Volume is **state, not a setting** — it rides the config channel but has no dashboard control (the slider was removed 2026-07-25: `SeedVolume` ignores later pushes, so moving it did nothing until the device restarted and any real volume change overwrote it). It is listed in `em_config_sections.STATE_KEYS`, exempt from section scoping, and shown read-only on the Status tab.
 
 Volume persists through reboots **controller-side**: every device `volume_state` report is stored into the device's `startupVolume` config, and the device restores it via `Server.SeedVolume` on the **first config push per run only** (later pushes must not stomp live changes). Until seeded (or a local volume change makes the device authoritative), the device suppresses its connect-time `volume_state` report — reporting the boot-default level is what used to clobber the stored value on reboot. Mute is the opposite: **device-sovereign**, persisted locally in `/data/local/etc/echomuse/state.json` (survives OTA slot flips; written on toggle, restored at boot pre-connect — ADC mute immediately, red ring/button LED after LED init).
