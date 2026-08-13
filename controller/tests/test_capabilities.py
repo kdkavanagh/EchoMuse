@@ -125,6 +125,32 @@ def test_native_afe_capability_is_surfaced_to_the_dashboard():
         "the dashboard must gate the beamformer/AEC/AGC/gain controls on the capability"
 
 
+def test_the_toggle_control_actually_honours_disabled():
+    """
+    "Disabled with the reason, never a control that silently does nothing" is
+    the whole rule the bypass table above is enforced by — and for the first
+    release of it, Toggle did not take a `disabled` prop at all (only Slider
+    did). Beamforming, Echo cancel and Auto gain therefore rendered greyed
+    with their reason, read as off, and WROTE THE OPPOSITE VALUE into config
+    when clicked: worse than doing nothing, because the setting silently
+    disagreed with what the control showed.
+
+    Asserted against the component rather than the call sites, because the
+    call sites already looked correct while the bug was live.
+    """
+    jsx = (ROOT / "controller" / "static" / "dashboard.jsx").read_text()
+    m = re.search(r'function Toggle\(\{(.*?)\}\)', jsx, re.S)
+    assert m, "dashboard.jsx must still define a Toggle component"
+    assert "disabled" in m.group(1), \
+        "Toggle must accept a `disabled` prop — every caller that passes one " \
+        "is relying on it to refuse the write, not merely to grey the switch"
+
+    body = jsx[m.end():jsx.index("\n}", m.end())]
+    assert re.search(r'if\s*\(!disabled\)|disabled\s*\?\s*undefined|disabled\s*\|\|', body), \
+        "Toggle's click handler must check `disabled` before calling onChange — " \
+        "styling it grey while still writing the value is the bug this pins"
+
+
 def test_native_afe_toggle_is_gated_on_the_backend_capability_not_the_active_one():
     """
     native_afe_backend is a fixed fact about the BUILD (compiled-in backends
