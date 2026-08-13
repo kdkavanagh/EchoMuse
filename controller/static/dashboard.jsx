@@ -1122,6 +1122,8 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
   const [logsLoading, setLogsLoading] = useState(false);
   const [pushLog, setPushLog] = useState([]);
   const [pushing, setPushing] = useState(false);
+  const [nativeAfeBusy, setNativeAfeBusy] = useState(false);
+  const [nativeAfeLog, setNativeAfeLog] = useState([]);
   const [release, setRelease] = useState(null);
   const [checkingRelease, setCheckingRelease] = useState(false);
   const [approveLabel, setApproveLabel] = useState(device.label || '');
@@ -1388,6 +1390,65 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
           clearInterval(poll); setPushing(false);
         }
       } catch(e) { clearInterval(poll); setPushing(false); }
+    }, 3000);
+  }
+
+  // Native AFE opt-in (docs/native-afe-migration.md) — the marker write
+  // takes effect only on the device's next boot, so this always confirms
+  // (unlike doRollback: that's a well-worn recovery path, this is putting
+  // brand-new, hardware-unverified code — OpenSL ES, HAL routing — directly
+  // in the path of the device's next real voice turn) and always reboots
+  // immediately rather than leaving a marker set with no visible effect,
+  // which would read as the control having silently done nothing.
+  async function doNativeAfeToggle(enable) {
+    const verb = enable ? 'Enable' : 'Disable';
+    if (!confirm(`${verb} native AFE and restart ${device.label || device.device_id} now?\n\n` +
+                 `This replaces the beamformer/AEC/AGC with Android's own audio HAL front end ` +
+                 `for the device's mic and speaker. The device will be briefly unreachable while ` +
+                 `it reboots.`)) return;
+    setNativeAfeBusy(true);
+    setNativeAfeLog([`${verb === 'Enable' ? 'Enabling' : 'Disabling'} — writing the marker and rebooting…`]);
+    try {
+      await API.post(`/api/devices/${device.device_id}/native_afe`, { enabled: enable, reboot: true });
+      setNativeAfeLog(l => [...l, 'Marker set — waiting for the device to come back…']);
+      _pollNativeAfeReconnect(enable);
+    } catch(e) {
+      setNativeAfeLog(l => [...l, `Error: ${e.error || 'Could not write the marker'}`]);
+      setNativeAfeBusy(false);
+    }
+  }
+
+  // Unlike _pollReconnect, completion is "reconnected" — a reboot for this
+  // doesn't change firmware_ver, so that check can't apply. Reports whether
+  // the capability actually came up matching what was requested: the
+  // backend falls back to tinyalsa on any OpenSL ES open failure (default-
+  // off-safe by design), which from here looks like "reconnected but the
+  // toggle didn't take" and is worth saying plainly rather than claiming success.
+  function _pollNativeAfeReconnect(wantActive) {
+    let attempts = 0;
+    let wasDisconnected = false;
+    const poll = setInterval(async () => {
+      attempts++;
+      try {
+        const devices = await API.get('/api/devices');
+        const d = devices.find(x => x.device_id === device.device_id);
+        if (!d?.connected) wasDisconnected = true;
+        if (wasDisconnected && d?.connected) {
+          if (!!d.nativeAfeCapable === wantActive) {
+            setNativeAfeLog(l => [...l, `✓ Reconnected — native AFE is now ${wantActive ? 'active' : 'off'}.`]);
+          } else if (wantActive) {
+            setNativeAfeLog(l => [...l, `⚠ Reconnected, but native AFE did not come up — it fell back ` +
+              `to the tinyalsa path. Check the device's logs (Status tab).`]);
+          } else {
+            setNativeAfeLog(l => [...l, `⚠ Reconnected, but native AFE is still reporting active — ` +
+              `the marker removal or reboot may not have taken. Check the device's logs.`]);
+          }
+          clearInterval(poll); setNativeAfeBusy(false);
+        } else if (attempts > 40) {
+          setNativeAfeLog(l => [...l, 'Timed out waiting for reconnect — check the device.']);
+          clearInterval(poll); setNativeAfeBusy(false);
+        }
+      } catch(e) { clearInterval(poll); setNativeAfeBusy(false); }
     }, 3000);
   }
 
@@ -1907,6 +1968,50 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                   </div>
                 )}
               </Panel>
+
+              {/* Native AFE opt-in (docs/native-afe-migration.md) — only
+                  offered when the firmware build supports it at all
+                  (native_afe_backend: compiled-in backends + a
+                  start_server.sh that checks the marker). Gated on THAT
+                  capability rather than nativeAfeCapable, which reflects
+                  only whether it happens to be running right now — gating
+                  on the latter would mean the control to turn it ON only
+                  ever appeared once it was already on. */}
+              {device.nativeAfeBackendCapable && (
+                <Panel label="Native AFE (experimental)">
+                  <div style={{ fontFamily:"'DM Mono',monospace", fontSize:10, color:'var(--muted)', lineHeight:1.6, marginBottom:14 }}>
+                    Routes this device's mic and speaker through Android's own audio HAL —
+                    Amazon's per-mic AEC, beamformer and SNR beam selection — instead of the
+                    beamformer/AEC/AGC controls under Microphones, which it replaces while active.
+                    Hardware-unverified: run <code>afe_probe</code> on this device before enabling
+                    it for real use. Both directions restart the device to apply.
+                  </div>
+                  <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom: nativeAfeLog.length ? 12 : 0, flexWrap:'wrap' }}>
+                    <span style={{ fontFamily:"'DM Mono',monospace", fontSize:11, color: device.nativeAfeCapable ? 'var(--ok)' : 'var(--muted)' }}>
+                      {device.nativeAfeCapable ? '● Active' : '○ Off (tinyalsa)'}
+                    </span>
+                    <Pill small accent={!device.nativeAfeCapable}
+                      disabled={!device.connected || nativeAfeBusy || device.nativeAfeCapable}
+                      onClick={() => doNativeAfeToggle(true)}>
+                      {nativeAfeBusy ? 'Working…' : 'Enable + restart'}
+                    </Pill>
+                    <Pill small danger={device.nativeAfeCapable}
+                      disabled={!device.connected || nativeAfeBusy || !device.nativeAfeCapable}
+                      onClick={() => doNativeAfeToggle(false)}>
+                      {nativeAfeBusy ? 'Working…' : 'Disable + restart'}
+                    </Pill>
+                  </div>
+                  {nativeAfeLog.map((line, i) => (
+                    <div key={i} style={{
+                      fontFamily:"'DM Mono',monospace", fontSize:10, marginTop:4,
+                      color: line.startsWith('✓') ? 'var(--ok)'
+                           : line.startsWith('⚠') ? 'var(--warn)'
+                           : line.startsWith('Error') ? 'var(--error)'
+                           : 'var(--muted)',
+                    }}>{line}</div>
+                  ))}
+                </Panel>
+              )}
 
               {/* The GitHub Release panel that used to sit here held one
                   button, which now lives beside the version state above.

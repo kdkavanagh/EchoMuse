@@ -125,6 +125,24 @@ def test_native_afe_capability_is_surfaced_to_the_dashboard():
         "the dashboard must gate the beamformer/AEC/AGC/gain controls on the capability"
 
 
+def test_native_afe_toggle_is_gated_on_the_backend_capability_not_the_active_one():
+    """
+    native_afe_backend is a fixed fact about the BUILD (compiled-in backends
+    + a start_server.sh new enough to check the marker); native_afe reflects
+    only whether the AFE happens to be running right now. The dashboard's
+    toggle — which offers to turn it ON — has to gate on the former: gating
+    on the latter would mean the control to enable it only appears once it
+    is already enabled.
+    """
+    assert "native_afe_backend" in CONTROLLER.read_text(), \
+        "em_controller must expose the native-AFE backend capability as a property"
+    assert "nativeAfeBackendCapable" in API.read_text(), \
+        "/api/devices must surface the native-AFE backend capability"
+    jsx = (ROOT / "controller" / "static" / "dashboard.jsx").read_text()
+    assert "nativeAfeBackendCapable" in jsx, \
+        "the dashboard must gate the native-AFE toggle on the backend capability"
+
+
 def test_capabilities_reported_before_the_server_exists_are_not_lost():
     """
     A device registers BEFORE its ESPHome server is created — the listener
