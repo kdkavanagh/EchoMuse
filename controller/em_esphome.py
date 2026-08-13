@@ -72,6 +72,7 @@ import em_recordings
 import em_oww_models
 import em_player
 import em_turnclock
+import em_volume
 
 # ── VAD sentinels ──────────────────────────────────────────────────────────────
 # Queue items marking end-of-speech in mic_queue/voice_queue, in place of
@@ -508,9 +509,12 @@ class EchoMuseSatellite(SatelliteServerProtocol):
             device_id = (self._owning_server.device_id
                          if self._owning_server is not None else None)
             if msg.has_volume and self._owning_server is not None:
-                # HA set an explicit volume — convert float (0.0–1.0) to device
-                # integer (0–175) and forward to the physical device.
-                level = max(0, min(175, round(msg.volume * 175)))
+                # HA set an explicit volume — convert float (0.0–1.0) to the
+                # device's native level and forward to the physical device.
+                # The conversion is em_volume's, not a local `* 175`: the
+                # ceiling is the codec's unity gain, above which the DAC
+                # clips (see em_volume's docstring).
+                level = em_volume.ha_volume_to_device(msg.volume)
                 log.debug(
                     f"[{self._log_name}] MediaPlayerCommandRequest: "
                     f"volume={msg.volume:.3f} → level={level}"

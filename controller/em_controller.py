@@ -79,6 +79,7 @@ import em_esphome as esphome
 import em_ble_proxy
 import em_oww_models
 import em_player
+import em_volume
 import em_sounds
 
 _LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s — %(message)s"
@@ -219,16 +220,11 @@ SPEAKER_FRAME_TYPE = 0x02
 SPEAKER_EOS_TYPE   = 0x03
 MIC_HEADER_LEN     = 3   # [type][seq_hi][seq_lo]
 
-# Volume conversion — device uses integer 0–175, HA expects float 0.0–1.0.
-VOLUME_MAX_DEVICE = 175
-
-def _device_level_to_ha(level: int) -> float:
-    """Convert device volume (0–175) to HA float (0.0–1.0)."""
-    return max(0.0, min(1.0, level / VOLUME_MAX_DEVICE))
-
-def _ha_volume_to_device(volume: float) -> int:
-    """Convert HA volume float (0.0–1.0) to device integer (0–175)."""
-    return max(0, min(VOLUME_MAX_DEVICE, round(volume * VOLUME_MAX_DEVICE)))
+# Volume conversion lives in em_volume so the scale has ONE definition and a
+# test — it used to be spelled `/ 175` in three separate modules.
+VOLUME_MAX_DEVICE = em_volume.DEVICE_VOLUME_MAX
+_device_level_to_ha = em_volume.device_level_to_ha
+_ha_volume_to_device = em_volume.ha_volume_to_device
 
 # ─── Device registry ──────────────────────────────────────────────────────────
 
@@ -3021,7 +3017,7 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
                     })
 
                 elif msg_type == "volume_state":
-                    # Device reports current volume level (0–175 int).
+                    # Device reports its current volume level (raw tinymix index).
                     # Convert to HA float, update in-memory state, persist to
                     # config so the value survives controller and device restarts.
                     raw_level = int(msg.get("level", 85))

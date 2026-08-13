@@ -79,6 +79,7 @@ COPY em_config_sections.py .
 COPY em_recordings.py .
 COPY em_turnclock.py .
 COPY em_sounds.py .
+COPY em_volume.py .
 COPY version.py .
 # ESPHome native API subpackage (frame protocol, message registry, vendored protobuf)
 COPY esphome/ ./esphome/
