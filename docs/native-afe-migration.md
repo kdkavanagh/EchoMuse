@@ -14,10 +14,11 @@ exists specifically to make that cheap to do:
   tinyalsa on any failure to open). Compiles clean under `-tags server` and
   `go vet`; the existing tinyalsa path is unmodified and remains the default.
   The firmware build carrying this has been OTA'd to the one fielded device
-  (`G090LF10728426PR`, `20260812-1957-dev`), and its durable opt-in marker
-  ("Opting a device in" below) is deployed and confirmed by md5 — but the
-  marker itself is **not set**, so that device is still running the tinyalsa
-  path exactly as before. Nothing has run through the OpenSL ES path yet.
+  (`G090LF10728426PR`, now `20260812-2028-dev`), and its durable opt-in marker
+  ("Opting a device in" below) is deployed and confirmed by md5, with a
+  dashboard toggle (Updates tab) to flip it and reboot — but the marker
+  itself is **not set**, so that device is still running the tinyalsa path
+  exactly as before. Nothing has run through the OpenSL ES path yet.
 - **Phase 2** — `native_afe` capability (advertised only while the backend is
   actually active, not merely compiled in — see `control.go`'s
   `nativeAFEActive`), `Device.native_afe_capable`, `/api/devices`'s
@@ -272,7 +273,20 @@ erase a script edit:
 /data/local/etc/echomuse/native_afe.enabled   # present = EM_NATIVE_AFE=1
 ```
 
-To flip it, write or remove that file over the shell proxy
+**Dashboard:** a device advertising `native_afe_backend` (unconditional —
+compiled-in backends + a `start_server.sh` new enough to check the marker,
+not whether it's active right now) shows an "Native AFE (experimental)" panel
+on its Updates tab, with Enable/Disable buttons. Both write the marker via
+`POST /api/devices/{id}/native_afe` (`{"enabled": bool, "reboot": bool}`,
+admin-only) and reboot immediately — a marker write with no reboot would be a
+control that visibly does nothing until some later, unrelated restart, which
+is worse than making the (brief, expected) interruption explicit up front.
+The dashboard confirms before sending it and reports afterward whether the
+capability actually came up matching what was asked (it may not: the backend
+falls back to tinyalsa on any OpenSL ES open failure, by design).
+
+Manually, over the shell proxy directly (what the endpoint above does under
+the hood) — write or remove the marker file
 (`controller/tools/devshell.py`) — **never** `stop`/`start` the echomuse
 service from that same shell to make it take effect. That shell is a child of
 the very server process being stopped; per `devshell.py`'s own warning, doing

@@ -288,6 +288,7 @@ async def create_app() -> web.Application:
     app.router.add_post("/api/devices/{id}/wifi/scan",    _post_device_wifi_scan)
     app.router.add_post("/api/devices/{id}/update",       _post_device_update)
     app.router.add_post("/api/devices/{id}/rollback",     _post_device_rollback)
+    app.router.add_post("/api/devices/{id}/native_afe",   _post_device_native_afe)
     app.router.add_post("/api/releases/upload",           _post_upload_binary)
 
     # Custom wake-word models (oww_forge output → data/oww_models/)
@@ -1220,6 +1221,84 @@ async def _post_device_rollback(request: web.Request) -> web.Response:
 
     asyncio.create_task(_run_rollback(device_id, row["firmware_previous"]))
     return _ok({"status": "started", "rolling_back_to": row["firmware_previous"]}, status=202)
+
+
+# Path start_server.sh checks (docs/native-afe-migration.md's "Opting a
+# device in") — presence exports EM_NATIVE_AFE=1 for that boot. Data, not
+# script, so it survives the OTA-time canonical-payload re-sync that would
+# silently erase a hand-edited export in the script itself.
+NATIVE_AFE_MARKER = "/data/local/etc/echomuse/native_afe.enabled"
+
+
+@auth.require_admin
+async def _post_device_native_afe(request: web.Request) -> web.Response:
+    """
+    POST /api/devices/{id}/native_afe
+
+    Body: {"enabled": bool, "reboot": bool (default false)}
+
+    Writes or removes the on-device native-AFE opt-in marker. This ALONE
+    changes nothing: EM_NATIVE_AFE is read once at the Go binary's own
+    startup (docs/native-afe-migration.md — a boot-time choice, not a live
+    config push), and start_server.sh's own shell keeps its old inode open
+    regardless of anything short of a real restart of THAT script, not just
+    the server it supervises. Pass "reboot": true to also apply it now.
+
+    Gated on native_afe_backend, not native_afe: the backend capability is a
+    fixed fact about this build (compiled-in code + a start_server.sh new
+    enough to have the marker check), where native_afe reflects only whether
+    the AFE path happens to be running right this second — gating on the
+    latter would mean the toggle to turn it ON only appears once it is
+    already on.
+    """
+    device_id = request.match_info["id"]
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    enabled = bool(body.get("enabled"))
+    do_reboot = bool(body.get("reboot"))
+
+    live = _devices.get(device_id)
+    if live is None:
+        return _error("device_offline", "Device is not connected", 409)
+
+    if not getattr(live, "native_afe_backend_capable", False):
+        return _error("not_supported",
+                      "This firmware's start_server.sh predates the native-AFE "
+                      "opt-in marker — OTA it first", 409)
+
+    if device_id in _updates_in_progress:
+        return _error("update_in_progress", "An update is already in progress", 409)
+
+    if enabled:
+        cmd = (f"mkdir -p {DEVICE_TLS_DIR} && touch {NATIVE_AFE_MARKER} && "
+               f"test -f {NATIVE_AFE_MARKER} && echo MARKER_SET")
+    else:
+        cmd = (f"rm -f {NATIVE_AFE_MARKER}; "
+               f"test -f {NATIVE_AFE_MARKER} && echo STILL_PRESENT || echo MARKER_CLEARED")
+    result = await _shell_run(live, cmd)
+
+    want = "MARKER_SET" if enabled else "MARKER_CLEARED"
+    if want not in result:
+        return _error("marker_write_failed",
+                      f"Could not confirm the marker was "
+                      f"{'set' if enabled else 'cleared'} "
+                      f"(device shell reported: {result.strip() or 'nothing'})", 502)
+
+    await _push_log_event(
+        device_id, "info", "controller",
+        f"native AFE opt-in marker {'set' if enabled else 'cleared'} — "
+        f"takes effect on next reboot" + (" (rebooting now)" if do_reboot else ""))
+
+    if do_reboot:
+        # The shell dies the instant `reboot` executes on the device side, so
+        # no response will ever arrive — same shape as the OTA slot-flip's
+        # `kill $PPID` (see _run_update), a short timeout rather than
+        # something to meaningfully await a result from.
+        await _shell_run(live, "reboot", timeout=5.0)
+
+    return _ok({"status": "ok", "marker": enabled, "rebooting": do_reboot})
 
 
 @auth.require_admin
@@ -4245,6 +4324,10 @@ def _merge_device(row) -> dict:
         # bypasses — "disabled with the reason", never a control that
         # silently does nothing.
         "nativeAfeCapable": getattr(live, "native_afe_capable", False) if live else False,
+        # Fixed build property (opt-in mechanism exists at all), distinct
+        # from the runtime state above — gates whether the dashboard offers
+        # the toggle in the first place.
+        "nativeAfeBackendCapable": getattr(live, "native_afe_backend_capable", False) if live else False,
         # Gates the tap-as-event toggle — see em_button.decide.
         "buttonHoldCapable": getattr(live, "button_hold_capable", False) if live else False,
         # Whether the device found its ambient light sensor. Reported so the

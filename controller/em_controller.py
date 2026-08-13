@@ -695,6 +695,22 @@ class Device:
         """
         return "native_afe" in (self.capabilities or [])
 
+    @property
+    def native_afe_backend_capable(self) -> bool:
+        """
+        Whether this firmware BUILD supports being opted into native AFE at
+        all — internal/bindings/slmic + slspeaker compiled in, and a
+        start_server.sh with the opt-in marker check. Unlike
+        native_afe_capable above, this is a fixed property of the build, not
+        of what is running right now: a device can have this and still be on
+        the tinyalsa path (marker unset, or not yet rebooted).
+
+        This is what the dashboard's toggle gates on. Writing the marker file
+        to a device that lacks this would be a control that silently does
+        nothing — older firmware's start_server.sh never checks for it.
+        """
+        return "native_afe_backend" in (self.capabilities or [])
+
     async def send_led_anim(self, anim: dict):
         """
         Hand the ring to the device's local animation engine (led_anim

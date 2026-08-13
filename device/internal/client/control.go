@@ -771,7 +771,16 @@ func capabilities() []string {
 	// capability the firmware has, rather than inferring one from a version
 	// string, is the rule the whole registration follows.
 	caps := []string{"mic", "speaker", "leds", "led_anim", "buttons",
-		"oww_shadow", "oww_trigger", "button_hold", "audio_mix"}
+		"oww_shadow", "oww_trigger", "button_hold", "audio_mix",
+		// "native_afe_backend": this binary has internal/bindings/slmic and
+		// slspeaker compiled in AND its start_server.sh has the opt-in
+		// marker check (docs/native-afe-migration.md) — unconditional,
+		// unlike "native_afe" below, because it is a fact about the BUILD,
+		// not about what is running right now. This is the capability the
+		// dashboard's toggle is gated on: writing the marker file on a
+		// device that lacks this would be a control that silently does
+		// nothing, since older firmware's start_server.sh never checks it.
+		"native_afe_backend"}
 	if als.Present() {
 		caps = append(caps, "ambient_light")
 	}
