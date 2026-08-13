@@ -141,6 +141,29 @@ func NewSpeaker(echoTap func([]byte), levelTap func(rms float64)) (*Speaker, err
 	s.mixer.SetGainImmediate(unityGain)
 
 	go s.pumpLoop()
+
+	// Enable the internal speaker amp, exactly as PcmSpeaker.Init does — this
+	// backend replaces that Init, and the amp is the one piece of its work that
+	// is NOT about owning the ALSA PCM. Ext_Speaker_Amp_Switch is a physical
+	// mixer control that survives across backends, defaults off, and is turned
+	// off by accdet on a headphone insert; Init was historically the only thing
+	// that ever turned it on (issue #80). Dropping it here made the native-AFE
+	// path deliver every period with underruns=0, minDepth healthy and the
+	// controller reporting a clean turn, into a dead amp — audible as nothing
+	// at all, with no failure visible anywhere in the logs. Confirmed on
+	// hardware 2026-08-12: the control read Off with no jack inserted, and
+	// setting it On restored audio with no other change.
+	//
+	// Unlike PcmSpeaker, there is no "amp on onto a clocked, silent DAC" wait
+	// before it: that ordering exists to keep the amp's turn-on transient
+	// inaudible, and it relies on tinyalsa's continuously silence-filled
+	// session, which this path deliberately does not have (an idle OpenSL ES
+	// player queues nothing at all — see NewPlayer). Whether that costs an
+	// audible pop here is unverified on hardware; a pop is strictly better
+	// than silence, and Phase 0/3 owns settling it with measurement rather
+	// than a guess, the same reasoning Close already documents.
+	s.EnableSpeakerAmp()
+
 	log.Printf("[slspeaker] playing via OpenSL ES (%dHz mono) — mediaserver keeps the PCM, no stop media on this path", sampleRateHz)
 	return s, nil
 }
