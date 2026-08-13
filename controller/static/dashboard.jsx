@@ -1414,8 +1414,7 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                  (enable
                    ? `Recording and playback move to the Echo's original Amazon audio ` +
                      `software, which does its own beamforming, echo cancellation and auto ` +
-                     `gain in place of EchoMuse's. This has not been measured on real ` +
-                     `hardware yet.`
+                     `gain in place of EchoMuse's.`
                    : `Recording and playback move back to EchoMuse's own pipeline, and its ` +
                      `beamforming, echo cancellation and gain settings take effect again.`) +
                  `\n\nThe Echo will be briefly unreachable while it restarts.`)) return;
@@ -1859,9 +1858,8 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                         sound it played itself.
                       </div>
                       <div style={{ marginTop:8 }}>
-                        Experimental — nothing has been measured through it on real hardware
-                        yet. Run <code>afe_probe</code> on this Echo first. Either direction
-                        restarts the Echo, which is briefly unreachable while it comes back.
+                        Either direction restarts the Echo, which is briefly unreachable
+                        while it comes back.
                       </div>
                     </div>
                     <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom: nativeAfeLog.length ? 12 : 0, flexWrap:'wrap' }}>
