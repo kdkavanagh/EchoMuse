@@ -1995,8 +1995,16 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                       onClick={() => doNativeAfeToggle(true)}>
                       {nativeAfeBusy ? 'Working…' : 'Enable + restart'}
                     </Pill>
+                    {/* Gated on nativeAfeBackendCapable, not nativeAfeCapable — the
+                        marker can be set with the AFE NOT active (it fell back to
+                        tinyalsa on open failure, exactly the case _pollNativeAfeReconnect
+                        warns about below), and that is precisely the state someone
+                        needs to be able to clear. Gating on the runtime flag would
+                        strand them: Enable no-ops on an already-set marker, Disable
+                        greyed out, no way back short of devshell.py — the workflow
+                        this panel exists to replace. */}
                     <Pill small danger={device.nativeAfeCapable}
-                      disabled={!device.connected || nativeAfeBusy || !device.nativeAfeCapable}
+                      disabled={!device.connected || nativeAfeBusy || !device.nativeAfeBackendCapable}
                       onClick={() => doNativeAfeToggle(false)}>
                       {nativeAfeBusy ? 'Working…' : 'Disable + restart'}
                     </Pill>
