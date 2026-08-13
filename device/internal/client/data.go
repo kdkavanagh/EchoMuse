@@ -744,7 +744,21 @@ func (d *DataClient) streamMic(conn *websocket.Conn, stopCh <-chan struct{}, loc
 			// measures or gates the signal. No-op while aecEnabled=false.
 			// (Has its own mutex — inside pipeMu only for lock ordering
 			// simplicity; aec.mu is a leaf lock, no inversion possible.)
-			mono = d.aec.Process(mono)
+			//
+			// Skipped outright on the native-AFE path: internal/aec is
+			// replaced there by the AFE's own per-mic subband AEC (bypass
+			// table, docs/native-afe-migration.md), and it is not merely
+			// redundant — its FrameSize is tuned to the tinyalsa raw batch
+			// cadence (2560 samples/160ms), not slmic's periodFrames
+			// (1280 samples/80ms), so feeding it here is a permanent no-op
+			// caught by its own size guard (aec.sizeWarned) rather than a
+			// harmless pass-through. Confirmed on hardware 2026-08-12: an
+			// aecEnabled=true device left over from the tinyalsa path logged
+			// "AEC BYPASSED" once and silently did nothing on every period
+			// from then on.
+			if !d.micPassthrough {
+				mono = d.aec.Process(mono)
+			}
 
 			// ── Processing pipeline ──────────────────────────────────────
 			// VAD on raw beamformed output — pre-NS/AGC so threshold is
