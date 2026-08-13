@@ -333,19 +333,26 @@ function Slider({ label, sub, value, min, max, step = 1, unit = '', formatValue,
   );
 }
 
-function Toggle({ label, sub, value, onChange }) {
+function Toggle({ label, sub, value, onChange, disabled = false }) {
   // minWidth: 0 on the flex container and label lets long label/sub text
   // shrink and wrap instead of forcing the row (and the switch with it)
   // wider than the grid column — which pushed the switch past the edge of
   // the config dialog. flexShrink: 0 keeps the switch at full size.
+  //
+  // `disabled` is honoured here, not just styled: callers have passed it
+  // since the native-AFE bypass table landed, but the prop was ignored, so
+  // a control shown as off-and-greyed still WROTE the opposite value on a
+  // click — the exact "silently does something else" that disabled-with-
+  // reason exists to prevent. Slider has always taken the same prop.
   return (
     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20, minWidth: 0, gap: 10 }}>
       <div style={{ minWidth: 0, flex: 1 }}>
-        <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, color: 'var(--text2)' }}>{label}</span>
+        <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, color: disabled ? 'var(--muted)' : 'var(--text2)' }}>{label}</span>
         {sub && <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: 'var(--muted)', marginLeft: 8 }}>{sub}</span>}
       </div>
-      <div onClick={() => onChange(!value)} style={{
-        width: 36, height: 20, borderRadius: 10, cursor: 'pointer', position: 'relative', flexShrink: 0,
+      <div onClick={() => { if (!disabled) onChange(!value); }} style={{
+        width: 36, height: 20, borderRadius: 10, cursor: disabled ? 'default' : 'pointer',
+        position: 'relative', flexShrink: 0, opacity: disabled ? 0.45 : 1,
         background: value ? 'var(--accent)' : 'var(--muted)',
         border: value ? '1px solid var(--accent-deep)' : '1px solid var(--muted)',
         transition: 'background 0.15s',
@@ -1411,13 +1418,19 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
   // immediately rather than leaving a marker set with no visible effect,
   // which would read as the control having silently done nothing.
   async function doNativeAfeToggle(enable) {
-    const verb = enable ? 'Enable' : 'Disable';
-    if (!confirm(`${verb} native AFE and restart ${device.label || device.device_id} now?\n\n` +
-                 `This replaces the beamformer/AEC/AGC with Android's own audio HAL front end ` +
-                 `for the device's mic and speaker. The device will be briefly unreachable while ` +
-                 `it reboots.`)) return;
+    const who = enable ? "Amazon's" : "EchoMuse's";
+    if (!confirm(`Switch ${device.label || device.device_id} to ${who} audio pipeline ` +
+                 `and restart it now?\n\n` +
+                 (enable
+                   ? `Recording and playback move to the Echo's original Amazon audio ` +
+                     `software, which does its own beamforming, echo cancellation and auto ` +
+                     `gain in place of EchoMuse's. This has not been measured on real ` +
+                     `hardware yet.`
+                   : `Recording and playback move back to EchoMuse's own pipeline, and its ` +
+                     `beamforming, echo cancellation and gain settings take effect again.`) +
+                 `\n\nThe Echo will be briefly unreachable while it restarts.`)) return;
     setNativeAfeBusy(true);
-    setNativeAfeLog([`${verb === 'Enable' ? 'Enabling' : 'Disabling'} — writing the marker and rebooting…`]);
+    setNativeAfeLog([`Switching to ${who} pipeline — writing the marker and restarting…`]);
     try {
       await API.post(`/api/devices/${device.device_id}/native_afe`, { enabled: enable, reboot: true });
       setNativeAfeLog(l => [...l, 'Marker set — waiting for the device to come back…']);
@@ -1445,13 +1458,13 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
         if (!d?.connected) wasDisconnected = true;
         if (wasDisconnected && d?.connected) {
           if (!!d.nativeAfeCapable === wantActive) {
-            setNativeAfeLog(l => [...l, `✓ Reconnected — native AFE is now ${wantActive ? 'active' : 'off'}.`]);
+            setNativeAfeLog(l => [...l, `✓ Back online — now using ${wantActive ? "Amazon's" : "EchoMuse's"} pipeline.`]);
           } else if (wantActive) {
-            setNativeAfeLog(l => [...l, `⚠ Reconnected, but native AFE did not come up — it fell back ` +
-              `to the tinyalsa path. Check the device's logs (Status tab).`]);
+            setNativeAfeLog(l => [...l, `⚠ Back online, but Amazon's pipeline did not start — it fell ` +
+              `back to EchoMuse's. Check the device's logs (Status tab).`]);
           } else {
-            setNativeAfeLog(l => [...l, `⚠ Reconnected, but native AFE is still reporting active — ` +
-              `the marker removal or reboot may not have taken. Check the device's logs.`]);
+            setNativeAfeLog(l => [...l, `⚠ Back online, but it is still reporting Amazon's pipeline — ` +
+              `the marker removal or restart may not have taken. Check the device's logs.`]);
           }
           clearInterval(poll); setNativeAfeBusy(false);
         } else if (attempts > 40) {
@@ -1817,6 +1830,86 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                 <ConnectivityTab device={device} row={row}/>
               </div>
 
+              {/* Audio pipeline / native AFE opt-in (docs/native-afe-migration.md).
+                  Lives here rather than on the Updates tab because it decides what
+                  half the controls below this point even do — but ABOVE the config
+                  form and outside it, for two reasons that both bite if ignored:
+                  it is not a config key (it is a marker file plus a reboot, applied
+                  immediately, never by "Push config"), and it is always per-device,
+                  so it must not sit inside a Stage whose Fleet/Device switch would
+                  grey it out. Same placement argument as the WiFi block above.
+
+                  Offered when the firmware BUILD supports it (native_afe_backend:
+                  compiled-in backends + a start_server.sh that checks the marker),
+                  not when it happens to be running (nativeAfeCapable) — gating on
+                  the latter would mean the control to turn it on only ever appeared
+                  once it was already on.
+
+                  isAdmin is part of the gate and was not needed on the Updates
+                  tab, which admins alone can reach — the Config tab is visible
+                  to everyone (read-only, `disabled={!isAdmin}` on the form
+                  below). The endpoint is admin-only regardless, so without this
+                  a viewer would get buttons that 403. */}
+              {isAdmin && device.nativeAfeBackendCapable && (
+                <div style={{ paddingBottom: 24, marginBottom: 24, borderBottom: '1px solid var(--line, var(--track))' }}>
+                  <Panel label="Audio pipeline">
+                    <div style={{ fontFamily:"'DM Mono',monospace", fontSize:10, color:'var(--muted)', lineHeight:1.7, marginBottom:14 }}>
+                      Which software records from the mics and plays to the speaker.
+                      <div style={{ marginTop:8 }}>
+                        <b style={{ color:'var(--text2)' }}>EchoMuse</b> — the default. Our own
+                        recording and playback, shaped by the beamforming, echo cancellation
+                        and gain settings further down this page.
+                      </div>
+                      <div style={{ marginTop:6 }}>
+                        <b style={{ color:'var(--text2)' }}>Amazon</b> — the Echo&apos;s original
+                        audio software, the one it shipped with for Alexa. It does its own
+                        beamforming, per-mic echo cancellation and auto gain, so the settings
+                        it takes over are greyed out below while it is on. Recording and
+                        playback switch together: Amazon&apos;s echo canceller can only remove
+                        sound it played itself.
+                      </div>
+                      <div style={{ marginTop:8 }}>
+                        Experimental — nothing has been measured through it on real hardware
+                        yet. Run <code>afe_probe</code> on this Echo first. Either direction
+                        restarts the Echo, which is briefly unreachable while it comes back.
+                      </div>
+                    </div>
+                    <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom: nativeAfeLog.length ? 12 : 0, flexWrap:'wrap' }}>
+                      <span style={{ fontFamily:"'DM Mono',monospace", fontSize:11, color: device.nativeAfeCapable ? 'var(--ok)' : 'var(--muted)' }}>
+                        {device.nativeAfeCapable ? '● Using Amazon' : '○ Using EchoMuse'}
+                      </span>
+                      <Pill small accent={!device.nativeAfeCapable}
+                        disabled={!device.connected || nativeAfeBusy || device.nativeAfeCapable}
+                        onClick={() => doNativeAfeToggle(true)}>
+                        {nativeAfeBusy ? 'Working…' : 'Switch to Amazon'}
+                      </Pill>
+                      {/* Gated on nativeAfeBackendCapable, not nativeAfeCapable — the
+                          marker can be set with the AFE NOT active (it fell back to
+                          our own path on an open failure, exactly the case
+                          _pollNativeAfeReconnect warns about), and that is precisely
+                          the state someone needs to be able to clear. Gating on the
+                          runtime flag would strand them: enabling no-ops on an
+                          already-set marker, the way back greyed out, no recovery
+                          short of devshell.py — the workflow this panel replaces. */}
+                      <Pill small danger={device.nativeAfeCapable}
+                        disabled={!device.connected || nativeAfeBusy || !device.nativeAfeBackendCapable}
+                        onClick={() => doNativeAfeToggle(false)}>
+                        {nativeAfeBusy ? 'Working…' : 'Switch to EchoMuse'}
+                      </Pill>
+                    </div>
+                    {nativeAfeLog.map((line, i) => (
+                      <div key={i} style={{
+                        fontFamily:"'DM Mono',monospace", fontSize:10, marginTop:4,
+                        color: line.startsWith('✓') ? 'var(--ok)'
+                             : line.startsWith('⚠') ? 'var(--warn)'
+                             : line.startsWith('Error') ? 'var(--error)'
+                             : 'var(--muted)',
+                      }}>{line}</div>
+                    ))}
+                  </Panel>
+                </div>
+              )}
+
               {/* Scoping summary. Each section below carries its own
                   Fleet/Device switch — this is just the roll-up plus a way
                   back to fully inheriting. */}
@@ -1981,58 +2074,6 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                   </div>
                 )}
               </Panel>
-
-              {/* Native AFE opt-in (docs/native-afe-migration.md) — only
-                  offered when the firmware build supports it at all
-                  (native_afe_backend: compiled-in backends + a
-                  start_server.sh that checks the marker). Gated on THAT
-                  capability rather than nativeAfeCapable, which reflects
-                  only whether it happens to be running right now — gating
-                  on the latter would mean the control to turn it ON only
-                  ever appeared once it was already on. */}
-              {device.nativeAfeBackendCapable && (
-                <Panel label="Native AFE (experimental)">
-                  <div style={{ fontFamily:"'DM Mono',monospace", fontSize:10, color:'var(--muted)', lineHeight:1.6, marginBottom:14 }}>
-                    Routes this device's mic and speaker through Android's own audio HAL —
-                    Amazon's per-mic AEC, beamformer and SNR beam selection — instead of the
-                    beamformer/AEC/AGC controls under Microphones, which it replaces while active.
-                    Hardware-unverified: run <code>afe_probe</code> on this device before enabling
-                    it for real use. Both directions restart the device to apply.
-                  </div>
-                  <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom: nativeAfeLog.length ? 12 : 0, flexWrap:'wrap' }}>
-                    <span style={{ fontFamily:"'DM Mono',monospace", fontSize:11, color: device.nativeAfeCapable ? 'var(--ok)' : 'var(--muted)' }}>
-                      {device.nativeAfeCapable ? '● Active' : '○ Off (tinyalsa)'}
-                    </span>
-                    <Pill small accent={!device.nativeAfeCapable}
-                      disabled={!device.connected || nativeAfeBusy || device.nativeAfeCapable}
-                      onClick={() => doNativeAfeToggle(true)}>
-                      {nativeAfeBusy ? 'Working…' : 'Enable + restart'}
-                    </Pill>
-                    {/* Gated on nativeAfeBackendCapable, not nativeAfeCapable — the
-                        marker can be set with the AFE NOT active (it fell back to
-                        tinyalsa on open failure, exactly the case _pollNativeAfeReconnect
-                        warns about below), and that is precisely the state someone
-                        needs to be able to clear. Gating on the runtime flag would
-                        strand them: Enable no-ops on an already-set marker, Disable
-                        greyed out, no way back short of devshell.py — the workflow
-                        this panel exists to replace. */}
-                    <Pill small danger={device.nativeAfeCapable}
-                      disabled={!device.connected || nativeAfeBusy || !device.nativeAfeBackendCapable}
-                      onClick={() => doNativeAfeToggle(false)}>
-                      {nativeAfeBusy ? 'Working…' : 'Disable + restart'}
-                    </Pill>
-                  </div>
-                  {nativeAfeLog.map((line, i) => (
-                    <div key={i} style={{
-                      fontFamily:"'DM Mono',monospace", fontSize:10, marginTop:4,
-                      color: line.startsWith('✓') ? 'var(--ok)'
-                           : line.startsWith('⚠') ? 'var(--warn)'
-                           : line.startsWith('Error') ? 'var(--error)'
-                           : 'var(--muted)',
-                    }}>{line}</div>
-                  ))}
-                </Panel>
-              )}
 
               {/* The GitHub Release panel that used to sit here held one
                   button, which now lives beside the version state above.
@@ -5425,38 +5466,41 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
         <StageAdvanced open={advMics} onToggle={() => setAdvMics(o => !o)} disabledStyle={inputStyle}>
           <div className="em-grid2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px 24px' }}>
             <Slider label="MICPGA" disabled={afeActive}
-              sub={afeActive ? "gain now comes from the AFE (HAL PGA + AFE output gain) — see native AFE below" : "analog gain, before the ADC"}
+              sub={afeActive ? "Amazon's pipeline sets its own mic gain" : "analog gain, before the ADC"}
               value={config.adcMicpga ?? 40} min={0} max={59} onChange={v => set('adcMicpga', v)}/>
             <Slider label="Digital gain" disabled={afeActive}
-              sub={afeActive ? "gain now comes from the AFE (HAL PGA + AFE output gain) — see native AFE below" : "ADC digital gain — affects wake + turns"}
+              sub={afeActive ? "Amazon's pipeline sets its own mic gain" : "ADC digital gain — affects wake + turns"}
               value={config.adcDigitalGain ?? 88} min={0} max={100} onChange={v => set('adcDigitalGain', v)}/>
             <Slider label="Mic gain" disabled={afeActive}
-              sub={afeActive ? "gain now comes from the AFE (HAL PGA + AFE output gain) — see native AFE below" : "fixed gain on the 24-bit capture, pre-16-bit stream"}
+              sub={afeActive ? "Amazon's pipeline sets its own mic gain" : "fixed gain on the 24-bit capture, pre-16-bit stream"}
               value={config.micGainDb ?? 24} min={0} max={42} unit="dB" onChange={v => set('micGainDb', v)}/>
             <Slider label="Beam angle" disabled={afeActive || !(config.beamformingEnabled ?? false)}
-              sub={afeActive ? "the AFE selects its own beam — see native AFE below" : "-1 = auto (onset-ratio selection)"}
+              sub={afeActive ? "Amazon's pipeline picks its own direction" : "-1 = auto (onset-ratio selection)"}
               value={config.beamAngle ?? -1} min={-1} max={359} step={1} onChange={v => set('beamAngle', v)}/>
             <Toggle label="Beamforming" disabled={afeActive}
-              sub={afeActive ? "replaced by the AFE's fixed+adaptive beamformer and SNR beam selection — see native AFE below" : "perimeter mic lock during turns"}
+              sub={afeActive ? "Amazon's pipeline does its own beamforming" : "perimeter mic lock during turns"}
               value={afeActive ? false : (config.beamformingEnabled ?? false)} onChange={v => set('beamformingEnabled', v)}/>
             <Toggle label="Echo cancel (AEC)" disabled={afeActive}
-              sub={afeActive ? "replaced by the AFE's own per-mic AEC — see native AFE below" : "subtracts the device's own playback — wake + turns, and lets the wake word land over a ringing timer"}
+              sub={afeActive ? "Amazon's pipeline cancels its own echo, on every mic" : "subtracts the device's own playback — wake + turns, and lets the wake word land over a ringing timer"}
               value={afeActive ? false : (config.aecEnabled ?? false)} onChange={v => set('aecEnabled', v)}/>
-            <Toggle label="Noise suppression" sub={afeActive ? "the mic stream is already denoised by the AFE — this would be a second pass on top of it" : "DTLN denoise on speech-to-text audio only — helps fans/hum, not TV speech"} value={config.nsAsr ?? false} onChange={v => set('nsAsr', v)}/>
+            {/* Not disabled under the AFE: this one is CONTROLLER-side (DTLN on
+                the speech-to-text stream), so it still runs and still has an
+                effect — just a second denoise on an already-denoised stream,
+                which is a judgement call and not an inert control. */}
+            <Toggle label="Noise suppression" sub={afeActive ? "Amazon's pipeline already denoises the mic — this adds a second pass on top" : "DTLN denoise on speech-to-text audio only — helps fans/hum, not TV speech"} value={config.nsAsr ?? false} onChange={v => set('nsAsr', v)}/>
             <Slider label="AEC delay" disabled={afeActive || !(config.aecEnabled ?? false)}
-              sub={afeActive ? "the AFE times its own reference — see native AFE below" : "playback write-to-ear latency compensation"}
+              sub={afeActive ? "Amazon's pipeline times its own echo canceller" : "playback write-to-ear latency compensation"}
               value={config.aecDelayMs ?? 250} min={0} max={1000} step={10} unit="ms" onChange={v => set('aecDelayMs', v)}/>
             <Slider label="AEC tail" disabled={afeActive || !(config.aecEnabled ?? false)}
-              sub={afeActive ? "the AFE runs its own filter — see native AFE below" : "filter length — residual delay error + room reverb"}
+              sub={afeActive ? "Amazon's pipeline runs its own echo canceller" : "filter length — residual delay error + room reverb"}
               value={config.aecTailMs ?? 300} min={50} max={500} step={10} unit="ms" onChange={v => set('aecTailMs', v)}/>
             <Toggle label="Save utterances" sub="keeps the last 10 turns' mic audio on the server — play or download from Activity" value={config.saveUtterances ?? false} onChange={v => set('saveUtterances', v)}/>
             {afeActive && (
               <div style={{ gridColumn: '1 / -1', marginTop: 4, fontFamily: mono, fontSize: 10, color: 'var(--muted)', lineHeight: 1.6 }}>
-                Native AFE is active on this device (docs/native-afe-migration.md):
-                Android's own audio HAL — Amazon's per-mic AEC, fixed+adaptive
-                beamformer and SNR beam selection — is doing capture instead of
-                the controls above. Recovery is a firmware flag flip and a
-                restart, not a setting here.
+                This Echo is recording through Amazon&apos;s own audio pipeline, so the
+                greyed-out controls above have no effect — it does that work itself.
+                Switch back under <b>Audio pipeline</b> at the top of this tab; it
+                needs a restart, so it is not part of Push config.
               </div>
             )}
           </div>
@@ -5565,7 +5609,7 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
         {subHeader('Turn processing')}
         <div className="em-grid2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0 24px', ...inputStyle }}>
           <Toggle label="Auto gain (AGC)" disabled={afeActive}
-            sub={afeActive ? "replaced by the AFE's own AGC (native AFE — see Microphones)" : "levels button-turn speech; never the wake stream"}
+            sub={afeActive ? "Amazon's pipeline does its own auto gain — see Audio pipeline at the top of this tab" : "levels button-turn speech; never the wake stream"}
             value={afeActive ? false : (config.agcEnabled ?? true)} onChange={v => set('agcEnabled', v)}/>
         </div>
         {subHeader('Speech gate')}

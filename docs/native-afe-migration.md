@@ -16,7 +16,7 @@ exists specifically to make that cheap to do:
   The firmware build carrying this has been OTA'd to the one fielded device
   (`G090LF10728426PR`, now `20260812-2028-dev`), and its durable opt-in marker
   ("Opting a device in" below) is deployed and confirmed by md5, with a
-  dashboard toggle (Updates tab) to flip it and reboot — but the marker
+  dashboard toggle (Config tab, "Audio pipeline") to flip it and reboot — but the marker
   itself is **not set**, so that device is still running the tinyalsa path
   exactly as before. Nothing has run through the OpenSL ES path yet.
 - **Phase 2** — `native_afe` capability (advertised only while the backend is
@@ -275,15 +275,31 @@ erase a script edit:
 
 **Dashboard:** a device advertising `native_afe_backend` (unconditional —
 compiled-in backends + a `start_server.sh` new enough to check the marker,
-not whether it's active right now) shows an "Native AFE (experimental)" panel
-on its Updates tab, with Enable/Disable buttons. Both write the marker via
-`POST /api/devices/{id}/native_afe` (`{"enabled": bool, "reboot": bool}`,
-admin-only) and reboot immediately — a marker write with no reboot would be a
-control that visibly does nothing until some later, unrelated restart, which
-is worse than making the (brief, expected) interruption explicit up front.
-The dashboard confirms before sending it and reports afterward whether the
-capability actually came up matching what was asked (it may not: the backend
-falls back to tinyalsa on any OpenSL ES open failure, by design).
+not whether it's active right now) shows an **"Audio pipeline"** panel on its
+**Config** tab, offering EchoMuse's pipeline or Amazon's. Both write the
+marker via `POST /api/devices/{id}/native_afe`
+(`{"enabled": bool, "reboot": bool}`, admin-only) and reboot immediately — a
+marker write with no reboot would be a control that visibly does nothing until
+some later, unrelated restart, which is worse than making the (brief,
+expected) interruption explicit up front. The dashboard confirms before
+sending it and reports afterward whether the capability actually came up
+matching what was asked (it may not: the backend falls back to tinyalsa on any
+OpenSL ES open failure, by design).
+
+It sits on the Config tab because it decides what half the controls on that
+tab do — but **above the config form and outside it**, beside the WiFi block,
+for two reasons that both bite if ignored. It is not a config key: it is a
+marker file plus a reboot, applied immediately, never by "Push config". And it
+is always per-device, so it must not sit inside a `Stage` whose Fleet/Device
+switch would grey it out for any device following the fleet.
+
+The user-facing copy names the two choices **EchoMuse** and **Amazon** and
+says what each one does — "native AFE", "ASP", "audio HAL" and "tinyalsa" are
+names for the implementation, and a control whose label only makes sense
+having read this document is a control nobody will touch. The panel does say
+that recording and playback switch together, and why (the echo canceller can
+only remove sound it played itself), because that is the one part a user could
+otherwise reasonably expect to choose separately.
 
 Manually, over the shell proxy directly (what the endpoint above does under
 the hood) — write or remove the marker file
@@ -325,6 +341,13 @@ Controller side: `Device.native_afe_capable`, and the config controls listed
 in the bypass table above rendered **disabled with the reason** when it is set.
 `tests/test_capabilities.py` covers both directions of this pattern already —
 follow it.
+
+`Toggle` in `dashboard.jsx` **did not accept a `disabled` prop** when this
+first landed, only `Slider` did. So Beamforming, Echo cancel and Auto gain
+rendered greyed with their reason, read as off — and wrote the opposite value
+into config on a click, which is precisely the "silently does something else"
+that disabled-with-reason exists to prevent. Fixed 2026-08-13; the prop is now
+honoured in the handler, not only in the styling.
 
 ### Phase 3 — measurement on real devices
 
