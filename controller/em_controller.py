@@ -618,6 +618,24 @@ class Device:
         """
         return "oww_trigger" in (self.capabilities or [])
 
+    @property
+    def native_afe_capable(self) -> bool:
+        """
+        Whether this device's audio is running through Android's audio HAL
+        (OpenSL ES) right now, reaching Amazon's ASP front end — see
+        docs/native-afe-migration.md.
+
+        Unlike most capabilities here, this is NOT a fixed property of the
+        firmware build: it is a boot-time choice (EM_NATIVE_AFE) that falls
+        back to the tinyalsa backends if the OpenSL ES path fails to open, so
+        the device only announces it when that fallback did NOT happen (see
+        internal/client/control.go's capabilities()). Reporting the attempt
+        rather than the outcome would tell the dashboard to disable the
+        beamformer/AEC/AGC/gain controls on a device that silently fell back
+        and still needs them.
+        """
+        return "native_afe" in (self.capabilities or [])
+
     async def send_led_anim(self, anim: dict):
         """
         Hand the ring to the device's local animation engine (led_anim

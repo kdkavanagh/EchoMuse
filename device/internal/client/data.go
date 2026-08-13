@@ -168,6 +168,16 @@ type DataClient struct {
 	onDirectionChange func(angle float64)
 	directionMu       sync.Mutex
 
+	// micPassthrough is true when the mic backend already delivers one fully
+	// processed mono channel (internal/bindings/slmic, on the native-AFE
+	// path — see docs/native-afe-migration.md). Decided once, at
+	// construction, from the concrete backend NewDataClient was given: this
+	// mirrors the AFE selection itself, which is a boot-time choice, not a
+	// live config push (see cmd/server.go). When true, streamMic skips
+	// internal/beamformer entirely rather than feed it a buffer shaped for
+	// raw 9-channel capture — see pkg/mic.PassthroughReporter.
+	micPassthrough bool
+
 	// shadowScorer scores the always-on wake stream on the device without
 	// acting on it (internal/wakeword/shadow), nil when off. Guarded because
 	// a config push swaps it from the control goroutine while the mic
@@ -192,14 +202,19 @@ type DataClient struct {
 // runs its near-end side on the mono mic stream. Disabled cancellers pass
 // audio through untouched.
 func NewDataClient(deviceID string, microphone mic.Subscribable, spk speaker.Speaker, canceller *aec.Canceller) *DataClient {
+	passthrough := false
+	if pr, ok := microphone.(mic.PassthroughReporter); ok {
+		passthrough = pr.Passthrough()
+	}
 	return &DataClient{
-		deviceID: deviceID,
-		mic:      microphone,
-		spk:      spk,
-		readyCh:  make(chan string, 1),
-		beam:     beamformer.New(),
-		proc:     processor.New(),
-		aec:      canceller,
+		deviceID:       deviceID,
+		mic:            microphone,
+		spk:            spk,
+		readyCh:        make(chan string, 1),
+		beam:           beamformer.New(),
+		proc:           processor.New(),
+		aec:            canceller,
+		micPassthrough: passthrough,
 	}
 }
 
@@ -677,7 +692,14 @@ func (d *DataClient) streamMic(conn *websocket.Conn, stopCh <-chan struct{}, loc
 			// ResetAGC each stream.
 			agcEnabled := lockMic && (snap.AgcEnabled == nil || *snap.AgcEnabled)
 
-			if snap.MicGainDb != nil && *snap.MicGainDb != gainDb {
+			// micGainDb is a pre-truncation gain applied to the raw 24-bit
+			// capture (see internal/beamformer's extractChannel) — meaningless
+			// on the native-AFE path, where the HAL already hands back 16-bit
+			// audio with its own gain baked in (HAL PGA + AFE output gain; see
+			// the bypass table in docs/native-afe-migration.md). gainLin stays
+			// at its unity default there, so the VAD threshold below is used
+			// as configured rather than scaled by a stage that never runs.
+			if !d.micPassthrough && snap.MicGainDb != nil && *snap.MicGainDb != gainDb {
 				gainDb = *snap.MicGainDb
 				gainLin = math.Pow(10, float64(gainDb)/20.0)
 				log.Printf("[data] mic gain: %ddB (linear %.2f)", gainDb, gainLin)
@@ -697,8 +719,25 @@ func (d *DataClient) streamMic(conn *websocket.Conn, stopCh <-chan struct{}, loc
 				d.beam.Unlock()
 			}
 
-			mono, angle := d.beam.Process(raw, beamAngle, gainLin)
-			clipped := d.beam.ClippedSamples()
+			// On the native-AFE path `raw` IS the processed mono period —
+			// Android's audio HAL already ran per-mic AEC and beamforming
+			// before this ever reached Go (docs/native-afe-migration.md).
+			// Feeding that into internal/beamformer would misinterpret its
+			// bytes as interleaved 9-channel capture, so it must be skipped
+			// outright rather than merely redundant. There is no per-frame
+			// beam angle on this path either (the AFE selects a beam
+			// internally and does not report it per frame — see the
+			// "LED direction arc" deferred item), and clip counting belongs
+			// to the fixed pre-truncation gain stage this path doesn't run.
+			var mono []byte
+			var angle float64
+			var clipped uint64
+			if d.micPassthrough {
+				mono, angle, clipped = raw, -1, 0
+			} else {
+				mono, angle = d.beam.Process(raw, beamAngle, gainLin)
+				clipped = d.beam.ClippedSamples()
+			}
 
 			// AEC — subtract the speaker's own output (reference tapped at
 			// the ALSA write, aligned by aecDelayMs) before anything

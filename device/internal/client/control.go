@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -728,6 +729,28 @@ func (c *ControlClient) runShellSession(ctx context.Context, baseURL string, pty
 	log.Println("[shell] Session closed")
 }
 
+// nativeAFEActive records whether cmd/server.go selected the OpenSL ES /
+// native-AFE audio backends (internal/bindings/slmic + slspeaker) for THIS
+// run — see cmd/server.go's newAudioBackends. Set at most once, before the
+// control client connects; SetNativeAFEActive is exported for main() to call
+// from outside this package.
+//
+// Unlike "ambient_light" (a fixed property of the hardware, resolved once at
+// als.Present()), this reflects a boot-time CHOICE that can fall back to
+// tinyalsa if libOpenSLES.so fails to open — so the capability must track
+// what actually ended up running, not merely what this firmware build knows
+// how to attempt. Reporting the attempt rather than the outcome would tell
+// the controller/dashboard a device is on the native-AFE path (and so
+// disable the beamformer/AEC/AGC controls that bypass table describes) on a
+// device that silently fell back and still needs them.
+var nativeAFEActive atomic.Bool
+
+// SetNativeAFEActive records which audio backend pair main() actually
+// brought up. Call before Run(), so the very first register message already
+// reports it — capabilities() is read once per connection, same as every
+// other entry in the list.
+func SetNativeAFEActive(active bool) { nativeAFEActive.Store(active) }
+
 // capabilities is what this firmware implements, negotiated by capability
 // rather than by version so the controller needs no knowledge of our release
 // history (see CLAUDE.md). "ambient_light" is conditional on the hardware
@@ -751,6 +774,15 @@ func capabilities() []string {
 		"oww_shadow", "oww_trigger", "button_hold", "audio_mix"}
 	if als.Present() {
 		caps = append(caps, "ambient_light")
+	}
+	// "native_afe": Android's audio HAL front end (per-mic AEC, beamformer,
+	// SNR beam selection) is doing capture/playback for this run, so the
+	// controller/dashboard must show beamformingEnabled, aecEnabled,
+	// agcEnabled, micGainDb/adcDigitalGain/adcMicpga and nsAsr as disabled
+	// with the reason rather than as controls that silently do nothing —
+	// see docs/native-afe-migration.md's bypass table.
+	if nativeAFEActive.Load() {
+		caps = append(caps, "native_afe")
 	}
 	return caps
 }

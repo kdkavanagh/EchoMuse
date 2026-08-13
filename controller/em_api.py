@@ -4065,6 +4065,12 @@ def _merge_device(row) -> dict:
         # device that never answers.
         "owwTriggerCapable": getattr(live, "oww_trigger_capable", False) if live else False,
         "audioMixCapable": getattr(live, "audio_mix_capable", False) if live else False,
+        # Native AFE (docs/native-afe-migration.md): whether this device's
+        # audio is running through Android's audio HAL right now. Drives the
+        # dashboard disabling the beamformer/AEC/AGC/gain controls that path
+        # bypasses — "disabled with the reason", never a control that
+        # silently does nothing.
+        "nativeAfeCapable": getattr(live, "native_afe_capable", False) if live else False,
         # Gates the tap-as-event toggle — see em_button.decide.
         "buttonHoldCapable": getattr(live, "button_hold_capable", False) if live else False,
         # Whether the device found its ambient light sensor. Reported so the

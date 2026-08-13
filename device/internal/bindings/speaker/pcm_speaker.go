@@ -14,6 +14,7 @@ import (
 
 	"github.com/Binozo/GoTinyAlsa/pkg/pcm"
 	"github.com/Binozo/GoTinyAlsa/pkg/tinyalsa"
+	pkgspeaker "github.com/wilbowes/EchoMuse/pkg/speaker"
 )
 
 // cardNr/deviceNr live in pcmstatus.go so the host test can pin them against
@@ -454,3 +455,9 @@ func periodRMS(period []byte) float64 {
 	}
 	return math.Sqrt(float64(sum)/float64(n)) / 32768.0
 }
+
+// Compile-time proof that this backend and the native-AFE backend
+// (internal/bindings/slspeaker) satisfy the exact same interface, so
+// cmd/server.go's backend-selection switch can hold either behind one
+// variable.
+var _ pkgspeaker.FullSpeaker = (*PcmSpeaker)(nil)

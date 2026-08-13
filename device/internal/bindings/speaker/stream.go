@@ -5,6 +5,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	pkgspeaker "github.com/wilbowes/EchoMuse/pkg/speaker"
 )
 
 // errSpeakerDead is returned when the ALSA pump loop has exited, so a caller
@@ -27,15 +29,14 @@ var errSpeakerDead = errors.New("speaker: ALSA loop has died")
 //     definitive "the wire could not keep up" signal.
 //   - MaxGapMs: the worst single stall in arrivals, which distinguishes a
 //     uniformly slow link from a briefly stalled one.
-type StreamStats struct {
-	Periods     uint64 `json:"periods"`
-	Underruns   uint64 `json:"underruns"`
-	MinDepth    int    `json:"minDepth"`
-	PrimeWaitMs int64  `json:"primeWaitMs"`
-	RecvSpanMs  int64  `json:"recvSpanMs"`
-	MaxGapMs    int64  `json:"maxGapMs"`
-	BytesRecv   uint64 `json:"bytesRecv"`
-}
+//
+// A type alias, not a new struct: internal/bindings/slspeaker (the native-AFE
+// backend) has to report this exact same shape (see pkg/speaker.StreamStats,
+// the canonical definition), and aliasing rather than duplicating means every
+// existing reference to speaker.StreamStats in this package and in
+// cmd/server.go keeps compiling unchanged while both backends produce values
+// of one identical type.
+type StreamStats = pkgspeaker.StreamStats
 
 // audioStream is one buffered playback stream: the voice/TTS plane or the
 // music plane. Both need the same machinery — a prime gate, discard-until-EOS

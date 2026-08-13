@@ -26,6 +26,8 @@ import (
 	"github.com/wilbowes/EchoMuse/internal/bindings/jack"
 	internalbuttons "github.com/wilbowes/EchoMuse/internal/bindings/buttons"
 	"github.com/wilbowes/EchoMuse/internal/bindings/mic"
+	"github.com/wilbowes/EchoMuse/internal/bindings/slmic"
+	"github.com/wilbowes/EchoMuse/internal/bindings/slspeaker"
 	"github.com/wilbowes/EchoMuse/internal/bindings/speaker"
 	"github.com/wilbowes/EchoMuse/internal/bluetooth"
 	"github.com/wilbowes/EchoMuse/internal/client"
@@ -35,6 +37,8 @@ import (
 	"github.com/wilbowes/EchoMuse/internal/wifi"
 	pkgbuttons "github.com/wilbowes/EchoMuse/pkg/buttons"
 	"github.com/wilbowes/EchoMuse/pkg/led"
+	pkgmic "github.com/wilbowes/EchoMuse/pkg/mic"
+	pkgspeaker "github.com/wilbowes/EchoMuse/pkg/speaker"
 )
 
 func main() {
@@ -68,27 +72,26 @@ func main() {
 		log.Fatalf("Failed to initialize Button controller: %v", err)
 	}
 
-	microphone, err := mic.NewMicrophone()
-	if err != nil {
-		log.Fatalf("Failed to initialize Microphone: %v", err)
-	}
-
 	// AEC canceller — far end fed by the speaker's echo tap, near end run
 	// by the data client on the mono mic stream. Starts disabled; armed by
-	// applyAecConfig from env defaults below and on every config push.
+	// applyAecConfig from env defaults below and on every config push. On
+	// the native-AFE audio path this stays wired up but unused — see
+	// newAudioBackends.
 	canceller := aec.New()
 
 	// The level tap drives the energy-reactive LED ring ("meter" pattern).
 	// The Server doesn't exist yet when the speaker starts its pump loop,
 	// so the tap goes through an atomic pointer armed just below.
 	var srvPtr atomic.Pointer[server.Server]
-	pcmSpeaker, err := speaker.NewPcmSpeaker(canceller.WriteFar, func(rms float64) {
+	levelTap := func(rms float64) {
 		if srv := srvPtr.Load(); srv != nil {
 			srv.SetAudioLevel(rms)
 		}
-	})
+	}
+
+	microphone, pcmSpeaker, err := newAudioBackends(canceller, levelTap)
 	if err != nil {
-		log.Fatalf("Failed to initialize PCM Speaker: %v", err)
+		log.Fatalf("Failed to initialize audio: %v", err)
 	}
 
 	s := server.NewServer(buttonController, microphone, pcmSpeaker)
@@ -500,6 +503,87 @@ func main() {
 	os.Exit(0)
 }
 
+// ─── Audio backend selection ───────────────────────────────────────────────────
+//
+// See docs/native-afe-migration.md. Two backend pairs implement the same
+// pkg/mic and pkg/speaker interfaces:
+//
+//	tinyalsa (default): internal/bindings/mic + internal/bindings/speaker —
+//	  writes PCM directly, our own beamformer/AEC/AGC.
+//	native AFE (opt-in): internal/bindings/slmic + internal/bindings/slspeaker —
+//	  OpenSL ES through Android's audio HAL, reaching Amazon's ASP front end
+//	  (per-mic AEC, beamforming, SNR beam selection) at the cost of no longer
+//	  owning the PCM outright.
+//
+// This is a BOOT-TIME choice, not a live config push — the mic/speaker
+// backends are opened here, before any controller connection exists to push
+// a config to. Per the plan's own "Risks" section, recovery from a bad AFE
+// run in the field is "a firmware flag flip and a restart", deliberately not
+// a config toggle: EM_NATIVE_AFE is read once, at process start.
+//
+// The two backends are ALWAYS chosen together, never independently — an AFE
+// build with only one side converted produces audio that is beamformed but
+// not echo-cancelled, with no error anywhere, which reads as the AFE
+// underperforming rather than as a wiring mistake ("the one rule that
+// matters" in the migration doc).
+type micBackend interface {
+	pkgmic.Microphone
+	pkgmic.Subscribable
+}
+
+// nativeAFERequested reads the boot-time audio backend selection.
+func nativeAFERequested() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("EM_NATIVE_AFE")))
+	return v == "1" || v == "true" || v == "on"
+}
+
+// newAudioBackends opens the mic and speaker backends selected by
+// EM_NATIVE_AFE, falling back to tinyalsa if the native-AFE path fails to
+// open — a device where libOpenSLES.so cannot be dlopen'd, or the HAL
+// refuses the configuration, keeps working exactly as it did before this
+// migration rather than failing to boot. On success on the native path, it
+// also flips the capability control.go's capabilities() reports: unlike
+// "ambient_light" (hardware either has the sensor or it doesn't),
+// "native_afe" reflects the backend actually running right now, not merely
+// what this firmware build supports — the same reasoning that keeps a
+// config control "disabled with the reason" rather than "present but inert"
+// on the controller/dashboard side (see docs/native-afe-migration.md's
+// Phase 2 and CLAUDE.md's capability-negotiation rule).
+func newAudioBackends(canceller *aec.Canceller, levelTap func(rms float64)) (micBackend, pkgspeaker.FullSpeaker, error) {
+	if !nativeAFERequested() {
+		return newTinyalsaBackends(canceller, levelTap)
+	}
+
+	log.Println("[audio] EM_NATIVE_AFE set — attempting the OpenSL ES / native-AFE audio path")
+	m, err := slmic.NewMicrophone()
+	if err != nil {
+		log.Printf("[audio] native AFE microphone unavailable, falling back to tinyalsa: %v", err)
+		return newTinyalsaBackends(canceller, levelTap)
+	}
+	spk, err := slspeaker.NewSpeaker(canceller.WriteFar, levelTap)
+	if err != nil {
+		log.Printf("[audio] native AFE speaker unavailable, falling back to tinyalsa: %v", err)
+		m.Close()
+		return newTinyalsaBackends(canceller, levelTap)
+	}
+
+	client.SetNativeAFEActive(true)
+	log.Println("[audio] native AFE audio path active (OpenSL ES) — beamformer/AEC/AGC bypassed, see docs/native-afe-migration.md")
+	return m, spk, nil
+}
+
+func newTinyalsaBackends(canceller *aec.Canceller, levelTap func(rms float64)) (micBackend, pkgspeaker.FullSpeaker, error) {
+	m, err := mic.NewMicrophone()
+	if err != nil {
+		return nil, nil, fmt.Errorf("tinyalsa microphone: %w", err)
+	}
+	spk, err := speaker.NewPcmSpeaker(canceller.WriteFar, levelTap)
+	if err != nil {
+		return nil, nil, fmt.Errorf("tinyalsa speaker: %w", err)
+	}
+	return m, spk, nil
+}
+
 // ─── Hardware stats collection ────────────────────────────────────────────────
 
 // shadowStats drains the on-device wake word counters for this reporting
@@ -879,7 +963,7 @@ var shadowState struct {
 // rather than on every config push, and the device carries on with
 // controller-side wake word exactly as before.
 func applyShadowConfig(dc *client.DataClient, cc *client.ControlClient,
-	spk *speaker.PcmSpeaker, srv *server.Server) {
+	spk pkgspeaker.FullSpeaker, srv *server.Server) {
 	snap := config.Get().Snapshot()
 	mode, model := snap.OwwOnDevice, snap.OwwModel
 	threshold := float32(snap.OwwThreshold)
