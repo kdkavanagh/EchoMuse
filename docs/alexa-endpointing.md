@@ -177,10 +177,104 @@ frames of silence". A voting window tolerates a stray speech-scoring frame
 inside a genuine pause, which is exactly what a TV produces, without needing
 the timer to be long.
 
-`search.endpoint.model_filepath` — "a file containing the model for
-model-based endpointing" — plus `getDynamicEndpointDnnConfig` show the
-non-speech decision itself can be a DNN posterior rather than a phone
-alignment.
+### What "a non-speech frame" actually means here
+
+The decoder is Kaldi — `pryon/cpp/decoder/kaldi_decoder.cpp`,
+`LatticeFasterDecoder`, HCLG, transition-ids and pdfs throughout. So the
+non-speech test is not a heuristic on the audio; it is a **set of pdf-ids in
+the acoustic model**:
+
+```
+nonSpeechPdf   non-speech-pdf   NONSPEECH_CLASS
+Could not find nonspeech transition ID to assign as failsafe emitting label
+```
+
+A frame counts as non-speech when the transition-id it took on the winning
+path maps into that class — silence and noise models the acoustic model was
+*trained* to recognise, distinguished from speech phones by the same network
+that does the recognition. There is even a failsafe for a model that ships
+without one.
+
+Two properties fall out, and both are things a VAD structurally cannot do.
+
+**The count is over the best token's traceback, not a per-frame flag.**
+The feature is `bestTokNonSpeechCount` — non-speech frames along the current
+best hypothesis's history. It is recomputed from the best path every frame, so
+when the decoder revises what it thinks was said, the *labelling of frames
+already past* changes with it. A VAD writes its history down once and cannot
+take it back; the endpointer's view of "was that a pause" is retrospective and
+keeps improving while the utterance is still in flight.
+
+**And it is not limited to the 1-best.** The per-frame record also carries
+`latticeNonSpeechPosterior` and `latticeSpeechPosterior` — the posterior mass
+across the whole lattice. The question stops being "does the winning path say
+non-speech" and becomes "what fraction of the probability says non-speech",
+which survives a temporarily wrong 1-best.
+
+Alongside those, `search.require_endstate` and the assertion
+`!mEndpointFeatureConfig || mFinalWord != SYMBOL_NOT_FOUND` say the path must
+also be sitting in a **grammar-final state** — a complete utterance, not just
+a quiet one. `dynamic` mode is defined by when it is allowed to skip that
+check (`max_pause_duration`: "Endpoint will be detected **without considering
+final states** if the expected pause duration is larger than this threshold").
+
+### The endpointer that actually ships is a fusion network
+
+`search.endpoint.model_filepath` is "a file containing the model for
+model-based endpointing", and `DnnEndpointDecision` /
+`VadAssistedDnnEndpointDecision` / `getDynamicEndpointDnnConfig` /
+`epDnnPosteriors` say the decision is a DNN posterior per frame. What that
+network eats is pinned by one assertion:
+
+```
+vadDnnEpEmbeddingOutputDim + EP_DNN_INPUT_EXTRA_FEATURES_NUM
+    == network.InputDim(mDnnInputTag)
+```
+
+Its input is **the VAD DNN's embedding output concatenated with a small fixed
+number of extra features**. So the shipped endpointer is neither "a VAD" nor
+"the decoder" — it is a learned fusion of an acoustic embedding and decoder
+state, and `search_based` names one family of its inputs rather than the whole
+mechanism. (`EP_DNN_INPUT_EXTRA_FEATURES_NUM` is a compile-time constant and
+its value is not in the strings.)
+
+The candidate feature set is enumerated in the per-frame endpointing record,
+which is worth reading in full because it is the clearest statement anywhere
+of what Amazon thinks the question depends on:
+
+```
+activeToksCount        searchBeam            bestTokNonSpeechCount
+oneBestCost            totalCost             logTotalCostOffset
+bestTotalScoreToken    bestAcousticScoreToken    bestGraphScoreToken
+bestPathPhones         bestPathTransitions
+tokenLatticeGraphScore     tokenLatticeAcousticScore
+hypothesisGraphScore       hypothesisAcousticScore
+latticeNonSpeechPosterior  latticeSpeechPosterior
+expectedPauseDuration      expectedFinalPauseDuration
+expectedFinalPauseWithBestNSfinal   expectedFinalPauseWithContext
+foregroundEnergy       backgroundEnergy
+epDnnPosteriors        endpointerInSpecialMode
+acousticEmbeddingForDeviceDirectedness    embeddingVector
+```
+
+Three observations for EchoMuse.
+
+- **`foregroundEnergy` / `backgroundEnergy` is our max/min tracker.** Amazon
+  carries a foreground-vs-background energy split into the endpoint feature
+  vector as one input among ~25. That is a direct corroboration of
+  `em_endpoint`'s design rather than a coincidence: the level split is a real
+  feature, it is just not sufficient on its own, which is exactly the caveat
+  already documented for P1.
+- **`activeToksCount` and `searchBeam` are trellis breadth.** A decoder that
+  has narrowed to few surviving hypotheses is one that has decided; breadth
+  collapsing is an endpoint cue with no acoustic analogue at all.
+- **The directedness embedding rides in the same record.** "Is this finished"
+  and "was this addressed to me" are computed from shared state, which is why
+  the stock device gets both right in a room with a television and why a
+  bolt-on VAD gets neither.
+
+`Static` vs `Elastic EndpointUttdetLogicConfigProvider` closes it out: the
+thresholds themselves need not be constant for the length of an utterance.
 
 ## The vote-queue VAD
 
