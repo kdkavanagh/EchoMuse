@@ -849,6 +849,16 @@ async def _apply_live_config(device_id: str, live, effective: dict) -> None:
         live.ns_asr = bool(effective["nsAsr"])
     if "saveUtterances" in effective:
         live.save_utterances = bool(effective["saveUtterances"])
+    if "endpointRelative" in effective:
+        live.endpoint_relative = bool(effective["endpointRelative"])
+    if "endpointLowPerMil" in effective:
+        live.endpoint_low_per_mil = int(effective["endpointLowPerMil"])
+    if "endpointSilenceMs" in effective:
+        live.endpoint_silence_ms = int(effective["endpointSilenceMs"])
+    if "endpointBackporchMs" in effective:
+        live.endpoint_backporch_ms = int(effective["endpointBackporchMs"])
+    if "maxSpeechMs" in effective:
+        live.max_speech_ms = int(effective["maxSpeechMs"])
     if "bargeInEnabled" in effective:
         live.barge_in_enabled = bool(effective["bargeInEnabled"])
     if "bargeInThreshold" in effective:

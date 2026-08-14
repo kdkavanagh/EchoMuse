@@ -45,6 +45,8 @@ SECTIONS: dict[str, dict] = {
             "beamformingEnabled", "beamAngle",
             "aecEnabled", "aecDelayMs", "aecTailMs", "nsAsr",
             "saveUtterances",
+            "endpointRelative", "endpointLowPerMil", "endpointSilenceMs",
+            "endpointBackporchMs", "maxSpeechMs",
         ],
     },
     "ring": {

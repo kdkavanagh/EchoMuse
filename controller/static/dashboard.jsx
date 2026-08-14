@@ -4942,7 +4942,7 @@ const STAGE_MONO = "'DM Mono',monospace";
 const CONFIG_SECTIONS = {
   "playback": ["eqBands", "eqLoudness", "duckDb"],
   "wakeword": ["owwModel", "owwThreshold", "owwSpeexNs", "bargeInEnabled", "bargeInThreshold", "wakeArbitrationMs", "owwOnDevice", "wakeSound"],
-  "microphones": ["adcMicpga", "adcDigitalGain", "micGainDb", "beamformingEnabled", "beamAngle", "aecEnabled", "aecDelayMs", "aecTailMs", "nsAsr", "saveUtterances"],
+  "microphones": ["adcMicpga", "adcDigitalGain", "micGainDb", "beamformingEnabled", "beamAngle", "aecEnabled", "aecDelayMs", "aecTailMs", "nsAsr", "saveUtterances", "endpointRelative", "endpointLowPerMil", "endpointSilenceMs", "endpointBackporchMs", "maxSpeechMs"],
   "ring": ["ledScene", "ledListenColor", "ledThinkColor", "meterAttack", "meterDecay", "meterFloor", "meterGamma", "meterRef", "meterCurve"],
   "advanced": ["agcEnabled", "vadThreshold", "vadSpeechMs", "vadSilenceMs", "buttonSingleTapEvent", "buttonMultiTapMs"],
   "bluetooth": ["bleProxyEnabled"],
@@ -5506,6 +5506,22 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
               sub={afeActive ? "Amazon's pipeline runs its own echo canceller" : "filter length — residual delay error + room reverb"}
               value={config.aecTailMs ?? 300} min={50} max={500} step={10} unit="ms" onChange={v => set('aecTailMs', v)}/>
             <Toggle label="Save utterances" sub="keeps the last 10 turns' mic audio on the server — play or download from Activity" value={config.saveUtterances ?? false} onChange={v => set('saveUtterances', v)}/>
+            {/* Controller-side, like Noise suppression above — the endpointing
+                decision is made on the stream heading for speech-to-text, so
+                these stay live under the AFE. */}
+            <Toggle label="Stop on quiet" sub="ends a turn when the loudest voice stops, so a TV in the background can't hold it open" value={config.endpointRelative ?? true} onChange={v => set('endpointRelative', v)}/>
+            <Slider label="Stop sensitivity" disabled={!(config.endpointRelative ?? true)}
+              sub="higher ends turns sooner and ignores quieter background speech; lower is safer for a soft talker"
+              value={config.endpointLowPerMil ?? 400} min={100} max={700} step={25} onChange={v => set('endpointLowPerMil', v)}/>
+            <Slider label="Pause before stopping" disabled={!(config.endpointRelative ?? true)}
+              sub="quiet needed to end a turn — raise if it cuts you off mid-sentence; below 1000 it starts deciding ordinary turns too, not just stuck ones"
+              value={config.endpointSilenceMs ?? 1200} min={800} max={3000} step={100} unit="ms" onChange={v => set('endpointSilenceMs', v)}/>
+            <Slider label="Trailing audio" disabled={!(config.endpointRelative ?? true)}
+              sub="kept after the stop decision — raise if answers come back missing your last word"
+              value={config.endpointBackporchMs ?? 250} min={0} max={1000} step={50} unit="ms" onChange={v => set('endpointBackporchMs', v)}/>
+            <Slider label="Max turn length"
+              sub="hard cap on one spoken command — the answer is still given, on what was heard"
+              value={config.maxSpeechMs ?? 12000} min={4000} max={20000} step={1000} unit="ms" onChange={v => set('maxSpeechMs', v)}/>
             {afeActive && (
               <div style={{ gridColumn: '1 / -1', marginTop: 4, fontFamily: mono, fontSize: 10, color: 'var(--muted)', lineHeight: 1.6 }}>
                 This Echo is recording through Amazon&apos;s own audio pipeline, so the

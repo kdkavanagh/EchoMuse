@@ -212,6 +212,52 @@ DEFAULT_DEVICE_CONFIG = {
     # only (the device never sees the audio again); the key rides the
     # config channel and the device ignores it, same as wakeArbitrationMs.
     "saveUtterances":   False,
+    # endpointRelative: end a voice turn when the loudest voice in it stops,
+    # even if other speech continues. Controller-side only (em_endpoint.py);
+    # the device never sees these three, same as saveUtterances.
+    #
+    # Default ON, unlike most new behaviour here, because the behaviour it
+    # replaces is broken rather than merely different: a wake turn's only
+    # endpointer is Home Assistant's VAD, which asks "is there speech?" and so
+    # never ends with a television on — the turn runs to the 20s hard cap and
+    # hands STT the command with the TV mixed in. The window is deliberately
+    # slower than HA's own (1.2s of below-threshold audio against HA's
+    # ~0.5-1.0s of silence), so in a quiet room HA still wins every turn and
+    # this changes nothing. It is a ceiling, not a competitor.
+    "endpointRelative":  True,
+    # Stop threshold as thousandths of the way from the turn's tracked
+    # minimum level to its tracked maximum (anchored on the wake word). Raise
+    # toward 500-600 if a television still holds turns open; lower toward
+    # 250-300 if a quiet talker gets cut off mid-sentence. A taste parameter
+    # that wants tuning by ear in a real room, same reasoning as duckDb and
+    # the LED meter curve — see docs/alexa-endpointing.md for where the shape
+    # comes from (Amazon's fe.energy_vad.low_per_mil).
+    "endpointLowPerMil": 400,
+    # How much below-threshold audio ends a turn. The knob behind both "it cut
+    # me off mid-sentence" (raise it) and "it kept listening" (lower it) — the
+    # same question vadSilenceMs answers for the device's own button-turn
+    # gate, which is why it is exposed alongside the sensitivity rather than
+    # left as a module constant.
+    #
+    # 1200 is deliberately SLOWER than HA's own VAD (~500-1000ms of silence),
+    # which is what makes this a ceiling rather than a competitor: in a quiet
+    # room HA still ends every turn and nothing changes. Below ~1000 that
+    # stops being true and this starts deciding ordinary turns too.
+    "endpointSilenceMs": 1200,
+    # Audio kept flowing to HA after the stop decision, before end=True.
+    # Amazon calls it the backporch. A voting window that needs 80% of its
+    # length to agree has by construction already spent part of itself on
+    # audio the user was still producing, so without a tail the last word is
+    # clipped on exactly the turns this feature rescues. Raise it if answers
+    # come back missing the final word.
+    "endpointBackporchMs": 250,
+    # Hard cap on one turn's speech, in ms. Amazon ships this as a real
+    # parameter (fe.uttdet.max_speech_seconds), not a panic guard, and firing
+    # it is an ordinary endpoint: HA still gets end=True and still answers, so
+    # the user gets a truncated command answered instead of 20s of dead air
+    # followed by a garbage transcript. The 20s asyncio.wait_for in
+    # em_esphome stays behind it as the genuine last resort. 0 disables.
+    "maxSpeechMs":      12000,
     # timerSound: which uploaded sound (em_sounds id) an expired Home
     # Assistant timer rings with. Empty means the fleet "default" upload if
     # there is one, and the synthesised two-tone chime if there is not — a

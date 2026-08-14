@@ -283,6 +283,89 @@ The always-on wake stream (`mic_start` without `lock_mic`) is **ungated and AGC-
 
 1. **Wake word** — openwakeword (ONNX) runs in a thread executor per device on `mic_queue`. When 2+ devices are connected, `em_arbiter.py` applies **first-detector-wins** suppression: the first device to cross threshold answers *immediately* (no added latency, the claim is synchronous) and any other device detecting within `wakeArbitrationMs` (default 700, 0 = off) stands down and logs "Wake ceded". The claim is released at turn end. Do NOT reinstate the original best-SNR-after-a-wait design: it taxed every wake ~364ms (it gated on devices *connected*, not in earshot) and field data showed SNR at detection was indistinguishable across devices (0.9/1.15/0.93) while the SNR winner produced a worse transcript than the first detector.
 2. **Voice turn** — on wake or dot-button: drain stale frames → acquire `voice_lock` → stream mic to HA via the ESPHome satellite → receive TTS URL → **incrementally** fetch + ffmpeg-decode straight to 48kHz mono → EQ (`em_eq.py`) → stream back as 0x02 frames. `_stream_tts_audio` pipes the HTTP response into one long-lived ffmpeg and yields PCM as it decodes, so playback starts while HA is still generating — neither the encoded response nor the decoded speech is accumulated. **A retry is only safe before the first PCM has been emitted**; `_fetch_tts_audio` remains for callers that genuinely need the whole buffer
+
+### Ending the turn: relative endpointing (`em_endpoint.py`)
+
+A wake turn used to have **no endpointer of its own**. The device's VAD gate
+applies only to `lock_mic` (button) turns — the wake stream is ungated by
+design — so no device sentinel is ever sent, and end-of-turn was decided
+entirely by HA's `STT_VAD_END`. HA's VAD asks *"is there speech?"*, so with a
+television on the answer never becomes no: the turn ran to the 20s hard cap
+and STT was handed the command with the TV mixed into it.
+
+The fix comes from Amazon's own stack on this hardware
+(`docs/alexa-endpointing.md`, from `libpryon.so`). **Alexa does not endpoint
+with a VAD**; its strongest mode predicts the pause duration expected at this
+point in the sentence from the decoder's active hypotheses, which background
+speech cannot influence. That needs a decoder we do not have — but Amazon's
+*fallback* energy VAD is still not a threshold on RMS. It tracks a running
+maximum **and** minimum dB energy with hunt and hysteresis on each and sets
+its stop threshold as a per-mille fraction of the range between them. That
+part needs no model, and it is what `em_endpoint.Endpointer` implements.
+
+- **The threshold is measured DOWN from the maximum, not up from the
+  minimum.** Identical whenever the observed range exceeds `min_range_db`;
+  where the floor clamps it, anchoring from the minimum is actively wrong — a
+  steady tone converges both trackers onto its own level and `min + 0.4×12dB`
+  then sits *above* the signal, so a speaker holding a constant level
+  endpoints themselves. The maximum is the speaker.
+- **The maximum is anchored on the wake word** (`Endpointer.seed`, fed by
+  `device.last_wake_db`, the peak chunk RMS of the ~1s the wake listener was
+  scoring). A known-good sample of the target speaker at their real distance,
+  available before the first frame of the command, so the threshold is placed
+  correctly from frame zero rather than after the tracker converges. `seed`
+  only ever *raises* — a wake word's tail is quiet, and anchoring down to it
+  would sit below the person's real level for the whole turn. It is consumed
+  at turn start so a later button turn cannot inherit it.
+- **It is a ceiling, not a competitor.** The loop ends on whichever fires
+  first and the defaults are deliberately slower than HA's (1.2s of
+  below-threshold audio against HA's ~0.5–1.0s of silence), so in a quiet room
+  HA still wins every turn and nothing changes. `test_defaults_are_slower_
+  than_home_assistants_vad` pins that; drop the window below ~1s and every
+  turn's behaviour changes, not just the stuck ones.
+- **N-of-M voting, not K-consecutive-frames** (Amazon's shape at both the
+  search endpointer and the vote-queue VAD). A voting window tolerates the
+  stray speech-scoring sub-frame inside a genuine pause — precisely what a
+  television produces — without needing to be longer. `min_speech_ms` is a
+  veto checked *after* the trackers update, so the window keeps filling
+  during the protected period; resetting the vote there would cost a full
+  window of latency on every turn instead of none.
+- **Five keys, all `microphones`-scoped**: `endpointRelative`,
+  `endpointLowPerMil` (400), `endpointSilenceMs` (1200),
+  `endpointBackporchMs` (250), `maxSpeechMs` (12000). `config_for()` derives
+  `stop_window`/`stop_count` from the silence setting at a fixed `STOP_RATIO`
+  — the ratio is deliberately NOT exposed, because a user holding both it and
+  the window length has two knobs that trade against each other with no way
+  to tell which one they moved. Every one is read **once per turn**, so a
+  config change lands on the next turn and never mid-stream, and `config_for`
+  clamps rather than raising: `EndpointConfig`'s assertions must not be
+  reachable from a value someone typed into the fleet JSON, since refusing
+  there costs the turn its endpointing entirely — the broken behaviour.
+  `test_config_for_defaults_reproduce_the_module_defaults` pins the three
+  copies of the defaults (em_db, dashboard.jsx, `DEFAULT_CONFIG`) together.
+- **`endpointBackporchMs` is not optional garnish.** A window needing 80% of its length to
+  agree has by construction already spent part of itself on audio the user was
+  still producing, so without a tail the last word is clipped on exactly the
+  turns this rescues. Wall clock, not audio time — a link that stalls
+  mid-backporch must still close the turn. Amazon estimates its backporch from
+  the phone alignment (four estimators); we have no alignment, so it is fixed.
+- **It runs on the PRE-NS payload**, unlike the `saveUtterances` capture tap
+  directly below it, which is post-NS because it must match what STT heard.
+  The denoiser is optional, can fail mid-turn and fall back to raw, and
+  reshapes levels non-linearly; endpointing on its output would make the
+  decision depend on which of those happened.
+- **`maxSpeechMs` is a first-class parameter**, as it is for Amazon
+  (`fe.uttdet.max_speech_seconds`), not a panic guard: HA still gets
+  `end=True` and still answers, so the user hears a reply to a truncated
+  command. Measured from the first real frame (`em_turnclock`'s reason) and
+  checked on the **wall clock outside the frame path**, so a device that stops
+  sending cannot hold the cap open. The 20s `asyncio.wait_for` stays behind it
+  as the genuine last resort.
+- **What it cannot do**: level cannot separate a quiet talker from a loud TV
+  at the same level at the mic. Amazon separates them with a device-
+  directedness classifier over a per-frame acoustic embedding — speaker
+  identity, not energy. Not attempted; `min_speech_ms` and the backporch bound
+  the damage when this is wrong, and `endpointLowPerMil` is the knob.
 ### Ducking: music and voice are separate planes on the device
 
 **A voice turn DUCKS music; it does not pause it** — on firmware announcing

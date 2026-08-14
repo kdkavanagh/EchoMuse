@@ -67,6 +67,7 @@ from zeroconf import ServiceInfo
 
 import em_db as db
 import em_api as api
+import em_endpoint
 import em_ns
 import em_recordings
 import em_oww_models
@@ -1205,6 +1206,68 @@ class EchoMuseSatellite(SatelliteServerProtocol):
         listening_since = None      # monotonic; set when the first real frame lands
         turn_start = time.monotonic()
 
+        # ── Relative endpointing (em_endpoint.py) ──────────────────────────
+        # The reason this exists: for a wake turn, HA's VAD is the ONLY thing
+        # that ends the stream, and it asks "is there speech?" — with a
+        # television on the answer is always yes, so the turn runs to the 20s
+        # hard cap and STT is handed the command with the TV mixed in.
+        #
+        # It does not replace HA's VAD; the loop ends on whichever fires
+        # first, and the defaults are deliberately slower than HA's, so in a
+        # quiet room HA still wins every turn. Read once per turn so toggling
+        # the setting cannot change the rules mid-stream — the same discipline
+        # as `capture` above.
+        endpointer = None
+        if getattr(device, "endpoint_relative", True):
+            try:
+                endpointer = em_endpoint.Endpointer(em_endpoint.config_for(
+                    silence_ms=int(getattr(device, "endpoint_silence_ms", 1200)),
+                    low_per_mil=int(getattr(device, "endpoint_low_per_mil", 400)),
+                ))
+            except ValueError as e:
+                # A bad config value must not cost the turn its endpointing:
+                # falling back to the defaults is strictly better than falling
+                # back to "HA's VAD only", which is the broken behaviour.
+                log.warning(
+                    f"[{self._log_name}] Invalid endpointer config ({e}) — "
+                    f"using defaults"
+                )
+                endpointer = em_endpoint.Endpointer()
+            # Anchor on the wake word. Consumed here so a later button turn,
+            # which has no wake word of its own, cannot inherit the level of
+            # whoever last spoke to the device.
+            wake_db = getattr(device, "last_wake_db", None)
+            device.last_wake_db = None
+            if wake_db is not None:
+                endpointer.seed(wake_db)
+                log.debug(
+                    f"[{self._log_name}] Endpointer anchored on wake word at "
+                    f"{wake_db:.1f} dBFS"
+                )
+
+        # Backporch: audio kept flowing after the stop decision, before
+        # end=True. A voting window that needs 80% of 1.2s to agree has by
+        # construction already spent part of that window on audio the user was
+        # still producing, so without a tail the last word is clipped on
+        # exactly the turns this is meant to rescue. Wall clock, not audio
+        # time — a link that stalls mid-backporch must still close the turn.
+        # Read once per turn, like everything else here, so a config change
+        # cannot land between the stop decision and the tail it sizes.
+        backporch_s = max(0, int(
+            getattr(device, "endpoint_backporch_ms", em_endpoint.BACKPORCH_MS)
+        )) / 1000.0
+        backporch_until = None
+        endpoint_reason = ""
+
+        # maxSpeechMs. Amazon ships this as a first-class parameter
+        # (fe.uttdet.max_speech_seconds), not a panic guard: HA still gets
+        # end=True and still answers, so the user hears a reply to a truncated
+        # command instead of waiting 20s for a transcript with a TV in it. The
+        # outer 20s asyncio.wait_for stays behind this as the real last resort.
+        # Measured from the first real frame for em_turnclock's reason — from
+        # turn start, a slow link spends the user's budget before they speak.
+        max_speech_ms = int(getattr(device, "max_speech_ms", 12000))
+
         def _is_speech(chunk: bytes) -> bool:
             samples = np.frombuffer(chunk, dtype=np.int16)
             if samples.size == 0:
@@ -1235,6 +1298,33 @@ class EchoMuseSatellite(SatelliteServerProtocol):
                     if self._transport and not self._transport.is_closing():
                         self._send_one(api_pb2.VoiceAssistantAudio(data=b"", end=True))
                     return
+
+                # Backporch expired — the stop decision was made
+                # `endpointBackporchMs` ago and the tail has been sent, which
+                # a zero setting makes immediate. This is the only exit for a
+                # controller-side endpoint, so both the relative endpointer and
+                # maxSpeechMs come through here and neither can skip the tail.
+                if backporch_until is not None and time.monotonic() >= backporch_until:
+                    log.info(
+                        f"[{self._log_name}] {endpoint_reason} — sending audio "
+                        f"end to HA (controller-side endpoint)"
+                    )
+                    if self._trace and self._trace.t_vad_end_ms == -1:
+                        self._trace.t_vad_end_ms = self._trace.elapsed_ms()
+                    if self._transport and not self._transport.is_closing():
+                        self._send_one(api_pb2.VoiceAssistantAudio(data=b"", end=True))
+                    return
+
+                # maxSpeechMs. Checked on the wall clock and outside the frame
+                # path on purpose: a stalled link must still end the turn, and
+                # counting audio frames would let a device that stops sending
+                # hold the cap open indefinitely.
+                if (backporch_until is None and max_speech_ms > 0
+                        and listening_since is not None
+                        and (time.monotonic() - listening_since) * 1000.0 >= max_speech_ms):
+                    endpoint_reason = f"Max turn length reached ({max_speech_ms}ms)"
+                    backporch_until = time.monotonic() + backporch_s
+                    log.info(f"[{self._log_name}] {endpoint_reason} — ending turn")
 
                 # No-speech timeout: if nothing above the room's noise floor has
                 # arrived within NO_SPEECH_TIMEOUT seconds, treat as accidental
@@ -1344,6 +1434,28 @@ class EchoMuseSatellite(SatelliteServerProtocol):
                     # second lock) and after any TTS mic restart, which resets
                     # the beam to ch6 omni.
                     asyncio.ensure_future(device.beam_lock())
+
+                # Relative endpointing runs on the PRE-NS payload — what the
+                # microphone actually sent. The denoiser below is optional
+                # (default off, and redundant under the native AFE), can fail
+                # mid-turn and fall back to raw, and reshapes levels
+                # non-linearly. Endpointing on its output would make the
+                # decision depend on which of those happened. The capture tap
+                # further down is post-NS for the opposite and equally
+                # deliberate reason: it must match what STT heard.
+                if endpointer is not None and backporch_until is None:
+                    if endpointer.push_pcm(payload, np):
+                        endpoint_reason = (
+                            f"Loudest voice stopped "
+                            f"(floor {endpointer.min_db:.0f}dB, peak "
+                            f"{endpointer.max_db:.0f}dB, stop below "
+                            f"{endpointer.low_threshold:.0f}dB)"
+                        )
+                        backporch_until = time.monotonic() + backporch_s
+                        log.info(
+                            f"[{self._log_name}] {endpoint_reason} — ending turn "
+                            f"after {backporch_s * 1000:.0f}ms backporch"
+                        )
 
                 if denoiser is not None:
                     raw_payload = payload

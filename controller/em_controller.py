@@ -52,6 +52,7 @@ import collections
 import contextlib
 import json
 import logging
+import math
 import os
 import socket
 import struct
@@ -74,6 +75,7 @@ import em_scenes
 import em_shadow
 import em_arbiter
 import em_button
+import em_endpoint
 import em_tap_burst
 import em_esphome as esphome
 import em_ble_proxy
@@ -320,6 +322,22 @@ class Device:
         # switching it off stops the next turn being captured, not the one
         # already streaming.
         self.save_utterances: bool = False
+        # Relative endpointing (em_endpoint.py) — ends a turn when the loudest
+        # voice in it stops, so continuous background speech cannot hold the
+        # turn open until the hard cap. All three are read per turn, so a
+        # config change lands on the next turn rather than mid-stream.
+        self.endpoint_relative:     bool = True
+        self.endpoint_low_per_mil:   int = 400
+        self.endpoint_silence_ms:    int = 1200
+        self.endpoint_backporch_ms:  int = 250
+        self.max_speech_ms:          int = 12000
+        # RMS of the wake word itself, in dBFS — the anchor the relative
+        # endpointer seeds its maximum tracker from. Set by the wake listener
+        # at detection and consumed once, at the start of the turn it belongs
+        # to. None means the turn has no anchor (a button turn, or a wake
+        # whose audio the listener never measured) and the endpointer
+        # converges on the turn's own audio instead.
+        self.last_wake_db: float | None = None
         # This turn's captured mic audio, handed from _stream_mic_audio to
         # _persist_turn (which owns the write — it has the rowid the
         # filename is keyed on) and consumed there.
@@ -2054,6 +2072,16 @@ async def wake_word_listener(device: Device):
     dead_streak = 0   # consecutive 10s mic_queue timeouts (resets on any frame)
     ring_reset_due = False  # ring audio just stopped; reset before scoring again
     last_ring_score_log_ts = 0.0  # rate-limit ring-window score logging to 1/s
+    # Rolling level of the audio openwakeword is scoring, so a detection can
+    # be given the wake word's own loudness. That is the anchor the relative
+    # endpointer needs (em_endpoint.Endpointer.seed): a known-good sample of
+    # the target speaker at their real distance, available before the first
+    # frame of the command. 12 chunks is ~1s at 12.5 chunks/s, which brackets
+    # a wake word without reaching back into whatever preceded it; the MAX is
+    # taken rather than the mean because the tail of a wake word is quiet and
+    # anchoring on it would place the threshold below the speaker's real
+    # level for the rest of the turn.
+    wake_level = collections.deque(maxlen=12)
     try:
         while True:
             if device.oww_model != current_model_name or device.oww_speex_ns != current_speex_ns:
@@ -2221,6 +2249,7 @@ async def wake_word_listener(device: Device):
                 # feeds no-speech detection on later turns, so letting a 60s
                 # alarm drag it up would answer a question nobody asked.
                 rms = float(np.sqrt(np.mean((samples.astype(np.float64) / 32768.0) ** 2)))
+                wake_level.append(rms)
                 if device.timer_ring_audible:
                     pass
                 elif device.noise_floor == 0.0:
@@ -2365,6 +2394,17 @@ async def wake_word_listener(device: Device):
                     device.ctrl_shadow.active = True
 
                 if source != "none":
+                    # Hand the turn the wake word's own level. Set on BOTH wake
+                    # sources: an on-device crossing is scored on the same
+                    # frames this listener is holding, so the anchor is just as
+                    # good and a device-driven turn would otherwise be the one
+                    # case that silently lost it.
+                    if wake_level:
+                        peak = max(wake_level)
+                        device.last_wake_db = (
+                            20.0 * math.log10(peak) if peak > 0.0
+                            else em_endpoint.DB_FLOOR
+                        )
                     if source == "device":
                         score      = dev_wake["score"]
                         # The bar the DEVICE cleared, which during playback is
@@ -2895,6 +2935,11 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
         device.oww_speex_ns  = bool(config.get("owwSpeexNs", False))
         device.ns_asr        = bool(config.get("nsAsr", False))
         device.save_utterances = bool(config.get("saveUtterances", False))
+        device.endpoint_relative   = bool(config.get("endpointRelative", True))
+        device.endpoint_low_per_mil = int(config.get("endpointLowPerMil", 400))
+        device.endpoint_silence_ms = int(config.get("endpointSilenceMs", 1200))
+        device.endpoint_backporch_ms = int(config.get("endpointBackporchMs", 250))
+        device.max_speech_ms       = int(config.get("maxSpeechMs", 12000))
         device.barge_in_enabled = bool(config.get("bargeInEnabled", False))
         device.barge_threshold  = float(config.get("bargeInThreshold", 0.6))
         device.aec_enabled      = bool(config.get("aecEnabled", False))
