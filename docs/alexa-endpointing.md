@@ -190,6 +190,74 @@ rather than borrowing the wake word's threshold.
 Not implemented; recorded here because it came out of this investigation and
 is the clearest transferable idea in it after the energy VAD.
 
+#### Could we drive Amazon's spotter directly instead? — no, and the reason is the model
+
+Worth evaluating properly rather than dismissing, because the native-AFE path
+removes the objection that killed this last time
+([alexa-afe.md](alexa-afe.md) route 4 assumed the only audio transport was the
+shared-memory `IAudioStreamService`, whose host `amazon.speech.sim` our
+debloat hides). It is not the only transport.
+
+**The plumbing works, and native AFE makes it easier.** `WakeWordService` has
+a *push* API:
+
+```
+detectAudioDataFromAudioInput(void*, size_t, uint64_t)   // buffer, size, timestamp
+detectAudioData(void*, size_t, uint64_t, PryonString)
+injectWaveFile(const char*, bool)
+initializeAudioRecordAndInjector()   AudioRecordInput / AudioRecordAdapter
+```
+
+So it can take audio handed to it — no shared-memory service, no second
+`AudioRecord`, no contention for `pcm24c`. Under native AFE we already hold
+16 kHz mono AFE-processed capture, which is exactly pryon's input format, so
+the frames could be pushed straight in. Results would come back through
+`pryonLocalCommandCallback_JNI` / `PryonApi_SetLocalCommandEnumeratedResult
+Callback`. And the C++ API is genuinely exported — 102 `WakeWordService`
+symbols are `T`/`W` in `libwakewordserver_jni.so` — so `dlopen` + `dlsym`
+is possible in principle, the same pattern `internal/wakeword/ort` already
+uses for ONNX Runtime.
+
+**The model is fatal, and it is not a detail.**
+
+- There is no model on the device.
+  `res/raw/applicable_models.json` is `{"configurations":{"wakewordModels":[]}}`.
+- Models arrive only through DAVS, keyed by wake word name and locale, gated
+  on an Amazon account (`AmazonAccountUtils`). EchoMuse exists to not have
+  one.
+- **libpryon cannot author a base model.** It exports
+  `PryonModelSet_StoreSupplementalModel` / `...ById`, and
+  `supplemental_model_compiler.*` has a g2p pipeline — but that composes
+  *custom vocabulary* into an existing base model
+  (`supplemental_model_compiler.compose_with_lm_fst.filepath`, a g2p model, a
+  base ModelSet). Every one of those inputs is a DAVS artifact we do not
+  have. There is no path from nothing to a keyword model.
+- The format is Amazon proprietary and undocumented.
+
+Without a ModelSet, `PryonModelSet_New` fails and every one of those push
+calls has nothing to score against — `Error creating PryonModelSet for ww.`
+
+**And the cost/benefit is bad even if a model appeared.** The remaining work
+would be constructing a C++ object whose constructor takes 25 arguments
+including an `android::sp<amazon::AudioStream>` and eleven callbacks, from Go
+via cgo, in the process that owns the audio hardware — the same "days of work,
+every wrong guess corrupts memory" assessment `alexa-afe.md` route 3 made of
+`libasp`. Against that, the alternative is a tool this repo already ships:
+`oww_forge` trains a custom openWakeWord model from synthetic TTS in a Docker
+batch job, the wake listener already scores a continuous stream, and
+`device.timer_ringing` already exists. A "stop" model is a few hours of GPU
+and no new native dependency.
+
+The one path that technically exists — extracting a ModelSet from a stock,
+signed-in Dot Gen 2, the same "extract from your own hardware" line the AFE
+notes draw — is worse than it sounds: nothing could ship (Amazon proprietary),
+and it makes "own a second signed-in Echo" a prerequisite for a feature that
+otherwise needs a training run.
+
+**Verdict: take the idea, not the implementation.** Amazon's design insight —
+answer a ringing alarm with a dedicated key-phrase spotter rather than the
+wake word — is free. Their spotter is not.
+
 The practical consequence: there is no version of "just run Amazon's
 endpointer locally". Not the weights, not the models, not the API, not the
 architecture. Everything below is a design to learn from, not an asset to
