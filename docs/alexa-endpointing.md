@@ -110,8 +110,85 @@ applied on the cloud."*
 
 So a Dot Gen 2 spots the wake word locally and endpoints **in the cloud**. The
 endpointing machinery is in `libpryon` because `libpryon` is Amazon's one
-speech library, built once and linked everywhere including server-side; on
-this hardware it is dead code.
+speech library, built once and linked everywhere including server-side.
+
+"Dead code" was the wrong word, though, and the correction is the most
+directly useful thing in this document — see the next section.
+
+### What the device DOES use libpryon for: three words
+
+`libpryon` is not linked here merely for the wake word. The device also runs
+acoustic event detection, presence detection, federated learning, and — the
+interesting one — **Local Voice Control**:
+
+```
+isLocalVoiceControlEnabled: Fallback to enabled.
+LocalCommandListener   dispatchLocalCommandDetectedLocked
+alexa_hybrid_user_triggered_offline_mode    Alexa.LocalVoiceControl.status
+```
+with `is-local-command`, `LOCAL_COMMAND` and `KeywordLocalCommandTimeout` on
+the `libpryon` side.
+
+The local command set on this SKU is exactly three actions. From
+`com.amazon.headlessbeacon.apk`, which bundles the alerts subsystem:
+
+```
+com.amazon.speech.LocalCommand.Stop
+com.amazon.speech.LocalCommand.Snooze
+com.amazon.speech.LocalCommand.Cancel
+```
+
+They are received by `amazon.alexa.alerts.receiver.LocalCommandReceiver` and
+handled as `TimedEventLocalCommandStopEvent` /
+`TimedEventLocalCommandSnoozeEvent`, next to `ON_ALARM_RINGING`,
+`ALERT_RINGING_START` and `TimedEventOutOfRingingWindowEvent`. When nothing is
+ringing the command is discarded outright — the log lines are literally
+`Received local command stop but no alert is ringing.` and `Local Snooze: got
+command but nothing is ringing`.
+
+**Local voice control on an Echo Dot Gen 2 is "stop", "snooze" and "cancel"
+for a ringing alarm or timer, and nothing else.**
+
+And it is a **keyword spotter, not a recognizer** — the same
+`kaldi-key-phrase` / `KeywordHmmSpotter` / `KeywordMultiWordSpotter` machinery
+as the wake word, riding the same audio stream and the same ModelSet, flagged
+`is-local-command`. Detections carry the same payload the wake word does
+(`kwName`, `kwScore`, `kwDetectionType`, `kwSampleStart/End/DetectionIndex`,
+`kwSnr`, `kwSigLevel`).
+
+That choice is not an accident, and it is why this belongs in a document about
+endpointing: **a key-phrase spotter has no endpointing problem by
+construction.** The phrase matches or it does not; there is never a question
+of when the user stopped talking. Amazon reserved the one thing that must work
+with no cloud round trip, in the acoustically worst case a device ever faces —
+its own alarm blaring into its own microphones — for the one mechanism with no
+endpointer in it at all.
+
+#### This maps exactly onto a weakness EchoMuse already documents
+
+From CLAUDE.md, on the timer ring:
+
+> HA discards a timer as it fires, so nothing upstream can stop a ring and the
+> **wake word is the only acoustic stop — weakest in exactly the loud room an
+> alarm rings in**.
+
+Amazon's answer to the identical problem is a second, dedicated spotter for
+stop/snooze/cancel, scored on the same stream, independent of the wake word
+and independent of the cloud. EchoMuse can do the same thing with parts it
+already has: `oww_forge` trains custom openWakeWord models, and the wake
+listener already scores a continuous stream and already knows
+`device.timer_ringing`. A "stop" model scored **only while the ring is
+audible** would give the ring an acoustic stop that does not require the wake
+word to survive the alarm, and does not require a turn, HA, or a network hop.
+
+Worth noting the same section of CLAUDE.md records that the ring is currently
+scored at `bargeInThreshold` and that the honest test for whether a chime can
+silence itself is `Ring listening (chime audible, AEC)` in the log. A separate
+model changes that calculus: it can be tuned against the chime specifically,
+rather than borrowing the wake word's threshold.
+
+Not implemented; recorded here because it came out of this investigation and
+is the clearest transferable idea in it after the energy VAD.
 
 The practical consequence: there is no version of "just run Amazon's
 endpointer locally". Not the weights, not the models, not the API, not the
