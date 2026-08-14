@@ -55,12 +55,68 @@ pryon/cpp/config/elastic_uttdet_logic_config_provider.cpp
 pryon/cpp/config/eos_estimation_config.cpp
 ```
 
-**No tuned numbers were recovered, and none exist on this device.** The values
-live in JSON model artifacts (`recognizer.uttdet.json_filename`,
-`recognizer.eos_estimation.json_filename`, `search.endpoint.model_filepath`)
-that never ship in the image. What transfers is the **design**, not a
-parameter set. Every parameter description quoted below is verbatim from the
-binary's own help text.
+**No tuned numbers were recovered, and none exist on this device.** What
+transfers is the **design**, not a parameter set. Every parameter description
+quoted below is verbatim from the binary's own help text.
+
+That is not a case of "the model is here but the weights are missing". It is
+three separate absences, each independently sufficient:
+
+**1. `libpryon.so` carries no weights at all.** Its 21.6 MB is code:
+
+```
+.text     15,250,496      .rodata   2,585,984
+.data          5,352      .bss        175,296
+```
+
+15 MB of ARM `.text` is a Kaldi-derived WFST decoder, lattice rescoring, a DNN
+runtime, FST composition, boost and a regex engine compiled in — not a model.
+Every model is loaded from a path at runtime
+(`search.model_filepath`, `search.endpoint.model_filepath`,
+`recognizer.uttdet.json_filename`, `ep_dnn_path`).
+
+**2. There are no model files anywhere on the device.** No `.fst`, `.mdl`,
+`.nnet` or `.pryon` under `/system` or `/vendor`; no file over 500 KB anywhere
+under `/data`; and `SpeechInteractionManager.apk` ships
+`res/raw/applicable_models.json` containing exactly:
+
+```json
+{ "configurations": { "wakewordModels": [ ] } }
+```
+
+Empty. Even the *wake word* model — the one thing this device certainly ran
+locally — is not in the image. It arrives through DAVS after account sign-in,
+which is why a debloated unit has nothing.
+
+**3. This device would not run the endpointer even with the weights.** The
+only consumer of `libpryon` here is `amazon::WakeWordService`, and the symbols
+it imports are the **spotter** surface, not a recognizer:
+
+```
+PryonDecoder_NewSpotterAudioDecoder     PryonModelSet_New
+PryonDecoder_NewMultichannelAudioDecoder    PryonApi_SetEnumeratedResultCallback
+PryonDecoder_NewPcmInt16                PryonApi_SetPresenceDetectionResultCallback
+setNewPryonModel(const char*, const char**, int)
+```
+
+Wake word, acoustic event detection and presence. There is no transcript API
+and no endpointer configuration surface. Nothing on the device — not the JNI,
+not any APK — sets a single `recognizer.*`, `search.*` or `fe.*` parameter.
+DAVS's artifact types on this build are `ARTIFACT_TYPE_WAKEWORD`,
+`ARTIFACT_KEY_CID_DATABASE` and `ARTIFACT_KEY_PERSONALIZED_AED` — no ASR,
+language model or endpointer artifact exists to fetch. And `AFE.cfg` says it
+outright: *"Device side bias factors always set to 1.0f. Bias factors are
+applied on the cloud."*
+
+So a Dot Gen 2 spots the wake word locally and endpoints **in the cloud**. The
+endpointing machinery is in `libpryon` because `libpryon` is Amazon's one
+speech library, built once and linked everywhere including server-side; on
+this hardware it is dead code.
+
+The practical consequence: there is no version of "just run Amazon's
+endpointer locally". Not the weights, not the models, not the API, not the
+architecture. Everything below is a design to learn from, not an asset to
+recover.
 
 ### DAVS, and why the tuning is not on the device
 
