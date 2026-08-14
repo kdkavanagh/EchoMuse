@@ -107,6 +107,62 @@ def test_triggering_is_a_separate_capability_from_scoring():
         "the dashboard must gate the 'On device' option on the capability"
 
 
+def test_the_wake_chime_is_gated_on_the_firmware_that_carries_it():
+    """
+    The chime is embedded in the firmware and played from a `wake_sound`
+    control message, so a device that predates it ignores the message
+    entirely — no error, no sound, nothing in any log the user reads. That is
+    exactly the shape a version comparison gets wrong and a capability gets
+    right.
+
+    Both halves are pinned: the device announcing it, and the controller
+    refusing to send unless it did. The message being harmless to an old
+    device is not a reason to send it blind — "the chime is off" and "this
+    Echo cannot chime" are different answers, and only one of them is fixed
+    by turning the setting on.
+    """
+    caps = device_capabilities()
+    assert "wake_sound" in caps, "firmware no longer announces wake_sound"
+    assert "wake_sound_capable" in CONTROLLER.read_text(), \
+        "em_controller must expose the wake-sound capability as a property"
+    assert "wakeSoundCapable" in API.read_text(), \
+        "/api/devices must surface the wake-sound capability"
+    jsx = (ROOT / "controller" / "static" / "dashboard.jsx").read_text()
+    assert "wakeSoundCapable" in jsx, \
+        "the dashboard must gate the wake chime toggle on the capability"
+
+
+def test_the_wake_chime_is_audio_the_device_already_has():
+    """
+    The whole point of this feature is that the sound does not travel: the
+    clip lives in the firmware (device/internal/cue) and only the DECISION
+    crosses the link, so the feedback never waits on a link with measured
+    1.1–2.6s RTT excursions.
+
+    Pinned because the tempting "fix" for any future change to the sound is
+    to stream it from the controller like em_sounds does for a timer ring —
+    which would work, and would quietly turn the one piece of instant
+    feedback in the system into another thing that can arrive late.
+    """
+    pcm = ROOT / "device" / "internal" / "cue" / "wake_word_triggered.pcm"
+    assert pcm.exists(), "the embedded wake chime is missing"
+    assert pcm.stat().st_size > 1000, "the embedded wake chime looks like a stub"
+
+    control = CONTROL_GO.read_text()
+    assert 'case "wake_sound":' in control, \
+        "the device must handle the wake_sound control message"
+
+    controller = CONTROLLER.read_text()
+    m = re.search(r'async def play_wake_sound\(self\):(.*?)\n    async def',
+                  controller, re.S)
+    assert m, "em_controller.Device must still have play_wake_sound"
+    body = m.group(1)
+    assert '"type": "wake_sound"' in body, \
+        "play_wake_sound must send the wake_sound control message"
+    assert "send_data" not in body and "stream_speaker" not in body, \
+        "the chime must not be streamed as audio — it is already on the device"
+
+
 def test_native_afe_capability_is_surfaced_to_the_dashboard():
     """
     docs/native-afe-migration.md's bypass table: beamformingEnabled,

@@ -83,6 +83,7 @@ type ControlClient struct {
 	speakerFlushCallback  StateCallback
 	musicFlushCallback    StateCallback
 	duckCallback          func(on bool)
+	wakeSoundCallback     StateCallback
 	wifiChangeCallback    WifiChangeCallback
 	wifiCommitCallback    StateCallback
 	wifiScanCallback      StateCallback
@@ -128,6 +129,7 @@ func (c *ControlClient) OnBeamLock(cb BeamLockCallback)           { c.beamLockCa
 func (c *ControlClient) OnSpeakerFlush(cb StateCallback)          { c.speakerFlushCallback = cb }
 func (c *ControlClient) OnMusicFlush(cb StateCallback)            { c.musicFlushCallback = cb }
 func (c *ControlClient) OnDuck(cb func(on bool))                  { c.duckCallback = cb }
+func (c *ControlClient) OnWakeSound(cb StateCallback)             { c.wakeSoundCallback = cb }
 func (c *ControlClient) OnWifiChange(cb WifiChangeCallback)       { c.wifiChangeCallback = cb }
 func (c *ControlClient) OnWifiCommit(cb StateCallback)            { c.wifiCommitCallback = cb }
 func (c *ControlClient) OnWifiScan(cb StateCallback)              { c.wifiScanCallback = cb }
@@ -529,6 +531,16 @@ func (c *ControlClient) connect(ctx context.Context, server *discovery.ServerInf
 				c.musicFlushCallback()
 			}
 
+		case "wake_sound":
+			// Play the wake confirmation chime, which lives in this firmware
+			// (internal/cue) — the message carries the DECISION, never the
+			// audio. Deliberately not logged: it lands on every wake, and a
+			// log line per wake is noise in the one file people read to
+			// diagnose wakes.
+			if c.wakeSoundCallback != nil {
+				c.wakeSoundCallback()
+			}
+
 		case "duck":
 			// Duck the music under a voice turn. Sent at turn start and
 			// released at turn end; the DEPTH is config (duckDb), so it can
@@ -771,8 +783,14 @@ func capabilities() []string {
 	// device that scores, stays silent, and looks broken. Announcing a
 	// capability the firmware has, rather than inferring one from a version
 	// string, is the rule the whole registration follows.
+	// "wake_sound": this firmware carries the wake confirmation chime and can
+	// play it from a `wake_sound` control message (internal/cue). Without it
+	// the controller must not offer the setting at all — the message would be
+	// ignored, which is the "I enabled it and nothing happened" the whole
+	// capability rule exists to prevent. It is a fact about the BUILD (the
+	// audio is embedded), so it is unconditional, like audio_mix.
 	caps := []string{"mic", "speaker", "leds", "led_anim", "buttons",
-		"oww_shadow", "oww_trigger", "button_hold", "audio_mix",
+		"oww_shadow", "oww_trigger", "button_hold", "audio_mix", "wake_sound",
 		// "native_afe_backend": this binary has internal/bindings/slmic and
 		// slspeaker compiled in AND its start_server.sh has the opt-in
 		// marker check (docs/native-afe-migration.md) — unconditional,

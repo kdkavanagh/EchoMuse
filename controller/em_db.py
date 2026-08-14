@@ -45,6 +45,25 @@ DEFAULT_DEVICE_CONFIG = {
     # needs ONNX Runtime plus the models installed on the device out of band
     # (they are not in the firmware). Enable on ONE device at a time.
     "owwOnDevice":      "off",
+    # wakeSound: play a short confirmation chime on the Echo the moment a
+    # wake word is accepted — the "I heard you" that the ring alone gives
+    # only to someone looking at the device.
+    #
+    # The audio is compiled into the firmware and played from there
+    # (device/internal/cue); only the decision crosses the wire. That is the
+    # opposite call to timerSound above, and deliberately: a timer cannot
+    # ring without the controller anyway (HA pushes the FINISHED event
+    # through us), while a wake needs nothing from anyone once it has been
+    # accepted, and it is the one piece of feedback whose whole value is
+    # arriving promptly.
+    #
+    # Default OFF. This is an audible behaviour change on every device it
+    # reaches, it is a matter of taste rather than correctness, and a fleet
+    # that started chiming after an ordinary controller upgrade would be a
+    # surprise nobody asked for. Requires the "wake_sound" capability —
+    # older firmware would simply ignore the message, so the dashboard shows
+    # it disabled with the reason rather than as a toggle that does nothing.
+    "wakeSound":        False,
     "adcDigitalGain":   88,
     "adcMicpga":        40,
     # micGainDb: fixed digital gain (dB) the device applies to the full

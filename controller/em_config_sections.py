@@ -31,6 +31,11 @@ SECTIONS: dict[str, dict] = {
             "owwModel", "owwThreshold", "owwSpeexNs",
             "bargeInEnabled", "bargeInThreshold", "wakeArbitrationMs",
             "owwOnDevice",
+            # The chime a wake fires. Here rather than in "playback": that
+            # section is how audio SOUNDS (EQ, duck depth), and this is part
+            # of what a wake does — a device taking its own wake behaviour
+            # should take this with it.
+            "wakeSound",
         ],
     },
     "microphones": {

@@ -866,6 +866,8 @@ async def _apply_live_config(device_id: str, live, effective: dict) -> None:
         live.button_multi_tap_ms = int(effective["buttonMultiTapMs"])
     if "wakeArbitrationMs" in effective:
         live.wake_arb_ms = int(effective["wakeArbitrationMs"])
+    if "wakeSound" in effective:
+        live.wake_sound = bool(effective["wakeSound"])
     if "owwOnDevice" in effective:
         # Resolved against the CAPABILITY, not taken at face value: "on"
         # against firmware that cannot trigger would stop this controller
@@ -4342,6 +4344,9 @@ def _merge_device(row) -> dict:
         "nativeAfeBackendCapable": getattr(live, "native_afe_backend_capable", False) if live else False,
         # Gates the tap-as-event toggle — see em_button.decide.
         "buttonHoldCapable": getattr(live, "button_hold_capable", False) if live else False,
+        # Gates the wake confirmation chime: the audio is embedded in the
+        # firmware, so older builds ignore the message entirely.
+        "wakeSoundCapable": getattr(live, "wake_sound_capable", False) if live else False,
         # Whether the device found its ambient light sensor. Reported so the
         # dashboard can tell "no sensor" apart from "sensor present, no reading
         # yet" — which is the question #90 had to be answered by hand, because

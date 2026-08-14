@@ -299,6 +299,10 @@ class Device:
         # consulted when 2+ devices are connected — a solo fleet never
         # pays the latency.
         self.wake_arb_ms:   int   = 300
+        # wakeSound: chime on the device when a wake word is accepted. The
+        # audio lives in the firmware (device/internal/cue); this only
+        # decides whether the one-word `wake_sound` message is sent.
+        self.wake_sound:    bool  = False
         # Q1 fix (2026-07-05 review): openwakeword's built-in speexdsp noise
         # suppressor — 16kHz-native, applied controller-side, only to the
         # wake path (cannot affect STT audio since STT never sees it). Like
@@ -639,6 +643,20 @@ class Device:
         return "audio_mix" in (self.capabilities or [])
 
     @property
+    def wake_sound_capable(self) -> bool:
+        """
+        Whether this firmware carries the wake confirmation chime and can play
+        it on a `wake_sound` message (device/internal/cue).
+
+        The audio is embedded in the binary, so this is a fixed property of
+        the build. Without it the message is ignored silently, which is why
+        the setting is shown disabled with the reason rather than offered —
+        a chime that never sounds reads as a broken feature, not an
+        unsupported one.
+        """
+        return "wake_sound" in (self.capabilities or [])
+
+    @property
     def button_hold_capable(self) -> bool:
         """Measures hold time — and so was offered the HA event entity."""
         return "button_hold" in (self.capabilities or [])
@@ -739,6 +757,24 @@ class Device:
 
     async def beam_unlock(self):
         await self.send_control({"type": "beam_unlock"})
+
+    async def play_wake_sound(self):
+        """
+        Chime, if this device is configured for one and can play it.
+
+        No audio crosses the wire — the clip is compiled into the firmware
+        (device/internal/cue), so this is a single small JSON object on the
+        control plane, sent alongside beam_lock at the same instant.
+
+        Both guards matter and neither is redundant: `wake_sound` is the
+        user's setting, and the capability is whether the firmware would do
+        anything with the message. Sending it regardless would be harmless
+        (unknown types are ignored device-side) but would make an unsupported
+        device indistinguishable from a working one in the log.
+        """
+        if not (self.wake_sound and self.wake_sound_capable):
+            return
+        await self.send_control({"type": "wake_sound"})
 
     async def push_config(self, **kwargs):
         await self.send_control({"type": "config", **kwargs})
@@ -2484,6 +2520,16 @@ async def wake_word_listener(device: Device):
                             )
                             continue
 
+                        # Chime, now that the wake is definitely this
+                        # device's to answer. Deliberately AFTER the
+                        # arbitration cede check and not before it: a ring
+                        # that lit on the losing device is reverted a few
+                        # milliseconds later, and a chime cannot be. It is
+                        # also why the device does not play this off its own
+                        # oww crossing when owwOnDevice=on, where it would be
+                        # marginally sooner — see device/internal/cue.
+                        await device.play_wake_sound()
+
                         # "wakeword-dev" rather than a separate field: every
                         # reader of trigger already matches on the "wakeword"
                         # prefix (including _persist_turn's shadow block), so
@@ -2845,6 +2891,7 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
         device.oww_threshold = float(config.get("owwThreshold", OWW_THRESHOLD))
         device.oww_model     = config.get("owwModel", f"{OWW_MODEL}_v0.1")
         device.wake_arb_ms   = int(config.get("wakeArbitrationMs", 300))
+        device.wake_sound    = bool(config.get("wakeSound", False))
         device.oww_speex_ns  = bool(config.get("owwSpeexNs", False))
         device.ns_asr        = bool(config.get("nsAsr", False))
         device.save_utterances = bool(config.get("saveUtterances", False))

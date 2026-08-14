@@ -59,4 +59,15 @@ type FullSpeaker interface {
 	OnStreamStats(cb func(StreamStats))
 	IsStreaming() bool
 	EnableSpeakerAmp()
+
+	// PlayCue plays a short device-local notification sound (48kHz mono
+	// S16_LE) on a third plane, mixed with voice and music at the same
+	// write point — see internal/cue for why a cue is deliberately not a
+	// stream and must not travel through the voice plane.
+	//
+	// On FullSpeaker rather than Speaker because a cue is played from
+	// cmd/server.go, which already holds this interface, while
+	// internal/server and internal/client take the narrower Speaker: a cue
+	// is not part of the playback contract those two depend on.
+	PlayCue(pcm []byte)
 }

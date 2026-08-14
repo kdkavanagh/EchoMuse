@@ -123,6 +123,26 @@ func (m *Mixer) applyGain(buf []byte, target int32) {
 	}
 }
 
+// mixCue adds a device-local notification sound to the period about to be
+// written, returning the buffer to write — the same contract as
+// speaker.mixCue (see there for why a cue is neither ducked nor a stream),
+// minus the toStereo step: this backend writes the wire's mono format
+// straight to OpenSL ES.
+//
+// Returning cueMono itself when there is nothing else playing is safe
+// because it is the pump loop's own scratch buffer and Player.Next refills
+// it in place; opensl.Player.Write copies before returning.
+func mixCue(out, cueMono []byte) []byte {
+	if len(cueMono) == 0 {
+		return out
+	}
+	if out == nil {
+		return cueMono
+	}
+	mixInto(out, cueMono)
+	return out
+}
+
 // mixInto sums music into voice with saturation — identical to
 // speaker.mixInto; this loop was never stereo-specific (it walks raw 2-byte
 // samples regardless of channel layout), so it carries over unchanged.

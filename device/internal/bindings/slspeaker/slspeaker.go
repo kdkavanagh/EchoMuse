@@ -27,6 +27,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/wilbowes/EchoMuse/internal/cue"
 	"github.com/wilbowes/EchoMuse/internal/opensl"
 	pkgspeaker "github.com/wilbowes/EchoMuse/pkg/speaker"
 )
@@ -77,6 +78,16 @@ type Speaker struct {
 
 	duckTarget atomic.Int32
 	mixer      Mixer
+
+	// cue is the third plane — short device-local sounds (the wake
+	// confirmation chime), mixed at the same write point with none of
+	// audioStream's stream machinery. Same arrangement as PcmSpeaker's, and
+	// deliberately so: the cue is not audio from the controller, so nothing
+	// about it differs between the two backends. cueBuf is pump-loop-local
+	// scratch, and is MONO here — this backend writes the wire format
+	// straight out, so there is no toStereo step.
+	cue    cue.Player
+	cueBuf []byte
 
 	// echoTap is accepted for call-site symmetry with
 	// speaker.NewPcmSpeaker (cmd/server.go's backend switch constructs
@@ -137,6 +148,7 @@ func NewSpeaker(echoTap func([]byte), levelTap func(rms float64)) (*Speaker, err
 	}
 	s.voice = newAudioStream(audioChanDepth, s.deadCh)
 	s.music = newAudioStream(audioChanDepth, s.deadCh)
+	s.cueBuf = make([]byte, periodFrames*2) // mono S16
 	s.duckTarget.Store(unityGain)
 	s.mixer.SetGainImmediate(unityGain)
 
@@ -224,6 +236,13 @@ func (s *Speaker) pumpLoop() {
 		}
 
 		out := s.mixer.Mix(voice, music, s.duckTarget.Load())
+		// Before the idle sleep, or a cue starting while nothing else plays
+		// would be the one thing this loop never notices. The level tap
+		// stays voice-only either way — a cue is the device speaking for
+		// itself, not a response to visualise.
+		if s.cue.Next(s.cueBuf) {
+			out = mixCue(out, s.cueBuf)
+		}
 		if out == nil {
 			time.Sleep(idlePeriod)
 			continue
@@ -267,6 +286,11 @@ func (s *Speaker) PumpPeriod(data []byte) error {
 	_, err := s.voice.pump(data, len(data))
 	return err
 }
+
+// PlayCue starts a device-local notification sound (the wake confirmation
+// chime). Returns immediately — pumpLoop mixes it in over the following
+// periods.
+func (s *Speaker) PlayCue(pcm []byte) { s.cue.Play(pcm) }
 
 // PumpMusic queues one period of MUSIC audio (0x04) — identical handling to
 // the voice plane, kept separate so a voice turn can duck it rather than

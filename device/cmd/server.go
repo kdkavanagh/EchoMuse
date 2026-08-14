@@ -32,6 +32,7 @@ import (
 	"github.com/wilbowes/EchoMuse/internal/bluetooth"
 	"github.com/wilbowes/EchoMuse/internal/client"
 	"github.com/wilbowes/EchoMuse/internal/config"
+	"github.com/wilbowes/EchoMuse/internal/cue"
 	"github.com/wilbowes/EchoMuse/internal/server"
 	"github.com/wilbowes/EchoMuse/internal/wakeword/shadow"
 	"github.com/wilbowes/EchoMuse/internal/wifi"
@@ -307,6 +308,18 @@ func main() {
 	// instead and must never send this.
 	controlClient.OnMusicFlush(func() {
 		pcmSpeaker.FlushMusic()
+	})
+
+	// Wake confirmation chime. The controller decides WHETHER (per-device
+	// config, and only once a wake has survived multi-device arbitration);
+	// the audio itself is compiled into this binary, so the sound never
+	// crosses the link and the feedback does not wait on it. Playing from a
+	// controller message rather than from our own oww crossing is deliberate:
+	// with owwOnDevice=on the device could chime a few ms sooner, but a wake
+	// that then LOSES arbitration would have already made a noise, and an
+	// un-played chime is not a thing. See internal/cue.
+	controlClient.OnWakeSound(func() {
+		pcmSpeaker.PlayCue(cue.WakeWordTriggered())
 	})
 
 	// Duck — music is attenuated under a voice turn and restored at the end.

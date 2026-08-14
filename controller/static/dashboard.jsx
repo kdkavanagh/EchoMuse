@@ -1948,6 +1948,7 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                 triggerCapable={!device.connected || !!device.owwTriggerCapable}
                 mixCapable={!device.connected || !!device.audioMixCapable}
                 holdCapable={!device.connected || !!device.buttonHoldCapable}
+                wakeSoundCapable={!device.connected || !!device.wakeSoundCapable}
                 afeActive={!!device.nativeAfeCapable}
                 deviceId={device.device_id}
                 deviceConnected={!!device.connected}
@@ -4940,7 +4941,7 @@ const STAGE_MONO = "'DM Mono',monospace";
 // be silently wrong.
 const CONFIG_SECTIONS = {
   "playback": ["eqBands", "eqLoudness", "duckDb"],
-  "wakeword": ["owwModel", "owwThreshold", "owwSpeexNs", "bargeInEnabled", "bargeInThreshold", "wakeArbitrationMs", "owwOnDevice"],
+  "wakeword": ["owwModel", "owwThreshold", "owwSpeexNs", "bargeInEnabled", "bargeInThreshold", "wakeArbitrationMs", "owwOnDevice", "wakeSound"],
   "microphones": ["adcMicpga", "adcDigitalGain", "micGainDb", "beamformingEnabled", "beamAngle", "aecEnabled", "aecDelayMs", "aecTailMs", "nsAsr", "saveUtterances"],
   "ring": ["ledScene", "ledListenColor", "ledThinkColor", "meterAttack", "meterDecay", "meterFloor", "meterGamma", "meterRef", "meterCurve"],
   "advanced": ["agcEnabled", "vadThreshold", "vadSpeechMs", "vadSilenceMs", "buttonSingleTapEvent", "buttonMultiTapMs"],
@@ -5072,6 +5073,7 @@ function onDeviceMode(config) {
 function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
                             shadowCapable = true, mixCapable = true,
                             holdCapable = true, triggerCapable = true,
+                            wakeSoundCapable = true,
                             afeActive = false, deviceId = null,
                             deviceConnected = false, deviceRinging = false }) {
   // deviceId is null in the fleet-config view, where "ring this device now"
@@ -5391,6 +5393,17 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
               </div>
             </div>
             <div style={{ marginTop: 16, ...inputStyle }}>
+              {/* The chime is compiled into the firmware and played from
+                  there, so this control is offered only where that firmware
+                  is — an older build ignores the message and the toggle
+                  would be a setting that silently does nothing. */}
+              <Toggle label="Wake chime"
+                sub={wakeSoundCapable
+                  ? 'the Echo plays a short sound the moment it hears you — from the device, so it does not wait on the network'
+                  : 'needs newer firmware on this Echo — the sound ships inside it'}
+                value={wakeSoundCapable && (config.wakeSound ?? false)}
+                disabled={!wakeSoundCapable}
+                onChange={v => set('wakeSound', v)}/>
               <Toggle label="Speex denoise" sub="cleans audio before scoring — try in noisy rooms" value={config.owwSpeexNs ?? false} onChange={v => set('owwSpeexNs', v)}/>
               <Toggle label="Barge-in" sub="wake word interrupts playback — enable AEC first" value={config.bargeInEnabled ?? false} onChange={v => set('bargeInEnabled', v)}/>
               <Slider label="Barge threshold" sub="wake confidence needed during playback — raise it if a response cuts itself short" value={config.bargeInThreshold ?? 0.05} min={0.05} max={0.9} step={0.05} onChange={v => set('bargeInThreshold', v)}/>

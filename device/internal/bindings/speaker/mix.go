@@ -155,6 +155,53 @@ func (m *Mixer) applyGain(buf []byte, target int32) {
 	}
 }
 
+// toStereo converts a mono S16 wire period into the stereo frames the ALSA
+// device requires. The stereo config is an I2S/codec-path constraint, not a
+// wire one — shipping two identical channels would double bandwidth for
+// nothing on links that are already marginal.
+//
+// Lives here rather than in pcm_speaker.go so it can be tested on the host:
+// it is arithmetic on the audio path, which is exactly what this file is for.
+func toStereo(data []byte) []byte {
+	n := len(data) / 2
+	period := make([]byte, n*4)
+	for i := 0; i < n; i++ {
+		lo, hi := data[i*2], data[i*2+1]
+		period[i*4+0], period[i*4+1] = lo, hi // L
+		period[i*4+2], period[i*4+3] = lo, hi // R
+	}
+	return period
+}
+
+// mixCue adds a device-local notification sound (mono, as embedded) to the
+// period about to be written, returning the buffer to write.
+//
+// Separate from Mix, and applied AFTER it, for three reasons:
+//
+//   - A cue is never ducked and never ducks anything. It is short, it is the
+//     device speaking for itself, and the duck ramp exists to make a voice
+//     turn's arrival gentle — a chime that faded the music under it for
+//     170ms and then let it back up would be a worse artefact than the chime.
+//   - It has no stream state, so it must not touch the prime gate, the
+//     underrun accounting or StreamStats (see internal/cue).
+//   - `out` may be nil when nothing else is playing, which is the common
+//     case at a wake word: the cue then IS the period.
+//
+// Saturating, via the same mixInto as the music sum — the cue peaks at
+// −3.1dBFS, so a barge-in landing on a still-draining response can genuinely
+// reach full scale, and a wrap there is far worse than clipping.
+func mixCue(out, cueMono []byte) []byte {
+	if len(cueMono) == 0 {
+		return out
+	}
+	stereo := toStereo(cueMono)
+	if out == nil {
+		return stereo
+	}
+	mixInto(out, stereo)
+	return out
+}
+
 // mixInto sums music into voice with saturation.
 //
 // Saturating rather than wrapping: an int16 overflow wraps a loud peak to

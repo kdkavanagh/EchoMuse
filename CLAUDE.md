@@ -69,7 +69,7 @@ Controller tests cover the pure-logic modules only (`em_eq`, `em_scenes`, `em_ow
 **Release:** pushing a `v*` tag triggers `.github/workflows/release.yml`, which builds the binary in the compiler image and attaches it to a GitHub release. **Tag with `git tag -a`** — the annotation message becomes the release body (`body_path` from `git tag -l --format='%(contents)'`), which is what the dashboard shows next to an available update. Write it for the person deciding whether to push firmware to a device they depend on: what changed, what to expect, anything required of them. GitHub's generated commit list is still appended below it. A lightweight tag yields an empty body and falls back to that list, which is a worse experience, not a broken one.
 
 **Device/controller compatibility.** The two halves version independently, so any pairing can occur in the field. Two rules, both guarded by `tests/test_capabilities.py`:
-- **Negotiate by capability, not version.** The device announces what it implements in its register message (`internal/client/control.go`: `mic`, `speaker`, `leds`, `led_anim`, `buttons`, `oww_shadow`, `button_hold`, and `ambient_light` **only when the sensor is actually readable**); the controller reads `Device.capabilities` via properties like `led_anim_capable` / `oww_shadow_capable`. Never compare version strings — that puts release history in the controller and misjudges dev builds. A UI control whose feature the device lacks is shown **disabled with the reason**, never as a control that silently does nothing.
+- **Negotiate by capability, not version.** The device announces what it implements in its register message (`internal/client/control.go`: `mic`, `speaker`, `leds`, `led_anim`, `buttons`, `oww_shadow`, `button_hold`, `wake_sound`, and `ambient_light` **only when the sensor is actually readable**); the controller reads `Device.capabilities` via properties like `led_anim_capable` / `oww_shadow_capable`. Never compare version strings — that puts release history in the controller and misjudges dev builds. A UI control whose feature the device lacks is shown **disabled with the reason**, never as a control that silently does nothing.
 - **Degrade to old behaviour, never to a wrong answer.** Unknown JSON fields and message types are ignored both ways. Where a new field records a measurement, absence stores as **NULL, not 0** — old firmware reporting no `playback_stats` must not read as "zero underruns", and a device that cannot score wake words locally must not read as "scored and missed" (hence `turns.dev_shadow` alongside `dev_wake_score`).
 
 ### Schema migrations
@@ -333,6 +333,42 @@ with no way for the user to tell which they had.
 - `reported_state` stays for firmware that cannot mix. On the ducking path it
   is simply never triggered, because nothing is ever paused behind HA's back.
 
+### The wake chime is a THIRD plane, and the audio never crosses the wire
+
+`wakeSound` (Config → Wake word, default off, gated on the `wake_sound`
+capability) plays a short confirmation sound on the Echo the moment a wake
+word is accepted. The clip
+(`device/internal/cue/wake_word_triggered.pcm`, from esphome/home-assistant-
+voice-pe, MIT) is **compiled into the firmware** and decoded at authoring
+time to 48kHz mono S16_LE — the device's native rate — so playing it costs a
+memcpy and the only thing on the wire is a one-word `wake_sound` control
+message.
+
+That is the opposite call to `em_sounds.py`'s timer ring, for a reason that
+does not generalise: HA owns the timer countdown and pushes FINISHED through
+the controller, so a ring cannot happen without us anyway. A wake needs
+nothing from anyone once it has been accepted, and it is the one piece of
+feedback whose entire value is arriving promptly — on a link with measured
+1.1–2.6s RTT excursions, streaming ~90KB for it would put the confirmation
+behind the same TCP head-of-line blocking as everything else (#139).
+
+- **It must not travel through the voice plane.** A cue has no stream: no
+  prime gate, no discard-until-EOS, no underrun, no `StreamStats`. Pumped as
+  voice it would emit a spurious `playback_stats`, which the controller
+  attaches to `device.last_turn_id` — corrupting whichever turn was nearest —
+  and would make `IsStreaming()` true, dropping the on-device wake scorer to
+  its barge-in threshold. Hence `internal/cue` and a third mix at the same
+  write point, in **both** speaker backends.
+- **Mixed before the echo tap, never ducked.** It is real audio out of the
+  speaker that the live wake stream hears immediately, so the AEC far-end
+  reference has to carry it. It is not ducked and does not duck: a chime that
+  faded the music under it for 170ms would be a worse artefact than the chime.
+  The level tap stays voice-only — the meter ring visualises the response.
+- **Sent after arbitration, not at detection.** A losing device's ring is
+  reverted a few milliseconds later; a chime cannot be. That is also why the
+  device does not play it off its own crossing under `owwOnDevice=on`, where
+  it would be marginally sooner.
+
 3. **Media playback** (`em_player.py`) — the HA `media_player` entity accepts `play_media`/browse (PLAY_MEDIA+BROWSE_MEDIA feature flags): ffmpeg subprocess streams s16le/48k/mono, fed to the same 0x02 plane, paced to `LEAD_S`=**4.0s** ahead of realtime. That is sized against the device's own depth (`audioChanDepth` 128 periods × 42.7ms ≈ 5.46s) leaving ~1.4s headroom so the feed can never outrun `audioCh`. It was 1.5s until 2026-07-25, which left ~4s of hardware buffer unused and let measured 1.8-2.6s link stalls drain it into audible gaps. **The lead is NOT what makes pause/stop/voice-preempt instant** — `speaker_flush` drains the device buffer and the discard-until-EOS contract swallows what is still in TCP; the old comment misattributed that. Resume passes `-ss` before `-i`, an INPUT seek: ffmpeg does NOT ignore a seek it cannot perform, it decodes and discards until it reaches the timestamp, so a 173s bookmark on a non-seekable live stream (Music Assistant flow) is 173s of silence — a first-chunk deadline (`SEEK_STALL_S`) catches that and rejoins the live edge. Pause = speaker_flush + position bookmark, resume = ffmpeg `-ss` (live streams rejoin the live edge); teardown always EOSes the stream (flush-discard contract, same as barge-in). **Voice turns and announcements OWN the speaker**: `interrupt()` takes ownership and `resume_interrupted()` releases it. Ownership is taken unconditionally, even with nothing playing — the old behaviour only paused what was ALREADY playing, which did nothing to stop something *starting* mid-turn, and "play some jazz" runs the intent **before** HA generates the spoken reply, so `play_media` lands while the TTS is still coming and puts music on the same 0x02 plane as the response. While owned, `play`/`resume`/`pause`/`stop` record the user's intent instead of touching the wire; the release applies it, **last write wins** ("play jazz… actually, pause"). A user command **overrides** the auto-resume — theirs is an instruction, `resume_after` is bookkeeping — which is what makes pausing during a barge-in possible at all (issue #53: `MediaSession.pause()` returns early unless PLAYING, so the command was discarded and then contradicted by the resume). Deferred commands still push the **intended** state to HA (`push_intent`) so the entity is not stale for the length of a turn. The feed must NOT set `device.speaking` (that makes the wake loop drop frames — deaf for a whole song); wake-over-music scores against `bargeInThreshold` when barge-in is enabled, same physics as barge during TTS. Music EQ runs through `em_eq.StreamingEQ` (chunk-carried filter state — per-chunk `apply()` would click at boundaries).
 
     **Never send HA a hardcoded `MediaPlayerState`.** The feed announces `playing` exactly ONCE, when the decoder starts producing audio, so anything sent afterwards becomes HA's last word. Two places asserted a constant `IDLE` — turn end, and every device volume report — and each left the entity showing idle over audible music (issue #53, twice: fixing the first instance is how the second survived). Use `_media_state_msg()`, which reads em_player truth. `tests/test_deploy.py` forbids the shape, allowing only the documented optimistic `PLAYING` for `play_media` and `ANNOUNCING`.
@@ -353,6 +389,7 @@ with no way for the user to tell which they had.
 | `internal/client/data.go` | WebSocket client to controller `/data` — mic streaming, speaker playback |
 | `internal/server/` | Local state machine: mute, volume, LED mode priority |
 | `internal/config/config.go` | Global runtime config; env var defaults, overridden by controller push |
+| `internal/cue/` | Short device-local sounds (the wake chime), embedded via `go:embed` and mixed as a third plane. Deliberately NOT an `audioStream` — see "The wake chime is a THIRD plane" |
 | `internal/bindings/` | Hardware drivers: mic PCM, speaker PCM, LED I2C, button evdev |
 | `internal/wakeword/` | openWakeWord streaming feature pipeline (mel ring → 76-frame windows → embedding ring → classifier). Pure Go: inference sits behind the `Inferer` interface so the buffering is host-testable with no ONNX/cgo. Validated tensor-for-tensor against Python via a golden fixture (`testdata/`, regenerate with `gen_fixture.py`) |
 | `internal/wakeword/ort/` | The `Inferer` implementation: ONNX Runtime via cgo. The library is **dlopen'd at runtime, never linked** (only the MIT C header is vendored) so a device without it boots normally and falls back to controller-side wake word — verified by the ARM binary needing only libdl/liblog/libc with zero undefined `Ort*` symbols. `DefaultOptions` (1 thread, XNNPACK, `allow_spinning=0`) is the measured optimum: 37.7% of one core against 243% for ORT's defaults. Don't "fix" the thread count — more threads lowers latency and *raises* CPU, the wrong trade for duty-cycled work |
@@ -1103,7 +1140,7 @@ house, so rows survive with the SSID replaced and the selected network marked.
 
 `config.ConfigMessage` JSON fields (camelCase) are sent from controller to device on connect and on per-device config change. Non-zero fields are applied; zero/nil fields are ignored (partial update). Changes take effect immediately — no restart required.
 
-Configurable parameters: `vadThreshold`, `vadSpeechMs`, `vadSilenceMs`, `owwThreshold`, `owwModel`, `owwSpeexNs`, `adcDigitalGain`, `adcMicpga`, `micGainDb`, `startupVolume`, `beamAngle`, `beamformingEnabled`, `aecEnabled`, `aecDelayMs`, `aecTailMs`, `agcEnabled`, `nsAsr`, `bargeInEnabled`, `bargeInThreshold`, `bleProxyEnabled`, `eqBands`, `eqLoudness`, `ledScene`, `ledListenColor`, `ledThinkColor`, `meterAttack`, `meterDecay`, `meterFloor`, `meterGamma`, `meterRef`, `meterCurve`, `wakeArbitrationMs`, `duckDb`, `buttonSingleTapEvent`, `buttonMultiTapMs`, `owwOnDevice` and `saveUtterances` (the last two are controller-consumed for scoping purposes, though `owwOnDevice` IS acted on by the device; `saveUtterances`, `wakeArbitrationMs` and the two `button*` keys are ignored by it).
+Configurable parameters: `vadThreshold`, `vadSpeechMs`, `vadSilenceMs`, `owwThreshold`, `owwModel`, `owwSpeexNs`, `adcDigitalGain`, `adcMicpga`, `micGainDb`, `startupVolume`, `beamAngle`, `beamformingEnabled`, `aecEnabled`, `aecDelayMs`, `aecTailMs`, `agcEnabled`, `nsAsr`, `bargeInEnabled`, `bargeInThreshold`, `bleProxyEnabled`, `eqBands`, `eqLoudness`, `ledScene`, `ledListenColor`, `ledThinkColor`, `meterAttack`, `meterDecay`, `meterFloor`, `meterGamma`, `meterRef`, `meterCurve`, `wakeArbitrationMs`, `duckDb`, `buttonSingleTapEvent`, `buttonMultiTapMs`, `owwOnDevice`, `saveUtterances` and `wakeSound` (the last three are controller-consumed for scoping purposes, though `owwOnDevice` IS acted on by the device; `saveUtterances`, `wakeSound`, `wakeArbitrationMs` and the two `button*` keys are ignored by it — `wakeSound` decides only whether the controller sends the `wake_sound` message, whose audio already lives on the device).
 
 ### Fleet vs device scoping (schema v8)
 

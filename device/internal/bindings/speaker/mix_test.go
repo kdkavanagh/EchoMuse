@@ -191,3 +191,62 @@ func TestBothChannelsAreScaled(t *testing.T) {
 		t.Fatalf("channels diverged: L=%d R=%d", l, r)
 	}
 }
+
+// ─── cue plane ────────────────────────────────────────────────────────────────
+
+// monoPeriod builds a mono S16 buffer where every sample has the same value —
+// the shape internal/cue hands out.
+func monoPeriod(samples int, v int16) []byte {
+	b := make([]byte, samples*2)
+	for i := 0; i < samples; i++ {
+		b[i*2] = byte(uint16(v) & 0xff)
+		b[i*2+1] = byte(uint16(v) >> 8)
+	}
+	return b
+}
+
+func TestCueAloneBecomesThePeriod(t *testing.T) {
+	// The common case: a wake word with nothing else playing. Mix returns nil
+	// there, and the cue has to become the period rather than be dropped.
+	out := mixCue(nil, monoPeriod(4, 5000))
+	if len(out) != 16 {
+		t.Fatalf("cue should be widened to a stereo period, got %d bytes", len(out))
+	}
+	if l, r := sampleAt(out, 2, 0), sampleAt(out, 2, 1); l != 5000 || r != 5000 {
+		t.Fatalf("cue should play on both channels at its own level, got L=%d R=%d", l, r)
+	}
+}
+
+func TestCueMixesOverWhateverIsPlaying(t *testing.T) {
+	// Barge-in: the previous response is still draining when the chime for
+	// the new wake word lands.
+	out := mixCue(period(4, 1000), monoPeriod(4, 2000))
+	if got := sampleAt(out, 0, 0); got != 3000 {
+		t.Fatalf("cue should sum with the playing audio, got %d", got)
+	}
+}
+
+func TestCueIsNotDucked(t *testing.T) {
+	// A cue passes through mixCue AFTER Mix, so no duck target can reach it.
+	// The chime is the device speaking for itself, not a bed under a voice.
+	m := &Mixer{gain: DuckGain(-18)}
+	out := m.Mix(nil, period(4, 8000), DuckGain(-18))
+	out = mixCue(out, monoPeriod(4, 8000))
+	music := int32(sampleAt(out, 0, 0)) - 8000
+	if music >= 8000 {
+		t.Fatalf("music should have been ducked under the cue, got %d", music)
+	}
+	if music == 0 {
+		t.Fatal("the cue replaced the music instead of mixing with it")
+	}
+}
+
+func TestCueSaturatesRatherThanWraps(t *testing.T) {
+	// The chime peaks at -3.1dBFS, so a sum with a loud response genuinely
+	// reaches full scale. A wrap there turns the peak into full-scale
+	// opposite polarity, which is a far worse noise than the clipping.
+	out := mixCue(period(2, 30000), monoPeriod(2, 30000))
+	if got := sampleAt(out, 0, 0); got != math.MaxInt16 {
+		t.Fatalf("expected saturation to 32767, got %d", got)
+	}
+}

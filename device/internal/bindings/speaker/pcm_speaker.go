@@ -14,6 +14,7 @@ import (
 
 	"github.com/Binozo/GoTinyAlsa/pkg/pcm"
 	"github.com/Binozo/GoTinyAlsa/pkg/tinyalsa"
+	"github.com/wilbowes/EchoMuse/internal/cue"
 	pkgspeaker "github.com/wilbowes/EchoMuse/pkg/speaker"
 )
 
@@ -79,6 +80,15 @@ type PcmSpeaker struct {
 	duckTarget atomic.Int32
 	mixer      Mixer
 
+	// cue is the third plane: short device-local sounds (the wake
+	// confirmation chime), mixed in at the same write point but with none of
+	// audioStream's machinery — no prime gate, no EOS, no stats. See
+	// internal/cue for why a cue must not travel through the voice plane.
+	// cueBuf is its scratch period, reused rather than allocated per period;
+	// only the ALSA goroutine touches it.
+	cue    cue.Player
+	cueBuf []byte
+
 	// echoTap, when non-nil, receives every period pumped to ALSA — real
 	// audio and silence alike — so an AEC reference stream advances in
 	// lockstep with the playback clock. Fixed at construction (silenceLoop
@@ -123,6 +133,7 @@ func NewPcmSpeaker(echoTap func([]byte), levelTap func(rms float64)) (*PcmSpeake
 	}
 	s.voice = newAudioStream(audioChanDepth, s.deadCh)
 	s.music = newAudioStream(audioChanDepth, s.deadCh)
+	s.cueBuf = make([]byte, monoPeriodBytes)
 	s.duckTarget.Store(unityGain)
 	s.mixer.SetGainImmediate(unityGain)
 	if err := s.Init(); err != nil {
@@ -276,6 +287,17 @@ func (p *PcmSpeaker) silenceLoop() {
 		}
 
 		out := p.mixer.Mix(voice, music, p.duckTarget.Load())
+		// BEFORE the silence substitution, and before both taps. Before the
+		// substitution because silencePeriod is shared and must never be
+		// written into; before the echo tap because a cue is real audio out
+		// of this speaker that the live wake stream will hear ~immediately,
+		// so the AEC far-end reference has to carry it or the chime arrives
+		// at the mic uncancelled. (The LEVEL tap stays voice-only: the meter
+		// ring visualises the response, and at a wake word the ring is
+		// showing the listening animation anyway.)
+		if p.cue.Next(p.cueBuf) {
+			out = mixCue(out, p.cueBuf)
+		}
 		if out == nil {
 			out = silencePeriod
 		}
@@ -327,20 +349,10 @@ func (p *PcmSpeaker) report(st *StreamStats, plane string) {
 	}
 }
 
-// toStereo converts a mono S16 wire period into the stereo frames the ALSA
-// device requires. The stereo config is an I2S/codec-path constraint, not a
-// wire one — shipping two identical channels would double bandwidth for
-// nothing on links that are already marginal.
-func toStereo(data []byte) []byte {
-	n := len(data) / 2
-	period := make([]byte, n*4)
-	for i := 0; i < n; i++ {
-		lo, hi := data[i*2], data[i*2+1]
-		period[i*4+0], period[i*4+1] = lo, hi // L
-		period[i*4+2], period[i*4+3] = lo, hi // R
-	}
-	return period
-}
+// PlayCue starts a device-local notification sound (the wake confirmation
+// chime). Returns immediately — the audio is mixed in by silenceLoop over the
+// following periods.
+func (p *PcmSpeaker) PlayCue(pcm []byte) { p.cue.Play(pcm) }
 
 // PumpPeriod queues one period of VOICE audio (TTS, announcements). Called by
 // the WS client for each incoming 0x02 frame. Blocks until the ALSA loop has

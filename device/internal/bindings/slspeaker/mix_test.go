@@ -160,3 +160,47 @@ func TestMixHandlesMismatchedLengths(t *testing.T) {
 		t.Fatalf("the tail beyond the shorter buffer should be untouched, got %d", got)
 	}
 }
+
+// ─── cue plane ────────────────────────────────────────────────────────────────
+
+func TestCueAloneBecomesThePeriod(t *testing.T) {
+	// A wake word with nothing else playing — Mix returns nil, and the cue
+	// has to become the period rather than be dropped. Mono throughout on
+	// this backend: OpenSL ES takes the wire format directly.
+	cue := period(4, 5000)
+	out := mixCue(nil, cue)
+	if len(out) != len(cue) {
+		t.Fatalf("cue period changed length: %d vs %d", len(out), len(cue))
+	}
+	if got := sampleAt(out, 2); got != 5000 {
+		t.Fatalf("cue should play at its own level, got %d", got)
+	}
+}
+
+func TestCueMixesOverWhateverIsPlaying(t *testing.T) {
+	out := mixCue(period(4, 1000), period(4, 2000))
+	if got := sampleAt(out, 0); got != 3000 {
+		t.Fatalf("cue should sum with the playing audio, got %d", got)
+	}
+}
+
+func TestCueIsNotDucked(t *testing.T) {
+	// mixCue runs AFTER Mix, so no duck target reaches the cue.
+	m := &Mixer{gain: DuckGain(-18)}
+	out := m.Mix(nil, period(4, 8000), DuckGain(-18))
+	out = mixCue(out, period(4, 8000))
+	music := int32(sampleAt(out, 0)) - 8000
+	if music >= 8000 {
+		t.Fatalf("music should have been ducked under the cue, got %d", music)
+	}
+	if music == 0 {
+		t.Fatal("the cue replaced the music instead of mixing with it")
+	}
+}
+
+func TestCueSaturatesRatherThanWraps(t *testing.T) {
+	out := mixCue(period(2, 30000), period(2, 30000))
+	if got := sampleAt(out, 0); got != math.MaxInt16 {
+		t.Fatalf("expected saturation to 32767, got %d", got)
+	}
+}
