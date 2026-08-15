@@ -18,25 +18,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git wget ca-certificates libsndfile1 ffmpeg build-essential \
     && rm -rf /var/lib/apt/lists/*
 
+pip install --no-cache-dir uv
 # torch first, so the CPU/GPU split doesn't invalidate the rest of the cache.
 # cu128 is required for Blackwell cards (RTX 50xx = sm_120); these wheels fall
 # back to CPU cleanly at runtime when no GPU is visible.
 RUN if [ "$GPU" = "1" ]; then \
-        pip install --no-cache-dir torch==2.7.1 torchaudio==2.7.1 \
+       uv  pip install --no-cache-dir torch==2.7.1 torchaudio==2.7.1 \
             --index-url https://download.pytorch.org/whl/cu128; \
     else \
-        pip install --no-cache-dir torch==2.7.1 torchaudio==2.7.1 \
+       uv  pip install --no-cache-dir torch==2.7.1 torchaudio==2.7.1 \
             --index-url https://download.pytorch.org/whl/cpu; \
     fi
 
 COPY requirements.txt /opt/forge/requirements.txt
-RUN pip install --no-cache-dir -r /opt/forge/requirements.txt
+RUN uv pip install --no-cache-dir -r /opt/forge/requirements.txt
 
 # openWakeWord, pinned to a known-good main commit (train.py + example config
 # verified against this SHA — see oww_forge/README.md)
 RUN git clone https://github.com/dscripka/openWakeWord /opt/openwakeword \
     && git -C /opt/openwakeword checkout 368c03716d1e92591906a84949bc477f3a834455 \
-    && pip install --no-cache-dir -e /opt/openwakeword \
+    && uv pip install --no-cache-dir -e /opt/openwakeword \
     # Upstream bug: --convert_to_tflite defaults to the STRING "False", which
     # is truthy — without this patch every --train_model run ends by importing
     # tensorflow (not installed here; we ship ONNX only) and crashing.
