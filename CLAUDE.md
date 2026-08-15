@@ -501,6 +501,7 @@ behind the same TCP head-of-line blocking as everything else (#139).
 | `em_config_sections.py` | Fleet-vs-device config scoping — the six sections, `STATE_KEYS`, and the merge that resolves a device's effective config |
 | `em_tap_burst.py` | Coalesces a burst of action-button taps into one single/double/triple event. The window is restarted per tap and `enabled()` is re-checked at expiry, both correct. **The window is timed at the CONTROLLER, on arrival**, so the gap it measures is the real gap plus the RTT difference between the two taps — 26.4% of probes on this fleet exceed 200ms, which is why double/triple are unreliable below ~350ms (#115). The fix is a device-measured gap, the same reasoning as `heldMs` |
 | `em_recordings.py` | Utterance capture storage — WAVs in `recordings/` beside the DB, per-device file-count retention, ownership-checked path resolution |
+| `em_samples.py` | Wake-word sample collection — cuts the continuous wake stream into training clips at the silences (energy-relative, floor-tracked), and stores them in `samples/<device>/`. Pure logic + filesystem; the mode itself lives in `em_controller.set_collect_mode` |
 | `em_turnclock.py` | When a voice turn stops waiting, as a pure function. **The no-speech window is measured from the FIRST REAL AUDIO FRAME, not from turn start** — those answer different questions, and measured from turn start a slow link masquerades as a silent user. A 1373ms delivery gap (#139) shortened a 5s window to 3.6s and answered `no_speech` to someone mid-sentence, with the audio captured perfectly on the device and TCP holding it. `FIRST_AUDIO_GRACE` bounds the other side so audio that never arrives still ends the turn |
 | `em_linkauth.py` | The device-link auth decision as a pure function. Split out of `em_controller._link_auth_ok` so it is testable: the suite does not import em_controller, so this was security logic with no coverage until it orphaned a device |
 | `em_ble_proxy.py` | BLE proxy ESPHome servers — a second, separate ESPHome device per Echo (own port from the shared counter, own mDNS, MAC = serial-derived with the locally-administered bit flipped). Forwards `ble_adverts` control messages from the device's passive scanner (`device/internal/bluetooth`, raw HCI over `/dev/stpbt`; enabling durably disables Android's BT stack) to HA as raw advertisements. Lifecycle = idempotent `reconcile()` driven by `bleProxyEnabled` |
@@ -672,6 +673,74 @@ enabled it and nothing happened" this removes.
 - `DEVICE_DIR`, the shared model names and the classifier stem rule are pinned
   against the firmware constants **by test**. Drift installs assets the device
   never looks for, and the only symptom is shadow mode silently never starting.
+
+## Wake-word sample collection (`em_samples.py`)
+
+A device can be put into **collect mode** from the dashboard (device →
+Samples): its microphone is recorded continuously and cut into clips at the
+silences, which is the training material `oww_forge` cannot synthesise — this
+speaker, at this distance, through this array. **While collecting, the device
+starts no voice turns at all**, so nothing reaches Home Assistant.
+
+**The device needs nothing new for this and no OTA is involved.** The always-on
+wake stream is already continuous, ungated and AGC-free, so the whole feature
+is what the controller does with frames it is already receiving: the tap sits
+in `wake_word_listener`, so a clip is **byte-for-byte the audio the wake model
+scores**. That is the property that makes the clips worth training on — a
+sample captured through a different gain, denoiser or resampler teaches the
+model about a path it will never see in service. (Contrast `saveUtterances`,
+which is deliberately tapped *below* NS because it must match what STT heard.)
+
+- **It is a per-device MODE, not a config key** (`devices.collect_mode`, schema
+  v18, `POST /api/devices/{id}/collect`). Config is section-scoped and
+  fleet-inherited by default, so a key would let one toggle in the fleet panel
+  silence every Echo in the house at once. It is **persisted** because it
+  outlives the process: someone walks the house saying the wake word for
+  twenty minutes, and a controller restart in the middle must not leave the
+  dashboard claiming to record while nothing is written. `handle_control`
+  re-arms it on connect; arming an offline device is allowed and takes effect
+  when it comes back.
+- **The refusal lives at `_run_voice_locked`**, which is where wake word, dot
+  button and HA's own `start_conversation` all meet — guarding each trigger
+  would leave whichever one nobody remembered still streaming a room to Home
+  Assistant. The wake listener additionally takes the frame *before*
+  `model.predict`, so a collecting device is not paying for inference nothing
+  may act on. Both pinned by `tests/test_samples.py`.
+- **Segmentation is energy-relative**, for the reason `em_endpoint` is, but
+  measured from the other end: the endpointer measures DOWN from a tracked
+  maximum because it knows the speaker is talking, while here the question is
+  *did anything louder than this room just happen*, so the threshold is
+  measured UP from a tracked noise floor. The floor is **frozen while a clip
+  is open** (otherwise speech drags it up and the clip closes on the speaker),
+  and **clamped at `ABS_FLOOR_DB`** for thresholding — a muted device streams
+  zero-filled frames, and a floor tracking true digital silence puts the open
+  threshold at -168dB where ADC noise is a shout.
+- **The preroll is not a nicety.** A wake word opens on its vowel, not its
+  first consonant, so without `preroll_ms` of pre-onset audio every clip
+  starts a syllable late and the model learns to want a word nobody says.
+  `min_clip_ms` is judged on the SPEECH span, never the padded file: preroll
+  plus tail is ~560ms, nearly twice the minimum, so a file-length test would
+  promote every door click into a training sample.
+- **A continuous source is cut once and then left alone.** `max_clip_ms` ends
+  a clip a television would otherwise hold open forever, and the cooldown that
+  follows refuses to reopen until the room is actually quiet — without it the
+  same television emits a mid-word clip every 6s all evening.
+- Turning the mode **off flushes the open clip**: someone switching it off has
+  almost always just finished saying the thing they turned it on to record.
+  A disconnect flushes too (`collect_teardown`).
+- **The ring throbs magenta** for the length of the session (`COLLECT_ANIM`,
+  renewed inside its own TTL) and the dashboard shows `COLLECTING` next to the
+  device state everywhere, because a device that answers nothing is otherwise
+  indistinguishable from a broken one — and the person who set it collecting
+  is not necessarily the person who next asks it for the weather.
+- Clips live in `samples/<device>/<epoch_ms>.wav` beside the DB, capped at
+  `KEEP_PER_DEVICE` (2000, ~64MB) and unlinked by `db.delete_device` — nothing
+  cascades from SQLite to the volume. `GET …/samples.zip` is the point of the
+  feature: a training run wants the set, not one file at a time. Like
+  `saveUtterances`, this writes recognisable speech to disk, so it is opt-in,
+  per device, admin-only, and excluded from support bundles (only the boolean
+  is included — a device answering nothing on purpose is exactly what a
+  support report describes as "it stopped working").
 
 ## The external audio jack
 

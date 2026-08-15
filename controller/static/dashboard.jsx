@@ -1122,6 +1122,262 @@ function ConnectivityTab({ device, row }) {
   );
 }
 
+// ─── Wake-word sample collection ──────────────────────────────────────────────
+//
+// Records this device's mic continuously and cuts it into clips at the
+// silences, for training a custom wake word on the array that will actually
+// hear it (see em_samples.py). The mode SUSPENDS the assistant on that
+// device, which is the one thing this panel must never let anyone discover
+// by accident — hence the warning above the switch rather than below it, and
+// the state repeated in the device header.
+
+function SamplesTab({ device, isAdmin }) {
+  const [data, setData]       = useState(null);   // null = not fetched yet
+  const [busy, setBusy]       = useState(false);
+  const [error, setError]     = useState('');
+  const [playing, setPlaying] = useState(null);   // clip name currently sounding
+  const [confirmWipe, setConfirmWipe] = useState(false);
+  const [zipping, setZipping] = useState(false);
+  const audioRef = useRef(null);
+  const urlsRef  = useRef({});                    // name -> object URL
+
+  const id   = device.device_id;
+  const on   = !!device.collectMode;
+  const mono = "'DM Mono',monospace";
+  const slug = (device.label || id).replace(/[^A-Za-z0-9]+/g, '-').toLowerCase();
+
+  const load = async () => {
+    try {
+      setData(await API.get(`/api/devices/${id}/samples`));
+      setError('');
+    } catch (e) {
+      setError(e.error || e.message || 'Could not read samples');
+    }
+  };
+
+  // Poll while collecting — clips appear on their own, and a panel that only
+  // updated on a click would look like nothing was being recorded.
+  useEffect(() => {
+    load();
+    if (!on) return;
+    const iv = setInterval(load, 5000);
+    return () => clearInterval(iv);
+  }, [id, on]);
+
+  const stopAudio = () => {
+    if (audioRef.current) { audioRef.current.pause(); audioRef.current = null; }
+    setPlaying(null);
+  };
+
+  // Object URLs pin their blob until revoked; a long session auditioning
+  // clips would otherwise hold every one of them in memory.
+  useEffect(() => () => {
+    stopAudio();
+    Object.values(urlsRef.current).forEach(URL.revokeObjectURL);
+    urlsRef.current = {};
+  }, [id]);
+
+  const clipUrl = async name => {
+    if (urlsRef.current[name]) return urlsRef.current[name];
+    // API.blob, not an <a href>: sessions are Bearer-header-only, so a
+    // browser-initiated request would 401.
+    const url = URL.createObjectURL(await API.blob(`/api/devices/${id}/samples/${name}`));
+    urlsRef.current[name] = url;
+    return url;
+  };
+
+  const toggleAudio = async name => {
+    const wasPlaying = playing === name;
+    stopAudio();
+    if (wasPlaying) return;
+    let url;
+    try { url = await clipUrl(name); } catch { return; }
+    const el = new Audio(url);
+    el.onended = el.onerror = () => setPlaying(p => (p === name ? null : p));
+    audioRef.current = el;
+    setPlaying(name);
+    el.play().catch(() => setPlaying(p => (p === name ? null : p)));
+  };
+
+  const download = (url, filename) => {
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+  };
+
+  async function setMode(enabled) {
+    setBusy(true); setError('');
+    try {
+      await API.post(`/api/devices/${id}/collect`, { enabled });
+      // device.collectMode arrives on the events socket; refresh the list so
+      // a flushed final clip shows up immediately on stop.
+      await load();
+    } catch (e) {
+      setError(e.error || e.message || 'Could not change the mode');
+    }
+    setBusy(false);
+  }
+
+  async function doZip() {
+    setZipping(true); setError('');
+    try {
+      const url = URL.createObjectURL(await API.blob(`/api/devices/${id}/samples.zip`));
+      download(url, `${slug}-samples.zip`);
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setError(e.error || e.message || 'Could not build the archive');
+    }
+    setZipping(false);
+  }
+
+  async function doDelete(name) {
+    stopAudio();
+    try {
+      await API.del(`/api/devices/${id}/samples/${name}`);
+      if (urlsRef.current[name]) {
+        URL.revokeObjectURL(urlsRef.current[name]);
+        delete urlsRef.current[name];
+      }
+      setData(d => d && { ...d, clips: d.clips.filter(c => c.name !== name),
+                          count: Math.max(0, d.count - 1) });
+    } catch (e) {
+      setError(e.error || e.message || 'Could not delete that clip');
+    }
+  }
+
+  async function doWipe() {
+    stopAudio();
+    setConfirmWipe(false);
+    try {
+      await API.del(`/api/devices/${id}/samples`);
+      Object.values(urlsRef.current).forEach(URL.revokeObjectURL);
+      urlsRef.current = {};
+      await load();
+    } catch (e) {
+      setError(e.error || e.message || 'Could not delete the samples');
+    }
+  }
+
+  const clips = data?.clips || [];
+  const totalMb = data ? (data.bytes / 1048576).toFixed(1) : '—';
+  const totalS  = data ? Math.round(data.ms / 1000) : 0;
+
+  return (
+    <div style={{ minHeight:'100%', display:'flex', flexDirection:'column', gap:16 }}>
+
+      <Panel label="Sample collection">
+        <div style={{ fontFamily:"'DM Sans',sans-serif", fontSize:12, color:'var(--text2)', lineHeight:1.55, marginBottom:14 }}>
+          Records this device&apos;s microphone continuously and cuts it into
+          clips at the silences — say the wake word around the room and each
+          one lands here as a WAV. The audio is exactly what the wake model
+          scores, so the clips train against the array that will hear them.
+        </div>
+        <div style={{ background:'linear-gradient(160deg,var(--lcd-face),var(--lcd-deep))', border:'1px solid var(--lcd-line)', borderRadius:6, padding:'10px 12px', marginBottom:16 }}>
+          <span style={{ fontFamily:mono, fontSize:10, color:'var(--lcd-amber)', lineHeight:1.6 }}>
+            While collecting, this device answers nothing — no wake word, no
+            button turn, and nothing reaches Home Assistant. Its ring throbs
+            magenta so it is obvious from the room.
+          </span>
+        </div>
+
+        <div style={{ display:'flex', gap:16, alignItems:'flex-end', flexWrap:'wrap', marginBottom:16 }}>
+          <Lcd label="Mode"    value={on ? 'COLLECTING' : 'OFF'} color={on ? 'var(--lcd-amber)' : 'var(--lcd-dim)'}/>
+          <Lcd label="Clips"   value={data ? String(data.count) : '—'} color="var(--lcd-green)"/>
+          <Lcd label="Audio"   value={data ? `${totalS}s` : '—'} color="var(--lcd-dim)"/>
+          <Lcd label="On disk" value={data ? `${totalMb} MB` : '—'} color="var(--lcd-dim)"/>
+        </div>
+
+        <div style={{ display:'flex', alignItems:'center', gap:10, flexWrap:'wrap' }}>
+          <Pill big accent={!on} danger={on} disabled={!isAdmin || busy}
+                onClick={() => setMode(!on)}>
+            {busy ? '…' : on ? 'Stop collecting' : 'Start collecting'}
+          </Pill>
+          {!device.connected && (
+            <span style={{ fontFamily:mono, fontSize:10, color:'var(--warn)' }}>
+              {on ? 'Armed — collection resumes when the device reconnects'
+                  : 'Device offline — this will take effect on its next connect'}
+            </span>
+          )}
+          {device.connected && on && (
+            <span style={{ fontFamily:mono, fontSize:10, color:'var(--muted)' }}>
+              {device.collectClips || 0} clip(s) this session
+              {device.collectLastMs ? ` · last ${device.collectLastMs}ms` : ''}
+            </span>
+          )}
+        </div>
+        {/* What the segmenter is hearing. A room whose floor sits just under
+            the open threshold and a muted mic both produce an empty list;
+            these three numbers are what tell them apart without a log tail. */}
+        {data?.live && (
+          <div style={{ marginTop:14, borderTop:'1px solid var(--hairline)', paddingTop:10,
+                        fontFamily:mono, fontSize:9, color:'var(--muted)', lineHeight:1.7 }}>
+            Room floor {data.live.floor_db}dBFS · clips open above {data.live.open_db}dBFS
+            {' · '}{data.live.frames} frame(s) heard
+            {data.live.dropped_short ? ` · ${data.live.dropped_short} too short to keep` : ''}
+            {data.live.truncated ? ` · ${data.live.truncated} cut at the length cap` : ''}
+            <br/>
+            Nothing appearing? Speak closer to the device — a clip starts when the
+            room gets ~12dB louder than its own floor.
+          </div>
+        )}
+        {error && (
+          <div style={{ fontFamily:mono, fontSize:10, color:'var(--error)', marginTop:10 }}>{error}</div>
+        )}
+      </Panel>
+
+      <Panel label={`Clips (${data ? data.count : '…'}${data ? ` of ${data.keep} kept` : ''})`}>
+        <div style={{ display:'flex', alignItems:'center', gap:10, flexWrap:'wrap', marginBottom:12 }}>
+          <Pill small disabled={!clips.length || zipping} onClick={doZip}>
+            {zipping ? 'Building…' : 'Download all (.zip)'}
+          </Pill>
+          <Pill small onClick={load}>Refresh</Pill>
+          <span style={{ flex:1 }}/>
+          {isAdmin && !confirmWipe && (
+            <Pill small danger disabled={!clips.length} onClick={() => setConfirmWipe(true)}>Delete all</Pill>
+          )}
+          {isAdmin && confirmWipe && (
+            <>
+              <span style={{ fontFamily:mono, fontSize:9, color:'var(--error)' }}>Delete {clips.length} clip(s)?</span>
+              <Pill small danger onClick={doWipe}>Confirm</Pill>
+              <Pill small onClick={() => setConfirmWipe(false)}>Cancel</Pill>
+            </>
+          )}
+        </div>
+
+        {!clips.length && (
+          <div style={{ fontFamily:mono, fontSize:10, color:'var(--muted)' }}>
+            {on ? 'Listening — say the wake word.' : 'Nothing collected yet.'}
+          </div>
+        )}
+
+        <div style={{ display:'flex', flexDirection:'column' }}>
+          {clips.map(c => (
+            <div key={c.name} style={{
+              display:'flex', alignItems:'center', gap:10, padding:'6px 0',
+              borderTop:'1px solid var(--hairline)',
+            }}>
+              <span style={{ fontFamily:mono, fontSize:10, color:'var(--text2)', minWidth:150 }}>
+                {new Date(c.ts * 1000).toLocaleString()}
+              </span>
+              <span style={{ fontFamily:mono, fontSize:10, color:'var(--muted)', minWidth:60 }}>
+                {(c.ms / 1000).toFixed(1)}s
+              </span>
+              <span style={{ flex:1 }}/>
+              <Pill small onClick={() => toggleAudio(c.name)}>{playing === c.name ? '■ Stop' : '▶ Play'}</Pill>
+              <Pill small onClick={async () => {
+                try { download(await clipUrl(c.name), `${slug}-${c.name}`); } catch {}
+              }}>Download</Pill>
+              {isAdmin && <Pill small danger onClick={() => doDelete(c.name)}>Delete</Pill>}
+            </div>
+          ))}
+        </div>
+      </Panel>
+    </div>
+  );
+}
+
+
 // ─── Device detail modal ──────────────────────────────────────────────────────
 
 function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDeviceConfigChange }) {
@@ -1168,8 +1424,11 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
   const state = deviceState(device);
   const needsUpdate = device.firmware_ver && release?.version && device.firmware_ver !== release.version;
 
+  // "samples" is admin-only for the reason the endpoint behind it is: the
+  // mode suspends the assistant on this device, which is not something a
+  // read-only viewer should be able to do to everyone else in the house.
   const TABS = device.approved
-    ? (isAdmin ? ['status', 'activity', 'config', 'console', 'updates', 'logs'] : ['status', 'activity', 'config', 'logs'])
+    ? (isAdmin ? ['status', 'activity', 'samples', 'config', 'console', 'updates', 'logs'] : ['status', 'activity', 'config', 'logs'])
     : ['approve'];
 
   useEffect(() => {
@@ -1587,6 +1846,17 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
               <div style={{ background: 'linear-gradient(160deg,var(--lcd-face),var(--lcd-deep))', border: '1px solid var(--lcd-line)', borderRadius: 6, padding: '5px 12px', boxShadow: 'inset 0 1px 3px rgba(0,0,0,0.5)' }}>
                 <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, color: state.dot, textShadow: `0 0 8px ${state.dot}88`, letterSpacing: '0.05em' }}>{state.label.toUpperCase()}</span>
               </div>
+              {/* A collecting device is silent by design, which from every
+                  other panel is indistinguishable from a broken one. Say so
+                  next to the state, not only on the tab that caused it. */}
+              {device.collectMode && (
+                <span className="em-pill em-pill--small em-pill--accent"
+                      title="Collecting wake-word samples — voice turns suspended"
+                      style={{ display: 'inline-block', pointerEvents: 'none',
+                               fontFamily: "'DM Mono',monospace", letterSpacing: '0.05em' }}>
+                  COLLECTING
+                </span>
+              )}
               {isAdmin && !confirmDelete && (
                 <CircleButton onClick={() => setConfirmDelete(true)} title="Delete device" color="var(--error)">🗑</CircleButton>
               )}
@@ -1819,6 +2089,9 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
               </div>
             );
           })()}
+
+          {/* SAMPLES — wake-word training capture */}
+          {tab === 'samples' && <SamplesTab device={device} isAdmin={isAdmin}/>}
 
           {/* CONFIG */}
           {tab === 'config' && (

@@ -60,6 +60,11 @@ _DEVICE_FIELDS = (
     "device_id", "approved", "firmware_ver", "firmware_previous",
     "first_seen", "last_seen", "config_sections", "use_global_config",
     "esphome_port", "ble_proxy_port", "ble_proxy_enabled",
+    # A device in sample-collection mode answers nothing on purpose, which is
+    # exactly what a support report describes when it says "it stopped
+    # working". One boolean settles it; without it the bundle shows a healthy
+    # device with no turns and no explanation.
+    "collect_mode",
 )
 
 # Config keys are behaviour, not secrets — but the WiFi credential is neither

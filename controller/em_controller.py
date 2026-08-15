@@ -76,6 +76,7 @@ import em_shadow
 import em_arbiter
 import em_button
 import em_endpoint
+import em_samples
 import em_tap_burst
 import em_esphome as esphome
 import em_ble_proxy
@@ -342,6 +343,18 @@ class Device:
         # _persist_turn (which owns the write — it has the rowid the
         # filename is keyed on) and consumed there.
         self.last_utterance_pcm: bytes | None = None
+
+        # Wake-word sample collection (em_samples). A MODE, not a setting:
+        # while it is on the wake stream is cut into training clips and this
+        # device starts no voice turns at all, so nothing reaches Home
+        # Assistant. Persisted per device in the DB (schema v18) and read
+        # back on connect, because it outlives the process — see
+        # set_collect_mode.
+        self.collect_mode: bool = False
+        self.collect_seg: em_samples.Segmenter | None = None
+        self.collect_clips: int = 0            # clips written this session
+        self.collect_last_ms: int | None = None
+        self.collect_led_task: asyncio.Task | None = None
         self.eq_bands:      list  = [0.0] * 8
         self.eq_loudness:   bool  = False
         # LED ring scene — render-ready palette/spinner from em_scenes,
@@ -939,6 +952,15 @@ async def _push_device_state(device: Device) -> None:
             # timeout), so the UI has to be told rather than left to assume
             # its Test button is still the thing that stops it.
             "ringing":   device.timer_ringing,
+            # A collecting device answers nothing, which looks identical to a
+            # broken one from every other panel — so it says so everywhere.
+            # Same key the REST device object uses (em_api._merge_device):
+            # the dashboard merges these events straight onto that object, so
+            # a second name for one fact would leave the two disagreeing
+            # depending on which arrived last.
+            "collectMode":   device.collect_mode,
+            "collectClips":  device.collect_clips,
+            "collectLastMs": device.collect_last_ms,
         },
     })
 
@@ -1706,6 +1728,18 @@ async def _run_voice_locked(device: Device, trigger_label: str = "unknown", is_w
     trace display, not a control-flow key) so a future change to the label
     format can't silently change behaviour here.
     """
+    # Sample collection suspends the assistant entirely — see em_samples.
+    # Enforced here rather than only at each trigger because this is the one
+    # place all three of them meet (wake word, dot button, and HA's own
+    # start_conversation), and a mode that stops audio reaching Home
+    # Assistant has to hold for the paths nobody remembered.
+    if device.collect_mode:
+        log.info(
+            f"[{device.device_id}] Voice turn refused ({trigger_label}) — "
+            f"device is collecting wake-word samples"
+        )
+        return False
+
     drained = 0
     while not device.mic_queue.empty():
         try:
@@ -2040,6 +2074,161 @@ async def _run_voice_locked(device: Device, trigger_label: str = "unknown", is_w
         await em_player.resume_interrupted(device.device_id)
 
 
+# ─── Wake-word sample collection ──────────────────────────────────────────────
+#
+# The device needs nothing new for this: its always-on wake stream is already
+# continuous and ungated, so collection is entirely a question of what the
+# controller does with frames it is already receiving. See em_samples for the
+# segmentation, and CLAUDE.md for why this is a per-device mode rather than a
+# config key.
+
+# The ring while collecting. Magenta because every other meaning is taken —
+# red is mute, orange a dead link, cyan the volume arc, and the scene colours
+# are turn state. A slow throb rather than a solid ring: this can be left on
+# for an hour, and a lit ring in a bedroom reads as a fault.
+COLLECT_ANIM = {"pattern": "pulse", "colors": [[180, 0, 200]], "periodMs": 2600}
+
+# Dead-man TTL on that animation, and how often it is renewed. The device
+# clears the ring by itself if the controller dies mid-session, for the same
+# reason every other animation carries one — but this animation has no end,
+# so something has to keep saying so. Renewal is comfortably inside the TTL
+# so one dropped control message does not blank the ring.
+COLLECT_TTL_SEC     = 120
+COLLECT_RENEW_SEC   = 45
+
+
+async def _collect_led_loop(device: Device):
+    """Hold the collect ring up for as long as the mode is on."""
+    try:
+        while device.collect_mode:
+            await device.send_led_anim({**COLLECT_ANIM, "ttlSec": COLLECT_TTL_SEC})
+            await asyncio.sleep(COLLECT_RENEW_SEC)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        # A ring is feedback, not the feature. Losing it must not stop the
+        # collection that is the point.
+        log.warning(f"[{device.device_id}] Collect ring stopped: {e}")
+
+
+async def _write_clip(device: Device, clip: em_samples.Clip) -> None:
+    """Persist one cut clip and tell the dashboard about it."""
+    loop = asyncio.get_event_loop()
+    try:
+        name = await loop.run_in_executor(
+            None, em_samples.save_clip, device.device_id, clip
+        )
+    except Exception as e:
+        log.warning(f"[{device.device_id}] Sample write failed: {e}")
+        return
+    if name is None:
+        return
+    device.collect_clips  += 1
+    device.collect_last_ms = clip.duration_ms
+    log.info(
+        f"[{device.device_id}] Sample {name} "
+        f"({clip.duration_ms}ms, speech {clip.speech_ms}ms, "
+        f"peak {clip.peak_db:.1f}dBFS"
+        f"{', truncated' if clip.truncated else ''})"
+    )
+    await api._push_event({
+        "type":      "device_update",
+        "device_id": device.device_id,
+        "state": {
+            "collectClips":  device.collect_clips,
+            "collectLastMs": device.collect_last_ms,
+        },
+    })
+
+
+async def _collect_frame(device: Device, frame: bytes, rms: float) -> None:
+    """
+    One wake-stream frame, while collecting.
+
+    The RMS is the one the wake listener has already computed for its own
+    noise floor — recomputing it here would double the per-frame numpy work
+    on the busiest path in the controller.
+    """
+    seg = device.collect_seg
+    if seg is None:
+        return
+    clip = seg.push(frame, rms)
+    if clip is not None:
+        await _write_clip(device, clip)
+
+
+async def set_collect_mode(device: Device, enabled: bool) -> None:
+    """
+    Arm or disarm sample collection on a connected device.
+
+    Idempotent: the API can be called twice, and re-arming would otherwise
+    reset the session counter and drop a clip that was mid-word.
+
+    Turning it OFF flushes whatever is open. Someone switching the mode off
+    has almost always just finished saying the thing they turned it on to
+    record, and discarding that clip because its trailing silence never
+    arrived is the one loss they would notice.
+    """
+    enabled = bool(enabled)
+    if device.collect_mode == enabled:
+        return
+    device.collect_mode = enabled
+
+    if device.collect_led_task is not None:
+        device.collect_led_task.cancel()
+        device.collect_led_task = None
+
+    if enabled:
+        device.collect_seg     = em_samples.Segmenter()
+        device.collect_clips   = 0
+        device.collect_last_ms = None
+        device.collect_led_task = asyncio.create_task(_collect_led_loop(device))
+        log.info(
+            f"[{device.device_id}] Sample collection ON — this device will "
+            f"not start voice turns until it is switched off"
+        )
+        db.log_device(device.device_id, "info", "controller",
+                      "Sample collection started (voice turns suspended)")
+    else:
+        seg, device.collect_seg = device.collect_seg, None
+        if seg is not None:
+            clip = seg.flush()
+            if clip is not None:
+                await _write_clip(device, clip)
+        # A device that dropped off between the click and here must not turn
+        # the API call into a 500 — the mode is already off, which is what
+        # was asked for, and the ring goes with the connection anyway.
+        with contextlib.suppress(Exception):
+            await leds_off(device)
+        log.info(
+            f"[{device.device_id}] Sample collection OFF — "
+            f"{device.collect_clips} clip(s) this session"
+        )
+        db.log_device(
+            device.device_id, "info", "controller",
+            f"Sample collection stopped ({device.collect_clips} clips)",
+        )
+    await _push_device_state(device)
+
+
+async def collect_teardown(device: Device) -> None:
+    """
+    Device is going away. Keep the clip, drop the ring task.
+
+    No LED message and no state push: the socket this would travel over is
+    the one that just closed. The mode itself is persisted, so a device that
+    comes back is put straight back into it by handle_control.
+    """
+    if device.collect_led_task is not None:
+        device.collect_led_task.cancel()
+        device.collect_led_task = None
+    seg, device.collect_seg = device.collect_seg, None
+    if seg is not None:
+        clip = seg.flush()
+        if clip is not None:
+            await _write_clip(device, clip)
+
+
 # ─── Wake word listener ───────────────────────────────────────────────────────
 
 async def wake_word_listener(device: Device):
@@ -2258,6 +2447,23 @@ async def wake_word_listener(device: Device):
                     device.noise_floor += 0.3 * (rms - device.noise_floor)
                 else:
                     device.noise_floor += 0.008 * (rms - device.noise_floor)
+
+                # Sample collection takes the frame here and stops.
+                #
+                # After the noise floor so switching the mode off leaves the
+                # room measurement current, and before the model so a
+                # collecting device is not paying for inference whose result
+                # nothing may act on. Not scoring is also the point: this is
+                # the whole of "starts no voice turns", enforced one more
+                # time at _run_voice_locked for the button and HA paths.
+                if device.collect_mode:
+                    await _collect_frame(device, frame, rms)
+                    # A device in owwOnDevice="on" keeps reporting its own
+                    # crossings; drop them here rather than leaving one in the
+                    # slot to be taken (and warned about as stale) whenever
+                    # collection ends. It is a wake nobody is going to act on.
+                    device.pending_wake.take()
+                    continue
 
                 prediction = await loop.run_in_executor(
                     None, model.predict, samples
@@ -2969,6 +3175,13 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
         log.info(f"[control] Config pushed to {device_id} (volume={device.volume:.3f})")
 
         await leds_off(device)
+        # Sample collection is a persisted MODE (schema v18), not config, so
+        # it is read from the device row rather than the config push and
+        # re-armed here. A device rebooting mid-session must come back
+        # collecting: the alternative is a controller that looks like it is
+        # still recording and writes nothing.
+        if await loop.run_in_executor(None, db.get_collect_mode, device_id):
+            await set_collect_mode(device, True)
         await api.notify_device_connected(device_id)
         _device_ref = device
         async def _standalone_play(pcm_bytes: bytes, _d=_device_ref) -> None:
@@ -3464,6 +3677,9 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
             # send_button_event resolves by device_id, so an orphaned timer
             # would fire a phantom tap at the replacement connection.
             device.tap_burst.cancel()
+            # Also per-connection: the ring renewal task holds this Device,
+            # and a clip left open belongs to this connection's audio.
+            await collect_teardown(device)
             if _devices.get(device.device_id) is not device:
                 # A replacement connection has already registered for this
                 # device_id — this socket is stale. Tearing down shared

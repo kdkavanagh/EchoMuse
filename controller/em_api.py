@@ -34,6 +34,7 @@ state with persisted DB state without coupling to a global.
 import asyncio
 import hashlib
 import html as _html
+import io
 import json
 import logging
 import os
@@ -43,6 +44,7 @@ import shutil
 import sqlite3 as _sqlite3
 import tempfile
 import time
+import zipfile
 from pathlib import Path
 from typing import Any, Optional
 
@@ -59,6 +61,7 @@ import em_oww_models
 import em_pki
 import em_player
 import em_recordings
+import em_samples
 import em_volume
 import em_scenes
 import em_shadow
@@ -285,6 +288,15 @@ async def create_app() -> web.Application:
     app.router.add_get("/api/devices/{id}/turns",         _get_device_turns)
     app.router.add_get("/api/devices/{id}/activity",      _get_device_activity)
     app.router.add_get("/api/devices/{id}/turns/{turn}/audio", _get_turn_audio)
+    # Wake-word sample collection. samples.zip before samples/{name} — the
+    # two cannot collide (different segment counts), but the file's ordering
+    # rule is worth keeping honest.
+    app.router.add_post("/api/devices/{id}/collect",      _post_device_collect)
+    app.router.add_get("/api/devices/{id}/samples.zip",   _get_samples_zip)
+    app.router.add_get("/api/devices/{id}/samples",       _get_samples)
+    app.router.add_delete("/api/devices/{id}/samples",    _delete_samples)
+    app.router.add_get("/api/devices/{id}/samples/{name}", _get_sample_audio)
+    app.router.add_delete("/api/devices/{id}/samples/{name}", _delete_sample)
     app.router.add_post("/api/devices/{id}/wifi",         _post_device_wifi)
     app.router.add_post("/api/devices/{id}/wifi/scan",    _post_device_wifi_scan)
     app.router.add_post("/api/devices/{id}/update",       _post_device_update)
@@ -608,6 +620,218 @@ def _slug(text: str) -> str:
     """Lowercase ASCII slug, safe for a Content-Disposition filename."""
     out = re.sub(r"[^A-Za-z0-9]+", "-", text).strip("-").lower()
     return out or "device"
+
+
+# ─── Wake-word sample collection ──────────────────────────────────────────────
+#
+# Collection mode itself (em_samples, em_controller.set_collect_mode) plus the
+# read side: list, play, download, delete. The mode is persisted on the device
+# row rather than in its config — see the schema v18 migration.
+
+
+@auth.require_admin
+async def _post_device_collect(request: web.Request) -> web.Response:
+    """
+    POST /api/devices/{id}/collect — body {"enabled": bool}
+
+    Puts a device into (or out of) wake-word sample collection: its mic
+    stream is cut into training clips on the controller and it starts no
+    voice turns at all until this is switched off.
+
+    Admin-only and one device at a time, because it SUSPENDS the assistant
+    on that device. A device that answers nothing looks broken to everyone
+    else in the house, so this is a deliberate act with a state the
+    dashboard shows on every panel.
+
+    Persisted even when the device is offline: arming a device that is
+    rebooting is a reasonable thing to do, and the mode is re-applied by
+    handle_control on its next connect.
+    """
+    device_id = request.match_info["id"]
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    enabled = bool(body.get("enabled"))
+
+    loop = asyncio.get_event_loop()
+    row  = await loop.run_in_executor(None, db.get_device, device_id)
+    if row is None:
+        return _error("device_not_found", f"No device: {device_id}", 404)
+    if not row["approved"]:
+        return _error("not_approved",
+                      "Approve this device before collecting from it", 409)
+
+    await loop.run_in_executor(None, db.set_collect_mode, device_id, enabled)
+
+    live = _devices.get(device_id)
+    if live is not None:
+        # Lazy import — em_controller imports em_api at module level. It
+        # writes the device log line itself, since it is the thing that
+        # knows the mode actually took effect (and how many clips a session
+        # produced on the way out).
+        import em_controller
+        await em_controller.set_collect_mode(live, enabled)
+    else:
+        await _push_log_event(
+            device_id, "info", "controller",
+            f"Sample collection {'armed' if enabled else 'disarmed'} — "
+            f"device offline, takes effect on its next connect",
+        )
+    return _ok({
+        "enabled":   enabled,
+        "connected": live is not None,
+        "samples":   await loop.run_in_executor(
+            None, em_samples.usage, device_id
+        ),
+    })
+
+
+@auth.require_auth
+async def _get_samples(request: web.Request) -> web.Response:
+    """
+    GET /api/devices/{id}/samples — the clips collected from this device,
+    newest first, with the mode's own state alongside.
+
+    Served from the filesystem rather than a table: the files ARE the
+    record, and a DB row that disagreed with the volume (a restored backup,
+    a hand-deleted file) would be a second source of truth for no gain.
+    """
+    device_id = request.match_info["id"]
+    loop = asyncio.get_event_loop()
+    row  = await loop.run_in_executor(None, db.get_device, device_id)
+    if row is None:
+        return _error("device_not_found", f"No device: {device_id}", 404)
+    clips = await loop.run_in_executor(None, em_samples.list_for, device_id)
+    live  = _devices.get(device_id)
+    # What the segmenter is hearing, while it is hearing it. Without this,
+    # "I turned it on and got nothing" has no answer short of a log tail:
+    # a room whose floor sits 3dB under the open threshold and one where the
+    # mic is muted produce the same empty list. `dropped_short` separates a
+    # third case — something IS crossing the threshold, and it is a click.
+    seg = getattr(live, "collect_seg", None) if live else None
+    return _ok({
+        "enabled":  bool(row["collect_mode"]),
+        "clips":    clips,
+        "count":    len(clips),
+        "bytes":    sum(c["bytes"] for c in clips),
+        "ms":       sum(c["ms"] for c in clips),
+        "keep":     em_samples.KEEP_PER_DEVICE,
+        # Session counters live on the connection, so they reset when the
+        # device does — the file count above is the durable number.
+        "session":  getattr(live, "collect_clips", 0) if live else 0,
+        "live": None if seg is None else {
+            "floor_db":      round(seg.floor_db, 1),
+            "open_db":       round(seg.open_db, 1),
+            "frames":        seg.stats.frames,
+            "dropped_short": seg.stats.dropped_short,
+            "truncated":     seg.stats.truncated,
+        },
+    })
+
+
+@auth.require_auth
+async def _get_sample_audio(request: web.Request) -> web.Response:
+    """GET /api/devices/{id}/samples/{name} — one clip, as a WAV.
+
+    em_samples.resolve re-checks that the name belongs to the device in the
+    URL: both come from the path, so without it a name from one device
+    would reach another's audio."""
+    device_id = request.match_info["id"]
+    name      = request.match_info["name"]
+    path = em_samples.resolve(device_id, name)
+    if path is None:
+        return _error("no_sample", "No such sample", 404)
+    label = _slug(device_id)
+    return web.FileResponse(
+        path,
+        headers={
+            "Content-Type":        "audio/wav",
+            "Content-Disposition": f'attachment; filename="{label}-{name}"',
+            # Immutable once written, but the retention cap means a name can
+            # stop resolving — private and brief, never shared.
+            "Cache-Control":       "private, max-age=60",
+        },
+    )
+
+
+@auth.require_auth
+async def _get_samples_zip(request: web.Request) -> web.Response:
+    """
+    GET /api/devices/{id}/samples.zip — every clip in one archive.
+
+    This is what the feature is FOR: the clips are training input, and a
+    training run wants the set, not one file at a time. Built in memory in
+    an executor — the retention cap bounds it at ~64MB, and streaming a zip
+    would mean either holding the response open across a prune or writing a
+    temporary file on the same volume the clips live on.
+    """
+    device_id = request.match_info["id"]
+    loop = asyncio.get_event_loop()
+    row  = await loop.run_in_executor(None, db.get_device, device_id)
+    if row is None:
+        return _error("device_not_found", f"No device: {device_id}", 404)
+
+    label = _slug(row["label"] or device_id)
+
+    def _build() -> bytes | None:
+        clips = em_samples.list_for(device_id)
+        if not clips:
+            return None
+        buf = io.BytesIO()
+        # ZIP_STORED: WAV of speech does not compress meaningfully and
+        # deflating 64MB would hold a worker for seconds.
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
+            for clip in clips:
+                path = em_samples.resolve(device_id, clip["name"])
+                if path is None:
+                    continue      # pruned between listing and reading
+                z.write(path, arcname=f"{label}/{clip['name']}")
+        return buf.getvalue()
+
+    blob = await loop.run_in_executor(None, _build)
+    if blob is None:
+        return _error("no_samples", "No samples collected yet", 404)
+    return web.Response(
+        body=blob,
+        headers={
+            "Content-Type":        "application/zip",
+            "Content-Disposition": f'attachment; filename="{label}-samples.zip"',
+            "Cache-Control":       "no-store",
+        },
+    )
+
+
+@auth.require_admin
+async def _delete_sample(request: web.Request) -> web.Response:
+    """DELETE /api/devices/{id}/samples/{name} — drop one clip.
+
+    Triage: a clip that caught the dishwasher rather than the wake word is
+    worse than no clip, because it trains the model toward it."""
+    device_id = request.match_info["id"]
+    name      = request.match_info["name"]
+    path = em_samples.resolve(device_id, name)
+    if path is None:
+        return _error("no_sample", "No such sample", 404)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, path.unlink)
+    return _ok({"deleted": name})
+
+
+@auth.require_admin
+async def _delete_samples(request: web.Request) -> web.Response:
+    """DELETE /api/devices/{id}/samples — drop every clip for this device."""
+    device_id = request.match_info["id"]
+    loop = asyncio.get_event_loop()
+    row  = await loop.run_in_executor(None, db.get_device, device_id)
+    if row is None:
+        return _error("device_not_found", f"No device: {device_id}", 404)
+    removed = await loop.run_in_executor(None, em_samples.delete_all, device_id)
+    await _push_log_event(
+        device_id, "info", "controller",
+        f"Deleted {removed} collected sample(s)",
+    )
+    return _ok({"deleted": removed})
 
 
 @auth.require_auth
@@ -4311,6 +4535,13 @@ def _merge_device(row) -> dict:
         "thinking":         getattr(live, "thinking",  False) if live else False,
         "ringing":          getattr(live, "timer_ringing", False) if live else False,
         "stats":            live.stats if live else None,
+        # Wake-word sample collection. Persistent (it is a device row column,
+        # armed whether or not the device is up) with the live session
+        # counter beside it, so an offline device still shows that it will
+        # come back collecting rather than answering.
+        "collectMode":      bool(row["collect_mode"]) if "collect_mode" in row.keys() else False,
+        "collectClips":     getattr(live, "collect_clips", 0) if live else 0,
+        "collectLastMs":    getattr(live, "collect_last_ms", None) if live else None,
         # Control-plane round trip, controller-measured. The RF counters are
         # structurally zero on this hardware (the MTK driver populates
         # neither retries nor noise), so this is the only latency signal.

@@ -31,6 +31,7 @@ from typing import Optional
 
 import em_config_sections
 import em_recordings
+import em_samples
 
 log = logging.getLogger("echomuse.db")
 
@@ -812,6 +813,26 @@ MIGRATIONS: list[str] = [
 
     UPDATE system_config SET value = '17' WHERE key = 'schema_version';
     """,
+
+    # ── v18 — wake-word sample collection mode ──────────────────────────────
+    #
+    # A device in collect mode streams its wake audio to disk as training
+    # clips (em_samples) and starts no voice turns at all. A COLUMN rather
+    # than a config key, deliberately: config is section-scoped and
+    # fleet-inherited by default, so a key here would let one toggle in the
+    # fleet panel silence every Echo in the house at once. This is a mode
+    # someone puts ONE device into for an afternoon.
+    #
+    # Persisted rather than held in memory because the mode outlives the
+    # process that was asked for it: someone walks the house saying the wake
+    # word for twenty minutes, and a controller restart in the middle must
+    # not silently turn collection off — it would look like it was still
+    # running and record nothing.
+    """
+    ALTER TABLE devices ADD COLUMN collect_mode INTEGER NOT NULL DEFAULT 0;
+
+    UPDATE system_config SET value = '18' WHERE key = 'schema_version';
+    """,
 ]
 
 # Post-migration fixups that need Python rather than SQL. Keyed by the schema
@@ -1201,6 +1222,26 @@ def set_device_label(device_id: str, label: str) -> None:
         )
 
 
+def get_collect_mode(device_id: str) -> bool:
+    """
+    Whether this device is collecting wake-word training samples.
+
+    A device in collect mode answers nothing — see the v18 migration for why
+    this is a column rather than a config key.
+    """
+    row = _q1("SELECT collect_mode FROM devices WHERE device_id = ?", (device_id,))
+    return bool(row["collect_mode"]) if row is not None else False
+
+
+def set_collect_mode(device_id: str, enabled: bool) -> None:
+    """Arm or disarm sample collection for a device."""
+    with _tx() as conn:
+        conn.execute(
+            "UPDATE devices SET collect_mode = ? WHERE device_id = ?",
+            (1 if enabled else 0, device_id),
+        )
+
+
 def set_device_config(device_id: str, config: dict) -> None:
     """
     Persist updated config for a device.
@@ -1420,10 +1461,10 @@ def delete_device(device_id: str) -> None:
     This is a hard delete — use with care. Logs are removed first to
     satisfy the foreign key constraint.
 
-    Saved utterance recordings live on disk rather than in the DB, so no
-    cascade reaches them — they are unlinked explicitly here. Leaving a
-    deleted device's speech behind on the volume is the one leftover that
-    actually matters.
+    Saved utterance recordings and collected wake-word samples live on disk
+    rather than in the DB, so no cascade reaches them — they are unlinked
+    explicitly here. Leaving a deleted device's speech behind on the volume
+    is the one leftover that actually matters.
     """
     with _tx() as conn:
         conn.execute("DELETE FROM device_logs WHERE device_id = ?", (device_id,))
@@ -1434,6 +1475,12 @@ def delete_device(device_id: str) -> None:
             log.info(f"[db] Removed {removed} recording(s) for {device_id}")
     except Exception as e:
         log.warning(f"[db] Recording cleanup failed for {device_id}: {e}")
+    try:
+        removed = em_samples.delete_device(device_id)
+        if removed:
+            log.info(f"[db] Removed {removed} collected sample(s) for {device_id}")
+    except Exception as e:
+        log.warning(f"[db] Sample cleanup failed for {device_id}: {e}")
     log.info(f"[db] Device deleted: {device_id}")
 
 
