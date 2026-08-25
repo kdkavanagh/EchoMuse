@@ -62,6 +62,7 @@ import em_wake_scorer
 import em_pki
 import em_player
 import em_recordings
+import em_capture
 import em_samples
 import em_ambient
 import em_volume
@@ -306,6 +307,14 @@ async def create_app() -> web.Application:
     app.router.add_delete("/api/devices/{id}/ambient",        _delete_ambient_all)
     app.router.add_get("/api/devices/{id}/ambient/{name}",    _get_ambient_audio)
     app.router.add_delete("/api/devices/{id}/ambient/{name}", _delete_ambient)
+    # Script-driven capture. The mode, then windows inside it — see em_capture.
+    # /window/stop before /window: aiohttp matches in registration order and
+    # the two would otherwise be ambiguous only by luck.
+    app.router.add_get("/api/devices/{id}/capture",             _get_device_capture)
+    app.router.add_post("/api/devices/{id}/capture",            _post_device_capture)
+    app.router.add_post("/api/devices/{id}/capture/window/stop", _post_capture_window_stop)
+    app.router.add_get("/api/devices/{id}/capture/recording",   _get_capture_recording)
+    app.router.add_post("/api/devices/{id}/capture/window",     _post_capture_window)
     app.router.add_post("/api/devices/{id}/wifi",         _post_device_wifi)
     app.router.add_post("/api/devices/{id}/wifi/scan",    _post_device_wifi_scan)
     app.router.add_post("/api/devices/{id}/update",       _post_device_update)
@@ -1581,6 +1590,198 @@ async def _get_device_logs(request: web.Request) -> web.Response:
         for r in rows
     ]
     return _ok(entries)
+
+
+# ─── Script-driven capture ────────────────────────────────────────────────────
+#
+# The mode (em_controller.set_capture_mode) plus windows inside it. Unlike
+# sample collection this is NOT persisted and cannot be armed on an offline
+# device: the webhook is a running process's address, so there is nothing
+# useful to remember about it — see em_capture's docstring.
+
+
+def _live_capture_device(device_id: str):
+    """The connected Device, or None. Lazy import for the usual cycle."""
+    return _devices.get(device_id)
+
+
+@auth.require_admin
+async def _post_device_capture(request: web.Request) -> web.Response:
+    """
+    POST /api/devices/{id}/capture — body
+        {"enabled": true, "webhook": "http://host:port/clip", "idle_s": 300}
+
+    Puts a device into (or out of) script-driven capture: it starts no voice
+    turns, and every recording window opened below is POSTed to `webhook` as
+    a WAV.
+
+    Admin-only for the same reason collect mode is — it SUSPENDS the
+    assistant on that device — and additionally requires the device to be
+    CONNECTED, which collect mode does not. Arming an offline device is
+    meaningful there (the mode is persisted and re-applied on connect) and
+    meaningless here: there is nothing to persist, and the caller is a script
+    that is about to start playing audio at a device that is not listening.
+    """
+    device_id = request.match_info["id"]
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    enabled = bool(body.get("enabled"))
+
+    loop = asyncio.get_event_loop()
+    row  = await loop.run_in_executor(None, db.get_device, device_id)
+    if row is None:
+        return _error("device_not_found", f"No device: {device_id}", 404)
+
+    live = _live_capture_device(device_id)
+    import em_controller
+
+    if not enabled:
+        if live is not None:
+            await em_controller.set_capture_mode(live, False)
+        return _ok(em_controller.capture_state(live))
+
+    if not row["approved"]:
+        return _error("not_approved",
+                      "Approve this device before capturing from it", 409)
+    if live is None:
+        return _error("not_connected",
+                      "Capture mode needs a connected device — it is not "
+                      "persisted and cannot be armed in advance", 409)
+
+    # Absent webhook means PULL: the controller holds each finished recording
+    # and the caller collects it from /capture/recording. That is the mode
+    # that works everywhere — push needs a route from the controller back to
+    # the caller, which a controller on a macvlan network does not have.
+    webhook = body.get("webhook") or None
+    if webhook is not None and not em_capture.valid_webhook(webhook):
+        return _error("bad_webhook",
+                      "webhook must be an http(s) URL with a host", 400)
+
+    await em_controller.set_capture_mode(
+        live, True, webhook=webhook, idle_s=body.get("idle_s"),
+    )
+    return _ok(em_controller.capture_state(live))
+
+
+@auth.require_admin
+async def _post_capture_window(request: web.Request) -> web.Response:
+    """
+    POST /api/devices/{id}/capture/window — body {"tag": "...", "max_ms": N}
+
+    Opens a recording window. Returns its session id, which the caller can
+    pass back to /capture/window/stop so a stop cannot land on the wrong
+    window if the previous one already closed itself on `max_ms`.
+
+    `tag` is opaque here and comes straight back on the delivery as
+    `X-EM-Tag`: correlation is the caller's business, and a tag format the
+    controller understood would be a second copy to drift.
+    """
+    device_id = request.match_info["id"]
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    live = _live_capture_device(device_id)
+    if live is None:
+        return _error("not_connected", f"Device not connected: {device_id}", 409)
+    if not getattr(live, "capture_mode", False):
+        return _error("not_capturing",
+                      "Arm capture mode before opening a window", 409)
+
+    import em_controller
+    window = await em_controller.open_capture_window(
+        live,
+        tag=str(body.get("tag") or ""),
+        max_ms=em_capture.clamp_max_ms(body.get("max_ms")),
+    )
+    return _ok({
+        "session": window.session,
+        "tag":     window.tag,
+        "max_ms":  window.max_ms,
+    })
+
+
+@auth.require_admin
+async def _post_capture_window_stop(request: web.Request) -> web.Response:
+    """
+    POST /api/devices/{id}/capture/window/stop — body {"session": "..."} 
+
+    Closes the open window and queues it for delivery. An unknown or already
+    finished session is not an error: the window closing itself on `max_ms`
+    is a normal outcome, and the caller finds out from the delivery either
+    way.
+    """
+    device_id = request.match_info["id"]
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    live = _live_capture_device(device_id)
+    if live is None:
+        return _error("not_connected", f"Device not connected: {device_id}", 409)
+
+    import em_controller
+    closed = await em_controller.close_capture_window(
+        live, session=(body.get("session") or None)
+    )
+    return _ok({"closed": closed, **em_controller.capture_state(live)})
+
+
+@auth.require_admin
+async def _get_capture_recording(request: web.Request) -> web.Response:
+    """
+    GET /api/devices/{id}/capture/recording?session=…&wait=…
+
+    Collect one finished recording, as a WAV, with the same `X-EM-*` headers
+    the webhook delivery carries — so a driver can use either transport
+    without a second parser.
+
+    This is the PULL half of delivery, and on some deployments it is the only
+    half that can work: a controller on a macvlan network cannot reach its
+    own Docker host, so a webhook served by the machine driving the run times
+    out every time. Pull needs no route back.
+
+    Long-polls up to `wait` seconds (default 30, capped at 120). 404 means
+    nothing arrived in that time, which is an ordinary answer rather than an
+    error — the driver decides whether to retry or record the cell as failed.
+    """
+    device_id = request.match_info["id"]
+    live = _live_capture_device(device_id)
+    if live is None:
+        return _error("not_connected", f"Device not connected: {device_id}", 409)
+    if not getattr(live, "capture_mode", False):
+        return _error("not_capturing", "Capture mode is not armed", 409)
+
+    session = request.query.get("session") or None
+    try:
+        wait_s = float(request.query.get("wait", 30))
+    except ValueError:
+        wait_s = 30.0
+    wait_s = max(0.0, min(wait_s, 120.0))
+
+    import em_controller
+    result = await em_controller.take_recording(live, session, wait_s)
+    if result is None:
+        return _error("no_recording", "No recording available", 404)
+    return web.Response(
+        body=result.wav(),
+        headers=em_capture.headers(result, device_id),
+    )
+
+
+@auth.require_auth
+async def _get_device_capture(request: web.Request) -> web.Response:
+    """GET /api/devices/{id}/capture — the mode's live state.
+
+    Everything here is per-connection, so an offline device reports the mode
+    off rather than a stale sink."""
+    device_id = request.match_info["id"]
+    import em_controller
+    return _ok(em_controller.capture_state(_live_capture_device(device_id)))
 
 
 # ─── OTA: update + rollback ───────────────────────────────────────────────────
@@ -4849,6 +5050,10 @@ def _merge_device(row) -> dict:
         "ambientMs":        (getattr(live.ambient_rec, "duration_ms", 0)
                              if live is not None and getattr(live, "ambient_rec", None) is not None
                              else 0),
+        # Script-driven capture. Live-only by construction — nothing is
+        # persisted, so an offline device is never capturing.
+        "captureMode":      bool(getattr(live, "capture_mode", False)) if live else False,
+        "captureDelivered": getattr(live, "capture_delivered", 0) if live else 0,
         # Control-plane round trip, controller-measured. The RF counters are
         # structurally zero on this hardware (the MTK driver populates
         # neither retries nor noise), so this is the only latency signal.

@@ -69,15 +69,6 @@ DEFAULT_DEVICE_CONFIG = {
     "adcDigitalGain":   88,
     "adcMicpga":        40,
     # micGainDb: fixed digital gain (dB) the device applies to the full
-    # 24-bit capture before quantising to the 16-bit stream. Sized from
-    # 20h fleet logs (2026-07-07): speech RMS at wake detection was
-    # 0.0001–0.0006 FS (~3–20 LSB in 16-bit — the old S24→S16 truncation
-    # discarded most of the signal), loudest observed chunk 0.0035 FS, so
-    # +24dB (×16) lifts speech into a usable range with ample clipping
-    # headroom. Device clamps to [0, 42]; clipped-sample count appears in
-    # the device's periodic VAD diag log. Note: the device interprets
-    # vadThreshold in pre-gain units (threshold is scaled by the gain
-    # internally), so this can be tuned without retuning vadThreshold.
     "micGainDb":        24,
     # AEC (speexdsp, device-side, whole mic path incl. wake stream).
     # Default ON, and coupled to bargeInEnabled below: with barge-in the mic
@@ -96,6 +87,14 @@ DEFAULT_DEVICE_CONFIG = {
     "aecEnabled":       True,
     "aecDelayMs":       0,
     "aecTailMs":        300,
+    # ringBargeIn: what the wake listener does with mic frames captured
+    # while a timer ring is AUDIBLE. Off (the default) drops them and
+    # rescores the silent gap between bursts from a reset model; on scores
+    # them at the barge-in threshold, so the wake word can land during the
+    # chime instead of only in the gaps.
+    #
+    # This is a controller-side question about scoring, not a device
+    # setting: the device's audio HAL cancels its own echo unconditionally
     "startupVolume":    85,
     # vadThreshold: 0.001 (normalised RMS pre-AGC).
     # Q2 fix (2026-07-05 review, tracked as B6): this was drifted to 0.003 in
@@ -837,6 +836,8 @@ MIGRATIONS: list[str] = [
 
     # ── v19 — ambient recording mode ────────────────────────────────────────
     #
+    # The other half of a training set: collect mode captures the wake word
+    # and cuts at the silences, this one holds the mic open and hands back a
     # single WAV of the whole session (em_ambient) — room noise, which has no
     # onsets to cut on and is worthless once it has been chopped up.
     #

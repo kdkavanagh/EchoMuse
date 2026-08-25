@@ -58,6 +58,7 @@ import socket
 import struct
 
 import numpy as np
+import aiohttp
 from aiohttp import web
 from zeroconf.asyncio import AsyncZeroconf
 from zeroconf import ServiceInfo
@@ -77,6 +78,7 @@ import em_button
 import em_endpoint
 import em_samples
 import em_ambient
+import em_capture
 import em_tap_burst
 import em_esphome as esphome
 import em_ble_proxy
@@ -356,6 +358,7 @@ class Device:
         self.collect_clips: int = 0            # clips written this session
         self.collect_last_ms: int | None = None
         self.collect_led_task: asyncio.Task | None = None
+
         # Ambient recording (em_ambient). The same shape as collect mode —
         # persisted (schema v19), suspends voice turns, taps the same wake
         # frames — but the mic is simply held open and the whole session
@@ -369,6 +372,40 @@ class Device:
         self.ambient_files: int = 0            # files closed this session
         self.ambient_led_task: asyncio.Task | None = None
 
+        # Script-driven capture (em_capture). Like collect mode it suspends
+        # voice turns and taps the same wake-stream frames, but the windows
+        # are opened and closed by whoever is driving — so one playback
+        # yields exactly one recording, which a segmenter cannot promise.
+        #
+        # Deliberately NOT persisted, and that is the opposite call to
+        # collect_mode. A webhook is the address of a RUNNING process: a
+        # controller that came back up still suspended, POSTing at a socket
+        # nobody holds, would be a device answering nothing for a reason
+        # nothing on screen explains. It lives on the connection, and the
+        # idle dead-man below covers the script dying without cleaning up.
+        self.capture_mode: bool = False
+        self.capture_webhook: str | None = None
+        self.capture_idle_s: float = em_capture.DEFAULT_IDLE_S
+        self.capture_window: em_capture.Window | None = None
+        self.capture_last_activity: float = 0.0     # monotonic
+        self.capture_queue: asyncio.Queue | None = None
+        self.capture_sender_task: asyncio.Task | None = None
+        self.capture_watchdog_task: asyncio.Task | None = None
+        self.capture_led_task: asyncio.Task | None = None
+        self.capture_delivered: int = 0
+        self.capture_failed: int = 0
+        # Two counters, not one: the total is what the disarm log and the API
+        # report, and `_pending` is what rides the next delivery's
+        # X-EM-Dropped header and is zeroed as it is sent. Folding them
+        # together made the total read as "dropped since the last successful
+        # delivery", i.e. usually zero, in a line claiming to be a summary.
+        self.capture_dropped: int = 0               # windows the queue refused
+        self.capture_dropped_pending: int = 0       # not yet reported to the caller
+        # PULL mode (no webhook): closed windows wait here to be collected.
+        # See em_capture.ResultStore — push is unusable on a macvlan
+        # controller, which cannot reach its own Docker host.
+        self.capture_store: em_capture.ResultStore = em_capture.ResultStore()
+        self.capture_ready: asyncio.Event = asyncio.Event()
         self.eq_bands:      list  = [0.0] * 8
         self.eq_loudness:   bool  = False
         # LED ring scene — render-ready palette/spinner from em_scenes,
@@ -986,6 +1023,8 @@ async def _push_device_state(device: Device) -> None:
             # has to be as visible. Separate key rather than folded into
             # collectMode: they mean different things to whoever is looking
             # at the panel, and one of them survives a restart.
+            "captureMode":      device.capture_mode,
+            "captureDelivered": device.capture_delivered,
         },
     })
 
@@ -1764,15 +1803,19 @@ async def _run_voice_locked(device: Device, trigger_label: str = "unknown", is_w
     trace display, not a control-flow key) so a future change to the label
     format can't silently change behaviour here.
     """
-    # Sample collection suspends the assistant entirely — see em_samples.
-    # Enforced here rather than only at each trigger because this is the one
-    # place all three of them meet (wake word, dot button, and HA's own
-    # start_conversation), and a mode that stops audio reaching Home
+    # Sample collection, ambient recording and script-driven capture all
+    # suspend the assistant entirely — see em_samples, em_ambient and
+    # em_capture. Enforced here rather than only at each trigger because this
+    # is the one place all three triggers meet (wake word, dot button, and
+    # HA's own start_conversation), and a mode that stops audio reaching Home
     # Assistant has to hold for the paths nobody remembered.
-    if device.collect_mode:
+    if device.collect_mode or device.capture_mode or device.ambient_mode:
+        why = ("capturing to a webhook" if device.capture_mode
+               else "recording ambient audio" if device.ambient_mode
+               else "collecting wake-word samples")
         log.info(
             f"[{device.device_id}] Voice turn refused ({trigger_label}) — "
-            f"device is collecting wake-word samples"
+            f"device is {why}"
         )
         return False
 
@@ -2273,6 +2316,9 @@ async def collect_teardown(device: Device) -> None:
 # session is one file, which is the whole contract (see em_ambient's
 # docstring for why a segmenter would ruin room noise).
 
+# The same magenta throb collect and capture use. Three modes, one ring
+# colour, one meaning: this device is recording and will not answer you.
+# Which of them is running is a dashboard question, not a ring question.
 AMBIENT_ANIM      = COLLECT_ANIM
 AMBIENT_TTL_SEC   = COLLECT_TTL_SEC
 AMBIENT_RENEW_SEC = COLLECT_RENEW_SEC
@@ -2369,6 +2415,9 @@ async def _ambient_frame(device: Device, frame: bytes) -> None:
             return
     if rec.full:
         # The length cap rolls instead of stopping: an unattended overnight
+        # capture is a real use of this mode, and ending it silently at the
+        # cap would lose the rest of the night. The roll is visible — each
+        # file is listed with its own timestamp.
         name = await _ambient_close(device)
         log.info(
             f"[{device.device_id}] Ambient recording hit the "
@@ -2446,6 +2495,498 @@ async def ambient_teardown(device: Device) -> None:
         device.ambient_led_task.cancel()
         device.ambient_led_task = None
     await _ambient_close(device)
+
+
+# ─── Script-driven capture ────────────────────────────────────────────────────
+#
+# em_capture holds the window and its metadata; this is the lifecycle, the
+# frame tap and the transport. See em_capture's docstring for why a window
+# rather than the segmenter, and CLAUDE.md for why the mode is not persisted.
+
+# The ring while capturing. The same magenta throb collect mode uses, on
+# purpose: both mean "this device is recording and will not answer you", and
+# a second colour for the same fact would have to be learned twice. Which of
+# the two is running is a dashboard question, not a ring question.
+CAPTURE_ANIM      = COLLECT_ANIM
+CAPTURE_TTL_SEC   = COLLECT_TTL_SEC
+CAPTURE_RENEW_SEC = COLLECT_RENEW_SEC
+
+# How many closed windows may wait on the sender before new ones are dropped.
+# Small deliberately: a webhook that cannot keep up is a caller that has gone
+# away, and holding a minute of recordings for it costs memory to deliver
+# audio nobody is waiting for. Drops are counted and reported.
+CAPTURE_QUEUE_MAX = 4
+
+# One delivery attempt's timeout, and how many attempts. The receiver is a
+# script on the LAN writing a file, so a slow one is a stuck one.
+CAPTURE_POST_TIMEOUT_S = 15.0
+CAPTURE_POST_ATTEMPTS  = 3
+CAPTURE_POST_BACKOFF_S = 1.0
+
+# How often the dead-man and the overdue-window check run.
+CAPTURE_WATCHDOG_S = 2.0
+
+
+async def _capture_led_loop(device: Device):
+    """Hold the capture ring up for as long as the mode is on."""
+    try:
+        while device.capture_mode:
+            await device.send_led_anim({**CAPTURE_ANIM, "ttlSec": CAPTURE_TTL_SEC})
+            await asyncio.sleep(CAPTURE_RENEW_SEC)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        # A ring is feedback, not the feature — same as the collect loop.
+        log.warning(f"[{device.device_id}] Capture ring stopped: {e}")
+
+
+async def _capture_deliver(device: Device, result: em_capture.CaptureResult,
+                           webhook: str, dropped: int) -> bool:
+    """
+    POST one recording. Returns True if it was accepted.
+
+    Redirects are NOT followed and the scheme was checked before the mode was
+    armed (em_capture.valid_webhook): the URL comes from an authenticated
+    admin, but it is still a controller-side fetch of a user-supplied address
+    on a home LAN, and refusing to be bounced somewhere else is the cheap
+    half of not building an SSRF gadget.
+    """
+    body    = result.wav()
+    headers = em_capture.headers(result, device.device_id, dropped)
+    timeout = aiohttp.ClientTimeout(total=CAPTURE_POST_TIMEOUT_S)
+    last: Exception | str | None = None
+    for attempt in range(CAPTURE_POST_ATTEMPTS):
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(webhook, data=body, headers=headers,
+                                        allow_redirects=False) as resp:
+                    if 200 <= resp.status < 300:
+                        return True
+                    last = f"HTTP {resp.status}"
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            last = e
+        if attempt < CAPTURE_POST_ATTEMPTS - 1:
+            await asyncio.sleep(CAPTURE_POST_BACKOFF_S * (attempt + 1))
+    # `type(last).__name__` is not decoration: a bare asyncio.TimeoutError
+    # stringifies to the EMPTY STRING, so the message read "delivery failed:"
+    # with nothing after it — which is precisely the case that matters, since
+    # a timeout is what an unreachable webhook produces.
+    detail = last if isinstance(last, str) else f"{type(last).__name__}: {last}"
+    log.warning(
+        f"[{device.device_id}] Capture delivery failed "
+        f"(tag={result.tag!r}, {result.ms}ms): {detail}"
+    )
+    return False
+
+
+async def _capture_sender(device: Device):
+    """
+    Drain closed windows to the webhook, one at a time.
+
+    Off the frame path on purpose: the mic loop appends bytes and returns, so
+    a slow webhook degrades to dropped WINDOWS — counted, logged and reported
+    in the mode's state — never to a stuttering microphone. Same rule as
+    shadow.Scorer.Push on the device.
+    """
+    queue = device.capture_queue
+    if queue is None:
+        return
+    try:
+        while True:
+            result = await queue.get()
+            # task_done in a finally, unconditionally: _capture_drain waits on
+            # queue.join() during disarm, and one missed call there hangs the
+            # disarm until its timeout on every subsequent run.
+            try:
+                webhook = device.capture_webhook
+                if webhook is None:
+                    continue
+                dropped = device.capture_dropped_pending
+                device.capture_dropped_pending = 0
+                ok = await _capture_deliver(device, result, webhook, dropped)
+                if ok:
+                    device.capture_delivered += 1
+                    log.info(
+                        f"[{device.device_id}] Capture delivered "
+                        f"({result.ms}ms, tag={result.tag!r}, "
+                        f"peak {result.peak_db:.1f}dBFS, floor {result.floor_db:.1f}dBFS"
+                        f"{', truncated' if result.truncated else ''})"
+                    )
+                else:
+                    device.capture_failed += 1
+                    # A failed delivery that only reached stdout is
+                    # indistinguishable from a window that never opened,
+                    # which is the question the caller will be asking.
+                    db.log_device(
+                        device.device_id, "warn", "controller",
+                        f"Capture delivery failed for tag {result.tag!r}",
+                    )
+                await _push_device_state(device)
+            finally:
+                queue.task_done()
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.error(f"[{device.device_id}] Capture sender stopped: {e}")
+
+
+async def _capture_watchdog(device: Device):
+    """
+    Close overdue windows and clear a mode nobody is driving any more.
+
+    Both halves are wall-clock checks OUTSIDE the frame path, deliberately: a
+    device that stops sending frames stops advancing the window's audio
+    clock, so a stalled link would otherwise hold a window open forever and
+    the caller would wait for a delivery that never comes.
+    """
+    try:
+        while device.capture_mode:
+            await asyncio.sleep(CAPTURE_WATCHDOG_S)
+            if not device.capture_mode:
+                return
+            now = _capture_now()
+            if em_capture.window_overdue(device.capture_window, now):
+                log.info(
+                    f"[{device.device_id}] Capture window overdue "
+                    f"(tag={device.capture_window.tag!r}) — closing on the clock"
+                )
+                await close_capture_window(device)
+                continue
+            if em_capture.decide_idle_expiry(
+                now, device.capture_last_activity, device.capture_idle_s,
+                device.capture_window is not None,
+            ):
+                log.info(
+                    f"[{device.device_id}] Capture mode idle for "
+                    f"{device.capture_idle_s:.0f}s — clearing"
+                )
+                db.log_device(
+                    device.device_id, "info", "controller",
+                    f"Capture mode cleared after {device.capture_idle_s:.0f}s idle "
+                    f"(the driving script is gone)",
+                )
+                await set_capture_mode(device, False)
+                return
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.error(f"[{device.device_id}] Capture watchdog stopped: {e}")
+
+
+def _capture_now() -> float:
+    """
+    The monotonic clock this module measures capture with.
+
+    The event loop's, not `time.monotonic()`: em_controller does not import
+    `time` at all, deliberately — reaching for it at the wake-detection site
+    once raised NameError and killed the listener for the rest of the
+    process. Every capture timestamp comes from here so the window's own
+    clock and the watchdog's are the same clock, which is the only way
+    `overdue` means anything.
+    """
+    return asyncio.get_event_loop().time()
+
+
+def _capture_cancel_tasks(device: Device) -> None:
+    """
+    Drop the mode's three background tasks.
+
+    Never cancels the task it is RUNNING ON. The watchdog disarms the mode
+    itself when the dead-man fires, so a blind cancel would raise
+    CancelledError into set_capture_mode at its next await and abandon the
+    rest of the disarm — the webhook and queue left set, no log line, no
+    state push. The device would look like it was still capturing to
+    everything except the frame tap.
+    """
+    current = asyncio.current_task()
+    for attr in ("capture_sender_task", "capture_watchdog_task",
+                 "capture_led_task"):
+        task = getattr(device, attr)
+        setattr(device, attr, None)
+        if task is not None and task is not current:
+            task.cancel()
+
+
+def _capture_touch(device: Device) -> None:
+    """Mark the mode as being driven. Resets the dead-man."""
+    device.capture_last_activity = _capture_now()
+
+
+async def _capture_frame(device: Device, frame: bytes, rms: float) -> None:
+    """
+    One wake-stream frame, while capturing.
+
+    The RMS is the one the wake listener already computed, exactly as
+    _collect_frame takes it — recomputing it here would double the per-frame
+    numpy work on the busiest path in the controller.
+
+    A frame arriving with no window open is discarded rather than buffered.
+    The caller decides what a recording contains; audio from between windows
+    belongs to nothing.
+    """
+    window = device.capture_window
+    if window is None:
+        return
+    if window.push(frame, rms):
+        await close_capture_window(device)
+
+
+async def open_capture_window(device: Device, tag: str,
+                              max_ms: int) -> em_capture.Window:
+    """
+    Start recording. Closes any window already open first.
+
+    Closing rather than refusing: a caller whose previous window was never
+    stopped has almost always lost the reply to it, and refusing here would
+    make the whole run wedge on one lost message instead of one lost clip.
+    """
+    if device.capture_window is not None:
+        await close_capture_window(device)
+    # opened_mono from our clock, not em_capture's default — see _capture_now.
+    window = em_capture.Window(tag=tag, max_ms=max_ms,
+                               opened_mono=_capture_now())
+    device.capture_window = window
+    _capture_touch(device)
+    log.info(
+        f"[{device.device_id}] Capture window open "
+        f"(tag={window.tag!r}, max {window.max_ms}ms, session {window.session[:8]})"
+    )
+    return window
+
+
+async def close_capture_window(device: Device,
+                               session: str | None = None) -> bool:
+    """
+    Stop the open window and queue it for delivery.
+
+    `session` is an optional guard: a stop that names a window which has
+    already closed itself on the cap is a no-op rather than closing the NEXT
+    one, which on a matrix run would silently pair every recording with the
+    wrong source file from there on.
+    """
+    window, device.capture_window = device.capture_window, None
+    _capture_touch(device)
+    if window is None:
+        return False
+    if session and session != window.session:
+        # Put it back — the stop was for something else.
+        device.capture_window = window
+        return False
+    result = window.close()
+    if not result.pcm:
+        # Nothing arrived. Report it as a failure rather than posting an
+        # empty WAV: a zero-length recording read as success is how a caller
+        # ends up with a corpus of silence it believes in.
+        device.capture_failed += 1
+        log.warning(
+            f"[{device.device_id}] Capture window closed empty "
+            f"(tag={result.tag!r}) — no mic frames arrived"
+        )
+        await _push_device_state(device)
+        return False
+    if device.capture_webhook is None:
+        # Pull mode: hold it for the driver to collect. No queue, no retry,
+        # no reachability requirement in this direction at all.
+        device.capture_store.put(result)
+        device.capture_ready.set()
+        log.info(
+            f"[{device.device_id}] Capture ready "
+            f"({result.ms}ms, tag={result.tag!r}, session {result.session[:8]}, "
+            f"peak {result.peak_db:.1f}dBFS)"
+        )
+        await _push_device_state(device)
+        return True
+    queue = device.capture_queue
+    if queue is None:
+        return False
+    try:
+        queue.put_nowait(result)
+    except asyncio.QueueFull:
+        device.capture_dropped += 1
+        device.capture_dropped_pending += 1
+        log.warning(
+            f"[{device.device_id}] Capture queue full — dropped "
+            f"tag={result.tag!r} ({result.ms}ms)"
+        )
+        return False
+    return True
+
+
+async def set_capture_mode(device: Device, enabled: bool,
+                           webhook: str | None = None,
+                           idle_s: float | None = None) -> None:
+    """
+    Arm or disarm script-driven capture.
+
+    Turning it ON suspends voice turns on this device, lights the ring and
+    starts the sender and watchdog. Turning it OFF closes any open window
+    FIRST, so the recording the caller is waiting for is still delivered —
+    the same reasoning as set_collect_mode flushing its clip, and for the
+    same reason: whoever switched it off has usually just finished the thing
+    they turned it on for.
+
+    Re-arming an already-armed device with a NEW webhook is allowed and
+    re-points the sink: a script that restarted has a new port, and making it
+    disarm first would be a round trip whose failure mode is a stranded
+    device.
+    """
+    enabled = bool(enabled)
+
+    if enabled:
+        # Assigned unconditionally: None means pull mode, and treating it as
+        # "leave whatever was there" would silently keep a dead webhook from
+        # a previous run and fail every delivery against it.
+        if not device.capture_mode:
+            device.capture_webhook = webhook
+        elif webhook is not None:
+            device.capture_webhook = webhook
+        if idle_s is not None:
+            device.capture_idle_s = em_capture.clamp_idle_s(idle_s)
+        _capture_touch(device)
+        if device.capture_mode:
+            return                     # already on; sink updated above
+        device.capture_mode      = True
+        device.capture_delivered = 0
+        device.capture_failed    = 0
+        device.capture_dropped   = 0
+        device.capture_dropped_pending = 0
+        device.capture_store.clear()
+        device.capture_ready.clear()
+        if device.capture_webhook is not None:
+            device.capture_queue       = asyncio.Queue(maxsize=CAPTURE_QUEUE_MAX)
+            device.capture_sender_task = asyncio.create_task(_capture_sender(device))
+        else:
+            device.capture_queue = None
+        device.capture_watchdog_task = asyncio.create_task(_capture_watchdog(device))
+        device.capture_led_task      = asyncio.create_task(_capture_led_loop(device))
+        sink = (f"webhook {device.capture_webhook}" if device.capture_webhook
+                else "pull (no webhook)")
+        log.info(
+            f"[{device.device_id}] Capture mode ON ({sink}) — this device "
+            f"will not start voice turns until it is switched off"
+        )
+        db.log_device(device.device_id, "info", "controller",
+                      "Capture mode started (voice turns suspended)")
+        await _push_device_state(device)
+        return
+
+    if not device.capture_mode:
+        return
+    # Close before tearing the sender down, so the last window still ships.
+    await close_capture_window(device)
+    await _capture_drain(device)
+    device.capture_mode = False
+    _capture_cancel_tasks(device)
+    device.capture_queue   = None
+    device.capture_webhook = None
+    # The store is deliberately NOT cleared: the driver's own cleanup disarms
+    # right after collecting, and a race there would throw away the recording
+    # it is about to ask for. Arming again clears it.
+    # A device that dropped off between the call and here must not turn the
+    # API call into a 500 — the mode is off, which is what was asked for.
+    with contextlib.suppress(Exception):
+        await leds_off(device)
+    log.info(
+        f"[{device.device_id}] Capture mode OFF — "
+        f"{device.capture_delivered} delivered, {device.capture_failed} failed, "
+        f"{device.capture_dropped} dropped"
+    )
+    db.log_device(
+        device.device_id, "info", "controller",
+        f"Capture mode stopped ({device.capture_delivered} recordings delivered)",
+    )
+    await _push_device_state(device)
+
+
+async def _capture_drain(device: Device, timeout: float = 30.0) -> None:
+    """
+    Wait for the sender to finish what is queued, briefly.
+
+    Bounded: a webhook that has gone away must not hold the disarm — the
+    point of disarming is usually that it HAS gone away.
+    """
+    queue = device.capture_queue
+    if queue is None:
+        return
+    with contextlib.suppress(asyncio.TimeoutError):
+        await asyncio.wait_for(queue.join(), timeout=timeout)
+
+
+async def capture_teardown(device: Device) -> None:
+    """
+    Device is going away. Drop the tasks; the audio goes with the connection.
+
+    No LED message and no state push — the socket this would travel over is
+    the one that just closed. Nothing is persisted, so a device that comes
+    back is NOT put back into capture mode: the caller has to re-arm, which
+    is correct, because the caller is the only thing that knows whether it
+    is still running.
+    """
+    device.capture_mode    = False
+    device.capture_window  = None
+    device.capture_queue   = None
+    device.capture_webhook = None
+    _capture_cancel_tasks(device)
+
+
+async def take_recording(device: Device, session: str | None,
+                         wait_s: float) -> em_capture.CaptureResult | None:
+    """
+    Collect one finished recording, waiting up to `wait_s` for it to appear.
+
+    Long-polling rather than a bare 404-and-retry: the driver's next action
+    after starting a playback is to wait for exactly this, and a poll loop
+    would either spin or add latency to every single cell of a run that is
+    thousands of cells long.
+
+    The wait is on an Event rather than a sleep loop, so a recording that
+    lands 50ms in is returned in 50ms. The event is cleared whenever the
+    store empties, and re-set by close_capture_window.
+    """
+    deadline = _capture_now() + max(0.0, wait_s)
+    while True:
+        result = device.capture_store.take(session)
+        if not device.capture_store:
+            device.capture_ready.clear()
+        if result is not None:
+            _capture_touch(device)
+            return result
+        remaining = deadline - _capture_now()
+        if remaining <= 0:
+            return None
+        try:
+            await asyncio.wait_for(device.capture_ready.wait(), timeout=remaining)
+        except asyncio.TimeoutError:
+            return None
+
+
+def capture_state(device: Device | None) -> dict:
+    """The mode's state, for the API. Safe on a device that is not connected."""
+    if device is None or not getattr(device, "capture_mode", False):
+        return {"enabled": False}
+    window = device.capture_window
+    return {
+        "enabled":   True,
+        "mode":      "push" if device.capture_webhook else "pull",
+        "webhook":   device.capture_webhook,
+        "ready":     len(device.capture_store),
+        "evicted":   device.capture_store.evicted,
+        "idle_s":    device.capture_idle_s,
+        "delivered": device.capture_delivered,
+        "failed":    device.capture_failed,
+        "dropped":   device.capture_dropped,
+        "window": None if window is None else {
+            "session":   window.session,
+            "tag":       window.tag,
+            "max_ms":    window.max_ms,
+            "ms":        window.ms,
+            "frames":    window.frames,
+            "peak_db":   round(window.peak_db, 1),
+            "floor_db":  round(window.floor_db, 1),
+        },
+    }
 
 
 # ─── Wake word listener ───────────────────────────────────────────────────────
@@ -2607,6 +3148,9 @@ async def wake_word_listener(device: Device):
                 # session. The only gap left is a MUTED mic, above: there is
                 # nothing to record when the mic is off.
                 #
+                # Passive for the same reason a capture window can open
+                # underneath a session — the two write to different stores,
+                # and neither is the poorer for it.
                 if device.ambient_mode:
                     await _ambient_frame(device, frame)
 
@@ -2637,8 +3181,16 @@ async def wake_word_listener(device: Device):
                 # No reset at the edge on this path, deliberately — the whole
                 # point is a rolling context that spans the burst/gap boundary,
                 # and resetting would discard the context just built.
+                # every capture, and the ring is playback like any other, so
+                # what arrives here is residual rather than chime. Score it —
+                # at the barge threshold, set below — so a wake word can land
+                # during the burst instead of only in the gap. Purely additive:
+                # the cadence is unchanged and the silent window is still
+                # there, so the worst case is the behaviour above. No reset at
+                # the edge on this path, deliberately — the whole point is a
+                # rolling context that spans the burst/gap boundary, and
+                # resetting would discard the context just built.
                 #
-                # The risk this takes is a chime whose residual scores as the
                 # wake word, which silences the alarm itself. AEC being opt-in
                 # is the gate for now; scoring an uploaded sound against the
                 # model at upload time is the way to retire it properly, and
@@ -2680,16 +3232,27 @@ async def wake_word_listener(device: Device):
                 else:
                     device.noise_floor += 0.008 * (rms - device.noise_floor)
 
-                # Sample collection takes the frame here and stops.
+                # Sample collection takes the frame here and stops, and an
+                # ambient session (tapped above) stops here too.
                 #
-                # After the noise floor so switching the mode off leaves the
+                # After the noise floor so switching a mode off leaves the
                 # room measurement current, and before the model so a
-                # collecting device is not paying for inference whose result
+                # recording device is not paying for inference whose result
                 # nothing may act on. Not scoring is also the point: this is
                 # the whole of "starts no voice turns", enforced one more
                 # time at _run_voice_locked for the button and HA paths.
-                if device.collect_mode:
-                    await _collect_frame(device, frame, rms)
+                if (device.collect_mode or device.capture_mode
+                        or device.ambient_mode):
+                    # Capture takes precedence where both are on: it is
+                    # ephemeral and was armed by something actively driving
+                    # this device right now, while collect mode is a persisted
+                    # standing order. Segmenting the same frames into a second
+                    # set of clips underneath a matrix run would fill the
+                    # samples directory with fragments of a corpus.
+                    if device.capture_mode:
+                        await _capture_frame(device, frame, rms)
+                    elif device.collect_mode:
+                        await _collect_frame(device, frame, rms)
                     # A device in owwOnDevice="on" keeps reporting its own
                     # crossings; drop them here rather than leaving one in the
                     # slot to be taken (and warned about as stale) whenever
@@ -3952,6 +4515,7 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
             # Capture is per-connection by construction (nothing is
             # persisted), so this only has to drop the tasks — the caller
             # re-arms if it is still running.
+            await capture_teardown(device)
             if _devices.get(device.device_id) is not device:
                 # A replacement connection has already registered for this
                 # device_id — this socket is stale. Tearing down shared

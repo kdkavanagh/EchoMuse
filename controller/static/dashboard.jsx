@@ -2122,7 +2122,14 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                   RECORDING
                 </span>
               )}
+              {/* Same reasoning for capture mode: it suspends voice turns
+                  too. Its own badge rather than reusing COLLECTING — the
+                  two are cleared by different things, and a capture badge
+                  that outlives the script that armed it is the one case
+                  someone will need to recognise. */}
+              {device.captureMode && (
                 <span className="em-pill em-pill--small em-pill--accent"
+                      title="Capturing to a webhook — voice turns suspended"
                       style={{ display: 'inline-block', pointerEvents: 'none',
                                fontFamily: "'DM Mono',monospace", letterSpacing: '0.05em' }}>
                   CAPTURING

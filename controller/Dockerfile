@@ -80,6 +80,7 @@ COPY em_config_sections.py .
 COPY em_recordings.py .
 COPY em_samples.py .
 COPY em_ambient.py .
+COPY em_capture.py .
 COPY em_turnclock.py .
 COPY em_endpoint.py .
 COPY em_sounds.py .

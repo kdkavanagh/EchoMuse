@@ -275,6 +275,9 @@ The always-on wake stream (`mic_start` without `lock_mic`) is **ungated and AGC-
 
 - **Beamformer** (`internal/beamformer/`) — selects the perimeter mic with the highest onset energy ratio (fast/slow EWMA) at voice turn start, then locks for the duration. Its `extractChannel` also applies the fixed mic gain (`micGainDb`, default +24dB) against the full 24-bit sample before quantising to S16 — captured speech sits at ~−70dBFS, so gain must happen pre-truncation to recover real resolution. `vadThreshold` stays in pre-gain units (the device scales it by the gain internally). **It is a selector, not a summing beamformer, and that is settled — do not propose delay-and-sum.** A frequency-domain implementation (exact FFT phase shifts, no interpolation artefacts) exists in `device/tools/bf_capture` and was measured as only marginally better than mic selection. The reason is the 72mm aperture, not the code: diffuse-field noise coherence is 0.84–0.99 below 1.5kHz where speech energy lives, so a sum has almost nothing uncorrelated to cancel, and 36mm adjacent spacing puts spatial aliasing at 4.76kHz — a working window of roughly 2–4.7kHz. Superdirective/differential beamforming is the only class that works at this aperture and it trades against white-noise gain (20dB+ amplification of sensor self-noise) on unmatched capsules across four ADCs. Full derivation and the coherence table are in SETUP.md's mic-array section (SETUP.md is the architecture reference; the chronological log is JOURNAL.md, the rooting prerequisites docs/rooting.md). **Far-field reach is therefore not a beamforming problem here** — it is room noise floor, distance and placement; the single-channel levers (`nsAsr`, wake model) are the ones that exist
 - **AEC** (`internal/aec/`) — speexdsp echo canceller (vendored C, SpeexDSP-1.2.1), whole mic path including the wake stream; far-end reference tapped at the speaker ALSA write (every period incl. silence), delayed by `aecDelayMs` — **keep 0**: the mic side's 160ms batch reads absorb the speaker's output latency, and higher values make the echo non-causal (zero cancellation). The mic ALSA ring is only 160ms deep, so >160ms capture stalls silently lose whole batches (~every 20–30s in steady state, load-correlated); an occupancy governor trims the resulting reference backlog **without resetting the filter** — the trim restores the alignment the filter converged against, and the reset that used to live there thrashed convergence to ≤5dB (the v2.7.8 fix). `[aec] att=`/`far:` telemetry logs ~1/s during playback; `[mic] clock/stall` lines track capture loss. `far:` carries `rms`, `mean` and `peak` — **rms alone cannot tell audio from a constant offset**, since both read high, and that ambiguity cost an evening on #117 where the device was writing rms≈4000 to a codec while every speaker stayed silent. `mean≈±rms` with a small peak-to-peak is a DC offset; `mean≈0` with peak well above rms is real audio and the fault is downstream. Note this tap sits after the (L+R)/2 downmix and 3:1 decimation, so DC survives intact but `peak` is mildly smoothed — read it as a floor. It reports only while `aecEnabled`, so a diagnosis that needs it must not have AEC turned off. Default off (`aecEnabled`); ~14dB per response, held across turns. The far-end tap sits downstream of the music mix, so it already covers a **timer ring** — which is why `aecEnabled` also decides what the wake listener does with audible ring frames: off (fleet default) drops them and rescores the silent gap from a reset model, on scores them at the barge threshold so a wake word can land during the burst. Additive only; the ring cadence is unchanged either way. Audible frames never feed `noise_floor` (residual echo is not room noise, and the floor outlives the ring). The risk it takes is a chime whose residual scores as the wake word and silences its own alarm — `Ring listening (chime audible, AEC)` vs `(silent window)` in the log is what tells the two apart; pre-scoring an uploaded sound against the model at upload time is the way to retire it
+  (`internal/bindings/slspeaker`). A build that converted capture only would
+2–4.7kHz. A frequency-domain implementation exists in `device/tools/bf_capture`
+and measured only marginally better than plain mic selection, for that reason
 - **Barge-in** (controller-side `_barge_watcher`) — wake word spoken during TTS cancels playback (device does a stateful `speaker_flush`: drains buffer + discards until stream EOS, since the rest of the stream is typically still in TCP buffers; controller-side, both `stream_speaker` and the post-playback drain sleep race `cancel_event`). `bargeInThreshold` is used as-is and sits *below* `owwThreshold` by design (0.05–0.10): echo at the mic is ~25dB louder than the person, so speech-over-TTS scores are depressed (~0.3–0.5 observed), while converged self-echo scores 0.002–0.003
 - **AGC** (`internal/processor/`) — lock_mic turns only; release is frozen during silence (RMS speech flag), preventing noise floor amplification. (Device-side RNNoise NS was removed 2026-07-12 — noise suppression is controller-side now: `em_ns.py`/DTLN on the ASR-bound stream, per-device `nsAsr` flag)
 - **VAD** (lock_mic turns only) runs on pre-NS/AGC audio; opens gate after `VAD_SPEECH_MS` of speech, closes after `VAD_SILENCE_MS` of silence, then sends an end-of-speech sentinel
@@ -503,6 +506,7 @@ behind the same TCP head-of-line blocking as everything else (#139).
 | `em_recordings.py` | Utterance capture storage — WAVs in `recordings/` beside the DB, per-device file-count retention, ownership-checked path resolution |
 | `em_samples.py` | Wake-word sample collection — cuts the continuous wake stream into training clips at the silences (energy-relative, floor-tracked), and stores them in `samples/<device>/`. Pure logic + filesystem; the mode itself lives in `em_controller.set_collect_mode` |
 | `em_ambient.py` | Ambient recording — the mic held open, the whole session streamed to one WAV in `ambient/<device>/`. Hand-written WAV header patched on close, so a `.part` from a killed controller is recovered by arithmetic rather than lost. Pure logic + filesystem; the mode lives in `em_controller.set_ambient_mode` |
+| `em_capture.py` | Script-driven recording windows, POSTed to a webhook. A window is opened and closed by the CALLER, so one playback yields exactly one recording — the property a segmenter cannot offer. Pure logic; the lifecycle and transport live in `em_controller`, the routes in `em_api` |
 | `em_turnclock.py` | When a voice turn stops waiting, as a pure function. **The no-speech window is measured from the FIRST REAL AUDIO FRAME, not from turn start** — those answer different questions, and measured from turn start a slow link masquerades as a silent user. A 1373ms delivery gap (#139) shortened a 5s window to 3.6s and answered `no_speech` to someone mid-sentence, with the audio captured perfectly on the device and TCP holding it. `FIRST_AUDIO_GRACE` bounds the other side so audio that never arrives still ends the turn |
 | `em_linkauth.py` | The device-link auth decision as a pure function. Split out of `em_controller._link_auth_ok` so it is testable: the suite does not import em_controller, so this was security logic with no coverage until it orphaned a device |
 | `em_ble_proxy.py` | BLE proxy ESPHome servers — a second, separate ESPHome device per Echo (own port from the shared counter, own mDNS, MAC = serial-derived with the locally-administered bit flipped). Forwards `ble_adverts` control messages from the device's passive scanner (`device/internal/bluetooth`, raw HCI over `/dev/stpbt`; enabling durably disables Android's BT stack) to HA as raw advertisements. Lifecycle = idempotent `reconcile()` driven by `bleProxyEnabled` |
@@ -776,9 +780,19 @@ on. Same stream, same suspension of voice turns, same magenta ring, same
   can only leave a *prefix* — never a hole — and `finalize()` derives both size
   fields from the file length. `recover()` therefore promotes an orphaned
   `.part` into a playable WAV on the next connect instead of discarding it: an
+  overnight capture is hours of audio that only this makes survivable.
+- **The cap ROLLS, it does not stop.** `MAX_RECORDING_MS` (30 min, 57.6MB)
+  closes the file and opens another. Ending an unattended overnight capture at
+  00:30 and saying so nowhere is the worse failure; the roll is visible as a
+  second file with its own timestamp. `KEEP_PER_DEVICE` is 6 — ~350MB per
+  device, and the ceiling is disk rather than what is useful.
+- **Mutually exclusive with collect mode**, refused with 409 at both endpoints
+  rather than resolved by an invisible precedence rule: the two want the same
   frames for opposite purposes, and a user who armed both would get an ambient
   file full of the wake word they were saying for the segmenter. Script-driven
   capture is *not* excluded — ambient is a **passive sink that takes the frame
+  before the branch that claims it**, so a capture window opening underneath a
+  session cannot punch a hole in the file the session promised.
 - Persisted for collect mode's reasons (`devices.ambient_mode`, schema v19) and
   re-armed by `handle_control` in a NEW file; a disconnect **closes** the open
   one (`ambient_teardown`) because the audio that connection delivered is a
@@ -788,6 +802,84 @@ on. Same stream, same suspension of voice turns, same magenta ring, same
   call to samples: there the archive IS the feature, here one recording is one
   artefact and zipping ~350MB in memory from a dashboard click is a way to take
   the controller down.
+
+## Playback capture (`em_capture.py`)
+
+A second recording mode, for re-recording a **corpus** through the device
+rather than a person: Common Voice played from HA media players across a
+matrix of positions and volumes, captured off the Echo's own mic array. It
+carries the array, the beam the HAL selected and the gain it applied, the
+room and the distance —
+the path the model is scored on in service, which augmentation cannot invent
+from a clean file. Driver: `oww_forge/tools/playback_matrix.py`. Full
+reference: `docs/playback-capture.md`.
+
+**It is a WINDOW, not the segmenter, and that is the whole design.** The
+caller knows exactly when the audio starts because it is the thing playing
+it, and it must pair each recording with the file that produced it. Run a 5s
+Common Voice clip through `em_samples.Segmenter` and the result is
+nondeterministic: `silence_ms=400` splits the sentence at its internal
+pauses, `max_clip_ms=6000` truncates anything longer and then refuses to
+reopen until the room is quiet, and a clip at the bottom of a volume matrix
+may never clear `open_margin_db` at all. One playback becomes 0..N files with
+no way to tell which. A window opened and closed by the caller yields one.
+
+It reuses collect mode's frame tap (same point in `wake_word_listener`, so
+the audio is byte-for-byte what the wake model scores), its suspension of
+voice turns at `_run_voice_locked`, and its magenta ring. **Capture takes
+precedence where both modes are on** — segmenting the same frames into a
+second set of clips underneath a matrix run would fill `samples/` with
+fragments of a corpus.
+
+- **The mode is NOT persisted, the opposite call to `collect_mode`.** A
+  collect flag survives a restart because the person walking the house saying
+  the wake word should not lose their session to a `docker compose up`. A
+  webhook is the address of a RUNNING process: a controller that came back up
+  still suspended, POSTing at a socket nobody holds, is a device answering
+  nothing for a reason nothing on screen explains. Hence no schema change and
+  nothing to add to the support-bundle allowlist — and hence the mode
+  requires a CONNECTED device, unlike collect.
+- **Three things stop it stranding a device**, and each has already been the
+  obvious way to get it wrong. `idle_s` is a dead-man that clears an undriven
+  mode (but never underneath an open window — a caller may legitimately open
+  30s and say nothing). A window closes on audio time at `max_ms` *and* on
+  the **wall clock** at `max_ms + WINDOW_GRACE_MS`, because a device that
+  stops sending frames stops advancing audio time and would hold the window
+  open forever — same reasoning as `em_endpoint` checking `maxSpeechMs`
+  outside the frame path. And `_capture_cancel_tasks` **never cancels the
+  task it is running on**: the watchdog disarms the mode itself, so a blind
+  cancel raises `CancelledError` at the next await and abandons the rest of
+  the disarm, leaving the webhook and queue set with no log line and no state
+  push.
+- **The mic path never waits on HTTP.** The frame tap appends bytes and
+  returns; delivery runs on a per-device sender task off a bounded queue, so
+  a slow webhook degrades to dropped WINDOWS (counted, and reported to the
+  next delivery as `X-EM-Dropped`) rather than a stuttering microphone —
+  the `shadow.Scorer.Push` rule. Redirects are not followed and the scheme is
+  checked before arming: not authorisation (the caller is an admin) but the
+  cheap half of not building an SSRF gadget. An **empty window is a failure,
+  not a delivery** — a zero-length recording read as success is how a caller
+  ends up with a corpus of silence it believes in.
+- **`tag` is opaque and echoed verbatim.** Correlation is the caller's
+  business; a tag format the controller understood would be a second copy to
+  drift. Metadata rides `X-EM-*` headers rather than multipart so both ends
+  stay dependency-free.
+- **Trimming is deliberately not done here.** The driver has ffmpeg and the
+  source clip; the controller has neither, and a trim rule baked in at this
+  end is one the driver cannot change without a redeploy.
+
+Driver rules worth not undoing (`playback_matrix.py`): **files are the outer
+loop and the matrix the inner one**, because the run has no end and is killed
+by hand — the other order leaves every recording at one player and one
+volume. Playback end is judged by the **source duration**, never by polling
+`media_player` state (Music Assistant flow players lag and misreport). The
+window's `max_ms` is a backstop, not the mechanism, or every recording reads
+as `truncated` and the signal that a playback *overran* is lost. A delivery
+for any other tag is **discarded**, since a late arrival from the previous
+cell mislabels every file after it. Sources are streamed with `os.scandir`
+and resume is one `stat` per candidate — the Common Voice clips directory
+holds ~1.9M entries, so anything that lists, globs or sorts it costs more
+than the recording.
 
 ## The external audio jack
 
