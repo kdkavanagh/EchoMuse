@@ -1289,10 +1289,20 @@ function SamplesTab({ device, isAdmin }) {
         </div>
 
         <div style={{ display:'flex', alignItems:'center', gap:10, flexWrap:'wrap' }}>
-          <Pill big accent={!on} danger={on} disabled={!isAdmin || busy}
+          <Pill big accent={!on} danger={on}
+                disabled={!isAdmin || busy || (!on && !!device.ambientMode)}
                 onClick={() => setMode(!on)}>
             {busy ? '…' : on ? 'Stop collecting' : 'Start collecting'}
           </Pill>
+          {/* Mutually exclusive with ambient recording, and refused by the
+              endpoint too: both modes want the same frames, and a segmenter
+              running under an ambient session cuts the wake word out of the
+              room noise it was recording. */}
+          {!on && !!device.ambientMode && (
+            <span style={{ fontFamily:mono, fontSize:10, color:'var(--warn)' }}>
+              Stop ambient recording first — both modes want the same audio
+            </span>
+          )}
           {!device.connected && (
             <span style={{ fontFamily:mono, fontSize:10, color:'var(--warn)' }}>
               {on ? 'Armed — collection resumes when the device reconnects'
@@ -1373,7 +1383,250 @@ function SamplesTab({ device, isAdmin }) {
           ))}
         </div>
       </Panel>
+
+      <AmbientPanel device={device} isAdmin={isAdmin}/>
     </div>
+  );
+}
+
+
+// ─── Ambient recording ────────────────────────────────────────────────────────
+//
+// The other half of a training set (see em_ambient.py): the mic simply held
+// open, and one WAV of the whole session when it is switched off. Room noise
+// has no onsets to cut on, so nothing is segmented — which makes the elapsed
+// time the only feedback this mode can give while it runs, and the reason it
+// is on screen rather than implied. Suspends the assistant exactly as sample
+// collection does, and is mutually exclusive with it.
+
+function AmbientPanel({ device, isAdmin }) {
+  const [data, setData]   = useState(null);
+  const [busy, setBusy]   = useState(false);
+  const [error, setError] = useState('');
+  const [playing, setPlaying] = useState(null);
+  const [confirmWipe, setConfirmWipe] = useState(false);
+  const audioRef = useRef(null);
+  const urlsRef  = useRef({});
+
+  const id        = device.device_id;
+  const on        = !!device.ambientMode;
+  const collecting = !!device.collectMode;
+  const mono      = "'DM Mono',monospace";
+  const slug      = (device.label || id).replace(/[^A-Za-z0-9]+/g, '-').toLowerCase();
+
+  const load = async () => {
+    try {
+      setData(await API.get(`/api/devices/${id}/ambient`));
+      setError('');
+    } catch (e) {
+      setError(e.error || e.message || 'Could not read recordings');
+    }
+  };
+
+  // Poll while recording: the open file's length is the only thing that
+  // moves, and it is exactly what tells a working mode from a stalled one.
+  useEffect(() => {
+    load();
+    if (!on) return;
+    const iv = setInterval(load, 3000);
+    return () => clearInterval(iv);
+  }, [id, on]);
+
+  const stopAudio = () => {
+    if (audioRef.current) { audioRef.current.pause(); audioRef.current = null; }
+    setPlaying(null);
+  };
+
+  useEffect(() => () => {
+    stopAudio();
+    Object.values(urlsRef.current).forEach(URL.revokeObjectURL);
+    urlsRef.current = {};
+  }, [id]);
+
+  // These are tens of megabytes each, so unlike a sample clip the blob is
+  // NOT cached: holding two of them pinned is a browser tab using 100MB to
+  // remember audio nobody is listening to any more.
+  const fileUrl = async name =>
+    URL.createObjectURL(await API.blob(`/api/devices/${id}/ambient/${name}`));
+
+  const toggleAudio = async name => {
+    const wasPlaying = playing === name;
+    stopAudio();
+    if (wasPlaying) return;
+    let url;
+    try { url = await fileUrl(name); } catch { return; }
+    urlsRef.current[name] = url;
+    const el = new Audio(url);
+    el.onended = el.onerror = () => setPlaying(p => (p === name ? null : p));
+    audioRef.current = el;
+    setPlaying(name);
+    el.play().catch(() => setPlaying(p => (p === name ? null : p)));
+  };
+
+  async function setMode(enabled) {
+    setBusy(true); setError('');
+    try {
+      await API.post(`/api/devices/${id}/ambient`, { enabled });
+      // device.ambientMode arrives on the events socket; reload so the
+      // finished file appears the moment it is switched off — that file is
+      // the entire point of the mode.
+      await load();
+    } catch (e) {
+      setError(e.error || e.message || 'Could not change the mode');
+    }
+    setBusy(false);
+  }
+
+  async function doDelete(name) {
+    stopAudio();
+    try {
+      await API.del(`/api/devices/${id}/ambient/${name}`);
+      if (urlsRef.current[name]) {
+        URL.revokeObjectURL(urlsRef.current[name]);
+        delete urlsRef.current[name];
+      }
+      await load();
+    } catch (e) {
+      setError(e.error || e.message || 'Could not delete that recording');
+    }
+  }
+
+  async function doWipe() {
+    stopAudio();
+    setConfirmWipe(false);
+    try {
+      await API.del(`/api/devices/${id}/ambient`);
+      Object.values(urlsRef.current).forEach(URL.revokeObjectURL);
+      urlsRef.current = {};
+      await load();
+    } catch (e) {
+      setError(e.error || e.message || 'Could not delete the recordings');
+    }
+  }
+
+  const clock = ms => {
+    const s = Math.max(0, Math.round((ms || 0) / 1000));
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+  };
+
+  const files   = data?.clips || [];
+  const totalMb = data ? (data.bytes / 1048576).toFixed(1) : '—';
+  // The live length comes from the poll rather than the events socket: state
+  // pushes only happen on a mode change or a rolled file, so between them
+  // the socket's ambientMs is the value it had minutes ago.
+  const liveMs  = data?.live ? data.live.ms : (device.ambientMs || 0);
+  const capMin  = data ? Math.round(data.maxMs / 60000) : 30;
+
+  return (
+    <>
+      <Panel label="Ambient recording">
+        <div style={{ fontFamily:"'DM Sans',sans-serif", fontSize:12, color:'var(--text2)', lineHeight:1.55, marginBottom:14 }}>
+          Holds this device&apos;s microphone open and keeps everything it
+          hears. Stopping writes one WAV covering the whole session — the room
+          as it actually sounds, which is the negative material a wake model is
+          trained against and what a threshold is tuned on. Nothing is cut into
+          clips: room noise has no pauses to cut at.
+        </div>
+        <div style={{ background:'linear-gradient(160deg,var(--lcd-face),var(--lcd-deep))', border:'1px solid var(--lcd-line)', borderRadius:6, padding:'10px 12px', marginBottom:16 }}>
+          <span style={{ fontFamily:mono, fontSize:10, color:'var(--lcd-amber)', lineHeight:1.6 }}>
+            While recording, this device answers nothing — no wake word, no
+            button turn, and nothing reaches Home Assistant. Its ring throbs
+            magenta so it is obvious from the room. Recordings roll into a new
+            file every {capMin} minutes.
+          </span>
+        </div>
+
+        <div style={{ display:'flex', gap:16, alignItems:'flex-end', flexWrap:'wrap', marginBottom:16 }}>
+          <Lcd label="Mode"   value={on ? 'RECORDING' : 'OFF'} color={on ? 'var(--lcd-amber)' : 'var(--lcd-dim)'}/>
+          <Lcd label="Elapsed" value={on ? clock(liveMs) : '—'} color="var(--lcd-green)"/>
+          <Lcd label="Files"  value={data ? String(data.count) : '—'} color="var(--lcd-dim)"/>
+          <Lcd label="On disk" value={data ? `${totalMb} MB` : '—'} color="var(--lcd-dim)"/>
+        </div>
+
+        <div style={{ display:'flex', alignItems:'center', gap:10, flexWrap:'wrap' }}>
+          <Pill big accent={!on} danger={on}
+                disabled={!isAdmin || busy || (!on && collecting)}
+                onClick={() => setMode(!on)}>
+            {busy ? '…' : on ? 'Stop and save' : 'Start recording'}
+          </Pill>
+          {!on && collecting && (
+            <span style={{ fontFamily:mono, fontSize:10, color:'var(--warn)' }}>
+              Stop sample collection first — both modes want the same audio
+            </span>
+          )}
+          {!device.connected && (
+            <span style={{ fontFamily:mono, fontSize:10, color:'var(--warn)' }}>
+              {on ? 'Armed — a new file starts when the device reconnects'
+                  : 'Device offline — this will take effect on its next connect'}
+            </span>
+          )}
+          {device.connected && on && (
+            <span style={{ fontFamily:mono, fontSize:10, color:'var(--muted)' }}>
+              writing now — the file appears here when you stop
+              {data?.session ? ` · ${data.session} already saved this session` : ''}
+            </span>
+          )}
+        </div>
+        {error && (
+          <div style={{ fontFamily:mono, fontSize:10, color:'var(--error)', marginTop:10 }}>{error}</div>
+        )}
+      </Panel>
+
+      <Panel label={`Recordings (${data ? data.count : '…'}${data ? ` of ${data.keep} kept` : ''})`}>
+        <div style={{ display:'flex', alignItems:'center', gap:10, flexWrap:'wrap', marginBottom:12 }}>
+          <Pill small onClick={load}>Refresh</Pill>
+          <span style={{ flex:1 }}/>
+          {isAdmin && !confirmWipe && (
+            <Pill small danger disabled={!files.length} onClick={() => setConfirmWipe(true)}>Delete all</Pill>
+          )}
+          {isAdmin && confirmWipe && (
+            <>
+              <span style={{ fontFamily:mono, fontSize:9, color:'var(--error)' }}>Delete {files.length} recording(s)?</span>
+              <Pill small danger onClick={doWipe}>Confirm</Pill>
+              <Pill small onClick={() => setConfirmWipe(false)}>Cancel</Pill>
+            </>
+          )}
+        </div>
+
+        {!files.length && (
+          <div style={{ fontFamily:mono, fontSize:10, color:'var(--muted)' }}>
+            {on ? 'Recording — stop to save the file.' : 'Nothing recorded yet.'}
+          </div>
+        )}
+
+        <div style={{ display:'flex', flexDirection:'column' }}>
+          {files.map(f => (
+            <div key={f.name} style={{
+              display:'flex', alignItems:'center', gap:10, padding:'6px 0',
+              borderTop:'1px solid var(--hairline)',
+            }}>
+              <span style={{ fontFamily:mono, fontSize:10, color:'var(--text2)', minWidth:150 }}>
+                {new Date(f.ts * 1000).toLocaleString()}
+              </span>
+              <span style={{ fontFamily:mono, fontSize:10, color:'var(--muted)', minWidth:60 }}>
+                {clock(f.ms)}
+              </span>
+              <span style={{ fontFamily:mono, fontSize:10, color:'var(--muted)', minWidth:70 }}>
+                {(f.bytes / 1048576).toFixed(1)} MB
+              </span>
+              <span style={{ flex:1 }}/>
+              <Pill small onClick={() => toggleAudio(f.name)}>{playing === f.name ? '■ Stop' : '▶ Play'}</Pill>
+              <Pill small onClick={async () => {
+                try {
+                  const url = await fileUrl(f.name);
+                  const a = document.createElement('a');
+                  a.href = url; a.download = `${slug}-ambient-${f.name}`; a.click();
+                  // Revoked on a timer, not immediately: the click starts the
+                  // save, and a revoked URL cancels a download in progress.
+                  setTimeout(() => URL.revokeObjectURL(url), 60000);
+                } catch {}
+              }}>Download</Pill>
+              {isAdmin && <Pill small danger onClick={() => doDelete(f.name)}>Delete</Pill>}
+            </div>
+          ))}
+        </div>
+      </Panel>
+    </>
   );
 }
 
@@ -1855,6 +2108,24 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                       style={{ display: 'inline-block', pointerEvents: 'none',
                                fontFamily: "'DM Mono',monospace", letterSpacing: '0.05em' }}>
                   COLLECTING
+                </span>
+              )}
+              {/* And ambient recording, for the same reason again. Its own
+                  badge rather than reusing COLLECTING: this one is holding a
+                  file open, so "how long has it been on" is the question,
+                  and it is the mode most likely to be left running. */}
+              {device.ambientMode && (
+                <span className="em-pill em-pill--small em-pill--accent"
+                      title="Recording ambient audio — voice turns suspended"
+                      style={{ display: 'inline-block', pointerEvents: 'none',
+                               fontFamily: "'DM Mono',monospace", letterSpacing: '0.05em' }}>
+                  RECORDING
+                </span>
+              )}
+                <span className="em-pill em-pill--small em-pill--accent"
+                      style={{ display: 'inline-block', pointerEvents: 'none',
+                               fontFamily: "'DM Mono',monospace", letterSpacing: '0.05em' }}>
+                  CAPTURING
                 </span>
               )}
               {isAdmin && !confirmDelete && (

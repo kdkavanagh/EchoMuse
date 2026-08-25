@@ -32,6 +32,7 @@ from typing import Optional
 import em_config_sections
 import em_recordings
 import em_samples
+import em_ambient
 
 log = logging.getLogger("echomuse.db")
 
@@ -833,6 +834,26 @@ MIGRATIONS: list[str] = [
 
     UPDATE system_config SET value = '18' WHERE key = 'schema_version';
     """,
+
+    # ── v19 — ambient recording mode ────────────────────────────────────────
+    #
+    # single WAV of the whole session (em_ambient) — room noise, which has no
+    # onsets to cut on and is worthless once it has been chopped up.
+    #
+    # A column for both of v18's reasons, which apply unchanged: it is a
+    # per-device mode rather than fleet-inherited config, and it outlives the
+    # process. The restart case is stronger here, not weaker — someone leaves
+    # a room recording for an hour, and a controller that came back with the
+    # mode silently off would show a device that is recording nothing while
+    # its ring says otherwise. On reconnect the mode is re-armed and a NEW
+    # file is started; the interrupted one is recovered from its `.part` by
+    # em_ambient.recover rather than lost.
+    """
+    ALTER TABLE devices ADD COLUMN ambient_mode INTEGER NOT NULL DEFAULT 0;
+
+    UPDATE system_config SET value = '19' WHERE key = 'schema_version';
+    """,
+
 ]
 
 # Post-migration fixups that need Python rather than SQL. Keyed by the schema
@@ -1242,6 +1263,26 @@ def set_collect_mode(device_id: str, enabled: bool) -> None:
         )
 
 
+def get_ambient_mode(device_id: str) -> bool:
+    """
+    Whether this device is recording ambient room audio.
+
+    Answers nothing while it is on, exactly like collect mode — see the v19
+    migration for why this is a column too.
+    """
+    row = _q1("SELECT ambient_mode FROM devices WHERE device_id = ?", (device_id,))
+    return bool(row["ambient_mode"]) if row is not None else False
+
+
+def set_ambient_mode(device_id: str, enabled: bool) -> None:
+    """Arm or disarm ambient recording for a device."""
+    with _tx() as conn:
+        conn.execute(
+            "UPDATE devices SET ambient_mode = ? WHERE device_id = ?",
+            (1 if enabled else 0, device_id),
+        )
+
+
 def set_device_config(device_id: str, config: dict) -> None:
     """
     Persist updated config for a device.
@@ -1461,10 +1502,7 @@ def delete_device(device_id: str) -> None:
     This is a hard delete — use with care. Logs are removed first to
     satisfy the foreign key constraint.
 
-    Saved utterance recordings and collected wake-word samples live on disk
-    rather than in the DB, so no cascade reaches them — they are unlinked
-    explicitly here. Leaving a deleted device's speech behind on the volume
-    is the one leftover that actually matters.
+    Saved utterance recordings, collected wake-word samples, ambient
     """
     with _tx() as conn:
         conn.execute("DELETE FROM device_logs WHERE device_id = ?", (device_id,))

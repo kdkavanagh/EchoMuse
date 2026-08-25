@@ -76,6 +76,7 @@ import em_arbiter
 import em_button
 import em_endpoint
 import em_samples
+import em_ambient
 import em_tap_burst
 import em_esphome as esphome
 import em_ble_proxy
@@ -355,6 +356,19 @@ class Device:
         self.collect_clips: int = 0            # clips written this session
         self.collect_last_ms: int | None = None
         self.collect_led_task: asyncio.Task | None = None
+        # Ambient recording (em_ambient). The same shape as collect mode —
+        # persisted (schema v19), suspends voice turns, taps the same wake
+        # frames — but the mic is simply held open and the whole session
+        # becomes ONE file. Room noise has no onsets to cut on, so a
+        # segmenter would destroy the only property that makes it useful.
+        #
+        # `ambient_rec` is a file open on disk, not a buffer: an hour of the
+        # wire format is 115MB and the mode has no natural end.
+        self.ambient_mode: bool = False
+        self.ambient_rec: em_ambient.Recorder | None = None
+        self.ambient_files: int = 0            # files closed this session
+        self.ambient_led_task: asyncio.Task | None = None
+
         self.eq_bands:      list  = [0.0] * 8
         self.eq_loudness:   bool  = False
         # LED ring scene — render-ready palette/spinner from em_scenes,
@@ -961,6 +975,17 @@ async def _push_device_state(device: Device) -> None:
             "collectMode":   device.collect_mode,
             "collectClips":  device.collect_clips,
             "collectLastMs": device.collect_last_ms,
+            # Ambient recording, likewise: a third mode that answers nothing,
+            # with its own key because "how long has this one file been
+            # running" is the question the panel asks about it.
+            "ambientMode":  device.ambient_mode,
+            "ambientFiles": device.ambient_files,
+            "ambientMs":    (device.ambient_rec.duration_ms
+                             if device.ambient_rec is not None else 0),
+            # Capture mode suspends the assistant for the same reason and so
+            # has to be as visible. Separate key rather than folded into
+            # collectMode: they mean different things to whoever is looking
+            # at the panel, and one of them survives a restart.
         },
     })
 
@@ -2240,6 +2265,189 @@ async def collect_teardown(device: Device) -> None:
             await _write_clip(device, clip)
 
 
+# ─── Ambient recording ────────────────────────────────────────────────────────
+#
+# em_ambient owns the container and the store; this is the lifecycle, the
+# frame tap and the rolling at the length cap. Same shape as collect mode
+# above, and deliberately so — the difference is that nothing is cut: the
+# session is one file, which is the whole contract (see em_ambient's
+# docstring for why a segmenter would ruin room noise).
+
+AMBIENT_ANIM      = COLLECT_ANIM
+AMBIENT_TTL_SEC   = COLLECT_TTL_SEC
+AMBIENT_RENEW_SEC = COLLECT_RENEW_SEC
+
+
+async def _ambient_led_loop(device: Device):
+    """Hold the ambient ring up for as long as the mode is on."""
+    try:
+        while device.ambient_mode:
+            await device.send_led_anim({**AMBIENT_ANIM, "ttlSec": AMBIENT_TTL_SEC})
+            await asyncio.sleep(AMBIENT_RENEW_SEC)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        # A ring is feedback, not the feature — same as the collect loop.
+        log.warning(f"[{device.device_id}] Ambient ring stopped: {e}")
+
+
+async def _ambient_open(device: Device) -> bool:
+    """
+    Open a new recording file. False if it could not be opened.
+
+    Recovery runs first: a `.part` left by a killed controller is promoted
+    to a playable WAV before this session's file joins it in the directory,
+    so the retention cap counts real recordings rather than dropping one to
+    make room for a corpse.
+    """
+    loop = asyncio.get_event_loop()
+
+    def _open():
+        em_ambient.recover(device.device_id)
+        return em_ambient.start(device.device_id)
+
+    try:
+        device.ambient_rec = await loop.run_in_executor(None, _open)
+    except Exception as e:
+        device.ambient_rec = None
+        log.warning(f"[{device.device_id}] Ambient recording could not start: {e}")
+    return device.ambient_rec is not None
+
+
+async def _ambient_close(device: Device) -> str | None:
+    """Close the open recording and report it. Returns the filename kept."""
+    rec, device.ambient_rec = device.ambient_rec, None
+    if rec is None:
+        return None
+    loop = asyncio.get_event_loop()
+    held_ms = rec.duration_ms
+
+    def _finish():
+        # Prune AFTER the rename, so this session's recording is one of the
+        # files the retention cap counts rather than the one it drops.
+        kept = rec.close()
+        em_ambient.prune(device.device_id)
+        return kept
+
+    try:
+        name = await loop.run_in_executor(None, _finish)
+    except Exception as e:
+        log.warning(f"[{device.device_id}] Ambient recording write failed: {e}")
+        return None
+    if name is None:
+        # Armed and disarmed with no audio in between. Nothing was written,
+        # which is not a failure and not worth a file.
+        return None
+    device.ambient_files += 1
+    log.info(
+        f"[{device.device_id}] Ambient recording {name} "
+        f"({held_ms / 1000:.0f}s, {rec.written / 1048576:.1f}MB)"
+    )
+    return name
+
+
+async def _ambient_frame(device: Device, frame: bytes) -> None:
+    """
+    One wake-stream frame, while recording ambient audio.
+
+    No RMS and no thresholds: everything is kept, which is the point. The
+    frame is buffered and written in ~2s batches — one executor hop per
+    64kB rather than per 80ms frame, on the busiest path in the controller.
+    """
+    rec = device.ambient_rec
+    if rec is None:
+        return
+    loop = asyncio.get_event_loop()
+    if rec.push(frame):
+        try:
+            await loop.run_in_executor(None, rec.flush)
+        except Exception as e:
+            # A write that fails mid-session ends the session rather than
+            # letting the buffer grow forever behind a dead file handle.
+            log.warning(f"[{device.device_id}] Ambient write failed: {e}")
+            await set_ambient_mode(device, False)
+            return
+    if rec.full:
+        # The length cap rolls instead of stopping: an unattended overnight
+        name = await _ambient_close(device)
+        log.info(
+            f"[{device.device_id}] Ambient recording hit the "
+            f"{em_ambient.MAX_RECORDING_MS // 60000}min cap"
+            f"{f' at {name}' if name else ''} — continuing in a new file"
+        )
+        if not await _ambient_open(device):
+            await set_ambient_mode(device, False)
+            return
+        await _push_device_state(device)
+
+
+async def set_ambient_mode(device: Device, enabled: bool) -> None:
+    """
+    Arm or disarm ambient recording on a connected device.
+
+    Idempotent, for collect mode's reason and one more: re-arming would
+    close the open file and start another, turning one session into two for
+    a duplicated API call.
+
+    Turning it OFF is what produces the recording — the file is finalised
+    and named here, and until then it is a `.part` that nothing lists.
+    """
+    enabled = bool(enabled)
+    if device.ambient_mode == enabled:
+        return
+    device.ambient_mode = enabled
+
+    if device.ambient_led_task is not None:
+        device.ambient_led_task.cancel()
+        device.ambient_led_task = None
+
+    if enabled:
+        device.ambient_files = 0
+        if not await _ambient_open(device):
+            # Nothing was opened, so nothing would be recorded. Fail the
+            # mode rather than throb a ring over a device that is silently
+            # writing to nowhere.
+            device.ambient_mode = False
+            db.log_device(device.device_id, "error", "controller",
+                          "Ambient recording could not open a file")
+            await _push_device_state(device)
+            return
+        device.ambient_led_task = asyncio.create_task(_ambient_led_loop(device))
+        log.info(
+            f"[{device.device_id}] Ambient recording ON — mic held open, "
+            f"this device will not start voice turns until it is switched off"
+        )
+        db.log_device(device.device_id, "info", "controller",
+                      "Ambient recording started (voice turns suspended)")
+    else:
+        name = await _ambient_close(device)
+        with contextlib.suppress(Exception):
+            await leds_off(device)
+        log.info(f"[{device.device_id}] Ambient recording OFF — "
+                 f"{device.ambient_files} file(s) this session")
+        db.log_device(
+            device.device_id, "info", "controller",
+            f"Ambient recording stopped ({name})" if name
+            else "Ambient recording stopped (nothing recorded)",
+        )
+    await _push_device_state(device)
+
+
+async def ambient_teardown(device: Device) -> None:
+    """
+    Device is going away. Keep the audio, drop the ring task.
+
+    The open file is CLOSED rather than left as a `.part`: the recording is
+    complete as far as this connection's audio goes, and a device that comes
+    back is re-armed by handle_control and starts a new file. No LED message
+    and no state push — the socket both would travel over just closed.
+    """
+    if device.ambient_led_task is not None:
+        device.ambient_led_task.cancel()
+        device.ambient_led_task = None
+    await _ambient_close(device)
+
+
 # ─── Wake word listener ───────────────────────────────────────────────────────
 
 async def wake_word_listener(device: Device):
@@ -2387,12 +2595,26 @@ async def wake_word_listener(device: Device):
                 del buf[:CHUNK_BYTES]
                 samples = np.frombuffer(frame, dtype=np.int16)
 
+                # Ambient recording takes the frame FIRST, before every gate
+                # below, and never claims it. The gates exist to protect
+                # inference — a chime the model would score as the wake word,
+                # the device's own TTS filling the rolling context — and none
+                # of that is a reason to punch a hole in a recording whose
+                # whole promise is "the mic was open for this long". Dropping
+                # the frames the wake model declines would make audio time
+                # diverge from wall time, so the file and the elapsed clock in
+                # the dashboard would disagree with each other and with the
+                # session. The only gap left is a MUTED mic, above: there is
+                # nothing to record when the mic is off.
+                #
+                if device.ambient_mode:
+                    await _ambient_frame(device, frame)
+
                 # The speaking guard keeps the device's own TTS out of the
                 # wake stream. A timer ring is the deliberate exception: the
                 # wake word is the only acoustic thing that can stop it, since
                 # HA discards the timer as it fires.
                 #
-                # What happens during the ring's AUDIBLE window depends on
                 # AEC. device.speaking tracks the socket write, which finishes
                 # ~1.1s before the room hears anything (SPEAKER_PRIME_SECONDS),
                 # so it is the wrong signal for "is the chime audible" —
@@ -2478,6 +2700,9 @@ async def wake_word_listener(device: Device):
                 # The ring is fed here, immediately before the inference it
                 # exists to explain, so a clip is exactly the frames the model
                 # scored — the same tap and the same reason as em_samples. A
+                # frame taken by collect/capture/ambient above never reaches
+                # this line and never enters the ring: those modes score
+                # nothing, so no wake can be attributed to their audio.
                 score = await loop.run_in_executor(None, model.push, samples)
                 # None is "this chunk produced no score", not a low score.
                 # openWakeWord scores every 80ms chunk and never returns it;
@@ -3210,6 +3435,17 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
         # still recording and writes nothing.
         if await loop.run_in_executor(None, db.get_collect_mode, device_id):
             await set_collect_mode(device, True)
+        # Ambient recording is persisted for the same reason (schema v19) and
+        # re-armed the same way. A NEW file is started: the one this device
+        # was writing when it dropped was closed at teardown, or recovered
+        # from its `.part` by _ambient_open if the controller itself died.
+        # Recovery also runs for a device that is NOT armed, so audio from a
+        # killed controller is not left unplayable until someone happens to
+        # record again.
+        if await loop.run_in_executor(None, db.get_ambient_mode, device_id):
+            await set_ambient_mode(device, True)
+        else:
+            await loop.run_in_executor(None, em_ambient.recover, device_id)
         await api.notify_device_connected(device_id)
         _device_ref = device
         async def _standalone_play(pcm_bytes: bytes, _d=_device_ref) -> None:
@@ -3708,6 +3944,14 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
             # Also per-connection: the ring renewal task holds this Device,
             # and a clip left open belongs to this connection's audio.
             await collect_teardown(device)
+            # Same reasoning, and here it FINISHES the file: the audio this
+            # connection delivered is a complete recording, and holding the
+            # `.part` open for a device that may never come back would leave
+            # the session's only artefact unplayable.
+            await ambient_teardown(device)
+            # Capture is per-connection by construction (nothing is
+            # persisted), so this only has to drop the tasks — the caller
+            # re-arms if it is still running.
             if _devices.get(device.device_id) is not device:
                 # A replacement connection has already registered for this
                 # device_id — this socket is stale. Tearing down shared

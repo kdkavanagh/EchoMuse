@@ -502,6 +502,7 @@ behind the same TCP head-of-line blocking as everything else (#139).
 | `em_tap_burst.py` | Coalesces a burst of action-button taps into one single/double/triple event. The window is restarted per tap and `enabled()` is re-checked at expiry, both correct. **The window is timed at the CONTROLLER, on arrival**, so the gap it measures is the real gap plus the RTT difference between the two taps — 26.4% of probes on this fleet exceed 200ms, which is why double/triple are unreliable below ~350ms (#115). The fix is a device-measured gap, the same reasoning as `heldMs` |
 | `em_recordings.py` | Utterance capture storage — WAVs in `recordings/` beside the DB, per-device file-count retention, ownership-checked path resolution |
 | `em_samples.py` | Wake-word sample collection — cuts the continuous wake stream into training clips at the silences (energy-relative, floor-tracked), and stores them in `samples/<device>/`. Pure logic + filesystem; the mode itself lives in `em_controller.set_collect_mode` |
+| `em_ambient.py` | Ambient recording — the mic held open, the whole session streamed to one WAV in `ambient/<device>/`. Hand-written WAV header patched on close, so a `.part` from a killed controller is recovered by arithmetic rather than lost. Pure logic + filesystem; the mode lives in `em_controller.set_ambient_mode` |
 | `em_turnclock.py` | When a voice turn stops waiting, as a pure function. **The no-speech window is measured from the FIRST REAL AUDIO FRAME, not from turn start** — those answer different questions, and measured from turn start a slow link masquerades as a silent user. A 1373ms delivery gap (#139) shortened a 5s window to 3.6s and answered `no_speech` to someone mid-sentence, with the audio captured perfectly on the device and TCP holding it. `FIRST_AUDIO_GRACE` bounds the other side so audio that never arrives still ends the turn |
 | `em_linkauth.py` | The device-link auth decision as a pure function. Split out of `em_controller._link_auth_ok` so it is testable: the suite does not import em_controller, so this was security logic with no coverage until it orphaned a device |
 | `em_ble_proxy.py` | BLE proxy ESPHome servers — a second, separate ESPHome device per Echo (own port from the shared counter, own mDNS, MAC = serial-derived with the locally-administered bit flipped). Forwards `ble_adverts` control messages from the device's passive scanner (`device/internal/bluetooth`, raw HCI over `/dev/stpbt`; enabling durably disables Android's BT stack) to HA as raw advertisements. Lifecycle = idempotent `reconcile()` driven by `bleProxyEnabled` |
@@ -741,6 +742,52 @@ which is deliberately tapped *below* NS because it must match what STT heard.)
   per device, admin-only, and excluded from support bundles (only the boolean
   is included — a device answering nothing on purpose is exactly what a
   support report describes as "it stopped working").
+
+## Ambient recording (`em_ambient.py`)
+
+The other half of a training set, and the mirror image of collect mode: **the
+mic is held open and the whole session becomes ONE WAV**, written when the mode
+is switched off (device → Samples → *Ambient recording*, `POST
+/api/devices/{id}/ambient`). Collect mode has to guess where the speech is, so
+it cuts at the silences; room noise — fridge, extractor fan, a TV two rooms
+away, dinner — has no onsets to cut on, and a set of clips cut out of it has
+thrown away the continuity that made it worth recording. That audio is what
+`oww_forge` mixes its synthetic positives against and what a threshold is tuned
+on. Same stream, same suspension of voice turns, same magenta ring, same
+`RECORDING` badge everywhere a device is shown.
+
+- **The tap sits ABOVE the gates that protect inference**, unlike collect
+  mode's: the speaking guard, the deaf-ring window and the mode branch that
+  `continue`s all exist so the wake model is not fed the device's own output,
+  and none of them is a reason to punch a hole in a recording whose promise is
+  "the mic was open for this long". Dropping them would make audio time
+  diverge from wall time and leave the file disagreeing with the elapsed clock
+  the dashboard shows. The one gap left is a **muted** mic — there is nothing
+  to record when the mic is off.
+- **It streams to disk, and that is the whole design.** A clip is ~32kB and can
+  live in memory; an ambient recording is **1.92 MB/min with no natural end**,
+  so the file is opened when the mode is armed and frames are appended in ~2s
+  batches (`FLUSH_BYTES`, flushed through to the OS — a bound that only holds
+  while Python's buffer happens to be smaller is not a bound). One write per
+  64kB rather than one per 80ms frame, on the busiest path in the controller.
+- **The header is patched by arithmetic, not by `wave`.** A streamed WAV cannot
+  know its length when opened, so 44 zeroed bytes go down first and are
+  rewritten on close. Writes are strictly sequential, so a killed controller
+  can only leave a *prefix* — never a hole — and `finalize()` derives both size
+  fields from the file length. `recover()` therefore promotes an orphaned
+  `.part` into a playable WAV on the next connect instead of discarding it: an
+  frames for opposite purposes, and a user who armed both would get an ambient
+  file full of the wake word they were saying for the segmenter. Script-driven
+  capture is *not* excluded — ambient is a **passive sink that takes the frame
+- Persisted for collect mode's reasons (`devices.ambient_mode`, schema v19) and
+  re-armed by `handle_control` in a NEW file; a disconnect **closes** the open
+  one (`ambient_teardown`) because the audio that connection delivered is a
+  complete recording. Recordings live in `ambient/<device>/<epoch_ms>.wav`
+  beside the DB, are unlinked by `db.delete_device`, and are served with
+  `FileResponse` — **there is deliberately no `.zip` endpoint**, the opposite
+  call to samples: there the archive IS the feature, here one recording is one
+  artefact and zipping ~350MB in memory from a dashboard click is a way to take
+  the controller down.
 
 ## The external audio jack
 

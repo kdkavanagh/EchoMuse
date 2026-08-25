@@ -63,6 +63,7 @@ import em_pki
 import em_player
 import em_recordings
 import em_samples
+import em_ambient
 import em_volume
 import em_scenes
 import em_shadow
@@ -298,6 +299,13 @@ async def create_app() -> web.Application:
     app.router.add_delete("/api/devices/{id}/samples",    _delete_samples)
     app.router.add_get("/api/devices/{id}/samples/{name}", _get_sample_audio)
     app.router.add_delete("/api/devices/{id}/samples/{name}", _delete_sample)
+    # Ambient recording — the mic held open, one file per session. `/ambient`
+    # before `/ambient/{name}` for the same ordering reason as above.
+    app.router.add_post("/api/devices/{id}/ambient",          _post_device_ambient)
+    app.router.add_get("/api/devices/{id}/ambient",           _get_ambient)
+    app.router.add_delete("/api/devices/{id}/ambient",        _delete_ambient_all)
+    app.router.add_get("/api/devices/{id}/ambient/{name}",    _get_ambient_audio)
+    app.router.add_delete("/api/devices/{id}/ambient/{name}", _delete_ambient)
     app.router.add_post("/api/devices/{id}/wifi",         _post_device_wifi)
     app.router.add_post("/api/devices/{id}/wifi/scan",    _post_device_wifi_scan)
     app.router.add_post("/api/devices/{id}/update",       _post_device_update)
@@ -662,6 +670,12 @@ async def _post_device_collect(request: web.Request) -> web.Response:
     if not row["approved"]:
         return _error("not_approved",
                       "Approve this device before collecting from it", 409)
+    # The mirror of the guard in _post_device_ambient: the two modes want the
+    # same frames for opposite purposes, so they are mutually exclusive at
+    # the API rather than resolved by a precedence rule nobody can see.
+    if enabled and bool(row["ambient_mode"]):
+        return _error("recording_ambient",
+                      "Stop ambient recording on this device first", 409)
 
     await loop.run_in_executor(None, db.set_collect_mode, device_id, enabled)
 
@@ -831,6 +845,181 @@ async def _delete_samples(request: web.Request) -> web.Response:
     await _push_log_event(
         device_id, "info", "controller",
         f"Deleted {removed} collected sample(s)",
+    )
+    return _ok({"deleted": removed})
+
+
+# ─── Ambient recording ────────────────────────────────────────────────────────
+#
+# The mode (em_ambient, em_controller.set_ambient_mode) plus the read side.
+# Same shape as sample collection above and persisted the same way (schema
+# v19) — the difference is what comes out: one WAV covering the whole session
+# rather than a set of clips, so there is no archive endpoint. One recording
+# IS the artefact, and zipping ~350MB of them in memory from a dashboard
+# click is a way to take the controller down.
+
+
+@auth.require_admin
+async def _post_device_ambient(request: web.Request) -> web.Response:
+    """
+    POST /api/devices/{id}/ambient — body {"enabled": bool}
+
+    Holds this device's mic open and writes everything it hears to one file;
+    switching it off finalises that file and lists it. This is the room-noise
+    half of a training set — the negatives a wake model is mixed against, and
+    the material an endpointer threshold is tuned on.
+
+    Admin-only and one device at a time, for collect mode's reasons: it
+    SUSPENDS the assistant on that device, and a device that answers nothing
+    looks broken to everyone else in the house.
+
+    Refused while sample collection is on, rather than silently sharing the
+    stream: the two modes want the same frames for opposite purposes, and a
+    user who armed both would get an ambient file full of the wake word they
+    were saying for the segmenter.
+
+    Persisted even when the device is offline — handle_control re-arms it on
+    the next connect, in a new file.
+    """
+    device_id = request.match_info["id"]
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    enabled = bool(body.get("enabled"))
+
+    loop = asyncio.get_event_loop()
+    row  = await loop.run_in_executor(None, db.get_device, device_id)
+    if row is None:
+        return _error("device_not_found", f"No device: {device_id}", 404)
+    if not row["approved"]:
+        return _error("not_approved",
+                      "Approve this device before recording from it", 409)
+    if enabled and bool(row["collect_mode"]):
+        return _error("collecting",
+                      "Stop wake-word sample collection on this device first",
+                      409)
+
+    await loop.run_in_executor(None, db.set_ambient_mode, device_id, enabled)
+
+    live = _devices.get(device_id)
+    if live is not None:
+        # Lazy import — em_controller imports em_api at module level. It
+        # writes the device log line itself: it is the thing that knows
+        # whether a file was opened, and which one was kept on the way out.
+        import em_controller
+        await em_controller.set_ambient_mode(live, enabled)
+    else:
+        await _push_log_event(
+            device_id, "info", "controller",
+            f"Ambient recording {'armed' if enabled else 'disarmed'} — "
+            f"device offline, takes effect on its next connect",
+        )
+    return _ok({
+        "enabled":   enabled,
+        "connected": live is not None,
+        # A live device reports what actually happened: arming can fail if
+        # the file cannot be opened, and reporting the request back would be
+        # a dashboard showing a recording that is not running.
+        "recording": bool(getattr(live, "ambient_mode", False)) if live else False,
+        "usage":     await loop.run_in_executor(
+            None, em_ambient.usage, device_id
+        ),
+    })
+
+
+@auth.require_auth
+async def _get_ambient(request: web.Request) -> web.Response:
+    """
+    GET /api/devices/{id}/ambient — this device's finished recordings,
+    newest first, with the mode's own state alongside.
+
+    The recording currently open is NOT in the list — it is a `.part` until
+    it is closed, and half a WAV is not something to hand a browser. Its
+    elapsed length is reported separately as `live`, which is the only
+    feedback a mode with one artefact at the end can give while it runs.
+    """
+    device_id = request.match_info["id"]
+    loop = asyncio.get_event_loop()
+    row  = await loop.run_in_executor(None, db.get_device, device_id)
+    if row is None:
+        return _error("device_not_found", f"No device: {device_id}", 404)
+    items = await loop.run_in_executor(None, em_ambient.list_for, device_id)
+    live  = _devices.get(device_id)
+    rec   = getattr(live, "ambient_rec", None) if live else None
+    return _ok({
+        "enabled":  bool(row["ambient_mode"]),
+        "clips":    items,
+        "count":    len(items),
+        "bytes":    sum(i["bytes"] for i in items),
+        "ms":       sum(i["ms"] for i in items),
+        "keep":     em_ambient.KEEP_PER_DEVICE,
+        "maxMs":    em_ambient.MAX_RECORDING_MS,
+        "session":  getattr(live, "ambient_files", 0) if live else 0,
+        "live": None if rec is None else {
+            "ms":         rec.duration_ms,
+            "bytes":      rec.data_bytes,
+            "startedMs":  rec.started_ms,
+        },
+    })
+
+
+@auth.require_auth
+async def _get_ambient_audio(request: web.Request) -> web.Response:
+    """GET /api/devices/{id}/ambient/{name} — one recording, as a WAV.
+
+    Served with FileResponse rather than read into memory: these are tens of
+    megabytes each, which is exactly the size that must not be buffered per
+    request. em_ambient.resolve re-checks that the name belongs to the device
+    in the URL — both come from the path."""
+    device_id = request.match_info["id"]
+    name      = request.match_info["name"]
+    path = em_ambient.resolve(device_id, name)
+    if path is None:
+        return _error("no_recording", "No such recording", 404)
+    label = _slug(device_id)
+    return web.FileResponse(
+        path,
+        headers={
+            "Content-Type":        "audio/wav",
+            "Content-Disposition": f'attachment; filename="{label}-ambient-{name}"',
+            "Cache-Control":       "private, max-age=60",
+        },
+    )
+
+
+@auth.require_admin
+async def _delete_ambient(request: web.Request) -> web.Response:
+    """DELETE /api/devices/{id}/ambient/{name} — drop one recording.
+
+    These are the largest artefacts the controller stores, and one that
+    caught a houseful of guests rather than a quiet room is worth nothing
+    but disk."""
+    device_id = request.match_info["id"]
+    name      = request.match_info["name"]
+    path = em_ambient.resolve(device_id, name)
+    if path is None:
+        return _error("no_recording", "No such recording", 404)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, path.unlink)
+    return _ok({"deleted": name})
+
+
+@auth.require_admin
+async def _delete_ambient_all(request: web.Request) -> web.Response:
+    """DELETE /api/devices/{id}/ambient — drop every recording for a device.
+
+    The recording currently open is untouched: it is not one of these files
+    yet, and stopping the mode is how you end it."""
+    device_id = request.match_info["id"]
+    loop = asyncio.get_event_loop()
+    row  = await loop.run_in_executor(None, db.get_device, device_id)
+    if row is None:
+        return _error("device_not_found", f"No device: {device_id}", 404)
+    removed = await loop.run_in_executor(None, em_ambient.delete_all, device_id)
+    await _push_log_event(
+        device_id, "info", "controller",
+        f"Deleted {removed} ambient recording(s)",
     )
     return _ok({"deleted": removed})
 
@@ -4651,6 +4840,15 @@ def _merge_device(row) -> dict:
         "collectMode":      bool(row["collect_mode"]) if "collect_mode" in row.keys() else False,
         "collectClips":     getattr(live, "collect_clips", 0) if live else 0,
         "collectLastMs":    getattr(live, "collect_last_ms", None) if live else None,
+        # Ambient recording. Persistent for the same reason, with the length
+        # of the file currently open beside it — a mode whose only artefact
+        # appears when it STOPS needs the elapsed time visible while it runs,
+        # or an hour of recording looks identical to a broken one.
+        "ambientMode":      bool(row["ambient_mode"]) if "ambient_mode" in row.keys() else False,
+        "ambientFiles":     getattr(live, "ambient_files", 0) if live else 0,
+        "ambientMs":        (getattr(live.ambient_rec, "duration_ms", 0)
+                             if live is not None and getattr(live, "ambient_rec", None) is not None
+                             else 0),
         # Control-plane round trip, controller-measured. The RF counters are
         # structurally zero on this hardware (the MTK driver populates
         # neither retries nor noise), so this is the only latency signal.
