@@ -209,9 +209,9 @@ Mute is the reference implementation of principle 5, and its behaviour is
 
 | # | Message | State | Ring outcome | Status |
 |---|---|---|---|---|
-| C1 | `led_anim` listening (`solid`, `listening:true`) | any unsuppressed | Scene listening colour; enables direction overlay | [today] |
+| C1 | `led_anim` listening (`solid`) | any unsuppressed | Scene listening colour | [today] |
 | C2 | `led_anim` `spin`/`rotate` (thinking) | any unsuppressed | Spinner on device ticker, 80ms | [today] |
-| C3 | `led_anim` `meter` (playing) | any unsuppressed | Throbs with live speaker RMS at the ALSA write — the **voice plane only**, measured before the music mix (v2.10.0). The AEC far-end tap deliberately sees the mixed output, since that is what must be cancelled from the mic; the meter must not, or it throbs to a song nobody asked it to visualise | [today] |
+| C3 | `led_anim` `meter` (playing) | any unsuppressed | Throbs with live speaker RMS at the write point — the **voice plane only**, measured before the music mix (v2.10.0). The echo canceller's reference is taken by Android's audio HAL downstream of everything, since the mixed output is what must be cancelled from the mic; the meter must not see it, or it throbs to a song nobody asked it to visualise | [today] |
 | C4 | `led_anim` `off` | any unsuppressed | Ring black | [today] |
 | C5 | Any `led_anim` / `leds` | MUTED or VOL-DISPLAY | **Recorded into `baseLEDs`, not painted** | [today] |
 | C6 | Legacy `leds` frame | any unsuppressed | Atomically replaces any running animation (generation counter) | [today] |
@@ -454,9 +454,11 @@ longer free, and its floor is set by the worst legitimate round trip.
   goroutine must never paint over its successor.
 - **`baseLEDs` keeps recording while suppressed.** This is what makes hand-back
   seamless.
-- **The direction overlay requires `listeningLEDs`** and brightens the base
-  colour — it must never paint a hardcoded green, which reads as a glitch on
-  any non-standard scene.
+- **There is no direction overlay any more.** It pointed at whichever
+  perimeter microphone EchoMuse's own beamformer had locked; the Echo's audio
+  front end picks its beam internally and reports it only in debug output, so
+  there is nothing to point with. The `listening` flag that enabled it went
+  with it.
 
 ---
 

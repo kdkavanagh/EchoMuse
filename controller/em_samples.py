@@ -84,8 +84,8 @@ DB_FLOOR = -100.0
 # Lowest noise floor used for thresholding, whatever the tracker believes.
 # See the module docstring: a muted device streams zeroes, and an unclamped
 # floor turns the quantisation noise that follows an unmute into "speech".
-# Measured room floors on this fleet sit around -66dBFS after micGainDb, so
-# this is well below anything real.
+# Measured room floors on this fleet sit around -66dBFS at the level the
+# device delivers, so this is well below anything real.
 ABS_FLOOR_DB = -75.0
 
 

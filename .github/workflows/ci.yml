@@ -83,7 +83,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: true  # GoTinyAlsa replace directive in device/go.mod
+          submodules: true  # GoTinyAlsa, used by device/tools/{capture_mics,bf_capture}
       - uses: actions/setup-go@v5
         with:
           go-version-file: device/go.mod
@@ -143,11 +143,11 @@ jobs:
       # it is low-noise enough to read every time — unlike a plain dependency
       # diff, most of which never executes.
       #
-      # Two blind spots worth stating rather than discovering later: the
-      # vendored SpeexDSP C in internal/aec/ has no package metadata and is
-      # invisible to every scanner we could run, and ONNX Runtime is dlopen'd
-      # at runtime rather than linked, so it is not in this module graph at
-      # all — its version is pinned by AAR sha256 in the asset path instead.
+      # One blind spot worth stating rather than discovering later: both cgo
+      # libraries are dlopen'd at runtime rather than linked, so neither is in
+      # this module graph at all. ONNX Runtime's version is pinned by AAR
+      # sha256 in the asset path instead; OpenSL ES is whatever /system/lib
+      # ships, on a platform that cannot be updated.
       #
       # Same package scope as go vet: cmd/ carries //go:build server and
       # fails package setup on a host platform.

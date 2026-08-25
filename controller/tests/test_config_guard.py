@@ -51,7 +51,10 @@ def _load_dropped_keys():
 
 dropped_keys = _load_dropped_keys()
 
-# The real fleet config as it stood before the incident.
+# The real fleet config as it stood before the incident, kept verbatim —
+# including the mic-chain keys that no longer exist (the audio HAL owns that
+# chain now). The logic under test is pure key-set arithmetic and does not
+# know what any key means, and the count below is the count from the incident.
 LIVE_CONFIG = {
     "adcDigitalGain": 88, "adcMicpga": 40, "micGainDb": 24,
     "aecEnabled": True, "aecDelayMs": 0, "aecTailMs": 300,

@@ -60,10 +60,14 @@ hear the answer through the Dot's speaker. The hardware you already own
   a `git clone`, and how often it happens is yours to set
   ([docs/configuration.md](docs/configuration.md#what-leaves-your-network)).
 
-The 7-mic array, LED ring, buttons, and speaker are all driven natively:
-onset-ratio beamforming, +24dB pre-truncation mic gain (the stock capture
-path throws away most of the signal), device-local LED animations, mute
-that's genuinely hardware (ADC off, red ring, button LED).
+The LED ring, buttons and speaker are all driven natively: device-local LED
+animations, per-sample ducking of music under a voice turn, mute that's
+genuinely hardware (ADC off, red ring, button LED). The 7-mic array is the
+exception, deliberately — capture goes through the Echo's own audio front end,
+the one Amazon built for Alexa, which does per-microphone echo cancellation,
+adaptive beamforming and beam selection tuned for this exact array. Reaching
+it takes no Amazon service and no Alexa packages
+([docs/native-afe-migration.md](docs/native-afe-migration.md)).
 
 ## How it works
 
@@ -71,8 +75,8 @@ that's genuinely hardware (ADC off, red ring, button LED).
 Echo Dot (Go firmware) ⇄ WebSocket/TLS ⇄ Controller (Python) ⇄ ESPHome native API ⇄ Home Assistant
 ```
 
-The device is deliberately dumb: it captures, beamforms, and streams audio
-continuously, and plays what it's sent. Everything that can drift or
+The device is deliberately dumb: it captures, streams audio continuously, and
+plays what it's sent. Everything that can drift or
 misjudge — wake scoring, endpointing, noise suppression, EQ, arbitration —
 lives on the controller where it can be observed and updated fleet-wide.
 (The one exception is opt-in and observational: the Echo can *also* score the

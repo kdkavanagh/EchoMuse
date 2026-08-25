@@ -18,7 +18,7 @@ def test_every_preset_resolves_render_ready():
         _assert_frame(scene["spin_frame"](7))
         # led_anim specs must carry the fields firmware keys on
         assert scene["listening_anim"]["pattern"] == "solid"
-        assert scene["listening_anim"]["listening"] is True
+        assert scene["listening_anim"]["ttlSec"] > 0
         assert scene["spin_anim"]["pattern"] in ("spin", "rotate")
         assert scene["spin_anim"]["ttlSec"] > 0
         assert scene["meter_anim"]["pattern"] == "meter"

@@ -28,7 +28,7 @@ Device WebSocket protocol:
   /control — Server → Device:
     {"type": "ack",     "device_id": "..."}
     {"type": "pending"}
-    {"type": "config",  "adcDigitalGain": 100, ...}
+    {"type": "config",  "owwThreshold": 0.5, ...}
     {"type": "leds",    "leds": [...]}
     {"type": "mic_start"}
     {"type": "mic_stop"}
@@ -689,17 +689,8 @@ class Device:
         except Exception as e:
             log.warning(f"[{self.device_id}] Data send failed: {e}")
 
-    async def set_leds(self, leds: list, listening: bool | None = None):
-        # The optional listening flag tells the device explicitly that this
-        # frame is the listening ring (enables its direction overlay).
-        # Pre-scene firmware inferred it from the ring being all-green —
-        # that heuristic breaks for every non-green scene, so newer
-        # firmware trusts this flag when present and old firmware just
-        # ignores the extra key.
-        msg = {"type": "leds", "leds": leds}
-        if listening is not None:
-            msg["listening"] = listening
-        await self.send_control(msg)
+    async def set_leds(self, leds: list):
+        await self.send_control({"type": "leds", "leds": leds})
 
     @property
     def led_anim_capable(self) -> bool:
@@ -772,38 +763,19 @@ class Device:
         return "oww_trigger" in (self.capabilities or [])
 
     @property
-    def native_afe_capable(self) -> bool:
+    def oww_bcresnet_capable(self) -> bool:
         """
-        Whether this device's audio is running through Android's audio HAL
-        (OpenSL ES) right now, reaching Amazon's ASP front end — see
-        docs/native-afe-migration.md.
+        Whether this firmware carries a BC-ResNet engine as well as openWakeWord.
 
-        Unlike most capabilities here, this is NOT a fixed property of the
-        firmware build: it is a boot-time choice (EM_NATIVE_AFE) that falls
-        back to the tinyalsa backends if the OpenSL ES path fails to open, so
-        the device only announces it when that fallback did NOT happen (see
-        internal/client/control.go's capabilities()). Reporting the attempt
-        rather than the outcome would tell the dashboard to disable the
-        beamformer/AEC/AGC/gain controls on a device that silently fell back
-        and still needs them.
+        A THIRD capability rather than a property of the other two, because the
+        questions are independent: firmware in the field scores and triggers
+        perfectly well with no BC-ResNet engine at all. Without this the
+        controller cannot tell "cannot score on device" from "cannot score THIS
+        MODEL on device", and has to assume the second — which is what it did
+        before the device gained the engine, and which would go on silently
+        refusing on-device scoring forever once it had.
         """
-        return "native_afe" in (self.capabilities or [])
-
-    @property
-    def native_afe_backend_capable(self) -> bool:
-        """
-        Whether this firmware BUILD supports being opted into native AFE at
-        all — internal/bindings/slmic + slspeaker compiled in, and a
-        start_server.sh with the opt-in marker check. Unlike
-        native_afe_capable above, this is a fixed property of the build, not
-        of what is running right now: a device can have this and still be on
-        the tinyalsa path (marker unset, or not yet rebooted).
-
-        This is what the dashboard's toggle gates on. Writing the marker file
-        to a device that lacks this would be a control that silently does
-        nothing — older firmware's start_server.sh never checks for it.
-        """
-        return "native_afe_backend" in (self.capabilities or [])
+        return "oww_bcresnet" in (self.capabilities or [])
 
     async def send_led_anim(self, anim: dict):
         """
@@ -829,22 +801,13 @@ class Device:
     async def mic_stop(self):
         await self.send_control({"type": "mic_stop"})
 
-    async def beam_lock(self):
-        # Lock the beamformer onto the speaker's perimeter mic mid-stream —
-        # no stream restart. Device no-ops if already locked or if
-        # beamformingEnabled is false in its config.
-        await self.send_control({"type": "beam_lock"})
-
-    async def beam_unlock(self):
-        await self.send_control({"type": "beam_unlock"})
-
     async def play_wake_sound(self):
         """
         Chime, if this device is configured for one and can play it.
 
         No audio crosses the wire — the clip is compiled into the firmware
         (device/internal/cue), so this is a single small JSON object on the
-        control plane, sent alongside beam_lock at the same instant.
+        control plane.
 
         Both guards matter and neither is redundant: `wake_sound` is the
         user's setting, and the capability is whether the firmware would do
@@ -1085,7 +1048,7 @@ async def leds_listening(device: Device):
     if device.led_anim_capable:
         await device.send_led_anim(device.led_scene["listening_anim"])
     else:
-        await device.set_leds(device.led_scene["listening"], listening=True)
+        await device.set_leds(device.led_scene["listening"])
 
 
 async def leds_timer_ring(device: Device, cap_seconds: float):
@@ -1420,7 +1383,7 @@ async def _run_timer_ring(device: Device, timer_name: str = "timer") -> None:
             await leds_timer_ring(device, max_s)
             # Mic on for the whole ring — this is what makes the wake word
             # able to stop it. Ordinary mic_start (no lock_mic): the device
-            # stays on ch6 omni, the same stream wake listening already uses.
+            # stays ungated, the same stream wake listening already uses.
             await device.mic_start()
             while not device.timer_ring_stop.is_set():
                 if loop.time() - started >= max_s:
@@ -1996,8 +1959,8 @@ async def _run_voice_locked(device: Device, trigger_label: str = "unknown", is_w
                         )
 
             # P0-1: no mic_start_turn() here on the initial (wake/button)
-            # entry — for a wake turn the stream is already running on
-            # ch6 and oww_paused routes frames to voice_queue. The
+            # entry — for a wake turn the stream is already running,
+            # ungated, and oww_paused routes frames to voice_queue. The
             # acoustic-feedback guard is mic_stop in
             # post_turn_play_esphome, sent immediately before TTS
             # playback; the finally below is only the safety net.
@@ -2016,7 +1979,7 @@ async def _run_voice_locked(device: Device, trigger_label: str = "unknown", is_w
             # stream back before looping into the next trigger_voice_turn,
             # so a continuation turn streamed from a stopped mic and
             # silently timed out as no_speech every time. Fixed by
-            # calling device.mic_start() (no lock_mic — same ch6 stream
+            # calling device.mic_start() (no lock_mic — same wake stream
             # as the wake path; no-ops if somehow already running) in the
             # continuation branch, before looping.
             #
@@ -2086,7 +2049,7 @@ async def _run_voice_locked(device: Device, trigger_label: str = "unknown", is_w
                     # the finally above just stopped it, and the next
                     # trigger_voice_turn will read from voice_queue,
                     # which is fed only while the device stream is
-                    # running. No lock_mic — same ch6 stream as wake.
+                    # running. No lock_mic — same stream as wake.
                     await device.mic_start()
                     # Fresh stream starts with the VAD gate closed — the
                     # user must speak again from zero, same onset cost
@@ -3157,9 +3120,6 @@ async def wake_word_listener(device: Device):
                 # wake word is the only acoustic thing that can stop it, since
                 # HA discards the timer as it fires.
                 #
-                # AEC. device.speaking tracks the socket write, which finishes
-                # ~1.1s before the room hears anything (SPEAKER_PRIME_SECONDS),
-                # so it is the wrong signal for "is the chime audible" —
                 # What happens during the ring's AUDIBLE window is the
                 # ringBargeIn setting. device.speaking tracks the socket write,
                 # which finishes ~1.1s before the room hears anything
@@ -3167,22 +3127,13 @@ async def wake_word_listener(device: Device):
                 # the chime audible" — timer_ring_audible is, because the ring
                 # loop clears it on the device's own playback_stats.
                 #
-                # AEC off (the fleet default): the audible frames are pure
-                # chime. Scoring them fills openWakeWord's rolling context with
-                # echo and the real word that follows scores near zero. Drop
-                # them, and reset once at the edge so the quiet window is
-                # scored from a clean model.
+                # Off (the default): treat the audible frames as pure chime.
+                # Scoring them fills openWakeWord's rolling context with echo
+                # and the real word that follows scores near zero. Drop them,
+                # and reset once at the edge so the quiet window is scored from
+                # a clean model.
                 #
-                # AEC on: the far-end reference is tapped at the device's ALSA
-                # write, downstream of the mix, so the chime is already in it
-                # and the frames arriving here have had it subtracted. Score
-                # them — at the barge threshold, set below — so a wake word can
-                # land during the burst instead of only in the gap. Purely
-                # additive: the cadence is unchanged and the silent window is
-                # still there, so the worst case is the behaviour above.
-                # No reset at the edge on this path, deliberately — the whole
-                # point is a rolling context that spans the burst/gap boundary,
-                # and resetting would discard the context just built.
+                # On: the device's audio HAL cancels its own playback out of
                 # every capture, and the ring is playback like any other, so
                 # what arrives here is residual rather than chime. Score it —
                 # at the barge threshold, set below — so a wake word can land
@@ -3193,9 +3144,11 @@ async def wake_word_listener(device: Device):
                 # rolling context that spans the burst/gap boundary, and
                 # resetting would discard the context just built.
                 #
-                # wake word, which silences the alarm itself. AEC being opt-in
-                # is the gate for now; scoring an uploaded sound against the
-                # model at upload time is the way to retire it properly, and
+                # The risk it takes is a chime whose residual scores as the
+                # wake word, which silences the alarm itself. Being opt-in is
+                # the gate for now, and the AFE's cancellation depth on this
+                # hardware is unmeasured; scoring an uploaded sound against the
+                # model at upload time is the way to retire this properly, and
                 # the ring log line below records which window a score came
                 # from so a self-silencing ring states its own cause.
                 ring_deaf = device.timer_ring_audible and not device.ring_barge_in
@@ -3534,16 +3487,9 @@ async def wake_word_listener(device: Device):
                             f"[{device.device_id}] OWW: oww_paused set, "
                             f"routing to voice_queue (no mic_stop/mic_start_turn)"
                         )
-                        # Lock the beamformer onto the speaker's perimeter mic
-                        # NOW, mid-utterance — the onset detector has the
-                        # freshest possible signal at this moment. No stream
-                        # restart; released by beam_unlock post-turn (and
-                        # implicitly by any TTS mic stop/start cycle).
-                        await device.beam_lock()
-
                         # Multi-device arbitration: if this utterance also
                         # woke another Echo, only the best-placed one should
-                        # answer. Capture routing (oww_paused, beam lock) is
+                        # answer. Capture routing (oww_paused) is
                         # already set up above ON PURPOSE — the winner's
                         # command audio must be flowing from the first
                         # syllable, so we arm optimistically and revert on
@@ -3561,7 +3507,10 @@ async def wake_word_listener(device: Device):
                         if won_by != device.device_id:
                             device.oww_paused.clear()
                             device.last_wake = None
-                            await device.beam_unlock()
+                            # No turn on this device, so nothing will consume
+                            # the clip — dropping it here is what stops the
+                            # winner's neighbour handing its audio to whatever
+                            # turn it eventually does start.
                             ceded = 0
                             while not device.voice_queue.empty():
                                 try:
@@ -3597,12 +3546,6 @@ async def wake_word_listener(device: Device):
                         # tab and in queries without any of them changing.
                         label = "wakeword-dev" if source == "device" else "wakeword"
                         await _run_voice_locked(device, trigger_label=f"{label}({score:.3f})", is_wakeword=True)
-                        # Back to ch6 omni for wake listening. Belt-and-braces
-                        # for turns that never restarted the stream (no-TTS
-                        # outcomes: error, no-speech, cancel) — a lock left
-                        # in place would point wake listening at one
-                        # perimeter mic instead of omni.
-                        await device.beam_unlock()
 
                         drained = 0
                         while not device.voice_queue.empty():
@@ -3618,8 +3561,8 @@ async def wake_word_listener(device: Device):
                             )
                         model.reset()
                         buf.clear()
-                        # mic_start without lock_mic — device stays on ch6 omni
-                        # (beamforming=off), same stream as OWW listening.
+                        # mic_start without lock_mic — the ungated wake
+                        # stream, same one OWW listens to.
                         # This is a defensive restart only: if the stream
                         # somehow died during the turn, this revives it.
                         # If already running, the device no-ops it.
@@ -3741,19 +3684,19 @@ async def handle_button_event(device: Device, event: dict):
             async def _button_voice_turn():
                 # Button is a deliberate act with no dead zone cost — nothing
                 # is being said at the moment of press, so stop/start RTT is
-                # fine. Stop the running ch6 stream, restart with lock_mic:true
-                # so streamMic calls beam.Lock(beamformingEnabled) and the
-                # beamformer selects the best perimeter mic for this turn.
-                # mic_start_turn() no-ops if already running, so stop first.
+                # fine. Stop the running wake stream, restart with
+                # lock_mic:true so the turn gets the device's VAD gate and its
+                # end-of-speech sentinel. mic_start_turn() no-ops if already
+                # running, so stop first.
                 await device.mic_stop()
                 await device.mic_start_turn()
                 await _run_voice_locked(device, trigger_label="button", is_wakeword=False)
                 log.info(f"[{device.device_id}] Button turn complete — restarting mic")
-                # Post-turn: back to ch6 omni for OWW listening. mic_stop
+                # Post-turn: back to the ungated wake stream. mic_stop
                 # first: if the turn had no TTS (cancel/error/no-speech), the
                 # lock_mic stream from mic_start_turn is still running and a
-                # bare mic_start would no-op against it — leaving the GATED,
-                # beam-locked turn stream as the permanent wake stream. Safe
+                # bare mic_start would no-op against it — leaving the GATED
+                # turn stream as the permanent wake stream. Safe
                 # now that streamMic's exit has the ownership check (the
                 # stop/start pair can no longer leak a second stream).
                 await device.mic_stop()

@@ -21,14 +21,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/wilbowes/EchoMuse/internal/aec"
 	"github.com/wilbowes/EchoMuse/internal/bindings/als"
 	"github.com/wilbowes/EchoMuse/internal/bindings/jack"
 	internalbuttons "github.com/wilbowes/EchoMuse/internal/bindings/buttons"
-	"github.com/wilbowes/EchoMuse/internal/bindings/mic"
 	"github.com/wilbowes/EchoMuse/internal/bindings/slmic"
 	"github.com/wilbowes/EchoMuse/internal/bindings/slspeaker"
-	"github.com/wilbowes/EchoMuse/internal/bindings/speaker"
 	"github.com/wilbowes/EchoMuse/internal/bluetooth"
 	"github.com/wilbowes/EchoMuse/internal/client"
 	"github.com/wilbowes/EchoMuse/internal/config"
@@ -73,13 +70,6 @@ func main() {
 		log.Fatalf("Failed to initialize Button controller: %v", err)
 	}
 
-	// AEC canceller — far end fed by the speaker's echo tap, near end run
-	// by the data client on the mono mic stream. Starts disabled; armed by
-	// applyAecConfig from env defaults below and on every config push. On
-	// the native-AFE audio path this stays wired up but unused — see
-	// newAudioBackends.
-	canceller := aec.New()
-
 	// The level tap drives the energy-reactive LED ring ("meter" pattern).
 	// The Server doesn't exist yet when the speaker starts its pump loop,
 	// so the tap goes through an atomic pointer armed just below.
@@ -90,7 +80,7 @@ func main() {
 		}
 	}
 
-	microphone, pcmSpeaker, err := newAudioBackends(canceller, levelTap)
+	microphone, pcmSpeaker, err := newAudioBackends(levelTap)
 	if err != nil {
 		log.Fatalf("Failed to initialize audio: %v", err)
 	}
@@ -111,21 +101,16 @@ func main() {
 
 	ctx := context.Background()
 
-	dataClient := client.NewDataClient(deviceID, microphone, pcmSpeaker, canceller)
-	applyAecConfig(canceller) // arm from env defaults before any config push
+	dataClient := client.NewDataClient(deviceID, microphone, pcmSpeaker)
 
-	// Direction callback — update LED ring to show estimated source angle
-	dataClient.OnDirectionChanged(func(angle float64) {
-		s.SetDirectionLEDs(angle)
-	})
 	controlClient := client.NewControlClient(
 		deviceID,
-		func(leds []led.Led, listening *bool) {
+		func(leds []led.Led) {
 			// A raw frame from the controller supersedes any running
 			// device-local animation — stop it so its next tick can't
 			// paint over this frame.
 			s.StopAnim()
-			s.SetLEDs(leds, listening)
+			s.SetLEDs(leds)
 		},
 		func(lockMic bool) {
 			if s.IsMuted() {
@@ -260,8 +245,7 @@ func main() {
 			// Orange pulse overwrote the red ring — restore it.
 			s.RestoreMuteRing()
 		} else {
-			s.SetLEDs(allLEDs(0, 0, 0), nil)
-			s.LEDModeDirection()
+			s.SetLEDs(allLEDs(0, 0, 0))
 		}
 		// Send an immediate stats snapshot so the dashboard populates on
 		// (re)connect rather than waiting up to 30s for the first tick.
@@ -280,11 +264,10 @@ func main() {
 		}
 	})
 
-	// Config applied — apply hardware changes via tinymix, AEC params to
-	// the canceller. AEC/BLE read the merged post-Apply snapshot rather than
-	// the (partial) message so unmentioned fields keep their values.
+	// Config applied. BLE and shadow read the merged post-Apply snapshot
+	// rather than the (partial) message so unmentioned fields keep their
+	// values.
 	controlClient.OnConfigApplied(func(msg config.ConfigMessage) {
-		applyHardwareConfig(msg)
 		// startupVolume is the controller's persisted record of this
 		// device's volume (updated on every volume_state report) — restore
 		// it through the Server, not a raw tinymix write: SeedVolume keeps
@@ -293,7 +276,6 @@ func main() {
 		if msg.StartupVolume > 0 {
 			s.SeedVolume(msg.StartupVolume)
 		}
-		applyAecConfig(canceller)
 		applyBleConfig(bleScanner)
 		applyShadowConfig(dataClient, controlClient, pcmSpeaker, s)
 	})
@@ -335,7 +317,7 @@ func main() {
 
 	// Per-stream playback stats — underrun/period counts reported upstream
 	// once per completed TTS stream, persisted against the voice turn.
-	pcmSpeaker.OnStreamStats(func(st speaker.StreamStats) {
+	pcmSpeaker.OnStreamStats(func(st pkgspeaker.StreamStats) {
 		controlClient.SendPlaybackStats(st.Periods, st.Underruns, st)
 	})
 
@@ -372,17 +354,6 @@ func main() {
 			}
 			controlClient.SendWifiScanResult(nets, "")
 		}()
-	})
-
-	// Beam lock/unlock — controller locks the beamformer onto the speaker's
-	// perimeter mic at wake detection (mid-stream, no restart) and releases
-	// it at turn end. Requests are consumed by the mic streaming goroutine.
-	controlClient.OnBeamLock(func(lock bool) {
-		if lock {
-			dataClient.RequestBeamLock()
-		} else {
-			dataClient.RequestBeamUnlock()
-		}
 	})
 
 	// Mute state change — notify controller so dashboard can reflect it,
@@ -516,84 +487,46 @@ func main() {
 	os.Exit(0)
 }
 
-// ─── Audio backend selection ───────────────────────────────────────────────────
+// ─── Audio backend ─────────────────────────────────────────────────────────────
 //
-// See docs/native-afe-migration.md. Two backend pairs implement the same
-// pkg/mic and pkg/speaker interfaces:
+// Capture and playback both go through Android's audio HAL over OpenSL ES
+// (internal/bindings/slmic + internal/bindings/slspeaker), which is what
+// reaches Amazon's ASP front end: per-mic AEC, fixed + adaptive beamformer,
+// SNR beam selection and its own AGC, selected by capturing at
+// AUDIO_SOURCE_VOICE_RECOGNITION. See docs/native-afe-migration.md.
 //
-//	tinyalsa (default): internal/bindings/mic + internal/bindings/speaker —
-//	  writes PCM directly, our own beamformer/AEC/AGC.
-//	native AFE (opt-in): internal/bindings/slmic + internal/bindings/slspeaker —
-//	  OpenSL ES through Android's audio HAL, reaching Amazon's ASP front end
-//	  (per-mic AEC, beamforming, SNR beam selection) at the cost of no longer
-//	  owning the PCM outright.
+// The two sides are inseparable, and that is the one rule worth restating
+// here: ASP takes its far-end reference on the HAL's PLAYBACK side, so a
+// build that captured through the framework while still writing PCM directly
+// would produce audio that is beamformed but not echo-cancelled, with no
+// error anywhere — a wiring mistake that reads as the AFE underperforming.
+// There is no longer a second backend pair to get that wrong with.
 //
-// This is a BOOT-TIME choice, not a live config push — the mic/speaker
-// backends are opened here, before any controller connection exists to push
-// a config to. Per the plan's own "Risks" section, recovery from a bad AFE
-// run in the field is "a firmware flag flip and a restart", deliberately not
-// a config toggle: EM_NATIVE_AFE is read once, at process start.
-//
-// The two backends are ALWAYS chosen together, never independently — an AFE
-// build with only one side converted produces audio that is beamformed but
-// not echo-cancelled, with no error anywhere, which reads as the AFE
-// underperforming rather than as a wiring mistake ("the one rule that
-// matters" in the migration doc).
+// There is also no fallback. The old tinyalsa backends (our own beamformer,
+// speexdsp AEC and AGC) were deleted with this migration, so a device where
+// libOpenSLES.so cannot be dlopen'd or the HAL refuses the configuration
+// fails to start rather than quietly running a different pipeline. That is
+// the recovery path we want: main() fatals, start_server.sh counts three
+// fast exits and flips the A/B symlink back to the previous slot, which is a
+// firmware the device is known to boot.
 type micBackend interface {
 	pkgmic.Microphone
 	pkgmic.Subscribable
 }
 
-// nativeAFERequested reads the boot-time audio backend selection.
-func nativeAFERequested() bool {
-	v := strings.ToLower(strings.TrimSpace(os.Getenv("EM_NATIVE_AFE")))
-	return v == "1" || v == "true" || v == "on"
-}
-
-// newAudioBackends opens the mic and speaker backends selected by
-// EM_NATIVE_AFE, falling back to tinyalsa if the native-AFE path fails to
-// open — a device where libOpenSLES.so cannot be dlopen'd, or the HAL
-// refuses the configuration, keeps working exactly as it did before this
-// migration rather than failing to boot. On success on the native path, it
-// also flips the capability control.go's capabilities() reports: unlike
-// "ambient_light" (hardware either has the sensor or it doesn't),
-// "native_afe" reflects the backend actually running right now, not merely
-// what this firmware build supports — the same reasoning that keeps a
-// config control "disabled with the reason" rather than "present but inert"
-// on the controller/dashboard side (see docs/native-afe-migration.md's
-// Phase 2 and CLAUDE.md's capability-negotiation rule).
-func newAudioBackends(canceller *aec.Canceller, levelTap func(rms float64)) (micBackend, pkgspeaker.FullSpeaker, error) {
-	if !nativeAFERequested() {
-		return newTinyalsaBackends(canceller, levelTap)
-	}
-
-	log.Println("[audio] EM_NATIVE_AFE set — attempting the OpenSL ES / native-AFE audio path")
+// newAudioBackends opens the OpenSL ES capture and playback backends. They are
+// opened together and either both succeed or neither does.
+func newAudioBackends(levelTap func(rms float64)) (micBackend, pkgspeaker.FullSpeaker, error) {
 	m, err := slmic.NewMicrophone()
 	if err != nil {
-		log.Printf("[audio] native AFE microphone unavailable, falling back to tinyalsa: %v", err)
-		return newTinyalsaBackends(canceller, levelTap)
+		return nil, nil, fmt.Errorf("native AFE microphone: %w", err)
 	}
-	spk, err := slspeaker.NewSpeaker(canceller.WriteFar, levelTap)
+	spk, err := slspeaker.NewSpeaker(levelTap)
 	if err != nil {
-		log.Printf("[audio] native AFE speaker unavailable, falling back to tinyalsa: %v", err)
 		m.Close()
-		return newTinyalsaBackends(canceller, levelTap)
+		return nil, nil, fmt.Errorf("native AFE speaker: %w", err)
 	}
-
-	client.SetNativeAFEActive(true)
-	log.Println("[audio] native AFE audio path active (OpenSL ES) — beamformer/AEC/AGC bypassed, see docs/native-afe-migration.md")
-	return m, spk, nil
-}
-
-func newTinyalsaBackends(canceller *aec.Canceller, levelTap func(rms float64)) (micBackend, pkgspeaker.FullSpeaker, error) {
-	m, err := mic.NewMicrophone()
-	if err != nil {
-		return nil, nil, fmt.Errorf("tinyalsa microphone: %w", err)
-	}
-	spk, err := speaker.NewPcmSpeaker(canceller.WriteFar, levelTap)
-	if err != nil {
-		return nil, nil, fmt.Errorf("tinyalsa speaker: %w", err)
-	}
+	log.Println("[audio] native AFE audio path active (OpenSL ES)")
 	return m, spk, nil
 }
 
@@ -927,37 +860,6 @@ func wifiRSSI() *int {
 
 // ─── Hardware config ──────────────────────────────────────────────────────────
 
-// applyHardwareConfig runs tinymix commands for fields that map to hardware.
-// Called whenever the controller pushes a config message.
-func applyHardwareConfig(msg config.ConfigMessage) {
-	if msg.AdcDigitalGain > 0 {
-		tinymix("89", strconv.Itoa(msg.AdcDigitalGain), strconv.Itoa(msg.AdcDigitalGain))
-		tinymix("107", strconv.Itoa(msg.AdcDigitalGain), strconv.Itoa(msg.AdcDigitalGain))
-		tinymix("125", strconv.Itoa(msg.AdcDigitalGain), strconv.Itoa(msg.AdcDigitalGain))
-		tinymix("143", strconv.Itoa(msg.AdcDigitalGain), strconv.Itoa(msg.AdcDigitalGain))
-	}
-	if msg.AdcMicpga > 0 {
-		tinymix("92", strconv.Itoa(msg.AdcMicpga), strconv.Itoa(msg.AdcMicpga))
-		tinymix("110", strconv.Itoa(msg.AdcMicpga), strconv.Itoa(msg.AdcMicpga))
-		tinymix("128", strconv.Itoa(msg.AdcMicpga), strconv.Itoa(msg.AdcMicpga))
-		tinymix("146", strconv.Itoa(msg.AdcMicpga), strconv.Itoa(msg.AdcMicpga))
-	}
-}
-
-// applyAecConfig pushes the current effective AEC config into the canceller.
-// SetParams no-ops when nothing changed, so calling it on every config push
-// is free; when delay/tail change it rebuilds the echo state (adaptive
-// filter state is meaningless across a timing change anyway).
-func applyAecConfig(canceller *aec.Canceller) {
-	snap := config.Get().Snapshot()
-	enabled := snap.AecEnabled != nil && *snap.AecEnabled
-	delayMs := 250
-	if snap.AecDelayMs != nil {
-		delayMs = *snap.AecDelayMs
-	}
-	canceller.SetParams(enabled, delayMs, snap.AecTailMs)
-}
-
 // applyBleConfig starts/stops the BLE proxy scanner from the current
 // effective config. SetEnabled is idempotent, so calling it on every config
 // push is free.
@@ -1087,14 +989,6 @@ func applyBleConfig(scanner *bluetooth.Scanner) {
 	scanner.SetEnabled(snap.BleProxyEnabled != nil && *snap.BleProxyEnabled)
 }
 
-func tinymix(ctl string, args ...string) {
-	cmdArgs := append([]string{"-D", "0", ctl}, args...)
-	out, err := exec.Command("tinymix", cmdArgs...).CombinedOutput()
-	if err != nil {
-		log.Printf("[tinymix] ctl %s failed: %v — %s", ctl, err, string(out))
-	}
-}
-
 func allLEDs(r, g, b uint8) []led.Led {
 	leds := make([]led.Led, 12)
 	for i := range leds {
@@ -1123,7 +1017,7 @@ func pulseOrange(ctx context.Context, s *server.Server) {
 		case <-ticker.C:
 			t := float64(step) / float64(periodMs/stepMs)
 			br := minBr + (maxBr-minBr)*(0.5+0.5*math.Sin(2*math.Pi*t))
-			s.SetLEDs(allLEDs(uint8(255*br), uint8(40*br), 0), nil)
+			s.SetLEDs(allLEDs(uint8(255*br), uint8(40*br), 0))
 			step = (step + 1) % (periodMs / stepMs)
 		}
 	}
@@ -1149,7 +1043,7 @@ func pulseWhite(ctx context.Context, s *server.Server) {
 			t := float64(step) / float64(periodMs/stepMs)
 			br := minBr + (maxBr-minBr)*(0.5+0.5*math.Sin(2*math.Pi*t))
 			v := uint8(255 * br)
-			s.SetLEDs(allLEDs(v, v, v), nil)
+			s.SetLEDs(allLEDs(v, v, v))
 			step = (step + 1) % (periodMs / stepMs)
 		}
 	}

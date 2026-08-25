@@ -198,7 +198,7 @@ removes the objection that killed this last time
 shared-memory `IAudioStreamService`, whose host `amazon.speech.sim` our
 debloat hides). It is not the only transport.
 
-**The plumbing works, and native AFE makes it easier.** `WakeWordService` has
+**The plumbing works, and capturing through the audio HAL makes it easier.** `WakeWordService` has
 a *push* API:
 
 ```
@@ -209,8 +209,8 @@ initializeAudioRecordAndInjector()   AudioRecordInput / AudioRecordAdapter
 ```
 
 So it can take audio handed to it — no shared-memory service, no second
-`AudioRecord`, no contention for `pcm24c`. Under native AFE we already hold
-16 kHz mono AFE-processed capture, which is exactly pryon's input format, so
+`AudioRecord`, no contention for `pcm24c`. We already hold 16 kHz mono
+AFE-processed capture, which is exactly pryon's input format, so
 the frames could be pushed straight in. Results would come back through
 `pryonLocalCommandCallback_JNI` / `PryonApi_SetLocalCommandEnumeratedResult
 Callback`. And the C++ API is genuinely exported — 102 `WakeWordService`

@@ -206,13 +206,12 @@ def resolve(config: dict) -> dict:
             "ttlSec":   SPIN_TTL,
         }
     listening_anim = {
-        "pattern":   "solid",
-        "colors":    [list(c) for c in preset["listening"]],
-        "listening": True,
-        "ttlSec":    30,
+        "pattern": "solid",
+        "colors":  [list(c) for c in preset["listening"]],
+        "ttlSec":  30,
     }
     # Playback: the ring throbs with the live speaker level (device-side
-    # RMS at the ALSA write). Solid scenes throb the spinner head colour;
+    # RMS at the write point). Solid scenes throb the spinner head colour;
     # pride throbs the whole rainbow.
     meter_palette = (preset["listening"] if preset["rotate"]
                      else [preset["spin_head"]])

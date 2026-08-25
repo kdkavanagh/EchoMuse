@@ -37,7 +37,15 @@ tinymix -D 0 64 1 1
 tinymix -D 0 88 On
 tinymix -D 0 61 100 100
 
-# Mic gain — equalised across all four ADCs (A/B/C/D)
+# Mic gain — equalised across all four ADCs (A/B/C/D).
+#
+# Kept even though Android's audio HAL owns the mic chain now (its own PGA
+# plus the AFE's output gain — docs/native-afe-migration.md's bypass table).
+# Whether the HAL rewrites these four pairs when it opens the input, or
+# inherits whatever it finds, is unverified on hardware; if it inherits, this
+# is the only thing equalising the four ADCs, and if it rewrites, this costs
+# eight tinymix calls at boot. Removing it is a measurement away, not a
+# guess.
 tinymix -D 0 89 88 88
 tinymix -D 0 92 40 40
 tinymix -D 0 107 88 88
@@ -119,36 +127,14 @@ sup_log() {
 
 sup_log "boot slot=$(readlink /data/local/bin/server 2>/dev/null)"
 
-# ── Native AFE opt-in (docs/native-afe-migration.md) ───────────────────────────
-# EM_NATIVE_AFE is read once by the Go binary at ITS OWN startup — a boot-time
-# choice, not a live config push (cmd/server.go's newAudioBackends: mic/speaker
-# are opened before any controller connection exists to push a config to).
-#
-# A marker FILE, not a hand-export in this script, is what makes the choice
-# durable: this script is re-synced against the canonical payload on every
-# OTA when it drifts (_sync_start_script) and a hand edit here would simply be
-# overwritten. The marker lives in DEVICE_TLS_DIR's directory, not this
-# script, so it survives exactly the syncs that would erase an edit here.
-#
-# Checked once, before the retry loop — `export` here is inherited by every
-# `/data/local/bin/server` launch for the rest of this script's run, so one
-# check covers every restart the retry loop performs. It does NOT take effect
-# on a running device until this script itself re-execs (a real reboot, or
-# `stop`/`start` of the echomuse service from a channel independent of the
-# server's own shell proxy — see the marker's controller-side helper for why
-# the shell proxy must not do this itself).
-NATIVE_AFE_MARKER=/data/local/etc/echomuse/native_afe.enabled
-if [ -f "$NATIVE_AFE_MARKER" ]; then
-    export EM_NATIVE_AFE=1
-    sup_log "native AFE opt-in marker present — EM_NATIVE_AFE=1"
-fi
-
 # ── Amp safety ────────────────────────────────────────────────────────────────
-# Mute + amp off whenever the server is not running. The server does this
-# itself on SIGTERM (PcmSpeaker.Close), but SIGKILL/panic paths skip it —
-# and an enabled amp on an idle DAC produces audible hiss for as long as
-# the server is down (between OTA slots was the worst case). Idempotent;
-# the server re-enables the amp in its own startup sequence.
+# Mute + amp off whenever the server is not running. An enabled amp on an
+# idle DAC produces audible hiss for as long as the server is down (between
+# OTA slots was the worst case). This is the ONLY thing that does it: the
+# speaker backend deliberately leaves the amp/mute controls alone on close,
+# because mediaserver owns the PCM and Android's HAL reacts to the same
+# controls (see slspeaker.Close). Idempotent; the server re-enables the amp
+# in its own startup sequence.
 amp_off() {
     tinymix -D 0 61 0 0 2>/dev/null
     tinymix -D 0 5 Off 2>/dev/null

@@ -5,7 +5,7 @@ em_recordings.py — utterance audio capture for the Activity panel
 Saves the mic audio of recent voice turns as WAV files so you can *listen*
 to what the array actually captured, rather than inferring mic quality from
 an STT transcript and a wake score. Asked for by users who wanted to judge
-capture quality before spending an evening tuning micGainDb/AEC/NS.
+capture quality before spending an evening on the room and the placement.
 
 Storage mirrors `em_oww_models`: files live in `recordings/` beside the
 SQLite DB, so they sit inside the persisted Docker volume and survive image

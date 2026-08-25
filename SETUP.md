@@ -37,9 +37,13 @@ Ch7, Ch8 → unconnected
 
 **ADC architecture:** Four TLV320ADC3101 stereo ADCs (I2C bus 0, addresses 0x18–0x1b). Probe order at boot determines channel assignment: 0x18→Ch0/1, 0x19→Ch2/3, 0x1a→Ch4/5, 0x1b→Ch6/7. All chips share a TDM data bus (confirmed from PCB trace analysis — DOUT shared, not daisy-chained). Array radius: 36mm (confirmed from PCB measurement).
 
-**Why ch6 for wake word?** The centre mic is equidistant from all directions. OWW receives consistent audio regardless of where you're standing, and ambient sounds cannot lock it to a suboptimal direction. Perimeter mics are directional by proximity — good for STT once direction is known, but wrong for always-on wake word detection.
+**EchoMuse no longer reads these channels.** Capture goes through Android's audio HAL at `AUDIO_SOURCE_VOICE_RECOGNITION`, which hands back one processed mono channel — Amazon's ASP front end has already done per-mic AEC, fixed and adaptive beamforming, SNR beam selection and gain (see [docs/native-afe-migration.md](docs/native-afe-migration.md)). The channel map above is still the hardware, still what `device/tools/capture_mics` and `bf_capture` see, and still what the analysis below is about — but nothing in the shipping firmware selects a channel any more.
 
-**Why directional mic selection for voice turns?** The mic physically closest to the speaker has the best SNR for that speaker. Selecting it at voice turn start (after wake word or button press) locks in the optimal channel for the duration of the turn. The lock happens at `mic_start` with `lock_mic: true` — not during ambient VAD activity — ensuring ambient sounds before the turn don't influence selection.
+The rest of this section is the reasoning that led there, and it is worth keeping: it is why handing the array to Amazon's front end is the right answer rather than a shortcut, and it is what anyone proposing to write a beamformer here needs to read first.
+
+**Why ch6 for wake word?** (EchoMuse's own selector, until the HAL took over.) The centre mic is equidistant from all directions. OWW receives consistent audio regardless of where you're standing, and ambient sounds cannot lock it to a suboptimal direction. Perimeter mics are directional by proximity — good for STT once direction is known, but wrong for always-on wake word detection.
+
+**Why directional mic selection for voice turns?** The mic physically closest to the speaker has the best SNR for that speaker. Selecting it at voice turn start (after wake word or button press) locks in the optimal channel for the duration of the turn.
 
 **Why mic selection rather than delay-and-sum?** At speech frequencies (<2kHz), a 72mm array has insufficient angular resolution to reliably discriminate between the 6 candidate directions. More critically, the maximum inter-mic delay is ~3.3 samples at 16kHz — requiring sub-sample fractional delay interpolation that introduces frequency-dependent phase errors causing comb filtering. Directional mic selection avoids all phase math and produces clean output.
 
@@ -61,43 +65,35 @@ Below ~1.5kHz — where most speech energy is — every mic is hearing between 8
 
 The class of algorithm that *does* extract directivity from a sub-wavelength aperture is **superdirective / differential** beamforming (and is presumably close to what the XMOS front-end in purpose-built far-field kit is doing). It is not a free upgrade: superdirective designs trade directly against **white noise gain**, amplifying uncorrelated sensor self-noise by 20dB or more at low frequencies on a 0.1λ aperture, and they need per-element magnitude and phase calibration to come anywhere near theory. Seven MEMS capsules spread across four unmatched TLV320ADC3101s, on a CPU already at ~18–20% baseline just running the mic pipeline, is not the substrate for that. Filed as a research curiosity, not a roadmap item.
 
-**Practical consequence for far-field reach:** it is not a beamforming problem on this hardware, and not recoverable by a config change either — the ch6-vs-best-perimeter SNR difference is negligible at conversational distance (see the `beamformingEnabled` note in `em_db.py`). Reach here is set by the room's noise floor, distance and placement. The 2026-07-29 utterance analysis measured 8.7dB of noise-floor drift between two runs of the *same phrase* at ~1.3m, enough on its own to flip the transcript. The levers that genuinely exist are single-channel: `nsAsr`, wake model choice, and moving the device.
+**Practical consequence for far-field reach:** it is not a beamforming problem on this hardware, and there is no config change that recovers it — the ch6-vs-best-perimeter SNR difference was negligible at conversational distance, and the mic chain is not adjustable at all now. Reach here is set by the room's noise floor, distance and placement. The 2026-07-29 utterance analysis measured 8.7dB of noise-floor drift between two runs of the *same phrase* at ~1.3m, enough on its own to flip the transcript. The levers that genuinely exist are single-channel: `nsAsr`, wake model choice, and moving the device.
 
-**How Amazon does it:** Amazon's `amazon.speech.sim` reads the same raw 9-channel array via Android AudioRecord and does software processing. There is no hardware beamforming output channel. The MediaTek MAGI Conference DOA feature (in `audio.primary.mt8163.so`) is designed for phone call use cases and is not active in voice assistant mode on this device.
+**How Amazon does it, and why we let it.** Amazon's `amazon.speech.sim` reads the same raw 9-channel array via Android AudioRecord and does software processing — there is no hardware beamforming output channel, and the MediaTek MAGI Conference DOA feature (in `audio.primary.mt8163.so`) is for phone-call use cases and is not active in voice assistant mode here.
+
+What Amazon's front end does have is exactly the class of algorithm the analysis above says this aperture needs, tuned by the people who chose the aperture: per-microphone subband echo cancellation ahead of a fixed *and* adaptive beamformer, with SNR-based beam selection. It reaches it through the ordinary Android capture API at `AUDIO_SOURCE_VOICE_RECOGNITION`, with no Amazon service running and no Alexa packages un-hidden. That is what EchoMuse captures through now. How much better it measures on this hardware is **still not known** — the probe that would answer it has never been run (see the migration doc's Phase 0).
 
 ---
 
 ## Mic Array — What Actually Happens at Each Stage
 
-This describes the pipeline as of v2.9.4 (2026-07-18; originally written for v2.7.1): the wake stream is **ungated and AGC-free** — the device streams continuously, and all adaptation lives controller-side as measurement. The only gain in the path is the fixed 24-bit mic gain (v2.7.1). Device-side NS is gone entirely (RNNoise removed 2026-07-12; noise suppression is now controller-side DTLN on the speech-to-text stream only, per-device `nsAsr` flag), and speexdsp AEC (v2.7.3+) sits in the mono path when enabled. One cadence correction to the numbers below: GoTinyAlsa delivers whole ALSA buffers, so the mic loop actually runs on **160ms batches of 2560 frames** (69120 raw bytes), not single 512-frame periods. The stages are in order from hardware to HA.
+This describes the pipeline as it stands after the move to Android's audio HAL. **Every signal-processing stage EchoMuse used to run on the device is gone** — the beamformer, the speexdsp echo canceller, the AGC and the fixed 24-bit mic gain were deleted, and the HAL's ASP front end does that work before Go ever sees a sample. What is left on the device is framing, a VAD gate on button turns, and the wire.
+
+The wake stream is **ungated** — the device streams continuously, and all adaptation lives controller-side as measurement. Device-side NS is gone (RNNoise removed 2026-07-12); noise suppression is controller-side DTLN on the speech-to-text stream only, per-device `nsAsr` flag, and is now a *second* pass on top of the HAL's own. Cadence: the OpenSL ES recorder delivers **80ms periods of 1280 samples**, sized to match the wire frame exactly — the old ALSA path delivered 160ms batches of raw 9-channel capture, so anything reasoning about batch size predates this. The stages are in order from hardware to HA.
 
 Why the gate came out (2026-07-06 rework): the VAD gate's absolute RMS threshold is wrong in at least one room of every home, openwakeword is a streaming model that scores best on continuous audio (gated bursts spliced together measurably depress scores even with preroll), and the AGC's persistent gain state on a never-restarting stream rebaselined itself to each room's noise floor — the "wake word degrades over days, reboot fixes it" disease. Bandwidth was the reason for the gate and it doesn't survive arithmetic: 16kHz mono S16 is 32KB/s per device, 6× smaller than the TTS playback stream.
 
 ### Idle — waiting for wake word
 
 ```
-ALSA card 0 device 24 (9ch S24_3LE 16kHz)
-  → pcm_microphone.go subscriber channel (raw 13824-byte periods at ~31ms intervals)
-  → beamformer.Process(raw, beamAngle, gain)
-      — unlocked (idle): always returns ch6 (centre/omni mic)
-      — smoothers still update every period (baseline stays warm;
-        energy ratios are gain-invariant)
-      — fixed mic gain (micGainDb, default +24dB) applied to the FULL
-        24-bit sample during S16 extraction (v2.7.1) — the old path took
-        the upper 2 bytes and threw away the low byte, where nearly all
-        of the signal lives at this hardware's capture levels (speech
-        ≈ −70dBFS raw). Clipped samples are counted and reported.
-      — returns mono S16_LE 512 samples
+9-mic array → Android audio HAL, captured at AUDIO_SOURCE_VOICE_RECOGNITION
+  — ASP pipeline 0: per-mic AEC, fixed + adaptive beamformer, SNR beam
+    selection, false-wake prevention, +7.2dB. Tuned in /system/etc/AFE.cfg,
+    which is read-only: nothing here is adjustable.
+  — the far-end reference it cancels against is taken on the HAL's own
+    playback side, which is why playback must go through the framework too
+  → slmic.go subscriber channel (mono S16 16kHz, 2560-byte 80ms periods)
   → vadPeriodRMS(mono) — computed for the periodic diagnostic log only
-      (every ~10min, or within ~16s of a clipped sample — v2.7.1);
-      does NOT gate sending on this stream (v2.7.0)
-  → aec.Process(mono) — speexdsp echo cancel against the speaker's own
-      output (v2.7.3; no-op while aecEnabled=false; ~14dB when converged)
-  → AGC: NEVER on the wake stream (v2.7.0 — forced off regardless of config;
-      adaptive gain state on a permanent stream is a rebaselining mechanism
-      by construction). agcEnabled config now applies to lock_mic turn
-      streams only.
-  → EVERY period sent — batched into 80ms chunks, ~12.5 frames/s, 32KB/s:
+      (every ~10min); does NOT gate sending on this stream
+  → EVERY period sent, ~12.5 frames/s, 32KB/s:
       frame: [0x01][seq_hi][seq_lo][2560 bytes PCM = 80ms]
       No VAD gate, no preroll ring, no 0x04/0x05 sentinels on this stream.
 
@@ -119,7 +115,7 @@ wake_word_listener():
   → score >= threshold → wake detected
 ```
 
-**Key: the stream runs continuously and is completely stateless — no gate, no adaptive gain, nothing that can drift with room history. OWW always sees uninterrupted audio. ch6 omni during idle. Per-room adaptation happens controller-side as a noise-floor *measurement*, consumed by endpointing — never applied to the signal.**
+**Key: on EchoMuse's side the stream is completely stateless — no gate, no adaptive gain, nothing that can drift with room history. OWW always sees uninterrupted audio. Per-room adaptation happens controller-side as a noise-floor *measurement*, consumed by endpointing — never applied to the signal. What adaptation exists is inside the HAL (its adaptive beamformer and AGC), where it is Amazon's to have got right and ours only to observe.**
 
 ### Wake word detected → command capture
 
@@ -127,12 +123,6 @@ wake_word_listener():
 wake_word_listener():
   → oww_paused.set() — routing flips: handle_data() now sends to voice_queue
   → model.reset(), buf.clear()
-  → beam_lock control message (v2.7.0) — device locks the beamformer onto
-    the perimeter mic with the best speech onset ratio, mid-stream, no
-    restart. Sent at detection because that's the freshest onset signal the
-    selector will get (though see the beamforming caveat in the table below
-    — controller-side detection latency means even this is 300–500ms after
-    the wake word started). beam_unlock is sent after the turn completes.
   → _run_voice_locked(device, trigger_label="wakeword(score)")
       → [esphome path] trigger_voice_turn()
           → TurnTrace created (t0 = now)
@@ -163,9 +153,8 @@ wake_word_listener():
                     → VoiceAssistantAudio(end=True), t_vad_end logged
 
 NOTE: the stream never stops. No mic_stop, no mic_start_turn on OWW path.
-The only changes at wake are the oww_paused flag flipping the queue routing
-and the beam_lock switching the mic channel. Command audio flows in with
-zero gap.
+The only change at wake is the oww_paused flag flipping the queue routing.
+Command audio flows in with zero gap.
 ```
 
 ### HA pipeline → response
@@ -186,23 +175,19 @@ Controller satellite:
   → EQ at 48kHz (mono end-to-end — no resample, no stereo)
   → mic_stop → device stream stops BEFORE playback starts (v2.6.5 —
     previously only in the post-turn finally, so the device processed
-    63–65 frames of its own TTS echo per turn, contended the Wi-Fi radio
-    against the incoming speaker frames, and crushed AGC gain)
+    63–65 frames of its own TTS echo per turn and contended the Wi-Fi radio
+    against the incoming speaker frames). Skipped entirely when barge-in is
+    on: the mic stays live and the HAL's echo canceller keeps it usable.
   → stream PCM to device ALSA as 0x02 binary frames, 0x03 EOS
   → sleep for audio duration (acoustic feedback prevention)
   → EITHER (continuation, v2.6.5 C2): HA set continue_conversation →
     mic_start (no lock_mic) → loop into next turn with preroll_discard=0.
-    The restarted stream is ungated so audio flows immediately; the
-    controller sends beam_lock again the moment the user's answer clears
-    the noise floor (the TTS mic restart reset the beam to ch6 omni)
+    The restarted stream is ungated so audio flows immediately
   → OR (normal end): voice_queue drained WHILE oww_paused is still set
     (v2.6.5 regression fix — draining after the routing flip left stale
     ambient frames to arrive as preamble on the next turn)
   → oww_paused.clear() → routing returns to mic_queue
-  → mic_start (no lock_mic) → stream restarts on ch6 omni
-  → beam_unlock sent (belt-and-braces — matters for no-TTS turns where the
-    stream never restarted and a beam lock would otherwise persist into
-    idle wake listening)
+  → mic_start (no lock_mic) → ungated wake stream restarts
   → stale frames drained (belt-and-braces no-op now), OWW model reset
   → [TURN] log line emitted with full timing breakdown
 ```
@@ -224,21 +209,19 @@ Button press (clickType=138):
   → oww_paused.set()
   → mic_stop → device stream stops
   → mic_start(lock_mic:true) → new stream with lockMic=true
-      → beam.Lock(beamformingEnabled) called
-        — beamformingEnabled=true: selects perimeter mic with highest onset ratio
-        — beamformingEnabled=false: Lock() no-ops, stays on ch6
-      → [beam] locked to chX (Y°) onset_ratio=Z logged
+      → the device's VAD gate, preroll ring and end-of-speech sentinel
+        apply — the audio itself is identical to the wake stream's
   → _run_voice_locked(device, trigger_label="button")
   → [same HA pipeline as above]
-  → mic_stop → mic_start (no lock_mic) → back to ch6 omni
+  → mic_stop → mic_start (no lock_mic) → back to the ungated wake stream
     (explicit stop first, v2.7.0: on no-TTS outcomes — cancel, error,
     no-speech — the lock_mic stream is still running and a bare mic_start
-    would no-op against it, leaving the GATED, beam-locked turn stream as
-    the permanent wake stream)
+    would no-op against it, leaving the GATED turn stream as the permanent
+    wake stream)
 
 Button path retains stop/start because: (a) no dead zone cost — button is
 pressed before speech starts, (b) the lock_mic stream is the only place the
-VAD gate, preroll ring, sentinels, and (config-gated) AGC still exist.
+VAD gate, preroll ring and sentinels exist.
 ```
 
 ### What's currently off and why
@@ -246,17 +229,18 @@ VAD gate, preroll ring, sentinels, and (config-gated) AGC still exist.
 | Stage | State | Reason |
 |---|---|---|
 | RNNoise NS | **REMOVED** (2026-07-12) | Was calibrated for 48kHz, fed 16kHz — miscalibrated speech probability, degraded HF consonants. P0-3 resolved exactly as predicted here: deleted device-side, replaced by controller-side DTLN (`em_ns.py`, 16kHz-native) applied to the speech-to-text stream only, per-device `nsAsr` flag, default off. Wake stream stays raw. |
-| AGC | **OFF on the wake stream, permanently** (v2.7.0 — ignores config). Config-gated on lock_mic turns only. | v2.6.5 re-enabled it after the echo fixes, but ResetAGC only runs at stream start and the wake stream never restarts — in any room with steady noise above vadThreshold, the release path walked gain up toward amplifying the noise floor (the RNNoise interlock that was meant to prevent this is dead while NS is off), then the fast attack compressed the wake word's envelope mid-utterance. Adaptive gain state on a permanent stream = rebaselining by construction. The fixed gain staging that replaced it shipped in v2.7.1: `micGainDb` (+24dB default) applied to the full 24-bit sample pre-truncation. |
-| VAD gate (wake stream) | **REMOVED** (v2.7.0) | Absolute RMS threshold can't be right in every room; OWW wants continuous audio; the gate held open by ambient noise was also what let the AGC release run continuously. Still exists on lock_mic (button) streams for endpointing. |
-| Beamforming | ON in config, **lock-back selection (v2.7.2)** | Lock is commanded at wake detection (v2.7.0, beam_lock mid-stream); detection lands 300–500ms after the wake word ends, so live onset ratios had decayed and selection was known-poor. Fixed via lock-back: a ~2s ring of per-direction period energies (frozen while locked, like the baseline); Lock() scores each direction by its top-8-period burst within the window relative to its baseline, so it selects on the recorded wake word rather than the decayed present. Unit-tested (TV-vs-decayed-speaker scenario in `beamformer_test.go`). Known caveat: TTS echo enters the ring between turns — the baseline absorbs the same energy, damping its ratio, but continuation-turn locks are the weaker case until AEC. Validate direction LED against speaker position after OTA. |
+| Device-side AGC | **REMOVED** | Ours never ran on the wake stream (adaptive gain state on a permanent stream is a rebaselining mechanism by construction — the "wake word degrades over days" disease) and applied only to button turns. The HAL's own AGC runs on everything now, and is not switchable. |
+| Device-side AEC and beamforming | **REMOVED** | Replaced by the HAL's per-mic subband AEC, fixed + adaptive beamformer and SNR beam selection. Our speexdsp canceller reached ~7–9dB, which was measured as the physical ceiling for that approach on this hardware; the HAL's depth is **unmeasured** (docs/native-afe-migration.md, Phase 0). |
+| Fixed 24-bit mic gain | **REMOVED** | The framework hands back 16-bit audio with the HAL's PGA and the AFE's +7.2dB already applied. Note this moves every level in the tables below: values calibrated against `micGainDb` do not carry over. |
+| VAD gate (wake stream) | **REMOVED** (v2.7.0) | Absolute RMS threshold can't be right in every room; OWW wants continuous audio. Still exists on lock_mic (button) streams for endpointing. |
 | owwSpeexNs | OFF | Available (v2.6.5, Q1): openwakeword's speexdsp suppressor, wake path only. Off by default — flip on the lounge device and A/B wake rate with TV on before fleet-wide enable. |
 | Noise floor tracking | **ON** (v2.7.0, controller) | Per-device asymmetric EWMA over the continuous wake stream. Measurement only. Consumed by the SNR-relative no-speech timeout; logged as floor= in OWW lines. |
 
 ### VAD threshold guidance
 
-**Units (v2.7.1):** all values below are *pre-gain* — measured before the fixed `micGainDb` stage. The device scales `vadThreshold` by the linear gain internally, so the config value keeps these units regardless of the gain setting; the `rms=`/`floor=` values in controller logs are *post-gain* (multiply this table by ~16 at the default +24dB to compare).
+**These numbers are STALE and are kept as a shape, not a calibration.** They were measured on ch6 with EchoMuse's own gain staging, which no longer exists — the HAL's PGA and the AFE's output gain sit where `micGainDb` did, so absolute levels have moved by an unmeasured amount. What survives is the *ratio* between ambient and speech, which is what `vadThreshold` is really placed against. Re-measure before trusting a number here; the `rms=`/`floor=` values in controller logs are the audio as delivered.
 
-Measured signal levels at 16kHz on ch6, MICPGA=40, digital gain=88:
+Measured signal levels at 16kHz on ch6, MICPGA=40, digital gain=88, +24dB mic gain (the pre-AFE path):
 
 | Condition | Typical RMS |
 |---|---|
@@ -267,7 +251,7 @@ Measured signal levels at 16kHz on ch6, MICPGA=40, digital gain=88:
 
 vadThreshold 0.001 sits comfortably between ambient and speech. Raise to 0.003–0.005 in noisy rooms (TV on). Dashboard slider now goes down to 0.0001 for quiet environments.
 
-**Scope change (v2.7.0):** vadThreshold/vadSpeechMs/vadSilenceMs apply only to lock_mic (button) turn streams now — the wake stream is ungated and ignores all three. Wake-turn endpointing is HA's VAD; accidental-wake cutoff is the controller's 5s SNR-relative timeout against the measured per-room noise floor (no per-room tuning needed). The fixed-gain bump this table originally motivated shipped in v2.7.1 (`micGainDb`).
+**Scope change (v2.7.0):** vadThreshold/vadSpeechMs/vadSilenceMs apply only to lock_mic (button) turn streams now — the wake stream is ungated and ignores all three. Wake-turn endpointing is `em_endpoint`'s relative endpointer plus HA's VAD; accidental-wake cutoff is the controller's 5s SNR-relative timeout against the measured per-room noise floor (no per-room tuning needed).
 
 ---
 
@@ -451,15 +435,11 @@ Server → Device:
 ```json
 {"type": "ack", "device_id": "G0K0XXXXXXXX"}
 {"type": "pending"}
-{"type": "config", "adcDigitalGain": 88, "adcMicpga": 40, "vadThreshold": 0.001, ...}
+{"type": "config", "vadThreshold": 0.001, "owwThreshold": 0.5, ...}
 {"type": "leds", "leds": [{"id": 0, "r": 0, "g": 180, "b": 0}, ...]}
 {"type": "mic_start"}
 {"type": "mic_start", "lock_mic": true}
 {"type": "mic_stop"}
-{"type": "beam_lock"}      // v2.7.0: lock beamformer onto best perimeter mic
-                           // mid-stream, no restart (no-op if beamforming
-                           // disabled in config or already locked)
-{"type": "beam_unlock"}    // v2.7.0: release beam lock, back to ch6 omni
 {"type": "led_anim", "pattern": "spin", "colors": [...], "periodMs": 900, "ttlSec": 135}
                            // v2.9: device renders frames on its own ticker;
                            // ttlSec is a dead-man so a dropped clear cannot
@@ -701,11 +681,11 @@ One consequence worth knowing: with mediaserver alive, Android still reacts to j
 
 **Direction estimation — onset ratio.** Two parallel smoothers run per direction: fast (α=0.9, ~320ms) tracking instantaneous energy, and slow (α=0.995, ~10s) tracking the background noise floor. At lock time, the direction with the highest `energySmooth / energyBaseline` ratio is selected — this is the direction with the biggest *recent energy increase* (speech onset), not the direction with the highest absolute energy (TV, fan). The slow baseline is frozen during voice turns to prevent the speaker's own voice from corrupting the noise estimate. This reliably picks the speaker direction even with a television on in the room.
 
-**LED direction overlay.** The direction arc is overlaid on the solid green listening ring during voice turns only (not during idle wake word listening). The overlay uses the controller-set base ring state rather than accumulating — each period resets to the base green and applies the direction marker fresh. Primary direction LED: bright light green (R:0 G:255 B:80). Adjacent LEDs: base green boosted by 60. The overlay stops immediately when the controller sends the thinking spinner (spinner LEDs are not solid green, so `listeningLEDs` flag goes false).
+**LED direction overlay — removed.** It brightened the segment of the listening ring facing whichever perimeter mic EchoMuse's beamformer had locked. The HAL selects its beam internally and reports it only in ASP debug output, never per frame, so there is nothing to point with; the arc, the `listening` flag on `leds` frames and the device-side `ledMode` priority that existed for it all went with the beamformer.
 
 **LED physical mapping.** 12 LEDs (IS31FL3236A), one either side of each perimeter mic. LED 0 is physically at 240° (just clockwise of MK5 at 210°). Volume sweep confirmed: starts at LED 0, sweeps clockwise. Offset formula: `LED = ((angle - 240 + 360) % 360) / 30`.
 
-**Audio processing pipeline.** Each 160ms mic batch of raw beamformed audio passes through: (1) speexdsp AEC (v2.7.3, when enabled) — subtracts the speaker's own output, whole mic path including the wake stream. (2) AGC (button/lock_mic turns only; never the wake stream) — targets -22dBFS RMS with fast attack (0.05) and slow release (0.005); release frozen during silence to prevent noise floor amplification. VAD decisions are made on pre-AGC audio to keep the threshold stable. Device-side RNNoise was removed 2026-07-12 — noise suppression is controller-side DTLN on the speech-to-text stream (`nsAsr` flag).
+**Audio processing pipeline.** There is no longer one on the device. Every 80ms period arrives from the HAL already echo-cancelled, beamformed, beam-selected and gained; EchoMuse frames it and sends it. The only remaining decision on the device is the VAD gate on button turns. Device-side RNNoise was removed 2026-07-12 and the speexdsp AEC, the beamformer and the AGC went with the move to the HAL — noise suppression is controller-side DTLN on the speech-to-text stream (`nsAsr` flag), which is now a second pass on top of the HAL's own.
 
 **Acoustic feedback prevention.** `stream_speaker` completes well ahead of actual playback (the WS write runs ~2× realtime and the device buffers ~5.5s). Without compensation, the mic would restart while the speaker is still playing, and the assistant would hear itself and trigger another turn. The controller sleeps for the remaining playback duration (plus the ~1s prime allowance) after streaming, racing `cancel_event` so barge-in cuts the wait instantly. With barge-in enabled the mic never stops at all — AEC is what keeps the live mic usable during playback.
 

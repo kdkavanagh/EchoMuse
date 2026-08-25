@@ -201,6 +201,15 @@ would have let the shared "hey" carry it over the bar. Comma-separate
 `--phrase` to accept spelling variants, matching `target_phrase`. Tune with
 `--match-ratio`, or skip the whole thing with `--no-verify`.
 
+  `nsAsr`, `agcEnabled` and `beamformingEnabled` off for the session and
+  `saveUtterances` on, then **puts the device's config back exactly as it
+  was on exit, Ctrl+C included** (if the restore ever fails it prints the
+  body to undo it by hand). `micGainDb` and `aecEnabled` are deliberately
+  left alone: they apply to the wake stream too.
+
+Needs an admin session — `--token`/`EM_TOKEN`, or it prompts. Mute must be
+off (a dot press while muted refuses the turn), HA will answer every press,
+and only the newest ten recordings per device survive on the controller, so
 leave a beat between phrases.
 
 property `collect_device_clips.py` works so hard for on the positive side,

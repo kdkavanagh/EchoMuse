@@ -1648,8 +1648,6 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
   const [logsLoading, setLogsLoading] = useState(false);
   const [pushLog, setPushLog] = useState([]);
   const [pushing, setPushing] = useState(false);
-  const [nativeAfeBusy, setNativeAfeBusy] = useState(false);
-  const [nativeAfeLog, setNativeAfeLog] = useState([]);
   const [release, setRelease] = useState(null);
   const [checkingRelease, setCheckingRelease] = useState(false);
   const [approveLabel, setApproveLabel] = useState(device.label || '');
@@ -1919,70 +1917,6 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
           clearInterval(poll); setPushing(false);
         }
       } catch(e) { clearInterval(poll); setPushing(false); }
-    }, 3000);
-  }
-
-  // Native AFE opt-in (docs/native-afe-migration.md) — the marker write
-  // takes effect only on the device's next boot, so this always confirms
-  // (unlike doRollback: that's a well-worn recovery path, this is putting
-  // brand-new, hardware-unverified code — OpenSL ES, HAL routing — directly
-  // in the path of the device's next real voice turn) and always reboots
-  // immediately rather than leaving a marker set with no visible effect,
-  // which would read as the control having silently done nothing.
-  async function doNativeAfeToggle(enable) {
-    const who = enable ? "Amazon's" : "EchoMuse's";
-    if (!confirm(`Switch ${device.label || device.device_id} to ${who} audio pipeline ` +
-                 `and restart it now?\n\n` +
-                 (enable
-                   ? `Recording and playback move to the Echo's original Amazon audio ` +
-                     `software, which does its own beamforming, echo cancellation and auto ` +
-                     `gain in place of EchoMuse's.`
-                   : `Recording and playback move back to EchoMuse's own pipeline, and its ` +
-                     `beamforming, echo cancellation and gain settings take effect again.`) +
-                 `\n\nThe Echo will be briefly unreachable while it restarts.`)) return;
-    setNativeAfeBusy(true);
-    setNativeAfeLog([`Switching to ${who} pipeline — writing the marker and restarting…`]);
-    try {
-      await API.post(`/api/devices/${device.device_id}/native_afe`, { enabled: enable, reboot: true });
-      setNativeAfeLog(l => [...l, 'Marker set — waiting for the device to come back…']);
-      _pollNativeAfeReconnect(enable);
-    } catch(e) {
-      setNativeAfeLog(l => [...l, `Error: ${e.error || 'Could not write the marker'}`]);
-      setNativeAfeBusy(false);
-    }
-  }
-
-  // Unlike _pollReconnect, completion is "reconnected" — a reboot for this
-  // doesn't change firmware_ver, so that check can't apply. Reports whether
-  // the capability actually came up matching what was requested: the
-  // backend falls back to tinyalsa on any OpenSL ES open failure (default-
-  // off-safe by design), which from here looks like "reconnected but the
-  // toggle didn't take" and is worth saying plainly rather than claiming success.
-  function _pollNativeAfeReconnect(wantActive) {
-    let attempts = 0;
-    let wasDisconnected = false;
-    const poll = setInterval(async () => {
-      attempts++;
-      try {
-        const devices = await API.get('/api/devices');
-        const d = devices.find(x => x.device_id === device.device_id);
-        if (!d?.connected) wasDisconnected = true;
-        if (wasDisconnected && d?.connected) {
-          if (!!d.nativeAfeCapable === wantActive) {
-            setNativeAfeLog(l => [...l, `✓ Back online — now using ${wantActive ? "Amazon's" : "EchoMuse's"} pipeline.`]);
-          } else if (wantActive) {
-            setNativeAfeLog(l => [...l, `⚠ Back online, but Amazon's pipeline did not start — it fell ` +
-              `back to EchoMuse's. Check the device's logs (Status tab).`]);
-          } else {
-            setNativeAfeLog(l => [...l, `⚠ Back online, but it is still reporting Amazon's pipeline — ` +
-              `the marker removal or restart may not have taken. Check the device's logs.`]);
-          }
-          clearInterval(poll); setNativeAfeBusy(false);
-        } else if (attempts > 40) {
-          setNativeAfeLog(l => [...l, 'Timed out waiting for reconnect — check the device.']);
-          clearInterval(poll); setNativeAfeBusy(false);
-        }
-      } catch(e) { clearInterval(poll); setNativeAfeBusy(false); }
     }, 3000);
   }
 
@@ -2380,85 +2314,6 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                 <ConnectivityTab device={device} row={row}/>
               </div>
 
-              {/* Audio pipeline / native AFE opt-in (docs/native-afe-migration.md).
-                  Lives here rather than on the Updates tab because it decides what
-                  half the controls below this point even do — but ABOVE the config
-                  form and outside it, for two reasons that both bite if ignored:
-                  it is not a config key (it is a marker file plus a reboot, applied
-                  immediately, never by "Push config"), and it is always per-device,
-                  so it must not sit inside a Stage whose Fleet/Device switch would
-                  grey it out. Same placement argument as the WiFi block above.
-
-                  Offered when the firmware BUILD supports it (native_afe_backend:
-                  compiled-in backends + a start_server.sh that checks the marker),
-                  not when it happens to be running (nativeAfeCapable) — gating on
-                  the latter would mean the control to turn it on only ever appeared
-                  once it was already on.
-
-                  isAdmin is part of the gate and was not needed on the Updates
-                  tab, which admins alone can reach — the Config tab is visible
-                  to everyone (read-only, `disabled={!isAdmin}` on the form
-                  below). The endpoint is admin-only regardless, so without this
-                  a viewer would get buttons that 403. */}
-              {isAdmin && device.nativeAfeBackendCapable && (
-                <div style={{ paddingBottom: 24, marginBottom: 24, borderBottom: '1px solid var(--line, var(--track))' }}>
-                  <Panel label="Audio pipeline">
-                    <div style={{ fontFamily:"'DM Mono',monospace", fontSize:10, color:'var(--muted)', lineHeight:1.7, marginBottom:14 }}>
-                      Which software records from the mics and plays to the speaker.
-                      <div style={{ marginTop:8 }}>
-                        <b style={{ color:'var(--text2)' }}>EchoMuse</b> — the default. Our own
-                        recording and playback, shaped by the beamforming, echo cancellation
-                        and gain settings further down this page.
-                      </div>
-                      <div style={{ marginTop:6 }}>
-                        <b style={{ color:'var(--text2)' }}>Amazon</b> — the Echo&apos;s original
-                        audio software, the one it shipped with for Alexa. It does its own
-                        beamforming, per-mic echo cancellation and auto gain, so the settings
-                        it takes over are greyed out below while it is on. Recording and
-                        playback switch together: Amazon&apos;s echo canceller can only remove
-                        sound it played itself.
-                      </div>
-                      <div style={{ marginTop:8 }}>
-                        Either direction restarts the Echo, which is briefly unreachable
-                        while it comes back.
-                      </div>
-                    </div>
-                    <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom: nativeAfeLog.length ? 12 : 0, flexWrap:'wrap' }}>
-                      <span style={{ fontFamily:"'DM Mono',monospace", fontSize:11, color: device.nativeAfeCapable ? 'var(--ok)' : 'var(--muted)' }}>
-                        {device.nativeAfeCapable ? '● Using Amazon' : '○ Using EchoMuse'}
-                      </span>
-                      <Pill small accent={!device.nativeAfeCapable}
-                        disabled={!device.connected || nativeAfeBusy || device.nativeAfeCapable}
-                        onClick={() => doNativeAfeToggle(true)}>
-                        {nativeAfeBusy ? 'Working…' : 'Switch to Amazon'}
-                      </Pill>
-                      {/* Gated on nativeAfeBackendCapable, not nativeAfeCapable — the
-                          marker can be set with the AFE NOT active (it fell back to
-                          our own path on an open failure, exactly the case
-                          _pollNativeAfeReconnect warns about), and that is precisely
-                          the state someone needs to be able to clear. Gating on the
-                          runtime flag would strand them: enabling no-ops on an
-                          already-set marker, the way back greyed out, no recovery
-                          short of devshell.py — the workflow this panel replaces. */}
-                      <Pill small danger={device.nativeAfeCapable}
-                        disabled={!device.connected || nativeAfeBusy || !device.nativeAfeBackendCapable}
-                        onClick={() => doNativeAfeToggle(false)}>
-                        {nativeAfeBusy ? 'Working…' : 'Switch to EchoMuse'}
-                      </Pill>
-                    </div>
-                    {nativeAfeLog.map((line, i) => (
-                      <div key={i} style={{
-                        fontFamily:"'DM Mono',monospace", fontSize:10, marginTop:4,
-                        color: line.startsWith('✓') ? 'var(--ok)'
-                             : line.startsWith('⚠') ? 'var(--warn)'
-                             : line.startsWith('Error') ? 'var(--error)'
-                             : 'var(--muted)',
-                      }}>{line}</div>
-                    ))}
-                  </Panel>
-                </div>
-              )}
-
               {/* Scoping summary. Each section below carries its own
                   Fleet/Device switch — this is just the roll-up plus a way
                   back to fully inheriting. */}
@@ -2500,7 +2355,6 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                 mixCapable={!device.connected || !!device.audioMixCapable}
                 holdCapable={!device.connected || !!device.buttonHoldCapable}
                 wakeSoundCapable={!device.connected || !!device.wakeSoundCapable}
-                afeActive={!!device.nativeAfeCapable}
                 bcresnetCapable={!device.connected || !!device.owwBcresnetCapable}
                 deviceId={device.device_id}
                 deviceConnected={!!device.connected}
@@ -5292,142 +5146,6 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
 // Shared config form used by both the per-device config tab and the global
 // settings panel. disabled=true renders all controls read-only.
 
-// ─── DeviceDiagram ────────────────────────────────────────────────────────────
-// Top-down Echo Dot diagram. 0°=top (vol+ button / cable), clockwise.
-// SVG coords: x=sin(deg)*r, y=-cos(deg)*r
-// MK1=330° (-45,-78), MK2=30° (45,-78), MK3=90° (90,0),
-// MK4=150° (45,78),   MK5=210° (-45,78), MK6=270° (-90,0)
-
-function DeviceDiagram({ activeMics, patternType }) {
-  const MIC_POS = {
-    mk1: [-45,-78], mk2: [45,-78], mk3: [90,0],
-    mk4: [45,78],   mk5: [-45,78], mk6: [-90,0],
-  };
-  const ALL = Object.keys(MIC_POS);
-
-  return (
-    <svg width="200" height="200" viewBox="-110 -110 220 220" style={{ display:'block', overflow:'visible' }}>
-      <defs>
-        <radialGradient id="dcfsg" cx="35%" cy="30%" r="70%">
-          <stop offset="0%" stopColor="#3a3a3a"/>
-          <stop offset="40%" stopColor="#242424"/>
-          <stop offset="100%" stopColor="#161616"/>
-        </radialGradient>
-        <radialGradient id="dcfbg" cx="35%" cy="30%" r="65%">
-          <stop offset="0%" stopColor="#323232"/>
-          <stop offset="100%" stopColor="#1c1c1c"/>
-        </radialGradient>
-        <filter id="dcfmg" x="-100%" y="-100%" width="300%" height="300%">
-          <feGaussianBlur stdDeviation="3.5" result="b"/>
-          <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
-        </filter>
-        <filter id="dcfpg" x="-30%" y="-30%" width="160%" height="160%">
-          <feGaussianBlur stdDeviation="5" result="b"/>
-          <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
-        </filter>
-        <clipPath id="dcfsc"><circle cx="0" cy="0" r="104"/></clipPath>
-        <pattern id="dcfgr" patternUnits="userSpaceOnUse" width="5" height="5">
-          <circle cx="2.5" cy="2.5" r="0.8" fill="rgba(0,0,0,0.3)"/>
-        </pattern>
-      </defs>
-
-      {/* Pickup pattern — behind shell */}
-      {patternType === 'omni' && <>
-        <circle cx="0" cy="0" r="116" fill="rgba(64,88,120,0.07)" stroke="rgba(64,88,120,0.25)" strokeWidth="5" filter="url(#dcfpg)"/>
-        <circle cx="0" cy="0" r="116" fill="none" stroke="#405878" strokeWidth="1.5" strokeDasharray="5 3"/>
-      </>}
-      {patternType === 'front' && <>
-        <path d="M-116,0 A116,116 0 0,0 116,0 Z" fill="rgba(64,88,120,0.07)" stroke="rgba(64,88,120,0.25)" strokeWidth="5" filter="url(#dcfpg)"/>
-        <path d="M-116,0 A116,116 0 0,0 116,0 Z" fill="rgba(64,88,120,0.09)" stroke="#405878" strokeWidth="1.5"/>
-      </>}
-      {patternType === 'rear' && <>
-        <path d="M-116,0 A116,116 0 0,1 116,0 Z" fill="rgba(64,88,120,0.07)" stroke="rgba(64,88,120,0.25)" strokeWidth="5" filter="url(#dcfpg)"/>
-        <path d="M-116,0 A116,116 0 0,1 116,0 Z" fill="rgba(64,88,120,0.09)" stroke="#405878" strokeWidth="1.5"/>
-      </>}
-
-      {/* Shell */}
-      <circle cx="0" cy="0" r="108" fill="#0a0a0a"/>
-      <circle cx="0" cy="0" r="104" fill="url(#dcfsg)"/>
-
-      {/* LED ring */}
-      <circle cx="0" cy="0" r="96" fill="none" stroke="#0d0d0d" strokeWidth="11" clipPath="url(#dcfsc)"/>
-      <circle cx="0" cy="0" r="96" fill="none"
-        stroke={patternType === 'omni' ? '#40906a' : '#40906a'}
-        strokeWidth="7" strokeDasharray="36.3 14.0"
-        transform="rotate(-90)" clipPath="url(#dcfsc)"/>
-      <circle cx="0" cy="0" r="96" fill="none" stroke="#161616" strokeWidth="11"
-        strokeDasharray="1.5 49" transform="rotate(-90)" clipPath="url(#dcfsc)"/>
-
-      {/* Inner disc */}
-      <circle cx="0" cy="0" r="82" fill="#1a1a1a"/>
-      <circle cx="0" cy="0" r="82" fill="url(#dcfgr)" clipPath="url(#dcfsc)"/>
-      <circle cx="0" cy="0" r="82" fill="none" stroke="rgba(255,255,255,0.04)" strokeWidth="1"/>
-
-      {/* Buttons */}
-      <circle cx="0"   cy="-44" r="15" fill="url(#dcfbg)" stroke="rgba(255,255,255,0.05)" strokeWidth="0.5"/>
-      <text x="0" y="-39" textAnchor="middle" fontSize="15" fill="var(--sheen)" fontFamily="sans-serif" fontWeight="300">+</text>
-      <circle cx="44"  cy="0"   r="15" fill="url(#dcfbg)" stroke="rgba(255,255,255,0.05)" strokeWidth="0.5"/>
-      <circle cx="44"  cy="0"   r="4.5" fill="var(--sheen)"/>
-      <circle cx="0"   cy="44"  r="15" fill="url(#dcfbg)" stroke="rgba(255,255,255,0.05)" strokeWidth="0.5"/>
-      <text x="0" y="50" textAnchor="middle" fontSize="15" fill="var(--sheen)" fontFamily="sans-serif" fontWeight="300">−</text>
-      <circle cx="-44" cy="0"   r="15" fill="url(#dcfbg)" stroke="rgba(255,255,255,0.05)" strokeWidth="0.5"/>
-      <g transform="translate(-44,0)">
-        <rect x="-3.5" y="-7.5" width="7" height="10" rx="3.5" fill="var(--sheen)"/>
-        <path d="M-6,1.5 Q-6,8 0,8 Q6,8 6,1.5" fill="none" stroke="var(--sheen)" strokeWidth="1.5" strokeLinecap="round"/>
-        <line x1="0" y1="8" x2="0" y2="11" stroke="var(--sheen)" strokeWidth="1.5" strokeLinecap="round"/>
-      </g>
-
-      {/* Centre mic */}
-      <circle cx="0" cy="0" r="2.5" fill="rgba(255,255,255,0.18)"/>
-
-      {/* Perimeter mics */}
-      {ALL.map(id => {
-        const [cx, cy] = MIC_POS[id];
-        const active = activeMics.includes(id);
-        return (
-          <g key={id}>
-            <circle cx={cx} cy={cy} r="6"
-              fill={active ? '#1a3a5a' : '#1e2020'}
-              filter={active ? 'url(#dcfmg)' : undefined}/>
-            <circle cx={cx} cy={cy} r="4" fill={active ? '#4a7ab8' : '#2a2a2a'}/>
-          </g>
-        );
-      })}
-
-      <ellipse cx="-14" cy="-20" rx="22" ry="13" fill="rgba(255,255,255,0.04)"/>
-    </svg>
-  );
-}
-
-// Mini version for preset cards
-function DeviceDiagramMini({ activeMics, patternType }) {
-  const MIC_POS = {
-    mk1: [-45,-78], mk2: [45,-78], mk3: [90,0],
-    mk4: [45,78],   mk5: [-45,78], mk6: [-90,0],
-  };
-  return (
-    <svg width="52" height="52" viewBox="-110 -110 220 220">
-      <circle cx="0" cy="0" r="108" fill="#0a0a0a"/>
-      <circle cx="0" cy="0" r="104" fill="#222"/>
-      <circle cx="0" cy="0" r="96" fill="none" stroke="#0d0d0d" strokeWidth="11"/>
-      <circle cx="0" cy="0" r="96" fill="none"
-        stroke={patternType === 'omni' ? '#40906a' : '#40906a'}
-        strokeWidth="7" strokeDasharray="36.3 14" transform="rotate(-90)"/>
-      <circle cx="0" cy="0" r="96" fill="none" stroke="#161616" strokeWidth="11"
-        strokeDasharray="1.5 49" transform="rotate(-90)"/>
-      <circle cx="0" cy="0" r="82" fill="#1a1a1a"/>
-      {patternType === 'omni' && <circle cx="0" cy="0" r="68" fill="rgba(64,88,120,0.18)" stroke="#405878" strokeWidth="2"/>}
-      {patternType === 'front' && <path d="M-68,0 A68,68 0 0,0 68,0 Z" fill="rgba(64,88,120,0.18)" stroke="#405878" strokeWidth="2"/>}
-      {patternType === 'rear'  && <path d="M-68,0 A68,68 0 0,1 68,0 Z" fill="rgba(64,88,120,0.18)" stroke="#405878" strokeWidth="2"/>}
-      {Object.entries(MIC_POS).map(([id,[cx,cy]]) => (
-        <circle key={id} cx={cx} cy={cy} r="4"
-          fill={activeMics.includes(id) ? '#4a7ab8' : '#2a2a2a'}/>
-      ))}
-    </svg>
-  );
-}
-
-
 // ─── DeviceConfigForm ─────────────────────────────────────────────────────────
 // The config rendered as the actual signal path: numbered stages from the
 // microphones to the speaker, each labelled with WHERE it runs (device /
@@ -5493,10 +5211,9 @@ const STAGE_MONO = "'DM Mono',monospace";
 // be silently wrong.
 const CONFIG_SECTIONS = {
   "playback": ["eqBands", "eqLoudness", "duckDb"],
-  "wakeword": ["owwModel", "owwThreshold", "owwSpeexNs", "bargeInEnabled", "bargeInThreshold", "wakeArbitrationMs", "owwOnDevice", "wakeSound"],
-  "microphones": ["adcMicpga", "adcDigitalGain", "micGainDb", "beamformingEnabled", "beamAngle", "aecEnabled", "aecDelayMs", "aecTailMs", "nsAsr", "saveUtterances", "endpointRelative", "endpointLowPerMil", "endpointSilenceMs", "endpointBackporchMs", "maxSpeechMs"],
+  "microphones": ["nsAsr", "saveUtterances", "endpointRelative", "endpointLowPerMil", "endpointSilenceMs", "endpointBackporchMs", "maxSpeechMs"],
   "ring": ["ledScene", "ledListenColor", "ledThinkColor", "meterAttack", "meterDecay", "meterFloor", "meterGamma", "meterRef", "meterCurve"],
-  "advanced": ["agcEnabled", "vadThreshold", "vadSpeechMs", "vadSilenceMs", "buttonSingleTapEvent", "buttonMultiTapMs"],
+  "advanced": ["vadThreshold", "vadSpeechMs", "vadSilenceMs", "buttonSingleTapEvent", "buttonMultiTapMs"],
   "bluetooth": ["bleProxyEnabled"],
   "timers": ["timerSound", "timerRingSeconds", "timerRingGapSeconds", "timerRingBurstSeconds"]
 };
@@ -5625,8 +5342,8 @@ function onDeviceMode(config) {
 function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
                             shadowCapable = true, mixCapable = true,
                             holdCapable = true, triggerCapable = true,
-                            afeActive = false, deviceId = null,
                             wakeSoundCapable = true, bcresnetCapable = true,
+                            deviceId = null,
                             deviceConnected = false, deviceRinging = false }) {
   // deviceId is null in the fleet-config view, where "ring this device now"
   // has no subject — the Test control is hidden there rather than disabled,
@@ -5635,12 +5352,6 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
   // view, where there is no single device whose capability could gate a
   // control. Referencing a `device` here is what blank-screened the Config
   // tab: the prop does not exist, so `device.connected` threw during render.
-  // afeActive defaults FALSE for the same fleet-view reason, but its polarity
-  // is the opposite of the *Capable props above: those mean "can do X, so
-  // enable"; afeActive means "native AFE is running right now, so DISABLE the
-  // beamformer/AEC/AGC/gain controls it replaces" (docs/native-afe-
-  // migration.md's bypass table) — false is the safe default either way
-  // (fleet view, or a device we don't know is running it yet).
   // sections == null means the fleet-config view: nothing to inherit from, so
   // no per-section switches and every control is live.
   const scoped = Array.isArray(sections);
@@ -5665,27 +5376,6 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
   const secStyle = id => (disabled || !isLocal(id))
     ? { opacity: 0.45, pointerEvents: 'none' }
     : {};
-
-  // Derive current mic preset from beamAngle
-  const angle = config.beamAngle ?? -1;
-  const currentPreset = angle === -1 ? 'omni' : (angle === 90 ? 'front' : angle === 270 ? 'rear' : 'omni');
-
-  const PRESETS = {
-    // omni = centre mic (ch6) for everything, beamforming genuinely off.
-    // beamformingEnabled:true with beamAngle -1 is AUTO mode (onset-ratio
-    // perimeter mic selection at turn start), which is not what this
-    // preset's label or polar plot promise.
-    omni:  { beamAngle: -1,  beamformingEnabled: false, activeMics: ['mk1','mk2','mk3','mk4','mk5','mk6'], patternType: 'omni'  },
-    front: { beamAngle: 90,  beamformingEnabled: true,  activeMics: ['mk3','mk4','mk5','mk6'],             patternType: 'front' },
-    rear:  { beamAngle: 270, beamformingEnabled: true,  activeMics: ['mk1','mk2','mk3','mk6'],             patternType: 'rear'  },
-  };
-
-  function selectPreset(key) {
-    if (disabled) return;
-    const p = PRESETS[key];
-    onChange('beamAngle', p.beamAngle);
-    onChange('beamformingEnabled', p.beamformingEnabled);
-  }
 
   const WW_MODELS = [
     { value: 'hey_jarvis_v0.1',   label: 'Hey Jarvis'   },
@@ -6047,68 +5737,17 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
       {/* 03 MICROPHONES */}
       <Stage n="03" title="Microphones"
         chips={<ScopeChip tone="device">Device</ScopeChip>}
-        desc="Capture from the 7-mic array. Presets steer which perimeter mic is used during voice turns — wake-word listening always uses the centre mic. Gain here is the only gain in the wake path: it sets the level everything downstream hears."
+        desc="What the controller does with the sound the Echo sends it. The array itself — which microphone, how much gain, echo cancellation, noise reduction — is handled by the Echo's own audio software and is not adjustable from here."
         scope={scopeEl('microphones')} dim={secStyle('microphones')}>
-        <div className="em-grid2" style={{ display: 'grid', gridTemplateColumns: 'auto 1fr', gap: 20, alignItems: 'center' }}>
-          <DeviceDiagram
-            activeMics={PRESETS[currentPreset].activeMics}
-            patternType={PRESETS[currentPreset].patternType}
-          />
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 6, ...inputStyle }}>
-            {Object.entries(PRESETS).map(([key, p]) => (
-              <div key={key} onClick={() => selectPreset(key)} style={{
-                background: currentPreset === key
-                  ? 'linear-gradient(160deg,var(--accent-tint),var(--accent-line))'
-                  : 'linear-gradient(160deg,var(--raised),var(--surface))',
-                border: `1px solid ${currentPreset === key ? 'var(--accent)' : 'var(--border-soft)'}`,
-                borderRadius: 10, padding: '9px 6px 8px',
-                cursor: disabled ? 'default' : 'pointer',
-                display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6,
-                transition: 'border-color 0.15s, background 0.15s',
-              }}>
-                <DeviceDiagramMini activeMics={p.activeMics} patternType={p.patternType}/>
-                <div style={{ fontFamily: mono, fontSize: 10, color: 'var(--text2)' }}>
-                  {key.charAt(0).toUpperCase() + key.slice(1)}
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
         <StageAdvanced open={advMics} onToggle={() => setAdvMics(o => !o)} disabledStyle={inputStyle}>
           <div className="em-grid2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px 24px' }}>
-            <Slider label="MICPGA" disabled={afeActive}
-              sub={afeActive ? "Amazon's pipeline sets its own mic gain" : "analog gain, before the ADC"}
-              value={config.adcMicpga ?? 40} min={0} max={59} onChange={v => set('adcMicpga', v)}/>
-            <Slider label="Digital gain" disabled={afeActive}
-              sub={afeActive ? "Amazon's pipeline sets its own mic gain" : "ADC digital gain — affects wake + turns"}
-              value={config.adcDigitalGain ?? 88} min={0} max={100} onChange={v => set('adcDigitalGain', v)}/>
-            <Slider label="Mic gain" disabled={afeActive}
-              sub={afeActive ? "Amazon's pipeline sets its own mic gain" : "fixed gain on the 24-bit capture, pre-16-bit stream"}
-              value={config.micGainDb ?? 24} min={0} max={42} unit="dB" onChange={v => set('micGainDb', v)}/>
-            <Slider label="Beam angle" disabled={afeActive || !(config.beamformingEnabled ?? false)}
-              sub={afeActive ? "Amazon's pipeline picks its own direction" : "-1 = auto (onset-ratio selection)"}
-              value={config.beamAngle ?? -1} min={-1} max={359} step={1} onChange={v => set('beamAngle', v)}/>
-            <Toggle label="Beamforming" disabled={afeActive}
-              sub={afeActive ? "Amazon's pipeline does its own beamforming" : "perimeter mic lock during turns"}
-              value={afeActive ? false : (config.beamformingEnabled ?? false)} onChange={v => set('beamformingEnabled', v)}/>
-            <Toggle label="Echo cancel (AEC)" disabled={afeActive}
-              sub={afeActive ? "Amazon's pipeline cancels its own echo, on every mic" : "subtracts the device's own playback — wake + turns, and lets the wake word land over a ringing timer"}
-              value={afeActive ? false : (config.aecEnabled ?? false)} onChange={v => set('aecEnabled', v)}/>
-            {/* Not disabled under the AFE: this one is CONTROLLER-side (DTLN on
-                the speech-to-text stream), so it still runs and still has an
-                effect — just a second denoise on an already-denoised stream,
-                which is a judgement call and not an inert control. */}
-            <Toggle label="Noise suppression" sub={afeActive ? "Amazon's pipeline already denoises the mic — this adds a second pass on top" : "DTLN denoise on speech-to-text audio only — helps fans/hum, not TV speech"} value={config.nsAsr ?? false} onChange={v => set('nsAsr', v)}/>
-            <Slider label="AEC delay" disabled={afeActive || !(config.aecEnabled ?? false)}
-              sub={afeActive ? "Amazon's pipeline times its own echo canceller" : "playback write-to-ear latency compensation"}
-              value={config.aecDelayMs ?? 250} min={0} max={1000} step={10} unit="ms" onChange={v => set('aecDelayMs', v)}/>
-            <Slider label="AEC tail" disabled={afeActive || !(config.aecEnabled ?? false)}
-              sub={afeActive ? "Amazon's pipeline runs its own echo canceller" : "filter length — residual delay error + room reverb"}
-              value={config.aecTailMs ?? 300} min={50} max={500} step={10} unit="ms" onChange={v => set('aecTailMs', v)}/>
+            {/* The mic chain itself — gain, beamforming, echo cancellation,
+                auto gain — belongs to the Echo's own audio software and has no
+                controls here. Its tuning lives on a read-only system
+                partition. What remains on this stage is everything the
+                CONTROLLER decides about the stream after it arrives. */}
+            <Toggle label="Noise suppression" sub="a second denoise on the speech-to-text audio only — the Echo already denoises the mic, so this stacks on top; helps fans/hum, not TV speech" value={config.nsAsr ?? false} onChange={v => set('nsAsr', v)}/>
             <Toggle label="Save utterances" sub="keeps the last 10 turns' mic audio on the server — play or download from Activity" value={config.saveUtterances ?? false} onChange={v => set('saveUtterances', v)}/>
-            {/* Controller-side, like Noise suppression above — the endpointing
-                decision is made on the stream heading for speech-to-text, so
-                these stay live under the AFE. */}
             <Toggle label="Stop on quiet" sub="ends a turn when the loudest voice stops, so a TV in the background can't hold it open" value={config.endpointRelative ?? true} onChange={v => set('endpointRelative', v)}/>
             <Slider label="Stop sensitivity" disabled={!(config.endpointRelative ?? true)}
               sub="higher ends turns sooner and ignores quieter background speech; lower is safer for a soft talker"
@@ -6122,14 +5761,6 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
             <Slider label="Max turn length"
               sub="hard cap on one spoken command — the answer is still given, on what was heard"
               value={config.maxSpeechMs ?? 12000} min={4000} max={20000} step={1000} unit="ms" onChange={v => set('maxSpeechMs', v)}/>
-            {afeActive && (
-              <div style={{ gridColumn: '1 / -1', marginTop: 4, fontFamily: mono, fontSize: 10, color: 'var(--muted)', lineHeight: 1.6 }}>
-                This Echo is recording through Amazon&apos;s own audio pipeline, so the
-                greyed-out controls above have no effect — it does that work itself.
-                Switch back under <b>Audio pipeline</b> at the top of this tab; it
-                needs a restart, so it is not part of Push config.
-              </div>
-            )}
           </div>
         </StageAdvanced>
       </Stage>
@@ -6235,9 +5866,6 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
         </div>
         {subHeader('Turn processing')}
         <div className="em-grid2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0 24px', ...inputStyle }}>
-          <Toggle label="Auto gain (AGC)" disabled={afeActive}
-            sub={afeActive ? "Amazon's pipeline does its own auto gain — see Audio pipeline at the top of this tab" : "levels button-turn speech; never the wake stream"}
-            value={afeActive ? false : (config.agcEnabled ?? true)} onChange={v => set('agcEnabled', v)}/>
         </div>
         {subHeader('Speech gate')}
         <div className="em-grid2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '4px 20px', ...inputStyle }}>

@@ -41,7 +41,7 @@ def _rms(db: float) -> float:
 
 
 QUIET = _rms(-66.0)     # a measured room floor on this fleet
-SPEECH = _rms(-46.0)    # ~20dB above it, where speech sits after micGainDb
+SPEECH = _rms(-46.0)    # ~20dB above it, where speech sits as delivered
 
 
 def _settle(seg: smp.Segmenter, frames: int = 60, level: float = QUIET) -> None:

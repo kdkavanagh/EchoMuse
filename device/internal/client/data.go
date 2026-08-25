@@ -7,14 +7,10 @@ import (
 	"log"
 	"math"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/wilbowes/EchoMuse/internal/aec"
-	"github.com/wilbowes/EchoMuse/internal/beamformer"
 	"github.com/wilbowes/EchoMuse/internal/config"
-	"github.com/wilbowes/EchoMuse/internal/processor"
 	"github.com/wilbowes/EchoMuse/internal/wakeword/shadow"
 	"github.com/wilbowes/EchoMuse/pkg/mic"
 	"github.com/wilbowes/EchoMuse/pkg/speaker"
@@ -74,12 +70,18 @@ const (
 const (
 	vadOwwChunkBytes = 1280 * 2 // 2560 bytes = 80ms
 
+	// micPeriodMs is the cadence the mic backend delivers at — one OpenSL ES
+	// period, which slmic sizes to match the wire frame exactly. Used only to
+	// size the preroll ring; every window that matters is computed from the
+	// buffer actually received, so a backend that changed this would still be
+	// handled correctly.
+	micPeriodMs = 80
+
 	// prerollBudgetMs is how much pre-gate audio is retained while the VAD
 	// gate is closed and flushed upstream the moment it opens. The ring is
-	// sized in wall-clock terms because the mic delivers whole ALSA-buffer
-	// batches (160ms), not 32ms periods — a fixed batch count would drift
-	// with the batch size (the old prerollPeriods=16 was meant as ~512ms of
-	// periods but actually held 2.5s of batches). Only applies to lockMic
+	// sized in wall-clock terms rather than as a period count, because a fixed
+	// count drifts with the delivery cadence (the old prerollPeriods=16 was
+	// meant as ~512ms of periods but actually held 2.5s of them). Only applies to lockMic
 	// (bounded turn) streams — the always-on wake stream is ungated and
 	// sends everything, so OWW always sees a continuous stream. For turns,
 	// preroll gives STT the true first phoneme instead of a hard splice at
@@ -126,13 +128,6 @@ func vadPeriodRMS(mono []byte) float64 {
 
 // ─── DataClient ───────────────────────────────────────────────────────────────
 
-// Beam lock request states — see DataClient.beamReq.
-const (
-	beamReqNone   int32 = 0
-	beamReqLock   int32 = 1
-	beamReqUnlock int32 = 2
-)
-
 type DataClient struct {
 	deviceID string
 	mic      mic.Subscribable
@@ -148,35 +143,8 @@ type DataClient struct {
 	// defer in connect for the zombie-stream incident this guards against).
 	micConn *websocket.Conn
 
-	// beamReq carries a pending beam lock/unlock request from the control
-	// plane to the mic streaming goroutine. Beamformer methods are not safe
-	// to call from other goroutines (same reason beam.Unlock is deferred
-	// inside streamMic rather than called from StopMic), so the control
-	// handler only sets this flag; streamMic consumes it with Swap at the
-	// top of each period. Lets the controller lock the beamformer onto the
-	// speaker's perimeter mic mid-stream at wake detection — wake-triggered
-	// turns don't restart the stream (P0-1), so without this they ran the
-	// entire turn on ch6 omni and the mic array did nothing for them.
-	beamReq int32
-
 	conn   *websocket.Conn
 	connMu sync.Mutex
-
-	beam              *beamformer.Beamformer
-	proc              *processor.Processor
-	aec               *aec.Canceller
-	onDirectionChange func(angle float64)
-	directionMu       sync.Mutex
-
-	// micPassthrough is true when the mic backend already delivers one fully
-	// processed mono channel (internal/bindings/slmic, on the native-AFE
-	// path — see docs/native-afe-migration.md). Decided once, at
-	// construction, from the concrete backend NewDataClient was given: this
-	// mirrors the AFE selection itself, which is a boot-time choice, not a
-	// live config push (see cmd/server.go). When true, streamMic skips
-	// internal/beamformer entirely rather than feed it a buffer shaped for
-	// raw 9-channel capture — see pkg/mic.PassthroughReporter.
-	micPassthrough bool
 
 	// shadowScorer scores the always-on wake stream on the device without
 	// acting on it (internal/wakeword/shadow), nil when off. Guarded because
@@ -184,42 +152,22 @@ type DataClient struct {
 	// goroutine is pushing frames into it.
 	shadowMu     sync.Mutex
 	shadowScorer *shadow.Scorer
-
-	// pipeMu serialises access to beam and proc, which hold unsynchronised
-	// per-period state (reused analysis buffers, EWMA smoothers, AGC gain).
-	// Both are normally touched by a single streamMic goroutine, but a
-	// StopMic→StartMic pair (sent after every voice turn) spawns the
-	// replacement while the old goroutine may still be draining a period or
-	// two — the select on a closed stopCh vs a ready mic channel picks
-	// randomly, so the old goroutine can run Process() concurrently with
-	// the new one's Lock()/Process(). Uncontended outside that brief
-	// overlap, so the cost is a no-op lock per 160ms batch.
-	pipeMu sync.Mutex
 }
 
-// NewDataClient wires the mic/speaker pipeline. canceller is the shared AEC
-// instance — its far-end side is fed by the speaker's echo tap; this client
-// runs its near-end side on the mono mic stream. Disabled cancellers pass
-// audio through untouched.
-func NewDataClient(deviceID string, microphone mic.Subscribable, spk speaker.Speaker, canceller *aec.Canceller) *DataClient {
-	passthrough := false
-	if pr, ok := microphone.(mic.PassthroughReporter); ok {
-		passthrough = pr.Passthrough()
-	}
+// NewDataClient wires the mic/speaker pipeline. Every period the microphone
+// hands over is already one fully processed mono channel — Android's audio HAL
+// ran per-mic AEC, beamforming and gain before EchoMuse saw it (see
+// docs/native-afe-migration.md) — so this client only frames, gates and sends;
+// it does no signal processing of its own.
+func NewDataClient(deviceID string, microphone mic.Subscribable, spk speaker.Speaker) *DataClient {
 	return &DataClient{
-		deviceID:       deviceID,
-		mic:            microphone,
-		spk:            spk,
-		readyCh:        make(chan string, 1),
-		beam:           beamformer.New(),
-		proc:           processor.New(),
-		aec:            canceller,
-		micPassthrough: passthrough,
+		deviceID: deviceID,
+		mic:      microphone,
+		spk:      spk,
+		readyCh:  make(chan string, 1),
 	}
 }
 
-// OnDirectionChanged registers a callback invoked when the estimated dominant
-// source direction changes. Called from the mic streaming goroutine — keep it fast.
 // SetShadowScorer installs (or removes, with nil) the on-device wake word
 // scorer. Any previous scorer is closed, which releases its ONNX Runtime
 // sessions — a config push that changes the wake model rebuilds it, and
@@ -245,12 +193,6 @@ func (d *DataClient) ShadowScorer() *shadow.Scorer {
 	return d.shadowScorer
 }
 
-func (d *DataClient) OnDirectionChanged(cb func(angle float64)) {
-	d.directionMu.Lock()
-	d.onDirectionChange = cb
-	d.directionMu.Unlock()
-}
-
 func (d *DataClient) NotifyReady(serverAddr string) {
 	select {
 	case d.readyCh <- serverAddr:
@@ -261,20 +203,6 @@ func (d *DataClient) NotifyReady(serverAddr string) {
 		}
 		d.readyCh <- serverAddr
 	}
-}
-
-// RequestBeamLock asks the running mic stream to lock the beamformer onto
-// the best perimeter mic (respecting BeamformingEnabled config). Safe to call
-// from any goroutine; consumed by streamMic on its next period. A later
-// request overwrites an unconsumed earlier one.
-func (d *DataClient) RequestBeamLock() {
-	atomic.StoreInt32(&d.beamReq, beamReqLock)
-}
-
-// RequestBeamUnlock asks the running mic stream to release the beam lock and
-// return to ch6 omni. Safe to call from any goroutine.
-func (d *DataClient) RequestBeamUnlock() {
-	atomic.StoreInt32(&d.beamReq, beamReqUnlock)
 }
 
 func (d *DataClient) StartMic(lockMic bool) {
@@ -521,42 +449,12 @@ func (d *DataClient) streamMic(conn *websocket.Conn, stopCh <-chan struct{}, loc
 	// the identity token: they're equal only if no StartMic ran after us.
 	defer func() {
 		d.micMu.Lock()
-		owner := d.micStopCh == stopCh
-		if owner {
+		if d.micStopCh == stopCh {
 			d.micActive = false
 		}
 		d.micMu.Unlock()
-		// Unlock the beam only while still the current stream: if a
-		// replacement stream has already started (StopMic→StartMic pair),
-		// the beam belongs to it — this goroutine's late Unlock would
-		// otherwise land after the replacement's Lock() and silently drop
-		// the new turn onto ch6 omni. The replacement's own exit unlocks
-		// instead (Unlock on an unlocked beam is a no-op, so the wake
-		// stream's unconditional unlock stays harmless).
-		if owner {
-			d.pipeMu.Lock()
-			d.beam.Unlock()
-			d.pipeMu.Unlock()
-		}
 		log.Println("[data] streamMic: exited")
 	}()
-
-	// Claim a clean beam: a superseded stream skips its unlock (see the
-	// exit defer), so a lock left behind by the previous turn is released
-	// here — otherwise a lockMic turn replaced by the wake stream would
-	// leave the wake stream on the old turn's perimeter mic with the
-	// baseline frozen. Fresh stream = fresh gain, same reasoning
-	// (Processor.ResetAGC — without it, a gain crushed by TTS echo
-	// persists into the next listening stream).
-	d.pipeMu.Lock()
-	d.beam.Unlock()
-	if lockMic {
-		lockSnap := config.Get().Snapshot()
-		turnBeamEnabled := lockSnap.BeamformingEnabled != nil && *lockSnap.BeamformingEnabled
-		d.beam.Lock(turnBeamEnabled)
-	}
-	d.proc.ResetAGC()
-	d.pipeMu.Unlock()
 
 	ch := d.mic.Subscribe()
 	defer d.mic.Unsubscribe(ch)
@@ -568,21 +466,14 @@ func (d *DataClient) streamMic(conn *websocket.Conn, stopCh <-chan struct{}, loc
 	active := false
 	everActive := false // true once active has been true at least once this turn
 	buf := make([]byte, 0, vadOwwChunkBytes*4)
-	// preroll ring — processed mono periods captured while the gate is
-	// closed, oldest first. Flushed into buf at gate open, cleared while
-	// active. Slices are retained (not copied): Process() returns a fresh
-	// allocation each period, so nothing aliases them.
-	preroll := make([][]byte, 0, prerollBudgetMs/160+1) // capacity hint at the real batch cadence
+	// preroll ring — mono periods captured while the gate is closed, oldest
+	// first. Flushed into buf at gate open, cleared while active. Slices are
+	// retained (not copied): the recorder hands out a fresh allocation per
+	// period (opensl.Recorder.onComplete copies out of the hardware slot
+	// before re-enqueuing it), so nothing aliases them.
+	preroll := make([][]byte, 0, prerollBudgetMs/micPeriodMs+1)
 	var seqNum uint16
 	var periodCount uint64 // periodic RMS diagnostic
-	var lastClipped uint64 // clip count at last diag line
-
-	// Memoized linear mic gain — recomputed only when the config dB value
-	// changes (config push mid-stream). Sentinel forces computation on the
-	// first period.
-	gainDb := -1
-	gainLin := 1.0
-
 
 	// On-device shadow scoring. The pointer is re-read as the stream runs, not
 	// captured once: a config push builds a new Scorer and restarts nothing, so
@@ -682,121 +573,31 @@ func (d *DataClient) streamMic(conn *websocket.Conn, stopCh <-chan struct{}, loc
 			snap := cfg.Snapshot()
 			threshold := snap.VadThreshold
 
-			beamAngle := float64(-1)
-			if snap.BeamAngle != nil {
-				beamAngle = *snap.BeamAngle
-			}
-			// AGC is forced off on the always-on wake stream (!lockMic).
-			// Adaptive gain with persistent state on a stream that never
-			// restarts is a rebaselining mechanism by construction: in a
-			// room with steady background noise above vadThreshold, the
-			// RMS gate calls every noisy period "speech", the release path
-			// walks the gain up toward amplifying the noise floor, and the
-			// fast attack then compresses the wake word's envelope
-			// mid-utterance — depressing OWW scores. Wake word models
-			// are trained level-diverse and don't need AGC. The config
-			// toggle still governs bounded lockMic turns, which get a fresh
-			// ResetAGC each stream.
-			//
-			// Also forced off under native-AFE passthrough: unlike AEC (which
-			// silently no-ops on a size mismatch — see the aec.Process guard
-			// below), processor.Process has no frame-size assumption and
-			// would actually RUN, stacking our own gain control on top of
-			// the AFE's — the bypass table (docs/native-afe-migration.md)
-			// lists AGC as replaced, not merely redundant, and the dashboard
-			// already shows the config toggle as off while active; the
-			// device disagreeing with that would be the exact "control that
-			// silently does something else" CLAUDE.md warns against.
-			agcEnabled := !d.micPassthrough && lockMic && (snap.AgcEnabled == nil || *snap.AgcEnabled)
+			// `raw` IS the finished mono period. Android's audio HAL ran
+			// per-mic AEC, the fixed and adaptive beamformers, SNR beam
+			// selection and its own AGC before this ever reached Go
+			// (docs/native-afe-migration.md), so there is nothing left here
+			// to filter, steer or amplify — this loop only measures, gates
+			// and frames. There is no per-frame beam angle either: the AFE
+			// picks a beam internally and reports it only in ASP debug
+			// output, which is why the LED direction arc went with the old
+			// pipeline.
+			mono := raw
 
-			// micGainDb is a pre-truncation gain applied to the raw 24-bit
-			// capture (see internal/beamformer's extractChannel) — meaningless
-			// on the native-AFE path, where the HAL already hands back 16-bit
-			// audio with its own gain baked in (HAL PGA + AFE output gain; see
-			// the bypass table in docs/native-afe-migration.md). gainLin stays
-			// at its unity default there, so the VAD threshold below is used
-			// as configured rather than scaled by a stage that never runs.
-			if !d.micPassthrough && snap.MicGainDb != nil && *snap.MicGainDb != gainDb {
-				gainDb = *snap.MicGainDb
-				gainLin = math.Pow(10, float64(gainDb)/20.0)
-				log.Printf("[data] mic gain: %ddB (linear %.2f)", gainDb, gainLin)
-			}
-
-			d.pipeMu.Lock()
-			// Consume any pending beam lock/unlock request from the control
-			// plane (wake detection → lock, turn end → unlock). Handled on
-			// this goroutine because Beamformer methods aren't safe to call
-			// from the control handler. Lock() no-ops if already locked or
-			// if beamforming is disabled in config.
-			switch atomic.SwapInt32(&d.beamReq, beamReqNone) {
-			case beamReqLock:
-				turnBeam := snap.BeamformingEnabled != nil && *snap.BeamformingEnabled
-				d.beam.Lock(turnBeam)
-			case beamReqUnlock:
-				d.beam.Unlock()
-			}
-
-			// On the native-AFE path `raw` IS the processed mono period —
-			// Android's audio HAL already ran per-mic AEC and beamforming
-			// before this ever reached Go (docs/native-afe-migration.md).
-			// Feeding that into internal/beamformer would misinterpret its
-			// bytes as interleaved 9-channel capture, so it must be skipped
-			// outright rather than merely redundant. There is no per-frame
-			// beam angle on this path either (the AFE selects a beam
-			// internally and does not report it per frame — see the
-			// "LED direction arc" deferred item), and clip counting belongs
-			// to the fixed pre-truncation gain stage this path doesn't run.
-			var mono []byte
-			var angle float64
-			var clipped uint64
-			if d.micPassthrough {
-				mono, angle, clipped = raw, -1, 0
-			} else {
-				mono, angle = d.beam.Process(raw, beamAngle, gainLin)
-				clipped = d.beam.ClippedSamples()
-			}
-
-			// AEC — subtract the speaker's own output (reference tapped at
-			// the ALSA write, aligned by aecDelayMs) before anything
-			// measures or gates the signal. No-op while aecEnabled=false.
-			// (Has its own mutex — inside pipeMu only for lock ordering
-			// simplicity; aec.mu is a leaf lock, no inversion possible.)
-			//
-			// Skipped outright on the native-AFE path: internal/aec is
-			// replaced there by the AFE's own per-mic subband AEC (bypass
-			// table, docs/native-afe-migration.md), and it is not merely
-			// redundant — its FrameSize is tuned to the tinyalsa raw batch
-			// cadence (2560 samples/160ms), not slmic's periodFrames
-			// (1280 samples/80ms), so feeding it here is a permanent no-op
-			// caught by its own size guard (aec.sizeWarned) rather than a
-			// harmless pass-through. Confirmed on hardware 2026-08-12: an
-			// aecEnabled=true device left over from the tinyalsa path logged
-			// "AEC BYPASSED" once and silently did nothing on every period
-			// from then on.
-			if !d.micPassthrough {
-				mono = d.aec.Process(mono)
-			}
-
-			// ── Processing pipeline ──────────────────────────────────────
-			// VAD on raw beamformed output — pre-NS/AGC so threshold is
-			// consistent regardless of gain state.
-			//
-			// vadThreshold is calibrated in pre-gain (acoustic) units —
-			// the values validated in the v2.6.3 session predate the fixed
-			// mic gain and stay meaningful across gain changes. mono is
-			// post-gain, so scale the threshold up by the same factor
-			// rather than requiring every stored config to be retuned in
-			// lockstep with micGainDb.
+			// VAD on the audio as delivered. vadThreshold is an absolute
+			// level against that stream — there is no gain stage of ours in
+			// front of it to scale for, but note the number is NOT
+			// comparable with the pre-AFE fleet's: the HAL's PGA and the
+			// AFE's +7.2dB output gain sit where micGainDb used to, so this
+			// wants tuning by measurement rather than carrying a value over.
 			rms := vadPeriodRMS(mono)
-			speech := rms >= threshold*gainLin
+			speech := rms >= threshold
 
-			// Gate windows in units of actual iterations: the mic delivers
-			// whole ALSA-buffer batches (160ms/2560 samples — see the
-			// pipeline note in CLAUDE.md), so divide the configured ms by
-			// the real batch duration. The old /32 assumed 32ms periods and
-			// silently made both windows 5× longer than configured (80ms
-			// speech-to-open was really 320ms; 600ms silence-to-close was
-			// really 2.9s).
+			// Gate windows in units of actual iterations: divide the
+			// configured ms by the duration of the buffer that actually
+			// arrived rather than by an assumed period length. (The old /32
+			// assumed 32ms periods against 160ms batches and silently made
+			// both windows 5× longer than configured.)
 			batchMs := len(mono) / 32 // S16 mono @16kHz: 32 bytes per ms
 			if batchMs < 1 {
 				batchMs = 1
@@ -810,44 +611,18 @@ func (d *DataClient) streamMic(conn *websocket.Conn, stopCh <-chan struct{}, loc
 				silenceMax = 1
 			}
 
-			// Periodic RMS diagnostic — every ~10 min, or within ~16s of
-			// the mic gain clamping a sample (clipping is the one signal
-			// that says micGainDb is too hot for the room, so it's
-			// reported promptly; the %100 bound stops sustained clipping
-			// becoming its own log flood). Was every 100 counts (~16s
-			// measured on-device) while idle capture levels were being
-			// characterised — that job is done (2026-07-07 fleet
-			// analysis) and /tmp/server.log is RAM-backed and unrotated.
-			if periodCount%3750 == 0 || (clipped != lastClipped && periodCount%100 == 0) {
-				log.Printf("[data] VAD diag: rms=%.5f threshold=%.5f gain=%ddB clipped=%d gate=%v active=%v agc=%v",
-					rms, threshold*gainLin, gainDb, clipped, speech, active, agcEnabled)
-				lastClipped = clipped
+			// Periodic RMS diagnostic — every ~10 min. Was every 100 counts
+			// (~16s measured on-device) while idle capture levels were being
+			// characterised; that job is done (2026-07-07 fleet analysis)
+			// and /tmp/server.log is RAM-backed and unrotated.
+			if periodCount%7500 == 0 {
+				log.Printf("[data] VAD diag: rms=%.5f threshold=%.5f gate=%v active=%v",
+					rms, threshold, speech, active)
 			}
 			periodCount++
 
-			// AGC — lockMic turn streams only (see agcEnabled above). Pass
-			// the speech flag so AGC release freezes during silence,
-			// preventing noise floor amplification. When agcEnabled is
-			// false Process passes mono through untouched and gain state is
-			// frozen at whatever it last was. (RNNoise NS removed
-			// 2026-07-12 — see internal/processor package comment.)
-			mono = d.proc.Process(mono, agcEnabled, speech)
-			d.pipeMu.Unlock()
-			// ─────────────────────────────────────────────────────────────
-
-			// Notify direction listener — non-blocking, keep it fast.
-			// Only fire when angle is valid (beam locked).
-			if angle >= 0 {
-				d.directionMu.Lock()
-				cb := d.onDirectionChange
-				d.directionMu.Unlock()
-				if cb != nil {
-					cb(angle)
-				}
-			}
-
 			// Ungated wake stream: the always-on (!lockMic) stream sends
-			// every processed period, batched into 80ms chunks — no VAD
+			// every period, batched into 80ms chunks — no VAD
 			// gate, no preroll, no end-of-speech sentinels. openwakeword
 			// is a streaming model whose internal mel-spectrogram buffer
 			// assumes continuous audio; feeding it VAD-gated bursts spliced

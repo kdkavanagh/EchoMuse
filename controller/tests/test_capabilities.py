@@ -163,33 +163,53 @@ def test_the_wake_chime_is_audio_the_device_already_has():
         "the chime must not be streamed as audio — it is already on the device"
 
 
-def test_native_afe_capability_is_surfaced_to_the_dashboard():
+# Keys the device's audio HAL owns, which the controller therefore must not
+# offer as settings. Each was a real config key until the pipeline moved to
+# Android's audio HAL (docs/native-afe-migration.md); the firmware no longer
+# reads any of them, and its AFE.cfg tuning lives on a read-only partition.
+_HAL_OWNED_KEYS = (
+    "micGainDb", "adcMicpga", "adcDigitalGain",
+    "beamformingEnabled", "beamAngle",
+    "aecEnabled", "aecDelayMs", "aecTailMs",
+    "agcEnabled",
+)
+
+
+def test_the_mic_chain_is_not_offered_as_config():
     """
-    docs/native-afe-migration.md's bypass table: beamformingEnabled,
-    aecEnabled, agcEnabled and the mic gain controls do nothing while the
-    native-AFE backend is running, so the dashboard must be able to tell that
-    apart from an ordinary device — the same "cannot vs off" reasoning as
-    oww_shadow, just with the polarity inverted (this capability being present
-    is what DISABLES controls, not what offers a new one).
+    The one direction this can fail silently.
+
+    A control the device cannot honour is the exact thing the capability rule
+    exists to prevent, and these nine are the ones most likely to come back:
+    they read like ordinary audio settings, they have obvious dashboard
+    widgets, and re-adding one produces a slider that moves, saves, pushes and
+    changes nothing about the sound — indistinguishable from a setting that
+    simply does not help.
+
+    Asserted against DEFAULT_DEVICE_CONFIG and the dashboard rather than the
+    Go source: the firmware ignoring an unknown field is the safe half. The
+    unsafe half is the controller believing it is a setting.
     """
-    assert "native_afe_capable" in CONTROLLER.read_text(), \
-        "em_controller must expose the native-AFE capability as a property"
-    assert "nativeAfeCapable" in API.read_text(), \
-        "/api/devices must surface the native-AFE capability"
+    import em_db
+    present = [k for k in _HAL_OWNED_KEYS if k in em_db.DEFAULT_DEVICE_CONFIG]
+    assert not present, (
+        f"{present} is owned by the device's audio HAL and cannot be set from "
+        f"here — the firmware does not read it"
+    )
     jsx = (ROOT / "controller" / "static" / "dashboard.jsx").read_text()
-    assert "nativeAfeCapable" in jsx and "afeActive" in jsx, \
-        "the dashboard must gate the beamformer/AEC/AGC/gain controls on the capability"
+    shown = [k for k in _HAL_OWNED_KEYS if k in jsx]
+    assert not shown, f"dashboard still renders HAL-owned control(s): {shown}"
 
 
 def test_the_toggle_control_actually_honours_disabled():
     """
     "Disabled with the reason, never a control that silently does nothing" is
-    the whole rule the bypass table above is enforced by — and for the first
-    release of it, Toggle did not take a `disabled` prop at all (only Slider
-    did). Beamforming, Echo cancel and Auto gain therefore rendered greyed
-    with their reason, read as off, and WROTE THE OPPOSITE VALUE into config
-    when clicked: worse than doing nothing, because the setting silently
-    disagreed with what the control showed.
+    the rule every capability-gated control in this dashboard relies on — and
+    for a release, Toggle did not take a `disabled` prop at all (only Slider
+    did). Three toggles therefore rendered greyed with their reason, read as
+    off, and WROTE THE OPPOSITE VALUE into config when clicked: worse than
+    doing nothing, because the setting silently disagreed with what the
+    control showed.
 
     Asserted against the component rather than the call sites, because the
     call sites already looked correct while the bug was live.
@@ -207,22 +227,26 @@ def test_the_toggle_control_actually_honours_disabled():
         "styling it grey while still writing the value is the bug this pins"
 
 
-def test_native_afe_toggle_is_gated_on_the_backend_capability_not_the_active_one():
+def test_there_is_no_audio_pipeline_switch_left_to_half_remove():
     """
-    native_afe_backend is a fixed fact about the BUILD (compiled-in backends
-    + a start_server.sh new enough to check the marker); native_afe reflects
-    only whether the AFE happens to be running right now. The dashboard's
-    toggle — which offers to turn it ON — has to gate on the former: gating
-    on the latter would mean the control to enable it only appears once it
-    is already enabled.
+    There was an opt-in that chose between EchoMuse's own audio pipeline and
+    the HAL's: a marker file, a capability pair, an endpoint and a dashboard
+    panel. All four are gone, and they have to go together — a surviving
+    marker check or endpoint would offer a device a backend the firmware no
+    longer contains, and the observable failure is a reboot into a device
+    whose audio never starts.
     """
-    assert "native_afe_backend" in CONTROLLER.read_text(), \
-        "em_controller must expose the native-AFE backend capability as a property"
-    assert "nativeAfeBackendCapable" in API.read_text(), \
-        "/api/devices must surface the native-AFE backend capability"
+    assert "native_afe" not in CONTROLLER.read_text(), \
+        "em_controller still references the removed native-AFE capability"
+    api = API.read_text()
+    assert "native_afe" not in api and "nativeAfe" not in api, \
+        "em_api still exposes the removed native-AFE endpoint or capability"
     jsx = (ROOT / "controller" / "static" / "dashboard.jsx").read_text()
-    assert "nativeAfeBackendCapable" in jsx, \
-        "the dashboard must gate the native-AFE toggle on the backend capability"
+    assert "nativeAfe" not in jsx, \
+        "the dashboard still renders the removed audio-pipeline panel"
+    script = (ROOT / "controller" / "device_payloads" / "start_server.sh").read_text()
+    assert "EM_NATIVE_AFE" not in script, \
+        "start_server.sh still checks the removed opt-in marker"
 
 
 def test_capabilities_reported_before_the_server_exists_are_not_lost():

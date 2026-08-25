@@ -19,7 +19,6 @@ type Device struct {
 	mu sync.RWMutex
 
 	// Microphone / VAD
-	VadChannel   int
 	VadThreshold float64
 	VadSpeechMs  int
 	VadSilenceMs int
@@ -61,45 +60,12 @@ type Device struct {
 	// scored controller-side over the turn's own audio.
 	OwwOnDevice string
 
-	// ADC gain — applied via tinymix when config is pushed
-	AdcDigitalGain int
-	AdcMicpga      int
-
-	// MicGainDb is a fixed digital gain (dB) applied to the full 24-bit
-	// capture before quantising to the 16-bit stream (see beamformer
-	// extractChannel). Measured speech at normal levels sits at 0.0001–
-	// 0.0006 FS RMS — only ~3–20 LSB in 16-bit terms — so gain must be
-	// applied pre-truncation to recover real captured resolution rather
-	// than amplify 16-bit quantisation noise. Fixed by design: this is
-	// the "fixed gain" stage of the dumb-transducer architecture — all
-	// adaptation lives controller-side as measurement. 0 = unity.
-	MicGainDb int
-
-	// BeamAngle fixes the beamformer steering direction in degrees
-	// (0–360, clockwise from 12 o'clock). -1 = auto (track loudest source).
-	BeamAngle          float64
-	BeamformingEnabled bool
-
-	// AGC toggle — pointer typed so false is expressible over the wire.
-	// Defaults true; applies to bounded lockMic turn streams only (forced
-	// off on the always-on wake stream). RNNoise NS was removed 2026-07-12 —
-	// noise suppression lives controller-side (em_ns.py) on the ASR path.
-	AgcEnabled *bool
-
-	// Acoustic echo cancellation (speexdsp, internal/aec). Applies to the
-	// whole mic path (wake stream included) — defaults off until validated
-	// per deployment. AecDelayMs is the bulk write-to-ear latency the
-	// reference stream is shifted by; measured on hardware (2026-07-08)
-	// the right value is 0 — the mic side reads whole 160ms ALSA batches
-	// (see GetAudioStream), which eats most of the speaker's ≈340ms output
-	// buffering, and the filter tail absorbs the remainder. Values ≥100
-	// made the echo arrive before its reference (non-causal → zero
-	// cancellation). AecTailMs is the adaptive filter length, which must
-	// cover residual delay error plus room reverb. Device clamps: delay
-	// 0–1000ms, tail 50–500ms.
-	AecEnabled *bool
-	AecDelayMs int
-	AecTailMs  int
+	// Mic gain, beamforming, echo cancellation and AGC are NOT config here:
+	// Android's audio HAL owns all four (per-mic AEC, fixed + adaptive
+	// beamformer, SNR beam selection, its own AGC and output gain), selected
+	// by capturing at AUDIO_SOURCE_VOICE_RECOGNITION. Its tuning lives in
+	// /system/etc/AFE.cfg, on a read-only partition, so there is nothing here
+	// for the controller to set — see docs/native-afe-migration.md.
 
 	// BLE proxy (passive scan over /dev/stpbt, internal/bluetooth) —
 	// pointer typed so false is expressible over the wire. Default off.
@@ -125,7 +91,6 @@ func Get() *Device {
 // loadDefaults populates from environment variables, falling back to
 // hard-coded defaults. Must be called with mu held.
 func (d *Device) loadDefaults() {
-	d.VadChannel = envInt("VAD_CHANNEL", 0)
 	d.VadThreshold = envFloat("VAD_THRESHOLD", 0.004)
 	d.VadSpeechMs = envInt("VAD_SPEECH_MS", 80)
 	d.VadSilenceMs = envInt("VAD_SILENCE_MS", 600)
@@ -135,20 +100,6 @@ func (d *Device) loadDefaults() {
 	d.OwwOnDevice = normaliseOnDevice(envStr("OWW_ON_DEVICE", OnDeviceOff))
 	d.BargeInThreshold = envFloat("BARGE_IN_THRESHOLD", 0.05)
 	d.DuckDb = envFloat("DUCK_DB", -18)
-	d.AdcDigitalGain = envInt("ADC_DIGITAL_GAIN", 88)
-	d.AdcMicpga = envInt("ADC_MICPGA", 40)
-	d.MicGainDb = clampMicGainDb(envInt("MIC_GAIN_DB", 24))
-	d.BeamAngle = envFloat("BEAM_ANGLE", -1)
-	d.BeamformingEnabled = envBool("BEAMFORMING_ENABLED", true)
-	agcEnabled := envBool("AGC_ENABLED", true)
-	d.AgcEnabled = &agcEnabled
-	// true to match em_db.DEFAULT_DEVICE_CONFIG, which now defaults AEC on
-	// because barge-in does. The controller's value reaches us on the first
-	// config push either way; this only governs the window before it.
-	aecEnabled := envBool("AEC_ENABLED", true)
-	d.AecEnabled = &aecEnabled
-	d.AecDelayMs = envInt("AEC_DELAY_MS", 0)
-	d.AecTailMs = envInt("AEC_TAIL_MS", 300)
 	bleProxyEnabled := envBool("BLE_PROXY_ENABLED", false)
 	d.BleProxyEnabled = &bleProxyEnabled
 }
@@ -198,33 +149,6 @@ func (d *Device) Apply(msg ConfigMessage) {
 	if msg.StartupVolume > 0 {
 		d.StartupVolume = msg.StartupVolume
 	}
-	if msg.AdcDigitalGain > 0 {
-		d.AdcDigitalGain = msg.AdcDigitalGain
-	}
-	if msg.AdcMicpga > 0 {
-		d.AdcMicpga = msg.AdcMicpga
-	}
-	if msg.MicGainDb != nil {
-		d.MicGainDb = clampMicGainDb(*msg.MicGainDb)
-	}
-	if msg.BeamAngle != nil {
-		d.BeamAngle = *msg.BeamAngle
-	}
-	if msg.BeamformingEnabled != nil {
-		d.BeamformingEnabled = *msg.BeamformingEnabled
-	}
-	if msg.AgcEnabled != nil {
-		d.AgcEnabled = msg.AgcEnabled
-	}
-	if msg.AecEnabled != nil {
-		d.AecEnabled = msg.AecEnabled
-	}
-	if msg.AecDelayMs != nil {
-		d.AecDelayMs = *msg.AecDelayMs
-	}
-	if msg.AecTailMs > 0 {
-		d.AecTailMs = msg.AecTailMs
-	}
 	if msg.BleProxyEnabled != nil {
 		d.BleProxyEnabled = msg.BleProxyEnabled
 	}
@@ -234,26 +158,10 @@ func (d *Device) Apply(msg ConfigMessage) {
 func (d *Device) Snapshot() ConfigMessage {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	beamAngle := d.BeamAngle
-	// C4 fix (2026-07-05 review): previously &d.BeamformingEnabled leaked a
-	// pointer into the live mutex-guarded struct — the caller (streamMic,
-	// every period) dereferences it after RUnlock, racing with Apply()
-	// writing the same bool on a config push. Copy to a local like
-	// beamAngle/agcEnabled above.
-	beamformingEnabled := d.BeamformingEnabled
-	// Same reason as beamformingEnabled above: copy, never point into the
-	// mutex-guarded struct.
+	// C4 fix (2026-07-05 review): copy every pointed-to value to a local,
+	// never &d.Field — the caller dereferences it after RUnlock, racing with
+	// Apply() writing the same field on a config push.
 	bargeInEnabled := d.BargeInEnabled
-	agcEnabled := true
-	if d.AgcEnabled != nil {
-		agcEnabled = *d.AgcEnabled
-	}
-	micGainDb := d.MicGainDb
-	aecEnabled := false
-	if d.AecEnabled != nil {
-		aecEnabled = *d.AecEnabled
-	}
-	aecDelayMs := d.AecDelayMs
 	bleProxyEnabled := false
 	if d.BleProxyEnabled != nil {
 		bleProxyEnabled = *d.BleProxyEnabled
@@ -268,15 +176,6 @@ func (d *Device) Snapshot() ConfigMessage {
 		BargeInEnabled:     &bargeInEnabled,
 		BargeInThreshold:   d.BargeInThreshold,
 		StartupVolume:      d.StartupVolume,
-		AdcDigitalGain:     d.AdcDigitalGain,
-		AdcMicpga:          d.AdcMicpga,
-		MicGainDb:          &micGainDb,
-		BeamAngle:          &beamAngle,
-		BeamformingEnabled: &beamformingEnabled,
-		AgcEnabled:         &agcEnabled,
-		AecEnabled:         &aecEnabled,
-		AecDelayMs:         &aecDelayMs,
-		AecTailMs:          d.AecTailMs,
 		BleProxyEnabled:    &bleProxyEnabled,
 	}
 }
@@ -285,9 +184,6 @@ func (d *Device) Snapshot() ConfigMessage {
 // sent by the controller. JSON tags must match em_controller.py exactly.
 type ConfigMessage struct {
 	Type               string   `json:"type,omitempty"`
-	AdcDigitalGain     int      `json:"adcDigitalGain,omitempty"`
-	AdcMicpga          int      `json:"adcMicpga,omitempty"`
-	MicGainDb          *int     `json:"micGainDb,omitempty"`
 	StartupVolume      int      `json:"startupVolume,omitempty"`
 	VadThreshold       float64  `json:"vadThreshold,omitempty"`
 	VadSpeechMs        int      `json:"vadSpeechMs,omitempty"`
@@ -298,28 +194,7 @@ type ConfigMessage struct {
 	BargeInEnabled     *bool    `json:"bargeInEnabled,omitempty"`
 	BargeInThreshold   float64  `json:"bargeInThreshold,omitempty"`
 	DuckDb             *float64 `json:"duckDb,omitempty"`
-	BeamAngle          *float64 `json:"beamAngle,omitempty"`
-	BeamformingEnabled *bool    `json:"beamformingEnabled,omitempty"`
-	HasBeamforming     bool     `json:"hasBeamforming,omitempty"`
-	AgcEnabled         *bool    `json:"agcEnabled,omitempty"`
-	AecEnabled         *bool    `json:"aecEnabled,omitempty"`
-	AecDelayMs         *int     `json:"aecDelayMs,omitempty"`
-	AecTailMs          int      `json:"aecTailMs,omitempty"`
 	BleProxyEnabled    *bool    `json:"bleProxyEnabled,omitempty"`
-}
-
-// clampMicGainDb bounds the fixed mic gain to a sane range: 0dB (unity —
-// the pre-gain behaviour, bit-exact) up to +42dB. The 24-bit capture holds
-// 8 bits (48dB) below the old 16-bit truncation point; beyond +42dB the
-// gain is amplifying the capture's own noise floor with no headroom left.
-func clampMicGainDb(db int) int {
-	if db < 0 {
-		return 0
-	}
-	if db > 42 {
-		return 42
-	}
-	return db
 }
 
 // On-device wake word modes.

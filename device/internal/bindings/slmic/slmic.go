@@ -1,16 +1,14 @@
 //go:build server
 
-// Package slmic captures through Android's audio HAL via OpenSL ES instead of
-// writing tinyalsa PCM directly, so the capture reaches Amazon's ASP front
-// end (per-mic AEC, fixed+adaptive beamformer, SNR beam selection) instead of
-// bypassing it. See docs/native-afe-migration.md.
+// Package slmic captures through Android's audio HAL via OpenSL ES, which is
+// what puts the capture through Amazon's ASP front end (per-mic AEC,
+// fixed+adaptive beamformer, SNR beam selection) rather than bypassing it. It
+// is the only capture backend; see docs/native-afe-migration.md.
 //
-// It implements the same pkg/mic.Microphone (+ Subscribable) contract
-// PcmMicrophone does, with one declared difference: Passthrough() reports
-// true, because the HAL has already reduced the capture to one processed mono
-// channel before this package ever sees it. internal/client's streamMic uses
-// that to skip internal/beamformer entirely rather than feed it a buffer
-// shaped for raw 9-channel capture (see pkg/mic.PassthroughReporter).
+// Every period it hands out is one fully processed mono channel: the HAL has
+// already reduced the nine-microphone array to a single beam and applied its
+// own gain before this package sees anything. Nothing above it does signal
+// processing of its own.
 package slmic
 
 import (
@@ -40,17 +38,15 @@ const (
 
 	// hwBuffers is the OpenSL ES-facing double/triple buffering only — small
 	// by design. It is not the application-level lead buffer; that lives in
-	// each subscriber's own channel, same layering as PcmMicrophone's ALSA
-	// read loop vs. its per-subscriber fan-out.
+	// each subscriber's own channel, the same layering the ALSA read loop
+	// used before this backend replaced it.
 	hwBuffers = 4
 
-	// fanoutDepth matches PcmMicrophone.Subscribe's channel depth.
 	fanoutDepth = 32
 )
 
 // Microphone captures mono S16 16kHz through OpenSL ES at the
-// VOICE_RECOGNITION preset and fans it out to subscribers, mirroring
-// internal/bindings/mic.PcmMicrophone's shape.
+// VOICE_RECOGNITION preset and fans it out to subscribers.
 type Microphone struct {
 	eng *opensl.Engine
 	rec *opensl.Recorder
@@ -60,13 +56,11 @@ type Microphone struct {
 }
 
 // NewMicrophone opens the OpenSL ES engine, a recorder at the
-// VOICE_RECOGNITION preset, and starts capture — mirroring
-// mic.PcmMicrophone.NewMicrophone's contract of returning a fully running
-// microphone, so cmd/server.go's backend-selection switch can call either
-// constructor identically. Critically, it runs no `stop mixer` / `stop
-// media`: unlike the tinyalsa backends, this path needs mediaserver to keep
-// owning the PCM, or the HAL's ASP front end is never in the loop at all
-// (docs/native-afe-migration.md, "the one rule that matters").
+// VOICE_RECOGNITION preset, and starts capture, returning a fully running
+// microphone. Critically, it runs no `stop mixer` / `stop media`: this path
+// needs mediaserver to keep owning the PCM, or the HAL's ASP front end is
+// never in the loop at all (docs/native-afe-migration.md, "the one rule that
+// matters").
 func NewMicrophone() (*Microphone, error) {
 	lib := os.Getenv("EM_OPENSL_LIB")
 	if lib == "" {
@@ -88,9 +82,7 @@ func NewMicrophone() (*Microphone, error) {
 	return m, nil
 }
 
-// Init starts capture and the permanent fan-out loop, mirroring
-// PcmMicrophone.Init's shape so cmd/server.go's call site does not care which
-// backend it holds.
+// Init starts capture and the permanent fan-out loop.
 func (m *Microphone) Init() error {
 	if err := m.rec.Start(); err != nil {
 		return fmt.Errorf("slmic: start: %w", err)
@@ -103,8 +95,8 @@ func (m *Microphone) Init() error {
 }
 
 // readLoop reads completed periods forever and fans each out to every
-// current subscriber, exactly like PcmMicrophone.readLoop — down to closing
-// every subscriber channel on exit so callers see EOF rather than hang.
+// current subscriber, closing every subscriber channel on exit so callers see
+// EOF rather than hang.
 func (m *Microphone) readLoop() {
 	var drops uint64
 	for {
@@ -180,10 +172,6 @@ func (m *Microphone) Listen(callback pkgmic.AudioCallback, ctx context.Context) 
 	}
 }
 
-// Passthrough reports that every fanned-out period is already one fully
-// processed mono channel — see pkg/mic.PassthroughReporter.
-func (m *Microphone) Passthrough() bool { return true }
-
 // Close stops capture. The underlying opensl.Engine is process-shared
 // (cached by library path) and outlives any one Microphone, so it is
 // deliberately not closed here.
@@ -193,7 +181,6 @@ func (m *Microphone) Close() {
 }
 
 var (
-	_ pkgmic.Microphone          = (*Microphone)(nil)
-	_ pkgmic.Subscribable        = (*Microphone)(nil)
-	_ pkgmic.PassthroughReporter = (*Microphone)(nil)
+	_ pkgmic.Microphone   = (*Microphone)(nil)
+	_ pkgmic.Subscribable = (*Microphone)(nil)
 )

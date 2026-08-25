@@ -3,9 +3,8 @@ package slspeaker
 import "testing"
 
 // The buffering state machine, testable on the host because audioStream is
-// untagged — same behaviour as internal/bindings/speaker's version (see that
-// package's stream_test.go), ported here because slspeaker.go itself can
-// only be built on the device (//go:build server, cgo against OpenSL ES).
+// untagged — slspeaker.go itself can only be built on the device
+// (//go:build server, cgo against OpenSL ES).
 
 func newTestStream(depth int) (*audioStream, chan struct{}) {
 	dead := make(chan struct{})

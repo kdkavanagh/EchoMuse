@@ -14,17 +14,14 @@ import (
 var errSpeakerDead = errors.New("slspeaker: pump loop has died")
 
 // StreamStats is a type alias for pkg/speaker.StreamStats, the canonical
-// definition — see that comment. Aliasing rather than redefining means this
-// backend's stats and the tinyalsa backend's are one identical Go type, which
-// is what lets cmd/server.go hold either behind pkg/speaker.FullSpeaker.
+// definition — see that comment for what each field answers.
 type StreamStats = pkgspeaker.StreamStats
 
-// audioStream is one buffered playback stream (voice/TTS or music), the same
-// state machine as speaker.audioStream — see that file for the full
-// reasoning behind the prime gate, the discard-until-EOS contract and the
-// minDepth sampling rule. It is duplicated here rather than imported because
-// the two backends live in different packages (see the architecture note in
-// docs/native-afe-migration.md); nothing about the logic itself differs.
+// audioStream is one buffered playback stream: the voice/TTS plane or the
+// music plane. Both need the same machinery — a prime gate, discard-until-EOS
+// on flush, underrun accounting and delivery instrumentation — so it is
+// extracted rather than duplicated. Every comment here records behaviour that
+// was arrived at the hard way; none of it is new.
 //
 // Untagged on purpose — this is the buffering state machine, worth testing on
 // the host independent of OpenSL ES.
@@ -32,22 +29,60 @@ type audioStream struct {
 	ch     chan []byte
 	deadCh <-chan struct{} // closed when the pump loop exits
 
+	// eosPending is set by endStream (the WS reader received an EOS frame)
+	// and consumed by the pump loop when the channel drains, so a drain at
+	// the natural end of a stream is not misreported as an underrun.
 	eosPending atomic.Bool
 
-	mu         sync.Mutex
-	active     bool
+	// mu guards active and discarding as one unit. They used to be
+	// independent atomics, but flush's check-active-then-arm and endStream's
+	// clear-both are compound transitions: a barge-in flush racing a
+	// stream's natural end (control and data ride separate WebSockets) could
+	// observe active just before endStream cleared it and then arm
+	// discarding just after endStream consumed it — leaving discard armed
+	// with no EOS ever coming, silently swallowing the whole NEXT response
+	// up to its EOS.
+	mu sync.Mutex
+	// active tracks whether a stream is mid-flight (set by pump, cleared by
+	// endStream — both on the WS read goroutine). Read by flush to decide
+	// whether to arm discarding.
+	active bool
+	// discarding, when set, makes pump drop incoming periods until the
+	// stream's EOS arrives. Armed by flush when a stream is mid-flight:
+	// draining the channel alone is not enough, because the rest of the
+	// cancelled stream is typically already in flight in the TCP buffers of
+	// both ends — the WS reader would refill the channel straight after the
+	// drain and playback would carry on after a ~1.3s skip (observed
+	// 2026-07-08: barge-in cut the LED but the TTS kept talking, and the
+	// interrupting turn transcribed the device's own voice). The controller
+	// always terminates a stream with an EOS, on the cancel path included,
+	// so discard-until-EOS consumes exactly the remainder of the cancelled
+	// stream no matter how much was buffered.
 	discarding bool
 
+	// ── per-stream delivery instrumentation ───────────────────────────────
+	// Underruns are a rare binary event; these give the *margin* on every
+	// stream, so a link that is merely close to starving is visible before it
+	// audibly breaks (2026-07-20: added after underruns appeared with no
+	// measurable cause — every metric we had timed the wrong thing).
+	//
+	// Written only by pump, which the WS read loop calls sequentially —
+	// single writer, so a plain load/compare/store needs no lock. The pump
+	// loop reads them once per stream at EOS. Cost on the audio hot path is
+	// one time.Now() plus an integer compare per period; nothing here
+	// allocates or logs.
 	recvFirstNs  atomic.Int64
 	recvLastNs   atomic.Int64
 	recvMaxGapNs atomic.Int64
 	recvBytes    atomic.Uint64
 
-	playing     bool
+	// ── consumption-side accounting, pump-loop-local by contract ──────────
+	// Only the pump goroutine touches these, so they need no synchronisation.
+	playing     bool // mid-stream from the consumer's point of view
 	periods     uint64
 	underruns   uint64
-	minDepth    int
-	firstPumpNs int64
+	minDepth    int   // -1 = nothing consumed yet this stream
+	firstPumpNs int64 // first period actually played this stream
 }
 
 func newAudioStream(depth int, deadCh <-chan struct{}) *audioStream {
@@ -64,6 +99,9 @@ func newAudioStream(depth int, deadCh <-chan struct{}) *audioStream {
 func (s *audioStream) pump(period []byte, wireBytes int) (bool, error) {
 	s.mu.Lock()
 	if s.discarding {
+		// Flushed stream — swallow the network-buffered remainder without
+		// queueing it (see the discarding field for why draining the channel
+		// alone cannot do this).
 		s.mu.Unlock()
 		return false, nil
 	}
@@ -92,8 +130,17 @@ func (s *audioStream) pump(period []byte, wireBytes int) (bool, error) {
 	}
 }
 
-// endStream marks the EOS — see speaker.audioStream.endStream for why a
-// discarding stream must NOT re-arm eosPending here.
+// endStream marks the EOS. Called from the WS read goroutine the instant the
+// frame arrives, so by the time the pump loop drains the channel the flag is
+// already set and the drain is not counted as an underrun.
+//
+// A stream that was being DISCARDED is the exception, and it is load-bearing.
+// flush() already set eosPending and the drain that followed already consumed
+// it, so setting it again here leaves it armed with no stream behind it —
+// and the NEXT stream then reports itself complete at its first buffer dip.
+// Measured after this was briefly wrong: a 2800ms response reported complete
+// after 15 periods (640ms), which ended the turn, cleared the ring and
+// released the duck while the device was still holding most of the audio.
 func (s *audioStream) endStream() {
 	s.mu.Lock()
 	s.active = false
@@ -107,8 +154,10 @@ func (s *audioStream) endStream() {
 }
 
 // flush drops everything queued and, if a stream is mid-flight, arms discard
-// so the remainder still in flight from the controller is swallowed rather
-// than played — see speaker.audioStream.flush.
+// so the remainder still in TCP buffers is swallowed rather than played.
+//
+// eosPending is set so the drain the pump loop is about to see is accounted
+// as an end of stream rather than an underrun.
 func (s *audioStream) flush() {
 	s.mu.Lock()
 	if s.active {
@@ -125,15 +174,21 @@ func (s *audioStream) flush() {
 	}
 }
 
+// isActive reports whether a stream is mid-flight on the wire.
 func (s *audioStream) isActive() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.active
 }
 
-// ready reports whether the pump loop should take a period this round — the
-// prime gate. See speaker.audioStream.ready for the full rationale (protects
-// the opening seconds of playback against link stalls).
+// ready reports whether the pump loop should take a period this round.
+//
+// The prime gate: while not yet playing, hold on silence until the buffer has
+// primePeriods queued, or the stream's EOS is already in (a clip shorter than
+// the prime — everything it will ever have is queued). This protects the
+// opening seconds, when the sender's lead is still ~zero and a single WiFi
+// stall used to stutter. Once playing, the gate stays out of the way and
+// mid-stream drains are accounted as underruns instead.
 func (s *audioStream) ready(prime int) bool {
 	n := len(s.ch)
 	if n == 0 {
@@ -152,6 +207,17 @@ func (s *audioStream) take() []byte {
 	case period := <-s.ch:
 		s.playing = true
 		s.periods++
+		// Buffer margin: occupancy remaining *after* taking this period.
+		// len() on a channel is O(1); no allocation, no log.
+		//
+		// Sampled ONLY while the sender still has audio to send. The last
+		// periods of every stream necessarily drain the buffer to zero, so
+		// measuring across the tail made this read 0 on 100% of streams —
+		// healthy ones included — which is how it shipped in v2.9.6 and told
+		// us nothing (caught on first field data, 2026-07-20). eosPending is
+		// set the instant the EOS arrives, so !eosPending means "more audio
+		// is still expected" and a low buffer *there* is a real margin
+		// warning.
 		if !s.eosPending.Load() {
 			if d := len(s.ch); s.minDepth < 0 || d < s.minDepth {
 				s.minDepth = d

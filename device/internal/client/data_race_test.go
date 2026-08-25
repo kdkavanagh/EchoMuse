@@ -10,12 +10,11 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/wilbowes/EchoMuse/internal/aec"
 )
 
-// fanoutMic is a minimal mic.Subscribable: a background pump broadcasts raw
-// 9ch S24_3LE periods to every subscriber until closed, mimicking
-// PcmMicrophone's fan-out (including the drop-when-full behaviour).
+// fanoutMic is a minimal mic.Subscribable: a background pump broadcasts mono
+// S16 periods to every subscriber until closed, mimicking slmic's fan-out
+// (including the drop-when-full behaviour).
 type fanoutMic struct {
 	mu     sync.Mutex
 	subs   []chan []byte
@@ -24,9 +23,9 @@ type fanoutMic struct {
 
 func newFanoutMic() *fanoutMic {
 	m := &fanoutMic{stopCh: make(chan struct{})}
-	// One 512-frame period of 9ch S24_3LE (the minimum Process() analyses),
-	// non-zero so the beamformer smoothers see real energy.
-	raw := make([]byte, 512*9*3)
+	// One 80ms period of mono S16 @16kHz — what the HAL hands back — with
+	// non-zero content so the RMS gate sees real energy.
+	raw := make([]byte, 1280*2)
 	for i := range raw {
 		raw[i] = byte(i % 251)
 	}
@@ -106,19 +105,17 @@ func dialTestWS(t *testing.T) (*websocket.Conn, func()) {
 // while mic data is flowing. The superseded streamMic goroutine can keep
 // draining periods for a few iterations after its stopCh closes (select on a
 // closed channel vs a ready mic channel picks randomly), so for a window the
-// old and new goroutines run concurrently against the shared beamformer and
-// AGC state. Run under -race: before pipeMu serialised the pipeline this
-// reliably reported races on the beamformer's reused analysis buffers, and
-// the old goroutine's deferred beam.Unlock could land after the new stream's
-// Lock. Beam lock/unlock requests are mixed in to cover the mid-stream
-// request path too.
+// old and new goroutines run concurrently. Run under -race: the shared state
+// they still touch is micActive/micStopCh and the shadow scorer pointer, and
+// the ownership token is what keeps the old goroutine from clearing the
+// replacement's micActive.
 func TestStreamRestartOverlapIsRaceFree(t *testing.T) {
 	mic := newFanoutMic()
 	defer mic.close()
 	conn, cleanup := dialTestWS(t)
 	defer cleanup()
 
-	d := NewDataClient("race-test", mic, nil, aec.New())
+	d := NewDataClient("race-test", mic, nil)
 	d.connMu.Lock()
 	d.conn = conn
 	d.connMu.Unlock()
@@ -126,9 +123,7 @@ func TestStreamRestartOverlapIsRaceFree(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		lockMic := i%2 == 0 // alternate turn stream / wake stream
 		d.StartMic(lockMic)
-		d.RequestBeamLock()
 		time.Sleep(2 * time.Millisecond) // let a couple of periods flow
-		d.RequestBeamUnlock()
 		d.StopMic()
 		// No settling delay: the replacement StartMic in the next iteration
 		// racing the superseded goroutine's drain is the scenario under test.
@@ -171,7 +166,7 @@ func TestContextCancelReleasesMicStream(t *testing.T) {
 	// test's poll loop would eat that silently until its deadline.
 	addr := "ws://" + strings.TrimPrefix(srv.URL, "http://")
 
-	d := NewDataClient("zombie-test", mic, nil, aec.New())
+	d := NewDataClient("zombie-test", mic, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	connectDone := make(chan error, 1)

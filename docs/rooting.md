@@ -469,11 +469,11 @@ adb shell "su -c 'cat /tmp/server.log'"
 ✅ EchoMuse running as init service on boot (exec mode, no crash loop)
 ✅ Dummy mixer service for EchoMuse init compatibility
 ✅ Audio mixer configured at boot (tinymix in start_server.sh)
-✅ Mic gain equalised across all four ADCs — digital volume 88, MICPGA 40
+✅ Mic gain equalised across all four ADCs at boot — digital volume 88, MICPGA 40 (`start_server.sh`). Whether the audio HAL rewrites these when it opens the input is unverified; kept because if it inherits them, this is the only thing equalising the four chips
 ✅ WiFi wake lock — FireOS cannot suspend wireless interface
 ✅ p2p0 (WiFi Direct) disabled — no mDNS interference
 ✅ Full LED ring RGB control (IS31FL3236A, 12 RGB LEDs)
-✅ Microphone streaming (9 channels, S24_3LE, 16kHz, card 0 device 24)
+✅ Microphone capture through Android's audio HAL (OpenSL ES at AUDIO_SOURCE_VOICE_RECOGNITION → Amazon's ASP front end → mono S16 16kHz). The raw 9-channel array (S24_3LE, card 0 device 24) is still reachable by `device/tools/capture_mics`, but the firmware no longer reads it
 ✅ Speaker audio working (card 0, device 23, 48kHz stereo, period 2048 count 4)
 ✅ Button events (evdev)
 ✅ WiFi working
@@ -485,22 +485,19 @@ adb shell "su -c 'cat /tmp/server.log'"
 ✅ Orange LED pulse while disconnected / searching for server
 ✅ Slow white LED pulse while pending controller approval
 ✅ On-device energy VAD — VAD end signal (0x04) sent to controller on silence
-✅ Wake word detection on ch6 (centre/omni mic) — equidistant, no directional bias
+✅ Wake word detection on the HAL's processed mono channel
 ✅ OpenWakeWord — "Hey Jarvis" detected server-side (threshold 0.3)
 ✅ Mic channel mapping confirmed empirically (tone injection, analyse_capture.py)
-✅ Directional mic selection — best perimeter mic locked at voice turn start
-✅ Direction estimation — onset ratio (fast/slow EWMA) robust to background noise (TV etc.)
-✅ LED direction overlay — light green segment on listening ring during voice turn only
+⛔ Directional mic selection, onset-ratio direction estimation and the LED direction overlay — **removed** when capture moved to the audio HAL (its beamformer selects internally and reports no per-frame direction). The analysis behind them is in SETUP.md's mic-array section and is still worth reading
 ✅ LED mapping calibrated — LED 0 at 240°, confirmed from volume sweep
-✅ Audio processing pipeline — speexdsp AEC (v2.7.3) + AGC; device RNNoise removed 2026-07-12, NS is controller-side DTLN on the STT stream (`nsAsr` flag)
-✅ AGC applies to lock_mic turns only since v2.7.0 (wake stream is permanently AGC-free)
-✅ Ungated continuous wake stream (v2.7.0) — no VAD gate/AGC/preroll on the always-on stream; OWW scores uninterrupted audio; ~32KB/s per device
+✅ Audio processing — done by the Echo's own front end (per-mic AEC, fixed + adaptive beamformer, SNR beam selection, AGC, +7.2dB). EchoMuse's speexdsp AEC, beamformer, AGC and fixed mic gain were **removed**; device RNNoise went earlier (2026-07-12). NS is controller-side DTLN on the STT stream (`nsAsr` flag), now a second pass on top
+✅ Ungated continuous wake stream (v2.7.0) — no VAD gate or preroll on the always-on stream; OWW scores uninterrupted audio; ~32KB/s per device
 ✅ Mic stream leak fixed (v2.7.0) — ownership check in streamMic exit; stop/start pairs can no longer leak a concurrent duplicate stream (historical "wake degrades over days, reboot fixes it" root cause)
 ✅ Per-room noise floor tracking (v2.7.0, controller) — measurement-only asymmetric EWMA; drives the SNR-relative 5s no-speech cutoff (wake-then-silence closes quietly again)
-✅ Mid-stream beam lock (v2.7.0) — beam_lock/beam_unlock control messages; wake turns get perimeter mic selection without a stream restart
+⛔ Mid-stream beam lock (v2.7.0) — beam_lock/beam_unlock control messages, **removed** with the beamformer
 ✅ Beamformer lock-back selection (v2.7.2) — Lock() scores directions over a ~2s energy-history ring covering the wake word, not the decayed present (see pipeline state table)
-✅ Acoustic echo cancellation (v2.7.3, working since v2.7.7, convergence holds since v2.7.8, default OFF) — speexdsp canceller on the whole mic path; reference tapped at the speaker ALSA write. Keep aecDelayMs at 0 (measured; higher values are non-causal — see v2.7.7). Converges to ~14dB per response and *stays* converged across turns since v2.7.8 (governor trims no longer reset the filter); `[aec] att=` and `[mic] clock/stall` telemetry in the device log show live attenuation and capture health. Enable from the dashboard Microphones advanced section
-✅ 24-bit fixed mic gain (v2.7.1) — `micGainDb` (default +24dB) applied to the full 24-bit sample during S16 extraction; recovers the low byte the old truncation discarded (speech was ~3–20 LSB in 16-bit). Validated: STT empty-transcript rate went from 6/19 turns to 0/5, detection rms 0.0003 → 0.006–0.009, clipped=0
+⛔ speexdsp echo cancellation (v2.7.3–v2.7.8) — **removed**. It worked: ~14dB per response, convergence held across turns from v2.7.8, and 7–9dB was measured as the physical ceiling for that approach on this aperture. Replaced by the HAL's per-mic subband AEC, which is always on and whose depth is unmeasured
+⛔ 24-bit fixed mic gain (v2.7.1) — `micGainDb`, **removed**. It mattered a great deal at the time (STT empty-transcript rate 6/19 → 0/5) because the raw capture was extremely quiet; the framework hands back 16-bit audio with the HAL's PGA and the AFE's +7.2dB already applied, so there is nothing left to recover
 ✅ PTY dashboard shell (v2.7.1) — device allocates a real pseudo-terminal (mksh prompt, line editing, top/vi, resize); dashboard terminal is xterm.js; programmatic sessions (OTA) keep the raw pipe
 ✅ /tmp/server.log size cap (v2.7.1) — trim loop in start_server.sh, bounded at ~5.5MB; VAD diag slowed to ~10min with prompt clip-count reporting
 ✅ State-aware landing page (v2.7.1) — / shows first-run setup (amber ring) or login (green ring) and redirects authenticated visitors to /dashboard; sessions in localStorage
@@ -511,7 +508,7 @@ adb shell "su -c 'cat /tmp/server.log'"
 ✅ OWW near-miss visibility — scores > 0.05 logged at INFO (rate-limited 1/2s per device), persistent counter on dashboard status tab (v2.6.5)
 ✅ VAD threshold tunable down to 0.0001 (dashboard slider floor corrected)
 ✅ Beamformer structural fix — smoothers always run, output by lock state not flag
-✅ AGC release frozen during silence — prevents noise floor amplification past VAD threshold
+⛔ AGC release frozen during silence — **removed** with the AGC
 ✅ Acoustic feedback fix — controller sleeps for audio duration after EOS before mic restart
 ✅ Spinner runs for full response duration — duration calculated from PCM length
 ✅ VAD threshold default 0.001 — matches measured conversational speech range at 1.3m (v2.6.5; was 0.003, which sat above soft speech)
@@ -560,7 +557,7 @@ adb shell "su -c 'cat /tmp/server.log'"
 ✅ Mute is device-authoritative — mute stops the running mic stream, unmute restores it; audio stops leaving the device while the ring is red (v2.6.5, C5 partial — full-chip ADC mute pending)
 ✅ OWW speex NS toggle (owwSpeexNs) — openwakeword's 16kHz-native speexdsp suppressor on the wake path only, dashboard/API/DB wired, off by default (v2.6.5, Q1)
 ✅ Device preroll ring — ~512ms of pre-gate audio flushed on VAD gate open; fixes onset splice that depressed OWW scores and clipped first phonemes (v2.6.5)
-✅ AGC reset at every mic stream start + mic stopped before TTS playback — TTS-echo-crushed gain can't poison the next turn; enabled AGC re-enable (v2.6.5)
+✅ Mic stopped before TTS playback (v2.6.5) — the device no longer processes 60+ frames of its own echo per turn. Skipped when barge-in is on
 ✅ Speaker EOS vs underrun disambiguation — 0x03 EOS sets EndStream(), natural drain no longer logged as underrun (v2.6.5)
 ✅ Mic queue overflow drops oldest frame, not newest — audio tail stays contiguous with real time (v2.6.5)
 ✅ voice_queue drained before oww_paused routing flip — stale ambient frames no longer bleed into the next turn as STT preamble (v2.6.5 regression fix)

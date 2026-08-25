@@ -19,6 +19,11 @@ The Echo Dot runs FireOS 5 (API 22). Standard Go cross-compilation won't work �
 # GoTinyAlsa is a git submodule at the repo root — the wilbowes/GoTinyAlsa
 # fork, NOT upstream Binozo: it carries the GetAudioStream defer-in-loop
 # leak fix (v2.9.2). Don't repoint it upstream until that fix is merged there.
+#
+# The FIRMWARE no longer uses it: audio goes through the HAL over OpenSL ES
+# (internal/opensl). It is still needed by device/tools/capture_mics and
+# bf_capture, which read the raw 9-channel array directly, so the submodule
+# stays and compile.sh still mounts it.
 git submodule update --init
 
 # Build the compiler Docker image (from device/)
@@ -266,18 +271,78 @@ Credential delivery: the provisioning wizard installs credentials over adb pre-f
 Each mic buffer passes through, in order:
 
 ```
-raw 9ch S24_3LE → beamformer + fixed mic gain (micGainDb, applied to 24-bit samples) → mono S16_LE → [AEC] → [AGC] → [VAD gate] → /data WebSocket
+Android audio HAL @ AUDIO_SOURCE_VOICE_RECOGNITION → mono S16_LE 16kHz → [VAD gate] → /data WebSocket
 ```
 
-Note the real buffer cadence: GoTinyAlsa's `GetAudioStream` reads the whole ALSA buffer per chunk (PeriodSize 512 × PeriodCount 5), so the mic pipeline runs on **160ms batches of 2560 samples**, not single 32ms periods. Anything assuming 512-sample buffers must handle multiples (this silently disabled AEC for four releases — see `aec.Process`).
+**EchoMuse does no signal processing on the mic path.** Capture goes through
+OpenSL ES (`internal/bindings/slmic`), which puts it through Amazon's ASP
+front end: per-mic AEC, fixed + adaptive beamformer, SNR beam selection,
+false-wake prevention and +7.2dB, all inside the HAL. What arrives in Go is
+one finished mono channel. The device's own beamformer, speexdsp AEC, AGC and
+fixed 24-bit mic gain were **deleted** when this became the path — see
+`docs/native-afe-migration.md`, which is the reference for this whole section.
 
-The always-on wake stream (`mic_start` without `lock_mic`) is **ungated and AGC-free**: every 32ms period is sent continuously (batched into 80ms frames) so openwakeword scores an uninterrupted stream, and no adaptive gain state can drift with room noise. The VAD gate and AGC apply only to bounded `lock_mic` turn streams (button-triggered), which get a fresh `ResetAGC()` per stream.
+Three consequences that bite if forgotten:
 
-- **Beamformer** (`internal/beamformer/`) — selects the perimeter mic with the highest onset energy ratio (fast/slow EWMA) at voice turn start, then locks for the duration. Its `extractChannel` also applies the fixed mic gain (`micGainDb`, default +24dB) against the full 24-bit sample before quantising to S16 — captured speech sits at ~−70dBFS, so gain must happen pre-truncation to recover real resolution. `vadThreshold` stays in pre-gain units (the device scales it by the gain internally). **It is a selector, not a summing beamformer, and that is settled — do not propose delay-and-sum.** A frequency-domain implementation (exact FFT phase shifts, no interpolation artefacts) exists in `device/tools/bf_capture` and was measured as only marginally better than mic selection. The reason is the 72mm aperture, not the code: diffuse-field noise coherence is 0.84–0.99 below 1.5kHz where speech energy lives, so a sum has almost nothing uncorrelated to cancel, and 36mm adjacent spacing puts spatial aliasing at 4.76kHz — a working window of roughly 2–4.7kHz. Superdirective/differential beamforming is the only class that works at this aperture and it trades against white-noise gain (20dB+ amplification of sensor self-noise) on unmatched capsules across four ADCs. Full derivation and the coherence table are in SETUP.md's mic-array section (SETUP.md is the architecture reference; the chronological log is JOURNAL.md, the rooting prerequisites docs/rooting.md). **Far-field reach is therefore not a beamforming problem here** — it is room noise floor, distance and placement; the single-channel levers (`nsAsr`, wake model) are the ones that exist
-- **AEC** (`internal/aec/`) — speexdsp echo canceller (vendored C, SpeexDSP-1.2.1), whole mic path including the wake stream; far-end reference tapped at the speaker ALSA write (every period incl. silence), delayed by `aecDelayMs` — **keep 0**: the mic side's 160ms batch reads absorb the speaker's output latency, and higher values make the echo non-causal (zero cancellation). The mic ALSA ring is only 160ms deep, so >160ms capture stalls silently lose whole batches (~every 20–30s in steady state, load-correlated); an occupancy governor trims the resulting reference backlog **without resetting the filter** — the trim restores the alignment the filter converged against, and the reset that used to live there thrashed convergence to ≤5dB (the v2.7.8 fix). `[aec] att=`/`far:` telemetry logs ~1/s during playback; `[mic] clock/stall` lines track capture loss. `far:` carries `rms`, `mean` and `peak` — **rms alone cannot tell audio from a constant offset**, since both read high, and that ambiguity cost an evening on #117 where the device was writing rms≈4000 to a codec while every speaker stayed silent. `mean≈±rms` with a small peak-to-peak is a DC offset; `mean≈0` with peak well above rms is real audio and the fault is downstream. Note this tap sits after the (L+R)/2 downmix and 3:1 decimation, so DC survives intact but `peak` is mildly smoothed — read it as a floor. It reports only while `aecEnabled`, so a diagnosis that needs it must not have AEC turned off. Default off (`aecEnabled`); ~14dB per response, held across turns. The far-end tap sits downstream of the music mix, so it already covers a **timer ring** — which is why `aecEnabled` also decides what the wake listener does with audible ring frames: off (fleet default) drops them and rescores the silent gap from a reset model, on scores them at the barge threshold so a wake word can land during the burst. Additive only; the ring cadence is unchanged either way. Audible frames never feed `noise_floor` (residual echo is not room noise, and the floor outlives the ring). The risk it takes is a chime whose residual scores as the wake word and silences its own alarm — `Ring listening (chime audible, AEC)` vs `(silent window)` in the log is what tells the two apart; pre-scoring an uploaded sound against the model at upload time is the way to retire it
+- **Capture and playback are inseparable.** ASP takes its far-end reference on
+  the HAL's playback side, so playback must go through the framework too
   (`internal/bindings/slspeaker`). A build that converted capture only would
+  produce audio that is beamformed but not echo-cancelled, with no error
+  anywhere — it reads as the AFE underperforming rather than as a wiring
+  mistake. `newAudioBackends` opens both or fails.
+- **Neither `slmic` nor `slspeaker` may run `stop media` / `stop mixer`.**
+  mediaserver has to keep owning both PCMs or the HAL is not in the loop at
+  all. That is the opposite of what the old tinyalsa speaker did, and the
+  jack-at-boot hang it guarded against (#80) is moot rather than fixed —
+  unverified on hardware, and worth re-checking with a plug in at boot.
+- **There is no fallback and that is deliberate.** A failed OpenSL open is
+  `log.Fatalf`; three fast exits flip the A/B symlink back to a firmware the
+  device is known to boot. A silent fallback to a different pipeline would be
+  a device behaving differently for reasons nothing on screen explains.
+
+Cadence: the recorder delivers **80ms periods of 1280 samples**, sized to
+match the wire frame exactly. Anything reasoning about 160ms batches or
+512-sample periods predates this.
+
+The always-on wake stream (`mic_start` without `lock_mic`) is **ungated**:
+every period is sent continuously so openwakeword scores an uninterrupted
+stream. The VAD gate applies only to bounded `lock_mic` turn streams
+(button-triggered); the audio itself is identical either way.
+
+**The mic chain is not configurable, and re-adding a control for it is the
+mistake to guard against.** `AFE.cfg` lives on read-only `/system`, so
+`micGainDb`, `adcMicpga`, `adcDigitalGain`, `beamformingEnabled`, `beamAngle`,
+`aecEnabled`, `aecDelayMs`, `aecTailMs` and `agcEnabled` are gone from
+`DEFAULT_DEVICE_CONFIG`, from `em_config_sections` and from the dashboard.
+A slider that moves, saves, pushes and changes nothing about the sound is
+indistinguishable from a setting that does not help, which is why
+`tests/test_capabilities.py::test_the_mic_chain_is_not_offered_as_config`
+fails if one comes back.
+
+**Do not propose delay-and-sum, and do not propose writing a beamformer.**
+The analysis is settled and is in SETUP.md's mic-array section (SETUP.md is
+the architecture reference; the chronological log is JOURNAL.md, the rooting
+prerequisites docs/rooting.md). Short version: at a 72mm aperture,
+diffuse-field noise coherence is 0.84–0.99 below 1.5kHz where speech energy
+lives, so a sum has almost nothing uncorrelated to cancel, and 36mm adjacent
+spacing puts spatial aliasing at 4.76kHz — a working window of roughly
 2–4.7kHz. A frequency-domain implementation exists in `device/tools/bf_capture`
 and measured only marginally better than plain mic selection, for that reason
+rather than any shortfall in the code. Superdirective/differential beamforming
+is the only class that works at this aperture and it trades against
+white-noise gain (20dB+ amplification of sensor self-noise) on unmatched
+capsules across four ADCs. Handing the array to the HAL is the answer to that
+analysis, not a shortcut around it. **Far-field reach is not a beamforming
+problem here** — it is room noise floor, distance and placement; the levers
+that exist are `nsAsr`, the wake model, and moving the device.
+
+**What has never been measured, and should be said plainly:** the ERLE of the
+AFE's echo canceller on this hardware. `device/tools/afe_probe` exists, builds
+and has never been run. Every barge-in figure in this file — 0.002–0.003
+converged self-echo, 0.055 unconverged worst case, the 0.05 default — was
+measured against the speexdsp canceller that no longer exists. Treat the
+headroom as unverified.
+
 - **Timer-ring listening is a controller-side choice** (`ringBargeIn`,
   Wake word section, default off). The device cancels its own playback
   unconditionally and the ring is playback like any other, so what reaches
@@ -292,6 +357,7 @@ and measured only marginally better than plain mic selection, for that reason
   `(silent window)` in the log is what tells the two apart, and pre-scoring an
   uploaded sound against the model at upload time is the way to retire it.
 - **Barge-in** (controller-side `_barge_watcher`) — wake word spoken during TTS cancels playback (device does a stateful `speaker_flush`: drains buffer + discards until stream EOS, since the rest of the stream is typically still in TCP buffers; controller-side, both `stream_speaker` and the post-playback drain sleep race `cancel_event`). `bargeInThreshold` is used as-is and sits *below* `owwThreshold` by design (0.05–0.10): echo at the mic is ~25dB louder than the person, so speech-over-TTS scores are depressed (~0.3–0.5 observed), while converged self-echo scores 0.002–0.003
+- **VAD** (lock_mic turns only) opens the gate after `VAD_SPEECH_MS` of speech, closes after `VAD_SILENCE_MS` of silence, then sends an end-of-speech sentinel. Its threshold is absolute against the audio the HAL delivers — **not comparable with pre-AFE values**, since `micGainDb` used to sit in front of it. (Device-side RNNoise NS was removed 2026-07-12 — noise suppression is controller-side: `em_ns.py`/DTLN on the ASR-bound stream, per-device `nsAsr` flag, and now a second pass on top of the HAL's own)
 
 ### Controller audio pipeline
 
@@ -384,7 +450,9 @@ part needs no model, and it is what `em_endpoint.Endpointer` implements.
 
 **A voice turn DUCKS music; it does not pause it** — on firmware announcing
 the `audio_mix` capability. Music rides its own frame types (`0x04`/`0x05`)
-into a second buffer on the device, and the two are mixed at the ALSA write.
+into a second buffer on the device, and the two are mixed just before the
+OpenSL write — upstream of everything the audio HAL does, so the echo
+canceller's far-end reference carries the sum.
 
 It has to be device-side, and that is the whole design constraint. `LEAD_S` =
 4.0s means the next four seconds of music are already in the device's buffer
@@ -424,9 +492,9 @@ with no way for the user to tell which they had.
   (`IsStreaming` is voice-only). It is a quiet continuous bed, not a response
   being talked over; reporting it would drop the device's wake bar for the
   length of a song.
-- Taps see the MIXED output, which is more correct than before: the AEC
-  far-end reference is what needs cancelling from the mic, and with music
-  under a response the echo is the sum.
+- The mix happens before the HAL sees the audio, which is what the echo
+  canceller needs: with music under a response, the echo at the mic is the
+  sum, and cancelling only the voice would leave the bed behind.
 - `reported_state` stays for firmware that cannot mix. On the ducking path it
   is simply never triggered, because nothing is ever paused behind HA's back.
 
@@ -455,10 +523,11 @@ behind the same TCP head-of-line blocking as everything else (#139).
   attaches to `device.last_turn_id` — corrupting whichever turn was nearest —
   and would make `IsStreaming()` true, dropping the on-device wake scorer to
   its barge-in threshold. Hence `internal/cue` and a third mix at the same
-  write point, in **both** speaker backends.
-- **Mixed before the echo tap, never ducked.** It is real audio out of the
-  speaker that the live wake stream hears immediately, so the AEC far-end
-  reference has to carry it. It is not ducked and does not duck: a chime that
+  write point.
+- **Mixed into the stream the HAL plays, never ducked.** It is real audio out
+  of the speaker that the live wake stream hears immediately, so the echo
+  canceller's far-end reference has to carry it — which it does, because it
+  is taken downstream of everything we write. It is not ducked and does not duck: a chime that
   faded the music under it for 170ms would be a worse artefact than the chime.
   The level tap stays voice-only — the meter ring visualises the response.
 - **Sent after arbitration, not at detection.** A losing device's ring is
@@ -475,7 +544,7 @@ behind the same TCP head-of-line blocking as everything else (#139).
     **`SOURCE_STALL_MS`** (500ms) times the READ from ffmpeg, and exists to answer a question the device cannot: a device-side gap between frames arriving looks identical whether the controller had nothing to send (source starving — a Music Assistant flow) or the link swallowed it, and `send_ms` cannot settle it either since a socket write completes near-instantly however slow the wire is. A device gap WITH a source stall logged at the same moment is upstream; without one it is the link. Only the read is timed — the pacing sleep must stay outside it, or every healthy stream reports as permanently stalled.
 
     **`DATA_RECONNECT_GRACE_S`** (3s) rides out a brief data-plane drop instead of discarding the rest of the audio (#28). The budget is per STREAM, armed by `begin_data_stream()` and spent down by `send_data` — **never per frame**: `send_data` runs once per audio period, so a per-frame wait makes a genuinely-gone device stall every remaining frame in turn, draining a stream for hours while holding the voice lock.
-4. **Speaker** — the wire carries **mono** 48kHz; `_fetch_tts_audio` decodes at the wire rate (the satellite declares `supported_formats` 48k/mono/FLAC so HA transcodes at source when it can; ffmpeg resamples otherwise — no numpy resample step anymore). The device duplicates L=R at the ALSA write (stereo ALSA config is an I2S/codec constraint, not a wire one). Device buffers ~5.5s (`audioChanDepth`) and holds playback until ~1s is queued or EOS arrives (`primePeriods`) — WiFi-stall protection for marginal links
+4. **Speaker** — the wire carries **mono** 48kHz; `_fetch_tts_audio` decodes at the wire rate (the satellite declares `supported_formats` 48k/mono/FLAC so HA transcodes at source when it can; ffmpeg resamples otherwise — no numpy resample step anymore). The device writes that mono channel straight to the OpenSL player: duplicating L=R was an I2S/codec requirement of writing the PCM ourselves and no longer applies. Device buffers ~5.5s (`audioChanDepth`) and holds playback until ~1s is queued or EOS arrives (`primePeriods`) — WiFi-stall protection for marginal links. **Those two figures were sized against the ALSA ring, not this buffer queue**, and re-deriving them for OpenSL is filed rather than done (docs/native-afe-migration.md)
 
 ### Key Go packages
 
@@ -484,10 +553,13 @@ behind the same TCP head-of-line blocking as everything else (#139).
 | `cmd/server.go` | Entry point: wires hardware, callbacks, and clients together |
 | `internal/client/control.go` | WebSocket client to controller `/control` — registration, message dispatch |
 | `internal/client/data.go` | WebSocket client to controller `/data` — mic streaming, speaker playback |
-| `internal/server/` | Local state machine: mute, volume, LED mode priority |
+| `internal/server/` | Local state machine: mute, volume, LED ring (paint suppressions + the `led_anim` animator) |
 | `internal/config/config.go` | Global runtime config; env var defaults, overridden by controller push |
 | `internal/cue/` | Short device-local sounds (the wake chime), embedded via `go:embed` and mixed as a third plane. Deliberately NOT an `audioStream` — see "The wake chime is a THIRD plane" |
-| `internal/bindings/` | Hardware drivers: mic PCM, speaker PCM, LED I2C, button evdev |
+| `internal/bindings/` | Hardware drivers: `slmic`/`slspeaker` (audio, over OpenSL ES), LED I2C, button evdev, ambient light, headphone jack |
+| `internal/opensl/` | dlopen shim over `libOpenSLES.so` — the recorder and player `slmic`/`slspeaker` are built on. Same precedent as `wakeword/ort`: the library is loaded at runtime and only the header is vendored, so a load failure is a named error rather than a binary that will not start |
+| `internal/bindings/slmic/` | Capture at `AUDIO_SOURCE_VOICE_RECOGNITION`, which is what routes it through Amazon's ASP front end. Hands out one processed mono channel in 80ms periods. Runs **no** `stop mixer` — mediaserver must keep the PCM |
+| `internal/bindings/slspeaker/` | Playback, the two music/voice planes, the duck ramp, the prime gate and `StreamStats`. `mix.go` and `stream.go` are untagged and host-tested — that is the arithmetic and the buffering state machine, and it is where the reasoning behind both lives. Runs **no** `stop media`, for the same reason |
 | `internal/wakeword/` | openWakeWord streaming feature pipeline (mel ring → 76-frame windows → embedding ring → classifier). Pure Go: inference sits behind the `Inferer` interface so the buffering is host-testable with no ONNX/cgo. Validated tensor-for-tensor against Python via a golden fixture (`testdata/`, regenerate with `gen_fixture.py`) |
 | `internal/wakeword/ort/` | The `Inferer` implementation: ONNX Runtime via cgo. The library is **dlopen'd at runtime, never linked** (only the MIT C header is vendored) so a device without it boots normally and falls back to controller-side wake word — verified by the ARM binary needing only libdl/liblog/libc with zero undefined `Ort*` symbols. `DefaultOptions` (1 thread, XNNPACK, `allow_spinning=0`) is the measured optimum: 37.7% of one core against 243% for ORT's defaults. Don't "fix" the thread count — more threads lowers latency and *raises* CPU, the wrong trade for duty-cycled work |
 | `internal/wakeword/shadow/` | On-device scoring that reports but never acts (see "On-device wake word"). `Push` must never block: inference runs on its own goroutine and drops frames when behind |
@@ -699,7 +771,7 @@ speaker, at this distance, through this array. **While collecting, the device
 starts no voice turns at all**, so nothing reaches Home Assistant.
 
 **The device needs nothing new for this and no OTA is involved.** The always-on
-wake stream is already continuous, ungated and AGC-free, so the whole feature
+wake stream is already continuous and ungated, so the whole feature
 is what the controller does with frames it is already receiving: the tap sits
 in `wake_word_listener`, so a clip is **byte-for-byte the audio the wake model
 scores**. That is the property that makes the clips worth training on — a
@@ -1003,10 +1075,14 @@ Two traps for whoever picks this up:
   like an obvious fix and is currently the wrong one: accdet failing to
   mute is the only reason a user hears anything at all with a plug in, so
   it would turn "wrong speaker" into "no sound".
-- The mic stall log line says "ALSA overrun", which is an interpretation.
-  It measures the arrival gap in `readLoop`, and the GoTinyAlsa stream
-  channel is 16 batches (2.56s) deep, so a stall of that goroutine looks
-  the same. The growing clock deficit does show audio is genuinely lost.
+- The mic stall log line said "ALSA overrun", which was an interpretation:
+  it measured the arrival gap in the reader, not the hardware. **That whole
+  characterisation predates the move to the audio HAL** — the ALSA capture
+  path it describes no longer exists, capture now goes through AudioFlinger,
+  and the 102.3s metronome has not been re-measured on this path. Re-measure
+  before assuming it survived, and note the live hypothesis below (that the
+  fault is our userspace not answering accdet the way the HAL does) points
+  the other way: mediaserver owns the PCM again now.
 
 **ANSWERED 2026-08-12: the hardware is fine and this is ours.** The same
 external speaker and cable, plugged into a **stock unlocked Dot still
@@ -1442,7 +1518,7 @@ house, so rows survive with the SSID replaced and the selected network marked.
 
 `config.ConfigMessage` JSON fields (camelCase) are sent from controller to device on connect and on per-device config change. Non-zero fields are applied; zero/nil fields are ignored (partial update). Changes take effect immediately — no restart required.
 
-Configurable parameters: `vadThreshold`, `vadSpeechMs`, `vadSilenceMs`, `owwThreshold`, `owwModel`, `owwSpeexNs`, `adcDigitalGain`, `adcMicpga`, `micGainDb`, `startupVolume`, `beamAngle`, `beamformingEnabled`, `aecEnabled`, `aecDelayMs`, `aecTailMs`, `agcEnabled`, `nsAsr`, `bargeInEnabled`, `bargeInThreshold`, `bleProxyEnabled`, `eqBands`, `eqLoudness`, `ledScene`, `ledListenColor`, `ledThinkColor`, `meterAttack`, `meterDecay`, `meterFloor`, `meterGamma`, `meterRef`, `meterCurve`, `wakeArbitrationMs`, `duckDb`, `buttonSingleTapEvent`, `buttonMultiTapMs`, `owwOnDevice`, `saveUtterances` and `wakeSound` (the last three are controller-consumed for scoping purposes, though `owwOnDevice` IS acted on by the device; `saveUtterances`, `wakeSound`, `wakeArbitrationMs` and the two `button*` keys are ignored by it — `wakeSound` decides only whether the controller sends the `wake_sound` message, whose audio already lives on the device).
+Configurable parameters: `vadThreshold`, `vadSpeechMs`, `vadSilenceMs`, `owwThreshold`, `owwModel`, `owwSpeexNs`, `startupVolume`, `nsAsr`, `bargeInEnabled`, `bargeInThreshold`, `ringBargeIn`, `bleProxyEnabled`, `eqBands`, `eqLoudness`, `ledScene`, `ledListenColor`, `ledThinkColor`, `meterAttack`, `meterDecay`, `meterFloor`, `meterGamma`, `meterRef`, `meterCurve`, `wakeArbitrationMs`, `duckDb`, `buttonSingleTapEvent`, `buttonMultiTapMs`, `owwOnDevice`, `saveUtterances` and `wakeSound`. Several are controller-consumed only and the device ignores them: `owwSpeexNs`, `nsAsr`, `ringBargeIn`, `saveUtterances`, `wakeSound`, `wakeArbitrationMs` and the two `button*` keys. `owwOnDevice` IS acted on by the device; `wakeSound` decides only whether the controller sends the `wake_sound` message, whose audio already lives on the device.
 
 ### Fleet vs device scoping (schema v8)
 
@@ -1501,13 +1577,13 @@ Volume persists through reboots **controller-side**: every device `volume_state`
 
 ## LED priority system
 
-Turn-state ring colours (listening ring, thinking spinner) come from **LED scenes** (`em_scenes.py`), configurable per device (`ledScene` + custom colours). Firmware with the `led_anim` capability (v2.9+) **animates locally**: the controller sends one `led_anim` message per state change ({pattern: solid|spin|rotate|pulse|meter|off, colors, periodMs, ttlSec}) and the device renders frames on its own ticker (`internal/server/animator.go`) — controller/WiFi jitter can't judder the ring. `meter` throbs with the live speaker RMS (tapped at the ALSA write, so it tracks audible audio, not the ~5.5s-ahead send) — measured on the **voice plane only, before the music mix**, unlike the AEC far-end tap which deliberately sees the mixed output; a meter fed the mix throbs to the music bed before the response has started; its response curve is config-tunable (`meter*` keys → `AnimSpec` pointer fields → `resolveMeter`, which clamps independently of the dashboard ranges) because it is a taste parameter that needs iterating in a real room, not a firmware OTA per pass. `ttlSec` is bounded per phase — 30s listening, 135s spinner (**coupled to `_fetch_tts_audio`'s 60s timeout ×2 attempts, since the spinner spans HA think time AND the fetch — move one and move the other**), and computed per response for `meter` via `em_scenes.meter_ttl` so a long TTS cannot self-clear mid-answer. Loss-resilience: newer spec or raw `leds` frame atomically replaces the animation (generation counter), and `ttlSec` is a dead-man that self-clears the ring if the controller dies mid-turn. Legacy firmware falls back to controller-streamed frames. Controller `leds` messages carry an explicit `listening: true` flag on listening-ring frames — the device's direction overlay keys off it (pre-scene firmware inferred "listening" from an all-green ring, which breaks for any other scene; the heuristic remains as fallback for old controllers). The direction overlay brightens the base ring colour instead of painting green. Mute ring (red) and volume arc (cyan) are device-local and scene-independent by design.
+Turn-state ring colours (listening ring, thinking spinner) come from **LED scenes** (`em_scenes.py`), configurable per device (`ledScene` + custom colours). Firmware with the `led_anim` capability (v2.9+) **animates locally**: the controller sends one `led_anim` message per state change ({pattern: solid|spin|rotate|pulse|meter|off, colors, periodMs, ttlSec}) and the device renders frames on its own ticker (`internal/server/animator.go`) — controller/WiFi jitter can't judder the ring. `meter` throbs with the live speaker RMS (tapped at the OpenSL write, so it tracks audible audio rather than the ~5.5s-ahead send) — measured on the **voice plane only, before the music mix**, unlike the echo canceller's reference which necessarily sees the mixed output; a meter fed the mix throbs to the music bed before the response has started; its response curve is config-tunable (`meter*` keys → `AnimSpec` pointer fields → `resolveMeter`, which clamps independently of the dashboard ranges) because it is a taste parameter that needs iterating in a real room, not a firmware OTA per pass. `ttlSec` is bounded per phase — 30s listening, 135s spinner (**coupled to `_fetch_tts_audio`'s 60s timeout ×2 attempts, since the spinner spans HA think time AND the fetch — move one and move the other**), and computed per response for `meter` via `em_scenes.meter_ttl` so a long TTS cannot self-clear mid-answer. Loss-resilience: newer spec or raw `leds` frame atomically replaces the animation (generation counter), and `ttlSec` is a dead-man that self-clears the ring if the controller dies mid-turn. Legacy firmware falls back to controller-streamed frames. **There is no direction overlay** — it brightened the segment facing whichever perimeter mic our own beamformer had locked, and the HAL selects its beam internally and reports nothing per frame, so the arc, the `listening` flag on `leds` frames and the device-side `ledMode` priority that existed for it are all gone. Mute ring (red) and volume arc (cyan) are device-local and scene-independent by design.
 
 Turn *outcomes* are distinguished by rhythm, not colour (red/orange/cyan are taken by mute/link/volume): `no_speech` gets one slow throb, `no_tts`/`tts_error`/`timeout` fast blinks, everything else ends silently. Both ride the existing `pulse` pattern with a 1s TTL so they retire on the device's own ticker — no follow-up message to lose. Driven by `device.last_turn_outcome` (set in `em_esphome._persist_turn`, consumed once by `_leds_turn_end`).
 
 Playback ring clearing waits for the device's `playback_stats` (`device.playback_done`), NOT a wall-clock estimate. The old estimate subtracted socket-write time — which completes near-instantly however slow the wire is — so it cleared the ring up to 6.1s early on exactly the links that needed longest. `playback_stats` is emitted once the audio channel drains after EOS, i.e. the real end of audio; the timeout is only a backstop for the report never arriving.
 
-`server.go` maintains a `ledMode` (direction arc vs. system). System-level LEDs (controller commands, mute ring, pulse animations) always win over the beamformer direction arc. Two paint suppressions in `SetLEDs`/`SetDirectionLEDs` (state is still recorded in `baseLEDs` so the ring can be restored):
+Two paint suppressions in `SetLEDs` (state is still recorded in `baseLEDs` so the ring can be restored):
 
 - **Mute ring** (solid red) is device-sovereign — enforced since v2.7.8: controller LED writes are recorded but not painted while muted. Needed because muting now terminates an active turn (controller cancels + `speaker_flush` on `mute_state`), so the cancelled turn's LED cleanup arrives after the red ring is up.
 - **Volume arc** owns the ring for its 2s display window against *animations* — they repaint ~every 100ms and would otherwise stomp the arc within one frame. It does **not** outrank a deliberate action-button press: a dot release calls `CancelVolumeDisplay()`, which drops the hold so the listening frame paints (it deliberately does not repaint — the controller's frame lands within an RTT, and clearing to black would put a dark gap between the two). The arc is protection from repaint churn, not from the user. On expiry the ring repaints the latest `baseLEDs` frame (`onDisplayExpire` → `paintBaseLEDs`), handing back mid-animation. The arc shows only for physical volume button presses (v2.9.5): remote sets and the boot-time volume seed apply silently (`volumeController.Set` showRing flag). The mute-button LED is sysfs gpio444, active-high — not the gpio445 in Amazon's `libled_hal.so`, whose constant is off by one and whose pad is muxed away (stock drives the pin via the `/dev/mtgpio` ioctl; see `mute_button.go`).
@@ -1567,4 +1643,10 @@ while a value lives at the call site.**
 
 ## cgo dependency
 
-SpeexDSP C source (AEC) is vendored in `device/internal/aec/`. The compiler Docker image provides the ARM cross-toolchain. If adding new cgo dependencies, they must compile cleanly with the `echomuse-compiler` image against the FireOS 5 sysroot.
+Two cgo users remain, and neither links its library at build time:
+`internal/opensl` (OpenSL ES, the audio path) and `internal/wakeword/ort`
+(ONNX Runtime, on-device wake word). Both `dlopen` at runtime and vendor only
+the header, so a device missing the library gets a named error rather than a
+binary that will not start. The vendored SpeexDSP C in `internal/aec/` went
+with the echo canceller. If adding new cgo dependencies, they must compile
+cleanly with the `echomuse-compiler` image against the FireOS 5 sysroot.

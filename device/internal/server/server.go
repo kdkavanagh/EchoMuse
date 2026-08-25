@@ -2,7 +2,6 @@ package server
 
 import (
 	"log"
-	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,15 +14,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// ledMode controls which subsystem currently owns the LED ring.
-// Higher value = higher priority.
-type ledMode int
-
-const (
-	ledModeDirection ledMode = iota // beamformer arc — lowest priority
-	ledModeSystem                   // controller/mute/pulse — highest priority
-)
-
 type Server struct {
 	ledController    led.Controller
 	ledMu            sync.Mutex
@@ -33,17 +23,10 @@ type Server struct {
 	volume           *volumeController
 	mute             *muteController
 
-	ledModeMu sync.Mutex
-	ledMode   ledMode
-
-	// baseLEDs stores the controller-set ring state so direction overlay
-	// can always be applied fresh on top without accumulating.
+	// baseLEDs stores the controller-set ring state so the ring can be
+	// repainted after a volume arc or a mute ring has had it.
 	baseLEDs   [12]led.Led
 	baseLEDsMu sync.Mutex
-
-	// listeningLEDs is true when the controller has set the solid green
-	// listening ring — the only state where direction overlay is shown.
-	listeningLEDs bool
 
 	// anim owns the device-rendered ring animation (led_anim messages).
 	anim animator
@@ -258,93 +241,6 @@ func getUptime() (time.Duration, error) {
 	return time.Second * time.Duration(info.Uptime), nil
 }
 
-// SetLEDMode sets the current LED priority mode.
-func (s *Server) SetLEDMode(m ledMode) {
-	s.ledModeMu.Lock()
-	s.ledMode = m
-	s.ledModeMu.Unlock()
-}
-
-// LEDModeSystem claims the LED ring for system use.
-func (s *Server) LEDModeSystem() { s.SetLEDMode(ledModeSystem) }
-
-// LEDModeDirection releases the LED ring back to the beamformer arc.
-func (s *Server) LEDModeDirection() { s.SetLEDMode(ledModeDirection) }
-
-// SetDirectionLEDs overlays a direction marker onto the current LED ring state.
-func (s *Server) SetDirectionLEDs(angleDeg float64) {
-	if angleDeg < 0 {
-		return
-	}
-	// Same paint suppressions as SetLEDs: the volume arc owns the ring for
-	// its display window, and the mute ring is device-sovereign.
-	if s.volume.DisplayActive() || s.mute.IsMuted() {
-		return
-	}
-
-	s.baseLEDsMu.Lock()
-	listening := s.listeningLEDs
-	s.baseLEDsMu.Unlock()
-	if !listening {
-		return
-	}
-
-	s.ledMu.Lock()
-	lc := s.ledController
-	s.ledMu.Unlock()
-	if lc == nil {
-		return
-	}
-
-	const (
-		nLEDs     = 12
-		ledOffset = 240
-	)
-
-	normAngle := int(math.Round(angleDeg/30)) * 30
-	primary := ((normAngle - ledOffset + 360) % 360) / 30 % nLEDs
-	secondary := (primary + 1) % nLEDs
-	tertiary := (primary + nLEDs - 1) % nLEDs
-
-	s.baseLEDsMu.Lock()
-	base := s.baseLEDs
-	s.baseLEDsMu.Unlock()
-
-	leds := make([]led.Led, nLEDs)
-	for i := range leds {
-		leds[i] = base[i]
-		leds[i].ID = i
-	}
-
-	// Scene-agnostic highlight: brighten the base ring colour toward white
-	// rather than painting hardcoded green — the listening ring can be any
-	// colour now (LED scenes), and a green marker on e.g. a crimson ring
-	// read as a glitch. Primary gets a strong lift, neighbours a soft one.
-	brighten := func(l led.Led, add int) led.Led {
-		l.R = clampAdd(l.R, add)
-		l.G = clampAdd(l.G, add)
-		l.B = clampAdd(l.B, add)
-		return l
-	}
-	leds[primary] = brighten(base[primary], 150)
-	leds[secondary] = brighten(base[secondary], 60)
-	leds[tertiary] = brighten(base[tertiary], 60)
-	leds[primary].ID, leds[secondary].ID, leds[tertiary].ID = primary, secondary, tertiary
-
-	if err := lc.SetLEDs(leds...); err != nil {
-		log.Printf("SetDirectionLEDs error: %v", err)
-	}
-}
-
-// clampAdd adds delta to v, clamping to 255.
-func clampAdd(v uint8, delta int) uint8 {
-	result := int(v) + delta
-	if result > 255 {
-		return 255
-	}
-	return uint8(result)
-}
-
 // SetLEDs applies LED state directly — called by the controller client.
 //
 // Two conditions suppress the hardware paint (state is still recorded in
@@ -356,33 +252,13 @@ func clampAdd(v uint8, delta int) uint8 {
 //     overlap mute (mic stopped), but mute-terminates-turn (2026-07-10)
 //     means the cancelled turn's LED cleanup arrives after the red ring
 //     is up — it must not clear it. Unmute clears the ring explicitly.
-// listeningHint is the controller's explicit "this frame is the listening
-// ring" flag (nil from pre-scene controllers). When absent, fall back to
-// the historical heuristic — a 12-LED all-green frame — which only works
-// for the standard scene.
-func (s *Server) SetLEDs(leds []led.Led, listeningHint *bool) {
-	s.LEDModeSystem()
-	var listeningRing bool
-	if listeningHint != nil {
-		listeningRing = *listeningHint
-	} else {
-		listeningRing = len(leds) == 12
-		if listeningRing {
-			for _, l := range leds {
-				if l.R != 0 || l.B != 0 || l.G == 0 {
-					listeningRing = false
-					break
-				}
-			}
-		}
-	}
+func (s *Server) SetLEDs(leds []led.Led) {
 	s.baseLEDsMu.Lock()
 	for _, l := range leds {
 		if l.ID >= 0 && l.ID < 12 {
 			s.baseLEDs[l.ID] = l
 		}
 	}
-	s.listeningLEDs = listeningRing
 	s.baseLEDsMu.Unlock()
 	if s.volume.DisplayActive() || s.mute.IsMuted() {
 		return

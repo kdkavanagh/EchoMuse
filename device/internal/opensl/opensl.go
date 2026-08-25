@@ -1,23 +1,22 @@
 //go:build server
 
-// Package opensl is a minimal Go binding to Android's OpenSL ES, used to
-// reach the audio HAL's ASP front end (see docs/native-afe-migration.md) —
-// tinyalsa's direct pcm23p/pcm24c writes never pass through AudioFlinger, so
-// they never reach it.
+// Package opensl is a minimal Go binding to Android's OpenSL ES, which is how
+// EchoMuse reaches the audio HAL's ASP front end (see
+// docs/native-afe-migration.md). Writing PCM straight to pcm23p/pcm24c never
+// passes through AudioFlinger, so it never reaches it.
 //
-// The library is dlopen'd at RUNTIME (see shim.h), not linked, so this
-// package builds and the firmware boots on a device — or a plain Linux host
-// running `go build ./...` without -tags server, which excludes this package
-// entirely — where libOpenSLES.so was never resolved. Open just returns an
-// error and the caller (slmic/slspeaker) falls back to the tinyalsa backends.
+// The library is dlopen'd at RUNTIME (see shim.h), not linked, so a device
+// where libOpenSLES.so cannot be resolved gets a named error from Open rather
+// than a binary that will not start. There is no second audio backend to fall
+// back to: the caller reports the error and main() fatals, which lets the
+// supervisor's A/B slot flip do the recovering.
 //
 // Both Recorder and Player present a BLOCKING API — Read()/Write() — even
 // though OpenSL ES itself is callback-driven (a buffer queue completion fires
 // on a thread OpenSL ES owns, not one Go created). That asymmetry is
-// deliberate: it lets slmic/slspeaker read almost like the tinyalsa backends
-// they replace — a read loop, a pump loop — rather than every caller having
-// to become callback-shaped. The channel-based bridging between the two
-// models lives entirely in this package.
+// deliberate: it lets slmic/slspeaker stay shaped as a read loop and a pump
+// loop rather than making every caller callback-shaped. The channel-based
+// bridging between the two models lives entirely in this package.
 package opensl
 
 /*
@@ -194,9 +193,8 @@ type Recorder struct {
 // buffers of periodFrames mono samples each.
 //
 // nbuf is the HAL-facing double/triple buffering only — small by design (2-4
-// is typical). The application-level lead buffer (matching the tinyalsa
-// backends' subscriber channel depth) belongs in the caller, same layering as
-// PcmMicrophone's ALSA read loop vs. its per-subscriber channels.
+// is typical). The application-level lead buffer belongs in the caller, which
+// keeps one channel per subscriber behind its read loop.
 func (e *Engine) NewRecorder(preset Preset, rateHz, periodFrames, nbuf int) (*Recorder, error) {
 	if periodFrames <= 0 {
 		return nil, fmt.Errorf("opensl: NewRecorder: periodFrames must be positive, got %d", periodFrames)
@@ -212,7 +210,7 @@ func (e *Engine) NewRecorder(preset Preset, rateHz, periodFrames, nbuf int) (*Re
 		// Frame queue depth: a handful of periods of slack for Read()'s
 		// caller to fall behind before frames start dropping — the OpenSL
 		// ES callback thread must never block, so a full channel drops
-		// rather than waits (mirrors PcmMicrophone's subscriber drop).
+		// rather than waits — same rule as slmic's per-subscriber fan-out.
 		frames: make(chan []byte, nbuf*4),
 	}
 	r.handle = newHandle()
@@ -258,8 +256,7 @@ func (r *Recorder) Read() ([]byte, error) {
 	return buf, nil
 }
 
-// Drops counts periods dropped because Read fell behind the audio thread —
-// the OpenSL ES analogue of PcmMicrophone's sub_drops counter.
+// Drops counts periods dropped because Read fell behind the audio thread.
 func (r *Recorder) Drops() uint64 { return r.drops.Load() }
 
 // Close stops delivering frames and releases the recorder. Safe to call once;
@@ -302,7 +299,7 @@ func (r *Recorder) onComplete() {
 	// Best-effort: a failure here means the recorder is on its way down: the
 	// object was already destroyed under us, or is about to be. There is no
 	// caller to report it to from the audio thread, same reasoning as
-	// echoTap/levelTap being fire-and-forget in the tinyalsa backend.
+	// levelTap being fire-and-forget in slspeaker.
 	_ = goErr(C.em_recorder_enqueue(&r.rec, C.int(idx)))
 	select {
 	case r.inflight <- idx:
@@ -392,9 +389,8 @@ func (p *Player) Write(data []byte) error {
 }
 
 // Clear drops everything queued but not yet played (barge-in / user stop).
-// Buffers already handed to the HAL and mid-flight are unaffected — the
-// OpenSL ES analogue of tinyalsa's Flush leaving up to PeriodCount periods
-// still playing.
+// Buffers already handed to the HAL and mid-flight are unaffected, so a short
+// tail — nbuf periods at most — still reaches the speaker.
 func (p *Player) Clear() error { return goErr(C.em_player_clear(&p.play)) }
 
 // Close stops accepting writes and releases the player. Safe to call once; a

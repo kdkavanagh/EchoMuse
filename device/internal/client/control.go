@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -43,12 +42,8 @@ type controlMessage struct {
 
 // ─── Callbacks ────────────────────────────────────────────────────────────────
 
-// LEDCallback receives a ring frame plus the controller's optional
-// listening hint: non-nil when the message carried "listening", telling
-// the server explicitly whether this frame is the listening ring (which
-// enables the direction overlay). Nil on frames from older controllers —
-// the server falls back to its all-green heuristic.
-type LEDCallback func(leds []led.Led, listening *bool)
+// LEDCallback receives a ring frame from the controller.
+type LEDCallback func(leds []led.Led)
 
 // LEDAnimCallback receives the raw led_anim spec JSON (the "anim" object);
 // the server package unmarshals it into its own AnimSpec type.
@@ -58,7 +53,6 @@ type MicStopCallback func()
 type StateCallback func()
 type ConfigAppliedCallback func(msg config.ConfigMessage)
 type VolumeSetCallback func(level int)
-type BeamLockCallback func(lock bool)
 
 // WifiChangeCallback receives a wifi_change request. It must return
 // quickly (the executor runs in its own goroutine) — the control
@@ -79,7 +73,6 @@ type ControlClient struct {
 	pendingCallback       StateCallback
 	configAppliedCallback ConfigAppliedCallback
 	volumeSetCallback     VolumeSetCallback
-	beamLockCallback      BeamLockCallback
 	speakerFlushCallback  StateCallback
 	musicFlushCallback    StateCallback
 	duckCallback          func(on bool)
@@ -125,7 +118,6 @@ func (c *ControlClient) OnConnected(cb StateCallback)             { c.connectedC
 func (c *ControlClient) OnPending(cb StateCallback)               { c.pendingCallback = cb }
 func (c *ControlClient) OnConfigApplied(cb ConfigAppliedCallback) { c.configAppliedCallback = cb }
 func (c *ControlClient) OnVolumeSet(cb VolumeSetCallback)         { c.volumeSetCallback = cb }
-func (c *ControlClient) OnBeamLock(cb BeamLockCallback)           { c.beamLockCallback = cb }
 func (c *ControlClient) OnSpeakerFlush(cb StateCallback)          { c.speakerFlushCallback = cb }
 func (c *ControlClient) OnMusicFlush(cb StateCallback)            { c.musicFlushCallback = cb }
 func (c *ControlClient) OnDuck(cb func(on bool))                  { c.duckCallback = cb }
@@ -380,13 +372,12 @@ func (c *ControlClient) connect(ctx context.Context, server *discovery.ServerInf
 		switch peek.Type {
 		case "leds":
 			var msg struct {
-				LEDs      json.RawMessage `json:"leds"`
-				Listening *bool           `json:"listening"`
+				LEDs json.RawMessage `json:"leds"`
 			}
 			if err := json.Unmarshal(raw, &msg); err == nil && c.ledCallback != nil {
 				var leds []led.Led
 				if err := json.Unmarshal(msg.LEDs, &leds); err == nil {
-					c.ledCallback(leds, msg.Listening)
+					c.ledCallback(leds)
 				}
 			}
 
@@ -412,20 +403,6 @@ func (c *ControlClient) connect(ctx context.Context, server *discovery.ServerInf
 		case "mic_stop":
 			if c.micStopCallback != nil {
 				c.micStopCallback()
-			}
-
-		// beam_lock/beam_unlock: controller-driven beamformer control for the
-		// continuous wake stream. Sent at wake detection (lock onto the
-		// speaker's perimeter mic mid-utterance, no stream restart) and at
-		// turn end (back to ch6 omni for wake listening).
-		case "beam_lock":
-			if c.beamLockCallback != nil {
-				c.beamLockCallback(true)
-			}
-
-		case "beam_unlock":
-			if c.beamLockCallback != nil {
-				c.beamLockCallback(false)
 			}
 
 		case "volume_set":
@@ -742,28 +719,6 @@ func (c *ControlClient) runShellSession(ctx context.Context, baseURL string, pty
 	log.Println("[shell] Session closed")
 }
 
-// nativeAFEActive records whether cmd/server.go selected the OpenSL ES /
-// native-AFE audio backends (internal/bindings/slmic + slspeaker) for THIS
-// run — see cmd/server.go's newAudioBackends. Set at most once, before the
-// control client connects; SetNativeAFEActive is exported for main() to call
-// from outside this package.
-//
-// Unlike "ambient_light" (a fixed property of the hardware, resolved once at
-// als.Present()), this reflects a boot-time CHOICE that can fall back to
-// tinyalsa if libOpenSLES.so fails to open — so the capability must track
-// what actually ended up running, not merely what this firmware build knows
-// how to attempt. Reporting the attempt rather than the outcome would tell
-// the controller/dashboard a device is on the native-AFE path (and so
-// disable the beamformer/AEC/AGC controls that bypass table describes) on a
-// device that silently fell back and still needs them.
-var nativeAFEActive atomic.Bool
-
-// SetNativeAFEActive records which audio backend pair main() actually
-// brought up. Call before Run(), so the very first register message already
-// reports it — capabilities() is read once per connection, same as every
-// other entry in the list.
-func SetNativeAFEActive(active bool) { nativeAFEActive.Store(active) }
-
 // capabilities is what this firmware implements, negotiated by capability
 // rather than by version so the controller needs no knowledge of our release
 // history (see CLAUDE.md). "ambient_light" is conditional on the hardware
@@ -789,6 +744,7 @@ func capabilities() []string {
 	// ignored, which is the "I enabled it and nothing happened" the whole
 	// capability rule exists to prevent. It is a fact about the BUILD (the
 	// audio is embedded), so it is unconditional, like audio_mix.
+	//
 	// "oww_bcresnet": this firmware carries a BC-ResNet engine
 	// (internal/wakeword/bcresnet) as well as openWakeWord, and shadow.Open
 	// picks between them from the sidecar beside the installed model. It is a
@@ -799,27 +755,9 @@ func capabilities() []string {
 	// "cannot score THIS model on device". Without it the controller has to
 	// assume no device can run one, which is what it did before this shipped.
 	caps := []string{"mic", "speaker", "leds", "led_anim", "buttons",
-		// "native_afe_backend": this binary has internal/bindings/slmic and
-		// slspeaker compiled in AND its start_server.sh has the opt-in
-		// marker check (docs/native-afe-migration.md) — unconditional,
-		// unlike "native_afe" below, because it is a fact about the BUILD,
-		// not about what is running right now. This is the capability the
-		// dashboard's toggle is gated on: writing the marker file on a
-		// device that lacks this would be a control that silently does
-		// nothing, since older firmware's start_server.sh never checks it.
-		"native_afe_backend"}
 		"oww_shadow", "oww_trigger", "oww_bcresnet", "button_hold", "audio_mix", "wake_sound"}
 	if als.Present() {
 		caps = append(caps, "ambient_light")
-	}
-	// "native_afe": Android's audio HAL front end (per-mic AEC, beamformer,
-	// SNR beam selection) is doing capture/playback for this run, so the
-	// controller/dashboard must show beamformingEnabled, aecEnabled,
-	// agcEnabled, micGainDb/adcDigitalGain/adcMicpga and nsAsr as disabled
-	// with the reason rather than as controls that silently do nothing —
-	// see docs/native-afe-migration.md's bypass table.
-	if nativeAFEActive.Load() {
-		caps = append(caps, "native_afe")
 	}
 	return caps
 }

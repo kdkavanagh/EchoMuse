@@ -20,7 +20,7 @@
 // part of a wake that never needs anything but the Echo.
 //
 // A cue is NOT a stream, and that distinction is what keeps it out of
-// internal/bindings/speaker's audioStream machinery: there is no prime gate
+// slspeaker's audioStream machinery: there is no prime gate
 // (the audio is already here in full), no discard-until-EOS (nothing is in
 // flight to discard), no underrun (a drained cue has simply finished) and no
 // StreamStats. Feeding it through the voice plane instead would have emitted

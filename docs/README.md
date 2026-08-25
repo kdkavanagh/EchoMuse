@@ -18,8 +18,9 @@ Deeper technical references live elsewhere:
   cancellation and beamforming on the same hardware, where its tuning lives on
   the device, and what of it EchoMuse can and cannot reuse. Nothing from Amazon
   is vendored here; extract from your own Dot.
-- [native-afe-migration.md](native-afe-migration.md) — spec and phased plan for
-  moving device audio onto that native front end. Proposal, not started.
+- [native-afe-migration.md](native-afe-migration.md) — how device audio came
+  to run on that native front end, what the HAL now owns that used to be
+  configurable, and the measurement that still has not been taken.
 - [rooting.md](rooting.md) — what a device needs before EchoMuse can use it.
   The exploit itself is R0rt1z2's work on XDA Forums and that thread is canon;
   this covers where EchoMuse picks up, and what the wizard does for you.

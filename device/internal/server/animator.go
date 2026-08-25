@@ -31,16 +31,13 @@ type AnimSpec struct {
 	// PeriodMs: frame interval for spin/rotate (0 → 80ms); full throb
 	// cycle for pulse (0 → 2000ms). Meter ignores it (fixed 40ms tick).
 	PeriodMs int `json:"periodMs"`
-	// Listening marks solid frames as the listening ring so the
-	// beamformer direction overlay engages (same flag as set_leds).
-	Listening bool `json:"listening"`
 	// TTLSec auto-clears the ring if no newer spec arrives — protects
 	// against a controller that died mid-turn. 0 → no TTL.
 	TTLSec int `json:"ttlSec"`
 
 	// ── meter-only response curve ────────────────────────────────────────
 	// Pointer-typed so 0 is expressible and "absent" is distinguishable
-	// from "zero" (same reason micGainDb is a pointer in ConfigMessage).
+	// from "zero" — 0 is a legitimate value for every one of these.
 	// Nil fields fall back to the meterDefaults below.
 	//
 	// Tunable from the dashboard because this is a *taste* parameter: the
@@ -118,9 +115,9 @@ func (s *Server) StartAnim(spec AnimSpec) {
 
 	switch spec.Pattern {
 	case "off":
-		s.SetLEDs(blackFrame(), boolPtr(false))
+		s.SetLEDs(blackFrame())
 	case "solid":
-		s.SetLEDs(paletteFrame(spec.Colors), boolPtr(spec.Listening))
+		s.SetLEDs(paletteFrame(spec.Colors))
 		if spec.TTLSec > 0 {
 			go s.animExpiry(gen, time.Duration(spec.TTLSec)*time.Second)
 		}
@@ -132,7 +129,7 @@ func (s *Server) StartAnim(spec AnimSpec) {
 		go s.runMeter(gen, spec)
 	default:
 		log.Printf("StartAnim: unknown pattern %q — clearing ring", spec.Pattern)
-		s.SetLEDs(blackFrame(), boolPtr(false))
+		s.SetLEDs(blackFrame())
 	}
 }
 
@@ -159,7 +156,7 @@ func (s *Server) animExpiry(gen int, ttl time.Duration) {
 		return
 	}
 	log.Printf("led_anim: TTL expired with no replacement — clearing ring")
-	s.SetLEDs(blackFrame(), boolPtr(false))
+	s.SetLEDs(blackFrame())
 }
 
 // runAnim renders spin/rotate frames until replaced or TTL-expired. Frames
@@ -186,11 +183,11 @@ func (s *Server) runAnim(gen int, spec AnimSpec) {
 		if !deadline.IsZero() && time.Now().After(deadline) {
 			log.Printf("led_anim: TTL expired with no replacement — clearing ring")
 			if s.animCurrent(gen) {
-				s.SetLEDs(blackFrame(), boolPtr(false))
+				s.SetLEDs(blackFrame())
 			}
 			return
 		}
-		s.SetLEDs(animFrame(spec, pos), boolPtr(false))
+		s.SetLEDs(animFrame(spec, pos))
 		pos = (pos + 1) % 12
 		<-ticker.C
 	}
@@ -228,13 +225,13 @@ func (s *Server) runPulse(gen int, spec AnimSpec) {
 		if !deadline.IsZero() && time.Now().After(deadline) {
 			log.Printf("led_anim: TTL expired with no replacement — clearing ring")
 			if s.animCurrent(gen) {
-				s.SetLEDs(blackFrame(), boolPtr(false))
+				s.SetLEDs(blackFrame())
 			}
 			return
 		}
 		phase := float64(time.Since(start)) / float64(cycle)
 		b := 0.15 + 0.85*(0.5-0.5*math.Cos(2*math.Pi*phase))
-		s.SetLEDs(scaleFrame(base, b), boolPtr(false))
+		s.SetLEDs(scaleFrame(base, b))
 		<-ticker.C
 	}
 }
@@ -263,7 +260,7 @@ func (s *Server) runMeter(gen int, spec AnimSpec) {
 		if !deadline.IsZero() && time.Now().After(deadline) {
 			log.Printf("led_anim: TTL expired with no replacement — clearing ring")
 			if s.animCurrent(gen) {
-				s.SetLEDs(blackFrame(), boolPtr(false))
+				s.SetLEDs(blackFrame())
 			}
 			return
 		}
@@ -280,7 +277,7 @@ func (s *Server) runMeter(gen int, spec AnimSpec) {
 		// target. Painting the target directly (the pre-2026-07-25
 		// behaviour) is what made the throb near-invisible.
 		b := math.Pow(floor+span*env, gamma)
-		s.SetLEDs(scaleFrame(base, b), boolPtr(false))
+		s.SetLEDs(scaleFrame(base, b))
 		<-ticker.C
 	}
 }
@@ -357,4 +354,3 @@ func blackFrame() []led.Led {
 	return frame
 }
 
-func boolPtr(b bool) *bool { return &b }

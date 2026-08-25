@@ -31,6 +31,10 @@ SECTIONS: dict[str, dict] = {
             "owwModel", "owwThreshold", "owwSpeexNs",
             "bargeInEnabled", "bargeInThreshold", "wakeArbitrationMs",
             "owwOnDevice",
+            # Whether the wake word may be scored over an audible timer ring.
+            # Here rather than in "timers": it is a wake-detection decision
+            # (which frames the listener scores, at which threshold), and it
+            # belongs beside the barge-in pair it shares its threshold with.
             "ringBargeIn",
             # The chime a wake fires. Here rather than in "playback": that
             # section is how audio SOUNDS (EQ, duck depth), and this is part
@@ -46,10 +50,13 @@ SECTIONS: dict[str, dict] = {
     },
     "microphones": {
         "label": "Microphones",
+        # Mic gain, beamforming, echo cancellation and AGC are NOT here, and
+        # are not config anywhere: Android's audio HAL owns all four, and its
+        # tuning lives in /system/etc/AFE.cfg on a read-only partition. What
+        # remains in this section is everything the CONTROLLER decides about
+        # the mic stream after it arrives.
         "keys": [
-            "adcMicpga", "adcDigitalGain", "micGainDb",
-            "beamformingEnabled", "beamAngle",
-            "aecEnabled", "aecDelayMs", "aecTailMs", "nsAsr",
+            "nsAsr",
             "saveUtterances",
             "endpointRelative", "endpointLowPerMil", "endpointSilenceMs",
             "endpointBackporchMs", "maxSpeechMs",
@@ -66,7 +73,7 @@ SECTIONS: dict[str, dict] = {
     "advanced": {
         "label": "Advanced",
         "keys": [
-            "agcEnabled", "vadThreshold", "vadSpeechMs", "vadSilenceMs",
+            "vadThreshold", "vadSpeechMs", "vadSilenceMs",
             # Already the button-turn section; these decide whether they happen.
             "buttonSingleTapEvent", "buttonMultiTapMs",
         ],

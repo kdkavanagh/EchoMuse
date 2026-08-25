@@ -1428,17 +1428,10 @@ class EchoMuseSatellite(SatelliteServerProtocol):
                         f"[{self._log_name}] Speech detected (above noise floor "
                         f"{getattr(device, 'noise_floor', 0.0):.4f}) — no-speech timeout disarmed"
                     )
-                    # Lock the beamformer onto the speaker now that they're
-                    # audibly talking. Matters for continuation turns (the wake
-                    # turn already locked at detection — the device no-ops a
-                    # second lock) and after any TTS mic restart, which resets
-                    # the beam to ch6 omni.
-                    asyncio.ensure_future(device.beam_lock())
-
                 # Relative endpointing runs on the PRE-NS payload — what the
                 # microphone actually sent. The denoiser below is optional
-                # (default off, and redundant under the native AFE), can fail
-                # mid-turn and fall back to raw, and reshapes levels
+                # (default off, and redundant on top of the AFE's own), can
+                # fail mid-turn and fall back to raw, and reshapes levels
                 # non-linearly. Endpointing on its output would make the
                 # decision depend on which of those happened. The capture tap
                 # further down is post-NS for the opposite and equally

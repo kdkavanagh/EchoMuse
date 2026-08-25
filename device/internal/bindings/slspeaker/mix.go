@@ -2,41 +2,57 @@ package slspeaker
 
 import "math"
 
-// Ducking and mixing for the two playback streams, mono variant.
+// Ducking and mixing for the two playback streams.
 //
-// This is deliberately the same algorithm as internal/bindings/speaker/mix.go
-// — same ramp, same saturation, same reasoning, ported to mono because the
-// wire is duplicated to stereo only for tinyalsa's I2S/codec path (see
-// CLAUDE.md's speaker plane note); OpenSL ES takes the mono channel directly,
-// so there is nothing to duplicate here. It is a deliberate near-duplicate
-// rather than a shared package: the frame width differs (2 bytes here, 4
-// there) at exactly the one place — applyGain — where that matters, and
-// pulling the rest out for one differing loop was judged not worth new
-// cross-package plumbing during this migration. If both backends end up
-// shipping, extracting the identical parts (Mixer's dispatch, DuckGain,
-// mixInto, the ramp) into a shared internal package is the obvious follow-up.
+// No build tag and no OpenSL import, deliberately: this is the arithmetic the
+// write path runs on every period, and it is the part worth testing on the
+// host. slspeaker.go is `//go:build server` and cannot be compiled or tested
+// anywhere but the device.
 //
-// No build tag and no OpenSL import, deliberately — same as the tinyalsa
-// version, this is the arithmetic worth testing on the host.
+// WHY THE DEVICE MIXES AT ALL. Barge-in used to pause the music, answer, and
+// resume. Every assistant people compare us to ducks instead, and pausing
+// carried real bugs with it: a Music Assistant flow stream cannot be seeked,
+// so a 28-second turn cost 28 seconds of the song, and the media_player
+// entity had to report PLAYING while internally paused (#62) or Home
+// Assistant would decline the user's own pause.
+//
+// It has to happen HERE rather than in the controller because of `LEAD_S`:
+// the music feed runs 4 seconds ahead of realtime, so when a wake word fires
+// the next 4 seconds of music are already in this device's buffer. Audio
+// that has left the controller cannot be ducked by the controller. Doing it
+// on the device means the music keeps its full ~5.5s of link-stall
+// protection AND ducking is instant, because the gain is applied to audio we
+// are already holding.
 
-// unityGain: Q15 fixed point, 32768 == unity. See speaker.unityGain for why
-// (integer maths, exact at unity).
+// Q15 fixed point: 32768 == unity. Integer maths on a 32-bit A53 with no
+// FPU pressure on the audio path, and exact at unity — a float multiply
+// would leave a stream that is nominally not ducked very slightly altered.
 const unityGain int32 = 1 << 15
 
-// duckRampPeriods / rampStep: identical reasoning to speaker.duckRampPeriods
-// — a CONSTANT SLEW (not proportional), so "N periods" is a duration rather
-// than a time constant. Kept as a period count rather than a wall-clock
-// value because slspeaker's period size is whatever the wire sends (see
-// slspeaker.go), matching the tinyalsa backend's own periods-not-ms framing.
+// duckRampPeriods — periods taken to traverse the FULL gain range. A period
+// is ~42.7ms, so 4 gives a ~170ms ramp for a duck from unity to silence, and
+// proportionally less for a shallower one. Fast enough that the duck lands
+// with the wake word, slow enough to be a fade rather than a step: stepping
+// the gain at a period boundary is an audible click, landing on exactly the
+// transition the user is listening to.
+//
+// A CONSTANT SLEW, not a proportional one. `(target-gain)/n` per period is
+// an exponential approach: 4 is then a time constant, not a duration, and
+// the gain crawls the last few percent for over a second — measured at 31
+// periods (1.3s) to settle, against the 170ms this comment used to claim.
+//
+// A period count rather than a wall-clock value, because the period size is
+// whatever the wire sends.
 const duckRampPeriods = 4
+
+// rampStep is the most the gain may move in one period.
 const rampStep = unityGain / duckRampPeriods
 
 // Mixer combines the voice and music streams for one output period.
 //
 // Single-consumer by contract: only the pump goroutine (slspeaker.go) touches
 // it, so nothing here is synchronised. The gain TARGET is set from elsewhere
-// and needs atomicity — it lives in Speaker, not here, same split as
-// speaker.PcmSpeaker/Mixer.
+// and is the one field that needs atomicity — it lives in Speaker, not here.
 type Mixer struct {
 	gain int32 // current, Q15, ramps toward the target
 }
@@ -124,10 +140,14 @@ func (m *Mixer) applyGain(buf []byte, target int32) {
 }
 
 // mixCue adds a device-local notification sound to the period about to be
-// written, returning the buffer to write — the same contract as
-// speaker.mixCue (see there for why a cue is neither ducked nor a stream),
-// minus the toStereo step: this backend writes the wire's mono format
-// straight to OpenSL ES.
+// written, returning the buffer to write.
+//
+// A cue is neither ducked nor a stream: it is not audio from the controller,
+// so it has no prime gate, no discard-until-EOS and no StreamStats, and it
+// does not fade the music under it — a 170ms dip around a chime is a worse
+// artefact than the chime. It IS mixed before the point the HAL takes its
+// far-end reference, because the room hears it and the wake listener must
+// not.
 //
 // Returning cueMono itself when there is nothing else playing is safe
 // because it is the pump loop's own scratch buffer and Player.Next refills
@@ -143,9 +163,8 @@ func mixCue(out, cueMono []byte) []byte {
 	return out
 }
 
-// mixInto sums music into voice with saturation — identical to
-// speaker.mixInto; this loop was never stereo-specific (it walks raw 2-byte
-// samples regardless of channel layout), so it carries over unchanged.
+// mixInto sums music into voice with saturation. It walks raw 2-byte samples
+// regardless of channel layout.
 //
 // Saturating rather than wrapping: an int16 overflow wraps a loud peak to
 // full-scale opposite polarity, far worse than the clipping it replaces.

@@ -66,27 +66,6 @@ DEFAULT_DEVICE_CONFIG = {
     # older firmware would simply ignore the message, so the dashboard shows
     # it disabled with the reason rather than as a toggle that does nothing.
     "wakeSound":        False,
-    "adcDigitalGain":   88,
-    "adcMicpga":        40,
-    # micGainDb: fixed digital gain (dB) the device applies to the full
-    "micGainDb":        24,
-    # AEC (speexdsp, device-side, whole mic path incl. wake stream).
-    # Default ON, and coupled to bargeInEnabled below: with barge-in the mic
-    # streams throughout playback, and AEC is the only thing stopping the
-    # device waking on its own TTS. Turning one on without the other is the
-    # self-trigger case the barge threshold reasoning assumes away, so if
-    # this goes back to False, bargeInEnabled must go with it.
-    # ~14dB attenuation per response, held across turns since v2.7.8; check
-    # the [aec] att= logs when tuning.
-    # aecDelayMs: 0, measured on hardware 2026-07-08 — the mic side reads
-    # 160ms ALSA batches, which eats most of the speaker's write-to-ear
-    # latency; the filter tail absorbs the remainder. (The original 250
-    # guess made the echo arrive *before* its reference — non-causal, zero
-    # cancellation.) aecTailMs is the adaptive filter length (residual
-    # delay + room reverb). Device clamps: delay 0–1000, tail 50–500.
-    "aecEnabled":       True,
-    "aecDelayMs":       0,
-    "aecTailMs":        300,
     # ringBargeIn: what the wake listener does with mic frames captured
     # while a timer ring is AUDIBLE. Off (the default) drops them and
     # rescores the silent gap between bursts from a reset model; on scores
@@ -95,6 +74,13 @@ DEFAULT_DEVICE_CONFIG = {
     #
     # This is a controller-side question about scoring, not a device
     # setting: the device's audio HAL cancels its own echo unconditionally
+    # (there is no "AEC off" any more), so what is left to decide is whether
+    # the RESIDUAL is clean enough to score through. It is off by default
+    # because the risk runs one way — a chime whose residual scores as the
+    # wake word silences its own alarm — and the AFE's cancellation depth on
+    # this hardware is not yet measured. `Ring listening (chime audible)`
+    # vs `(silent window)` in the log says which mode a ring ran in.
+    # Additive either way: the ring cadence is unchanged.
     "ringBargeIn":      False,
     "startupVolume":    85,
     # vadThreshold: 0.001 (normalised RMS pre-AGC).
@@ -136,10 +122,12 @@ DEFAULT_DEVICE_CONFIG = {
     # trades recall for false positives (see oww_forge/README.md).
     "owwThreshold":     0.5,
     # Barge-in (§3.2, controller-side): wake word spoken during TTS playback
-    # cancels it and starts a fresh turn. Requires device AEC (aecEnabled)
-    # on — with barge-in the mic streams through playback, and AEC is what
-    # stops the device hearing itself — so aecEnabled above defaults on with
-    # it, and the two move together. bargeInThreshold is used as-is,
+    # cancels it and starts a fresh turn. It depends on the device cancelling
+    # its own echo — with barge-in the mic streams throughout playback, and
+    # the cancellation is what stops the device hearing itself. That is now
+    # unconditional (Android's audio HAL runs per-mic AEC on every capture),
+    # so there is no longer a second flag that has to move with this one.
+    # bargeInThreshold is used as-is,
     # deliberately BELOW the normal wake threshold: the echo at the mic is
     # ~25dB louder than the person talking over it, so speech-over-TTS wake
     # scores are inherently depressed (~0.10–0.12 measured), while post-AEC
@@ -155,12 +143,12 @@ DEFAULT_DEVICE_CONFIG = {
     # dashboard slider floor, so the only way to tune from here is UP, which
     # is the direction the visible failure asks for.
     #
-    # Watch one interaction: the beamformer locks a different mic per turn
-    # and each has its own echo path, so AEC re-converges per turn (per-
-    # channel filter states are the unbuilt fix) — and the one measured
-    # self-echo figure above 0.05 is that unconverged case at 0.055. The
-    # symptom would be a device cutting its own response short. This fleet
-    # runs 0.05 with beamforming and AEC both on and does not do that.
+    # All of those figures were measured against the speexdsp canceller this
+    # firmware no longer carries. The AFE's per-mic subband AEC has not been
+    # measured on this hardware at all (docs/native-afe-migration.md's Phase
+    # 0 is what would do it), so treat the headroom as unverified rather than
+    # inherited. The symptom of getting it wrong is a device cutting its own
+    # response short, which is self-evident; the fix is to raise this.
     "bargeInEnabled":   True,
     "bargeInThreshold": 0.05,
     # How far music is attenuated while a voice turn plays OVER it, on
@@ -290,22 +278,6 @@ DEFAULT_DEVICE_CONFIG = {
     # Android Bluetooth stack on the device (required — /dev/stpbt is
     # single-owner) and brings up a second ESPHome listener + mDNS entry.
     "bleProxyEnabled":  False,
-    # beamformingEnabled: True — ch6 (centre/omni) hears the wake word, then
-    # the turn locks to the best perimeter mic. The flag ONLY gates Lock():
-    # unlocked is always ch6 and the wake path never locks, so the wake
-    # stream is ch6 either way (beamformer.go). It cannot splice wake audio.
-    #
-    # This was False, on a comment describing the every-32ms reselection that
-    # be2f16d (v2.6.3 P0-2) had already fixed in the same commit. The real
-    # reason recorded there was that onset discrimination was unreliable at
-    # <=1.5m, "re-enable once P0-3/P0-4 are addressed" — P0-3 closed
-    # 2026-07-12 (DTLN) and v2.7.2's lock-back selection fixed the decayed-
-    # spike picks that caused most of the wrong-lock risk. Nobody went back.
-    # Meanwhile this fleet has run True since the 2026-07-20 config restore
-    # with no reported regression, so True is the value with field evidence
-    # behind it and False is the one that has not been run in months.
-    "beamformingEnabled": True,
-    "beamAngle":        -1,
     "eqBands":          [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
     "eqLoudness":       False,
     # LED ring scene (controller-side rendering — see em_scenes.py).
@@ -325,12 +297,6 @@ DEFAULT_DEVICE_CONFIG = {
     "meterGamma":       2.2,   # >1 expands the dark end so the swing reads
     "meterRef":         0.22,  # speaker RMS mapped to full brightness
     "meterCurve":       0.7,   # <1 lifts quiet consonants
-    # agcEnabled: automatic gain control (lockMic/button turn streams only).
-    # Disable to hear raw mic levels. (nsEnabled/RNNoise removed 2026-07-12
-    # with the device-side RNNoise code — a stale nsEnabled key in stored
-    # configs is harmless: new firmware ignores unknown fields, and old
-    # firmware keeps honouring the stored False until it's OTA'd.)
-    "agcEnabled":       True,
 }
 
 # Maximum log rows retained per device. Older rows are pruned on insert.
@@ -1334,7 +1300,7 @@ def get_global_device_config() -> dict:
     if not stored:
         return dict(DEFAULT_DEVICE_CONFIG)
     # Underlay defaults so keys added after the stored config was last
-    # saved (e.g. micGainDb) are still pushed with their default value
+    # saved (e.g. ringBargeIn) are still pushed with their default value
     # instead of silently falling back to whatever the device binary's
     # env default happens to be.
     return {**DEFAULT_DEVICE_CONFIG, **stored}

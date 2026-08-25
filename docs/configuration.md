@@ -180,18 +180,21 @@ spoke, move toward Precise.
 ### Barge-in
 Lets the wake word **interrupt the assistant mid-turn** — say "Hey
 Rhasspy, stop" while it's reading you a paragraph (or still thinking
-about your last question) and it cuts off and listens. Off by default. **Turn on Echo cancel (AEC) first**: barge-in
-works by leaving the microphones live while the device speaks, and AEC is
-what stops it hearing itself. The **barge threshold** is the wake
-confidence required during playback — and counter-intuitively it should be
-much *lower* than the normal wake threshold (≈0.10 works well): the
-speaker is far louder at the microphones than you are, so your voice
+about your last question) and it cuts off and listens. On by default. It works
+by leaving the microphones live while the device speaks; what stops it hearing
+itself is the Dot's own echo cancellation, which is always running.
+
+The **barge threshold** is the wake confidence required during playback — and
+counter-intuitively it should be much *lower* than the normal wake threshold:
+the speaker is far louder at the microphones than you are, so your voice
 scores lower over playback than in a quiet room, while the device's own
-(echo-cancelled) voice barely scores at all (0.002–0.003 measured since
-v2.7.8). **0.05 is a good default** — you shouldn't need to raise your
-voice much. Raise it if responses ever cut themselves off. (During the
-silent *thinking* pause the normal wake sensitivity applies instead —
-nothing is playing, so the low barge threshold isn't needed there.)
+(cancelled) voice barely scores at all. **0.05 is the default** — you
+shouldn't need to raise your voice much. Raise it if responses ever cut
+themselves off, which is what a chime or a phrase in the response scoring as
+the wake word looks like. (During the silent *thinking* pause the normal wake
+sensitivity applies instead — nothing is playing, so the low barge threshold
+isn't needed there.)
+
 **Wake word over a ringing timer** — a separate switch, off by default. A
 ringing timer plays in bursts with gaps between them, and by default the Dot
 only listens for you in the gaps. Turn this on to have it listen *through* the
@@ -266,61 +269,31 @@ Three things to know before leaving Controller:
 
 ## 03 — Microphones
 
-How your voice gets captured. These settings were tuned carefully — the
-presets are the only part most people should touch.
+What the controller does with the sound the Dot sends it.
 
-### Pickup presets (Omni / Front / Rear)
-The Dot has 7 microphones. During a command, it can favour the mic closest
-to your voice:
+### The microphone chain is not adjustable, and that is on purpose
 
-- **Omni** — use the centre mic for everything. The safe choice; also the
-  fallback if directional pickup ever misbehaves.
-- **Front / Rear** — permanently favour one side. For Dots against a wall or
-  next to a TV: point the pickup *away* from the noise.
-- With directional pickup on and no fixed direction, the device picks the
-  mic automatically at each wake — see the pipeline doc's "lock-back"
-  section.
+The Dot has 7 microphones, and the work of turning them into one usable
+channel — picking the direction your voice is coming from, subtracting the
+Dot's own speech so it doesn't hear itself, levelling the volume, setting the
+gain — is done by **the Echo's own audio software**, the one Amazon shipped it
+with for Alexa. EchoMuse hands it the job rather than doing it again worse: it
+is tuned for this exact microphone array by the people who designed it.
+
+That software's settings live on a read-only part of the device, so there is
+nothing here to turn up or down, and there are no pickup presets any more. If
+a Dot hears you badly, the levers that exist are physical: move it away from
+the wall, away from the TV, and closer to where people talk.
 
 ### Advanced (inside the Microphones section)
 
-**MICPGA / Digital gain** — hardware amplifier levels inside the Dot's audio
-chips, matched to Amazon's own factory values. *Leave these alone* unless
-you're deep-diving; wrong values can distort every mic at once.
-
-**Mic gain (dB)** — the software gain applied to the raw 24-bit microphone
-signal before anything else hears it. Default **24dB**, chosen from real
-measurements (the Dot's raw capture is extremely quiet — without this boost,
-speech recognition regularly failed). Raise only if a device in a very large
-room still tests quiet; the device reports "clipped" samples in its log if
-you've gone too far. Lower toward 0 if you ever see clipping.
-
-**Beam angle / Beamforming** — the raw controls behind the pickup presets.
-Beam angle `-1` means "choose automatically at each wake"; any other number
-fixes the pickup direction in degrees (0 = the side with the volume-up
-button, clockwise). The presets set both of these for you.
-
 **Noise suppression** — cleans the audio sent to speech-to-text (and only
 that — wake-word listening is untouched). It uses a small neural denoiser
-(DTLN) running on the controller, so there's no load on the Dot. Helps most
-with *steady* noise — fans, air-con, appliance hum — in rooms where
-transcripts come back garbled. It does not remove other people talking or
-the TV; pointing the beamformer away from them is the tool for that. Off by
-default — turn it on per device and compare transcripts.
-
-**Echo cancel (AEC)** — teaches the mics to *subtract the Dot's own voice*
-from what they hear. Benefits: the device can hear you properly during and
-right after its own responses (follow-up questions work much better), its
-own speech can't confuse the listening logic, and it's what makes barge-in
-possible. Off by default; turn it on per device and check the `[aec] att=`
-lines in the device log show attenuation climbing during a response. Two
-tuning knobs:
-
-- **AEC delay** — alignment between what was played and what the mics
-  heard. **Leave it at 0** — that's the measured correct value for this
-  hardware (the mic pipeline's own buffering absorbs the speaker latency).
-  Raising it can silently disable cancellation entirely.
-- **AEC tail** — how much room echo/reverberation the canceller models.
-  Default 300ms; raise toward 500 in big empty-sounding rooms.
+(DTLN) running on the controller, so there's no load on the Dot. Note this is
+a *second* pass: the Dot has already denoised what it sent. Off by default,
+and worth leaving off unless steady noise — fans, air-con, appliance hum — is
+visibly garbling transcripts in one room. Turn it on per device and compare.
+It does not remove other people talking or the TV.
 
 **Save utterances** — keeps the audio of recent voice turns so you can
 *listen* to what was sent for transcription. The **Activity** tab then shows
@@ -334,10 +307,10 @@ only recording that can explain it is the one the recogniser actually heard.
 
 This is the honest way to answer "is my microphone any good?". Without it
 you're guessing from a garbled transcript, which can't tell you whether the
-room was noisy, the gain was too low, or the denoiser chewed a word. Thirty
+room was noisy, the Dot is too far away, or the denoiser chewed a word. Thirty
 seconds of listening usually settles it — and it's the only sensible way to
-A/B **Mic gain**, the pickup presets, or **Noise suppression**, since you can
-compare the same phrase before and after.
+A/B **Noise suppression** or a change of position, since you can compare the
+same phrase before and after.
 
 **Off by default, and worth thinking about before switching on.** This is the
 only setting that stores recognisable speech on the controller. What's kept:
@@ -458,22 +431,15 @@ currently measured when the taps reach the controller rather than on the
 device. On a busy or distant device you may need more. Zero disables
 grouping, and a tap fires `single` immediately.
 
-### Turn processing
-
-**Auto gain (AGC)** — automatically levels your voice volume on button
-turns, so whispering and shouting come out similar. Harmless here; it's
-deliberately never applied to wake-word listening (automatic gain drifting
-with room noise was the root cause of a "stops responding after a few days"
-bug, and it stays banished from that path).
-
 ### Speech gate
 
 Decides when a button-press utterance starts and stops:
 
-- **Threshold** — how loud counts as "speech". Measured in pre-gain units
-  (the mic gain doesn't change what this number means). The default 0.001
-  was validated by measurement; raise slightly (0.003–0.005) only in
-  genuinely noisy rooms.
+- **Threshold** — how loud counts as "speech", measured against the audio the
+  Dot sends. Raise it only if a noisy room keeps a button turn open; lower it
+  if a quiet talker gets cut off. Worth knowing: the level the Dot delivers
+  changed when the microphone chain moved to the Echo's own audio software, so
+  a value carried over from an older install may want re-checking.
 - **Speech gate (ms)** — how much continuous speech opens the gate. Higher =
   ignores brief noises, but clips fast talkers.
 - **Silence gate (ms)** — how much silence ends your turn. Higher = you can

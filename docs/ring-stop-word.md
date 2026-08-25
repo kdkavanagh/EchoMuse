@@ -33,8 +33,9 @@ A few terms, since they come up throughout:
 - **openWakeWord.** The open-source engine EchoMuse uses to do that scoring.
   It is what makes a custom wake word possible.
 - **Echo cancellation (AEC).** Subtracting the device's own speaker output from
-  what its microphones pick up, so it can hear you over itself. Off by default
-  on this fleet.
+  what its microphones pick up, so it can hear you over itself. Always running:
+  it is part of the Echo's own audio front end, not something EchoMuse
+  switches on.
 - **Timer ring.** When Home Assistant reports a timer has finished, the
   controller plays an alarm sound on the device in repeated bursts, with silent
   gaps in between, for up to a configured number of seconds.

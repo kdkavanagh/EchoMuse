@@ -15,7 +15,8 @@ can be updated, tuned, and observed without touching the hardware.
     │
     ▼
 ┌─ On the Echo Dot ───────────────────────────────────────────┐
-│  7 microphones → gain boost → echo cancel → mic selection   │
+│  7 microphones → the Echo's own audio front end             │
+│                  (echo cancel, beamform, select, gain)      │
 └──────────────────────────────│──────────────────────────────┘
                                │  continuous audio stream (WiFi)
                                ▼
@@ -37,79 +38,61 @@ can be updated, tuned, and observed without touching the hardware.
 ## Stage 1 — Seven microphones
 
 The Dot has 6 microphones in a ring plus 1 in the centre, all captured
-together, 16,000 times per second in high-precision 24-bit audio.
+together and continuously.
 
 **Benefit:** hearing from every direction at once, plus the raw material for
-knowing *which direction* you spoke from.
+working out *which direction* you spoke from.
 
 **Caveat:** they're tiny microphones in a small puck sitting in your room —
 they hear the TV, the dishwasher, and the Dot's own speaker just as keenly
 as they hear you. Most of the rest of the pipeline exists to deal with that.
 
-## Stage 2 — Gain boost ("mic gain")
+## Stage 2 — The Echo's own audio front end
 
-The raw capture is *extremely* quiet — measurements showed normal speech
-using only a tiny fraction of the available signal range, and the old
-processing threw the quietest (most information-rich) part away when
-converting the audio for transmission. The fix: amplify the full-precision
-24-bit signal by 24dB (≈16×) *before* that conversion, keeping detail that
-would otherwise be lost forever.
+Everything between the raw microphones and one clean mono channel is done by
+**the software the Echo shipped with**, the audio front end Amazon built for
+Alexa. EchoMuse captures through Android's normal audio path at the
+"voice recognition" setting, which is the switch that turns it on, and gets
+back a single processed channel. Four jobs happen in there:
 
-**Benefit:** this single change took speech recognition from "fails on 1 in
-3 requests" to "reliable" in real-room testing. It's the foundation
-everything downstream stands on.
+- **Echo cancellation**, per microphone. When the Dot is speaking, its
+  microphones hear its own voice — loudly. A copy of exactly what the speaker
+  is playing is subtracted from what each mic hears, leaving only *other*
+  sounds — like you interrupting. This is why follow-up questions work over
+  the tail of a response, why the device's own speech can't trigger it, and
+  what makes **barge-in** possible.
+- **Beamforming**, fixed and adaptive, combining the seven microphones into
+  beams pointed in different directions.
+- **Beam selection**, choosing the beam with the best signal-to-noise ratio —
+  in practice, the one pointed at whoever is talking.
+- **Gain**, both the analogue amplifier in the audio chips and a boost after
+  the processing.
 
-**Caveat:** a fixed boost means a very loud event (a shout next to the
-device) can hit the ceiling and distort briefly. The device counts these
-"clipped" moments in its log; in practice, even TV-at-movie-volume produces
-zero.
+**Benefit:** it is tuned for this exact microphone array, by the people who
+designed the array, and it is a genuinely sophisticated piece of signal
+processing — per-microphone echo cancellation and an adaptive beamformer are
+well beyond what EchoMuse could sensibly reimplement. Getting it costs nothing
+and runs on hardware that was built for it.
 
-## Stage 3 — Echo cancellation (AEC)
+**Caveats:** none of it is adjustable. Its tuning lives in a configuration file
+on a read-only part of the device, so there are no gain sliders, no pickup
+presets, no echo-cancellation switches — that whole section of the dashboard
+went away when this became the audio path. It also means **the Dot must hand
+its speaker back to Android**: playback goes through the same framework,
+because that is where the echo canceller takes its reference from. Capture and
+playback are inseparable here.
 
-When the Dot is speaking, its microphones hear its own voice — loudly. AEC
-keeps a copy of exactly what the speaker is playing and mathematically
-subtracts it from what the mics hear, leaving only *other* sounds — like you
-interrupting.
+It also does nothing about the TV. Removing *other people's speech* is a
+different problem, and a hard one — see Stage 6.
 
-**Benefit:** follow-up questions work properly (the device can hear you over
-the tail of its own response), and its own speech can't trigger or confuse
-the listening logic. It's also what makes **barge-in** possible —
-interrupting the assistant mid-sentence with the wake word (see the
-configuration guide's Barge-in setting).
+**Honesty note:** how well this performs on this hardware has not actually been
+measured. It replaced EchoMuse's own beamformer and echo canceller, which were
+measured, and the expectation is that Amazon's is better; that expectation is
+reasonable and unverified.
 
-**Caveats:** it only removes the *Dot's own* sound — it does nothing about
-the TV (that's a different problem; see Stage 8). It ships disabled until
-you've turned it on and sanity-checked it. (Since v2.7.8 the canceller
-stays "warmed up" between responses instead of relearning each time —
-if barge-in used to need a raised voice, it shouldn't anymore.)
+## Stage 3 — The continuous stream
 
-## Stage 4 — Microphone selection ("beamforming" + "lock-back")
-
-For idle listening, the device always uses the centre microphone — it hears
-all directions equally, so the wake word works wherever you stand. When you
-*do* wake it, the device switches to the ring microphone facing you, which
-hears you a little better and the rest of the room a little worse.
-
-The subtle part is *how it picks*: by the time the controller has recognised
-the wake word, half a second has passed and the sound of you saying it has
-faded. So the device continuously keeps a two-second memory of how much
-sound energy came from each direction, and when the wake arrives, it looks
-**back** through that memory to find where the wake word actually came from
-— not where sound is coming from right now. It also scores directions by
-*sudden change* rather than raw loudness, so a voice beats a permanently
-loud TV.
-
-**Benefit:** better speech-to-text from the mic pointed at you, and the LED
-direction indicator actually points at you.
-
-**Caveats:** one selected mic is a modest improvement, not a magic zoom
-lens. And in the gap between conversations, the device's own speech can
-linger in that two-second memory — follow-up conversations get the weaker
-version of this feature until barge-in/AEC work matures.
-
-## Stage 5 — The continuous stream
-
-Every 32 milliseconds, the processed audio is sent over WiFi to the
+Every 80 milliseconds, the processed audio is sent over WiFi to the
 controller. Always. There is deliberately **no** "only send when it sounds
 like speech" gate on this stream.
 
@@ -131,7 +114,7 @@ what streaming the *response* audio uses, so in practice a non-issue on any
 home network. And to be clear about privacy: the stream goes to *your*
 controller on *your* LAN and nowhere else.
 
-## Stage 6 — Wake-word spotting
+## Stage 4 — Wake-word spotting
 
 The controller runs openwakeword, a small neural network, over each
 device's stream, scoring every moment: "how much did that sound like the
@@ -160,7 +143,7 @@ a false-accepts vs. false-rejects trade-off you tune to your room (the
 near-miss counter exists precisely to make that tuning informed rather than
 vibes-based).
 
-## Stage 7 — The conversation ("turn")
+## Stage 5 — The conversation ("turn")
 
 On wake: the LED goes green, the device's mic selection locks toward you,
 and the controller pipes your audio to Home Assistant, which decides when
@@ -179,7 +162,7 @@ long and the tail of TV dialogue rides along into speech-to-text (you'll
 occasionally see a stray phrase appended to your transcript). Cleaning the
 audio sent to speech-to-text is the next planned fix for this.
 
-## Stage 8 — Speech-to-text, understanding, action
+## Stage 6 — Speech-to-text, understanding, action
 
 Home Assistant's Assist pipeline takes over: your speech becomes text
 (Whisper or whichever STT you've configured), the text becomes intent
@@ -194,12 +177,12 @@ response generation are the slow steps, especially on modest hardware), and
 where background-noise transcription errors ultimately land. Better mics and
 cleaner audio help; they can't fully substitute for a good STT model.
 
-## Stage 9 — The response
+## Stage 7 — The response
 
 The reply audio comes back through the controller, which shapes the sound
 (the EQ from the configuration guide — the raw speaker is boomy) and
 streams it to the Dot, which plays it while a copy is fed to the echo
-canceller (Stage 3) so the mics can subtract it. The audio arrives at the
+canceller (Stage 2) so the mics can subtract it. The audio arrives at the
 hardware's native rate: the satellite tells Home Assistant what format the
 speaker wants (48kHz mono), so recent HA versions transcode at source, and
 ffmpeg covers anything else during decode.
@@ -220,12 +203,11 @@ at roughly the same moment a short one would, instead of making you wait for
 the last word to be synthesised before hearing the first. The EQ carries its
 filter state across chunks, so there's no click at the joins.
 
-**Caveat:** interrupting a response by voice (**barge-in**) works when
-enabled — say the wake word over the top and the response cuts off — but
-it's off by default and depends on AEC being on and tuned (Stage 3): the
-mics stay live during playback, and echo cancellation is what stops the
-device waking itself. Interrupting by *just talking* (without the wake
-word) is deliberately not attempted.
+**Caveat:** interrupting a response by voice (**barge-in**) works — say the
+wake word over the top and the response cuts off. The mics stay live during
+playback, and the Dot's echo cancellation (Stage 2) is what stops it waking
+itself. Interrupting by *just talking* (without the wake word) is deliberately
+not attempted.
 
 ## Beyond voice — music
 
@@ -248,9 +230,9 @@ only the bed under it. How far it drops is yours to set (**Ducking**,
 in the Playback section) — it's a taste call best made by ear in the
 actual room.
 
-For reliable wake-over-music, enable AEC and barge-in (Stage 3): the
-same echo cancellation that lets you interrupt the assistant's own
-voice is what lets it hear you over a song.
+Wake-over-music leans on the same echo cancellation (Stage 2) that lets
+you interrupt the assistant's own voice — it is what lets the Dot hear
+you over a song it is playing itself.
 
 Older firmware that can't mix the two streams falls back to the previous
 behaviour — pause for the turn, resume after.
@@ -261,8 +243,11 @@ behaviour — pause for the turn, resume after.
 
 1. **Dumb device, smart controller.** Anything that can drift, misjudge, or
    need tuning lives where it can be observed and updated without touching
-   hardware. The Dot captures, amplifies, cancels its own echo, and streams
-   — that's it.
+   hardware. The Dot captures, hands the array to the audio front end it
+   already had, and streams the result — that's it. The one exception proves
+   the rule: ducking music under a voice turn happens on the device, because
+   the next few seconds of music have already left the controller by the time
+   you start speaking.
 2. **Measure, don't modify.** The controller tracks each room's noise floor
    and uses it to make *decisions* (is anyone speaking?), but never rewrites
    the audio on its way to speech-to-text. Adaptive audio-mangling is how
