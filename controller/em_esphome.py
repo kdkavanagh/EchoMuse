@@ -70,6 +70,7 @@ import em_api as api
 import em_endpoint
 import em_ns
 import em_recordings
+import em_wakeclips
 import em_oww_models
 import em_player
 import em_turnclock
@@ -2059,6 +2060,47 @@ async def _save_utterance(device, turn_id: int, turn_record: dict) -> None:
     )
 
 
+async def _save_wake_clip(device, turn_id: int, turn_record: dict) -> None:
+    """
+    Write the audio that crossed the wake threshold (if saveWakeClips is on)
+    to wakes/ and record the filename on the turn row.
+
+    The same shape as _save_utterance, and for the same reason — the
+    filename is keyed on the rowid — but a different artefact answering a
+    different question. The utterance is what STT heard; this is what the
+    WAKE MODEL heard, which on a false positive is the only recording that
+    can be handed back to oww_forge as a negative. The buffer is consumed
+    here so one detection's audio can never be attributed to a second turn.
+
+    Best-effort throughout: a full disk costs the clip, never the turn.
+    """
+    pcm = getattr(device, "last_wake_pcm", None)
+    device.last_wake_pcm = None
+    if not pcm:
+        return
+    try:
+        name = await asyncio.get_running_loop().run_in_executor(
+            None, em_wakeclips.save, device.device_id, turn_id, pcm
+        )
+    except Exception as e:
+        log.warning(f"[{device.device_id}] Wake clip save failed: {e}")
+        return
+    if not name:
+        return
+    turn_record["wake_file"] = name
+    try:
+        await asyncio.get_running_loop().run_in_executor(
+            None, db.set_turn_wake, turn_id, name
+        )
+    except Exception as e:
+        log.warning(f"[{device.device_id}] Wake clip link failed: {e}")
+        return
+    log.info(
+        f"[{device.device_id}] Wake clip saved: {name} "
+        f"({em_wakeclips.duration_ms(len(pcm)) / 1000:.1f}s)"
+    )
+
+
 async def _persist_turn(device, turn_record: dict) -> None:
     """
     Write a completed turn to SQLite (survives controller restarts) and
@@ -2146,6 +2188,7 @@ async def _persist_turn(device, turn_record: dict) -> None:
         )
         turn_record["turn_id"] = turn_id
         await _save_utterance(device, turn_id, turn_record)
+        await _save_wake_clip(device, turn_id, turn_record)
         if played and "underruns" not in turn_record:
             # Playback happened but its stats haven't arrived — leave the
             # rendezvous open for handle_control's playback_stats branch.

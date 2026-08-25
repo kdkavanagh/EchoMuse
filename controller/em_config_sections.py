@@ -46,6 +46,7 @@ SECTIONS: dict[str, dict] = {
             # that key is about the mic stream a turn records, and this one
             # is about the wake decision itself — a device taking its own
             # threshold and model should take the evidence for them too.
+            "saveWakeClips",
         ],
     },
     "microphones": {

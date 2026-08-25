@@ -787,13 +787,26 @@ function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, nearMis
   const [hover, setHover] = useState(null); // index into `recent`
   const mono = "'DM Mono',monospace";
 
-  // Saved utterances — play in place or download the WAV. Both go through
-  // one fetched object URL per turn (API.blob; see the auth note there), so
+  // Saved audio — play in place or download the WAV. Both go through one
+  // fetched object URL per clip (API.blob; see the auth note there), so
   // playing then downloading costs one transfer, not two.
-  const [playing, setPlaying] = useState(null);   // turn_id currently sounding
-  const [gone, setGone]       = useState(() => new Set()); // 404 = pruned
+  //
+  // A turn can carry two different recordings: the wake clip (the 2s that
+  // crossed the threshold) and the utterance (the command that followed).
+  // Everything here is therefore keyed `<turn_id>:<kind>` rather than by the
+  // turn alone — one key means one <audio> element, so starting either clip
+  // stops the other instead of leaving them talking over each other.
+  const WAKE = 'wake', MIC = 'audio';   // also the last segment of the URL
+  const clipKey = (t, kind) => `${t.turn_id}:${kind}`;
+
+  const [playing, setPlaying]   = useState(null);   // clip key currently sounding
+  const [gone, setGone]         = useState(() => new Set()); // 404 = pruned
+  const [zipping, setZipping]   = useState(false);
+  const [zipError, setZipError] = useState('');
   const audioRef = useRef(null);
-  const urlsRef  = useRef({});    // turn_id -> object URL
+  const urlsRef  = useRef({});    // clip key -> object URL
+
+  const slug = (deviceLabel || deviceId).replace(/[^A-Za-z0-9]+/g, '-').toLowerCase();
 
   const stopAudio = () => {
     if (audioRef.current) { audioRef.current.pause(); audioRef.current = null; }
@@ -802,42 +815,72 @@ function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, nearMis
 
   // Retention is a small per-device file count, far shorter than the turn
   // history, so a row naming a recording that no longer exists is ordinary.
-  // Mark it gone and drop its controls rather than surfacing an error.
-  const audioUrl = async t => {
-    if (urlsRef.current[t.turn_id]) return urlsRef.current[t.turn_id];
+  // Mark it gone and drop its controls rather than surfacing an error. Per
+  // clip rather than per turn: the two kinds are kept to their own counts,
+  // so a turn routinely still has its wake clip long after its utterance
+  // was pruned.
+  const clipUrl = async (t, kind) => {
+    const key = clipKey(t, kind);
+    if (urlsRef.current[key]) return urlsRef.current[key];
     try {
       const url = URL.createObjectURL(await API.blob(
-        `/api/devices/${deviceId}/turns/${t.turn_id}/audio`));
-      urlsRef.current[t.turn_id] = url;
+        `/api/devices/${deviceId}/turns/${t.turn_id}/${kind}`));
+      urlsRef.current[key] = url;
       return url;
     } catch {
-      setGone(g => new Set(g).add(t.turn_id));
+      setGone(g => new Set(g).add(key));
       return null;
     }
   };
 
-  const toggleAudio = async t => {
-    const wasPlaying = playing === t.turn_id;
+  const toggleAudio = async (t, kind) => {
+    const key = clipKey(t, kind);
+    const wasPlaying = playing === key;
     stopAudio();
     if (wasPlaying) return;
-    const url = await audioUrl(t);
+    const url = await clipUrl(t, kind);
     if (!url) return;
     const el = new Audio(url);
-    el.onended = el.onerror = () => setPlaying(p => (p === t.turn_id ? null : p));
+    el.onended = el.onerror = () => setPlaying(p => (p === key ? null : p));
     audioRef.current = el;
-    setPlaying(t.turn_id);
-    el.play().catch(() => setPlaying(p => (p === t.turn_id ? null : p)));
+    setPlaying(key);
+    el.play().catch(() => setPlaying(p => (p === key ? null : p)));
   };
 
-  const downloadAudio = async t => {
-    const url = await audioUrl(t);
-    if (!url) return;
-    const when = new Date(t.ts * 1000).toISOString().slice(0, 19).replace(/[:T]/g, '');
+  const download = (url, filename) => {
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${(deviceLabel || deviceId).replace(/[^A-Za-z0-9]+/g, '-').toLowerCase()}-${when}.wav`;
+    a.download = filename;
     a.click();
   };
+
+  const downloadAudio = async (t, kind) => {
+    const url = await clipUrl(t, kind);
+    if (!url) return;
+    const when = new Date(t.ts * 1000).toISOString().slice(0, 19).replace(/[:T]/g, '');
+    // The kind is in the filename because both clips of one turn land in the
+    // same downloads folder seconds apart, and only one of them is the
+    // training negative anyone went looking for.
+    download(url, `${slug}-${when}${kind === WAKE ? '-wake' : ''}.wav`);
+  };
+
+  // Every wake clip the device still holds, in one archive — the hand-off to
+  // a retraining run. Deliberately not "the clips for the turns on screen":
+  // the store keeps hundreds and this list is the last 50, so most of the
+  // false positives worth training on are already off the bottom of it.
+  // Its object URL is used once and revoked straight away; unlike the
+  // per-clip ones there is nothing to replay it for.
+  async function doWakeZip() {
+    setZipping(true); setZipError('');
+    try {
+      const url = URL.createObjectURL(await API.blob(`/api/devices/${deviceId}/wakeclips.zip`));
+      download(url, `${slug}-wakeclips.zip`);
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setZipError(e.error || e.message || 'Could not build the archive');
+    }
+    setZipping(false);
+  }
 
   useEffect(() => () => {
     stopAudio();
@@ -848,6 +891,7 @@ function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, nearMis
   }, []);
 
   const anyAudio = turns.some(t => t.audio_file);
+  const anyWake  = turns.some(t => t.wake_file);
 
   const ok = turns.filter(t => t.outcome === 'ok');
   const successPct = turns.length ? Math.round(ok.length / turns.length * 100) : null;
@@ -860,6 +904,11 @@ function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, nearMis
   // rest of the tab) out of view.
   const recent = turns.slice().reverse();
   const scale = Math.max(3000, ...recent.map(t => turnSegments(t).shown));
+
+  // The row controls are bare glyphs rather than Pills: four of them share
+  // the last column of a 14px-tall row, and anything with a border in there
+  // reads as a second timeline.
+  const glyphBtn = { background: 'none', border: 'none', padding: 0, cursor: 'pointer', fontSize: 10, lineHeight: 1 };
 
   return (
     <div>
@@ -890,11 +939,31 @@ function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, nearMis
                 {s.label}
               </span>
             ))}
-            {(recordingsOn || anyAudio) && (
-              <span style={{ fontFamily: mono, fontSize: 9, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.08em', marginLeft: 'auto' }}>
-                ▶ hear the mic{anyAudio ? '' : ' — next turn'}
-              </span>
-            )}
+            <span style={{ marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 12 }}>
+              {(recordingsOn || anyAudio) && (
+                <span style={{ fontFamily: mono, fontSize: 9, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+                  ▶ hear the mic{anyAudio ? '' : ' — next turn'}
+                </span>
+              )}
+              {anyWake && (
+                <span style={{ fontFamily: mono, fontSize: 9, color: 'var(--lcd-amber)', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+                  ▷ what woke it
+                </span>
+              )}
+              {zipError && (
+                <span style={{ fontFamily: mono, fontSize: 9, color: 'var(--warn)' }}>{zipError}</span>
+              )}
+              {/* Pill takes no title, so the explanation hangs off a wrapper
+                  — this is the button someone presses before a retraining
+                  run, and the label alone does not say that. */}
+              {anyWake && (
+                <span title="Download every wake clip this device still has, as one .zip — the false positives to feed back into wake-word training">
+                  <Pill small disabled={zipping} onClick={doWakeZip}>
+                    {zipping ? 'Building…' : 'Download wake clips (.zip)'}
+                  </Pill>
+                </span>
+              )}
+            </span>
           </div>
 
           {/* One stacked bar per turn, newest first — own scroll container */}
@@ -920,18 +989,32 @@ function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, nearMis
                 <span style={{ fontFamily: mono, fontSize: 8, textTransform: 'uppercase', letterSpacing: '0.08em', width: 62, flexShrink: 0, color: failed ? 'var(--warn)' : 'var(--ok)' }}>
                   {t.outcome === 'ok' ? 'ok' : (t.outcome || '?').replace(/_/g, ' ')}
                 </span>
-                {/* Saved utterance: listen in place, or download the WAV.
-                    The slot is reserved even when a turn has no recording so
-                    the columns stay aligned as the retention window rolls. */}
-                <span style={{ width: 34, flexShrink: 0, display: 'flex', gap: 4, justifyContent: 'flex-end' }}>
-                  {t.audio_file && !gone.has(t.turn_id) && (<>
-                    <button onClick={() => toggleAudio(t)}
-                      title={playing === t.turn_id ? 'Stop' : 'Play the mic audio for this turn'}
-                      style={{ background: 'none', border: 'none', padding: 0, cursor: 'pointer', fontSize: 10, lineHeight: 1, color: playing === t.turn_id ? 'var(--warn)' : 'var(--text2)' }}>
-                      {playing === t.turn_id ? '▮' : '▶'}
+                {/* The turn's saved audio, in the order it happened: the wake
+                    clip that opened the turn, then the utterance that
+                    followed. The slot is reserved even when a turn has
+                    neither, so the columns stay aligned as the retention
+                    windows roll — and the two roll at very different rates,
+                    which is why each pair tests its own key. */}
+                <span style={{ width: 60, flexShrink: 0, display: 'flex', gap: 4, justifyContent: 'flex-end' }}>
+                  {t.wake_file && !gone.has(clipKey(t, WAKE)) && (<>
+                    <button onClick={() => toggleAudio(t, WAKE)}
+                      title={playing === clipKey(t, WAKE) ? 'Stop'
+                        : 'Play the 2s that crossed the wake threshold — what triggered it, not the command'}
+                      style={{ ...glyphBtn, color: playing === clipKey(t, WAKE) ? 'var(--warn)' : 'var(--lcd-amber)' }}>
+                      {playing === clipKey(t, WAKE) ? '▮' : '▷'}
                     </button>
-                    <button onClick={() => downloadAudio(t)} title="Download the WAV"
-                      style={{ background: 'none', border: 'none', padding: 0, cursor: 'pointer', fontSize: 10, lineHeight: 1, color: 'var(--muted)' }}>⤓</button>
+                    <button onClick={() => downloadAudio(t, WAKE)}
+                      title="Download the wake clip — a false trigger belongs in wake-word training"
+                      style={{ ...glyphBtn, color: 'var(--muted)' }}>⤓</button>
+                  </>)}
+                  {t.audio_file && !gone.has(clipKey(t, MIC)) && (<>
+                    <button onClick={() => toggleAudio(t, MIC)}
+                      title={playing === clipKey(t, MIC) ? 'Stop' : 'Play the mic audio for this turn'}
+                      style={{ ...glyphBtn, color: playing === clipKey(t, MIC) ? 'var(--warn)' : 'var(--text2)' }}>
+                      {playing === clipKey(t, MIC) ? '▮' : '▶'}
+                    </button>
+                    <button onClick={() => downloadAudio(t, MIC)} title="Download the WAV"
+                      style={{ ...glyphBtn, color: 'var(--muted)' }}>⤓</button>
                   </>)}
                 </span>
               </div>
@@ -5211,6 +5294,7 @@ const STAGE_MONO = "'DM Mono',monospace";
 // be silently wrong.
 const CONFIG_SECTIONS = {
   "playback": ["eqBands", "eqLoudness", "duckDb"],
+  "wakeword": ["owwModel", "owwThreshold", "owwSpeexNs", "saveWakeClips", "bargeInEnabled", "bargeInThreshold", "wakeArbitrationMs", "owwOnDevice", "wakeSound", "ringBargeIn"],
   "microphones": ["nsAsr", "saveUtterances", "endpointRelative", "endpointLowPerMil", "endpointSilenceMs", "endpointBackporchMs", "maxSpeechMs"],
   "ring": ["ledScene", "ledListenColor", "ledThinkColor", "meterAttack", "meterDecay", "meterFloor", "meterGamma", "meterRef", "meterCurve"],
   "advanced": ["vadThreshold", "vadSpeechMs", "vadSilenceMs", "buttonSingleTapEvent", "buttonMultiTapMs"],
@@ -5686,6 +5770,14 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
                 value={!bcresnetSelected && (config.owwSpeexNs ?? false)}
                 disabled={bcresnetSelected}
                 onChange={v => set('owwSpeexNs', v)}/>
+              {/* Sits with the sensitivity controls because it is how you
+                  tune them: a threshold is only ever wrong about audio you
+                  can hear, and a false trigger is gone the moment it is
+                  logged unless the frames that scored it were kept. */}
+              <Toggle label="Save wake clips"
+                sub="keeps the 2 seconds of audio that crossed the threshold, for the last few hundred wakes — download a false trigger from Activity and feed it back into wake-word training"
+                value={config.saveWakeClips ?? false}
+                onChange={v => set('saveWakeClips', v)}/>
               <Toggle label="Barge-in" sub="wake word interrupts playback — enable AEC first" value={config.bargeInEnabled ?? false} onChange={v => set('bargeInEnabled', v)}/>
               <Slider label="Barge threshold" sub="wake confidence needed during playback — raise it if a response cuts itself short" value={config.bargeInThreshold ?? 0.05} min={0.05} max={0.9} step={0.05} onChange={v => set('bargeInThreshold', v)}/>
               <Slider label="Arbitration window" sub="ms that the first Echo to hear you silences the others — no added delay; 0 disables" value={config.wakeArbitrationMs ?? 700} min={0} max={2000} step={50} unit="ms" onChange={v => set('wakeArbitrationMs', v)}/>

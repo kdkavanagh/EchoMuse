@@ -81,6 +81,7 @@ COPY em_recordings.py .
 COPY em_samples.py .
 COPY em_ambient.py .
 COPY em_capture.py .
+COPY em_wakeclips.py .
 COPY em_turnclock.py .
 COPY em_endpoint.py .
 COPY em_sounds.py .

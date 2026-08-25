@@ -33,6 +33,7 @@ import em_config_sections
 import em_recordings
 import em_samples
 import em_ambient
+import em_wakeclips
 
 log = logging.getLogger("echomuse.db")
 
@@ -202,6 +203,15 @@ DEFAULT_DEVICE_CONFIG = {
     # only (the device never sees the audio again); the key rides the
     # config channel and the device ignores it, same as wakeArbitrationMs.
     "saveUtterances":   False,
+    # saveWakeClips: keep the ~2s of audio that crossed the wake threshold
+    # (em_wakeclips.CLIP_MS) for each turn, downloadable one at a time or as
+    # an archive for a retraining run. This is the only way to get a
+    # recording of a FALSE positive: the wake word is over before the
+    # detection, and saveUtterances above captures the turn that follows it
+    # — the preroll discard exists precisely to remove the wake word from
+    # that file. Default OFF for the same reason saveUtterances is, and
+    # controller-side only in the same way.
+    "saveWakeClips":    False,
     # endpointRelative: end a voice turn when the loudest voice in it stops,
     # even if other speech continues. Controller-side only (em_endpoint.py);
     # the device never sees these three, same as saveUtterances.
@@ -822,6 +832,28 @@ MIGRATIONS: list[str] = [
     UPDATE system_config SET value = '19' WHERE key = 'schema_version';
     """,
 
+    # ── v20 — wake clips ────────────────────────────────────────────────────
+    #
+    # The audio that crossed the wake threshold, kept per turn (em_wakeclips)
+    # so a false positive can be listened to and fed back to oww_forge as a
+    # training negative. A false wake previously left no recoverable evidence
+    # at all: the wake word ends before the detection, the turn's own
+    # utterance recording begins after it (the preroll discard exists
+    # specifically to remove the "…Jarvis" tail), and the model's rolling
+    # context is reset on the same iteration.
+    #
+    # A COLUMN on turns rather than a device column, unlike v18/v19: this is
+    # not a mode, it is an artefact of one turn, and the row that shows the
+    # false positive is the row that should link to its own audio. Retention
+    # is by file count per device (em_wakeclips.KEEP_PER_DEVICE), a shorter
+    # window than TURN_RETENTION, so a non-NULL wake_file on an older row is
+    # a claim to CHECK and every reader resolves it through em_wakeclips —
+    # exactly as v12's audio_file is treated.
+    """
+    ALTER TABLE turns ADD COLUMN wake_file TEXT;
+
+    UPDATE system_config SET value = '20' WHERE key = 'schema_version';
+    """,
 ]
 
 # Post-migration fixups that need Python rather than SQL. Keyed by the schema
@@ -1471,6 +1503,10 @@ def delete_device(device_id: str) -> None:
     satisfy the foreign key constraint.
 
     Saved utterance recordings, collected wake-word samples, ambient
+    recordings and wake clips live on disk rather than in the DB, so no
+    cascade reaches them — they are unlinked explicitly here. Leaving a
+    deleted device's speech behind on the volume is the one leftover that
+    actually matters.
     """
     with _tx() as conn:
         conn.execute("DELETE FROM device_logs WHERE device_id = ?", (device_id,))
@@ -1487,6 +1523,18 @@ def delete_device(device_id: str) -> None:
             log.info(f"[db] Removed {removed} collected sample(s) for {device_id}")
     except Exception as e:
         log.warning(f"[db] Sample cleanup failed for {device_id}: {e}")
+    try:
+        removed = em_ambient.delete_device(device_id)
+        if removed:
+            log.info(f"[db] Removed {removed} ambient recording(s) for {device_id}")
+    except Exception as e:
+        log.warning(f"[db] Ambient cleanup failed for {device_id}: {e}")
+    try:
+        removed = em_wakeclips.delete_device(device_id)
+        if removed:
+            log.info(f"[db] Removed {removed} wake clip(s) for {device_id}")
+    except Exception as e:
+        log.warning(f"[db] Wake clip cleanup failed for {device_id}: {e}")
     log.info(f"[db] Device deleted: {device_id}")
 
 
@@ -1750,6 +1798,11 @@ _TURN_COLUMNS = {
     # after the insert (the name is keyed on the rowid). Always NULL at
     # insert time; listed here so get_turns returns it.
     "audio_file":       "audio_file",
+    # v20 — filename of the wake clip, written by set_turn_wake after the
+    # insert for the same reason audio_file is. NULL on every turn that was
+    # not wake-triggered, and on wake turns captured while saveWakeClips was
+    # off.
+    "wake_file":        "wake_file",
 }
 
 
@@ -1834,6 +1887,19 @@ def set_turn_audio(turn_id: int, audio_file: Optional[str]) -> None:
         conn.execute(
             "UPDATE turns SET audio_file = ? WHERE id = ?",
             (audio_file, turn_id),
+        )
+
+
+def set_turn_wake(turn_id: int, wake_file: Optional[str]) -> None:
+    """
+    Attach the wake clip — the audio that crossed the threshold — to a
+    persisted turn. Separate from insert_turn for set_turn_audio's reason:
+    the filename is keyed on the rowid that insert_turn returns.
+    """
+    with _tx() as conn:
+        conn.execute(
+            "UPDATE turns SET wake_file = ? WHERE id = ?",
+            (wake_file, turn_id),
         )
 
 

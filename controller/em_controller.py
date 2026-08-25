@@ -79,6 +79,7 @@ import em_endpoint
 import em_samples
 import em_ambient
 import em_capture
+import em_wakeclips
 import em_tap_burst
 import em_esphome as esphome
 import em_ble_proxy
@@ -326,6 +327,12 @@ class Device:
         # switching it off stops the next turn being captured, not the one
         # already streaming.
         self.save_utterances: bool = False
+        # saveWakeClips: keep the audio that crossed the wake threshold and
+        # write it to wakes/ at turn end (em_wakeclips). Read per FRAME
+        # rather than per turn, unlike save_utterances above — the ring it
+        # gates is fed before any turn exists, and the point of the gate is
+        # that a device with the feature off holds no audio at all.
+        self.save_wake_clips: bool = False
         # Relative endpointing (em_endpoint.py) — ends a turn when the loudest
         # voice in it stops, so continuous background speech cannot hold the
         # turn open until the hard cap. All three are read per turn, so a
@@ -346,6 +353,16 @@ class Device:
         # _persist_turn (which owns the write — it has the rowid the
         # filename is keyed on) and consumed there.
         self.last_utterance_pcm: bytes | None = None
+        # The audio that woke the device: the wake listener's ring, joined at
+        # detection and consumed by _persist_turn alongside the utterance
+        # above. Only ever set when save_wake_clips is on.
+        self.last_wake_pcm: bytes | None = None
+        # The barge watcher's equivalent, held one turn longer: the cancelled
+        # turn persists before the interrupting one starts, so promoting this
+        # into last_wake_pcm is deferred to the barge branch that starts that
+        # turn (_run_voice_locked). Otherwise the audio that INTERRUPTED a
+        # response would be filed as the wake that began it.
+        self.barge_wake_pcm: bytes | None = None
 
         # Wake-word sample collection (em_samples). A MODE, not a setting:
         # while it is on the wake stream is cut into training clips and this
@@ -1181,6 +1198,18 @@ async def _barge_watcher(device: Device, playback_started: asyncio.Event):
     threshold = device.barge_threshold  # refined per-frame by phase below
     prev_score = 0.0  # previous frame's score — two-frame low tier (thinking)
     buf = bytearray()
+    # Wake clips (em_wakeclips) for the barge path too. This detector runs at
+    # the LOWEST bar in the product — bargeInThreshold is deliberately below
+    # the wake threshold (~0.10) because speech over TTS scores depressed —
+    # so it is the likeliest place to false-trigger, and a feature that could
+    # not explain a cancelled response would be promising evidence exactly
+    # where it is hardest to get. voice_queue carries the raw wire audio
+    # (NS applies further down, on the HA-bound copy only), so as in the wake
+    # listener a clip is byte-for-byte what this model scored.
+    barge_pcm = collections.deque(maxlen=em_wakeclips.CLIP_FRAMES)
+    # Any clip left over from a barge whose interrupting turn never ran is
+    # not evidence about this one.
+    device.barge_wake_pcm = None
     # Observability: the watcher used to log only on detection, which made a
     # failed barge-in attempt indistinguishable from "no frames arrived at
     # all" (mic not streaming) or "frames arrived but scored ~0" (AEC residual
@@ -1199,6 +1228,7 @@ async def _barge_watcher(device: Device, playback_started: asyncio.Event):
             payload = await device.voice_queue.get()
             if payload is None or isinstance(payload, str):
                 buf.clear()
+                barge_pcm.clear()   # a clip must not splice a discontinuity
                 prev_score = 0.0  # sentinel = stream discontinuity; frames
                 # across it aren't consecutive for the two-frame low tier
                 continue
@@ -1210,6 +1240,10 @@ async def _barge_watcher(device: Device, playback_started: asyncio.Event):
                 rms = float(np.sqrt(np.mean((samples.astype(np.float64) / 32768.0) ** 2)))
                 rms_sum += rms
                 rms_max  = max(rms_max, rms)
+                if device.save_wake_clips:
+                    barge_pcm.append(frame)
+                elif barge_pcm:
+                    barge_pcm.clear()
                 score = await loop.run_in_executor(None, model.push, samples)
                 frames += 1
                 # No score for this chunk (see the wake listener). `prev_score`
@@ -1274,6 +1308,13 @@ async def _barge_watcher(device: Device, playback_started: asyncio.Event):
                         "noise_floor": round(device.noise_floor, 5),
                     }
                     # The audio that cancelled the response. Parked in its own
+                    # slot rather than last_wake_pcm: the cancelled turn
+                    # persists before the interrupting one starts, and it is
+                    # the interrupting turn this clip belongs to (see the
+                    # hand-off in _run_voice_locked's barge branch).
+                    if device.save_wake_clips and barge_pcm:
+                        device.barge_wake_pcm = b"".join(barge_pcm)
+                        barge_pcm.clear()
                     device.cancel_event.set()
                     if in_playback:
                         await device.send_control({"type": "speaker_flush"})
@@ -2022,6 +2063,15 @@ async def _run_voice_locked(device: Device, trigger_label: str = "unknown", is_w
                     # "…rhasspy" tail to drop this time).
                     device.barge_detected = False
                     device.cancel_event.clear()
+                    # Hand the barge clip to the turn that is about to start,
+                    # not the one just cancelled. _save_wake_clip consumes
+                    # last_wake_pcm at turn persist, and the cancelled turn
+                    # persists first — writing it there would file the audio
+                    # that INTERRUPTED a response under the wake that started
+                    # it, on a row whose own wake clip is the honest one.
+                    device.last_wake_pcm, device.barge_wake_pcm = (
+                        device.barge_wake_pcm, None
+                    )
                     log.info(f"[{device.device_id}] Barge-in: starting interrupting turn")
                     await device.mic_start()  # defensive no-op if running
                     # Re-arm listening state — cleanup_esphome() in the
@@ -2992,6 +3042,14 @@ async def wake_word_listener(device: Device):
     # anchoring on it would place the threshold below the speaker's real
     # level for the rest of the turn.
     wake_level = collections.deque(maxlen=12)
+    # The audio itself, for the same detection but a different question:
+    # WHAT crossed the threshold (em_wakeclips). A false positive is
+    # otherwise unrecoverable — the wake word ends before the detection, the
+    # turn's utterance recording starts after it, and model.reset() below
+    # discards the only other copy — so there is nothing to hand back to
+    # oww_forge as a negative. Fed only while saveWakeClips is on: the
+    # default must be an empty ring, not a rolling two seconds of the room.
+    wake_pcm = collections.deque(maxlen=em_wakeclips.CLIP_FRAMES)
     try:
         while True:
             if device.oww_model != current_model_name or device.oww_speex_ns != current_speex_ns:
@@ -3079,9 +3137,11 @@ async def wake_word_listener(device: Device):
 
             # VAD sentinel (string; None accepted defensively — the pre-B5
             # encoding) — flush partial audio so OWW never scores across a
-            # stream boundary.
+            # stream boundary. The wake ring goes with it: a clip spliced
+            # across a stream boundary is not the audio anything scored.
             if payload is None or isinstance(payload, str):
                 buf.clear()
+                wake_pcm.clear()
                 continue
 
             if device.oww_paused.is_set():
@@ -3089,6 +3149,7 @@ async def wake_word_listener(device: Device):
 
             if device.muted:
                 buf.clear()
+                wake_pcm.clear()
                 continue
 
             buf.extend(payload)
@@ -3155,11 +3216,13 @@ async def wake_word_listener(device: Device):
                 if ring_deaf:
                     ring_reset_due = True
                     buf.clear()
+                    wake_pcm.clear()
                     break
                 if ring_reset_due:
                     ring_reset_due = False
                     model.reset()
                     buf.clear()
+                    wake_pcm.clear()
                     break
                 if device.speaking and not device.timer_ringing:
                     continue
@@ -3221,6 +3284,11 @@ async def wake_word_listener(device: Device):
                 # frame taken by collect/capture/ambient above never reaches
                 # this line and never enters the ring: those modes score
                 # nothing, so no wake can be attributed to their audio.
+                if device.save_wake_clips:
+                    wake_pcm.append(frame)
+                elif wake_pcm:
+                    wake_pcm.clear()
+
                 score = await loop.run_in_executor(None, model.push, samples)
                 # None is "this chunk produced no score", not a low score.
                 # openWakeWord scores every 80ms chunk and never returns it;
@@ -3436,6 +3504,14 @@ async def wake_word_listener(device: Device):
                         # preroll discard in _stream_mic_audio.
                         # TTS mic_stop/mic_start remains untouched — that
                         # acoustic-feedback guard is load-bearing.
+                        # Take the wake clip before the reset that discards
+                        # every other copy of this audio. Cleared with it, so
+                        # the NEXT wake's clip cannot begin with frames from
+                        # before this turn — the ring is not fed again until
+                        # the turn ends and frames come back to this listener.
+                        if device.save_wake_clips and wake_pcm:
+                            device.last_wake_pcm = b"".join(wake_pcm)
+                            wake_pcm.clear()
                         model.reset()
                         buf.clear()
                         device.cancel_event.clear()
@@ -3511,6 +3587,7 @@ async def wake_word_listener(device: Device):
                             # the clip — dropping it here is what stops the
                             # winner's neighbour handing its audio to whatever
                             # turn it eventually does start.
+                            device.last_wake_pcm = None
                             ceded = 0
                             while not device.voice_queue.empty():
                                 try:
@@ -3898,6 +3975,7 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
         device.oww_speex_ns  = bool(config.get("owwSpeexNs", False))
         device.ns_asr        = bool(config.get("nsAsr", False))
         device.save_utterances = bool(config.get("saveUtterances", False))
+        device.save_wake_clips = bool(config.get("saveWakeClips", False))
         device.endpoint_relative   = bool(config.get("endpointRelative", True))
         device.endpoint_low_per_mil = int(config.get("endpointLowPerMil", 400))
         device.endpoint_silence_ms = int(config.get("endpointSilenceMs", 1200))

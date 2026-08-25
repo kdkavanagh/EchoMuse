@@ -175,7 +175,10 @@ The confidence bar the recogniser must clear.
 **How to tune it**: the Status tab counts **near-misses** — moments where the
 score came close but didn't trigger. If you're being ignored and see
 near-misses climbing, move one step toward Eager. If it wakes up when nobody
-spoke, move toward Precise.
+spoke, move toward Precise — but a ghost activation is also worth *hearing*
+rather than guessing at, so turn on **Save wake clips** below and the next one
+leaves you the audio that caused it, which is both the answer and the material
+for retraining the word so it stops firing on that sound at all.
 
 ### Barge-in
 Lets the wake word **interrupt the assistant mid-turn** — say "Hey
@@ -209,6 +212,48 @@ Runs a noise cleaner on the audio *only for wake-word scoring* (your actual
 commands are untouched). Worth trying in rooms with constant background
 noise (TV, air-con) if wake detection is unreliable there. Off by default —
 it's a "try it and compare" option.
+
+### Save wake clips
+Keeps the **two seconds of audio that crossed the threshold** — the sound
+that woke the device, not the request that followed it. Off by default. Every
+wake that starts a turn gets one — including a **Barge-in** wake, which is the
+one most worth having, since barge-in listens at a deliberately lower bar than
+the wake word does and so is the likeliest thing here to fire on nothing. The
+turn's row in **Activity** grows an amber ▷ (play it here) and ⤓ (download the
+WAV) beside the pair a saved utterance already puts there. The legend above
+the list also offers **Download wake clips (.zip)** — the device's whole set in
+one archive, which is the form training wants.
+
+This exists for one question: *what woke it?* When a Dot answers a room
+nobody was talking to, the Activity row tells you a wake fired and how
+confidently, and that is all it can tell you. **Save utterances cannot help
+here, and never could** — a turn's recording deliberately starts *after* the
+wake word, because the tail of "hey jarvis" would otherwise be transcribed as
+part of your request. So the one sound worth hearing was the one sound
+nothing kept, and a false trigger you could describe but not produce is a
+false trigger you cannot fix.
+
+With the clip you can. Play it and you usually hear the culprit outright — a
+line of TV dialogue, a name that rhymes, a jingle. Then it becomes training
+data: drop the clips into `oww_forge` as negatives and retrain, and the model
+stops firing on that sound specifically, which is a better fix than moving
+**Sensitivity** toward Precise and losing real wakes along with the ghost.
+`oww_forge/README.md` has the steps.
+
+**What it does and doesn't store.** The window sits entirely *before* the
+trigger, so a clip contains the wake word and the seconds of room before it,
+and never a command — what came next is a saved utterance's job, and a
+training clip carrying somebody's actual request would be a cost with no
+benefit. While the setting is off **nothing is buffered at all** — there is no
+rolling two seconds of your room sitting anywhere waiting for the switch to be
+flipped. Kept per device: the newest **500 clips**, about 64kB each, so a
+device cannot use more than ~32MB however badly its threshold is tuned.
+
+Turning it back off stops new clips but **leaves the ones already saved**, so
+switching off doesn't destroy the corpus you were part-way through collecting.
+They stay until newer clips push them past the 500, or you delete the device,
+which removes its clips too. To clear them out sooner, delete the files from
+the controller's `data/wakes/` folder.
 
 ### Wake word detection
 Who decides you said the wake word. Three settings:
@@ -313,11 +358,13 @@ A/B **Noise suppression** or a change of position, since you can compare the
 same phrase before and after.
 
 **Off by default, and worth thinking about before switching on.** This is the
-only setting that stores recognisable speech on the controller. What's kept:
-the **last 10 turns per device**, as plain WAV files in the controller's data
+setting that stores recognisable speech on the controller. What's kept: the
+**last 10 turns per device**, as plain WAV files in the controller's data
 folder, each overwritten as newer ones arrive. Only the audio sent for
-recognition is saved — never the always-on wake-word listening, which is
-discarded continuously and never written anywhere.
+recognition is saved by this setting — the always-on wake-word listening is
+discarded continuously, and the sole exception is **Save wake clips** in the
+Wake word section, which keeps two seconds of it per wake and is off by
+default too.
 
 Turning the setting back off stops new recordings immediately, but **leaves
 the ones already saved where they are** — deliberately, so that switching off
@@ -566,6 +613,9 @@ poll loop spin without pausing, which is worse than leaving it alone.
   nowhere but HA.
 - **Saved utterance recordings** (`saveUtterances`, off by default) — written
   to disk beside the database and never uploaded.
+- **Saved wake clips** (`saveWakeClips`, off by default) — the same: written
+  to disk beside the database, and uploaded nowhere unless you download the
+  archive yourself to retrain a model with it.
 - **Device serials, WiFi credentials, network names and your fleet's
   configuration.** These live only in the controller's database.
 - **Support bundles** are built only when you ask for one, and sharing the

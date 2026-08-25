@@ -64,6 +64,7 @@ import em_player
 import em_recordings
 import em_capture
 import em_samples
+import em_wakeclips
 import em_ambient
 import em_volume
 import em_scenes
@@ -291,6 +292,14 @@ async def create_app() -> web.Application:
     app.router.add_get("/api/devices/{id}/turns",         _get_device_turns)
     app.router.add_get("/api/devices/{id}/activity",      _get_device_activity)
     app.router.add_get("/api/devices/{id}/turns/{turn}/audio", _get_turn_audio)
+    # Wake clips — the pre-detection audio that crossed the threshold. The
+    # per-turn WAV sits beside the turn's utterance because that is the pair
+    # you look at together; the archive and the purge are device-wide.
+    # wakeclips.zip before wakeclips for the file's ordering rule, though
+    # here they are two distinct literal segments and cannot collide.
+    app.router.add_get("/api/devices/{id}/turns/{turn}/wake", _get_turn_wake_audio)
+    app.router.add_get("/api/devices/{id}/wakeclips.zip",  _get_wakeclips_zip)
+    app.router.add_delete("/api/devices/{id}/wakeclips",   _delete_wakeclips)
     # Wake-word sample collection. samples.zip before samples/{name} — the
     # two cannot collide (different segment counts), but the file's ordering
     # rule is worth keeping honest.
@@ -707,6 +716,14 @@ async def _post_device_collect(request: web.Request) -> web.Response:
         "samples":   await loop.run_in_executor(
             None, em_samples.usage, device_id
         ),
+        # Both training corpora this device is filling, so the dashboard can
+        # show what arming (or disarming) collection is costing the volume
+        # without a second round trip. Wake clips accrue independently of
+        # collect mode — they are here because this is the one response that
+        # already reports per-feature disk use.
+        "wakeclips": await loop.run_in_executor(
+            None, em_wakeclips.usage, device_id
+        ),
     })
 
 
@@ -853,6 +870,131 @@ async def _delete_samples(request: web.Request) -> web.Response:
     await _push_log_event(
         device_id, "info", "controller",
         f"Deleted {removed} collected sample(s)",
+    )
+    return _ok({"deleted": removed})
+
+
+# ─── Wake clips ───────────────────────────────────────────────────────────────
+#
+# The ~2s of pre-detection audio that actually crossed the wake threshold,
+# kept per turn when saveWakeClips is on (em_wakeclips, and the ring the
+# wake_word_listener feeds it from). Sample collection above gathers wake
+# words on purpose; this gathers the ones nobody meant to say — a false
+# positive here goes straight back into oww_forge as a training negative,
+# which is the whole reason the audio is kept at all.
+
+
+@auth.require_auth
+async def _get_turn_wake_audio(request: web.Request) -> web.Response:
+    """GET /api/devices/{id}/turns/{turn}/wake — the pre-detection audio that
+    triggered one voice turn, as a downloadable WAV.
+
+    Only turns detected while saveWakeClips was on have one, and only the
+    newest em_wakeclips.KEEP_PER_DEVICE per device survive — that window is
+    shorter than the turns table's, so a turn row can carry a wake_file whose
+    file is already pruned. A 404 here is an ordinary outcome, not an error
+    state.
+
+    The filename is derived from (device, turn) rather than taken from the
+    row: em_wakeclips.resolve then re-checks that the file belongs to the
+    device in the URL, so a turn id from another device can't be used to
+    reach its audio."""
+    device_id = request.match_info["id"]
+    try:
+        turn_id = int(request.match_info["turn"])
+    except ValueError:
+        return _error("bad_request", "turn must be an integer", 400)
+
+    loop = asyncio.get_event_loop()
+    row  = await loop.run_in_executor(None, db.get_device, device_id)
+    if row is None:
+        return _error("device_not_found", f"No device: {device_id}", 404)
+
+    path = em_wakeclips.resolve(device_id, em_wakeclips.filename(turn_id))
+    if path is None:
+        return _error("no_wake_clip",
+                      "No saved wake clip for this turn", 404)
+
+    label = _slug(row["label"] or device_id)
+    return web.FileResponse(
+        path,
+        headers={
+            "Content-Type":        "audio/wav",
+            "Content-Disposition": f'attachment; filename="{label}-wake{turn_id}.wav"',
+            # Immutable once written and unique per turn, but the retention
+            # window means a name can stop resolving — so cache privately and
+            # briefly, never shared.
+            "Cache-Control":       "private, max-age=60",
+        },
+    )
+
+
+@auth.require_auth
+async def _get_wakeclips_zip(request: web.Request) -> web.Response:
+    """
+    GET /api/devices/{id}/wakeclips.zip — every wake clip in one archive.
+
+    This is what the feature is FOR: the clips are training input, and a
+    training run wants the set, not one false positive at a time. The
+    per-turn endpoint above is for deciding whether a clip belongs in the
+    set; this is how the set leaves the controller. Built in memory in an
+    executor — KEEP_PER_DEVICE bounds it at ~32MB, and streaming a zip would
+    mean either holding the response open across a prune or writing a
+    temporary file on the same volume the clips live on.
+    """
+    device_id = request.match_info["id"]
+    loop = asyncio.get_event_loop()
+    row  = await loop.run_in_executor(None, db.get_device, device_id)
+    if row is None:
+        return _error("device_not_found", f"No device: {device_id}", 404)
+
+    label = _slug(row["label"] or device_id)
+
+    def _build() -> bytes | None:
+        clips = em_wakeclips.list_for(device_id)
+        if not clips:
+            return None
+        buf = io.BytesIO()
+        # ZIP_STORED: WAV of speech does not compress meaningfully and
+        # deflating tens of MB would hold a worker for seconds.
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
+            for clip in clips:
+                path = em_wakeclips.resolve(device_id, clip["name"])
+                if path is None:
+                    continue      # pruned between listing and reading
+                z.write(path, arcname=f"{label}/{clip['name']}")
+        return buf.getvalue()
+
+    blob = await loop.run_in_executor(None, _build)
+    if blob is None:
+        return _error("no_wake_clips", "No wake clips saved yet", 404)
+    return web.Response(
+        body=blob,
+        headers={
+            "Content-Type":        "application/zip",
+            "Content-Disposition": f'attachment; filename="{label}-wakeclips.zip"',
+            "Cache-Control":       "no-store",
+        },
+    )
+
+
+@auth.require_admin
+async def _delete_wakeclips(request: web.Request) -> web.Response:
+    """DELETE /api/devices/{id}/wakeclips — drop every wake clip for this
+    device.
+
+    The turn rows keep their wake_file: the column records that a clip was
+    written, and rewriting history to hide a file someone deleted on purpose
+    would cost a write per turn to say nothing the 404 does not already."""
+    device_id = request.match_info["id"]
+    loop = asyncio.get_event_loop()
+    row  = await loop.run_in_executor(None, db.get_device, device_id)
+    if row is None:
+        return _error("device_not_found", f"No device: {device_id}", 404)
+    removed = await loop.run_in_executor(None, em_wakeclips.delete_all, device_id)
+    await _push_log_event(
+        device_id, "info", "controller",
+        f"Deleted {removed} wake clip(s)",
     )
     return _ok({"deleted": removed})
 
@@ -1271,6 +1413,11 @@ async def _apply_live_config(device_id: str, live, effective: dict) -> None:
         live.ns_asr = bool(effective["nsAsr"])
     if "saveUtterances" in effective:
         live.save_utterances = bool(effective["saveUtterances"])
+    if "saveWakeClips" in effective:
+        # The wake_word_listener reads this every chunk to decide whether to
+        # feed its ring, so a live toggle takes effect on the next frame
+        # rather than the next reconnect.
+        live.save_wake_clips = bool(effective["saveWakeClips"])
     if "endpointRelative" in effective:
         live.endpoint_relative = bool(effective["endpointRelative"])
     if "endpointLowPerMil" in effective:
@@ -4542,6 +4689,18 @@ def _controller_stats() -> dict:
         rec_dir = em_recordings.recordings_dir()
         total = sum(f.stat().st_size for f in rec_dir.iterdir() if f.is_file())
         stats["recordings_mb"] = round(total / 1048576.0, 1)
+    except OSError:
+        pass
+    try:
+        # rglob, not iterdir: the wake store is nested one directory per
+        # device, so a flat listing would count nothing but subdirectories.
+        # Reported separately from recordings_mb because the two grow for
+        # different reasons — utterance retention is a fixed handful per
+        # device, while this fills up in proportion to how badly a wake
+        # threshold is tuned, which is exactly the thing worth noticing.
+        total = sum(f.stat().st_size
+                    for f in em_wakeclips.wakes_dir().rglob("*.wav"))
+        stats["wakeclips_mb"] = round(total / 1048576.0, 1)
     except OSError:
         pass
 

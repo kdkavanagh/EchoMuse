@@ -109,7 +109,9 @@ badge).
 
 - `n_samples` — 30,000 default; 50,000–100,000 measurably helps difficult phrases.
 - `custom_negative_phrases` — add real-world confusions you observe
-  ("hey brisket") and retrain; the cheapest fix for false activations.
+  ("hey brisket") and retrain; the cheapest fix for false activations. When
+  you cannot tell what the confusion *was*, see **Negatives from a real false
+  trigger** below — the controller can hand you the audio.
 - `target_false_positives_per_hour` / `max_negative_weight` — the
   false-accept vs. false-reject trade; defaults match upstream guidance.
 - Choose a **3-4 syllable phrase**; short words make weak wake words no
@@ -201,6 +203,20 @@ would have let the shared "hey" carry it over the bar. Comma-separate
 `--phrase` to accept spelling variants, matching `target_phrase`. Tune with
 `--match-ratio`, or skip the whole thing with `--no-verify`.
 
+`--out` defaults to `./wake_clips/<label>-<date>`; point it straight at a wake
+word's `positive_train/` to skip the copy. Clips are named after the device,
+not the directory. Hold a handful back as an eval set for
+`forge test <name> --wav <dir>` — scores on real device audio are the ones
+that predict field behaviour.
+
+Two things it does that matter, and are the reason not to do this by hand:
+
+- **The button, not the wake word.** A wake-triggered turn's saved audio
+  starts *after* the phrase (the controller discards the wake-word tail), so
+  it contains no positive. Button turns keep the whole utterance.
+- **It makes the turn stream look like the wake stream.** The stream
+  openwakeword scores is the centre/omni mic, ungated and AGC-free, and the
+  recording tap sits below the controller's denoiser — so the script turns
   `nsAsr`, `agcEnabled` and `beamformingEnabled` off for the session and
   `saveUtterances` on, then **puts the device's config back exactly as it
   was on exit, Ctrl+C included** (if the restore ever fails it prints the
@@ -212,6 +228,21 @@ off (a dot press while muted refuses the turn), HA will answer every press,
 and only the newest ten recordings per device survive on the controller, so
 leave a beat between phrases.
 
+### Negatives from a real false trigger
+
+`custom_negative_phrases` fixes a false activation you can *name*. Most of
+them you cannot: a Dot answers an empty room, and the only thing anyone can
+say afterwards is that the TV was on. The controller could not help either —
+a wake turn's saved utterance begins *after* the phrase, for the reason in
+the section above, so the sound that actually crossed the threshold was
+discarded the instant after it fired the model.
+
+It is kept now, optionally, and it is a training negative that came out of
+the real microphone in the real room. On the offending device, turn
+**Config → Wake word → Save wake clips** on (`saveWakeClips`, off by
+default), leave it to misfire for a day or two, then download its wake clips
+from the Activity panel as `<device>-wakeclips.zip`. Each entry is a 2s 16kHz
+mono WAV ending at the crossing, tapped on the wake stream itself — the same
 property `collect_device_clips.py` works so hard for on the positive side,
 except that here it costs nothing, since there is no phrase to verify and
 nothing to trim. The archive holds them under a directory named for the
@@ -236,6 +267,28 @@ Two things to do with them, in this order:
 
 ```bash
 cd oww_forge
+unzip -j ~/Downloads/lounge-wakeclips.zip -d data/wakeclips   # ./data is /data inside
+
+# hold a handful back as the eval set, chosen by ear
+mkdir -p data/eval/hey_clara_fp
+mv data/wakeclips/412.wav data/wakeclips/519.wav data/eval/hey_clara_fp/
+
+# what does the current model make of them? (high — they fired it)
+docker compose run --rm forge test hey_clara --wav /data/eval/hey_clara_fp
+
+mv data/wakeclips/*.wav data/wakewords/hey_clara/hey_clara/negative_train/
+docker compose run --rm forge build hey_clara --from-step augment
+
+# and after: what fired the old model should score well under the ~0.5 threshold
+docker compose run --rm forge test hey_clara --wav /data/eval/hey_clara_fp
+```
+
+Hold those few clips back **before** they reach `negative_train`, for the same
+reason positives get an eval set: a clip that was trained on scores low
+whatever the model actually learned. And check the retrained model still
+wakes — `forge test` against the positives you held back is the other half of
+the answer, because a model taught not to fire on your living room can learn
+not to fire at all.
 
 ### Testing a built model
 
