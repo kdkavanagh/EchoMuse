@@ -58,6 +58,7 @@ import em_ble_proxy
 import em_config_sections as sections_mod
 import em_oww_assets
 import em_oww_models
+import em_wake_scorer
 import em_pki
 import em_player
 import em_recordings
@@ -1108,8 +1109,17 @@ async def _apply_live_config(device_id: str, live, effective: dict) -> None:
         # acting on its own detections while waiting for wakes the device has
         # no code to send, leaving it deaf. em_shadow.effective_mode degrades
         # that to shadow.
+        #
+        # It also degrades to off entirely for a model the device's engine
+        # cannot run — the owwModel block above has already updated
+        # live.oww_model, so this reads the value being applied and not the
+        # previous one.
         live.oww_on_device = em_shadow.effective_mode(
-            effective["owwOnDevice"], live.oww_trigger_capable
+            effective["owwOnDevice"], live.oww_trigger_capable,
+            device_scorable=em_shadow.device_can_score(
+                effective.get("owwModel", live.oww_model),
+                bcresnet_capable=live.oww_bcresnet_capable,
+            ),
         )
     if "timerSound" in effective:
         live.timer_sound = effective["timerSound"] or None
@@ -1609,15 +1619,29 @@ async def _post_oww_model_upload(request: web.Request) -> web.Response:
     """
     try:
         reader = await request.multipart()
-        field  = await reader.next()
-        if field is None or field.name != "model":
+        fname: str | None = None
+        data: bytes | None = None
+        sidecar_raw: bytes | None = None
+        # Read every part rather than assuming order: a BC-ResNet model needs
+        # its .json alongside, and a browser is free to send the two fields
+        # either way round.
+        while True:
+            field = await reader.next()
+            if field is None:
+                break
+            if field.name == "model":
+                fname = em_oww_models.safe_model_filename(field.filename or "")
+                if fname is None:
+                    return _error("invalid_filename",
+                                  "Model must be a .onnx file with a simple name "
+                                  "(letters, digits, _ - . only)", 400)
+                data = await field.read()
+            elif field.name == "sidecar":
+                sidecar_raw = await field.read()
+            else:
+                await field.read()   # drain, so the reader can advance
+        if data is None:
             return _error("invalid_upload", "Expected multipart field 'model'", 400)
-        fname = em_oww_models.safe_model_filename(field.filename or "")
-        if fname is None:
-            return _error("invalid_filename",
-                          "Model must be a .onnx file with a simple name "
-                          "(letters, digits, _ - . only)", 400)
-        data = await field.read()
         if not data:
             return _error("empty_upload", "Uploaded model is empty", 400)
         if len(data) > em_oww_models.MAX_MODEL_BYTES:
@@ -1625,18 +1649,77 @@ async def _post_oww_model_upload(request: web.Request) -> web.Response:
 
         directory = em_oww_models.models_dir()
         directory.mkdir(parents=True, exist_ok=True)
+
+        # Classify BEFORE installing. Until 2026-08-17 nothing here looked at
+        # the graph at all — name, size and a 20 MB cap were the whole of it —
+        # so a model the controller cannot run installed cleanly, deployed
+        # cleanly, and then failed at scoring time on a device, which is the
+        # worst place to find out. The file is written to a temp path first so
+        # onnxruntime can open it, and only a recognised family is ever renamed
+        # into the models dir.
         fd, tmp_path = tempfile.mkstemp(dir=directory, suffix=".tmp")
+        sidecar_tmp = None
         try:
             with os.fdopen(fd, "wb") as f:
                 f.write(data)
-            os.replace(tmp_path, directory / fname)
-        except BaseException:
             try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
-        log.info(f"[api] Wake model installed: {fname} ({len(data):,} bytes)")
+                kind, shape = em_wake_scorer.inspect_model_file(tmp_path)
+            except Exception as e:
+                return _error("invalid_model",
+                              f"Not a loadable ONNX model: {e}", 400)
+
+            if kind == em_wake_scorer.TYPE_BCRESNET_FEATURES:
+                # Named specifically because this is the file people will
+                # actually grab: train_qc.py's DEFAULT export mode writes this
+                # graph, to a file called bcresnet.onnx. "Unrecognised input
+                # shape" would send someone debugging the controller when the
+                # fix is one flag in the training repo.
+                return _error(
+                    "features_in_model",
+                    f"This is the log-mel-in BC-ResNet export (input {shape}), which "
+                    f"needs a mel frontend the controller does not have. Re-export it "
+                    f"with `--onnx_input audio` to get a model that takes raw audio.",
+                    400)
+            if kind == em_wake_scorer.TYPE_BCRESNET:
+                if not sidecar_raw:
+                    return _error(
+                        "sidecar_required",
+                        "A BC-ResNet model needs its .json sidecar uploaded alongside "
+                        "it — the .onnx cannot say which of its logits is the wake "
+                        "word, and guessing scores the wrong class.", 400)
+                try:
+                    spec = em_wake_scorer.parse_spec(json.loads(sidecar_raw))
+                except Exception as e:
+                    return _error("invalid_sidecar", f"Sidecar is not usable: {e}", 400)
+                if spec.window != shape[1]:
+                    return _error(
+                        "sidecar_mismatch",
+                        f"Sidecar says window={spec.window} but the model takes "
+                        f"{shape[1]} samples — mismatched .onnx/.json pair.", 400)
+                sc_fd, sidecar_tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")
+                with os.fdopen(sc_fd, "wb") as f:
+                    f.write(sidecar_raw)
+            elif kind != em_wake_scorer.TYPE_OWW:
+                return _error(
+                    "unsupported_model",
+                    f"Unrecognised model input shape {shape} — "
+                    f"{em_wake_scorer.describe_accepted_shapes()}.", 400)
+
+            # Sidecar first: a .onnx present without its .json reads as an
+            # openWakeWord model and would be scored as one.
+            if sidecar_tmp:
+                os.replace(sidecar_tmp, em_wake_scorer.sidecar_path(directory / fname))
+                sidecar_tmp = None
+            os.replace(tmp_path, directory / fname)
+            tmp_path = None
+        finally:
+            for leftover in (tmp_path, sidecar_tmp):
+                if leftover:
+                    try:
+                        os.unlink(leftover)
+                    except OSError:
+                        pass
+        log.info(f"[api] Wake model installed: {fname} ({len(data):,} bytes, {kind})")
         entry = next((m for m in em_oww_models.scan() if m["file"] == fname), None)
         return _ok({"model": entry}, status=201)
     except Exception as e:
@@ -1669,6 +1752,11 @@ async def _delete_oww_model(request: web.Request) -> web.Response:
                       f"Model is selected by: {', '.join(users)}", 409)
 
     path.unlink()
+    # The sidecar goes with it. Left behind it would be orphaned, and worse, a
+    # later upload reusing the stem would inherit someone else's wakeIndex and
+    # labels — a detector that runs and scores the wrong class.
+    sidecar = em_wake_scorer.sidecar_path(path)
+    sidecar.unlink(missing_ok=True)
     log.info(f"[api] Wake model deleted: {fname}")
     return _ok({"deleted": fname})
 
@@ -3840,11 +3928,22 @@ async def _sync_oww_assets(live, device_id: str, progress=None) -> dict:
         if progress:
             await progress(level, msg)
 
-    desired, problems = em_oww_assets.desired_assets(_oww_wanted_models(device_id))
+    desired, problems = em_oww_assets.desired_assets(
+        _oww_wanted_models(device_id),
+        bcresnet_capable=getattr(live, "oww_bcresnet_capable", False),
+    )
     for p in problems:
         await say("warn", p)
     if not desired:
         return {"ok": False, "error": "; ".join(problems) or "nothing to install"}
+    if not any(a.kind == "classifier" for a in desired):
+        # The runtime and the shared models cannot produce a detector on their
+        # own, so carrying on would push ~12MB, report success, and leave a
+        # device that scores nothing with nothing on it saying why. That is the
+        # exact shape of "a step reported success having achieved nothing".
+        err = "; ".join(problems) or "no wake model is configured for this device"
+        await say("error", err)
+        return {"ok": False, "error": err}
 
     state = await _oww_device_state(live)
     plan = em_oww_assets.plan_sync(desired, state["installed"], state["free_mb"])
@@ -3872,10 +3971,14 @@ async def _sync_oww_assets(live, device_id: str, progress=None) -> dict:
 
         dest = em_oww_assets.device_path(asset.name)
         part = f"{dest}.part"
-        pushed = await _stream_file_to_device(live, data, part, mode="644")
-        if not pushed:
-            await say("error", f"{asset.name} transfer failed: {pushed}")
-            return {"ok": False, "error": f"{asset.name}: {pushed}"}
+        # NOT `pushed`: that is the accumulator this loop returns, and
+        # assigning the transfer result over it made the first SUCCESSFUL
+        # transfer crash on `pushed.append`. The failure path never touched it,
+        # so this survived every test that exercised a failing push.
+        xfer = await _stream_file_to_device(live, data, part, mode="644")
+        if not xfer:
+            await say("error", f"{asset.name} transfer failed: {xfer}")
+            return {"ok": False, "error": f"{asset.name}: {xfer}"}
 
         res = await _shell_run(live, (
             f'GOT=$(busybox md5sum {part} | busybox cut -d" " -f1); '
@@ -3908,7 +4011,10 @@ async def _get_oww_assets(request: web.Request) -> web.Response:
     device_id = request.match_info["id"]
     live = _devices.get(device_id)
 
-    desired, problems = em_oww_assets.desired_assets(_oww_wanted_models(device_id))
+    desired, problems = em_oww_assets.desired_assets(
+        _oww_wanted_models(device_id),
+        bcresnet_capable=getattr(live, "oww_bcresnet_capable", False),
+    )
     payload = {
         "device_dir": em_oww_assets.DEVICE_DIR,
         "problems": problems,
@@ -3966,7 +4072,10 @@ async def _get_provision_oww_manifest(request: web.Request) -> web.Response:
     """
     fleet = db.get_global_device_config() or {}
     models = [m for m in [fleet.get("owwModel") or ""] if m]
-    desired, problems = em_oww_assets.desired_assets(models)
+    # The wizard installs the firmware it is shipping with, so the BC-ResNet
+    # engine is present by construction — unlike the field path, where the
+    # device on the other end may predate it and has to be asked.
+    desired, problems = em_oww_assets.desired_assets(models, bcresnet_capable=True)
     return _ok({
         "dir": em_oww_assets.DEVICE_DIR,
         "problems": problems,
@@ -3986,7 +4095,7 @@ async def _get_provision_oww_asset(request: web.Request) -> web.Response:
     name = request.match_info["name"]
     fleet = db.get_global_device_config() or {}
     desired, _ = em_oww_assets.desired_assets(
-        [m for m in [fleet.get("owwModel") or ""] if m])
+        [m for m in [fleet.get("owwModel") or ""] if m], bcresnet_capable=True)
     asset = next((a for a in desired if a.name == name), None)
     if asset is None:
         return _error("not_found", f"{name} is not a current asset", 404)
@@ -4572,9 +4681,8 @@ def _merge_device(row) -> dict:
         # without being able to act on it, and offering those "on" produces a
         # device that never answers.
         "owwTriggerCapable": getattr(live, "oww_trigger_capable", False) if live else False,
+        "owwBcresnetCapable": getattr(live, "oww_bcresnet_capable", False) if live else False,
         "audioMixCapable": getattr(live, "audio_mix_capable", False) if live else False,
-        # Native AFE (docs/native-afe-migration.md): whether this device's
-        # audio is running through Android's audio HAL right now. Drives the
         # dashboard disabling the beamformer/AEC/AGC/gain controls that path
         # bypasses — "disabled with the reason", never a control that
         # silently does nothing.

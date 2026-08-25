@@ -218,7 +218,7 @@ func (i *Inferer) Melspec(samples []float32) ([]float32, int, error) {
 		return nil, 0, errors.New("ort: melspec called with no samples")
 	}
 	shape := [2]C.int64_t{1, C.int64_t(len(samples))}
-	out, err := i.run(i.mel, samples, shape[:])
+	out, err := i.mel.run(samples, shape[:])
 	if err != nil {
 		return nil, 0, err
 	}
@@ -238,7 +238,7 @@ func (i *Inferer) Embed(window []float32) ([]float32, error) {
 		return nil, fmt.Errorf("ort: embed wants %d values, got %d", want, len(window))
 	}
 	shape := [4]C.int64_t{1, wakeword.MelWindow, wakeword.MelBins, 1}
-	out, err := i.run(i.emb, window, shape[:])
+	out, err := i.emb.run(window, shape[:])
 	if err != nil {
 		return nil, err
 	}
@@ -258,7 +258,7 @@ func (i *Inferer) Classify(feats []float32) (float32, error) {
 		return 0, fmt.Errorf("ort: classify wants %d values, got %d", want, len(feats))
 	}
 	shape := [3]C.int64_t{1, wakeword.FeatWindow, wakeword.FeatDim}
-	out, err := i.run(i.cls, feats, shape[:])
+	out, err := i.cls.run(feats, shape[:])
 	if err != nil {
 		return 0, err
 	}
@@ -273,7 +273,10 @@ func (i *Inferer) Classify(feats []float32) (float32, error) {
 // non-pointer data) and copies the malloc'd output into the model's reusable
 // buffer before returning, so no C allocation outlives this function and the
 // steady state does not allocate.
-func (i *Inferer) run(m *model, in []float32, shape []C.int64_t) ([]float32, error) {
+// A method on *model rather than on *Inferer: it never used the Inferer for
+// anything but the model it was handed, and the BC-ResNet path opens a single
+// session with no Inferer to hang it off.
+func (m *model) run(in []float32, shape []C.int64_t) ([]float32, error) {
 	var (
 		outPtr *C.float
 		outN   C.size_t

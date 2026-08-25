@@ -59,7 +59,6 @@ import struct
 
 import numpy as np
 from aiohttp import web
-from openwakeword.model import Model as OWWModel
 from zeroconf.asyncio import AsyncZeroconf
 from zeroconf import ServiceInfo
 import websockets
@@ -81,6 +80,7 @@ import em_tap_burst
 import em_esphome as esphome
 import em_ble_proxy
 import em_oww_models
+import em_wake_scorer
 import em_player
 import em_volume
 import em_sounds
@@ -1127,13 +1127,13 @@ async def _barge_watcher(device: Device, playback_started: asyncio.Event):
         name = device.oww_model
         log.info(f"[{device.device_id}] Barge-in: loading watcher model {name}")
         device._barge_model = await loop.run_in_executor(
-            None, lambda: OWWModel(wakeword_models=[name])
+            None, lambda: em_wake_scorer.build(name)
         )
         device._barge_model_key = name
+        log.info(f"[{device.device_id}] Barge-in: {device._barge_model.info}")
     model = device._barge_model
-    # _barge_model_key stays the raw owwModel value (staleness compare
-    # above); scoring needs the openwakeword prediction key (path → stem).
-    barge_pred_key = em_oww_models.prediction_key(device._barge_model_key)
+    # _barge_model_key stays the raw owwModel value, for the staleness compare
+    # above; turning it into whatever the scorer needs is the scorer's job now.
     model.reset()
 
     # Drop anything queued before the watcher started (command tail,
@@ -1185,9 +1185,16 @@ async def _barge_watcher(device: Device, playback_started: asyncio.Event):
                 rms = float(np.sqrt(np.mean((samples.astype(np.float64) / 32768.0) ** 2)))
                 rms_sum += rms
                 rms_max  = max(rms_max, rms)
-                prediction = await loop.run_in_executor(None, model.predict, samples)
-                score = prediction.get(barge_pred_key, 0.0)
+                score = await loop.run_in_executor(None, model.push, samples)
                 frames += 1
+                # No score for this chunk (see the wake listener). `prev_score`
+                # is deliberately left alone rather than zeroed: the two-tier
+                # rule below wants two consecutive SCORED frames above the low
+                # tier, and on a hopped scorer the frames between hops are not
+                # evidence against a barge — writing 0.0 there would break every
+                # two-frame pair the rule exists to catch.
+                if score is None:
+                    continue
                 in_playback = playback_started.is_set()
                 if in_playback:
                     threshold = device.barge_threshold
@@ -1233,11 +1240,15 @@ async def _barge_watcher(device: Device, playback_started: asyncio.Event):
                     # record — popped when the turn loop re-enters
                     # trigger_voice_turn with trigger "barge-in".
                     device.last_wake = {
-                        "model":       barge_pred_key,
+                        # Same stem the wake listener records, so a barge turn
+                        # and an ordinary one land under one key in the
+                        # per-model activity rollup.
+                        "model":       em_oww_models.prediction_key(device._barge_model_key),
                         "score":       round(float(score), 4),
                         "threshold":   float(threshold),
                         "noise_floor": round(device.noise_floor, 5),
                     }
+                    # The audio that cancelled the response. Parked in its own
                     device.cancel_event.set()
                     if in_playback:
                         await device.send_control({"type": "speaker_flush"})
@@ -2240,16 +2251,16 @@ async def wake_word_listener(device: Device):
         f"[{device.device_id}] OWW: loading model {current_model_name} "
         f"(speex_ns={current_speex_ns})"
     )
+    # em_wake_scorer picks the model family from the file itself (a BC-ResNet
+    # model is the one with a .json sidecar beside it) and hands back a scorer
+    # with the same two-method surface either way. The prediction-key dance for
+    # custom openWakeWord models — owwModel is a path, openwakeword keys by the
+    # filename STEM — lives inside OwwScorer now.
     model = await loop.run_in_executor(
         None,
-        lambda: OWWModel(
-            wakeword_models=[current_model_name],
-            enable_speex_noise_suppression=current_speex_ns,
-        ),
+        lambda: em_wake_scorer.build(current_model_name, speex_ns=current_speex_ns),
     )
-    # NB: for custom models owwModel is a file path but openwakeword keys
-    # the prediction dict by the filename stem — never score by the raw name.
-    model_key = em_oww_models.prediction_key(current_model_name)
+    log.info(f"[{device.device_id}] OWW: scorer ready — {model.info}")
 
     log.info(f"[{device.device_id}] OWW: starting (initial threshold={device.oww_threshold:.3f})")
     await device.mic_start()
@@ -2286,17 +2297,16 @@ async def wake_word_listener(device: Device):
                     _s = new_speex
                     new_model = await loop.run_in_executor(
                         None,
-                        lambda: OWWModel(
-                            wakeword_models=[_n],
-                            enable_speex_noise_suppression=_s,
-                        ),
+                        lambda: em_wake_scorer.build(_n, speex_ns=_s),
                     )
                     model             = new_model
-                    model_key         = em_oww_models.prediction_key(new_name)
                     current_model_name = new_name
                     current_speex_ns  = new_speex
                     buf.clear()
-                    log.info(f"[{device.device_id}] OWW: model reloaded → {new_name} (speex_ns={new_speex})")
+                    log.info(
+                        f"[{device.device_id}] OWW: model reloaded → {new_name} "
+                        f"(speex_ns={new_speex}) — {model.info}"
+                    )
                 except Exception as e:
                     log.error(
                         f"[{device.device_id}] OWW: failed to load {new_name} "
@@ -2465,10 +2475,20 @@ async def wake_word_listener(device: Device):
                     device.pending_wake.take()
                     continue
 
-                prediction = await loop.run_in_executor(
-                    None, model.predict, samples
-                )
-                score = prediction.get(model_key, 0.0)
+                # The ring is fed here, immediately before the inference it
+                # exists to explain, so a clip is exactly the frames the model
+                # scored — the same tap and the same reason as em_samples. A
+                score = await loop.run_in_executor(None, model.push, samples)
+                # None is "this chunk produced no score", not a low score.
+                # openWakeWord scores every 80ms chunk and never returns it;
+                # BC-ResNet scores a 1.4s window on a hop, so most chunks
+                # produce nothing, and one that is below the silence floor is
+                # deliberately not judged at all. Feeding any of those to the
+                # threshold compare or the near-miss counters would invent a
+                # zero for audio nobody looked at — which reads in the rollup
+                # as a detector that saw the room and declined.
+                if score is None:
+                    continue
 
                 # Log any score above noise floor so we can see near-misses
                 # and understand whether failed wakes are "close but below
@@ -2700,7 +2720,11 @@ async def wake_word_listener(device: Device):
                             dev_wake["at"] if source == "device" else em_shadow.now()
                         )
                         device.last_wake = {
-                            "model":       model_key,
+                            # The stem, as before: turns rows and the per-model
+                            # activity rollup key on it, so it must stay the
+                            # same string for an openWakeWord model whichever
+                            # scorer produced the score.
+                            "model":       em_oww_models.prediction_key(current_model_name),
                             "score":       round(float(score), 4),
                             # The EFFECTIVE threshold this wake actually cleared,
                             # not the nominal one. During playback with barge-in
@@ -3157,7 +3181,11 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
         # why "on" against firmware that cannot trigger must become shadow
         # rather than being honoured.
         device.oww_on_device = em_shadow.effective_mode(
-            config.get("owwOnDevice"), device.oww_trigger_capable
+            config.get("owwOnDevice"), device.oww_trigger_capable,
+            device_scorable=em_shadow.device_can_score(
+                config.get("owwModel"),
+                bcresnet_capable=device.oww_bcresnet_capable,
+            ),
         )
         device.timer_sound   = config.get("timerSound") or None
         device.timer_ring_seconds = int(config.get("timerRingSeconds", 60))

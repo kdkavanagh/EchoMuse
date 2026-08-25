@@ -363,7 +363,10 @@ def test_the_wake_model_is_not_scored_while_collecting():
     collecting for an afternoon."""
     src  = CONTROLLER.read_text()
     body = src.split("async def wake_word_listener", 1)[1].split("\nasync def ", 1)[0]
-    assert body.index("_collect_frame") < body.index("model.predict"), \
+    # `model` is an em_wake_scorer.WakeScorer; push() is the scoring call for
+    # both families. (It was `model.predict` while openWakeWord was the only
+    # backend — the invariant is unchanged, only the spelling.)
+    assert body.index("_collect_frame") < body.index("model.push"), \
         "the collect branch must take the frame before the model scores it"
 
 

@@ -240,7 +240,36 @@ class PendingWake:
         return self._wake is not None
 
 
-def effective_mode(configured, trigger_capable: bool) -> str:
+def device_can_score(oww_model, bcresnet_capable: bool) -> bool:
+    """
+    Whether the DEVICE's engines can run the configured model.
+
+    The device picks its engine from the sidecar sitting beside the installed
+    model — exactly the rule em_wake_scorer.is_bcresnet_model applies here — so
+    the only question the controller has to answer is whether the firmware
+    carries the engine that rule will select.
+
+    Kept as a named function rather than inlined at the two call sites because
+    the wrong answer is silent in both directions: False for a capable device
+    disables on-device scoring forever with the reason "the Echo cannot run
+    this", and True for one without the engine leaves it loading the
+    openWakeWord pipeline against a graph that is not an openWakeWord
+    classifier.
+
+    A model with no sidecar is openWakeWord, which every shadow-capable
+    firmware can run — so the answer is True and nothing about the existing
+    fleet changes.
+    """
+    import em_wake_scorer  # local: em_shadow is imported by the test suite,
+                           # which has numpy but need not pay for it here
+
+    if not em_wake_scorer.is_bcresnet_model(oww_model):
+        return True
+    return bool(bcresnet_capable)
+
+
+def effective_mode(configured, trigger_capable: bool,
+                   device_scorable: bool = True) -> str:
     """
     The mode actually in force, given what the device can do.
 
@@ -255,8 +284,20 @@ def effective_mode(configured, trigger_capable: bool) -> str:
     The dashboard refuses to offer "on" to such a device in the first place, so
     reaching this normally means firmware was rolled back under a config that
     was valid when it was set.
+
+    `device_scorable` is the OTHER half: the device can only score models its
+    engine understands, and a BC-ResNet model is not one — the device's scorer
+    is openWakeWord, so it would go on scoring whichever classifier happens to
+    be installed while the controller scores something else entirely. That
+    degrades to "off", not to "shadow", because shadow's whole purpose is to
+    compare the two detectors on the same audio AND the same model; two
+    different models produce a stream of confident disagreement that reads as
+    the device missing wakes it was never asked for. Off is the old behaviour;
+    a shadow column full of manufactured misses is a wrong answer.
     """
     mode = normalise_mode(configured)
+    if mode != MODE_OFF and not device_scorable:
+        return MODE_OFF
     if mode == MODE_ON and not trigger_capable:
         return MODE_SHADOW
     return mode

@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/wilbowes/EchoMuse/internal/wakeword"
+	"github.com/wilbowes/EchoMuse/internal/wakeword/bcresnet"
 	"github.com/wilbowes/EchoMuse/internal/wakeword/ort"
 )
 
@@ -47,8 +49,18 @@ func ModelStem(owwModel string) string {
 	return strings.TrimSuffix(filepath.Base(name), ".onnx")
 }
 
-// Open loads ONNX Runtime and the three models for owwModel, and starts a
-// Scorer.
+// SidecarPath is the BC-ResNet sidecar that would sit beside a model stem.
+//
+// Its EXISTENCE is what marks a model as BC-ResNet, at both ends — never the
+// filename, which is user-chosen, and never a config key, which would let the
+// two ends disagree about a file only one of them can see. em_oww_models.scan
+// and em_wake_scorer.is_bcresnet_model apply exactly this rule.
+func SidecarPath(dir, stem string) string {
+	return filepath.Join(dir, stem+".json")
+}
+
+// Open loads ONNX Runtime and whichever engine the installed model calls for,
+// and starts a Scorer.
 //
 // A missing library or model returns an error and is NOT a failure of the
 // device: shadow mode is off until someone installs them, the caller logs it
@@ -60,7 +72,60 @@ func Open(owwModel string, threshold float32, onCross func(score, threshold floa
 	if stem == "" {
 		return nil, fmt.Errorf("shadow: no wake word model configured")
 	}
+	if _, err := os.Stat(SidecarPath(dir, stem)); err == nil {
+		return openBcresnet(dir, stem, threshold, onCross)
+	}
+	return openOww(dir, stem, threshold, onCross)
+}
 
+// openBcresnet loads a single-graph BC-ResNet detector.
+//
+// It needs neither of openWakeWord's shared feature models — the log-mel
+// frontend is inside the graph — so it must not check for them. A device
+// carrying only a BC-ResNet model is correctly provisioned, and demanding
+// melspectrogram.onnx here would refuse it for a file it will never open.
+func openBcresnet(dir, stem string, threshold float32, onCross func(score, threshold float32, at time.Time)) (*Scorer, error) {
+	sidecar := SidecarPath(dir, stem)
+	spec, err := bcresnet.LoadSpec(sidecar)
+	if err != nil {
+		return nil, fmt.Errorf("shadow: %w", err)
+	}
+	if spec.SampleRate != wakeword.SampleRate {
+		return nil, fmt.Errorf(
+			"shadow: %s wants %dHz audio but the mic pipeline delivers %d",
+			filepath.Base(sidecar), spec.SampleRate, wakeword.SampleRate)
+	}
+
+	modelPath := filepath.Join(dir, stem+".onnx")
+	if _, err := os.Stat(modelPath); err != nil {
+		return nil, fmt.Errorf("shadow: BC-ResNet model not installed at %s", modelPath)
+	}
+
+	rt, err := ort.Open(filepath.Join(dir, "libonnxruntime.so"))
+	if err != nil {
+		return nil, fmt.Errorf("shadow: %w", err)
+	}
+	sess, err := rt.NewSingle(modelPath, spec.Window, ort.DefaultOptions())
+	if err != nil {
+		return nil, fmt.Errorf("shadow: %w", err)
+	}
+	det, err := bcresnet.New(sess, spec, bcresnet.Options{})
+	if err != nil {
+		sess.Close()
+		return nil, fmt.Errorf("shadow: %w", err)
+	}
+
+	s := NewEngineScorer(&bcresnetEngine{det: det}, threshold, onCross)
+	s.closer = sess
+	s.info = fmt.Sprintf(
+		"bcresnet via onnxruntime %s, model %s, wake %q@%d, %.2fs window, xnnpack=%v",
+		rt.Version(), stem, spec.WakeLabel(), spec.WakeIndex,
+		float64(spec.Window)/float64(spec.SampleRate), sess.XNNPACKActive())
+	return s, nil
+}
+
+// openOww loads openWakeWord's three-model streaming pipeline.
+func openOww(dir, stem string, threshold float32, onCross func(score, threshold float32, at time.Time)) (*Scorer, error) {
 	models := ort.Models{
 		Melspec:    filepath.Join(dir, "melspectrogram.onnx"),
 		Embedding:  filepath.Join(dir, "embedding_model.onnx"),

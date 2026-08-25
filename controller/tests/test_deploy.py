@@ -1039,3 +1039,49 @@ def test_bundle_live_state_carries_ambient_light_status():
         "em_api's live_state must include ambient_light_status so support "
         "bundles can answer why a device reports no light sensor"
     )
+
+
+def test_asset_sync_does_not_clobber_its_own_accumulator():
+    """
+    `_sync_oww_assets` collects installed names in `pushed` and returns it.
+    A transfer result was once assigned straight over that list, so the first
+    SUCCESSFUL push crashed on `pushed.append` with an AttributeError — and
+    every failing-transfer test passed, because the failure path returns before
+    reaching the append.
+
+    That is the shape worth pinning: the bug is invisible to any test that does
+    not drive a transfer all the way to success, which on this endpoint means
+    a real device and 15MB over the shell plane.
+    """
+    import ast
+    src = (CONTROLLER / "em_api.py").read_text()
+    tree = ast.parse(src)
+
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.AsyncFunctionDef) and n.name == "_sync_oww_assets")
+
+    # Names that accumulate with .append inside this function.
+    accumulators = {
+        n.func.value.id
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "append" and isinstance(n.func.value, ast.Name)
+    }
+    assert accumulators, "no accumulator found — has the function been rewritten?"
+
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Assign):
+            continue
+        call = node.value
+        if isinstance(call, ast.Await):
+            call = call.value
+        if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                and call.func.id == "_stream_file_to_device"):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id in accumulators:
+                raise AssertionError(
+                    f"_sync_oww_assets assigns the transfer result to "
+                    f"'{target.id}', which it also appends to — the first "
+                    f"successful push will raise AttributeError"
+                )

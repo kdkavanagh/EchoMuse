@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import em_oww_models
+import em_wake_scorer
 
 # Where the device expects everything. Must match shadow.DefaultDir in
 # device/internal/wakeword/shadow/open.go — there is a test.
@@ -167,7 +168,8 @@ class Plan:
 def desired_assets(models: list[str],
                    runtime_dir: str | Path = RUNTIME_DIR,
                    resources: Path | None = None,
-                   models_dir: Path | None = None) -> tuple[list[Asset], list[str]]:
+                   models_dir: Path | None = None,
+                   bcresnet_capable: bool = False) -> tuple[list[Asset], list[str]]:
     """
     Build the asset list for a device that should be able to score `models`.
 
@@ -178,6 +180,14 @@ def desired_assets(models: list[str],
 
     `models` is ordered most-important-first; the first entry is the one the
     device is currently configured to use.
+
+    `bcresnet_capable` is the device's `oww_bcresnet` capability. A BC-ResNet
+    model is planned as a PAIR — the .onnx plus its .json sidecar — because the
+    device decides which engine to load from the sidecar's presence, so sending
+    the model without it produces a device that loads the openWakeWord pipeline
+    against a graph that is not an openWakeWord classifier. Defaults to False so
+    a caller that has not been taught about the capability refuses rather than
+    ships a half-installed pair.
     """
     if resources is None:
         resources = openwakeword_resources()
@@ -213,12 +223,41 @@ def desired_assets(models: list[str],
         if not stem or stem in seen:
             continue
         seen.add(stem)
+        is_bcresnet = em_wake_scorer.is_bcresnet_model(model)
+        if is_bcresnet and not bcresnet_capable:
+            # A BC-ResNet .onnx is a whole detector — its own log-mel frontend
+            # and a 22400-sample audio input — where openWakeWord's scorer
+            # expects a classifier HEAD taking [1,16,96] off the shared
+            # embedding model. Firmware without the engine would install a file
+            # named exactly what it looks for and fail at session creation,
+            # which reads as a broken install rather than an unsupported model.
+            problems.append(
+                f"wake model '{stem}' is BC-ResNet and this device's firmware "
+                f"has no BC-ResNet engine — the controller scores it instead; "
+                f"update the device, or pick an openWakeWord model"
+            )
+            continue
         src = classifier_source(model, resources, models_dir)
         if src is None:
             problems.append(f"wake model '{model}' has no .onnx the device could use")
             continue
         assets.append(Asset(f"{stem}.onnx", src, md5_file(src),
                             src.stat().st_size, "classifier"))
+        if is_bcresnet:
+            # The sidecar is what makes the device choose the BC-ResNet engine,
+            # so the pair is planned together and never separately. A model
+            # without its sidecar is silently the wrong engine; a sidecar
+            # without its model is an error that at least names itself.
+            side = em_wake_scorer.sidecar_path(src)
+            if not side.is_file():
+                problems.append(
+                    f"wake model '{stem}' has no {side.name} beside it — "
+                    f"a BC-ResNet model cannot be installed without its sidecar"
+                )
+                assets.pop()
+                continue
+            assets.append(Asset(side.name, side, md5_file(side),
+                                side.stat().st_size, "sidecar"))
 
     return assets, problems
 
@@ -280,6 +319,18 @@ def plan_sync(desired: list[Asset],
     room = max(0, slots - len(desired_classifiers))
     p.keep.extend(extras[:room])
     p.prune.extend(extras[room:])
+
+    # A sidecar is evicted WITH its classifier. Leaving one behind would make
+    # the device take the BC-ResNet path for a stem whose model is gone — and,
+    # worse, for whatever openWakeWord model is later installed under that
+    # name, since the sidecar's presence is the whole of the engine decision.
+    # Orphans with no matching .onnx on the device are still left alone: this
+    # only cleans up after its own eviction, keeping "delete only what it
+    # positively recognises" true.
+    for name in list(p.prune):
+        side = name[: -len(".onnx")] + ".json"
+        if side in actual and side not in required:
+            p.prune.append(side)
 
     return p
 

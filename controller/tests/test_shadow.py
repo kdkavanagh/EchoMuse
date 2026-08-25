@@ -163,6 +163,30 @@ def test_capability_does_not_promote_a_lesser_mode():
         assert em_shadow.effective_mode(mode, trigger_capable=True) == mode
 
 
+def test_a_model_the_device_cannot_score_degrades_all_the_way_to_off():
+    """
+    Not to shadow. Shadow compares two detectors on the same audio AND the
+    same model; a device holding an openWakeWord classifier while the
+    controller scores BC-ResNet is comparing two different questions, and
+    every turn would be recorded as an on-device miss for a model the device
+    was never given. Off is the old behaviour; a shadow column full of
+    manufactured misses is a wrong answer.
+    """
+    for mode in ("on", "shadow"):
+        assert em_shadow.effective_mode(
+            mode, trigger_capable=True, device_scorable=False
+        ) == em_shadow.MODE_OFF
+
+
+def test_scorability_is_assumed_unless_stated():
+    """The default keeps every existing caller and every openWakeWord model
+    on exactly the path they were on."""
+    assert em_shadow.effective_mode("shadow", trigger_capable=True) == em_shadow.MODE_SHADOW
+    assert em_shadow.effective_mode(
+        "shadow", trigger_capable=True, device_scorable=True
+    ) == em_shadow.MODE_SHADOW
+
+
 def test_in_on_mode_only_the_device_triggers():
     """The controller keeps scoring — that is the comparison — but its own
     crossing must not start a turn, or every utterance is answered twice."""
@@ -266,3 +290,47 @@ def test_absurd_wake_age_is_clamped_and_then_dropped():
     wake, age = p.take(at_now=1000.0)
     assert wake is None
     assert age == pytest.approx(em_shadow.MAX_AGE_S)
+
+
+# ── which models the DEVICE's engines can run ───────────────────────────────
+
+
+def _model(tmp_path, stem, sidecar: bool):
+    p = tmp_path / f"{stem}.onnx"
+    p.write_bytes(b"onnx")
+    if sidecar:
+        (tmp_path / f"{stem}.json").write_text('{"window": 22400}')
+    return str(p)
+
+
+def test_an_openwakeword_model_is_scorable_by_any_shadow_firmware(tmp_path):
+    path = _model(tmp_path, "clara", sidecar=False)
+    assert em_shadow.device_can_score(path, bcresnet_capable=False)
+    assert em_shadow.device_can_score(path, bcresnet_capable=True)
+    # Stock model names are not paths and are openWakeWord by definition.
+    assert em_shadow.device_can_score("hey_jarvis_v0.1", bcresnet_capable=False)
+
+
+def test_a_bcresnet_model_needs_firmware_that_carries_the_engine(tmp_path):
+    path = _model(tmp_path, "ophelia", sidecar=True)
+    assert em_shadow.device_can_score(path, bcresnet_capable=True)
+    assert not em_shadow.device_can_score(path, bcresnet_capable=False)
+
+
+def test_scorability_follows_the_sidecar_not_the_name(tmp_path):
+    """
+    The same rule the device applies at shadow.Open and the asset planner
+    applies when deciding what to send. Three layers, one definition — a name
+    heuristic in any of them puts the device on the wrong engine.
+    """
+    named_like_one = _model(tmp_path, "ophelia-bcresnet", sidecar=False)
+    assert em_shadow.device_can_score(named_like_one, bcresnet_capable=False)
+
+
+def test_a_capable_device_keeps_the_mode_it_was_given(tmp_path):
+    path = _model(tmp_path, "ophelia", sidecar=True)
+    for mode in ("shadow", "on"):
+        assert em_shadow.effective_mode(
+            mode, trigger_capable=True,
+            device_scorable=em_shadow.device_can_score(path, bcresnet_capable=True),
+        ) == mode

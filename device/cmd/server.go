@@ -613,6 +613,12 @@ func shadowStats(dc *client.DataClient) interface{} {
 		"frames":    st.Frames,
 		"drops":     st.Drops,
 		"notReady":  st.NotReady,
+		// Frames the engine declined to score although it was warm. Zero for
+		// openWakeWord, which scores every frame; roughly half for BC-ResNet,
+		// which runs on a hop. Sent alongside notReady rather than folded into
+		// it because they mean opposite things — one is the duty cycle, the
+		// other is a stream that keeps restarting.
+		"skipped":   st.Skipped,
 		"crossings": st.Crossings,
 		"maxScore":  st.MaxScore,
 		"threshold": st.Threshold,

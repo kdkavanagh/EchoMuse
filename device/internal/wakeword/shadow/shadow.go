@@ -49,10 +49,19 @@ type Stats struct {
 	// Frames scored, and Drops that never reached the scorer because it was
 	// behind. Drops are the health metric: a nonzero rate means the device
 	// cannot keep up and the comparison is running on a subset of the audio.
-	Frames uint64
-	Drops  uint64
-	// NotReady counts frames pushed before the detector had 16 embeddings
-	// (~1.28s after a reset). Expected to be small and nonzero.
+	Frames  uint64
+	Drops   uint64
+	Skipped uint64
+	// NotReady counts frames pushed before the engine could score at all —
+	// 16 embeddings for openWakeWord (~1.28s after a reset), a full 1.4s
+	// window for BC-ResNet. Expected to be small and nonzero.
+	//
+	// Skipped is the other reason a frame produced no score, and it is not a
+	// problem: BC-ResNet runs on a hop, so with the default 160ms hop half of
+	// all frames are skipped BY DESIGN. Kept apart from NotReady because a
+	// rising NotReady means the stream keeps restarting, while a high Skipped
+	// is just the engine's duty cycle — the same number would otherwise mean
+	// two opposite things depending on which engine was loaded.
 	NotReady uint64
 	// Crossings is how many times the score reached the threshold, after the
 	// refractory period is applied.
@@ -92,7 +101,7 @@ type Stats struct {
 
 // Scorer runs a Detector over pushed audio on its own goroutine.
 type Scorer struct {
-	det       *wakeword.Detector
+	eng       Engine
 	threshold float32
 	// bargeThreshold is used instead of threshold while the speaker is
 	// streaming, mirroring the controller's own effective threshold. Zero
@@ -134,6 +143,16 @@ type Scorer struct {
 	// the caller, because Detector is not safe for concurrent use and the
 	// caller is a different goroutine.
 	resetReq bool
+
+	// closed is set before the channel is closed, so a Push racing Close is a
+	// no-op instead of a send on a closed channel — which panics, on the mic
+	// goroutine, taking the whole process with it.
+	//
+	// The race is real and not narrow: SetShadowScorer swaps the pointer and
+	// then Closes the old scorer, while the mic loop is pushing to whatever it
+	// last read. Any config push that rebuilds the scorer — a wake model
+	// change, a mode change from off — can land between the read and the push.
+	closed bool
 }
 
 // NewScorer starts a scorer. onCross is called from the scorer goroutine when
@@ -146,8 +165,18 @@ type Scorer struct {
 // speaker was streaming at the instant the frame was SCORED, and by the time a
 // callback asks, playback may have ended.
 func NewScorer(inf wakeword.Inferer, threshold float32, onCross func(score, threshold float32, at time.Time)) *Scorer {
+	return NewEngineScorer(NewOwwEngine(inf), threshold, onCross)
+}
+
+// NewEngineScorer is NewScorer for an already-built Engine — the BC-ResNet
+// path, and the seam the tests drive.
+//
+// NewScorer keeps its openWakeWord-shaped signature because it is the older
+// and more common construction, and because every existing caller and test
+// passes a wakeword.Inferer. The two share every line below.
+func NewEngineScorer(eng Engine, threshold float32, onCross func(score, threshold float32, at time.Time)) *Scorer {
 	s := &Scorer{
-		det:       wakeword.New(inf),
+		eng:       eng,
 		threshold: threshold,
 		refract:   DefaultRefractory,
 		onCross:   onCross,
@@ -235,19 +264,27 @@ func (s *Scorer) enqueue(cp []int16) {
 		s.lastPush = now
 	}
 
+	// The send is under the mutex so it cannot race Close. It is a
+	// non-blocking send, so this holds the lock for a bounded instant and
+	// cannot deadlock against the scorer goroutine. One uncontended
+	// acquisition per 80ms frame is not a cost worth trading a panic for —
+	// note the drop path already took it.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
 	select {
 	case s.ch <- cp:
 	default:
-		s.mu.Lock()
 		s.stats.Drops++
-		s.mu.Unlock()
 	}
 }
 
-// Ready reports whether the detector has accumulated enough embeddings to
-// score (~1.28s of audio). Exposed through the mutex rather than by reading the
-// Detector, which belongs to the scorer goroutine and is not safe to touch from
-// anywhere else — worth having so a log line can distinguish "no crossings
+// Ready reports whether the engine has accumulated enough audio to score at
+// all (~1.28s for openWakeWord, one 1.4s window for BC-ResNet). Exposed through
+// the mutex rather than by reading the engine, which belongs to the scorer
+// goroutine and is not safe to touch from anywhere else — worth having so a log line can distinguish "no crossings
 // because the room was quiet" from "no crossings because it never warmed up".
 func (s *Scorer) Ready() bool {
 	s.mu.Lock()
@@ -257,7 +294,7 @@ func (s *Scorer) Ready() bool {
 
 // Reset asks the scorer to clear its streaming state, for when the mic stream
 // restarts — audio from before a gap must not contribute to a score after it.
-// Applied by the scorer goroutine, since Detector is single-goroutine.
+// Applied by the scorer goroutine, since an Engine is single-goroutine.
 func (s *Scorer) Reset() {
 	s.mu.Lock()
 	s.resetReq = true
@@ -286,6 +323,9 @@ func (s *Scorer) Info() string { return s.info }
 // those can overlap.
 func (s *Scorer) Close() {
 	s.stop.Do(func() {
+		s.mu.Lock()
+		s.closed = true
+		s.mu.Unlock()
 		close(s.ch)
 		<-s.done
 		// After the goroutine has exited, so no inference is in flight.
@@ -306,30 +346,33 @@ func (s *Scorer) run() {
 		s.mu.Unlock()
 
 		if reset {
-			s.det.Reset()
+			s.eng.Reset()
 			s.mu.Lock()
 			s.ready = false
 			s.mu.Unlock()
 		}
 
 		t0 := time.Now()
-		if _, err := s.det.Push(pcm); err != nil {
-			s.recordErr(err)
-			continue
-		}
-		if !s.det.Ready() {
-			s.mu.Lock()
-			s.stats.Frames++
-			s.stats.NotReady++
-			s.mu.Unlock()
-			continue
-		}
-		s.mu.Lock()
-		s.ready = true
-		s.mu.Unlock()
-		score, err := s.det.Score()
+		score, scored, err := s.eng.Push(pcm)
 		if err != nil {
 			s.recordErr(err)
+			continue
+		}
+		ready := s.eng.Ready()
+		s.mu.Lock()
+		s.ready = ready
+		s.mu.Unlock()
+		if !scored {
+			// Two different silences, kept apart: still warming up, or between
+			// hops on an engine that does not score every frame.
+			s.mu.Lock()
+			s.stats.Frames++
+			if ready {
+				s.stats.Skipped++
+			} else {
+				s.stats.NotReady++
+			}
+			s.mu.Unlock()
 			continue
 		}
 

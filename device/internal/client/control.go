@@ -789,8 +789,16 @@ func capabilities() []string {
 	// ignored, which is the "I enabled it and nothing happened" the whole
 	// capability rule exists to prevent. It is a fact about the BUILD (the
 	// audio is embedded), so it is unconditional, like audio_mix.
+	// "oww_bcresnet": this firmware carries a BC-ResNet engine
+	// (internal/wakeword/bcresnet) as well as openWakeWord, and shadow.Open
+	// picks between them from the sidecar beside the installed model. It is a
+	// THIRD capability rather than an extension of oww_shadow/oww_trigger
+	// because the two questions are independent: firmware in the field scores
+	// and triggers perfectly well while having no BC-ResNet engine at all, and
+	// the controller must be able to tell "cannot score on device" from
+	// "cannot score THIS model on device". Without it the controller has to
+	// assume no device can run one, which is what it did before this shipped.
 	caps := []string{"mic", "speaker", "leds", "led_anim", "buttons",
-		"oww_shadow", "oww_trigger", "button_hold", "audio_mix", "wake_sound",
 		// "native_afe_backend": this binary has internal/bindings/slmic and
 		// slspeaker compiled in AND its start_server.sh has the opt-in
 		// marker check (docs/native-afe-migration.md) — unconditional,
@@ -800,6 +808,7 @@ func capabilities() []string {
 		// device that lacks this would be a control that silently does
 		// nothing, since older firmware's start_server.sh never checks it.
 		"native_afe_backend"}
+		"oww_shadow", "oww_trigger", "oww_bcresnet", "button_hold", "audio_mix", "wake_sound"}
 	if als.Present() {
 		caps = append(caps, "ambient_light")
 	}

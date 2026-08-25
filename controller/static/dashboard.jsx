@@ -2223,6 +2223,7 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                 holdCapable={!device.connected || !!device.buttonHoldCapable}
                 wakeSoundCapable={!device.connected || !!device.wakeSoundCapable}
                 afeActive={!!device.nativeAfeCapable}
+                bcresnetCapable={!device.connected || !!device.owwBcresnetCapable}
                 deviceId={device.device_id}
                 deviceConnected={!!device.connected}
                 deviceRinging={!!device.ringing}
@@ -5346,8 +5347,8 @@ function onDeviceMode(config) {
 function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
                             shadowCapable = true, mixCapable = true,
                             holdCapable = true, triggerCapable = true,
-                            wakeSoundCapable = true,
                             afeActive = false, deviceId = null,
+                            wakeSoundCapable = true, bcresnetCapable = true,
                             deviceConnected = false, deviceRinging = false }) {
   // deviceId is null in the fleet-config view, where "ring this device now"
   // has no subject — the Test control is hidden there rather than disabled,
@@ -5426,10 +5427,25 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
   }, []);
   useEffect(() => { loadCustomModels(); }, [loadCustomModels]);
 
-  async function uploadWakeModel(file) {
-    if (!file) return;
+  // The picker accepts .onnx and .json together, because a BC-ResNet model is
+  // BOTH files: the .onnx cannot say which of its logits is the wake word, so
+  // the controller refuses it without its sidecar rather than guess. An
+  // openWakeWord model is still just the one file — selecting a .json with it
+  // is harmless and selecting only a .json is the one case worth naming.
+  async function uploadWakeModel(files) {
+    const picked = Array.from(files || []);
+    if (!picked.length) return;
+    const model   = picked.find(f => f.name.endsWith('.onnx'));
+    const sidecar = picked.find(f => f.name.endsWith('.json'));
+    if (!model) {
+      alert('Select the .onnx model (a BC-ResNet model needs its .json alongside it).');
+      return;
+    }
     try {
-      const resp = await API.upload('/api/oww_models/upload', file, 'model');
+      const form = new FormData();
+      form.append('model', model);
+      if (sidecar) form.append('sidecar', sidecar);
+      const resp = await API.postForm('/api/oww_models/upload', form);
       await loadCustomModels();
       if (resp.model?.path) set('owwModel', resp.model.path);
     } catch (e) { alert(e.error || 'Model upload failed'); }
@@ -5517,6 +5533,17 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
     && !customModels.some(m => m.path === config.owwModel)
     ? { name: wwModelLabel(config.owwModel), file: config.owwModel.split('/').pop(), path: config.owwModel, missing: true }
     : null;
+
+  // Which engine the selected model needs. Decided by the model's `type` from
+  // the server (which reads the sidecar on disk), never by the filename — the
+  // name is user-chosen. An orphan or stock model is openWakeWord, which is
+  // also the right answer for every model predating BC-ResNet support.
+  const bcresnetSelected = customModels.some(
+    m => m.path === config.owwModel && m.type === 'bcresnet');
+  // On-device scoring needs the firmware to carry the engine the sidecar will
+  // select. Two separate facts — the model's family and the device's engines —
+  // so a device that CAN run BC-ResNet keeps every on-device option.
+  const engineMissing = bcresnetSelected && !bcresnetCapable;
 
   // Sensitivity: map owwThreshold (0.1–0.9) to 1–9 int, inverted (low threshold = eager)
   const sensitivityToThreshold = v => Number((1.0 - (v - 1) / 8 * 0.8).toFixed(2));
@@ -5633,7 +5660,9 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
               }}>
                 <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 12, fontWeight: 600, color: 'var(--lcd-line)' }}>{wwModelLabel(m.path)}</div>
                 <div style={{ fontFamily: mono, fontSize: 9, color: m.missing ? 'var(--error)' : 'var(--muted)', marginTop: 2 }}>
-                  {m.missing ? 'missing file' : `custom · ${m.file}`}
+                  {m.missing ? 'missing file'
+                    : m.type === 'bcresnet' ? `BC-ResNet · ${m.file}`
+                    : `custom · ${m.file}`}
                 </div>
                 {!disabled && !m.missing && config.owwModel !== m.path && (
                   <div onClick={e => { e.stopPropagation(); deleteWakeModel(m); }}
@@ -5649,9 +5678,9 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
               cursor: disabled ? 'default' : 'pointer', opacity: 0.85,
             }}>
               <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 12, fontWeight: 600, color: 'var(--text2)' }}>+ Custom model</div>
-              <div style={{ fontFamily: mono, fontSize: 9, color: 'var(--muted)', marginTop: 2 }}>upload .onnx (oww_forge)</div>
-              <input ref={wwFileRef} type="file" accept=".onnx" style={{ display: 'none' }}
-                onChange={e => { uploadWakeModel(e.target.files[0]); e.target.value = ''; }}/>
+              <div style={{ fontFamily: mono, fontSize: 9, color: 'var(--muted)', marginTop: 2 }}>upload .onnx (+ .json)</div>
+              <input ref={wwFileRef} type="file" accept=".onnx,.json" multiple style={{ display: 'none' }}
+                onChange={e => { uploadWakeModel(e.target.files); e.target.value = ''; }}/>
             </div>
           </div>
           <div>
@@ -5677,7 +5706,18 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
                 value={wakeSoundCapable && (config.wakeSound ?? false)}
                 disabled={!wakeSoundCapable}
                 onChange={v => set('wakeSound', v)}/>
-              <Toggle label="Speex denoise" sub="cleans audio before scoring — try in noisy rooms" value={config.owwSpeexNs ?? false} onChange={v => set('owwSpeexNs', v)}/>
+              {/* Speex NS is a feature of openWakeWord's own frontend, so it
+                  has nowhere to apply on a BC-ResNet model — that graph
+                  carries its log-mel frontend inside it and is fed the raw
+                  window. Disabled with the reason rather than left as a
+                  toggle that moves and changes nothing. */}
+              <Toggle label="Speex denoise"
+                sub={bcresnetSelected
+                  ? 'openWakeWord only — a BC-ResNet model has its own frontend and is scored on raw audio'
+                  : 'cleans audio before scoring — try in noisy rooms'}
+                value={!bcresnetSelected && (config.owwSpeexNs ?? false)}
+                disabled={bcresnetSelected}
+                onChange={v => set('owwSpeexNs', v)}/>
               <Toggle label="Barge-in" sub="wake word interrupts playback — enable AEC first" value={config.bargeInEnabled ?? false} onChange={v => set('bargeInEnabled', v)}/>
               <Slider label="Barge threshold" sub="wake confidence needed during playback — raise it if a response cuts itself short" value={config.bargeInThreshold ?? 0.05} min={0.05} max={0.9} step={0.05} onChange={v => set('bargeInThreshold', v)}/>
               <Slider label="Arbitration window" sub="ms that the first Echo to hear you silences the others — no added delay; 0 disables" value={config.wakeArbitrationMs ?? 700} min={0} max={2000} step={50} unit="ms" onChange={v => set('wakeArbitrationMs', v)}/>
@@ -5690,7 +5730,9 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
                   and reports without being able to act on it. */}
               <Select
                 label="Wake word detection"
-                sub={!shadowCapable
+                sub={engineMissing
+                  ? 'this Echo\'s firmware has no BC-ResNet engine — update it, or pick an openWakeWord model'
+                  : !shadowCapable
                   ? 'needs newer firmware on this Echo — the controller listens for now'
                   : (config.owwOnDevice ?? 'off') === 'on'
                     ? 'the Echo decides — no network hop before it hears you, and it keeps working through a controller restart. The controller still scores alongside it, so Activity shows whether they agreed'
@@ -5700,14 +5742,21 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
                 value={onDeviceMode(config)}
                 options={[
                   { value: 'off',    label: 'Controller' },
-                  { value: 'shadow', label: 'Both (compare)', disabled: !shadowCapable },
+                  // Also refused for a BC-ResNet model: the device would score
+                  // whichever openWakeWord classifier is installed while the
+                  // controller scores something else, and every turn would
+                  // record a disagreement about a model the device was never
+                  // given. em_shadow.effective_mode degrades a stored value
+                  // the same way, so a model switched after the fact does not
+                  // leave the mode live.
+                  { value: 'shadow', label: 'Both (compare)', disabled: !shadowCapable || engineMissing },
                   // Needs the runtime + models installed as well as the
                   // capability, which the Updates tab does — hence the hint
                   // rather than a hard block we cannot verify from here.
-                  { value: 'on',     label: 'On device',      disabled: !triggerCapable },
+                  { value: 'on',     label: 'On device',      disabled: !triggerCapable || engineMissing },
                 ]}
                 onChange={v => set('owwOnDevice', v)}/>
-              {(config.owwOnDevice ?? 'off') !== 'off' && shadowCapable && (
+              {(config.owwOnDevice ?? 'off') !== 'off' && shadowCapable && !engineMissing && (
                 <div className="em-label" style={{ marginTop: 6, color: 'var(--muted)' }}>
                   Needs the wake word runtime installed on this Echo (Updates tab) — costs ~0.4 of a core while it runs.
                 </div>

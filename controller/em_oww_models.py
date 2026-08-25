@@ -70,9 +70,15 @@ def safe_model_filename(filename: str) -> str | None:
 
 def scan(directory: Path | None = None) -> list[dict]:
     """
-    List custom models: [{name, file, path, size, mtime}], name-sorted.
+    List custom models: [{name, file, path, size, mtime, type}], name-sorted.
     `path` is the absolute path to store in owwModel config; `name` is
     the display label (filename stem). Missing dir → empty list.
+
+    `type` is "bcresnet" when a `<stem>.json` sidecar sits beside the file and
+    "oww" otherwise — decided by the sidecar rather than by the filename,
+    because the name is user-chosen and the sidecar is what actually makes a
+    BC-ResNet model runnable. Absence is therefore the right answer for every
+    model that predates this feature.
     """
     directory = directory if directory is not None else models_dir()
     if not directory.is_dir():
@@ -89,6 +95,7 @@ def scan(directory: Path | None = None) -> list[dict]:
             "path":  str(f.resolve()),
             "size":  st.st_size,
             "mtime": int(st.st_mtime),
+            "type":  "bcresnet" if f.with_suffix(".json").is_file() else "oww",
         })
     return out
 

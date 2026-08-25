@@ -583,12 +583,19 @@ func (d *DataClient) streamMic(conn *websocket.Conn, stopCh <-chan struct{}, loc
 	gainDb := -1
 	gainLin := 1.0
 
-	// On-device shadow scoring, read once per stream rather than per period:
-	// the pointer only changes on a config push, which also restarts nothing,
-	// so a stream that began before the change keeps using the scorer it
-	// started with until the next StartMic. Reset because a StopMic/StartMic
-	// pair happens after every voice turn and the detector must not splice
-	// across the gap.
+
+	// On-device shadow scoring. The pointer is re-read as the stream runs, not
+	// captured once: a config push builds a new Scorer and restarts nothing, so
+	// capturing it here meant enabling on-device scoring did nothing at all
+	// until the next StartMic — which on an idle device is the next voice turn,
+	// and never if the wake word it is meant to detect is the thing that would
+	// cause one. Measured: `[shadow] on-device wake word scoring` in the log,
+	// dev_frames=0 in the database, and a scorer costing 0% CPU.
+	//
+	// Reset only when the pointer CHANGES, which covers both cases that matter:
+	// a fresh stream (StopMic/StartMic after every voice turn, whose gap the
+	// detector must not splice across) and a newly installed scorer picked up
+	// mid-stream.
 	shadowScorer := d.ShadowScorer()
 	if shadowScorer != nil {
 		shadowScorer.Reset()
@@ -861,6 +868,16 @@ func (d *DataClient) streamMic(conn *websocket.Conn, stopCh <-chan struct{}, loc
 					// PushBytes never blocks: it drops when the scorer is
 					// behind rather than delaying this loop, which reads
 					// 160ms ALSA batches out of a 160ms-deep ring.
+					if sc := d.ShadowScorer(); sc != shadowScorer {
+						// Adopted mid-stream, or dropped. A new Scorer is
+						// already reset; resetting here as well is harmless and
+						// keeps "the detector never splices across a change"
+						// true in one place.
+						shadowScorer = sc
+						if shadowScorer != nil {
+							shadowScorer.Reset()
+						}
+					}
 					if shadowScorer != nil {
 						shadowScorer.PushBytes(buf[:vadOwwChunkBytes])
 					}
