@@ -31,11 +31,17 @@ SECTIONS: dict[str, dict] = {
             "owwModel", "owwThreshold", "owwSpeexNs",
             "bargeInEnabled", "bargeInThreshold", "wakeArbitrationMs",
             "owwOnDevice",
+            "ringBargeIn",
             # The chime a wake fires. Here rather than in "playback": that
             # section is how audio SOUNDS (EQ, duck depth), and this is part
             # of what a wake does — a device taking its own wake behaviour
             # should take this with it.
             "wakeSound",
+            # Whether the pre-detection audio that crossed the threshold is
+            # kept. Here rather than beside saveUtterances in "microphones":
+            # that key is about the mic stream a turn records, and this one
+            # is about the wake decision itself — a device taking its own
+            # threshold and model should take the evidence for them too.
         ],
     },
     "microphones": {

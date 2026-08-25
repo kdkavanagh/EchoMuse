@@ -1286,13 +1286,13 @@ async def _apply_live_config(device_id: str, live, effective: dict) -> None:
         live.barge_in_enabled = bool(effective["bargeInEnabled"])
     if "bargeInThreshold" in effective:
         live.barge_threshold = float(effective["bargeInThreshold"])
-    if "aecEnabled" in effective:
+    if "ringBargeIn" in effective:
         # Mirrors handle_control's initial read (em_controller.py) — the
-        # wake_word_listener's timer-ring branch reads live.aec_enabled to
+        # wake_word_listener's timer-ring branch reads live.ring_barge_in to
         # decide whether to score audible ring frames or drop-and-reset, and
-        # without this a live AEC toggle left that decision on whatever the
+        # without this a live toggle left that decision on whatever the
         # device reported at connect until the next reconnect.
-        live.aec_enabled = bool(effective["aecEnabled"])
+        live.ring_barge_in = bool(effective["ringBargeIn"])
     if "buttonSingleTapEvent" in effective:
         live.button_single_tap_event = bool(effective["buttonSingleTapEvent"])
     if "buttonMultiTapMs" in effective:

@@ -95,6 +95,7 @@ DEFAULT_DEVICE_CONFIG = {
     #
     # This is a controller-side question about scoring, not a device
     # setting: the device's audio HAL cancels its own echo unconditionally
+    "ringBargeIn":      False,
     "startupVolume":    85,
     # vadThreshold: 0.001 (normalised RMS pre-AGC).
     # Q2 fix (2026-07-05 review, tracked as B6): this was drifted to 0.003 in

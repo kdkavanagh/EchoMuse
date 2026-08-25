@@ -278,9 +278,20 @@ The always-on wake stream (`mic_start` without `lock_mic`) is **ungated and AGC-
   (`internal/bindings/slspeaker`). A build that converted capture only would
 2–4.7kHz. A frequency-domain implementation exists in `device/tools/bf_capture`
 and measured only marginally better than plain mic selection, for that reason
+- **Timer-ring listening is a controller-side choice** (`ringBargeIn`,
+  Wake word section, default off). The device cancels its own playback
+  unconditionally and the ring is playback like any other, so what reaches
+  the wake listener during an audible burst is residual, not chime. Off drops
+  those frames and rescores the silent gap from a reset model; on scores them
+  at the barge threshold so a wake word can land during the burst. Additive
+  only — the ring cadence is unchanged either way, and the silent window is
+  still there, so the worst case is the off behaviour. Audible frames never
+  feed `noise_floor` (residual echo is not room noise, and the floor outlives
+  the ring). The risk it takes is a chime whose residual scores as the wake
+  word and silences its own alarm; `Ring listening (chime audible)` vs
+  `(silent window)` in the log is what tells the two apart, and pre-scoring an
+  uploaded sound against the model at upload time is the way to retire it.
 - **Barge-in** (controller-side `_barge_watcher`) — wake word spoken during TTS cancels playback (device does a stateful `speaker_flush`: drains buffer + discards until stream EOS, since the rest of the stream is typically still in TCP buffers; controller-side, both `stream_speaker` and the post-playback drain sleep race `cancel_event`). `bargeInThreshold` is used as-is and sits *below* `owwThreshold` by design (0.05–0.10): echo at the mic is ~25dB louder than the person, so speech-over-TTS scores are depressed (~0.3–0.5 observed), while converged self-echo scores 0.002–0.003
-- **AGC** (`internal/processor/`) — lock_mic turns only; release is frozen during silence (RMS speech flag), preventing noise floor amplification. (Device-side RNNoise NS was removed 2026-07-12 — noise suppression is controller-side now: `em_ns.py`/DTLN on the ASR-bound stream, per-device `nsAsr` flag)
-- **VAD** (lock_mic turns only) runs on pre-NS/AGC audio; opens gate after `VAD_SPEECH_MS` of speech, closes after `VAD_SILENCE_MS` of silence, then sends an end-of-speech sentinel
 
 ### Controller audio pipeline
 

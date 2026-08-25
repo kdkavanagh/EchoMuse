@@ -192,6 +192,14 @@ v2.7.8). **0.05 is a good default** — you shouldn't need to raise your
 voice much. Raise it if responses ever cut themselves off. (During the
 silent *thinking* pause the normal wake sensitivity applies instead —
 nothing is playing, so the low barge threshold isn't needed there.)
+**Wake word over a ringing timer** — a separate switch, off by default. A
+ringing timer plays in bursts with gaps between them, and by default the Dot
+only listens for you in the gaps. Turn this on to have it listen *through* the
+chime as well, at the barge threshold above, so "stop" lands sooner. The reason
+it is off: if the chime itself ever scores as your wake word, the alarm
+silences itself. The device log says which window a score came from
+(`Ring listening (chime audible)` vs `(silent window)`), so a self-silencing
+ring states its own cause.
 
 ### Speex denoise
 Runs a noise cleaner on the audio *only for wake-word scoring* (your actual

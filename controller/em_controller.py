@@ -504,20 +504,18 @@ class Device:
         # True while the ring sound is actually coming out of the speaker,
         # as opposed to merely written to the socket — the device primes
         # SPEAKER_PRIME_SECONDS before any audio is audible, so socket-write
-        # completion says nothing about what the room can hear. The wake
-        # listener skips these frames entirely and rescores from a reset
-        # model once this clears: with AEC off (the fleet default) they are
-        # nothing but chime, and scoring them buries the quiet window's
-        # context in echo. With AEC on it scores them too — see aec_enabled.
+        # completion says nothing about what the room can hear. By default the
+        # wake listener skips these frames entirely and rescores from a reset
+        # model once this clears; ringBargeIn scores them instead.
         self.timer_ring_audible = False
-        # Device-side echo cancellation (aecEnabled), mirrored here because
-        # it changes what the wake listener may do with audible ring frames:
-        # the AEC far-end reference is tapped at the device's ALSA write, so
-        # it already covers the ring, and with it on the audible window is
-        # worth scoring instead of discarding. Off is the fleet default, and
-        # off is the conservative path (drop the frames), so a device that
-        # connects before its config push behaves as it always has.
-        self.aec_enabled = False
+        # ringBargeIn: whether the wake listener may score mic frames captured
+        # while the ring is audible. The device's audio HAL cancels its own
+        # playback unconditionally, so what arrives is residual rather than
+        # chime — but how much residual is unmeasured on this hardware, and a
+        # chime that scores as the wake word silences its own alarm. False is
+        # the conservative path (drop the frames), so a device that connects
+        # before its config push behaves as it always has.
+        self.ring_barge_in = False
         # Config: which stored sound to ring with (em_sounds id), and how
         # long to keep ringing before giving up. The cap is not a nicety —
         # HA discards the timer as it fires, so if nobody is home to say the
@@ -3162,8 +3160,12 @@ async def wake_word_listener(device: Device):
                 # AEC. device.speaking tracks the socket write, which finishes
                 # ~1.1s before the room hears anything (SPEAKER_PRIME_SECONDS),
                 # so it is the wrong signal for "is the chime audible" —
-                # timer_ring_audible is, because the ring loop clears it on the
-                # device's own playback_stats.
+                # What happens during the ring's AUDIBLE window is the
+                # ringBargeIn setting. device.speaking tracks the socket write,
+                # which finishes ~1.1s before the room hears anything
+                # (SPEAKER_PRIME_SECONDS), so it is the wrong signal for "is
+                # the chime audible" — timer_ring_audible is, because the ring
+                # loop clears it on the device's own playback_stats.
                 #
                 # AEC off (the fleet default): the audible frames are pure
                 # chime. Scoring them fills openWakeWord's rolling context with
@@ -3196,7 +3198,7 @@ async def wake_word_listener(device: Device):
                 # model at upload time is the way to retire it properly, and
                 # the ring log line below records which window a score came
                 # from so a self-silencing ring states its own cause.
-                ring_deaf = device.timer_ring_audible and not device.aec_enabled
+                ring_deaf = device.timer_ring_audible and not device.ring_barge_in
                 if ring_deaf:
                     ring_reset_due = True
                     buf.clear()
@@ -3216,8 +3218,8 @@ async def wake_word_listener(device: Device):
                 # drag it up. Feeds the SNR-relative no-speech detection in
                 # em_esphome._stream_mic_audio and the diagnostics below.
                 #
-                # An audible ring frame is excluded: it only reaches here on
-                # the AEC path above, and residual echo is not room noise. The
+                # An audible ring frame is excluded: it only reaches here
+                # under ringBargeIn, and residual echo is not room noise. The
                 # floor is a per-ROOM measurement that outlives the ring and
                 # feeds no-speech detection on later turns, so letting a 60s
                 # alarm drag it up would answer a question nobody asked.
@@ -3325,12 +3327,12 @@ async def wake_word_listener(device: Device):
                         if now - last_ring_score_log_ts >= 1.0:
                             last_ring_score_log_ts = now
                             # Which window the score came from is the whole
-                            # diagnostic on the AEC path: a chime silencing
+                            # diagnostic under ringBargeIn: a chime silencing
                             # itself and a person silencing it look identical
                             # in the stop log, and differ here.
                             log.info(
                                 f"[{device.device_id}] Ring listening "
-                                f"({'chime audible, AEC' if device.timer_ring_audible else 'silent window'}): "
+                                f"({'chime audible' if device.timer_ring_audible else 'silent window'}): "
                                 f"score={score:.3f} (need {eff_threshold:.2f}, "
                                 f"rms={rms:.4f}, floor={device.noise_floor:.4f})"
                             )
@@ -3960,7 +3962,7 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
         device.max_speech_ms       = int(config.get("maxSpeechMs", 12000))
         device.barge_in_enabled = bool(config.get("bargeInEnabled", False))
         device.barge_threshold  = float(config.get("bargeInThreshold", 0.6))
-        device.aec_enabled      = bool(config.get("aecEnabled", False))
+        device.ring_barge_in    = bool(config.get("ringBargeIn", False))
         device.button_single_tap_event = bool(
             config.get("buttonSingleTapEvent", False)
         )
