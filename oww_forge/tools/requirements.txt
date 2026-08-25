@@ -1,0 +1,17 @@
+# Host-side deps for collect_device_clips.py.
+#
+# NOT the trainer's requirements — oww_forge/requirements.txt is the fat
+# PyTorch image that runs in Docker. This is a handful of packages on the
+# machine you sit at, kept separate for that reason.
+#
+# The controller API client is stdlib (urllib), deliberately: the only thing
+# needing a wheel here is the transcription that checks each clip really
+# contains the wake phrase.
+#
+# Also needs `ffmpeg` on PATH — a system package, not a pip one:
+#   apt install ffmpeg   /   brew install ffmpeg
+
+# Whisper inference via CTranslate2. Pulls ctranslate2, tokenizers,
+# huggingface-hub and onnxruntime; models download on first use and cache in
+# ~/.cache/huggingface.
+faster-whisper>=1.0.0

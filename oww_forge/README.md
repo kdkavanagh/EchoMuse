@@ -140,6 +140,93 @@ US vowel, not a British "clar-ra". Three levers, in increasing strength:
    converts). Even 20–50 real clips measurably pull the model toward the
    voices that matter. They're augmented with reverb/noise like everything
    else, and displace synthetic clips rather than growing the set.
+   Best of all is recordings made **by the device** — see below.
+
+### Recording through the device itself
+
+A phone recording of the right voice is still the wrong microphone. The Echo
+has its own array, gain and room, and `tools/collect_device_clips.py` collects
+clips through exactly the path the wake model will be scored on in service:
+
+```bash
+# one-time, from oww_forge/ (needs ffmpeg on PATH too)
+python3 -m venv tools/.venv                              # gitignored
+tools/.venv/bin/pip install -r tools/requirements.txt
+
+# which devices are there?
+tools/.venv/bin/python tools/collect_device_clips.py \
+    --controller http://<controller>:8768
+
+tools/.venv/bin/python tools/collect_device_clips.py -d Lounge \
+    --controller http://<controller>:8768 \
+    --phrase "hey clara" \
+    --out data/wakewords/hey_clara/positive_train
+```
+
+Devices are named by their **dashboard label**, case-insensitively, and a
+unique part of the name is enough (`-d lounge`). A name matching two devices
+is an error listing both rather than a guess — the wrong choice would
+reconfigure the wrong Echo. Serials still work if you prefer them.
+
+Nothing plugs in. It runs from anywhere on the LAN and talks only to the
+controller's HTTP API: the config changes ride the device's existing
+`/control` WebSocket, and the recording is made controller-side (`em_recordings`
+writes the WAV beside the SQLite DB), so any device already in the fleet works
+on whatever firmware it has.
+
+Press the action button, say the phrase, pause; repeat; Ctrl+C when done. It
+polls the controller for finished turns, pulls each WAV (already 16kHz mono —
+no conversion), **trims the silence off both ends** and **transcribes it with
+faster-whisper**, keeping only the clips that really contain the phrase. What
+lands in `--out` is training-ready:
+
+```
+  ✓   1  turn 412  4.3s -> 1.4s  lounge_turn412.wav  "Hey, Clara."
+  ✗ turn 413 DISCARDED: heard "Hey, Sarah." — no match for "hey clara" (best 0.60 < 0.75)
+  ✗ turn 414 DISCARDED: nothing but silence after trim (2.9s -> 0.00s)
+```
+
+That check is the point, not a nicety: a mistimed press or a false start
+yields a WAV indistinguishable from a good one in a directory listing, and a
+mislabelled positive actively teaches the model the wrong sound. The
+transcriber is deliberately a *second opinion* — a bigger model than the
+pipeline's, run on the finished clip, and never given the phrase as a decoding
+hint, since a primed decoder would just agree with us.
+
+Discarded clips are deleted (the reason is always logged); `--rejects DIR`
+keeps copies to listen to. Matching is case- and punctuation-insensitive and
+tolerates a near miss, scored **per word, worst pair wins** — "hey claira"
+passes at 0.91 while "hey sarah" fails at 0.60, where whole-phrase similarity
+would have let the shared "hey" carry it over the bar. Comma-separate
+`--phrase` to accept spelling variants, matching `target_phrase`. Tune with
+`--match-ratio`, or skip the whole thing with `--no-verify`.
+
+leave a beat between phrases.
+
+property `collect_device_clips.py` works so hard for on the positive side,
+except that here it costs nothing, since there is no phrase to verify and
+nothing to trim. The archive holds them under a directory named for the
+device, and each clip is named after the turn it came from; turn ids are
+unique across the controller's whole fleet, so `unzip -j` flattens several
+devices' archives into one directory without collisions.
+
+Two things to do with them, in this order:
+
+1. **Listen.** Half the time the culprit is nameable after all — a name that
+   rhymes, a line of dialogue, an advert's jingle — and then
+   `custom_negative_phrases` is still the cheapest fix, and now an informed
+   one rather than a guess.
+2. **Train on the audio.** Unzip the WAVs into the wake word's negative
+   training set, beside where real positives go. `config.template.yml` puts
+   the clip directories at
+   `<output_dir>/<model_name>/{positive,negative}_{train,test}` — one level
+   deeper than the wake word's own directory — so for `hey_clara` that is
+   `data/wakewords/hey_clara/hey_clara/negative_train`. The augment step
+   builds `negative_features_train.npy` out of it, so the sound that fired
+   the model becomes one of the negatives it is trained against.
+
+```bash
+cd oww_forge
 
 ### Testing a built model
 
@@ -206,5 +293,6 @@ oww_forge/
   static/index.html    the web frontend (single file, no build step)
   google_tts.py        Google Cloud TTS positive-sample generator
   config.template.yml  per-wake-word training config template
+  tools/               host-side helpers (collect_device_clips.py)
   data/                (gitignored) assets, per-word workdirs, finished models
 ```

@@ -7,6 +7,13 @@ controller/static/vendor/
 controller/static/dashboard.js
 .claude/
 scratchpad/
+.venv/
+
+# Wake-word clips captured off a device (oww_forge/tools/collect_device_clips.py)
+# — its default output directory. These are recordings of real people saying
+# the wake phrase; they belong in a training set, never in the repo.
+wake_clips/
+wake_clips_rejected/
 
 # DTLN NS models (vendored into the Docker image at build time; bare-metal
 # dev drops them here or points NS_MODEL_DIR elsewhere)

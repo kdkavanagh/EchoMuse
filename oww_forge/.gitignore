@@ -1,1 +1,6 @@
 data
+tools/.venv
+tools/__pycache__
+wake_clips
+# written by tools/train_wakeword.sh when --data points off this disk
+docker-compose.override.yml
