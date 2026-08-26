@@ -203,7 +203,7 @@ DEFAULT_DEVICE_CONFIG = {
     # only (the device never sees the audio again); the key rides the
     # config channel and the device ignores it, same as wakeArbitrationMs.
     "saveUtterances":   False,
-    # saveWakeClips: keep the ~2s of audio that crossed the wake threshold
+    # saveWakeClips: keep the ~1.4s of audio that crossed the wake threshold
     # (em_wakeclips.CLIP_MS) for each turn, downloadable one at a time or as
     # an archive for a retraining run. This is the only way to get a
     # recording of a FALSE positive: the wake word is over before the

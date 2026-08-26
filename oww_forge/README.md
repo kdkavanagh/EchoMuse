@@ -241,7 +241,7 @@ It is kept now, optionally, and it is a training negative that came out of
 the real microphone in the real room. On the offending device, turn
 **Config → Wake word → Save wake clips** on (`saveWakeClips`, off by
 default), leave it to misfire for a day or two, then download its wake clips
-from the Activity panel as `<device>-wakeclips.zip`. Each entry is a 2s 16kHz
+from the Activity panel as `<device>-wakeclips.zip`. Each entry is a 1.4s 16kHz
 mono WAV ending at the crossing, tapped on the wake stream itself — the same
 property `collect_device_clips.py` works so hard for on the positive side,
 except that here it costs nothing, since there is no phrase to verify and

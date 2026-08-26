@@ -791,7 +791,7 @@ function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, nearMis
   // fetched object URL per clip (API.blob; see the auth note there), so
   // playing then downloading costs one transfer, not two.
   //
-  // A turn can carry two different recordings: the wake clip (the 2s that
+  // A turn can carry two different recordings: the wake clip (the 1.4s that
   // crossed the threshold) and the utterance (the command that followed).
   // Everything here is therefore keyed `<turn_id>:<kind>` rather than by the
   // turn alone — one key means one <audio> element, so starting either clip
@@ -999,7 +999,7 @@ function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, nearMis
                   {t.wake_file && !gone.has(clipKey(t, WAKE)) && (<>
                     <button onClick={() => toggleAudio(t, WAKE)}
                       title={playing === clipKey(t, WAKE) ? 'Stop'
-                        : 'Play the 2s that crossed the wake threshold — what triggered it, not the command'}
+                        : 'Play the 1.4s that crossed the wake threshold — what triggered it, not the command'}
                       style={{ ...glyphBtn, color: playing === clipKey(t, WAKE) ? 'var(--warn)' : 'var(--lcd-amber)' }}>
                       {playing === clipKey(t, WAKE) ? '▮' : '▷'}
                     </button>
@@ -5775,7 +5775,7 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
                   can hear, and a false trigger is gone the moment it is
                   logged unless the frames that scored it were kept. */}
               <Toggle label="Save wake clips"
-                sub="keeps the 2 seconds of audio that crossed the threshold, for the last few hundred wakes — download a false trigger from Activity and feed it back into wake-word training"
+                sub="keeps the 1.4 seconds of audio that crossed the threshold, for the last few hundred wakes — download a false trigger from Activity and feed it back into wake-word training"
                 value={config.saveWakeClips ?? false}
                 onChange={v => set('saveWakeClips', v)}/>
               <Toggle label="Barge-in" sub="wake word interrupts playback — enable AEC first" value={config.bargeInEnabled ?? false} onChange={v => set('bargeInEnabled', v)}/>

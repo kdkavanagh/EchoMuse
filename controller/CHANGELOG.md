@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Wake clips: the two seconds of audio that actually crossed the wake
+- Wake clips: the 1.4 seconds of audio that actually crossed the wake
   threshold are now kept per turn, opt-in per device (`saveWakeClips`,
   Config → Wake word). A turn's utterance recording cannot contain the wake
   word — the preroll discard exists to remove it — so until now a false

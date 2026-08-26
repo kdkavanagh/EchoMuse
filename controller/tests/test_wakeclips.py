@@ -2,10 +2,10 @@
 Tests for em_wakeclips — the audio that crossed the wake threshold.
 
 This store exists for one workflow: a device wakes when nobody spoke to it,
-somebody downloads the two seconds that caused it, and that clip goes back
-into oww_forge as a training negative. Everything below defends a property
-of that workflow whose failure looks like nothing at all until the corpus is
-already wrong:
+somebody downloads the second and a half that caused it, and that clip goes
+back into oww_forge as a training negative. Everything below defends a
+property of that workflow whose failure looks like nothing at all until the
+corpus is already wrong:
 
   * the file is exactly what the model scored — 16kHz mono 16-bit, the same
     frame count that went in. A clip that decodes at the wrong rate trains
@@ -94,7 +94,7 @@ def test_a_full_clip_reads_back_as_the_window_that_was_scored(tmp_path):
 # ─── what is refused ──────────────────────────────────────────────────────────
 
 def test_an_empty_ring_writes_no_file(tmp_path):
-    """The deque is empty until the feature has been on for two seconds, so
+    """The deque is empty until the feature has been on for a full window, so
     the first detection after enabling it arrives with nothing. A 44-byte WAV
     in the list is a clip that failed pretending to be one."""
     assert wc.save(DEV, 12, b"", _db(tmp_path)) is None
@@ -262,7 +262,7 @@ def test_a_stray_part_is_never_listed_served_or_counted(tmp_path):
 
 def test_the_ring_is_only_fed_for_a_device_that_asked_for_it():
     """The tap sits in the same loop that scores the wake model, so without
-    the per-device guard the controller holds a rolling two seconds of every
+    the per-device guard the controller holds a rolling 1.4 seconds of every
     room in the house whether or not anyone asked for it — audio nobody
     requested, kept in memory, and the feature's default is off."""
     body = _body(CONTROLLER.read_text(), "async def wake_word_listener")

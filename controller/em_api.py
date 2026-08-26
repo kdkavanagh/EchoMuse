@@ -876,7 +876,7 @@ async def _delete_samples(request: web.Request) -> web.Response:
 
 # ─── Wake clips ───────────────────────────────────────────────────────────────
 #
-# The ~2s of pre-detection audio that actually crossed the wake threshold,
+# The ~1.4s of pre-detection audio that actually crossed the wake threshold,
 # kept per turn when saveWakeClips is on (em_wakeclips, and the ring the
 # wake_word_listener feeds it from). Sample collection above gathers wake
 # words on purpose; this gathers the ones nobody meant to say — a false
@@ -938,7 +938,7 @@ async def _get_wakeclips_zip(request: web.Request) -> web.Response:
     training run wants the set, not one false positive at a time. The
     per-turn endpoint above is for deciding whether a clip belongs in the
     set; this is how the set leaves the controller. Built in memory in an
-    executor — KEEP_PER_DEVICE bounds it at ~32MB, and streaming a zip would
+    executor — KEEP_PER_DEVICE bounds it at ~23MB, and streaming a zip would
     mean either holding the response open across a prune or writing a
     temporary file on the same volume the clips live on.
     """

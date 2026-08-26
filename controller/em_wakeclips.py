@@ -12,7 +12,7 @@ overwritten by `model.reset()` on the same iteration. So the one recording
 that would let a false positive be fixed — feed it back to `oww_forge` as a
 negative and retrain — was the one recording that could not be obtained.
 
-This module stores it. `wake_word_listener` keeps the last `CLIP_MS` of the
+This module stores it. `wake_word_listener` keeps the last `CLIP_MS` (1.4s) of
 chunks it is scoring in a bounded deque; on a detection that starts a turn it
 joins them onto the Device, and `em_esphome._save_wake_clip` writes them here
 once the turn's rowid exists. Consequences of that shape worth stating:
@@ -27,7 +27,7 @@ once the turn's rowid exists. Consequences of that shape worth stating:
     request is a privacy cost with no modelling benefit.
   * **Nothing is retained in memory unless the feature is on.** The deque is
     only fed while `saveWakeClips` is set for the device, so the default is
-    an empty ring rather than a rolling two seconds of the room.
+    an empty ring rather than a rolling second and a half of the room.
   * **The size bound is structural.** The deque's `maxlen` is the only limit
     the buffer needs, so unlike `em_recordings` there is no byte cap here to
     keep in step with a stream that has no length of its own.
@@ -69,19 +69,24 @@ WAKES_SUBDIR = "wakes"
 # either model actually looked at with a little room in front of it — the
 # margin matters because a false positive is usually a word or two, and a
 # negative cut flush against the crossing trains the model on a fragment.
-CLIP_MS = 2000
-
+# The margin is all it needs to be: everything beyond the scored window is
+# room the model never judged, so it is memory held and audio written for no
+# training value.
+#
 # The wake stream arrives as 80ms chunks (em_controller.CHUNK_BYTES), which
-# is what the listener's ring holds. 25 frames = CLIP_MS.
+# is what the listener's ring holds, so the window is quantised to those:
+# 1.5s is not a multiple of 80ms and 18 frames is the longest ring that does
+# not exceed it.
 FRAME_MS    = 80
-CLIP_FRAMES = CLIP_MS // FRAME_MS
+CLIP_FRAMES = 18
+CLIP_MS     = CLIP_FRAMES * FRAME_MS      # 1440
 
 # Clips kept per device before the oldest go. A false-positive corpus is the
 # point here, not a diagnostic sample, so this is two orders of magnitude
 # above em_recordings.KEEP_PER_DEVICE — but well below em_samples, because
 # these accumulate unattended and a device with a badly-tuned threshold
-# should not be able to fill a volume on its own. 2s is ~64kB, so the cap is
-# ~32MB per device.
+# should not be able to fill a volume on its own. CLIP_MS is ~46kB, so the
+# cap is ~23MB per device.
 KEEP_PER_DEVICE = 500
 
 # `<turn_id>.wav`, inside a per-device directory. turn_id is a rowid and

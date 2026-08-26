@@ -214,7 +214,7 @@ noise (TV, air-con) if wake detection is unreliable there. Off by default —
 it's a "try it and compare" option.
 
 ### Save wake clips
-Keeps the **two seconds of audio that crossed the threshold** — the sound
+Keeps the **1.4 seconds of audio that crossed the threshold** — the sound
 that woke the device, not the request that followed it. Off by default. Every
 wake that starts a turn gets one — including a **Barge-in** wake, which is the
 one most worth having, since barge-in listens at a deliberately lower bar than
@@ -245,9 +245,9 @@ trigger, so a clip contains the wake word and the seconds of room before it,
 and never a command — what came next is a saved utterance's job, and a
 training clip carrying somebody's actual request would be a cost with no
 benefit. While the setting is off **nothing is buffered at all** — there is no
-rolling two seconds of your room sitting anywhere waiting for the switch to be
-flipped. Kept per device: the newest **500 clips**, about 64kB each, so a
-device cannot use more than ~32MB however badly its threshold is tuned.
+rolling 1.4 seconds of your room sitting anywhere waiting for the switch to be
+flipped. Kept per device: the newest **500 clips**, about 46kB each, so a
+device cannot use more than ~23MB however badly its threshold is tuned.
 
 Turning it back off stops new clips but **leaves the ones already saved**, so
 switching off doesn't destroy the corpus you were part-way through collecting.
@@ -363,7 +363,7 @@ setting that stores recognisable speech on the controller. What's kept: the
 folder, each overwritten as newer ones arrive. Only the audio sent for
 recognition is saved by this setting — the always-on wake-word listening is
 discarded continuously, and the sole exception is **Save wake clips** in the
-Wake word section, which keeps two seconds of it per wake and is off by
+Wake word section, which keeps 1.4 seconds of it per wake and is off by
 default too.
 
 Turning the setting back off stops new recordings immediately, but **leaves

@@ -3048,7 +3048,7 @@ async def wake_word_listener(device: Device):
     # turn's utterance recording starts after it, and model.reset() below
     # discards the only other copy — so there is nothing to hand back to
     # oww_forge as a negative. Fed only while saveWakeClips is on: the
-    # default must be an empty ring, not a rolling two seconds of the room.
+    # default must be an empty ring, not a rolling 1.4s of the room.
     wake_pcm = collections.deque(maxlen=em_wakeclips.CLIP_FRAMES)
     try:
         while True:
