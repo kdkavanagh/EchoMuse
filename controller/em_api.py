@@ -1401,6 +1401,8 @@ async def _apply_live_config(device_id: str, live, effective: dict) -> None:
     await live.send_control({"type": "config", **effective})
     if "owwThreshold" in effective:
         live.oww_threshold = float(effective["owwThreshold"])
+    if "nearMissThreshold" in effective:
+        live.near_miss_threshold = float(effective["nearMissThreshold"])
     if "owwModel" in effective:
         live.oww_model = effective["owwModel"]
         # Refresh HA's wake-word dropdown (lazy import — em_esphome imports
@@ -4331,10 +4333,23 @@ async def _oww_device_state(live) -> dict:
     One shell round trip. `md5sum` is asked for per file rather than with a
     glob so a missing directory yields an empty inventory rather than an
     error line that could be mistaken for one.
+
+    `.json` is listed alongside `.so`/`.onnx` because a BC-ResNet sidecar is
+    an asset too: without it here, `actual` never contains one, so
+    plan_sync's "evict the sidecar with its classifier" never fires (the
+    logic is right, and tested — tests/test_oww_assets.py hand-builds
+    `actual` with a `.json` entry — but nothing upstream of the test ever
+    produced one) and an evicted model's sidecar is stranded on the device.
+    That is not just clutter: a slot whose stem is later reused by an
+    openWakeWord model would find the old sidecar still there and load as
+    BC-ResNet against a classifier head that isn't one. It also made a
+    fully-installed BC-ResNet device report `outdated` forever and re-push
+    the sidecar on every sync, since a file that is never listed can never
+    compare equal.
     """
     d = em_oww_assets.DEVICE_DIR
     out = await _shell_run(live, (
-        f'for f in {d}/*.so {d}/*.onnx; do '
+        f'for f in {d}/*.so {d}/*.onnx {d}/*.json; do '
         f'[ -f "$f" ] && echo "$(busybox md5sum "$f" | busybox cut -d\" \" -f1) '
         f'$(busybox stat -c %Y "$f") $f"; done; '
         f'echo "FREE $(busybox df -m /data | busybox tail -1)"'

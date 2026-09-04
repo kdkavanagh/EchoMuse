@@ -180,6 +180,18 @@ rather than guessing at, so turn on **Save wake clips** below and the next one
 leaves you the audio that caused it, which is both the answer and the material
 for retraining the word so it stops firing on that sound at all.
 
+### Near-miss floor
+What counts as a near-miss at all. A frame scores near-zero constantly —
+ordinary room tone, not almost-a-wake — so the near-miss counter above
+ignores everything at or below a floor (default **0.05**) and only counts
+scores between the floor and the wake threshold.
+
+Raise it in a noisy room (TV, open kitchen) where background sound sits well
+above silence but nowhere near triggering: left at 0.05 there, the counter
+climbs on ambient noise and stops being a useful signal for tuning
+Sensitivity. Lower it only to see scores further from the bar — it does not
+change what triggers a wake, only what gets counted and logged as "close".
+
 ### Barge-in
 Lets the wake word **interrupt the assistant mid-turn** — say "Hey
 Rhasspy, stop" while it's reading you a paragraph (or still thinking

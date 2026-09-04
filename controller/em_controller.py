@@ -302,6 +302,10 @@ class Device:
         # without requiring a device reconnect.
         self.oww_threshold: float = OWW_THRESHOLD
         self.oww_model:     str   = f"{OWW_MODEL}_v0.1"
+        # Near-miss counter floor (config: nearMissThreshold). A below-
+        # threshold score above this is logged/counted as a near-miss; at
+        # or below it, it is ordinary room noise. See wake_word_listener.
+        self.near_miss_threshold: float = 0.05
         # Multi-device wake arbitration window (ms, 0 = off). Only
         # consulted when 2+ devices are connected — a solo fleet never
         # pays the latency.
@@ -3358,7 +3362,11 @@ async def wake_word_listener(device: Device):
                                 f"rms={rms:.4f}, floor={device.noise_floor:.4f})"
                             )
 
-                if 0.05 < score < eff_threshold:
+                # Floor is device.near_miss_threshold (config: nearMissThreshold,
+                # default 0.05) rather than a literal — a room with a noisier
+                # floor than this fleet's can raise it so the counter tracks
+                # genuine near-attempts instead of churning on background sound.
+                if device.near_miss_threshold < score < eff_threshold:
                     device.oww_near_misses += 1
                     nm_pending += 1
                     nm_max = max(nm_max, float(score))
@@ -3969,6 +3977,7 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
         )
         await device.send_control({"type": "config", **config})
         device.oww_threshold = float(config.get("owwThreshold", OWW_THRESHOLD))
+        device.near_miss_threshold = float(config.get("nearMissThreshold", 0.05))
         device.oww_model     = config.get("owwModel", f"{OWW_MODEL}_v0.1")
         device.wake_arb_ms   = int(config.get("wakeArbitrationMs", 300))
         device.wake_sound    = bool(config.get("wakeSound", False))

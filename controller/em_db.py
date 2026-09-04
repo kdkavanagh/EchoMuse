@@ -152,6 +152,16 @@ DEFAULT_DEVICE_CONFIG = {
     # response short, which is self-evident; the fix is to raise this.
     "bargeInEnabled":   True,
     "bargeInThreshold": 0.05,
+    # nearMissThreshold: score floor for the wake listener's near-miss
+    # counter (Activity tab, wake_counters.near_misses/near_miss_max). A
+    # frame scoring above this but below the effective wake threshold is
+    # "close but no cross"; at or below it, it is ordinary room noise and
+    # is not counted or logged at all. Was a hardcoded 0.05 until this key
+    # existed — that stayed the default because it already separated real
+    # near-misses from noise on this fleet, but a noisier room (TV, open
+    # kitchen) can want it raised so the counter tracks genuine attempts
+    # rather than churning on background sound the mic constantly grazes.
+    "nearMissThreshold": 0.05,
     # How far music is attenuated while a voice turn plays OVER it, on
     # firmware that can mix the two planes (the "audio_mix" capability).
     # Ducking replaces pausing there: the music feed runs 4s ahead of

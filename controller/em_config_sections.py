@@ -28,7 +28,7 @@ SECTIONS: dict[str, dict] = {
     "wakeword": {
         "label": "Wake word",
         "keys": [
-            "owwModel", "owwThreshold", "owwSpeexNs",
+            "owwModel", "owwThreshold", "owwSpeexNs", "nearMissThreshold",
             "bargeInEnabled", "bargeInThreshold", "wakeArbitrationMs",
             "owwOnDevice",
             # Whether the wake word may be scored over an audible timer ring.

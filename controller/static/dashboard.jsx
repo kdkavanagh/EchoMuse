@@ -1030,6 +1030,12 @@ function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, nearMis
                 <span style={{ color: 'var(--muted)' }}>{t.trigger}</span>
                 {' · '}listening {fmtS(seg.listen)} · transcribe {fmtS(seg.transcribe)} · respond {fmtS(seg.respond)} · total {fmtS(Math.max(t.total_ms, 0))}
                 {t.wake_model ? <><br/>wake {t.wake_model.replace(/\.[a-z]+$/, '').split('/').pop()} score {t.wake_score?.toFixed(3)} (thr {t.wake_threshold?.toFixed(2)}) · noise floor {t.noise_floor?.toFixed(4)}</> : null}
+                {t.dev_shadow ? <><br/>device {t.dev_wake_score != null
+                  ? `score ${t.dev_wake_score.toFixed(3)}${t.dev_wake_delta_ms != null ? ` (${t.dev_wake_delta_ms >= 0 ? '+' : ''}${t.dev_wake_delta_ms}ms)` : ''}`
+                  : `no cross${t.dev_threshold != null ? ` (thr ${t.dev_threshold.toFixed(2)})` : ''}`}</> : null}
+                {String(t.trigger || '').startsWith('wakeword-dev') ? <><br/>controller {t.ctrl_wake_score != null
+                  ? `score ${t.ctrl_wake_score.toFixed(3)}${t.ctrl_wake_delta_ms != null ? ` (${t.ctrl_wake_delta_ms >= 0 ? '+' : ''}${t.ctrl_wake_delta_ms}ms)` : ''}`
+                  : 'no cross'}</> : null}
                 {t.underruns != null ? <>{t.wake_model ? ' · ' : <br/>}underruns <span style={{ color: t.underruns > 0 ? 'var(--warn)' : 'inherit' }}>{t.underruns}</span></> : null}
                 {t.stt_text ? <><br/>“{t.stt_text.length > 90 ? t.stt_text.slice(0, 90) + '…' : t.stt_text}”</> : null}
               </div>
@@ -5294,7 +5300,7 @@ const STAGE_MONO = "'DM Mono',monospace";
 // be silently wrong.
 const CONFIG_SECTIONS = {
   "playback": ["eqBands", "eqLoudness", "duckDb"],
-  "wakeword": ["owwModel", "owwThreshold", "owwSpeexNs", "saveWakeClips", "bargeInEnabled", "bargeInThreshold", "wakeArbitrationMs", "owwOnDevice", "wakeSound", "ringBargeIn"],
+  "wakeword": ["owwModel", "owwThreshold", "owwSpeexNs", "nearMissThreshold", "saveWakeClips", "bargeInEnabled", "bargeInThreshold", "wakeArbitrationMs", "owwOnDevice", "wakeSound", "ringBargeIn"],
   "microphones": ["nsAsr", "saveUtterances", "endpointRelative", "endpointLowPerMil", "endpointSilenceMs", "endpointBackporchMs", "maxSpeechMs"],
   "ring": ["ledScene", "ledListenColor", "ledThinkColor", "meterAttack", "meterDecay", "meterFloor", "meterGamma", "meterRef", "meterCurve"],
   "advanced": ["vadThreshold", "vadSpeechMs", "vadSilenceMs", "buttonSingleTapEvent", "buttonMultiTapMs"],
@@ -5597,11 +5603,6 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
   // so a device that CAN run BC-ResNet keeps every on-device option.
   const engineMissing = bcresnetSelected && !bcresnetCapable;
 
-  // Sensitivity: map owwThreshold (0.1–0.9) to 1–9 int, inverted (low threshold = eager)
-  const sensitivityToThreshold = v => Number((1.0 - (v - 1) / 8 * 0.8).toFixed(2));
-  const thresholdToSensitivity = t => Math.round((1.0 - t) / 0.8 * 8) + 1;
-  const sensitivity = thresholdToSensitivity(config.owwThreshold ?? 0.5);
-
   const bands = config.eqBands ?? [0,0,0,0,0,0,0,0];
   const RING_SCENES = [
     { value: 'standard',   label: 'Standard',   swatches: ['#00b400'] },
@@ -5682,7 +5683,7 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
       {/* 02 WAKE WORD */}
       <Stage n="02" title="Wake word"
         chips={<ScopeChip tone="controller">Controller</ScopeChip>}
-        desc="openwakeword scores the continuous mic stream on the controller. Sensitivity sets the detection threshold — attempts that score close but miss are counted as near-misses (Status tab)."
+        desc="The controller scores the continuous mic stream. The wake threshold is the score a detection must reach — attempts that score close but miss are counted as near-misses (Status tab)."
         scope={scopeEl('wakeword')} dim={secStyle('wakeword')}>
         <div className="em-grid2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 24, alignItems: 'start' }}>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, ...inputStyle }}>
@@ -5736,15 +5737,26 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
             </div>
           </div>
           <div>
+            {/* The threshold itself, not a 1-9 "sensitivity" derived from
+                it. That mapping quantised to 0.1 and ran 0.2..1.0, so its
+                eager end was a bar no softmax reaches — a detector that
+                never fires — and the values a BC-ResNet model actually
+                needs were unreachable between steps. Measured on this
+                fleet, BC-ResNet wakes score 0.60-0.89 against openWakeWord's
+                0.10-0.998 over the same turns, so one engine's entire useful
+                range fell inside two positions of the old slider. The number
+                is what every other surface already reports anyway (the
+                Activity panel header, the fleet JSON, every near-miss log
+                line), so showing a different unit here only made the two
+                harder to compare. Floor is 0.05 to match the near-miss
+                floor below which nothing is even counted. */}
             <div style={inputStyle}>
-              <div style={{ fontFamily: mono, fontSize: 11, color: 'var(--text2)', marginBottom: 6 }}>Sensitivity</div>
-              <input type="range" min={1} max={9} step={1} value={sensitivity}
-                style={{ width: '100%' }}
-                onChange={e => set('owwThreshold', sensitivityToThreshold(Number(e.target.value)))}/>
-              <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4 }}>
-                <span style={{ fontFamily: mono, fontSize: 9, color: 'var(--muted)' }}>Precise</span>
-                <span style={{ fontFamily: mono, fontSize: 9, color: 'var(--muted)' }}>Eager</span>
-              </div>
+              <Slider label="Wake threshold"
+                sub="score a wake word must reach — low is eager, high is precise"
+                value={config.owwThreshold ?? 0.5}
+                min={0.05} max={0.95} step={0.01}
+                formatValue={v => Number(v).toFixed(2)}
+                onChange={v => set('owwThreshold', v)}/>
             </div>
             <div style={{ marginTop: 16, ...inputStyle }}>
               {/* The chime is compiled into the firmware and played from
@@ -5770,8 +5782,8 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
                 value={!bcresnetSelected && (config.owwSpeexNs ?? false)}
                 disabled={bcresnetSelected}
                 onChange={v => set('owwSpeexNs', v)}/>
-              {/* Sits with the sensitivity controls because it is how you
-                  tune them: a threshold is only ever wrong about audio you
+              {/* Sits with the threshold control because it is how you
+                  tune it: a threshold is only ever wrong about audio you
                   can hear, and a false trigger is gone the moment it is
                   logged unless the frames that scored it were kept. */}
               <Toggle label="Save wake clips"
@@ -5781,6 +5793,12 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
               <Toggle label="Barge-in" sub="wake word interrupts playback — enable AEC first" value={config.bargeInEnabled ?? false} onChange={v => set('bargeInEnabled', v)}/>
               <Slider label="Barge threshold" sub="wake confidence needed during playback — raise it if a response cuts itself short" value={config.bargeInThreshold ?? 0.05} min={0.05} max={0.9} step={0.05} onChange={v => set('bargeInThreshold', v)}/>
               <Slider label="Arbitration window" sub="ms that the first Echo to hear you silences the others — no added delay; 0 disables" value={config.wakeArbitrationMs ?? 700} min={0} max={2000} step={50} unit="ms" onChange={v => set('wakeArbitrationMs', v)}/>
+              {/* Score floor for the Activity tab's near-miss counter —
+                  below it a frame is ordinary room noise and is not counted
+                  or logged at all. Same scale as Wake threshold above, so
+                  it shares that slider's 0.01 step; default 0.05 matches
+                  what was previously hardcoded in the wake loop. */}
+              <Slider label="Near-miss floor" sub="score above this but below the wake threshold counts as a near-miss in Activity — raise it in a noisy room so the counter tracks real attempts" value={config.nearMissThreshold ?? 0.05} min={0.01} max={0.5} step={0.01} formatValue={v => Number(v).toFixed(2)} onChange={v => set('nearMissThreshold', v)}/>
               {/* Three modes, so a select rather than a toggle. Each option is
                   offered only when the device says it can do it — capability,
                   not firmware version, because a control that silently does
