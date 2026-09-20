@@ -173,6 +173,65 @@ class TurnTrace:
 # 3 = 240ms. Lower if first command word gets clipped; raise if wake-word
 # tail bleeds into transcripts.
 VOICE_PREROLL_DISCARD = 3
+
+# Linear gain applied to the ASR-bound stream ONLY, immediately before it goes
+# on the wire to HA.
+#
+# This hardware hands the controller a very quiet mic stream and nothing
+# amplifies it: AGC was removed from the wake stream in v2.7.0, and every
+# threshold in the system (vadThreshold 0.001, the noise floor, the relative
+# endpointer, oww scoring) is calibrated against those raw levels. So the fix
+# is not to raise the stream — it is to raise the copy HA hears, and leave
+# every measurement looking at the same audio it always did.
+#
+# Measured 2026-09-20 over ten consecutive saved utterances: peaks -37.6 to
+# -46.2 dBFS, RMS -56 to -65. faster-whisper degrades badly there, and it fails
+# by dropping the QUIET LEADING WORDS rather than by erroring — which reads
+# exactly like a truncated capture and sent one debugging session chasing the
+# preroll discard above. Same file, same decoder, gain is the only variable:
+#
+#   turn 400  +0dB  -> 'ounces are in a cup.'
+#             +20dB -> 'How many ounces are in a cup?'
+#   turn 399  +0dB  -> 'In a'
+#             +20dB -> 'How many ounces are in a cup?'
+#
+# 20 dB puts the worst-case peak at -17.6 dBFS, so nothing clips (verified over
+# the same ten clips; the helper hard-clamps regardless). Do not raise it much
+# further — at +25 dB two of the ten clips got WORSE, one from a clean
+# transcript to empty.
+ASR_GAIN_NOMINAL_DB = 20.0
+
+# The wake word is a free per-turn level measurement: same speaker, same
+# distance, one breath earlier, and `device.last_wake_db` already carries it
+# (the relative endpointer is seeded from it). The obvious move is to normalise
+# against it — gain = target - wake_db — and on this fleet that is WRONG.
+#
+# Measured over eight turns with both a wake clip and an utterance clip
+# (2026-09-20, frame-RMS peaks, the same domain as last_wake_db):
+#
+#   wake peak    -46.2 .. -52.9 dBFS   (6.7 dB spread)
+#   command peak -44.9 .. -52.2 dBFS   (7.3 dB spread)
+#   command - wake: mean -0.3 dB, but scatter +4.7 .. -5.6 dB, r = -0.17
+#
+# The mean offset is ~0, which is the good news: the wake word IS spoken at
+# the level of the command. But at a fixed listening position its per-turn
+# scatter is as large as the thing it would be correcting, and uncorrelated
+# with it — subtracting it 1:1 widens the post-gain spread from 7.3 dB to
+# 11.7 dB. It injects noise.
+#
+# So the anchor is used as a GUARD BAND, not a normaliser: hold the nominal
+# gain while the predicted post-gain level lands in the band that is known to
+# decode well, and only follow the wake word when it predicts falling out of
+# it. On every turn measured so far this returns exactly ASR_GAIN_NOMINAL_DB —
+# it is a no-op in the regime that was verified by ear, and earns its place
+# only at distances this fleet has not been measured at: a close talker who
+# would otherwise clip, and a far one 20 dB down who would still be inaudible.
+#
+# Band edges come from what actually decoded: turns 404/405/407 landed at
+# -30.5/-24.9/-26.0 dBFS post-gain and transcribed perfectly; -48..-52 failed.
+ASR_TARGET_MAX_DBFS = -22.0   # louder than this: back off (clipping risk)
+ASR_TARGET_MIN_DBFS = -34.0   # quieter than this: push, up to the ceiling
+ASR_GAIN_CEIL_DB    = 30.0
 from esphome.satellite_server import SatelliteServerProtocol, serve, _HANDLED
 from esphome.feature_flags import (
     MediaPlayerEntityFeature,
@@ -185,6 +244,47 @@ if TYPE_CHECKING:
     pass
 
 log = logging.getLogger("echomuse.esphome")
+
+
+def asr_gain_for(wake_db: float | None) -> float:
+    """
+    This turn's ASR gain, in dB, from the wake word's measured loudness.
+
+    See ASR_TARGET_MAX_DBFS. `wake_db` is `device.last_wake_db` — the peak
+    frame-RMS of the audio that crossed the wake threshold — or None for a
+    turn with no wake word of its own (button, continuation, announce-driven
+    conversation), which gets the nominal gain because there is nothing
+    better to go on.
+    """
+    if wake_db is None:
+        return ASR_GAIN_NOMINAL_DB
+    predicted = wake_db + ASR_GAIN_NOMINAL_DB
+    if predicted > ASR_TARGET_MAX_DBFS:
+        return max(0.0, ASR_TARGET_MAX_DBFS - wake_db)
+    if predicted < ASR_TARGET_MIN_DBFS:
+        return min(ASR_GAIN_CEIL_DB, ASR_TARGET_MIN_DBFS - wake_db)
+    return ASR_GAIN_NOMINAL_DB
+
+
+def apply_asr_gain(pcm: bytes, gain_db: float = ASR_GAIN_NOMINAL_DB) -> tuple[bytes, int]:
+    """
+    Scale S16_LE mono PCM by `gain_db`, hard-clamped to the int16 rail.
+
+    Returns (pcm, clipped_sample_count). Clamping rather than wrapping is the
+    whole point: a wrapped sample is a full-scale discontinuity and reads to a
+    decoder as an impulse, which is worse for the transcript than the quiet
+    audio this exists to fix.
+
+    gain_db == 0 returns the input unchanged and allocates nothing, so the
+    feature switches off cleanly by setting ASR_GAIN_NOMINAL_DB = 0.
+    """
+    if not gain_db or not pcm:
+        return pcm, 0
+    samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
+    samples *= 10.0 ** (gain_db / 20.0)
+    clipped = int(np.count_nonzero((samples > 32767.0) | (samples < -32768.0)))
+    np.clip(samples, -32768.0, 32767.0, out=samples)
+    return samples.astype(np.int16).tobytes(), clipped
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -1165,6 +1265,10 @@ class EchoMuseSatellite(SatelliteServerProtocol):
                 )
         ns_debug_raw = bytearray()
         ns_debug_out = bytearray()
+        # Samples the ASR gain had to clamp this turn. Should stay 0: the
+        # guard band in asr_gain_for exists to keep it there. A nonzero count
+        # means the band's upper edge is wrong for this room.
+        gain_clipped = 0
 
         # Utterance capture (saveUtterances): keep what was sent to HA for
         # recognition, so it can be listened to from the Activity tab. The
@@ -1218,6 +1322,21 @@ class EchoMuseSatellite(SatelliteServerProtocol):
         # quiet room HA still wins every turn. Read once per turn so toggling
         # the setting cannot change the rules mid-stream — the same discipline
         # as `capture` above.
+        # The wake word's loudness anchors two things this turn: the relative
+        # endpointer's level reference and the ASR gain. Read and consumed
+        # here — above the endpointer, so it is cleared even when relative
+        # endpointing is off — because a later button turn, which has no wake
+        # word of its own, must not inherit the level of whoever last spoke.
+        wake_db = getattr(device, "last_wake_db", None)
+        device.last_wake_db = None
+        asr_gain_db = asr_gain_for(wake_db)
+        if asr_gain_db != ASR_GAIN_NOMINAL_DB:
+            log.info(
+                f"[{self._log_name}] ASR gain {asr_gain_db:.1f}dB (not nominal "
+                f"{ASR_GAIN_NOMINAL_DB:.0f}dB) — wake word measured "
+                f"{wake_db:.1f} dBFS"
+            )
+
         endpointer = None
         if getattr(device, "endpoint_relative", True):
             try:
@@ -1234,11 +1353,7 @@ class EchoMuseSatellite(SatelliteServerProtocol):
                     f"using defaults"
                 )
                 endpointer = em_endpoint.Endpointer()
-            # Anchor on the wake word. Consumed here so a later button turn,
-            # which has no wake word of its own, cannot inherit the level of
-            # whoever last spoke to the device.
-            wake_db = getattr(device, "last_wake_db", None)
-            device.last_wake_db = None
+            # Same anchor as the ASR gain above; already consumed.
             if wake_db is not None:
                 endpointer.seed(wake_db)
                 log.debug(
@@ -1469,6 +1584,18 @@ class EchoMuseSatellite(SatelliteServerProtocol):
                             ns_debug_raw.extend(raw_payload)
                             ns_debug_out.extend(payload)
 
+                # ASR gain — see ASR_TARGET_MAX_DBFS. Deliberately the LAST
+                # thing that touches the payload: everything that measures the
+                # room (_is_speech, the relative endpointer, the noise floor)
+                # ran on the raw frame further up and keeps its calibration,
+                # while HA gets audio faster-whisper can actually decode.
+                # Above the capture tap, so the saved utterance stays
+                # byte-for-byte what STT heard — that invariant is the only
+                # reason the recordings were usable as evidence here.
+                if asr_gain_db:
+                    payload, _gain_clipped = apply_asr_gain(payload, asr_gain_db)
+                    gain_clipped += _gain_clipped
+
                 # Utterance capture sits HERE, below the denoiser, so the saved
                 # file is byte-for-byte what goes on the wire to HA — i.e. what
                 # STT actually heard. Tapping above NS (as this first shipped)
@@ -1492,6 +1619,12 @@ class EchoMuseSatellite(SatelliteServerProtocol):
                     del pcm_buf[:AUDIO_CHUNK]
                     self._send_one(api_pb2.VoiceAssistantAudio(data=chunk))
         finally:
+            if gain_clipped:
+                log.warning(
+                    f"[{self._log_name}] ASR gain clamped {gain_clipped} samples "
+                    f"at +{asr_gain_db:.1f}dB (wake {wake_db} dBFS) — lower "
+                    f"ASR_TARGET_MAX_DBFS"
+                )
             # Validation tooling: when NS_DEBUG_DIR is set, persist what
             # STT actually received next to what the mic actually sent.
             em_ns.dump_debug_pair(self._log_name, bytes(ns_debug_raw), bytes(ns_debug_out))
