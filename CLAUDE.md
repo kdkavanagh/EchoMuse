@@ -343,19 +343,18 @@ converged self-echo, 0.055 unconverged worst case, the 0.05 default — was
 measured against the speexdsp canceller that no longer exists. Treat the
 headroom as unverified.
 
-- **Timer-ring listening is a controller-side choice** (`ringBargeIn`,
-  Wake word section, default off). The device cancels its own playback
-  unconditionally and the ring is playback like any other, so what reaches
-  the wake listener during an audible burst is residual, not chime. Off drops
-  those frames and rescores the silent gap from a reset model; on scores them
-  at the barge threshold so a wake word can land during the burst. Additive
-  only — the ring cadence is unchanged either way, and the silent window is
-  still there, so the worst case is the off behaviour. Audible frames never
-  feed `noise_floor` (residual echo is not room noise, and the floor outlives
-  the ring). The risk it takes is a chime whose residual scores as the wake
-  word and silences its own alarm; `Ring listening (chime audible)` vs
-  `(silent window)` in the log is what tells the two apart, and pre-scoring an
-  uploaded sound against the model at upload time is the way to retire it.
+- **Timer-ring listening stays live through the audible burst and the quiet
+  gap.** The ring is playback like any other and uses the same
+  `bargeInThreshold`; there is no separate timer-listening switch or
+  threshold. The device cancels its own playback unconditionally, so what
+  reaches the wake listener during a burst is residual rather than the raw
+  chime. The model context is continuous across burst/gap boundaries — dropping
+  audible frames and resetting at the edge made a short configured gap too
+  small for the 1.4s scorer to produce any result, leaving an alarm that could
+  not be stopped by voice. Audible frames never feed `noise_floor` (residual
+  echo is not room noise, and the floor outlives the ring). A chime whose
+  residual crosses the bar can still silence its own alarm; `Ring listening
+  (chime audible)` vs `(silent window)` in the log states which window fired.
 - **Barge-in** (controller-side `_barge_watcher`) — wake word spoken during TTS cancels playback (device does a stateful `speaker_flush`: drains buffer + discards until stream EOS, since the rest of the stream is typically still in TCP buffers; controller-side, both `stream_speaker` and the post-playback drain sleep race `cancel_event`). `bargeInThreshold` is used as-is and sits *below* `owwThreshold` by design (0.05–0.10): echo at the mic is ~25dB louder than the person, so speech-over-TTS scores are depressed (~0.3–0.5 observed), while converged self-echo scores 0.002–0.003
 - **VAD** (lock_mic turns only) opens the gate after `VAD_SPEECH_MS` of speech, closes after `VAD_SILENCE_MS` of silence, then sends an end-of-speech sentinel. Its threshold is absolute against the audio the HAL delivers — **not comparable with pre-AFE values**, since `micGainDb` used to sit in front of it. (Device-side RNNoise NS was removed 2026-07-12 — noise suppression is controller-side: `em_ns.py`/DTLN on the ASR-bound stream, per-device `nsAsr` flag, and now a second pass on top of the HAL's own)
 
@@ -1521,7 +1520,7 @@ house, so rows survive with the SSID replaced and the selected network marked.
 
 `config.ConfigMessage` JSON fields (camelCase) are sent from controller to device on connect and on per-device config change. Non-zero fields are applied; zero/nil fields are ignored (partial update). Changes take effect immediately — no restart required.
 
-Configurable parameters: `vadThreshold`, `vadSpeechMs`, `vadSilenceMs`, `owwThreshold`, `owwModel`, `owwSpeexNs`, `nearMissThreshold`, `startupVolume`, `nsAsr`, `bargeInEnabled`, `bargeInThreshold`, `ringBargeIn`, `bleProxyEnabled`, `eqBands`, `eqLoudness`, `ledScene`, `ledListenColor`, `ledThinkColor`, `meterAttack`, `meterDecay`, `meterFloor`, `meterGamma`, `meterRef`, `meterCurve`, `wakeArbitrationMs`, `duckDb`, `buttonSingleTapEvent`, `buttonMultiTapMs`, `owwOnDevice`, `saveUtterances` and `wakeSound`. Several are controller-consumed only and the device ignores them: `owwSpeexNs`, `nsAsr`, `ringBargeIn`, `saveUtterances`, `wakeSound`, `wakeArbitrationMs`, `nearMissThreshold` and the two `button*` keys. `owwOnDevice` IS acted on by the device; `wakeSound` decides only whether the controller sends the `wake_sound` message, whose audio already lives on the device.
+Configurable parameters: `vadThreshold`, `vadSpeechMs`, `vadSilenceMs`, `owwThreshold`, `owwModel`, `owwSpeexNs`, `nearMissThreshold`, `startupVolume`, `nsAsr`, `bargeInEnabled`, `bargeInThreshold`, `bleProxyEnabled`, `eqBands`, `eqLoudness`, `ledScene`, `ledListenColor`, `ledThinkColor`, `meterAttack`, `meterDecay`, `meterFloor`, `meterGamma`, `meterRef`, `meterCurve`, `wakeArbitrationMs`, `duckDb`, `buttonSingleTapEvent`, `buttonMultiTapMs`, `owwOnDevice`, `saveUtterances` and `wakeSound`. Several are controller-consumed only and the device ignores them: `owwSpeexNs`, `nsAsr`, `saveUtterances`, `wakeSound`, `wakeArbitrationMs`, `nearMissThreshold` and the two `button*` keys. `owwOnDevice` IS acted on by the device; `wakeSound` decides only whether the controller sends the `wake_sound` message, whose audio already lives on the device.
 
 ### Fleet vs device scoping (schema v8)
 

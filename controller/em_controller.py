@@ -166,21 +166,13 @@ SPEAKER_BYTES  = SPEAKER_PERIOD * 2       # 4096 bytes/period (mono S16)
 # must allow for the delayed start.
 SPEAKER_PRIME_SECONDS = 1.1
 
-# Timer ring cadence. Two knobs, because the alarm has to do two jobs that
-# pull against each other: sound urgent, and leave the wake word a clear run
-# at the mic.
+# Timer ring cadence. Burst length controls urgency; the gap is a quiet
+# fallback for rooms where the HAL's echo cancellation leaves too much chime
+# residual. Wake scoring stays live through both parts of the cycle, so the
+# gap is never a prerequisite for saying the wake word over the alarm.
 #
-# The silent window is the constraint. openWakeWord needs ~1.4s of audio in
-# its rolling context before it can score a word at all, and the ring's
-# listener resets the model when the sound stops (see wake_word_listener), so
-# each window starts from nothing. Shrinking it is what made the first
-# version take ~15s and many attempts to silence (2026-08-09). Tunable per
-# device via timerRingGapSeconds — the right value depends on the room.
-#
-# Urgency is bought on the other side instead: a short sound repeats to fill
-# RING_MIN_BURST_SECONDS so one 0.6s chime becomes a burst of two rather than
-# a lonely chirp every few seconds, which is what the 2.5s-gap first cut
-# sounded like. Denser bursts, same listening window.
+# A short sound repeats to fill RING_MIN_BURST_SECONDS so one 0.6s chime
+# becomes a burst of two rather than a lonely chirp every few seconds.
 RING_GAP_SECONDS = 2.0
 RING_MIN_BURST_SECONDS = 1.2
 
@@ -525,18 +517,10 @@ class Device:
         # True while the ring sound is actually coming out of the speaker,
         # as opposed to merely written to the socket — the device primes
         # SPEAKER_PRIME_SECONDS before any audio is audible, so socket-write
-        # completion says nothing about what the room can hear. By default the
-        # wake listener skips these frames entirely and rescores from a reset
-        # model once this clears; ringBargeIn scores them instead.
+        # completion says nothing about what the room can hear. Wake scoring
+        # stays live in both states; this flag selects the threshold and keeps
+        # playback residual out of the room-noise measurement.
         self.timer_ring_audible = False
-        # ringBargeIn: whether the wake listener may score mic frames captured
-        # while the ring is audible. The device's audio HAL cancels its own
-        # playback unconditionally, so what arrives is residual rather than
-        # chime — but how much residual is unmeasured on this hardware, and a
-        # chime that scores as the wake word silences its own alarm. False is
-        # the conservative path (drop the frames), so a device that connects
-        # before its config push behaves as it always has.
-        self.ring_barge_in = False
         # Config: which stored sound to ring with (em_sounds id), and how
         # long to keep ringing before giving up. The cap is not a nicety —
         # HA discards the timer as it fires, so if nobody is home to say the
@@ -1359,33 +1343,17 @@ async def _run_timer_ring(device: Device, timer_name: str = "timer") -> None:
     that stops the mic for the duration of playback to keep TTS out of the
     wake stream, which for a ring would mean the device could not hear the
     word that stops it. Instead the mic keeps streaming into mic_queue and
-    wake_word_listener scores it, with two concessions in that loop for the
-    ring case — it ignores its `device.speaking` guard, and it drops to the
-    barge threshold, because the mic hears the ring ~25dB louder than the
-    person and wake scores are depressed accordingly (the same physics
-    barge-in already handles for TTS).
+    wake_word_listener scores the whole cycle, including while the chime is
+    audible, against the same barge threshold used for other playback. The
+    device's audio HAL always supplies the far-end playback reference, so the
+    scorer receives
+    residual rather than the raw chime.
 
-    The stop therefore has to work with AEC OFF, which is the fleet default
-    and what this was first tested against (2026-08-09: the wake word took
-    ~15s and many attempts to land, scoring so low it never even reached the
-    near-miss band). Barge-in gets away with leaning on AEC; a ring cannot,
-    because failing means an alarm nobody can silence. What makes it work
-    instead is a real quiet window: the loop waits for the device to report
-    the sound has actually FINISHED playing, then holds RING_GAP_SECONDS of
-    genuine silence, and the wake listener discards everything before it and
-    rescores from a reset model.
-
-    With AEC ON the wake listener additionally scores the audible window,
-    since the device's far-end reference is tapped downstream of the mix and
-    already contains the chime. That is additive only — the cadence below is
-    unchanged, so a device with AEC off behaves exactly as it always has.
-
-    That distinction is the whole fix. stream_speaker returns when the bytes
-    reach the socket, which on this hardware is ~1.1s (SPEAKER_PRIME_SECONDS)
-    before the room hears anything — the first version slept 1s from socket
-    completion and produced roughly 0.4s of real quiet per cycle, against the
-    ~1.4s rolling context openWakeWord needs. The wake word never had a clean
-    run at the mic.
+    The quiet gap remains a fallback, not a requirement. The loop waits for
+    the device's playback_stats before starting it: stream_speaker returns
+    when bytes reach the socket, about SPEAKER_PRIME_SECONDS before the room
+    hears them, so timing from socket completion does not describe an audible
+    interval.
 
     Takes voice_lock for the same reason a turn does: both own the speaker,
     and a ring streaming over an in-flight answer garbles both. It also
@@ -3034,7 +3002,6 @@ async def wake_word_listener(device: Device):
     nm_pending = 0    # near-misses buffered since the last hourly-rollup flush
     nm_max     = 0.0  # highest buffered near-miss score
     dead_streak = 0   # consecutive 10s mic_queue timeouts (resets on any frame)
-    ring_reset_due = False  # ring audio just stopped; reset before scoring again
     last_ring_score_log_ts = 0.0  # rate-limit ring-window score logging to 1/s
     # Rolling level of the audio openwakeword is scoring, so a detection can
     # be given the wake word's own loudness. That is the anchor the relative
@@ -3181,53 +3148,18 @@ async def wake_word_listener(device: Device):
                     await _ambient_frame(device, frame)
 
                 # The speaking guard keeps the device's own TTS out of the
-                # wake stream. A timer ring is the deliberate exception: the
-                # wake word is the only acoustic thing that can stop it, since
-                # HA discards the timer as it fires.
+                # wake stream. A timer ring is the deliberate exception: HA
+                # discards a timer as it fires, so the local wake detector has
+                # to hear someone speaking over the alarm as well as between
+                # bursts.
                 #
-                # What happens during the ring's AUDIBLE window is the
-                # ringBargeIn setting. device.speaking tracks the socket write,
-                # which finishes ~1.1s before the room hears anything
-                # (SPEAKER_PRIME_SECONDS), so it is the wrong signal for "is
-                # the chime audible" — timer_ring_audible is, because the ring
-                # loop clears it on the device's own playback_stats.
-                #
-                # Off (the default): treat the audible frames as pure chime.
-                # Scoring them fills openWakeWord's rolling context with echo
-                # and the real word that follows scores near zero. Drop them,
-                # and reset once at the edge so the quiet window is scored from
-                # a clean model.
-                #
-                # On: the device's audio HAL cancels its own playback out of
-                # every capture, and the ring is playback like any other, so
-                # what arrives here is residual rather than chime. Score it —
-                # at the barge threshold, set below — so a wake word can land
-                # during the burst instead of only in the gap. Purely additive:
-                # the cadence is unchanged and the silent window is still
-                # there, so the worst case is the behaviour above. No reset at
-                # the edge on this path, deliberately — the whole point is a
-                # rolling context that spans the burst/gap boundary, and
-                # resetting would discard the context just built.
-                #
-                # The risk it takes is a chime whose residual scores as the
-                # wake word, which silences the alarm itself. Being opt-in is
-                # the gate for now, and the AFE's cancellation depth on this
-                # hardware is unmeasured; scoring an uploaded sound against the
-                # model at upload time is the way to retire this properly, and
-                # the ring log line below records which window a score came
-                # from so a self-silencing ring states its own cause.
-                ring_deaf = device.timer_ring_audible and not device.ring_barge_in
-                if ring_deaf:
-                    ring_reset_due = True
-                    buf.clear()
-                    wake_pcm.clear()
-                    break
-                if ring_reset_due:
-                    ring_reset_due = False
-                    model.reset()
-                    buf.clear()
-                    wake_pcm.clear()
-                    break
+                # timer_ring_audible comes from the device's playback_stats,
+                # not socket-write completion (which leads the room by the
+                # device's prime buffer). Every ring frame is scored against
+                # the same barge threshold used for other playback. Keeping
+                # one continuous model context is essential — dropping the
+                # chime and resetting at its edge made a short configured gap
+                # too small for the 1.4s scorer to produce any result.
                 if device.speaking and not device.timer_ringing:
                     continue
 
@@ -3238,8 +3170,8 @@ async def wake_word_listener(device: Device):
                 # drag it up. Feeds the SNR-relative no-speech detection in
                 # em_esphome._stream_mic_audio and the diagnostics below.
                 #
-                # An audible ring frame is excluded: it only reaches here
-                # under ringBargeIn, and residual echo is not room noise. The
+                # An audible ring frame is excluded even though it is scored:
+                # residual echo is not room noise. The
                 # floor is a per-ROOM measurement that outlives the ring and
                 # feeds no-speech detection on later turns, so letting a 60s
                 # alarm drag it up would answer a question nobody asked.
@@ -3332,12 +3264,13 @@ async def wake_word_listener(device: Device):
                 eff_threshold = device.oww_threshold
                 if device.barge_in_enabled and em_player.is_playing(device.device_id):
                     eff_threshold = min(eff_threshold, device.barge_threshold)
-                # A ring is louder at the mic than music is, and unlike
-                # music there is no opt-in to respect — a wake word that
-                # cannot clear the bar leaves the ring unstoppable. Not
-                # gated on barge_in_enabled for that reason.
+                # A timer ring is playback and uses the same barge threshold
+                # as every other stream. Unlike optional interruption of a
+                # response or music, stopping an alarm must always be enabled.
                 if device.timer_ringing:
-                    eff_threshold = min(eff_threshold, device.barge_threshold)
+                    eff_threshold = min(
+                        eff_threshold, device.barge_threshold
+                    )
 
                     # Ring scoring gets its own log line, on a lower floor
                     # (0.01) and outside the near-miss counter. When the first
@@ -3351,10 +3284,8 @@ async def wake_word_listener(device: Device):
                         now = asyncio.get_event_loop().time()
                         if now - last_ring_score_log_ts >= 1.0:
                             last_ring_score_log_ts = now
-                            # Which window the score came from is the whole
-                            # diagnostic under ringBargeIn: a chime silencing
-                            # itself and a person silencing it look identical
-                            # in the stop log, and differ here.
+                            # The window says whether the score came through
+                            # audible playback or its quiet gap.
                             log.info(
                                 f"[{device.device_id}] Ring listening "
                                 f"({'chime audible' if device.timer_ring_audible else 'silent window'}): "
@@ -3403,9 +3334,10 @@ async def wake_word_listener(device: Device):
                         )
 
                 # Who gets to start a turn. In "on" mode the device decides and
-                # this controller's own crossing is demoted to a measurement —
-                # see em_shadow.decide_wake_source for why it keeps scoring at
-                # all. In every other mode this is exactly the old condition.
+                # this controller's crossing is normally measurement-only.
+                # A timer ring is controller-owned and stopping it starts no
+                # turn, so decide_ring_wake_source still accepts a controller
+                # crossing if the device report is absent or delayed.
                 ctrl_hit = score >= eff_threshold
                 dev_wake, dev_age = device.pending_wake.take()
                 if dev_wake is None and dev_age is not None:
@@ -3417,7 +3349,11 @@ async def wake_word_listener(device: Device):
                         f"{dev_age:.1f}s old (limit "
                         f"{em_shadow.MAX_PENDING_WAKE_S:.1f}s)"
                     )
-                source = em_shadow.decide_wake_source(
+                decide_source = (
+                    em_shadow.decide_ring_wake_source
+                    if device.timer_ringing else em_shadow.decide_wake_source
+                )
+                source = decide_source(
                     device.oww_on_device, dev_wake, ctrl_hit
                 )
                 if ctrl_hit and device.oww_on_device == em_shadow.MODE_ON:
@@ -3992,7 +3928,6 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
         device.max_speech_ms       = int(config.get("maxSpeechMs", 12000))
         device.barge_in_enabled = bool(config.get("bargeInEnabled", False))
         device.barge_threshold  = float(config.get("bargeInThreshold", 0.6))
-        device.ring_barge_in    = bool(config.get("ringBargeIn", False))
         device.button_single_tap_event = bool(
             config.get("buttonSingleTapEvent", False)
         )

@@ -8,6 +8,7 @@ per device and never appears in the dashboard, and nothing else would notice.
 import json
 import re
 from pathlib import Path
+import sqlite3
 
 import pytest
 
@@ -231,6 +232,37 @@ def test_v11_prunes_out_of_scope_values_from_migrated_rows(tmp_path, monkeypatch
     assert "nsAsr" not in stored
     # State keys are never section-scoped and must survive.
     assert stored["startupVolume"] == 42
+
+
+
+def test_v21_removes_the_obsolete_timer_barge_switch():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        CREATE TABLE system_config (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE devices (device_id TEXT PRIMARY KEY, config TEXT);
+        """
+    )
+    conn.execute(
+        "INSERT INTO system_config VALUES ('global_device_config', ?)",
+        (json.dumps({"owwThreshold": 0.9, "ringBargeIn": False}),),
+    )
+    conn.execute(
+        "INSERT INTO devices VALUES ('dev1', ?)",
+        (json.dumps({"ringBargeIn": True, "owwModel": "ophelia"}),),
+    )
+
+    em_db._fixup_v21(conn)
+
+    fleet = json.loads(conn.execute(
+        "SELECT value FROM system_config WHERE key = 'global_device_config'"
+    ).fetchone()["value"])
+    device = json.loads(conn.execute(
+        "SELECT config FROM devices WHERE device_id = 'dev1'"
+    ).fetchone()["config"])
+    assert fleet == {"owwThreshold": 0.9}
+    assert device == {"owwModel": "ophelia"}
 
 
 def test_config_form_does_not_reference_a_device_it_never_receives():

@@ -67,22 +67,6 @@ DEFAULT_DEVICE_CONFIG = {
     # older firmware would simply ignore the message, so the dashboard shows
     # it disabled with the reason rather than as a toggle that does nothing.
     "wakeSound":        False,
-    # ringBargeIn: what the wake listener does with mic frames captured
-    # while a timer ring is AUDIBLE. Off (the default) drops them and
-    # rescores the silent gap between bursts from a reset model; on scores
-    # them at the barge-in threshold, so the wake word can land during the
-    # chime instead of only in the gaps.
-    #
-    # This is a controller-side question about scoring, not a device
-    # setting: the device's audio HAL cancels its own echo unconditionally
-    # (there is no "AEC off" any more), so what is left to decide is whether
-    # the RESIDUAL is clean enough to score through. It is off by default
-    # because the risk runs one way — a chime whose residual scores as the
-    # wake word silences its own alarm — and the AFE's cancellation depth on
-    # this hardware is not yet measured. `Ring listening (chime audible)`
-    # vs `(silent window)` in the log says which mode a ring ran in.
-    # Additive either way: the ring cadence is unchanged.
-    "ringBargeIn":      False,
     "startupVolume":    85,
     # vadThreshold: 0.001 (normalised RMS pre-AGC).
     # Q2 fix (2026-07-05 review, tracked as B6): this was drifted to 0.003 in
@@ -282,14 +266,11 @@ DEFAULT_DEVICE_CONFIG = {
     # the wake word, nothing else in the system would ever stop the ring.
     "timerRingSeconds": 60,
     # The ring's cadence, and the reason it is two keys rather than one.
-    # timerRingGapSeconds is the SILENCE between bursts, which is also the
-    # only window the wake word gets — openWakeWord needs ~1.4s of context
-    # and the ring resets its model each time the sound stops, so dropping
-    # this much below 1.5 trades away the ability to stop the alarm. Buy
-    # urgency with timerRingBurstSeconds instead: a sound shorter than this
-    # repeats to fill it, so one 0.6s chime becomes a burst of two rather
-    # than a lone chirp. Both measured against the first cut, which was a
-    # 0.6s chime every 3.1s and read as "less frequent than before".
+    # timerRingGapSeconds is the quiet fallback between bursts; wake scoring
+    # remains live over the chime, so this is taste rather than a detector
+    # warm-up requirement. Buy urgency with timerRingBurstSeconds: a sound
+    # shorter than this repeats to fill it, so one 0.6s chime becomes a burst
+    # of two rather than a lone chirp.
     "timerRingGapSeconds":   2.0,
     "timerRingBurstSeconds": 1.2,
     # bleProxyEnabled: BLE proxy (device-side passive scan over the raw HCI
@@ -864,6 +845,18 @@ MIGRATIONS: list[str] = [
 
     UPDATE system_config SET value = '20' WHERE key = 'schema_version';
     """,
+
+    # ── v21 — timer rings use the ordinary barge-in path ────────────────────
+    #
+    # ringBargeIn used to decide whether the wake detector ran while a timer
+    # chime was audible. That made the default alarm impossible to stop by
+    # voice except during a configured quiet gap. Ring audio is playback and
+    # now always uses bargeInThreshold, so the separate switch has no valid
+    # meaning. Remove it from fleet and per-device JSON rather than leaving a
+    # dead setting that APIs keep round-tripping forever.
+    """
+    UPDATE system_config SET value = '21' WHERE key = 'schema_version';
+    """,
 ]
 
 # Post-migration fixups that need Python rather than SQL. Keyed by the schema
@@ -889,7 +882,46 @@ def _fixup_v11(conn) -> None:
             )
 
 
-_MIGRATION_FIXUPS = {11: _fixup_v11}
+def _fixup_v21(conn) -> None:
+    removed = "ringBargeIn"
+    changed = 0
+
+    row = conn.execute(
+        "SELECT value FROM system_config WHERE key = 'global_device_config'"
+    ).fetchone()
+    if row is not None:
+        try:
+            cfg = json.loads(row["value"] or "{}") or {}
+        except (json.JSONDecodeError, TypeError):
+            cfg = None
+        if cfg is not None and removed in cfg:
+            cfg.pop(removed)
+            conn.execute(
+                "UPDATE system_config SET value = ? "
+                "WHERE key = 'global_device_config'",
+                (json.dumps(cfg),),
+            )
+            changed += 1
+
+    for row in conn.execute("SELECT device_id, config FROM devices").fetchall():
+        try:
+            cfg = json.loads(row["config"] or "{}") or {}
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if removed not in cfg:
+            continue
+        cfg.pop(removed)
+        conn.execute(
+            "UPDATE devices SET config = ? WHERE device_id = ?",
+            (json.dumps(cfg), row["device_id"]),
+        )
+        changed += 1
+
+    if changed:
+        log.info(f"[db] v21: removed ringBargeIn from {changed} config scope(s)")
+
+
+_MIGRATION_FIXUPS = {11: _fixup_v11, 21: _fixup_v21}
 
 # ─── Connection management ────────────────────────────────────────────────────
 
@@ -1341,8 +1373,8 @@ def get_global_device_config() -> dict:
         return dict(DEFAULT_DEVICE_CONFIG)
     if not stored:
         return dict(DEFAULT_DEVICE_CONFIG)
-    # Underlay defaults so keys added after the stored config was last
-    # saved (e.g. ringBargeIn) are still pushed with their default value
+    # Underlay defaults so keys added after the stored config was last saved
+    # are still pushed with their default value
     # instead of silently falling back to whatever the device binary's
     # env default happens to be.
     return {**DEFAULT_DEVICE_CONFIG, **stored}

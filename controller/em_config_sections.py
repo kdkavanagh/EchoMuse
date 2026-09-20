@@ -31,11 +31,6 @@ SECTIONS: dict[str, dict] = {
             "owwModel", "owwThreshold", "owwSpeexNs", "nearMissThreshold",
             "bargeInEnabled", "bargeInThreshold", "wakeArbitrationMs",
             "owwOnDevice",
-            # Whether the wake word may be scored over an audible timer ring.
-            # Here rather than in "timers": it is a wake-detection decision
-            # (which frames the listener scores, at which threshold), and it
-            # belongs beside the barge-in pair it shares its threshold with.
-            "ringBargeIn",
             # The chime a wake fires. Here rather than in "playback": that
             # section is how audio SOUNDS (EQ, duck depth), and this is part
             # of what a wake does — a device taking its own wake behaviour

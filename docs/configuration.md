@@ -210,14 +210,12 @@ the wake word looks like. (During the silent *thinking* pause the normal wake
 sensitivity applies instead — nothing is playing, so the low barge threshold
 isn't needed there.)
 
-**Wake word over a ringing timer** — a separate switch, off by default. A
-ringing timer plays in bursts with gaps between them, and by default the Dot
-only listens for you in the gaps. Turn this on to have it listen *through* the
-chime as well, at the barge threshold above, so "stop" lands sooner. The reason
-it is off: if the chime itself ever scores as your wake word, the alarm
-silences itself. The device log says which window a score came from
-(`Ring listening (chime audible)` vs `(silent window)`), so a self-silencing
-ring states its own cause.
+**Wake word over a ringing timer** uses that same barge threshold. Listening
+stays active while the chime is audible as well as during the quiet gap, so
+you can speak over the alarm; there is no separate timer-listening switch or
+threshold. The device log names the scored window (`Ring listening (chime
+audible)` vs `(silent window)`), so a chime residual that crosses the bar and
+silences its own alarm states its own cause.
 
 ### Speex denoise
 Runs a noise cleaner on the audio *only for wake-word scoring* (your actual

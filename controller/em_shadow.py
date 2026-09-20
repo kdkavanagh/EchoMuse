@@ -64,6 +64,22 @@ def normalise_mode(v) -> str:
     s = str(v or "").strip().lower()
     return s if s in MODES else MODE_OFF
 
+
+
+
+def decide_ring_wake_source(mode, device_wake, controller_hit: bool) -> str:
+    """
+    Pick the detector allowed to silence a controller-owned timer ring.
+
+    `owwOnDevice="on"` makes the device sovereign over starting voice turns,
+    but a ring stop starts no turn. A controller crossing must therefore still
+    silence its own alarm if the device report is absent or delayed.
+    """
+    source = decide_wake_source(mode, device_wake, controller_hit)
+    if source == "none" and controller_hit:
+        return "controller"
+    return source
+
 # How far apart the device's crossing and the controller's detection may be and
 # still be considered the same utterance.
 #

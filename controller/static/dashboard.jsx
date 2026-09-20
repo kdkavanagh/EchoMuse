@@ -5300,7 +5300,7 @@ const STAGE_MONO = "'DM Mono',monospace";
 // be silently wrong.
 const CONFIG_SECTIONS = {
   "playback": ["eqBands", "eqLoudness", "duckDb"],
-  "wakeword": ["owwModel", "owwThreshold", "owwSpeexNs", "nearMissThreshold", "saveWakeClips", "bargeInEnabled", "bargeInThreshold", "wakeArbitrationMs", "owwOnDevice", "wakeSound", "ringBargeIn"],
+  "wakeword": ["owwModel", "owwThreshold", "owwSpeexNs", "nearMissThreshold", "saveWakeClips", "bargeInEnabled", "bargeInThreshold", "wakeArbitrationMs", "owwOnDevice", "wakeSound"],
   "microphones": ["nsAsr", "saveUtterances", "endpointRelative", "endpointLowPerMil", "endpointSilenceMs", "endpointBackporchMs", "maxSpeechMs"],
   "ring": ["ledScene", "ledListenColor", "ledThinkColor", "meterAttack", "meterDecay", "meterFloor", "meterGamma", "meterRef", "meterCurve"],
   "advanced": ["vadThreshold", "vadSpeechMs", "vadSilenceMs", "buttonSingleTapEvent", "buttonMultiTapMs"],
@@ -5790,8 +5790,8 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
                 sub="keeps the 1.4 seconds of audio that crossed the threshold, for the last few hundred wakes — download a false trigger from Activity and feed it back into wake-word training"
                 value={config.saveWakeClips ?? false}
                 onChange={v => set('saveWakeClips', v)}/>
-              <Toggle label="Barge-in" sub="wake word interrupts playback — enable AEC first" value={config.bargeInEnabled ?? false} onChange={v => set('bargeInEnabled', v)}/>
-              <Slider label="Barge threshold" sub="wake confidence needed during playback — raise it if a response cuts itself short" value={config.bargeInThreshold ?? 0.05} min={0.05} max={0.9} step={0.05} onChange={v => set('bargeInThreshold', v)}/>
+              <Toggle label="Barge-in" sub="wake word interrupts responses and music — timer alarms always listen" value={config.bargeInEnabled ?? false} onChange={v => set('bargeInEnabled', v)}/>
+              <Slider label="Barge threshold" sub="wake confidence needed over playback, including timer alarms — raise it if audio cuts itself short" value={config.bargeInThreshold ?? 0.05} min={0.05} max={0.9} step={0.05} onChange={v => set('bargeInThreshold', v)}/>
               <Slider label="Arbitration window" sub="ms that the first Echo to hear you silences the others — no added delay; 0 disables" value={config.wakeArbitrationMs ?? 700} min={0} max={2000} step={50} unit="ms" onChange={v => set('wakeArbitrationMs', v)}/>
               {/* Score floor for the Activity tab's near-miss counter —
                   below it a frame is ordinary room noise and is not counted
@@ -6049,7 +6049,7 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
         </div>
         <div style={{ marginTop: 16, ...inputStyle }}>
           <Slider label="Burst length" sub="a shorter sound repeats to fill this — how insistent each round sounds" value={config.timerRingBurstSeconds ?? 1.2} min={0.5} max={6} step={0.1} unit="s" onChange={v => set('timerRingBurstSeconds', v)}/>
-          <Slider label="Gap between bursts" sub="also the only window the wake word gets — below ~1.5s the alarm gets hard to stop, so buy urgency with burst length instead" value={config.timerRingGapSeconds ?? 2.0} min={0.5} max={8} step={0.1} unit="s" onChange={v => set('timerRingGapSeconds', v)}/>
+          <Slider label="Gap between bursts" sub="a quiet fallback; wake listening stays active while the alarm itself is sounding" value={config.timerRingGapSeconds ?? 2.0} min={0.5} max={8} step={0.1} unit="s" onChange={v => set('timerRingGapSeconds', v)}/>
           <Slider label="Stop ringing after" sub="gives up if nobody says the wake word — Home Assistant has already discarded the timer by then, so nothing else would" value={config.timerRingSeconds ?? 60} min={5} max={300} step={5} unit="s" onChange={v => set('timerRingSeconds', v)}/>
         </div>
         {deviceId && (

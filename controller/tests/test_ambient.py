@@ -298,23 +298,6 @@ def test_voice_turns_are_refused_while_recording_ambient():
     assert body.index("device.ambient_mode") < body.index("voice_lock")
 
 
-def test_the_frame_tap_sits_in_the_wake_listener_before_every_gate():
-    """
-    Same stream as collect mode — so the audio is byte-for-byte what the wake
-    model scores — but tapped ABOVE the gates that protect inference: the
-    speaking guard, the deaf-ring window, and the mode branch that `continue`s.
-    Those exist so the model is not fed the device's own output; none of them
-    is a reason to punch a hole in a recording whose promise is "the mic was
-    open for this long". Dropping them would make audio time diverge from
-    wall time, and the file would disagree with the elapsed clock.
-    """
-    src  = CONTROLLER.read_text()
-    body = src[src.index("async def wake_word_listener"):]
-    tap  = body.index("_ambient_frame(device, frame)")
-    assert tap < body.index("device.speaking")
-    assert tap < body.index("ring_deaf")
-    assert tap < body.index("_capture_frame(device")
-    assert tap < body.index("model.push")
 
 
 def test_the_mode_survives_a_controller_restart():

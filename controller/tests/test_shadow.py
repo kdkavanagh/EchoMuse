@@ -131,6 +131,23 @@ def test_active_defaults_false():
     assert tracker().active is False
 
 
+# ─── timer-ring wake decisions ───────────────────────────────────────────────
+
+
+
+def test_controller_can_stop_its_ring_in_on_device_mode():
+    assert em_shadow.decide_ring_wake_source(
+        "on", device_wake=None, controller_hit=True
+    ) == "controller"
+
+
+def test_device_crossing_still_wins_when_it_is_available():
+    wake = {"at": 0.0, "score": 0.95, "threshold": 0.9}
+    assert em_shadow.decide_ring_wake_source(
+        "on", device_wake=wake, controller_hit=True
+    ) == "device"
+
+
 # ─── owwOnDevice modes ───────────────────────────────────────────────────────
 #
 # The mode decides who is allowed to start a turn, and both wrong answers are
