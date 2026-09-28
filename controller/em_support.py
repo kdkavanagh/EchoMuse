@@ -71,13 +71,18 @@ _DEVICE_FIELDS = (
 # stored here nor wanted, so the guard is explicit rather than assumed.
 _CONFIG_DENY = ("psk", "password", "token", "secret", "key")
 
+# Keys as `db.get_turns` returns them (plus device_id, added by the caller).
+# The text fields (`asr_text`, `stt_raw`, `stt_text`, `response_text`) are
+# deliberately absent: they are speech.
 _TURN_FIELDS = (
-    "id", "device_id", "ts", "trigger_type", "wake_model", "wake_score",
-    "wake_threshold", "dev_shadow", "dev_wake_score", "dev_threshold",
-    "noise_floor", "outcome", "total_ms", "vad_end_ms", "stt_ms",
-    "tts_url_ms", "tts_fetch_ms", "playback_ms", "send_ms", "delivery_ms",
-    "eq_ms", "underruns", "min_depth", "prime_wait_ms", "recv_span_ms",
-    "max_gap_ms", "bytes_recv",
+    "turn_id", "device_id", "ts", "trigger", "wake_model", "wake_score",
+    "wake_threshold", "outcome", "total_ms", "stt_ms", "tts_url_ms",
+    "playback_ms", "audio_ms",
+    # §11.3 decision trace
+    "wake_model_sha256", "policy_hash", "wake_attribution", "reference_coverage",
+    "commit_route", "terminal_reason", "commit_id",
+    # per-stage detail (schema 24)
+    "endpoint_class", "endpoint_ms", "intent_ms", "intent_local", "response_type",
 )
 
 # Hourly device metrics, named as `db.get_device_metrics` RETURNS them, not as
@@ -121,13 +126,13 @@ _STATS_FIELDS = (
     "cpuPct", "memUsedMb", "memTotalMb", "storageUsedMb", "storageTotalMb",
     "wifiRssi", "linkSpeedMbps", "wifiFreqMhz", "txBytes", "rxBytes",
     "cpuTempC", "maxTempC", "coresOnline", "coresTotal", "thermalCoreLimit",
-    "ambientLux", "owwShadow",
+    "ambientLux",
 )
 
+# wake_counters as filled from the device's wake.stats (SPEC §18.4 step 4).
 _COUNTER_FIELDS = (
-    "device_id", "hour_ts", "near_misses", "near_miss_max", "underruns",
-    "dev_frames", "dev_drops", "dev_crossings", "dev_max_score",
-    "dev_max_infer_ms", "dev_max_gap_ms",
+    "device_id", "hour_ts", "near_misses", "near_miss_max", "dev_hops",
+    "dev_drops", "dev_crossings", "dev_max_score", "dev_max_infer_ms",
 )
 
 

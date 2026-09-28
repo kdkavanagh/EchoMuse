@@ -1,48 +1,39 @@
 """
-em_wakeclips.py — the audio that woke the device, kept for retraining
-=====================================================================
+em_wakeclips.py — the audio that woke the device, kept for diagnosis
+====================================================================
 
-A false wake has no evidence. The Activity row records that a turn started,
-which model scored it and how high (`wake_score`), and — if `saveUtterances`
-is on — the audio streamed to Home Assistant *afterwards*. None of that is
-the sound that actually crossed the threshold: the wake word ends before the
-detection, `_stream_mic_audio` then discards `VOICE_PREROLL_DISCARD` frames
-precisely to drop the tail of it, and the model's own rolling context is
-overwritten by `model.reset()` on the same iteration. So the one recording
-that would let a false positive be fixed — feed it back to `oww_forge` as a
-negative and retrain — was the one recording that could not be obtained.
+A false wake is only fixable if the sound that caused it can be heard. The
+Activity row records which registry model accepted the wake and its peak
+score, and — if `saveUtterances` is on — the committed utterance sent to Home
+Assistant. Neither is the wake word itself as the device's BCResNet heard it.
 
-This module stores it. `wake_word_listener` keeps the last `CLIP_MS` (1.4s) of
-chunks it is scoring in a bounded deque; on a detection that starts a turn it
-joins them onto the Device, and `em_esphome._save_wake_clip` writes them here
-once the turn's rowid exists. Consequences of that shape worth stating:
+This module stores that clip. When a turn started by an accepted
+`wake.candidate` ends, `em_session` reads the candidate's support span from
+the lease's mic timeline — support start −300 ms through `support_end` — and,
+if `saveWakeClips` is set for the device, writes it here once the turn's
+rowid exists. The clips serve two jobs: listening to why a device woke, and
+false-positive/true-positive material for BCResNet training, which lives
+outside this repository (`~/git/bcresnet`). Consequences of that shape:
 
-  * **The clip is exactly what the model scored**, byte for byte, tapped at
-    the same point as `em_samples` and for the same reason: a negative
-    captured through a different gain or denoiser teaches the model about a
-    path it will never see in service.
-  * **It ends at the detection and contains no command audio.** The causal
-    window is entirely before the crossing, the turn's own recording already
-    covers what follows, and a training negative that carries somebody's
-    request is a privacy cost with no modelling benefit.
-  * **Nothing is retained in memory unless the feature is on.** The deque is
-    only fed while `saveWakeClips` is set for the device, so the default is
-    an empty ring rather than a rolling second and a half of the room.
-  * **The size bound is structural.** The deque's `maxlen` is the only limit
-    the buffer needs, so unlike `em_recordings` there is no byte cap here to
-    keep in step with a stream that has no length of its own.
+  * **The clip is the audio the device scored.** The mic stream is the
+    native AFE's output, the same samples the on-device detector consumed,
+    with no controller gain or denoiser applied. Training material captured
+    through a different path teaches a model about audio it never sees.
+  * **It contains no command audio.** It ends where the candidate's support
+    ends; the utterance recording (opt-in, separate) covers what follows.
+  * **Nothing is written unless the feature is on** for that device.
 
 Storage follows `em_samples` rather than `em_recordings`: a per-device
 directory, because a device that false-triggers is going to produce hundreds
 of these and a flat directory would be listed in full on every write, and a
-retention cap sized for a training set rather than a diagnostic handful. The
+retention cap sized for a corpus rather than a diagnostic handful. The
 filename is the turn id, as in `em_recordings` — rowids are monotonic, so
 the ordering pruning depends on is exact even after a restore from a backup
 that flattened every timestamp, and the Activity row that shows the false
 positive links straight to the clip that caused it.
 
 Pure path/filesystem logic (no aiohttp, no db import) so it can be unit
-tested; em_esphome writes through it and em_api serves from it.
+tested; em_session writes through it and em_api serves from it.
 """
 
 from __future__ import annotations
@@ -64,19 +55,10 @@ log = logging.getLogger("echomuse.wakeclips")
 
 WAKES_SUBDIR = "wakes"
 
-# How much pre-detection audio a clip holds. openWakeWord's own context is
-# ~1.4s and BC-ResNet scores a 1.4s window, so this covers the whole of what
-# either model actually looked at with a little room in front of it — the
-# margin matters because a false positive is usually a word or two, and a
-# negative cut flush against the crossing trains the model on a fragment.
-# The margin is all it needs to be: everything beyond the scored window is
-# room the model never judged, so it is memory held and audio written for no
-# training value.
-#
-# The wake stream arrives as 80ms chunks (em_controller.CHUNK_BYTES), which
-# is what the listener's ring holds, so the window is quantised to those:
-# 1.5s is not a multiple of 80ms and 18 frames is the longest ring that does
-# not exceed it.
+# A nominal clip: 18 wire frames of 80 ms (1.44 s), about the BCResNet
+# window plus a little lead-in. Real clips are the candidate's support span
+# −300 ms, so their length varies; this is the unit the retention estimate
+# below and the tests use.
 FRAME_MS    = 80
 CLIP_FRAMES = 18
 CLIP_MS     = CLIP_FRAMES * FRAME_MS      # 1440

@@ -287,15 +287,6 @@ def test_deleting_a_device_takes_its_recordings_and_its_part_file(tmp_path):
 
 # ─── controller and API wiring (shape guards, as in test_samples.py) ──────────
 
-def test_voice_turns_are_refused_while_recording_ambient():
-    """A device holding its mic open for a recording must not also be
-    answering with it. Guarded at _run_voice_locked, where wake word, dot
-    button and HA's start_conversation all meet, and BEFORE the lock is taken
-    — refusing after would still pause music and take the speaker."""
-    src  = CONTROLLER.read_text()
-    body = src.split("async def _run_voice_locked", 1)[1].split("\nasync def ", 1)[0]
-    assert "device.ambient_mode" in body
-    assert body.index("device.ambient_mode") < body.index("voice_lock")
 
 
 
@@ -313,16 +304,6 @@ def test_the_mode_survives_a_controller_restart():
         "a .part from a killed controller must be recovered on connect"
 
 
-def test_the_open_file_is_closed_when_the_device_goes_away():
-    """The audio this connection delivered is a complete recording. Left as a
-    `.part` for a device that never comes back, the session's only artefact
-    is unplayable — so the connection teardown finishes the file, next to
-    the one that flushes a half-cut sample clip."""
-    src  = CONTROLLER.read_text()
-    body = src[src.index("async def handle_control"):]
-    assert "await ambient_teardown(device)" in body
-    assert body.index("await ambient_teardown(device)") > \
-           body.index("await collect_teardown(device)")
 
 
 def test_ambient_is_not_a_config_key():

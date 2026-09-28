@@ -5,7 +5,7 @@ Split out of `em_controller._link_auth_ok` so it can be tested. The rest of
 that function is a websocket header read, a DB lookup and a log call; the part
 worth getting right is the four-way decision below, and it was previously
 unreachable from the test suite because em_controller pulls in the whole
-websockets/openwakeword stack.
+controller runtime.
 
 It cost an orphaned device to find out. Deleting a device removed its row, and
 the token is a column on that row, so `expected` became None while the device

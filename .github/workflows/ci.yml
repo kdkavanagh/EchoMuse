@@ -14,11 +14,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # The tests cover pure-logic modules only — numpy/scipy for the EQ
-      # math, nothing that pulls in openwakeword/onnxruntime (which would
-      # cost minutes of install for zero coverage).
+      # Pure-logic modules plus the device link and HA client, which need
+      # only websockets and aiohttp (pinned as in requirements.txt). Model
+      # runtimes (onnxruntime, sherpa-onnx) are not installed; their tests
+      # skip via importorskip.
       - name: Install test dependencies
-        run: pip install pytest numpy scipy
+        run: pip install pytest numpy scipy websockets==16.0 aiohttp==3.13.5
       - name: Run pytest
         working-directory: controller
         run: python -m pytest tests/ -v
@@ -33,18 +34,11 @@ jobs:
           python-version: "3.12"
       - name: Install pyflakes
         run: pip install pyflakes
-      # Why this job exists, in one sentence: `time.monotonic()` was added to
-      # em_controller.py, which does not import time, and the resulting
-      # NameError killed the wake word listener on the first detection --
-      # fleet-wide, in production, on a line no test could reach because the
-      # wake loop needs openwakeword and a real utterance to execute.
-      #
-      # pyflakes finds that class of bug in milliseconds without importing
-      # anything, which is what makes it worth a job: the controller's heavy
-      # modules (em_controller, em_api, em_esphome) are deliberately NOT
-      # imported by the test suite, so every rarely-taken branch in them is
-      # untested by construction. Undefined names are the failure mode that
-      # punishes hardest -- silent until executed, then fatal.
+      # pyflakes finds undefined names in milliseconds without importing
+      # anything. The controller's wiring modules (em_controller, em_api,
+      # em_esphome) are not imported by the test suite, so their rarely-taken
+      # branches are untested by construction; an undefined name there is
+      # silent until executed, then fatal.
       #
       # Scoped to undefined names ONLY, on purpose. The codebase has pre-existing
       # unused-variable and f-string warnings that are not worth a churn commit,
@@ -52,7 +46,7 @@ jobs:
       - name: Check for undefined names
         working-directory: controller
         run: |
-          out=$(python -m pyflakes em_*.py tools/*.py tests/*.py esphome/*.py 2>&1 \
+          out=$(python -m pyflakes em_*.py echomuse_grammar/*.py tools/*.py tests/*.py esphome/*.py 2>&1 \
                 | grep -i "undefined name" || true)
           if [ -n "$out" ]; then
             echo "$out"
@@ -107,8 +101,7 @@ jobs:
       - name: Install pip-audit
         run: pip install pip-audit
       # This is the FAST check, not the authoritative one. requirements.txt
-      # leaves scipy/tqdm/scikit-learn/requests unpinned and installs
-      # openwakeword separately with --no-deps, so what a user actually runs
+      # leaves scipy and protobuf unpinned, so what a user actually runs
       # is decided at image build time, not here. The published image is the
       # source of truth and is scanned in security-scan.yml; this job exists
       # to fail on a PR that adds a known-vulnerable pin, minutes rather than

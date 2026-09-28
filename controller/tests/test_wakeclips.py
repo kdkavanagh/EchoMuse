@@ -2,10 +2,10 @@
 Tests for em_wakeclips — the audio that crossed the wake threshold.
 
 This store exists for one workflow: a device wakes when nobody spoke to it,
-somebody downloads the second and a half that caused it, and that clip goes
-back into oww_forge as a training negative. Everything below defends a
-property of that workflow whose failure looks like nothing at all until the
-corpus is already wrong:
+somebody listens to or downloads the clip that caused it, and that clip goes
+into a BCResNet training corpus (~/git/bcresnet) as a negative. Everything
+below defends a property of that workflow whose failure looks like nothing
+at all until the corpus is already wrong:
 
   * the file is exactly what the model scored — 16kHz mono 16-bit, the same
     frame count that went in. A clip that decodes at the wrong rate trains
@@ -16,8 +16,8 @@ corpus is already wrong:
     written file is never listed, served or counted
 
 Pure paths and bytes, so `tmp_path` is the whole fixture. The wiring that
-makes collection safe cannot be imported (openwakeword, aiohttp, a device),
-so it is pinned against the source as in test_samples.py and test_ambient.py.
+makes collection safe is pinned against the source as in test_samples.py and
+test_ambient.py.
 """
 
 import re
@@ -29,7 +29,6 @@ import pytest
 
 CONTROLLER_DIR = Path(__file__).resolve().parents[1]
 CONTROLLER = CONTROLLER_DIR / "em_controller.py"
-ESPHOME    = CONTROLLER_DIR / "em_esphome.py"
 API        = CONTROLLER_DIR / "em_api.py"
 DB         = CONTROLLER_DIR / "em_db.py"
 
@@ -69,7 +68,7 @@ def test_a_saved_clip_is_found_again_by_name(tmp_path):
 
 
 def test_a_clip_decodes_as_the_audio_the_model_scored(tmp_path):
-    """oww_forge trains on these directly, so the container has to agree with
+    """Training reads these directly, so the container has to agree with
     the wire format down to the frame count: a negative resampled or padded
     by a wrong header is a negative for a sound the device never heard."""
     pcm  = _pcm(6)
@@ -253,77 +252,19 @@ def test_a_stray_part_is_never_listed_served_or_counted(tmp_path):
 
 # ─── wiring (shape guards, as in test_samples.py) ─────────────────────────────
 #
-# The suite cannot import em_controller or em_esphome (openwakeword, aiohttp,
-# a device, a database), so the properties that make this feature safe rather
-# than merely present are pinned against the source. Each one fails silently:
-# a ring buffered for a room nobody opted in, or a clip filed against the
-# wrong turn.
+# The properties that make this feature safe rather than merely present are
+# pinned against the source. Each one fails silently: a clip written for a
+# device nobody opted in, or a clip filed against the wrong turn.
 
 
-def test_the_ring_is_only_fed_for_a_device_that_asked_for_it():
-    """The tap sits in the same loop that scores the wake model, so without
-    the per-device guard the controller holds a rolling 1.4 seconds of every
-    room in the house whether or not anyone asked for it — audio nobody
-    requested, kept in memory, and the feature's default is off."""
-    body = _body(CONTROLLER.read_text(), "async def wake_word_listener")
-    assert "model.push" in body, \
-        "the scoring loop must still be the tap point"
-    assert "save_wake_clips" in body, \
-        "the wake ring must be fed only while the device's flag is set"
 
 
-def test_the_clip_is_written_after_the_turn_exists():
-    """The filename is the turn's rowid, so there is nothing to name until
-    the insert has returned one. Ordered behind _save_utterance, which has
-    the same dependency for the same reason."""
-    body = _body(ESPHOME.read_text(), "async def _persist_turn")
-    assert "_save_wake_clip" in body, \
-        "_persist_turn must write the wake clip once the rowid exists"
-    assert body.index("_save_wake_clip") > body.index("_save_utterance"), \
-        "the clip is named by the rowid — it cannot precede the insert"
 
 
-def test_a_wake_buffer_is_spent_on_exactly_one_turn():
-    """The buffer is joined onto the Device at detection and read at persist,
-    which is a whole turn later. Left in place it would be written again for
-    the next turn — the button, a start_conversation from HA, or a turn whose
-    detection was a different device — and the corpus would carry a negative
-    filed against audio that did not cause it."""
-    body = _body(ESPHOME.read_text(), "async def _save_wake_clip")
-    assert "last_wake_pcm" in body
-    assert "last_wake_pcm = None" in body, \
-        "the buffer must be consumed, not merely read"
 
 
-def test_the_barge_detector_is_covered_too():
-    """barge-in scores at bargeInThreshold, deliberately BELOW the wake
-    threshold (speech over TTS is depressed ~25dB by the speaker), so it is
-    the likeliest detector in the product to fire on nothing — the case the
-    clip exists for. Its own ring, over voice_queue, gated on the same flag."""
-    body = _body(CONTROLLER.read_text(), "async def _barge_watcher")
-    assert "save_wake_clips" in body, \
-        "the barge ring must be fed only while the device's flag is set"
-    assert "barge_wake_pcm" in body
 
 
-def test_a_barge_clip_is_filed_against_the_interrupting_turn():
-    """The cancelled turn persists BEFORE the interrupting one starts, so a
-    barge clip written to last_wake_pcm would be consumed by the wrong turn —
-    filing the audio that interrupted a response under the wake that began
-    it, on a row whose own score says something else. The watcher therefore
-    parks it, and the branch that starts the interrupting turn promotes it."""
-    src     = CONTROLLER.read_text()
-    watcher = _body(src, "async def _barge_watcher")
-    # Assignments only — the watcher's own comment names the slot it is
-    # deliberately NOT writing, and a guard that cannot tell a mention from a
-    # write is a guard that gets deleted the next time someone explains
-    # themselves in a comment.
-    assert not re.search(r"last_wake_pcm\s*(=|,)", watcher), \
-        "the barge watcher must not write the slot the cancelled turn reads"
-    assert "barge_wake_pcm =" in watcher
-    branch = _body(src, "async def _run_voice_locked")
-    assert re.search(r"last_wake_pcm,\s*device\.barge_wake_pcm\s*=", branch), \
-        "the interrupting turn must be handed the parked clip"
 
 
 def test_deleting_a_device_reaches_the_volume():
@@ -340,6 +281,6 @@ def test_every_wake_clip_route_has_a_handler():
     assert "/api/devices/{id}/turns/{turn}/wake" in routes, \
         "the per-turn clip must be servable — it is the whole download path"
     assert "/api/devices/{id}/wakeclips.zip" in routes, \
-        "a corpus is fed to oww_forge in bulk, not one clip at a time"
+        "a corpus is downloaded in bulk, not one clip at a time"
     for path, handler in routes.items():
         assert f"async def {handler}" in src, f"{path} points at a missing handler"

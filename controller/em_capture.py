@@ -85,8 +85,8 @@ MAX_IDLE_S     = 3600.0
 # The frame path closes a full window as soon as the frame that fills it
 # arrives; this covers the case where frames STOP arriving — a link stall, a
 # device that dropped its mic stream — where waiting on audio time would hold
-# the window open forever. Same reasoning as em_endpoint checking `maxSpeechMs`
-# outside the frame path.
+# the window open forever. A wall-clock backstop for the case where audio
+# time stops advancing.
 WINDOW_GRACE_MS = 2_000
 
 # Tags are opaque to the controller and echoed into a header, so they are
@@ -355,7 +355,7 @@ class ResultStore:
         """
         Remove and return one result: the named session, or the oldest.
 
-        Consumed on read, like the shadow tracker's crossings — leaving it
+        Consumed on read — leaving it
         behind would let one recording be collected twice and paired with two
         different source files.
         """

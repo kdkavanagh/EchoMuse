@@ -1,7 +1,8 @@
 """
-Controller unit tests cover the pure-logic modules only (em_eq,
-em_scenes, em_oww_models, version) — nothing that needs openwakeword,
-aiohttp, a database, or a device. Run from anywhere:
+Controller tests need pytest, numpy and scipy, plus websockets and aiohttp
+for the device-link, legacy-handler and HA-client tests. Tests that load
+real models skip without onnxruntime/sherpa-onnx; nothing needs a live
+Home Assistant or a device. Run from anywhere:
 
     cd controller && python -m pytest
 """

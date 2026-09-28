@@ -1,27 +1,26 @@
 # Playback capture: re-recording a corpus through the Echo
 
-`oww_forge` trains on synthetic TTS positives; `em_samples` collects real
-speech from the room. Neither produces the third thing a wake model needs —
-**a large, already-labelled corpus carrying this device's signal chain**.
-Common Voice on disk is clean studio speech. The same clips played into a
-room and captured off the Echo's mic array carry the array, the beam the HAL
-selected and the gain it applied, the room's reverb and noise floor, the
-distance and whatever the
-playing speaker does to the spectrum: every part of the path the model is
-scored on in service, and none of which augmentation can invent from a clean
-file.
+Sample collection (`em_samples`) records real speech from the room.
+It does not produce the other thing a wake model or an endpoint qualification
+set needs — **a large, already-labelled corpus carrying this device's signal
+chain**. Common Voice on disk is clean studio speech. The same clips played
+into a room and captured off the Echo carry the mic array, the native AFE's
+beam selection and gain, the room's reverb and noise floor, the distance and
+whatever the playing speaker does to the spectrum: every part of the path the
+on-device BCResNet detector scores in service, and none of which augmentation
+can invent from a clean file. BCResNet training itself lives outside this
+repository (`~/git/bcresnet`); this is how its device-chain material is made.
 
-The playback matrix turns one corpus into several. Each source clip is played
+A playback matrix turns one corpus into several. Each source clip is played
 from each of several Home Assistant media players, at each of several
 volumes. Position gives direction, distance and reverb; volume gives SNR.
 
-Two pieces:
-
-- **`controller/em_capture.py`** — a recording window opened and closed by
-  whoever is driving, whose audio is POSTed to a webhook rather than written
-  to disk.
-- **`oww_forge/tools/playback_matrix.py`** — the driver: owns the matrix,
-  plays the files through HA, receives the recordings and files them.
+The controller provides the recording half as **capture mode**
+(`controller/em_capture.py`, lifecycle in `em_controller`, routes in
+`em_api`): a recording window opened and closed by whoever is driving, handed
+back whole. The driver — the thing that plays the files and files the
+recordings — is yours; [Writing a driver](#writing-a-driver) lists what it
+has to get right.
 
 ---
 
@@ -41,16 +40,20 @@ nothing at all. One playback becomes 0..N files with no way to tell which.
 
 So capture mode records a window, and hands back exactly one file per window.
 
-What it *does* reuse from collect mode, deliberately:
+What it shares with the other recording modes (sample collection, ambient
+recording):
 
-- **the frame tap**, at the same point in `wake_word_listener` — the audio is
-  byte-for-byte what the wake model scores, which is the whole reason these
-  recordings are worth training on;
-- **the assistant suspension**, at `_run_voice_locked`, where wake word, dot
-  button and HA's own `start_conversation` all meet;
-- **the magenta throb ring**, because both modes mean "this device is
-  recording and will not answer you", and a second colour for the same fact
-  would have to be learned twice.
+- **the audio source.** While any recording mode is armed, the device's
+  session actor holds one `diagnostic` uplink lease and every mode taps its
+  live mic timeline — the native AFE's 16 kHz output, the same samples the
+  on-device wake detector scores. The controller applies no gain, denoising
+  or resampling before the tap. All armed modes receive the same blocks.
+- **the assistant suspension.** The actor refuses wake candidates and button
+  turns while a diagnostic lease is wanted (refusal reason `diagnostic`, with
+  the error cue on the ring). Alerts still ring and physical stop still works.
+- **the ring.** A slow magenta pulse (`em_device`) for as long as any
+  recording mode is armed: "this device is recording and will not answer
+  you".
 
 Trimming is **not** done on the controller. The driver has ffmpeg and the
 source clip to compare against; the controller has neither, and a trim rule
@@ -64,28 +67,51 @@ baked in at that end is one the driver cannot change without a redeploy.
 
 ```
 POST   /api/devices/{id}/capture               {"enabled": true,
-                                                "webhook": "http://host:port/clip",
+                                                "webhook": "http://host:port/clip",   (optional)
                                                 "idle_s": 300}
 POST   /api/devices/{id}/capture               {"enabled": false}
 POST   /api/devices/{id}/capture/window        {"tag": "...", "max_ms": 12000}
                                             -> {"session": "...", "tag": ..., "max_ms": ...}
 POST   /api/devices/{id}/capture/window/stop   {"session": "..."}
+GET    /api/devices/{id}/capture/recording?session=…&wait=…
 GET    /api/devices/{id}/capture
 ```
 
-Admin-only, and unlike collect mode it **requires a connected device**.
-Arming an offline device is meaningful there (the mode is persisted and
-re-applied on connect) and meaningless here.
+Admin-only, and unlike sample collection it **requires a connected, approved
+device running v1 firmware** (a device waiting for its firmware upgrade gets
+`409 upgrade_required`). Arming an offline device is meaningful for
+collection (the mode is persisted and re-applied on connect) and meaningless
+here.
 
-### The mode is not persisted, and that is the opposite call to `collect_mode`
+`max_ms` is clamped to `MAX_WINDOW_MS` (30 s; default 12 s). `idle_s`
+defaults to 300 and is capped at 3600.
+
+### Two delivery transports
+
+- **Push** — arm with a `webhook`. Each finished window is POSTed to it.
+- **Pull** — arm without one. The controller holds each finished recording
+  and the driver collects it from `GET …/capture/recording`, which long-polls
+  up to `wait` seconds (default 30, capped at 120). `404` means nothing
+  arrived in that time — an ordinary answer, not an error. Pull needs no
+  route from the controller back to the driver, which a controller on a
+  macvlan network does not have to its own Docker host.
+
+Both carry the same body and headers: the WAV (16 kHz mono PCM16), with
+metadata in `X-EM-Tag`, `X-EM-Ms`, `X-EM-Peak-Db`, `X-EM-Floor-Db`,
+`X-EM-Truncated`, `X-EM-Dropped`, `X-EM-Frames`, `X-EM-Session`,
+`X-EM-Device`, `X-EM-Opened-Ms`. Headers rather than multipart so both ends
+stay dependency-free: the receiver writes the body straight to disk and reads
+the rest off the headers.
+
+### The mode is not persisted, and that is the opposite call to sample collection
 
 A collect flag survives a restart because the person walking the house saying
-the wake word should not lose their session to a `docker compose up`. A
-webhook is the address of a **running process**. A controller that came back
-up still suspended, POSTing at a socket nobody holds, would be a device
-answering nothing for a reason nothing on screen explains. Capture state
-lives on the `Device` object only — hence no schema change, and nothing to
-add to the support-bundle allowlist.
+the wake word should not lose their session to a `docker compose up`. Capture
+mode belongs to a **running process**. A controller that came back up still
+suspended, holding recordings for a driver that no longer exists, would be a
+device answering nothing for a reason nothing on screen explains. Capture
+state lives on the `Device` object only and is cleared when the device's
+session is lost — a driver must re-arm after a reconnect.
 
 ### Three things that stop it stranding a device
 
@@ -94,30 +120,23 @@ add to the support-bundle allowlist.
   log line says why. It never expires underneath an open window — a caller
   may legitimately open a 30s window and say nothing for its duration.
 - **A window closes two ways**: on audio time at `max_ms`, noticed by the
-  frame path, and on the **wall clock** at `max_ms + WINDOW_GRACE_MS`,
+  frame path, and on the **wall clock** at `max_ms + WINDOW_GRACE_MS` (2 s),
   noticed by the watchdog. The second is not redundant: a device that stops
-  sending frames stops advancing audio time, so a stalled link would
-  otherwise hold the window open forever. Same reasoning as `em_endpoint`
-  checking `maxSpeechMs` outside the frame path.
+  sending audio stops advancing audio time, so a stalled link would otherwise
+  hold the window open forever.
 - **The disarm never cancels the task it is running on.** The watchdog calls
   `set_capture_mode(False)` itself, so a blind `task.cancel()` would raise
   `CancelledError` at the next await and abandon the rest of the disarm —
-  webhook and queue left set, no log line, no state push. `tests/test_capture.py`
-  pins it.
+  webhook and queue left set, no log line, no state push.
+  `tests/test_capture.py` pins it.
 
-### Delivery
+### Delivery rules
 
-`POST <webhook>`, body = the WAV, metadata in headers (`X-EM-Tag`,
-`X-EM-Ms`, `X-EM-Peak-Db`, `X-EM-Floor-Db`, `X-EM-Truncated`, `X-EM-Dropped`,
-`X-EM-Frames`, `X-EM-Session`, `X-EM-Device`, `X-EM-Opened-Ms`). Headers
-rather than multipart so both ends stay dependency-free: the receiver writes
-the body straight to disk and reads the rest off the headers.
-
-- **The mic path never waits on HTTP.** The frame tap appends bytes and
-  returns; the POST runs on a per-device sender task off a bounded queue
-  (`CAPTURE_QUEUE_MAX`). A slow webhook degrades to dropped *windows* —
+- **The mic path never waits on HTTP.** The tap appends bytes and returns;
+  a push POST runs on a per-device sender task off a bounded queue
+  (`CAPTURE_QUEUE_MAX`, 4). A slow webhook degrades to dropped *windows* —
   counted, logged, and reported to the next delivery as `X-EM-Dropped` —
-  never to a stuttering microphone. Same rule as `shadow.Scorer.Push`.
+  never to a stuttering microphone.
 - **Redirects are not followed** and the scheme is checked before the mode is
   armed (`em_capture.valid_webhook`). The caller is an authenticated admin,
   so this is not authorisation; it is the cheap half of not building an SSRF
@@ -125,120 +144,70 @@ the body straight to disk and reads the rest off the headers.
 - **An empty window is a failure, not a delivery.** A zero-length recording
   read as success is how a caller ends up with a corpus of silence it
   believes in.
+- **A result is consumed on read** in pull mode, so one recording cannot be
+  collected twice and paired with two different source files.
 - `tag` is opaque and echoed verbatim. Correlation is the caller's business,
   and a tag format the controller understood would be a second copy to drift.
 
-### Precedence over collect mode
-
-Where both are on, capture wins: it is ephemeral and was armed by something
-actively driving the device right now, while collect mode is a persisted
-standing order. Segmenting the same frames into a second set of clips
-underneath a matrix run would fill the samples directory with fragments of a
-corpus.
-
 ---
 
-## The driver: `oww_forge/tools/playback_matrix.py`
+## Writing a driver
 
-Standard library plus `ffmpeg`/`ffprobe`. Reuses `collect_device_clips.py`'s
-`Api` shape and its cleanup discipline.
-
-```
-playback_matrix.py -d Office \
-  --controller http://192.168.3.211:8768 --user admin \
-  --ha-url http://192.168.3.211:8123 --ha-token $HA_TOKEN \
-  --src /media/nfsShare/common_voice/cv-corpus-26.0-2026-06-12/en/clips \
-  --player media_player.lounge:20,35,60 \
-  --player media_player.office:35,60
-```
-
-Volumes are accepted as percents (`35`) or fractions (`0.35`); anything ≤ 1
-reads as a fraction, so `100` means full and `1` means one percent — the
-reading that cannot silently blast a room.
-
-### One server, two routes
-
-- `GET /media/<token>` — serves the source clip currently armed. HA needs a
-  URL and this process already has the bytes; a separate file server would be
-  another thing to configure and keep alive. The token changes per cell and
-  anything else 404s, so the route is not a way to read arbitrary paths off
-  the host. Single-range `Range` requests are honoured, because several
-  players send one.
-- `POST /clip` — the controller's webhook.
-
-`--advertise` defaults to whichever local address routes to HA (a host with
-docker bridges and VPNs has no single obvious answer otherwise);
-`--media-base` overrides the URL handed to the players.
-
-### Loop order: files outer, matrix inner
-
-This costs a `volume_set` per cell instead of one per pass, and it buys the
-property that matters when the run has no end. The script is meant to be
-killed with Ctrl+C whenever enough has been collected; with the loops the
-other way round that would leave every recording at one player and one
-volume. Each source clip is finished across the whole matrix before the next
-is started, so whenever it stops the set is balanced.
+The driver owns the matrix, plays the files through Home Assistant, and
+files the recordings. Whatever it is written in, these are the properties
+that decide whether a long unattended run produces a usable corpus.
 
 ### Per cell
 
 ```
 volume_set -> settle -> open window -> play_media -> sleep(pre + duration + post)
-           -> stop window -> await the POST for this tag -> trim -> write
+           -> stop window -> collect the recording for this tag -> trim -> write
 ```
 
-- **Playback end is judged by the source duration, not by polling
-  `media_player` state.** Music Assistant flow players lag and misreport
-  their transitions; the duration is known exactly from `ffprobe`.
-- **`max_ms` is a backstop, not the mechanism.** The script stops the window
-  itself once the clip has played. Leaving the cap to do it would mark every
-  recording `truncated` and throw away the signal that a playback *overran*.
-- **A delivery for any other tag is discarded**, not returned. A late arrival
-  from the previous cell is the one thing that would pair a recording with
-  the wrong source file — and from there every file in the run is mislabelled
-  by one.
-- **Capture mode is re-checked every cell** (`ensure_armed`). The mode lives on
-  the device's connection and is not persisted, so a device that bounced
-  mid-run comes back with it off; noticing costs one GET and turns a silent
-  run of failures into a hiccup.
+- **Loop files outer, matrix inner.** It costs a volume change per cell
+  instead of one per pass, and buys the property that matters when the run
+  has no fixed end: each source clip is finished across the whole matrix
+  before the next starts, so whenever the run is stopped the set is balanced.
+- **Judge playback end by the source duration** (from `ffprobe`), not by
+  polling `media_player` state. Some players (Music Assistant flow players,
+  for one) lag and misreport their transitions.
+- **Stop the window yourself.** `max_ms` is a backstop; leaving it to close
+  every window marks every recording `truncated` and throws away the signal
+  that a playback *overran*. Pass the window's `session` to `…/window/stop`
+  so a stop cannot land on a newer window.
+- **Discard a recording for any other tag.** A late arrival from the previous
+  cell is the one thing that would pair a recording with the wrong source
+  file — and from there every file in the run is mislabelled by one.
+- **Re-check the mode every cell** (`GET …/capture`). Capture mode does not
+  survive a device reconnect; noticing costs one GET and turns a silent run
+  of failures into a hiccup.
+- **Serve the source clip to HA yourself** with a per-cell URL, so the media
+  route cannot read arbitrary paths off the host. Honour single-range
+  `Range` requests; several players send one.
+- **Treat volumes ≤ 1 as fractions** if you accept both forms, so a typo
+  cannot silently blast a room.
 
-### Output, resume and naming
+### Output and resume
 
-Recordings go to `clips_recorded/` beside the source directory by default
-(`--out` overrides). Names:
-
-```
-{stem}_recorded_{player_slug}_{pct}.wav
-common_voice_en_100000_recorded_lounge_35.wav
-```
-
-`player_slug` is the entity id minus `media_player.`, non-alnum → `-`. The
-volume is an integer percent so the name carries exactly one dot. One
-formatter and one regex, used by both the writer and the resume check — two
-copies of a filename convention is how a resumed run silently re-records
-everything.
-
-**Resume is one `stat` per candidate, never a directory listing.** The Common
-Voice clips directory holds ~1.9M entries; it is streamed with `os.scandir`
-and never globbed, listed or sorted. Files matching the output pattern are
-skipped as sources, so pointing `--out` at the source directory still works.
-
-Two sidecars in the output directory: `manifest.tsv` (one row per recording —
-source, player, volume, durations, peak/floor dB, truncated) and
-`failures.tsv`.
+- One filename formatter and one regex, shared by the writer and the resume
+  check — two copies of a naming convention is how a resumed run silently
+  re-records everything.
+- For very large source directories (Common Voice's clips directory holds
+  ~1.9M entries), resume with one `stat` per candidate and stream the
+  directory with `os.scandir`; never glob, list or sort it.
+- Keep a manifest row per recording (source, player, volume, durations,
+  peak/floor dB, truncated) and a separate failures file.
 
 ### Failure handling over a long unattended run
 
-- **No delivery inside the grace window** → the cell is recorded as failed
-  and the run continues.
-- **Peak less than `SILENT_MARGIN_DB` above the window's own floor** → the
-  capture was silence. `--max-silent` consecutive silent captures aborts the
-  run, rather than discovering at 3am that six hours went to a muted entity.
-- **Trimmed to nothing** → discarded rather than written, so the corpus never
+- **No recording inside the grace window** → record the cell as failed and
+  continue.
+- **Peak barely above the window's own floor** (`X-EM-Peak-Db` vs
+  `X-EM-Floor-Db`) → the capture was silence. Abort after a run of
+  consecutive silent captures, rather than discovering at 3am that six hours
+  went to a muted entity.
+- **Trimmed to nothing** → discard rather than write, so the corpus never
   gains a file of room tone.
-- **Exit — normal, exception or Ctrl+C** → players stopped, volumes restored,
-  capture mode cleared, with signals ignored while it happens. If the disarm
-  still fails it prints the exact `curl` to undo by hand. The device's own
-  `idle_s` dead-man is the backstop behind that.
-
-The first Ctrl+C asks the loop to finish the cell it is on; the cleanup is
-what matters and it always runs.
+- **On exit — normal, exception or Ctrl+C** → stop the players, restore
+  volumes and disarm capture mode, ignoring signals while it happens. The
+  controller's `idle_s` dead-man is the backstop behind that.

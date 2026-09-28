@@ -13,9 +13,9 @@ Config keys (global or per-device, pushed live like any other config):
   ledListenColor  — "#RRGGBB", custom scene only
   ledThinkColor   — "#RRGGBB", custom scene only
 
-resolve(config) returns everything em_controller's LED helpers need:
-  listening   — ready-to-send list of 12 {id,r,g,b} dicts
-  spin_frame  — fn(pos) -> list of 12 {id,r,g,b} dicts for spinner frame N
+resolve(config) returns what em_device's LED projection sends:
+  listening   — ready-to-send list of 12 {id,r,g,b} dicts (static frames)
+  *_anim      — led_anim specs the device animates on its own ticker
 """
 
 NUM_LEDS = 12
@@ -84,33 +84,11 @@ def _leds(palette: list) -> list:
     return [{"id": i, "r": r, "g": g, "b": b} for i, (r, g, b) in enumerate(palette)]
 
 
-# Seconds added on top of a response's own duration when sizing the meter
-# ring's dead-man TTL. Also the placeholder TTL on the base spec.
-METER_TTL_PAD = 20
-
-# Dead-man TTL for the thinking spinner. It must outlast everything the
-# spinner spans — HA's think time AND the TTS fetch — because the ring is
-# showing "working on it" for the whole of both. That makes it coupled to
-# _fetch_tts_audio's timeout (60s, x2 attempts): a shorter TTL would clear
-# the ring part-way through exactly the long responses that need it most,
-# which is the same class of bug as the playback estimate this release
-# replaces. Keep these two in step if either moves.
-SPIN_TTL = 135
-
-# Seconds added on top of a timer ring's own cap when sizing its dead-man
-# TTL. Unlike the meter's, the duration is known exactly up front
-# (timerRingSeconds), so this only has to cover the gap between arming the
-# ring and the sound starting — the device primes ~1.1s before any audio.
-# A ring whose TTL expired mid-alarm would go dark while still sounding,
-# which reads as a fault rather than as an alarm.
-RING_TTL_PAD = 10
-
-# The timer-ring pulse period. Between nospeech_anim's single slow throb
-# (900ms) and error_anim's agitated blink (220ms): an alarm should look
-# insistent without looking like a fault. Colour stays the scene's, per the
-# rhythm-not-colour rule below — red, orange and cyan are all taken (mute,
-# link down, volume).
-RING_PERIOD_MS = 500
+# Dead-man TTLs (§11.2): remote dialog indicators clear on controller loss.
+# em_device re-sends any layer with a TTL <= 30 s every 10 s while it holds,
+# so these bound how long a ring outlives a dead controller.
+METER_TTL = 20
+SPIN_TTL = 20
 
 # Meter response-curve config keys → the wire field the device reads, with
 # the range the dashboard offers. The device clamps independently
@@ -164,33 +142,9 @@ def resolve(config: dict) -> dict:
 
     listening_leds = _leds(preset["listening"])
 
-    if preset["rotate"]:
-        palette = preset["listening"]
-
-        def spin_frame(pos: int) -> list:
-            return _leds([palette[(i - pos) % NUM_LEDS] for i in range(NUM_LEDS)])
-    else:
-        head, trail = preset["spin_head"], preset["spin_trail"]
-
-        def spin_frame(pos: int) -> list:
-            frame = [(0, 0, 0)] * NUM_LEDS
-            frame[pos % NUM_LEDS] = head
-            frame[(pos - 1) % NUM_LEDS] = trail
-            return _leds(frame)
-
-    # Wire-ready led_anim specs for firmware that animates locally
-    # (capability "led_anim"). The device renders these on its own ticker,
-    # so spinner smoothness stops depending on controller/WiFi jitter.
-    # ttlSec is a dead-man switch: if the controller dies mid-turn the
-    # ring self-clears instead of spinning forever.
-    # TTLs are bounded by what each phase can legitimately take, not by a
-    # single generous constant. The old flat 180s meant a controller that
-    # died mid-turn left the ring animating for three minutes, which reads
-    # as broken long before it self-clears. Ceilings used: the mic stream's
-    # 20s hard cap for listening, and observed worst-case HA think time of
-    # 14.7s (2026-07-25, n=57) for the spinner — each with ~2-3x headroom.
-    # meter is the exception: response length is unbounded, so its TTL is
-    # set per playback from the actual audio duration (see METER_TTL_PAD).
+    # led_anim specs for the device's own ticker (capability "led_anim").
+    # ttlSec is a dead-man switch: if the controller dies mid-turn the ring
+    # self-clears instead of spinning forever.
     if preset["rotate"]:
         spin_anim = {
             "pattern":  "rotate",
@@ -218,10 +172,7 @@ def resolve(config: dict) -> dict:
     meter_anim = {
         "pattern": "meter",
         "colors":  [list(c) for c in meter_palette],
-        # Placeholder — the caller overrides this per playback with
-        # meter_ttl(audio_seconds). A long TTS must never self-clear its own
-        # ring mid-response, which a fixed TTL would eventually do.
-        "ttlSec":  METER_TTL_PAD,
+        "ttlSec":  METER_TTL,
         **_meter_curve(config or {}),
     }
 
@@ -234,7 +185,6 @@ def resolve(config: dict) -> dict:
     return {
         "name":           name,
         "listening":      listening_leds,
-        "spin_frame":     spin_frame,
         "listening_anim": listening_anim,
         "spin_anim":      spin_anim,
         "meter_anim":     meter_anim,
@@ -248,35 +198,5 @@ def resolve(config: dict) -> dict:
             "pattern": "pulse", "colors": outcome_colors,
             "periodMs": 220, "ttlSec": 1,
         },
-        # A timer is going off. Steady insistent pulse for the whole ring —
-        # the one anim here that is not self-clearing, so the caller
-        # overrides ttlSec with ring_ttl(cap) the same way playback
-        # overrides the meter's.
-        "ring_anim":      {
-            "pattern": "pulse", "colors": outcome_colors,
-            "periodMs": RING_PERIOD_MS, "ttlSec": RING_TTL_PAD,
-        },
     }
 
-
-def meter_ttl(audio_seconds: float) -> int:
-    """
-    Dead-man TTL for a playback meter ring, sized to the response actually
-    being played. Bounded below so a very short clip still gets a sane
-    window, and padded so a slow link (delivery has been observed at ~2x
-    the audio duration) cannot trip it mid-response.
-    """
-    return int(max(30.0, audio_seconds * 2.0 + METER_TTL_PAD))
-
-
-def ring_ttl(cap_seconds: float) -> int:
-    """
-    Dead-man TTL for a timer ring, sized to the ring's own stop cap.
-
-    No doubling as meter_ttl does: a ring's length is decided by the
-    controller (timerRingSeconds), not by how fast audio reaches the
-    device, so the cap is exact and only the arming/prime gap needs
-    covering. The ring is stopped explicitly in every path that ends it —
-    this is purely the "controller died mid-alarm" backstop.
-    """
-    return int(max(15.0, cap_seconds + RING_TTL_PAD))

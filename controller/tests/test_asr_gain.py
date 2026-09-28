@@ -1,4 +1,4 @@
-"""The ASR-bound stream is amplified; the rail must clamp, never wrap.
+"""The STT copy is amplified; the rail must clamp, never wrap.
 
 This hardware's mic stream peaks around -40 dBFS and faster-whisper fails on it
 by silently dropping the quiet leading words -- "How many ounces are in a cup?"
@@ -13,7 +13,9 @@ clamp and the gain's actual magnitude.
 import math
 import struct
 
-import em_esphome as es
+import numpy as np
+
+import em_stt_copy as es
 
 
 def pcm(*samples: int) -> bytes:
@@ -49,7 +51,7 @@ def test_clipped_count_is_only_the_samples_that_needed_clamping():
 
 
 def test_zero_gain_is_an_untouched_passthrough():
-    # Setting ASR_GAIN_DB = 0 is how the feature is turned off; it must hand
+    # A zero gain (a close talker at the band edge) must hand
     # back the original bytes, not a re-encoded copy.
     raw = pcm(1, -1, 500)
     out, clipped = es.apply_asr_gain(raw, gain_db=0.0)
@@ -110,3 +112,22 @@ def test_a_turn_with_no_wake_word_falls_back_to_nominal():
     # Button, continuation and announce-driven turns have no anchor; they get
     # the gain the fleet was measured at rather than no gain at all.
     assert es.asr_gain_for(None) == es.ASR_GAIN_NOMINAL_DB
+
+
+# ── the STT copy as a whole ────────────────────────────────────────────────
+
+
+def test_stt_copy_is_the_span_with_the_gain_and_nothing_else():
+    # Without NS the copy is exactly the gained canonical span: same length,
+    # nothing trimmed (§8.4: no audio is ever cut), clamped not wrapped.
+    span = np.array([100, -250, 30000, 0], dtype=np.int16)
+    out = es.stt_copy(span, gain=20.0, ns=False)
+    assert unpack(out) == [1000, -2500, 32767, 0]
+
+
+def test_stt_copy_leaves_the_canonical_span_untouched():
+    # The same span feeds attribution and the wake clip; the copy must not
+    # scale it in place.
+    span = np.array([100, -100], dtype=np.int16)
+    es.stt_copy(span, gain=20.0, ns=False)
+    assert span.tolist() == [100, -100]

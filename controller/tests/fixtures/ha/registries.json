@@ -1,0 +1,407 @@
+{
+  "source": [
+    "homeassistant/helpers/device_registry.py (DeviceEntry.dict_repr, format_mac)",
+    "homeassistant/helpers/entity_registry.py (as_partial_dict, extended_dict, _serialize_aliases None=COMPUTED_NAME, async_get_full_entity_name)",
+    "homeassistant/components/config/{device,entity,area,floor}_registry.py (list, get_entries)",
+    "homeassistant/helpers/area_registry.py (AreaEntry.json_fragment), homeassistant/components/config/floor_registry.py (_entry_dict)",
+    "homeassistant/components/homeassistant/exposed_entities.py (ws_expose_entity, ws_list_exposed_entities)",
+    "homeassistant/components/assist_pipeline/select.py (unique ids <prefix>-pipeline, <prefix>-vad_sensitivity; OPTION_PREFERRED)",
+    "homeassistant/components/assist_pipeline/vad.py (VadSensitivity.RELAXED = relaxed)"
+  ],
+  "device_registry_list": {
+    "request": {
+      "type": "config/device_registry/list"
+    },
+    "result": [
+      {
+        "area_id": "office",
+        "configuration_url": null,
+        "config_entries": [
+          "01K5ESPHOMEOFFICE"
+        ],
+        "config_entries_subentries": {
+          "01K5ESPHOMEOFFICE": [
+            null
+          ]
+        },
+        "config_entry_id": "01K5ESPHOMEOFFICE",
+        "config_subentry_id": null,
+        "connections": [
+          [
+            "mac",
+            "09:0f:10:72:84:26"
+          ]
+        ],
+        "created_at": 1758600000.0,
+        "disabled_by": null,
+        "entry_type": null,
+        "hw_version": null,
+        "id": "b285ec5e94b98f4c1cbeabf926be4b77",
+        "identifiers": [],
+        "labels": [],
+        "manufacturer": "Amazon",
+        "model": "Echo Dot Gen 2",
+        "model_id": null,
+        "modified_at": 1758600000.0,
+        "name_by_user": null,
+        "name": "Office",
+        "primary_config_entry": "01K5ESPHOMEOFFICE",
+        "serial_number": null,
+        "sw_version": "1.0",
+        "via_device_id": null
+      },
+      {
+        "area_id": "kitchen",
+        "configuration_url": null,
+        "config_entries": [
+          "01K5HUE"
+        ],
+        "config_entries_subentries": {
+          "01K5HUE": [
+            null
+          ]
+        },
+        "config_entry_id": "01K5HUE",
+        "config_subentry_id": null,
+        "connections": [],
+        "created_at": 1758600000.0,
+        "disabled_by": null,
+        "entry_type": null,
+        "hw_version": null,
+        "id": "hue-dev-1",
+        "identifiers": [
+          [
+            "hue",
+            "1"
+          ]
+        ],
+        "labels": [],
+        "manufacturer": "Signify",
+        "model": "Bulb",
+        "model_id": null,
+        "modified_at": 1758600000.0,
+        "name_by_user": "Ceiling Fan",
+        "name": "Hue fan module",
+        "primary_config_entry": "01K5HUE",
+        "serial_number": null,
+        "sw_version": null,
+        "via_device_id": null
+      }
+    ]
+  },
+  "entity_registry_list": {
+    "request": {
+      "type": "config/entity_registry/list"
+    },
+    "result": [
+      {
+        "area_id": null,
+        "categories": {},
+        "config_entry_id": null,
+        "config_subentry_id": null,
+        "created_at": 1758600000.0,
+        "device_id": "b285ec5e94b98f4c1cbeabf926be4b77",
+        "disabled_by": null,
+        "entity_category": null,
+        "entity_id": "select.office_assistant",
+        "has_entity_name": true,
+        "hidden_by": null,
+        "icon": null,
+        "id": "reg-select.office_assistant",
+        "labels": [],
+        "modified_at": 1758600000.0,
+        "name": null,
+        "options": {},
+        "original_name": "Assistant",
+        "platform": "esphome",
+        "translation_key": null,
+        "unique_id": "09:0F:10:72:84:26-pipeline"
+      },
+      {
+        "area_id": null,
+        "categories": {},
+        "config_entry_id": null,
+        "config_subentry_id": null,
+        "created_at": 1758600000.0,
+        "device_id": "b285ec5e94b98f4c1cbeabf926be4b77",
+        "disabled_by": null,
+        "entity_category": null,
+        "entity_id": "select.office_finished_speaking_detection",
+        "has_entity_name": true,
+        "hidden_by": null,
+        "icon": null,
+        "id": "reg-select.office_finished_speaking_detection",
+        "labels": [],
+        "modified_at": 1758600000.0,
+        "name": null,
+        "options": {},
+        "original_name": "Finished speaking detection",
+        "platform": "esphome",
+        "translation_key": null,
+        "unique_id": "09:0F:10:72:84:26-vad_sensitivity"
+      },
+      {
+        "area_id": null,
+        "categories": {},
+        "config_entry_id": null,
+        "config_subentry_id": null,
+        "created_at": 1758600000.0,
+        "device_id": "b285ec5e94b98f4c1cbeabf926be4b77",
+        "disabled_by": null,
+        "entity_category": null,
+        "entity_id": "select.office_assistant_2",
+        "has_entity_name": true,
+        "hidden_by": null,
+        "icon": null,
+        "id": "reg-select.office_assistant_2",
+        "labels": [],
+        "modified_at": 1758600000.0,
+        "name": null,
+        "options": {},
+        "original_name": "Assistant 2",
+        "platform": "esphome",
+        "translation_key": null,
+        "unique_id": "09:0F:10:72:84:26-pipeline_2"
+      }
+    ]
+  },
+  "entity_state": {
+    "request": {
+      "method": "GET",
+      "path": "/api/states/select.office_assistant"
+    },
+    "response": {
+      "entity_id": "select.office_assistant",
+      "state": "STT",
+      "attributes": {
+        "options": [
+          "preferred",
+          "Home Assistant",
+          "STT"
+        ],
+        "friendly_name": "Office Assistant"
+      },
+      "last_changed": "2026-09-23T11:30:00.123456+00:00",
+      "last_reported": "2026-09-23T11:30:00.123456+00:00",
+      "last_updated": "2026-09-23T11:30:00.123456+00:00",
+      "context": {
+        "id": "01K5",
+        "parent_id": null,
+        "user_id": null
+      }
+    }
+  },
+  "expose_entity": {
+    "request": {
+      "type": "homeassistant/expose_entity",
+      "assistants": [
+        "conversation"
+      ],
+      "entity_ids": [
+        "script.echomuse_set_alarm",
+        "script.echomuse_list_alarms"
+      ],
+      "should_expose": true
+    },
+    "result": null
+  },
+  "expose_entity_list": {
+    "request": {
+      "type": "homeassistant/expose_entity/list"
+    },
+    "result": {
+      "exposed_entities": {
+        "light.kitchen": {
+          "conversation": true
+        },
+        "fan.ceiling": {
+          "conversation": true
+        },
+        "switch.porch": {
+          "conversation": true
+        },
+        "light.garage": {
+          "cloud.alexa": true
+        },
+        "sensor.unregistered": {
+          "conversation": true
+        }
+      }
+    }
+  },
+  "get_entries": {
+    "request": {
+      "type": "config/entity_registry/get_entries",
+      "entity_ids": [
+        "fan.ceiling",
+        "light.kitchen",
+        "sensor.unregistered",
+        "switch.porch"
+      ]
+    },
+    "result": {
+      "light.kitchen": {
+        "area_id": "kitchen",
+        "categories": {},
+        "config_entry_id": null,
+        "config_subentry_id": null,
+        "created_at": 1758600000.0,
+        "device_id": null,
+        "disabled_by": null,
+        "entity_category": null,
+        "entity_id": "light.kitchen",
+        "has_entity_name": false,
+        "hidden_by": null,
+        "icon": null,
+        "id": "reg-light.kitchen",
+        "labels": [],
+        "modified_at": 1758600000.0,
+        "name": null,
+        "options": {},
+        "original_name": "Kitchen Lights",
+        "platform": "hue",
+        "translation_key": null,
+        "unique_id": "hue-1",
+        "aliases": [
+          null,
+          "cooking lights"
+        ],
+        "capabilities": null,
+        "device_class": null,
+        "original_device_class": null,
+        "original_icon": null
+      },
+      "fan.ceiling": {
+        "area_id": null,
+        "categories": {},
+        "config_entry_id": null,
+        "config_subentry_id": null,
+        "created_at": 1758600000.0,
+        "device_id": "hue-dev-1",
+        "disabled_by": null,
+        "entity_category": null,
+        "entity_id": "fan.ceiling",
+        "has_entity_name": true,
+        "hidden_by": null,
+        "icon": null,
+        "id": "reg-fan.ceiling",
+        "labels": [],
+        "modified_at": 1758600000.0,
+        "name": null,
+        "options": {},
+        "original_name": null,
+        "platform": "hue",
+        "translation_key": null,
+        "unique_id": "hue-2",
+        "aliases": [],
+        "capabilities": null,
+        "device_class": null,
+        "original_device_class": null,
+        "original_icon": null
+      },
+      "switch.porch": {
+        "area_id": null,
+        "categories": {},
+        "config_entry_id": null,
+        "config_subentry_id": null,
+        "created_at": 1758600000.0,
+        "device_id": null,
+        "disabled_by": null,
+        "entity_category": null,
+        "entity_id": "switch.porch",
+        "has_entity_name": false,
+        "hidden_by": null,
+        "icon": null,
+        "id": "reg-switch.porch",
+        "labels": [],
+        "modified_at": 1758600000.0,
+        "name": "Front Porch",
+        "options": {},
+        "original_name": "porch switch",
+        "platform": "template",
+        "translation_key": null,
+        "unique_id": "t-1",
+        "aliases": [
+          "Porch"
+        ],
+        "capabilities": null,
+        "device_class": null,
+        "original_device_class": null,
+        "original_icon": null
+      },
+      "sensor.unregistered": null
+    }
+  },
+  "area_registry_list": {
+    "request": {
+      "type": "config/area_registry/list"
+    },
+    "result": [
+      {
+        "aliases": [
+          "cookhouse"
+        ],
+        "area_id": "kitchen",
+        "floor_id": "ground",
+        "humidity_entity_id": null,
+        "icon": null,
+        "labels": [],
+        "name": "Kitchen",
+        "picture": null,
+        "temperature_entity_id": null,
+        "created_at": 1758600000.0,
+        "modified_at": 1758600000.0
+      },
+      {
+        "aliases": [],
+        "area_id": "office",
+        "floor_id": null,
+        "humidity_entity_id": null,
+        "icon": null,
+        "labels": [],
+        "name": "Office",
+        "picture": null,
+        "temperature_entity_id": null,
+        "created_at": 1758600000.0,
+        "modified_at": 1758600000.0
+      }
+    ]
+  },
+  "floor_registry_list": {
+    "request": {
+      "type": "config/floor_registry/list"
+    },
+    "result": [
+      {
+        "aliases": [
+          "downstairs"
+        ],
+        "created_at": 1758600000.0,
+        "floor_id": "ground",
+        "icon": null,
+        "level": 0,
+        "name": "Ground Floor",
+        "modified_at": 1758600000.0
+      }
+    ]
+  },
+  "entity_registry_updated": {
+    "event_type": "entity_registry_updated",
+    "data": {
+      "action": "update",
+      "entity_id": "switch.porch",
+      "changes": {
+        "aliases": [
+          "Porch"
+        ]
+      }
+    },
+    "origin": "LOCAL",
+    "time_fired": "2026-09-23T11:30:00.123456+00:00",
+    "context": {
+      "id": "01K5",
+      "parent_id": null,
+      "user_id": null
+    }
+  }
+}

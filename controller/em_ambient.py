@@ -8,8 +8,9 @@ happens to be" and therefore has to *guess* where the speech is, cutting at
 the silences. This module answers a question with no speech in it at all:
 **what does this room sound like when nobody is talking to it** — the fridge,
 the extractor fan, the TV two rooms away, the family having dinner. That is
-the negative material `oww_forge` mixes under its synthetic positives, and
-it is also what an endpointer or a threshold is tuned against.
+the negative/background material for BCResNet training (outside this
+repository, in `~/git/bcresnet`), and it is also what a threshold or the
+endpoint policy is checked against.
 
 For that job a segmenter is exactly wrong. Ambient noise has no onsets to cut
 on, and a set of clips cut out of it has thrown away the one property that
@@ -17,11 +18,11 @@ made the recording worth taking: continuity. So the contract here is the
 blunt one — **the mode opens the mic, and closing it hands back a single WAV
 covering the whole time it was open**.
 
-Like collect mode, the device needs nothing new: the wake stream is already
-continuous, ungated and AGC-free, and the frames are tapped at the same point
-in `wake_word_listener`, so the audio is byte-for-byte what the wake model
-scores. Also like collect mode, the mode SUSPENDS voice turns — a device
-whose mic is being recorded must not also be answering with it.
+Like collect mode, the audio comes from the `diagnostic` uplink lease the
+session actor holds while the mode is armed: the device's live mic timeline,
+the native AFE's output that the on-device wake detector also scores. Also
+like collect mode, the mode SUSPENDS voice turns — a device whose mic is
+being recorded must not also be answering with it.
 
 Three things differ from `em_samples`, and each one is why this is its own
 module rather than a flag on that one:

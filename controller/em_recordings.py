@@ -7,7 +7,7 @@ to what the array actually captured, rather than inferring mic quality from
 an STT transcript and a wake score. Asked for by users who wanted to judge
 capture quality before spending an evening on the room and the placement.
 
-Storage mirrors `em_oww_models`: files live in `recordings/` beside the
+Storage: files live in `recordings/` beside the
 SQLite DB, so they sit inside the persisted Docker volume and survive image
 upgrades. Retention is a hard per-device file count (KEEP_PER_DEVICE) —
 utterances are the one artefact here that contains raw speech, so "a
@@ -16,15 +16,14 @@ by turn id parsed out of the filename rather than mtime: ids are monotonic
 rowids, so the order is exact even if the volume is restored from a backup
 that flattened timestamps.
 
-The audio written is exactly what the controller streamed to Home Assistant
-for recognition — tapped BELOW noise suppression, so on a device with
-`nsAsr` on the file is the denoised stream, not the raw mic. That is the
-point: a recording that isn't what STT heard can tell you the room was
-noisy but never why a transcript came back wrong. 16kHz mono S16_LE,
-matching the ESPHome satellite wire format.
+The audio written is exactly the STT copy the controller uploaded to Home
+Assistant for the committed span — after ASR gain and, on a device with
+`nsAsr` on, DTLN noise suppression — not the raw mic. That is the point: a
+recording that isn't what STT heard can tell you the room was noisy but
+never why a transcript came back wrong. 16kHz mono S16_LE.
 
 Pure path/filesystem logic (no aiohttp, no db import) so it can be unit
-tested; em_esphome writes through it and em_api serves from it.
+tested; em_session writes through it and em_api serves from it.
 """
 
 from __future__ import annotations
@@ -44,16 +43,14 @@ RECORDINGS_SUBDIR = "recordings"
 # for and is deliberately small — see the module docstring.
 KEEP_PER_DEVICE = 10
 
-# Wire format of the ASR-bound mic stream (em_esphome._stream_mic_audio).
+# Format of the STT copy (em_stt_copy): 16 kHz mono PCM16.
 SAMPLE_RATE  = 16000
 SAMPLE_WIDTH = 2
 CHANNELS     = 1
 
-# Hard cap on one recording. A turn is endpointed by HA's VAD long before
-# this, but the mic stream has no structural length limit (a stuck-open RMS
-# gate in a noisy room is exactly the case that used to shovel audio at HA
-# indefinitely), and an unbounded bytearray on the turn path is not
-# something to leave to chance. 30s at 16kHz mono = 960 kB.
+# Nominal cap on one recording: the extendedUtterances utterance cap. Not
+# enforced by save(); a committed span can exceed it by its pre-roll and
+# tail. 30s at 16kHz mono = 960 kB.
 MAX_UTTERANCE_SECONDS = 30
 MAX_UTTERANCE_BYTES   = MAX_UTTERANCE_SECONDS * SAMPLE_RATE * SAMPLE_WIDTH
 

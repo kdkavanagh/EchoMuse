@@ -1,634 +1,715 @@
 # Configuration Guide
 
-Every setting, what it actually does, and when you'd touch it — in plain
-language.
+Every dashboard setting, what it does, and when you'd touch it — in plain
+language. The last section lists [what leaves your network](#what-leaves-your-network).
+
+How the pieces fit together (wake word on the Echo, end-of-request detection
+on the controller, Home Assistant for speech-to-text and everything after it)
+is in [voice-pipeline.md](voice-pipeline.md). What each light on the ring
+means is in [led-ring-states.md](led-ring-states.md).
 
 ## Where settings live
 
-- **Fleet config** (gear icon → Fleet Config): the defaults every device
-  uses.
-- **Per-device config** (device page → Config tab): each section carries its
-  own **Fleet / Device** switch in its header.
+- **Fleet config** (⚙ Settings → **Config**): the values every device uses
+  unless it overrides them. Only administrators can change them. **Save & push
+  to fleet** stores them and sends them to every connected device that follows
+  the fleet.
+- **Per-device config** (device page → **Config** tab): the same sections,
+  each with its own **Scope: Fleet / Device** switch in its header. **Push
+  config** stores and sends the device's changes.
 
-Scoping is **per section**, not all-or-nothing. Leave a section on *Fleet*
-and it keeps following the fleet-wide value, including future changes. Flip
-it to *Device* and only that section becomes this device's own — everything
-else carries on tracking the fleet.
+Scoping is **per section**. A section on *Fleet* keeps following the fleet
+value, including future fleet changes. A section on *Device* uses this
+device's own values for every setting in that section; everything else still
+tracks the fleet. So a Dot in a small room can have its own **Ring** scene and
+its own **Timers & alarms** sounds while still following the fleet's wake word,
+EQ and Bluetooth settings.
 
-So a Dot in a small room can have its own **Ring** scene and its own
-**Microphones** gain while still picking up every fleet change to the wake
-word, EQ and Bluetooth settings. Before this, one override forked *all* the
-settings and froze them against fleet changes permanently.
+A section on *Fleet* is shown dimmed and read-only, so you can see what it
+inherits. The banner above the sections reads `Following fleet config`, or
+`Local override (2 of 7)` with the overridden sections named, and **Revert all
+to fleet** puts every section back. Switching a section to *Device* starts it
+from the current fleet values.
 
-A section showing *Fleet* is displayed read-only rather than hidden, so you
-can always see what it is inheriting. The banner at the top of the tab
-summarises — `Fleet`, or `Local override (2 of 6)` with the sections named —
-and **Revert all to fleet** puts everything back.
+The Config tab opens with the device's **network (WiFi)** settings, which are
+always per device, then the seven sections in this order: **Playback**, **Wake
+word**, **Speech**, **Ring**, **Button**, **Bluetooth**, **Timers &
+alarms**. A control that needs something the device's firmware does not
+announce is shown disabled with the reason.
 
-Flipping a section back to *Fleet* **discards** the values it was holding.
-There is no hidden shadow copy waiting to reappear if you flip it to *Device*
-again months later; it starts from the fleet value.
+An Echo still running firmware from before protocol v1 shows an **Upgrade
+required** panel instead of its Config, Activity and Alerts tabs. Until you
+update it from the **Updates** tab it takes no voice turns and rings no timers
+or alarms.
 
-Changes apply **immediately** — no restarts, no rebuilds. The Config tab
-opens with the device's **network (WiFi)** settings at the top — always
-per-device, never inherited from the fleet — followed by the
-fleet-inheritable sections, in order of how often you'll realistically touch
-them: **Playback**, **Wake word**, **Microphones**, **Ring**, **Advanced**,
-**Bluetooth**.
+### Other device tabs
 
-The **CPU** meter shows the core count beside the percentage — "27% · 2/4
-cores". The Dot has four CPU cores and parks the ones it isn't using, and the
-percentage is a share of the cores that are *awake*, so the same amount of
-work reads as a bigger number when fewer are. Without the core count beside
-it the figure can appear to halve when nothing actually changed.
-
-Two other device tabs worth knowing: **Status** (IP, firmware, WiFi network,
-ESPHome port, current volume, whether the config is fleet or overridden,
-resource meters including **Latency** (the round trip to the device — amber
-past 200ms, red past 1s; the only link-health signal the Echo's WiFi driver
-actually provides, since it reports no retry or noise figures) and **Temp**
-(the Dot's CPU sensor, and the hottest of its eleven sensors when that's
-meaningfully warmer; it idles around 33°C, so anything amber is genuinely
-unusual — and if the chip's thermal governor ever starts capping CPU
-capacity, this is where it says so), and the
-Bluetooth-proxy diagnostics panel when enabled —
-the Status row reads `Online`, or `Offline` with how long ago the device was
-last heard from) and **Activity** (voice-turn history — what was heard, how it was
-transcribed, wake-word scores, playback underruns, near-misses, and — if
-**Save utterances** is on — the recorded audio of each turn, playable and
-downloadable). Activity
-history is stored in the controller's database, so it survives controller
-and device restarts; hourly hardware trends (CPU, memory, WiFi signal) are
-kept for 180 days and available via the API
-(`/api/devices/{id}/activity?days=N`).
+- **Status** — IP, firmware, WiFi network, ESPHome port, `Online` or `Offline
+  · last seen …`, current volume, link mode (`wss (TLS)` or `plain ws`), and
+  whether the config is `Fleet` or `Local override (n of 7)`. **Resources**
+  shows CPU (with the number of cores awake, because the Dot parks idle cores
+  and the percentage is a share of the awake ones), RAM, storage, WiFi signal,
+  **Latency** (round trip to the device; amber from 200 ms, red from 1 s) and
+  **Temp** (amber from 70 °C, red from 85 °C, with a note when the thermal
+  governor is capping cores). **Wake health** is described under
+  [Wake word](#02--wake-word). The Bluetooth proxy panel appears when the proxy
+  is on.
+- **Activity** — the voice-turn history: what was heard, the transcript, how
+  the turn ended, and the audio of each turn when **Save utterances** or
+  **Save wake clips** is on. The header names the wake model with its idle and
+  playback thresholds, and a counter shows **Refused wakes**. History is kept in the
+  controller's database. Daily turn summaries, hourly wake counters and hourly
+  hardware metrics (CPU, memory, WiFi signal) for up to 180 days are available
+  from `/api/devices/{id}/activity?days=N`.
+- **Alerts** — timers and alarms for this Echo; see
+  [The Alerts tab](#the-alerts-tab).
+- **Samples** (administrators) — recording tools; see
+  [Recording tools](#recording-tools-samples-tab).
+- **Console**, **Updates**, **Logs** — a remote shell, firmware updates and
+  rollback, and the device log.
 
 ---
 
 ## 01 — Playback
 
-How responses sound.
+How responses and music sound.
 
 ### Equalizer (8 faders + presets)
-Shapes the tone of the voice responses, like the EQ on a stereo. The Dot's
-little speaker is boomy and dull by default.
+
+Shapes the tone of everything the controller plays through the Dot: voice
+responses and music. It does not apply to timer and alarm sounds, which the
+Dot plays itself.
+
+Bands are 125, 250, 500, 1k, 2k, 3.5k, 5.5k and 8k Hz; each fader runs from
+−12 to +12 dB. Default: all flat.
 
 - **Flat** — no shaping.
-- **Clarity** — boosts the upper-mid frequencies where speech intelligibility
-  lives. Good default for voice.
-- **Warmth** — gentle low-mid lift, softer top. Nicer for music-ish content.
-- Drag any fader for a custom curve.
+- **Clarity** — +7 dB at 3.5k, +4 dB at 5.5k, +2 dB at 8k: lifts the range
+  where speech is intelligible.
+- **Warmth** — +3 dB at 250, +2 dB at 500, −2 dB at 2k.
+- Drag any fader for a custom curve (shown as `· Custom`).
 
 ### Speech boost
-An extra presence bump for spoken responses. Try it if responses sound
-muffled from across the room.
+
+Adds a +5 dB presence boost centred on 2.5 kHz on top of the EQ. Try it if
+responses sound muffled from across the room. Off by default.
 
 ### Duck depth
-How far music drops while the assistant is talking over it. Music **keeps
-playing** through a voice turn — it isn't paused — so the answer arrives
-mixed over a quiet bed, and the bed comes back up when the answer ends.
 
-Default **−18dB**. Less negative (−6, −10) leaves the music more present;
-more negative (−25, −30) all but silences it for the length of the answer.
-It's worth setting by ear in the room it plays in: the right depth depends
-on what you listen to and how loud, and there is no value that is correct
-everywhere. The response itself is never turned down, only the music under
-it — so if an answer is hard to hear over music, this is the setting, not
-the volume.
+How far music drops while the assistant is talking over it. Music keeps
+playing through a voice turn, quieter, and comes back up when the answer
+ends. The same depth is used for the brief dip while the controller checks a
+wake word heard over music.
 
-Requires firmware **v2.10.0 or newer**, which mixes the two audio streams on
-the device itself. That is not an arbitrary requirement: the controller runs
-about four seconds ahead of what you actually hear, so when you say the wake
-word those four seconds of music are already sitting on the Echo, past
-anything the controller could still change. Older firmware shows the slider
-disabled and falls back to pausing the music for the turn and resuming
-after.
+Default **−18 dB**; the slider runs from −40 to 0 dB. Less negative (−6, −10)
+keeps the music more present; more negative all but silences it for the
+answer. Set it by ear in the room it plays in. The response itself is never
+turned down, only the music under it — if an answer is hard to hear over
+music, this is the setting to change, not the volume.
 
 ### Volume
-Volume **tracks what you actually use** and survives reboots: every change —
-buttons, Home Assistant slider, wherever — is remembered by the controller
-and restored when the device reconnects. Set it low in the evening and a
-midnight power blip brings it back low.
 
-There is no volume slider in this section. There used to be, and it was
-misleading: the device only re-applies the stored level on the first config
-push after it boots, so moving the slider did nothing until the device
-restarted — and any real volume change overwrote it in the meantime. Volume
-is remembered device state rather than a setting you dial in, so the current
-level is now shown read-only on the **Status** tab. Change it from Home
-Assistant or the device buttons.
+Volume is device **state**, not a setting, so the Playback section has no
+volume control. Every change — buttons, Home Assistant, wherever — is
+remembered by the controller and restored when the device reconnects, so a
+power blip does not reset it. A device that has never reported a volume
+starts at 85%. The current level is on the **Status** tab. Volume is never
+inherited from the fleet, whatever the Playback section's scope says.
 
-It is also never inherited from the fleet, whatever the section's Fleet /
-Device switch says — otherwise a device would come back at another room's
-volume.
-
-Mute is remembered too, but by the device itself: a muted Dot stays muted
-through reboots, power cuts, and firmware updates — red ring and all —
-whether or not the controller is reachable.
+Mute is held by the device itself: a muted Dot stays muted through reboots
+and power cuts, red ring and all, whether or not the controller is reachable.
 
 ---
 
 ## 02 — Wake word
 
-How the device decides you said the magic word. By default this work happens
-on the controller, not the Dot — the Dot just streams audio to it. The Dot
-can also do this work itself, either alongside the controller as a
-comparison or instead of it; see **Wake word detection** below.
+The Echo listens for the wake word itself. It scores the microphone audio
+every 160 ms with a BCResNet model and, when the score crosses the model's
+threshold, tells the controller it may have heard the wake word. The
+controller decides whether to start a turn. When the Dot was silent, the
+threshold is enough. When the Dot was making sound — a response, music, an
+alarm — the controller first checks the wake against what the Dot was playing
+at that moment, so the Dot's own sound cannot wake it, and confirms the wake
+word in the recognised speech. Meanwhile the Dot briefly dips its own sound.
 
-### Wake word model
-Which word wakes it: Hey Jarvis, Alexa, Hey Mycroft, or Hey Rhasspy. These
-are pre-trained recognisers — you're picking a word, not training anything.
-Pick one that doesn't collide with words you say a lot (and if your
-household still talks to real Alexas, don't pick Alexa).
+So you can always interrupt the Dot by saying the wake word, whatever it is
+doing. There is no switch for interrupting; it is always on.
 
-Want your own word? Train a model with `oww_forge/` (see its README), then
-use the **+ Custom model** tile to upload the `.onnx` — it's stored in the
-controller's data volume, appears as a tile next to the stock words, and
-takes effect immediately on selection. The `×` on an unselected custom tile
-deletes it.
+The default wake word is **Ophelia**.
 
-### Arbitration window
-With more than one Echo, saying the wake word in earshot of two of them
-used to start two competing conversations. Now the **first device to hear
-you answers immediately**, and any other device detecting the same word
-within this window (default 700ms) quietly stands down.
+### Wake model
 
-There is **no latency cost**: the winner claims the turn on the spot rather
-than waiting out the window, so a solo wake is exactly as fast as it was
-before. The window only decides how long afterwards a second device counts
-as "the same utterance". `0` disables it, and it never applies when only
-one device is online.
+The section shows one tile per model in the controller's wake-model registry:
+its wake phrase, the short hashes of its graph and sidecar files, its four
+thresholds, and its validation probe result. The model in use is highlighted
+and marked `active`. Click another tile to select it, then save.
 
-An earlier version instead waited out the window and gave the turn to
-whichever device heard you *best*. That was dropped: it taxed every wake by
-~364ms even when nothing was competing, and field data showed the
-signal-to-noise winner produced a *worse* transcript than the device that
-simply heard you first.
+The model is chosen **fleet-wide**. Every Echo runs the fleet's selected
+model, even when its own Wake word section is set to *Device*. Each Echo picks
+up the model and its thresholds when its connection to the controller starts,
+so an Echo that is already connected keeps the previous model until it next
+reconnects (a reboot does this).
 
-### Sensitivity (Precise ↔ Eager)
-The confidence bar the recogniser must clear.
+A model that is selected anywhere cannot be deleted; the `×` appears only on
+unselected, unused tiles. A red **Missing registry model** tile means a stored
+setting names a model the registry does not have.
 
-- Toward **Precise**: fewer false wakes (it triggering off the TV), but it
-  may ignore you sometimes.
-- Toward **Eager**: catches you more reliably, but expect the occasional
-  ghost activation.
+#### Adding a model
 
-**How to tune it**: the Status tab counts **near-misses** — moments where the
-score came close but didn't trigger. If you're being ignored and see
-near-misses climbing, move one step toward Eager. If it wakes up when nobody
-spoke, move toward Precise — but a ghost activation is also worth *hearing*
-rather than guessing at, so turn on **Save wake clips** below and the next one
-leaves you the audio that caused it, which is both the answer and the material
-for retraining the word so it stops firing on that sound at all.
+**+ BCResNet model** opens the upload form. You need:
 
-### Near-miss floor
-What counts as a near-miss at all. A frame scores near-zero constantly —
-ordinary room tone, not almost-a-wake — so the near-miss counter above
-ignores everything at or below a floor (default **0.05**) and only counts
-scores between the floor and the wake threshold.
+| Field | What it is |
+|---|---|
+| **ONNX graph** | The BCResNet audio-in `.onnx` file (up to 20 MiB). |
+| **JSON sidecar** | Its `.json` sidecar (up to 64 KiB) describing input, labels and normalisation. |
+| **Wake phrase** | The word as it appears in transcripts, lowercase letters only (`ophelia`). The controller removes it from the transcript text before Home Assistant's conversation agent sees the request; the audio is never cut. |
+| **Verification core** | The part of the word the controller must find in the recognised speech to confirm a wake heard while the Dot was making sound, lowercase letters only (`ophel`). |
+| **idle, playback, reference, near miss** | The model's thresholds, each between 0 and 1. The form starts with the values of the built-in model. |
 
-Raise it in a noisy room (TV, open kitchen) where background sound sits well
-above silence but nowhere near triggering: left at 0.05 there, the counter
-climbs on ambient noise and stops being a useful signal for tuning
-Sensitivity. Lower it only to see scores further from the bar — it does not
-change what triggers a wake, only what gets counted and logged as "close".
+**Validate & add** checks that the graph and sidecar agree, runs the model on
+silence, noise and a tone, and requires every probe score to stay below the
+near-miss threshold. A model that passes is added but **not** selected; select
+it yourself when you are ready.
 
-### Barge-in
-Lets the wake word **interrupt the assistant mid-turn** — say "Hey
-Rhasspy, stop" while it's reading you a paragraph (or still thinking
-about your last question) and it cuts off and listens. On by default. It works
-by leaving the microphones live while the device speaks; what stops it hearing
-itself is the Dot's own echo cancellation, which is always running.
+Thresholds belong to the model because scores mean different things for
+different models. They must satisfy near miss < reference ≤ playback ≤ idle:
 
-The **barge threshold** is the wake confidence required during playback — and
-counter-intuitively it should be much *lower* than the normal wake threshold:
-the speaker is far louder at the microphones than you are, so your voice
-scores lower over playback than in a quiet room, while the device's own
-(cancelled) voice barely scores at all. **0.05 is the default** — you
-shouldn't need to raise your voice much. Raise it if responses ever cut
-themselves off, which is what a chime or a phrase in the response scoring as
-the wake word looks like. (During the silent *thinking* pause the normal wake
-sensitivity applies instead — nothing is playing, so the low barge threshold
-isn't needed there.)
+| Threshold | Used for | Built-in model |
+|---|---|---:|
+| **idle** | Wake threshold while nothing is playing, including while the Dot speaks a response | 0.90 |
+| **playback** | Wake threshold while music plays or an alarm or timer rings | 0.65 |
+| **reference** | Controller-side threshold for spotting the wake word in what the Dot itself played | 0.30 |
+| **near miss** | Scores at or above this that do not become a wake are counted as near misses | 0.17 |
 
-**Wake word over a ringing timer** uses that same barge threshold. Listening
-stays active while the chime is audible as well as during the quiet gap, so
-you can speak over the alarm; there is no separate timer-listening switch or
-threshold. The device log names the scored window (`Ring listening (chime
-audible)` vs `(silent window)`), so a chime residual that crosses the bar and
-silences its own alarm states its own cause.
+Thresholds are fixed when a model is added. Uploading the same graph again
+returns the existing entry unchanged. To change a model's thresholds, select a
+different model, delete this one, and upload it again with the new values.
 
-### Speex denoise
-Runs a noise cleaner on the audio *only for wake-word scoring* (your actual
-commands are untouched). Worth trying in rooms with constant background
-noise (TV, air-con) if wake detection is unreliable there. Off by default —
-it's a "try it and compare" option.
+### Wake health (Status tab)
+
+Each Echo reports its wake detector every 30 seconds. The **Wake health**
+panel shows:
+
+- **Availability** — `ready`, or why wake detection is off: `missing asset`
+  (the Dot has not yet fetched the model or runtime from the controller),
+  `load failed`, or `inference errors`.
+- **Installed graph** — the short hash of the model the Dot is running; amber
+  when it differs from the one its config selects.
+- **Last report**, **Max inference** (ms per scoring window), **Overruns**
+  (scoring windows dropped because the previous one had not finished),
+  **Near misses** and **Near-miss peak**, **Candidates** (possible wakes sent
+  to the controller) and **Inference errors**.
+
+A missing value shows `—`, never a reassuring zero.
+
+`GET /api/devices/{id}/speech_assets` returns the model and runtime files the
+controller has named for the device, which of them the device reported
+installed, and which are missing.
+
+### Wake chime
+
+Plays a short confirmation sound on the Dot as soon as a wake is accepted.
+Off by default. It does not play when the wake word interrupts a ringing
+timer or alarm or a spoken response — the sound stopping is the
+acknowledgement.
 
 ### Save wake clips
-Keeps the **1.4 seconds of audio that crossed the threshold** — the sound
-that woke the device, not the request that followed it. Off by default. Every
-wake that starts a turn gets one — including a **Barge-in** wake, which is the
-one most worth having, since barge-in listens at a deliberately lower bar than
-the wake word does and so is the likeliest thing here to fire on nothing. The
-turn's row in **Activity** grows an amber ▷ (play it here) and ⤓ (download the
-WAV) beside the pair a saved utterance already puts there. The legend above
-the list also offers **Download wake clips (.zip)** — the device's whole set in
-one archive, which is the form training wants.
 
-This exists for one question: *what woke it?* When a Dot answers a room
-nobody was talking to, the Activity row tells you a wake fired and how
-confidently, and that is all it can tell you. **Save utterances cannot help
-here, and never could** — a turn's recording deliberately starts *after* the
-wake word, because the tail of "hey jarvis" would otherwise be transcribed as
-part of your request. So the one sound worth hearing was the one sound
-nothing kept, and a false trigger you could describe but not produce is a
-false trigger you cannot fix.
+Keeps the audio of each accepted wake: from 300 ms before the stretch the
+model scored to the end of the last window that crossed the threshold. Off by
+default.
 
-With the clip you can. Play it and you usually hear the culprit outright — a
-line of TV dialogue, a name that rhymes, a jingle. Then it becomes training
-data: drop the clips into `oww_forge` as negatives and retrain, and the model
-stops firing on that sound specifically, which is a better fix than moving
-**Sensitivity** toward Precise and losing real wakes along with the ghost.
-`oww_forge/README.md` has the steps.
+This answers *what woke it?* When a Dot answers a room nobody was talking to,
+the Activity row says a wake happened; the clip lets you hear the sound that
+caused it — a line of TV dialogue, a name that rhymes, a jingle. Those clips
+are the material for training a better model.
 
-**What it does and doesn't store.** The window sits entirely *before* the
-trigger, so a clip contains the wake word and the seconds of room before it,
-and never a command — what came next is a saved utterance's job, and a
-training clip carrying somebody's actual request would be a cost with no
-benefit. While the setting is off **nothing is buffered at all** — there is no
-rolling 1.4 seconds of your room sitting anywhere waiting for the switch to be
-flipped. Kept per device: the newest **500 clips**, about 46kB each, so a
-device cannot use more than ~23MB however badly its threshold is tuned.
+Each turn with a clip gets an amber ▷ (play) and ⤓ (download the WAV) in
+**Activity**. **Download wake clips (.zip)** above the list gives the device's
+whole set as one archive.
 
-Turning it back off stops new clips but **leaves the ones already saved**, so
-switching off doesn't destroy the corpus you were part-way through collecting.
-They stay until newer clips push them past the 500, or you delete the device,
-which removes its clips too. To clear them out sooner, delete the files from
-the controller's `data/wakes/` folder.
+Nothing extra is recorded to make a clip: it is cut from audio the controller
+already received for that wake. The newest **500 clips per device** are kept.
+Turning the setting off stops new clips but keeps the saved ones until newer
+clips push them out or you delete the device. To clear them sooner, delete the
+files in the `wakes/` folder beside the controller's database.
 
-### Wake word detection
-Who decides you said the wake word. Three settings:
+### Arbitration window
 
-- **Controller** (default) — the Dot streams audio and the controller
-  listens. What EchoMuse has always done.
-- **Both (compare)** — the Echo *also* runs the same model over the same
-  audio and reports what it would have detected, without acting on it. It
-  never triggers a turn. This is the one to use first: it tells you whether
-  on-device detection is trustworthy on your hardware, in your room, before
-  anything depends on it.
-- **On device** — the Echo decides, and the controller starts the turn on
-  its word.
+With several Echos in earshot, one spoken wake word can reach more than one.
+The first Echo whose wake the controller accepts answers immediately; any
+other Echo accepted within this window stands down without a chime or a turn.
 
-**Why you might want "On device".** The wake decision stops crossing your
-network. On a marginal link that is the difference between a Dot that
-responds instantly and one that lags unpredictably, and it keeps working
-through a controller restart. It does *not* reduce network traffic — the
-audio still streams, because the controller runs the rest of the turn.
-
-The controller keeps listening alongside it, which is deliberate: it costs
-nothing extra (it was already scoring), it keeps the comparison in
-**Activity** running so you can see whether the two agree, and it leaves
-barge-in — interrupting a response by speaking over it — working exactly as
-before.
-
-Each voice turn's row in **Activity** shows both scores side by side, and
-the per-device activity API returns an agreement summary (how often they
-agreed, how far apart in milliseconds, and crossings the device saw that
-never became a turn).
-
-**Multi-device caveat.** If you have several Echos in earshot of each other,
-put only one on **On device** for now. The rule that stops two Dots
-answering at once still judges claims by when they arrive rather than when
-each Echo actually heard you, so a device whose message was delayed can lose
-to one that heard you less well. With a single device set this way, or with
-Echos that cannot hear each other, this does not apply.
-
-Three things to know before leaving Controller:
-
-- **It needs files installed on the Dot** that aren't part of the firmware —
-  ONNX Runtime plus the wake-word models, about 15MB, placed in
-  `/data/local/share/echomuse/oww`. They're deliberately not shipped in the
-  firmware image, because that would double both the download and the space
-  each of the two firmware slots takes. Until they're there, the setting does
-  nothing and the device log says which file is missing.
-- **It costs about half a CPU core, permanently**, because the wake stream is
-  always on. Measured on an Echo Dot Gen 2 that has capacity for it — the mic
-  pipeline was unaffected across hours of use, including during music
-  playback — but enable it on **one device at a time** and watch the
-  **Resources** panel on the Status tab.
-- **It needs recent firmware**, and the two settings need different
-  vintages: scoring shipped before triggering did. Each option is disabled
-  and says so on an Echo whose firmware cannot do it, rather than appearing
-  to work.
+Default **700 ms**; the slider runs from 0 to 2000 ms. The winner does not wait
+out the window, so a single Echo answers just as fast. `0` turns arbitration
+off. It never applies to the action button, and it never blocks an Echo from
+stopping its own ringing alarm.
 
 ---
 
-## 03 — Microphones
+## 03 — Speech
 
-What the controller does with the sound the Dot sends it.
+What the controller does with the speech it receives.
 
-### The microphone chain is not adjustable, and that is on purpose
+### The microphone chain is not adjustable
 
-The Dot has 7 microphones, and the work of turning them into one usable
-channel — picking the direction your voice is coming from, subtracting the
-Dot's own speech so it doesn't hear itself, levelling the volume, setting the
-gain — is done by **the Echo's own audio software**, the one Amazon shipped it
-with for Alexa. EchoMuse hands it the job rather than doing it again worse: it
-is tuned for this exact microphone array by the people who designed it.
+The Dot's own audio software — the one Amazon shipped for Alexa — turns its
+microphones into one channel: it picks the direction of the voice, removes the
+Dot's own sound, and sets the level. EchoMuse keeps it because it is tuned for
+this exact microphone array. Its settings are on a read-only part of the
+device, so there is no gain or pickup setting here. If a Dot hears you badly,
+the levers are physical: move it away from walls and the TV and closer to
+where people talk.
 
-That software's settings live on a read-only part of the device, so there is
-nothing here to turn up or down, and there are no pickup presets any more. If
-a Dot hears you badly, the levers that exist are physical: move it away from
-the wall, away from the TV, and closer to where people talk.
+When your request has ended is decided by a fixed policy on the controller
+(`post_afe_1`, described in [voice-pipeline.md](voice-pipeline.md)). It has no
+dashboard tuning.
 
-### Advanced (inside the Microphones section)
+### Noise suppression
 
-**Noise suppression** — cleans the audio sent to speech-to-text (and only
-that — wake-word listening is untouched). It uses a small neural denoiser
-(DTLN) running on the controller, so there's no load on the Dot. Note this is
-a *second* pass: the Dot has already denoised what it sent. Off by default,
-and worth leaving off unless steady noise — fans, air-con, appliance hum — is
-visibly garbling transcripts in one room. Turn it on per device and compare.
-It does not remove other people talking or the TV.
+Runs a neural denoiser (DTLN) on the controller over the copy of your request
+sent to Home Assistant's speech-to-text. Wake detection is untouched. It is a
+second pass: the Dot has already cleaned the audio. Off by default. Try it in
+a room where steady noise — fans, air conditioning, appliance hum — visibly
+garbles transcripts, and compare. It does not remove other people talking or
+the TV.
 
-**Save utterances** — keeps the audio of recent voice turns so you can
-*listen* to what was sent for transcription. The **Activity** tab then shows
-a ▶ (play here) and a ⤓ (download the WAV) on every turn that has a
-recording.
+### Save utterances
 
-What's saved is the audio **exactly as speech-to-text received it** — so if
-**Noise suppression** is on, you're hearing the cleaned-up version, not the
-raw microphone. That's deliberate: when a transcript comes back wrong, the
-only recording that can explain it is the one the recogniser actually heard.
+Keeps the audio of recent requests so you can hear what speech-to-text heard.
+Each turn with a recording gets a ▶ (play) and ⤓ (download the WAV) in
+**Activity**. Off by default.
 
-This is the honest way to answer "is my microphone any good?". Without it
-you're guessing from a garbled transcript, which can't tell you whether the
-room was noisy, the Dot is too far away, or the denoiser chewed a word. Thirty
-seconds of listening usually settles it — and it's the only sensible way to
-A/B **Noise suppression** or a change of position, since you can compare the
-same phrase before and after.
+The recording is exactly what speech-to-text received, including the wake
+word at the start and, when **Noise suppression** is on, after denoising. When
+a transcript comes back wrong, this is the recording that can explain it —
+room noise, distance, or a word the denoiser damaged. It is also the way to
+compare **Noise suppression** or a new position on the same phrase.
 
-**Off by default, and worth thinking about before switching on.** This is the
-setting that stores recognisable speech on the controller. What's kept: the
-**last 10 turns per device**, as plain WAV files in the controller's data
-folder, each overwritten as newer ones arrive. Only the audio sent for
-recognition is saved by this setting — the always-on wake-word listening is
-discarded continuously, and the sole exception is **Save wake clips** in the
-Wake word section, which keeps 1.4 seconds of it per wake and is off by
-default too.
+**Think before switching it on.** This is the setting that stores recognisable
+speech on the controller. It keeps the **last 10 turns per device** as WAV
+files in the `recordings/` folder beside the database, oldest replaced first.
+Turning it off stops new recordings but keeps the saved ones until newer ones
+replace them or you delete the device. To clear them sooner, delete the files.
+An older turn may show no buttons because its recording has already been
+replaced.
 
-Turning the setting back off stops new recordings immediately, but **leaves
-the ones already saved where they are** — deliberately, so that switching off
-doesn't destroy samples you were part-way through comparing. They stay until
-newer recordings push them out (which needs the setting back on) or you
-delete the device, which removes its recordings too. To clear them out sooner,
-delete the files from the controller's `data/recordings/` folder.
+### Extended utterances
 
-A turn recorded a while ago may show no buttons — that just means its
-recording has aged past the last 10 and the turn history has outlived it.
+Sets the longest request the controller accepts: **15 seconds** when off (the
+default), **30 seconds** when on. Turn it on for dictation or long requests.
+A request still going when it reaches the limit is dropped rather than sent
+half-finished; the Activity row shows it ended as too long.
 
 ---
 
 ## 04 — Ring
 
-The colours the LED ring uses during conversations. Scenes apply
-instantly and can differ per device. On current firmware (v2.9+) the
-device animates the ring itself — the controller sends one "play this
-animation" instruction per state change, so the spinner stays perfectly
-smooth regardless of WiFi or controller load, and while a response is
-speaking the ring **throbs in time with the audio** (brightness follows
-the actual level coming out of the speaker). If the controller ever
-vanishes mid-conversation the ring times itself out rather than spinning
-forever. Older firmware falls back to controller-rendered frames.
+The colours the LED ring uses during conversations. The Dot animates the ring
+itself, so it stays smooth regardless of WiFi or controller load. The full
+list of ring states is in [led-ring-states.md](led-ring-states.md).
 
-- **Standard** — the classic green.
-- **Airy** — a pale, calm sky blue.
+- **Standard** — green (default).
+- **Airy** — pale sky blue.
 - **Malevolent** — deep crimson listening ring with an ember spinner.
-- **Pride** — a rotating rainbow.
-- **Custom** — pick your own **Listening** (solid ring while recording) and
-  **Thinking** (spinner while processing) colours.
+- **Pride** — rainbow.
+- **Custom** — pick your own **Listening** colour (the solid ring while it
+  records; default `#00b400`) and **Thinking** colour (the spinner while it
+  works; default `#00c800`). The colours apply only to this scene.
 
-Two things never change, in every scene: the **red mute ring** (red always
-means the microphones are off — it's a privacy indicator, not decoration)
-and the cyan volume arc. The directional "which mic is listening" highlight
-also adapts automatically: it brightens the scene's ring colour rather than
-painting green.
-
-The volume arc holds the ring for about two seconds so a turn animation
-can't wipe it the instant it appears — but **pressing the action button
-cancels it immediately**, so adjusting the volume and then talking to the
-device still shows you the listening ring straight away.
-
-### How a turn ends
-The ring tells you *why* a conversation stopped, using rhythm rather than
-colour (red, orange and cyan already mean mute, no-controller and volume):
-
-- **One slow throb** — the device was listening and heard nothing.
-- **A few quick blinks** — something went wrong (Home Assistant errored, or
-  no speech came back).
-- **Ring simply goes out** — normal end, or you cancelled it yourself.
-
-The ring also now clears when the audio *actually* finishes, rather than
-when the controller estimates it should have. On a slow WiFi link the old
-estimate could clear the ring several seconds before the Dot had stopped
-talking.
+Two things never change in any scene: the **red mute ring** (red always means
+the microphones are off) and the cyan volume arc.
 
 ### Meter response (Advanced)
-While a response plays the ring throbs with the live speaker level. The
-**Advanced** panel here shapes how hard it throbs — the device renders it
-locally, so changes apply on the next response with no restart:
 
-- **Decay** — how fast it falls. Higher tracks individual syllables; lower
-  reads as a slow swell.
-- **Attack** — how fast it rises on a peak.
-- **Gamma** — contrast. Higher makes the swing more visible.
-- **Floor** — brightness during silence. `0` goes fully dark between words.
-- **Reference** — the speaker level mapped to full brightness. Lower is more
-  sensitive.
-- **Curve** — below `1` lifts quiet consonants into view.
+While a response plays, the ring pulses with the live speaker level.
+The **Advanced** panel shapes that pulse. Changes apply on the next response.
 
-These are taste settings, which is exactly why they're adjustable here
-rather than baked into firmware. The defaults are tuned for speech; if the
-ring looks too static, raise **Decay** and **Gamma** first.
+| Control | What it does | Default | Range |
+|---|---|---:|---|
+| **Decay** | How fast it falls; higher follows individual syllables | 0.30 | 0.02–1 |
+| **Attack** | How fast it rises on a peak | 0.6 | 0.05–1 |
+| **Gamma** | Contrast; higher makes the swing more visible | 2.2 | 1–3.5 |
+| **Floor** | Brightness during silence; `0` goes dark between words | 0.06 | 0–0.6 |
+| **Reference** | Speaker level mapped to full brightness; lower is more sensitive | 0.22 | 0.02–1 |
+| **Curve** | Below 1 lifts quiet sounds into view | 0.7 | 0.3–2 |
 
-## 05 — Advanced
+These are taste settings. For a livelier ring raise **Decay** and **Gamma**;
+lower them for a calmer one.
 
-Everything in this section affects **only button-press conversations**
-(tapping the action button to talk without a wake word — a *hold* is a
-separate gesture that fires an event in Home Assistant instead). Wake-word
-conversations ignore all of it — they're managed by Home Assistant's own
-speech detection.
+---
 
-While the mic is muted a tap does nothing, but a hold still fires its event:
-the mute silences speech, not the button.
+## 05 — Button
 
-### Make the tap an event instead
+Action-button gestures. A tap normally starts a conversation without the wake
+word, or stops a ringing timer or alarm; a hold fires the `long` event on the
+device's **Action Button** entity in Home Assistant. While the microphones are
+muted a tap starts nothing, but a hold still fires its event.
 
-**Tap fires an event** (`buttonSingleTapEvent`) — turns a tap into a Home
-Assistant event rather than the start of a conversation, so you can bind it to
-anything you like. With it on, the device no longer starts a voice turn from
-the button at all; the wake word is untouched, and a hold still fires `long`.
-A tap fires while muted too, for the same reason a hold does — it's an event,
-not speech.
+### Tap sends an event
 
-Needs firmware v2.10.0 or newer. On older firmware the toggle is disabled and
-says so.
+With this on, a tap fires the `single` event on the Action Button entity
+instead of starting a conversation, so you can bind it to anything. The wake
+word is unaffected, a tap still stops a ringing alert, and a hold still fires
+`long`. A tap fires while muted too, because it is an event, not speech. Off
+by default. Disabled, with the reason, on a device that does not report hold
+support.
 
 **Bind destructive automations to the hold, not the tap.** The button has no
-authentication, and a speaker sitting on a counter is a great deal easier to
-tap by accident than to hold for three quarters of a second.
+authentication, and a tap is far easier to make by accident than a hold.
 
-**Multi-tap window** (`buttonMultiTapMs`) — set it above zero and taps are
-grouped into `single`, `double` or `triple`. The cost is that *every* tap is
-delayed by this window, because a tap can only be called single once no
-second one follows.
+### Multi-tap window
 
-**Use 350ms.** Below about 300ms it fights both human timing — double taps
-land roughly 150–400ms apart — and network jitter, because the gap is
-currently measured when the taps reach the controller rather than on the
-device. On a busy or distant device you may need more. Zero disables
-grouping, and a tap fires `single` immediately.
+Available when **Tap sends an event** is on. Above zero, taps within the window
+are grouped into `single`, `double` or `triple` (four or more count as
+`triple`). The cost is that **every** tap waits for the window to close before
+anything fires, because a tap can only be called single once no second tap
+follows.
 
-### Speech gate
-
-Decides when a button-press utterance starts and stops:
-
-- **Threshold** — how loud counts as "speech", measured against the audio the
-  Dot sends. Raise it only if a noisy room keeps a button turn open; lower it
-  if a quiet talker gets cut off. Worth knowing: the level the Dot delivers
-  changed when the microphone chain moved to the Echo's own audio software, so
-  a value carried over from an older install may want re-checking.
-- **Speech gate (ms)** — how much continuous speech opens the gate. Higher =
-  ignores brief noises, but clips fast talkers.
-- **Silence gate (ms)** — how much silence ends your turn. Higher = you can
-  pause mid-sentence without being cut off; lower = snappier responses. 900ms
-  default; raise to ~1200 if you get cut off mid-thought.
-
-Note (v2.9.4): these two timings now behave exactly as configured. Older
-firmware quietly applied them ~5× longer than the number said (a counting
-bug against the mic's real batch size), so button-press turns used to hang
-on for a few seconds of silence before ending — if turns feel snappier
-after updating, that's why, and if a slow talker now gets clipped, raise
-the silence gate.
+Default **0** (off: every tap fires `single` at once); the slider runs from 0
+to 600 ms. The gap is measured when the taps reach the controller, so network
+delay counts against it; a busy or distant device may need a longer window.
 
 ---
 
 ## 06 — Bluetooth
 
-**Bluetooth proxy** — turns the Dot into a Home Assistant Bluetooth proxy.
-The device passively listens for Bluetooth Low Energy advertisements
-(presence beacons, BLE temperature/humidity sensors, phones and watches for
-room-presence systems like Bermuda) and forwards them to Home Assistant.
+**Bluetooth proxy** — turns the Dot into a Home Assistant Bluetooth proxy. The
+Dot passively listens for Bluetooth Low Energy advertisements (presence
+beacons, BLE temperature and humidity sensors, phones and watches for
+room-presence systems like Bermuda) and forwards them to Home Assistant. Off
+by default.
 
-In Home Assistant the proxy appears as a **separate ESPHome device** (named
-`<label> BT Proxy`), independent of the voice assistant — you can add,
-remove, or ignore it without touching the voice satellite. Once added, its
-scanner feeds HA's Bluetooth integration exactly like an ESP32 Bluetooth
-proxy would, and a diagnostic sensor counts received advertisements.
+In Home Assistant the proxy appears as a **separate ESPHome device** named
+`<label> BT Proxy`, independent of the voice assistant — add, remove or
+ignore it without touching the voice satellite.
 
-Two things to know before enabling:
+Before enabling:
 
-- Enabling **permanently switches the Dot's Bluetooth chip away from
-  Android's stack** (it survives reboots). Nothing EchoMuse uses needs
-  Android Bluetooth — but stock-style Bluetooth speaker pairing stops being
-  possible on that device.
-- The proxy is **receive-only** (passive scanning). Devices that need an
-  active connection to read data (some smart locks, older BLE devices)
-  aren't supported — advert-based sensors and presence tracking are.
+- Enabling **permanently switches the Dot's Bluetooth chip away from Android's
+  Bluetooth stack**, surviving reboots. EchoMuse does not use Android
+  Bluetooth, but Bluetooth speaker pairing stops being possible on that
+  device.
+- The proxy is **receive-only**. Devices that need an active connection to read
+  data (some smart locks, older BLE devices) are not supported; advertisement
+  sensors and presence tracking are.
 
-Diagnostics live on the device's **Status tab** (Bluetooth proxy panel):
-scanner state, advertisements seen, nearby device count, and whether Home
-Assistant is connected and receiving.
-
----
-
-## WiFi (device page → Config tab, top section)
-
-Move a device to a different WiFi network without touching ADB. The section
-at the top of the Config tab shows the current network, signal, and IP, lets
-you scan for visible networks, and switches with a confirmation step.
-
-The switch is designed to be **unbrickable**: the device applies the change
-itself and must pass three checks — join the network, get an IP, and
-**reconnect to this controller** — before the change is kept. Fail any of
-them (wrong passphrase, DHCP trouble, or a network that works but can't
-reach the controller, like an isolated guest VLAN) and it automatically
-restores the previous network and tells you why. Even a power cut
-mid-switch recovers: an unconfirmed change is rolled back on boot. Allow
-about two minutes for the device to drop off and come back.
+The **Bluetooth proxy** panel on the Status tab shows scanner state,
+advertisements seen, nearby devices in the last 5 minutes, the BT address,
+whether Home Assistant is connected and receiving, advertisements forwarded,
+the proxy's ESPHome port, and HCI errors and restarts.
 
 ---
 
-## Controller settings (the `.env` file)
+## 07 — Timers & alarms
 
-These are set once, on the server, and need a controller restart to change:
+Home Assistant owns both:
 
-| Setting | What it is |
-|---|---|
-| `SERVER_IP` | The controller computer's LAN IP — what devices connect to. |
-| `OWW_MODEL` / `OWW_THRESHOLD` | Startup defaults for wake word/sensitivity — the dashboard values override these. |
-| `DEVICE_APPROVAL` | `strict` (you approve every new device — recommended) or `auto`. |
-| `SERVER_TLS_PORT` | Encrypted device link (wss) port — default 8770, `0` disables. Devices switch to it automatically once they hold pushed credentials (wizard install, or the **Secure link** button on the device Status tab). |
-| `REQUIRE_DEVICE_TLS` | Set to `1` **only after every device shows "wss (TLS)"** on its Status tab — from then on the controller rejects unencrypted or tokenless device connections. |
+- **Timers** are Home Assistant's own voice-satellite timers. You set, change
+  and cancel them with ordinary requests; Home Assistant counts down, and
+  when a timer finishes EchoMuse rings the Dot.
+- **Alarms** are events on a **Local Calendar** EchoMuse creates for each
+  speaker ("EchoMuse Kitchen"), so they survive restarts and appear in Home
+  Assistant's calendar. The Dot keeps a copy of the next 7 days of alarms and
+  rings them itself, even while the controller or Home Assistant is
+  unreachable.
 
-See `.env.example` for the complete list with comments.
+The dashboard's banner calls this section **Timers**.
+
+### Sounds
+
+Each sound picker shows the controller's sound catalog as tiles.
+
+- **Default** — the catalog sound named `default` if you have uploaded one,
+  otherwise the Dot's built-in tone.
+- **+ Upload sound** — mp3, wav, flac, ogg or m4a, up to 10 MiB. The sound is
+  named after the file (so uploading `default.mp3` sets the default sound),
+  converted to 48 kHz mono, and cut to its **first 10 seconds** with a 50 ms
+  fade-out. A tile reads `shortened to 10s` when that happened.
+- **▶ preview** (device Config tab only) — plays the sound once on this Echo;
+  press again to stop. Unavailable while the device is offline.
+- **×** deletes a sound. A sound selected by the fleet or any device cannot be
+  deleted.
+
+A ring loops the whole sound. The Dot fetches sounds from the controller ahead
+of time and never downloads one when a ring is due; if a selected sound cannot
+be resolved, the picker says so and rings use the built-in tone.
+
+| Setting | What it rings | Default |
+|---|---|---|
+| **Timer sound** (`timerSound`) | Finished Home Assistant timers | empty = **Default** |
+| **Default alarm sound** (`alarmSound`) | New alarms set by voice, by an AI agent, or from the dashboard, and alarms created in Home Assistant's calendar | empty = **Default** |
+
+An alarm keeps the sound it was created with; changing **Default alarm sound**
+affects new alarms and alarms added in Home Assistant's calendar.
+
+### Gap between repeats
+
+Silence between loops of the timer sound. Default **2 s**; the slider runs from
+0 to 10 s. Alarms use their own gap (2 s by default), stored with each alarm.
+
+### Timer ring limit
+
+How long a finished timer rings if nobody stops it. Default **15 min**; the
+slider runs from 30 seconds to 30 minutes. Home Assistant forgets a timer as
+soon as it finishes, so this limit is the only thing that ends an unattended
+timer ring. Alarms have their own limit, 10 minutes by default, stored with
+each alarm.
+
+### Stopping, snoozing and interrupting
+
+- **Tap the action button** — stops whatever is ringing, on the Dot itself,
+  without the controller or Home Assistant.
+- **Say the wake word, then "stop"** (or "cancel") — stops the ring. **"Snooze"**
+  snoozes an alarm (9 minutes by default); timers cannot be snoozed. Saying the
+  wake word alone quiets the ring while you speak; the ring comes back if the
+  request is not a stop or snooze. Voice stop needs the controller; the button
+  does not.
+- The **`<label> Stop alert`** button entity in Home Assistant stops it too,
+  and the `<label> Alert ringing` sensor shows when something rings.
+
+An alarm that was due while everything was off rings on recovery only within
+30 minutes of its time; older ones are recorded as missed. A Home Assistant
+restart loses running timers, as it does for Home Assistant's own satellites.
+
+---
+
+## The Alerts tab
+
+Per device, available once its firmware speaks protocol v1:
+
+- **Now** — what is ringing (in the foreground, or in the background while a
+  conversation is open) and the running timers with their time left. The
+  timer list is a display copy of what Home Assistant reported; it never rings
+  on its own.
+- **Delivery health** — whether the calendar subscription is live, whether the
+  Echo is online, how far the Echo has acknowledged alarm updates, whether its
+  clock is trusted (after a reboot without a trustworthy clock it does not
+  ring old cached alarms until it has caught up), its wakelock, and its alarm
+  store. Warnings appear below.
+- **Alarm schedules and occurrences** — upcoming alarms with their state:
+  `armed on endpoint` (the Echo has it), `delivery pending` (saved in Home
+  Assistant, not yet on the Echo), `stored in HA`, or `unconfirmed`.
+  Administrators can **Cancel** an alarm (a repeating alarm is removed with all
+  its future occurrences) or create one with **Time**, **Name**, weekday
+  buttons for a repeating alarm, or **one date**. Home Assistant's calendar is
+  the full alarm editor; **Open Home Assistant calendar editor →** links to it.
+- **Home Assistant provisioning** — the result of the controller's checks
+  against Home Assistant, one row per feature: `voice` (a preferred Assist
+  pipeline exists), `calendar` (Local Calendar is available), `scripts` (the
+  alarm scripts can be installed and their requests received), `vocabulary`
+  (areas, floors and exposed entities can be read), `timers` (the timer
+  integrations are loaded). A failure disables only that feature and shows
+  why.
+- **Journal operations** — alarm changes waiting to reach Home Assistant, and
+  those applied in the last 24 hours.
+
+The controller installs five scripts exposed to Assist so AI agents can manage
+alarms: `echomuse_set_alarm`, `echomuse_list_alarms`, `echomuse_cancel_alarm`,
+`echomuse_dismiss_alert` and `echomuse_snooze_alarm`.
+
+---
+
+## WiFi (device Config tab, top section)
+
+Moves a device to a different WiFi network without ADB. The section shows the
+current network and IP, scans for visible networks, and switches after a
+confirmation step.
+
+The device applies the change itself and keeps it only after it has joined
+the network, got an address and **reconnected to this controller**. If any
+step fails — wrong passphrase, DHCP trouble, or a network that cannot reach
+the controller, such as an isolated guest VLAN — it restores the previous
+network. A power cut mid-switch recovers too: an unconfirmed change is rolled
+back on boot.
+
+---
+
+## Recording tools (Samples tab)
+
+Administrators get two recording modes per device for collecting wake-model
+training material. While either runs, the device answers nothing — no wake
+word, no button turn, nothing reaches Home Assistant — and its ring throbs
+magenta.
+
+- **Sample collection** records continuously and cuts clips at the silences:
+  say the wake word around the room and each one becomes a WAV. Up to 2000
+  clips per device are kept in the `samples/` folder.
+- **Ambient recording** keeps everything the microphone hears as one WAV per
+  session, starting a new file every 30 minutes. The newest 6 files per device
+  are kept in the `ambient/` folder.
+
+Both are stored beside the database and can be played, downloaded and deleted
+from the tab.
+
+---
+
+## Controller settings
+
+### Environment (`.env`, Docker Compose, bare metal)
+
+Set once on the server; a change needs a controller restart.
+
+| Variable | Default | What it is |
+|---|---|---|
+| `SERVER_IP` | — | The controller's LAN IP, advertised over mDNS; devices connect here. |
+| `HA_URL` | — | Home Assistant's base URL, for example `http://homeassistant.local:8123`. |
+| `HA_TOKEN` | — | A long-lived access token for a Home Assistant **administrator** (Profile → Security). Administrator rights are needed to create the calendars and scripts and to receive the scripts' requests. |
+| `DEVICE_APPROVAL` | `strict` | `strict`: an administrator approves each new device. `auto`: new devices are approved as `Unknown` plus the first 8 characters of their serial. See the note below. |
+| `SERVER_HOST` | `0.0.0.0` | Address the listeners bind to. |
+| `SERVER_PORT` | `8767` | Device connections (unencrypted). |
+| `SERVER_TLS_PORT` | `8770` | Encrypted device connections; `0` disables. |
+| `REQUIRE_DEVICE_TLS` | `0` | Set to `1` only after every device shows `wss (TLS)` on its Status tab; from then on unencrypted or tokenless device connections are refused. |
+| `API_PORT` | `8768` | Dashboard and API. |
+| `MDNS_NAME` | `echomuse` | Name advertised over mDNS. |
+| `ESPHOME_PROJECT_VERSION` | controller version | Project version each emulated ESPHome satellite reports to Home Assistant. |
+| `DB_PATH` | `echomuse.db` | The SQLite database. Everything the controller stores (wake models, sounds, recordings, TLS files) lives beside it. |
+
+`.env.example` lists them with comments. A bare-metal install also needs the
+files the Docker image downloads at build time: the speech bundle
+(`SPEECH_BUNDLE_DIR`, default `/app/speech`, fetched with
+`python tools/fetch_speech_bundle.py <dir>`), the Android ONNX Runtime the
+controller serves to devices (`ORT_ANDROID_LIB`), and the DTLN models for
+**Noise suppression** (`NS_MODEL_DIR`). See `controller/Dockerfile` for the
+exact sources.
+
+**Device approval note.** The approval policy in effect is the
+`device_approval` system setting in the database, which every new database
+starts as `strict`. `DEVICE_APPROVAL` (and the add-on's `device_approval`
+option) is consulted only when that setting is missing, so setting it to
+`auto` does not change the policy. To switch to `auto`, change the system
+setting through the API below.
+
+### Home Assistant add-on options
+
+The add-on connects to Home Assistant through the Supervisor, so it needs no
+URL or token. Its options are `server_ip`, `server_host`, `mdns_name`,
+`esphome_project_version`, `require_device_tls` and `device_approval`, with the
+same meanings as above. The database lives in the add-on's `/data`. Restart
+the add-on after changing an option.
+
+### System settings (API only)
+
+A few controller-wide settings have no dashboard control. Read them with
+`GET /api/system/config` and change them with `PATCH /api/system/config` (both
+administrator-only):
+
+| Key | Default | What it is |
+|---|---|---|
+| `device_approval` | `strict` | Approval policy for new devices, as above. |
+| `session_expiry_days` | `30` | How long a dashboard sign-in lasts. |
+| `update_check_interval` | `3600` | Seconds between release checks; see below. |
+| `github_repo` | `wilbowes/EchoMuse` | Repository whose releases the update check reads. |
 
 ### Encrypted device link
 
-The controller generates its own certificate authority on first start
-(stored in `tls/` next to the database) and listens for encrypted device
-connections alongside the plain ones. Each device gets two credentials —
-the CA certificate and a private token — installed automatically by the
-provisioning wizard, or pushed to an existing device with the **Secure
-link** button on its Status tab. A device with credentials connects
-encrypted from its next reconnect; the Status tab's **Link** row shows
-which mode each device is using. Once the whole fleet shows `wss (TLS)`,
-set `REQUIRE_DEVICE_TLS=1` to lock out unencrypted connections entirely.
+The controller creates its own certificate authority on first start (in
+`tls/` beside the database) and accepts encrypted device connections alongside
+unencrypted ones. Each device gets the CA certificate and a private token,
+installed by the provisioning wizard or pushed to an existing device with the
+**Secure link** button on its Status tab. The device connects encrypted from
+its next reconnect; the Status tab's **Link** row shows which mode it uses.
+Once the whole fleet shows `wss (TLS)`, set `REQUIRE_DEVICE_TLS=1`.
+
+---
+
+## Defaults at a glance
+
+| Section | Dashboard label | Key | Default |
+|---|---|---|---|
+| Playback | Equalizer faders | `eqBands` | all 0 dB |
+| Playback | Speech boost | `eqLoudness` | off |
+| Playback | Duck depth | `duckDb` | −18 dB |
+| Wake word | model tiles | `wakeModel` | the built-in Ophelia model (`4eb74512…`) |
+| Wake word | Wake chime | `wakeSound` | off |
+| Wake word | Save wake clips | `saveWakeClips` | off |
+| Wake word | Arbitration window | `wakeArbitrationMs` | 700 ms |
+| Speech | Noise suppression | `nsAsr` | off |
+| Speech | Save utterances | `saveUtterances` | off |
+| Speech | Extended utterances | `extendedUtterances` | off (15 s) |
+| Ring | scene tiles | `ledScene` | `standard` |
+| Ring | Listening | `ledListenColor` | `#00b400` |
+| Ring | Thinking | `ledThinkColor` | `#00c800` |
+| Ring | Attack / Decay / Floor | `meterAttack`, `meterDecay`, `meterFloor` | 0.6 / 0.30 / 0.06 |
+| Ring | Gamma / Reference / Curve | `meterGamma`, `meterRef`, `meterCurve` | 2.2 / 0.22 / 0.7 |
+| Button | Tap sends an event | `buttonSingleTapEvent` | off |
+| Button | Multi-tap window | `buttonMultiTapMs` | 0 ms |
+| Bluetooth | Bluetooth proxy | `bleProxyEnabled` | off |
+| Timers & alarms | Timer sound | `timerSound` | empty (Default) |
+| Timers & alarms | Default alarm sound | `alarmSound` | empty (Default) |
+| Timers & alarms | Gap between repeats | `timerRingGapSeconds` | 2 s |
+| Timers & alarms | Timer ring limit | `timerRingSeconds` | 900 s (15 min) |
+| — (device state) | Volume on the Status tab | `startupVolume` | 85 |
+
+---
 
 ## What leaves your network
 
-EchoMuse has **no telemetry**. There is no usage reporting, no analytics, no
-crash reporting and no install counter. Nothing reports which features you
-use, how many devices you have, or that you installed it at all. This is a
-deliberate decision rather than an omission: the project exists to take a
-cloud voice assistant off your network, and quietly adding a ping home would
-undo the reason to run it.
+EchoMuse has **no telemetry**: no usage reporting, no analytics, no crash
+reporting, no install counter. Nothing reports which features you use, how
+many devices you have, or that you installed it. The project exists to take a
+cloud voice assistant off your network, and a ping home would undo that.
 
-A consequence worth stating plainly: **nobody, including the maintainers, can
-tell how many people use EchoMuse.** Adoption is guessed at from GitHub stars
-and release download counts, which is the trade being made.
+A consequence: **nobody, including the maintainers, can tell how many people
+use EchoMuse.** Adoption is guessed from GitHub stars and release downloads.
 
-### The one outbound connection
+### Connections the controller makes
 
-The controller contacts `api.github.com` once an hour to ask what the newest
-release is, so the dashboard can tell you an update is available and show its
-notes. When you choose to update a device, the firmware binary is downloaded
-from `github.com` at that moment.
+- **Release check — `api.github.com`.** About 30 seconds after start, then
+  every `update_check_interval` seconds (default 3600, once an hour), the
+  controller asks GitHub for the newest firmware release and the newest
+  controller version, so the dashboard can offer updates with their notes.
+  **Check now** on the Updates tab asks immediately. These are ordinary
+  unauthenticated API requests with no EchoMuse identifier; like any request
+  they reveal your public IP to GitHub.
+- **Firmware download — `github.com`.** Only when you update a device, deploy
+  to the fleet, or use the provisioning wizard's install-latest step. The
+  controller downloads the release binary and passes it to the device; the
+  Echo itself connects only to the controller.
+- **Audio Home Assistant asks it to play.** Spoken responses and music reach
+  the controller as URLs from Home Assistant; the controller fetches each URL
+  to play it. Responses come from your Home Assistant; music comes from
+  wherever its stream lives.
+- **Home Assistant** at `HA_URL` (or through the Supervisor in the add-on).
 
-That is the whole of it. The request carries no identifiers — it is an
-ordinary unauthenticated API call — but like any request it does reveal your
-public IP to GitHub, the same exposure as a `git clone` or opening the repo
-in a browser.
+To make release checks rarer, set `update_check_interval` to a larger number
+of seconds (`86400` is once a day). **Do not set it to `0`**: that does not
+disable checking, it makes the controller check GitHub continuously.
 
-Set `update_check_interval` (seconds, default `3600`) in the system config to
-change how often it runs. A long interval, say `86400`, reduces it to once a
-day. Note that `0` does **not** disable checking — it currently makes the
-poll loop spin without pausing, which is worse than leaving it alone.
+### Downloads at install time, not at run time
+
+The speech-recognition models, the voice-activity model, the denoiser models,
+the Android ONNX Runtime and the dashboard's JavaScript and fonts are
+downloaded when the Docker image is **built** — from GitHub, PyPI, Maven
+Central, npm, cdnjs, jsDelivr and Google Fonts — and every model is checked
+against a pinned hash. The published image is built by the project's release
+workflow, so installing it contacts only the image registry (`ghcr.io`). A
+bare-metal install downloads the same files when you run the fetch tool. The
+running controller downloads none of them.
+
+### From your browser
+
+The dashboard is served entirely by the controller, except for one step: the
+**provisioning wizard** loads its USB (ADB) library from `esm.sh` in your
+browser the first time you connect a Dot over USB.
 
 ### What never leaves
 
-- **Voice audio and transcripts.** Mic audio goes from the device to your
-  controller and on to your Home Assistant, over your LAN. What happens next
-  is whatever your Assist pipeline does — if you have configured HA to use a
-  cloud speech-to-text service, HA sends it there. EchoMuse itself sends it
-  nowhere but HA.
-- **Saved utterance recordings** (`saveUtterances`, off by default) — written
-  to disk beside the database and never uploaded.
-- **Saved wake clips** (`saveWakeClips`, off by default) — the same: written
-  to disk beside the database, and uploaded nowhere unless you download the
-  archive yourself to retrain a model with it.
+- **Voice audio and transcripts.** Wake detection runs on the Echo, which
+  sends the controller audio only around a possible wake word and for the
+  request that follows, with a copy of what it was playing at those moments
+  (plus the recording tools, when you start them). The controller sends the
+  request audio to your Home Assistant for its speech-to-text step, then the
+  transcript to its conversation agent — all over your LAN. What happens next
+  is up to your Assist pipeline: if it uses a cloud speech-to-text engine or
+  conversation agent, Home Assistant sends the audio or text there. EchoMuse
+  itself sends it nowhere else.
+- **Saved recordings** — utterances (`saveUtterances`), wake clips
+  (`saveWakeClips`), samples and ambient recordings stay on disk beside the
+  database. Nothing uploads them; downloading an archive is your decision.
 - **Device serials, WiFi credentials, network names and your fleet's
-  configuration.** These live only in the controller's database.
-- **Support bundles** are built only when you ask for one, and sharing the
-  file is your decision. They deliberately exclude speech, transcripts,
-  network names and account names — see
-  [support-bundle.md](support-bundle.md).
+  configuration** stay in the controller's database.
+- **Support bundles** are built only when you ask for one (⚙ Settings →
+  **Support**), and sharing the file is your decision. They exclude
+  transcripts, recordings, device names, WiFi networks, addresses, tokens and
+  passwords — see [support-bundle.md](support-bundle.md).

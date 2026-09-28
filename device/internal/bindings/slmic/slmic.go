@@ -1,67 +1,40 @@
 //go:build server
 
-// Package slmic captures through Android's audio HAL via OpenSL ES, which is
-// what puts the capture through Amazon's ASP front end (per-mic AEC,
-// fixed+adaptive beamformer, SNR beam selection) rather than bypassing it. It
-// is the only capture backend; see docs/native-afe-migration.md.
-//
-// Every period it hands out is one fully processed mono channel: the HAL has
-// already reduced the nine-microphone array to a single beam and applied its
-// own gain before this package sees anything. Nothing above it does signal
-// processing of its own.
+// Package slmic captures through Android's audio HAL via OpenSL ES at the
+// VOICE_RECOGNITION preset, so capture passes through the native AFE (SPEC
+// §4.1): 16 kHz mono S16 in 1,280-sample (80 ms) periods, each stamped with
+// CLOCK_MONOTONIC when OpenSL ES completed it (§4.3). It has one consumer.
 package slmic
 
 import (
-	"context"
-	"errors"
 	"fmt"
-	"log"
 	"os"
-	"sync"
 
+	"github.com/wilbowes/EchoMuse/internal/audio/ema"
 	"github.com/wilbowes/EchoMuse/internal/opensl"
 	pkgmic "github.com/wilbowes/EchoMuse/pkg/mic"
 )
 
 const (
-	// defaultLib resolves against /system/lib on the device — the same
-	// library the plan's phase-0 spike confirmed present. Overridable for
-	// bench/emulator use, same idea as EM_OWW_DIR.
+	// defaultLib resolves against /system/lib; EM_OPENSL_LIB overrides it.
 	defaultLib = "libOpenSLES.so"
 
-	// sampleRateHz/periodFrames match the wire format every consumer above
-	// this package already expects: mono S16 16kHz in 80ms frames (see
-	// CLAUDE.md's device audio pipeline section). Nothing downstream needs
-	// to change to accept them.
-	sampleRateHz = 16000
-	periodFrames = 1280 // 80ms @ 16kHz
+	sampleRateHz = 16000 // §4.1
+	periodFrames = 1280  // §4.1: 80 ms callbacks
 
-	// hwBuffers is the OpenSL ES-facing double/triple buffering only — small
-	// by design. It is not the application-level lead buffer; that lives in
-	// each subscriber's own channel, the same layering the ALSA read loop
-	// used before this backend replaced it.
+	// hwBuffers is the HAL-facing buffer count only.
 	hwBuffers = 4
-
-	fanoutDepth = 32
 )
 
-// Microphone captures mono S16 16kHz through OpenSL ES at the
-// VOICE_RECOGNITION preset and fans it out to subscribers.
+// Microphone is the OpenSL ES capture stream.
 type Microphone struct {
-	eng *opensl.Engine
 	rec *opensl.Recorder
-
-	mu   sync.Mutex
-	subs []chan []byte
+	pcm [periodFrames]int16
 }
 
-// NewMicrophone opens the OpenSL ES engine, a recorder at the
-// VOICE_RECOGNITION preset, and starts capture, returning a fully running
-// microphone. Critically, it runs no `stop mixer` / `stop media`: this path
-// needs mediaserver to keep owning the PCM, or the HAL's ASP front end is
-// never in the loop at all (docs/native-afe-migration.md, "the one rule that
-// matters").
-func NewMicrophone() (*Microphone, error) {
+// Open starts a VOICE_RECOGNITION recorder. It never stops mediaserver or
+// the mixer: the HAL must keep owning the PCM for the AFE to run.
+func Open() (*Microphone, error) {
 	lib := os.Getenv("EM_OPENSL_LIB")
 	if lib == "" {
 		lib = defaultLib
@@ -74,113 +47,32 @@ func NewMicrophone() (*Microphone, error) {
 	if err != nil {
 		return nil, fmt.Errorf("slmic: %w", err)
 	}
-	m := &Microphone{eng: eng, rec: rec}
-	if err := m.Init(); err != nil {
+	if err := rec.Start(); err != nil {
 		rec.Close()
-		return nil, fmt.Errorf("slmic: %w", err)
+		return nil, fmt.Errorf("slmic: start: %w", err)
 	}
-	return m, nil
+	return &Microphone{rec: rec}, nil
 }
 
-// Init starts capture and the permanent fan-out loop.
-func (m *Microphone) Init() error {
-	if err := m.rec.Start(); err != nil {
-		return fmt.Errorf("slmic: start: %w", err)
+// Read blocks for the next completed period. Block.PCM is valid until the
+// next Read.
+func (m *Microphone) Read() (pkgmic.Block, error) {
+	buf, monoNs, err := m.rec.ReadStamped()
+	if err != nil {
+		return pkgmic.Block{}, fmt.Errorf("slmic: %w", err)
 	}
-	go m.readLoop()
-	log.Printf("[slmic] recording via OpenSL ES at %s preset (%dHz, %dms periods) — "+
-		"mediaserver keeps the PCM, no stop mixer/stop media on this path",
-		opensl.PresetVoiceRecognition, sampleRateHz, periodFrames*1000/sampleRateHz)
-	return nil
+	pcm := m.pcm[:len(buf)/2]
+	ema.PCM(pcm, buf)
+	return pkgmic.Block{PCM: pcm, MonoNs: monoNs}, nil
 }
 
-// readLoop reads completed periods forever and fans each out to every
-// current subscriber, closing every subscriber channel on exit so callers see
-// EOF rather than hang.
-func (m *Microphone) readLoop() {
-	var drops uint64
-	for {
-		buf, err := m.rec.Read()
-		if err != nil {
-			log.Printf("[slmic] recorder stream ended: %v", err)
-			break
-		}
-		m.mu.Lock()
-		for _, ch := range m.subs {
-			select {
-			case ch <- buf:
-			default:
-				drops++
-				if drops == 1 || drops%64 == 0 {
-					log.Printf("[slmic] subscriber channel full — period dropped (drops=%d)", drops)
-				}
-			}
-		}
-		m.mu.Unlock()
-	}
+// Drops counts periods OpenSL ES completed while Read was behind.
+func (m *Microphone) Drops() uint64 { return m.rec.Drops() }
 
-	m.mu.Lock()
-	log.Printf("[slmic] recorder stream closed — notifying %d subscribers", len(m.subs))
-	for _, ch := range m.subs {
-		close(ch)
-	}
-	m.subs = nil
-	m.mu.Unlock()
-}
-
-// Subscribe registers a new subscriber and returns its channel.
-func (m *Microphone) Subscribe() chan []byte {
-	ch := make(chan []byte, fanoutDepth)
-	m.mu.Lock()
-	m.subs = append(m.subs, ch)
-	m.mu.Unlock()
-	return ch
-}
-
-// Unsubscribe removes a subscriber channel. Safe to call after readLoop has
-// already closed it.
-func (m *Microphone) Unsubscribe(ch chan []byte) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for i, s := range m.subs {
-		if s == ch {
-			m.subs = append(m.subs[:i], m.subs[i+1:]...)
-			close(ch)
-			return
-		}
-	}
-}
-
-// Listen subscribes to the permanent stream and calls callback for each
-// period until ctx is cancelled. Satisfies pkgmic.Microphone.
-func (m *Microphone) Listen(callback pkgmic.AudioCallback, ctx context.Context) error {
-	if callback == nil {
-		return errors.New("callback can't be nil")
-	}
-	ch := m.Subscribe()
-	defer m.Unsubscribe(ch)
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case audio, ok := <-ch:
-			if !ok {
-				return nil
-			}
-			callback(audio)
-		}
-	}
-}
-
-// Close stops capture. The underlying opensl.Engine is process-shared
-// (cached by library path) and outlives any one Microphone, so it is
-// deliberately not closed here.
+// Close stops capture. The opensl.Engine is process-shared and stays open.
 func (m *Microphone) Close() {
 	_ = m.rec.Stop()
 	m.rec.Close()
 }
 
-var (
-	_ pkgmic.Microphone   = (*Microphone)(nil)
-	_ pkgmic.Subscribable = (*Microphone)(nil)
-)
+var _ pkgmic.Microphone = (*Microphone)(nil)

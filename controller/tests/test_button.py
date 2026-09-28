@@ -1,16 +1,9 @@
 """
-Action-button gesture policy.
+Dot-button gesture policy (em_button.decide).
 
-The case this file exists for is `test_hold_fires_while_muted`: a hold bound
-to an HA automation stopped working whenever the mic was muted, from the day
-holds shipped (v2.10.0) until this fix, because the device dropped every dot
-press while muted. Nothing tested it, so nothing said.
+The device stops a ringing alert itself and reports the press as handled; the
+controller's policy covers everything else, with mute blocking only speech.
 """
-
-import os
-import sys
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import em_button
 
@@ -18,14 +11,14 @@ HOLD_MS = 750
 
 
 def decide(held_ms=0, muted=False, turn_active=False, tap_event=False,
-           ring_active=False):
+           active_occurrence_id=None):
     return em_button.decide(
         held_ms=held_ms,
         hold_ms=HOLD_MS,
         muted=muted,
         turn_active=turn_active,
         tap_event=tap_event,
-        ring_active=ring_active,
+        active_occurrence_id=active_occurrence_id,
     )
 
 
@@ -75,11 +68,8 @@ def test_one_ms_under_is_a_tap():
 
 
 def test_absent_hold_time_reads_as_a_tap():
-    """
-    Firmware predating heldMs reports 0. It must degrade to the old
-    behaviour — a turn — never be promoted to a gesture the user did not
-    make.
-    """
+    """An unknown hold time must never be promoted to a gesture the user did
+    not make."""
     assert decide(held_ms=0) == em_button.TURN
     assert decide(held_ms=0, muted=True) == em_button.BLOCKED
 
@@ -112,50 +102,20 @@ def test_off_by_default_is_the_old_behaviour():
     assert decide(held_ms=10, turn_active=True, tap_event=False) == em_button.CANCEL
 
 
-# ── A ringing timer ──────────────────────────────────────────────────────────
-#
-# HA discards a timer as it fires, so nothing upstream can stop a ring. The
-# wake word is the acoustic stop and it is weakest in a loud room, which is
-# the room an alarm rings in — so the button is the stop that always works,
-# and it has to beat every other meaning a tap has.
+# ── A press the device used to stop an alert ─────────────────────────────────
 
-def test_tap_stops_the_ring():
-    assert decide(held_ms=10, ring_active=True) == em_button.TAP_RING_STOP
+def test_a_device_stopped_alert_consumes_the_press():
+    """The device already dismissed the occurrence; no turn, cancel or event."""
+    for kw in ({}, {"turn_active": True}, {"muted": True}, {"tap_event": True}):
+        assert decide(held_ms=10, active_occurrence_id="occ-1", **kw) == em_button.ALERT_STOPPED
 
 
-def test_ring_stop_beats_the_turn_cancel():
-    """
-    A ring holds voice_lock, so without this a tap read as CANCEL: the burst
-    went quiet, the ring never ended, and it held the lock to its cap.
-    """
-    assert decide(held_ms=10, ring_active=True, turn_active=True) == em_button.TAP_RING_STOP
+def test_a_device_stopped_alert_outranks_a_hold():
+    """Whatever the press length, the device acted on it; firing HA's `long`
+    too would give one press two effects."""
+    assert decide(held_ms=800, active_occurrence_id="occ-1") == em_button.ALERT_STOPPED
 
 
-def test_ring_stop_beats_mute():
-    """
-    The case that matters. Mute kills the mic and therefore the wake word, so
-    a muted ring has no other stop at all. Silencing an alarm is not speech,
-    which is all the mute rule is about.
-    """
-    assert decide(held_ms=10, ring_active=True, muted=True) == em_button.TAP_RING_STOP
-    assert decide(
-        held_ms=10, ring_active=True, muted=True, turn_active=True
-    ) == em_button.TAP_RING_STOP
-
-
-def test_ring_stop_beats_the_tap_event():
-    """One automation loses its `single` for a few seconds; the alternative
-    is an alarm that cannot be silenced."""
-    assert decide(held_ms=10, ring_active=True, tap_event=True) == em_button.TAP_RING_STOP
-
-
-def test_hold_keeps_its_meaning_during_a_ring():
-    """A hold is a separately-bound gesture, and a tap is still right there
-    to stop the ring."""
-    assert decide(held_ms=800, ring_active=True) == em_button.HOLD
-    assert decide(held_ms=800, ring_active=True, muted=True) == em_button.HOLD
-
-
-def test_no_ring_is_unchanged():
-    assert decide(held_ms=10, ring_active=False) == em_button.TURN
-    assert decide(held_ms=10, ring_active=False, muted=True) == em_button.BLOCKED
+def test_without_an_occurrence_the_policy_is_unchanged():
+    assert decide(held_ms=10, active_occurrence_id=None) == em_button.TURN
+    assert decide(held_ms=10, muted=True, active_occurrence_id=None) == em_button.BLOCKED

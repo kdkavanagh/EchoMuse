@@ -1,0 +1,185 @@
+{
+  "source": [
+    "homeassistant/components/config/config_entries.py (config_entries_get, ConfigManagerFlowIndexView, ConfigManagerFlowResourceView, _prepare_config_flow_result_json)",
+    "homeassistant/config_entries.py (ConfigEntry.as_json_fragment)",
+    "homeassistant/components/local_calendar/config_flow.py (STEP_USER_DATA_SCHEMA: calendar_name, import=create_empty; _async_abort_entries_match on storage key)",
+    "homeassistant/data_entry_flow.py (FlowResult form/create_entry/abort JSON)",
+    "homeassistant/components/config/entity_registry.py (config/entity_registry/list -> RegistryEntry.as_partial_dict)"
+  ],
+  "config_entries_get": {
+    "request": {
+      "type": "config_entries/get",
+      "domain": "local_calendar"
+    },
+    "result_found": [
+      {
+        "created_at": 1758600000.0,
+        "entry_id": "01K5LOCALCAL0FFICE",
+        "domain": "local_calendar",
+        "modified_at": 1758600000.0,
+        "title": "EchoMuse Office",
+        "source": "user",
+        "state": "loaded",
+        "supports_options": false,
+        "supports_remove_device": false,
+        "supports_unload": true,
+        "supports_reconfigure": false,
+        "supported_subentry_types": {},
+        "pref_disable_new_entities": false,
+        "pref_disable_polling": false,
+        "disabled_by": null,
+        "reason": null,
+        "error_reason_translation_key": null,
+        "error_reason_translation_placeholders": null,
+        "num_subentries": 0
+      }
+    ],
+    "result_empty": []
+  },
+  "entity_registry_list": {
+    "request": {
+      "type": "config/entity_registry/list"
+    },
+    "result": [
+      {
+        "area_id": null,
+        "categories": {},
+        "config_entry_id": "01K5LOCALCAL0FFICE",
+        "config_subentry_id": null,
+        "created_at": 1758600000.0,
+        "device_id": null,
+        "disabled_by": null,
+        "entity_category": null,
+        "entity_id": "calendar.echomuse_office",
+        "has_entity_name": false,
+        "hidden_by": null,
+        "icon": null,
+        "id": "reg-calendar.echomuse_office",
+        "labels": [],
+        "modified_at": 1758600000.0,
+        "name": null,
+        "options": {},
+        "original_name": "EchoMuse Office",
+        "platform": "local_calendar",
+        "translation_key": null,
+        "unique_id": "01K5LOCALCAL0FFICE"
+      },
+      {
+        "area_id": null,
+        "categories": {},
+        "config_entry_id": null,
+        "config_subentry_id": null,
+        "created_at": 1758600000.0,
+        "device_id": null,
+        "disabled_by": null,
+        "entity_category": null,
+        "entity_id": "light.kitchen",
+        "has_entity_name": false,
+        "hidden_by": null,
+        "icon": null,
+        "id": "reg-light.kitchen",
+        "labels": [],
+        "modified_at": 1758600000.0,
+        "name": null,
+        "options": {},
+        "original_name": "Kitchen Lights",
+        "platform": "hue",
+        "translation_key": null,
+        "unique_id": "hue-1"
+      }
+    ]
+  },
+  "flow_init": {
+    "request": {
+      "method": "POST",
+      "path": "/api/config/config_entries/flow",
+      "json": {
+        "handler": "local_calendar"
+      }
+    },
+    "response": {
+      "type": "form",
+      "flow_id": "4c1b9b4bd2d1",
+      "handler": "local_calendar",
+      "step_id": "user",
+      "data_schema": [
+        {
+          "name": "calendar_name",
+          "required": true,
+          "type": "string"
+        },
+        {
+          "name": "import",
+          "default": "create_empty",
+          "optional": true,
+          "selector": {
+            "select": {
+              "options": [
+                "create_empty",
+                "import_ics_file"
+              ],
+              "translation_key": "import",
+              "mode": "list"
+            }
+          }
+        }
+      ],
+      "errors": {},
+      "description_placeholders": null,
+      "last_step": null,
+      "preview": null
+    }
+  },
+  "flow_submit": {
+    "request": {
+      "method": "POST",
+      "path": "/api/config/config_entries/flow/4c1b9b4bd2d1",
+      "json": {
+        "calendar_name": "EchoMuse Office",
+        "import": "create_empty"
+      }
+    },
+    "response": {
+      "type": "create_entry",
+      "flow_id": "4c1b9b4bd2d1",
+      "handler": "local_calendar",
+      "title": "EchoMuse Office",
+      "description": null,
+      "description_placeholders": null,
+      "minor_version": 1,
+      "version": 1,
+      "options": {},
+      "subentries": [],
+      "result": {
+        "created_at": 1758600000.0,
+        "entry_id": "01K5LOCALCAL0FFICE",
+        "domain": "local_calendar",
+        "modified_at": 1758600000.0,
+        "title": "EchoMuse Office",
+        "source": "user",
+        "state": "loaded",
+        "supports_options": false,
+        "supports_remove_device": false,
+        "supports_unload": true,
+        "supports_reconfigure": false,
+        "supported_subentry_types": {},
+        "pref_disable_new_entities": false,
+        "pref_disable_polling": false,
+        "disabled_by": null,
+        "reason": null,
+        "error_reason_translation_key": null,
+        "error_reason_translation_placeholders": null,
+        "num_subentries": 0
+      }
+    }
+  },
+  "flow_abort": {
+    "response": {
+      "type": "abort",
+      "flow_id": "4c1b9b4bd2d1",
+      "handler": "local_calendar",
+      "reason": "already_configured",
+      "description_placeholders": null
+    }
+  }
+}

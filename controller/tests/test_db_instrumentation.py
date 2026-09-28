@@ -1,13 +1,7 @@
 """
-Schema + writer tests for the v7 delivery instrumentation.
-
-em_db is dependency-light (sqlite3/json/time only), so these run against a
-real temporary database — migrations included. That matters more than usual
-here: a migration that fails at container start takes the whole controller
-down, and the fleet's live DB is the only copy of the activity history.
+Schema and writer tests for turn traces, wake counters and device metrics,
+against a real temporary database migrated from scratch.
 """
-
-import sqlite3
 
 import pytest
 
@@ -27,84 +21,6 @@ def fresh_db(tmp_path, monkeypatch):
 
 def _cols(table: str) -> set:
     return {r[1] for r in db._conn.execute(f"PRAGMA table_info({table})")}
-
-
-def test_migrates_to_v7(fresh_db):
-    version = db.get_config("schema_version")
-    assert int(version) >= 7
-
-
-def test_turns_has_delivery_columns(fresh_db):
-    cols = _cols("turns")
-    for c in ("min_depth", "prime_wait_ms", "recv_span_ms", "max_gap_ms",
-              "bytes_recv", "send_ms", "delivery_ms", "eq_ms"):
-        assert c in cols, f"turns.{c} missing"
-
-
-def test_device_metrics_has_link_columns(fresh_db):
-    cols = _cols("device_metrics")
-    for c in ("link_speed_last", "link_speed_min", "wifi_freq_last",
-              "wifi_bssid_last", "tx_bytes_sum", "rx_bytes_sum",
-              "tx_errors_sum", "tx_dropped_sum", "rx_crc_sum"):
-        assert c in cols, f"device_metrics.{c} missing"
-
-
-def _mk_turn(fresh_db, device_id="dev1") -> int:
-    db.register_new_device(device_id, "1.2.3.4", "v2.9.6")
-    return db.insert_turn(device_id, {
-        "trigger": "wakeword(0.9)", "outcome": "ok", "tts_bytes": 96000,
-    })
-
-
-def test_set_turn_playback_stores_margin_fields(fresh_db):
-    turn_id = _mk_turn(fresh_db)
-    db.set_turn_playback(turn_id, periods=50, underruns=1, stats={
-        "minDepth": 2, "primeWaitMs": 900, "recvSpanMs": 4200,
-        "maxGapMs": 310, "bytesRecv": 204800,
-    })
-    row = db._q1("SELECT * FROM turns WHERE id = ?", (turn_id,))
-    assert row["playback_periods"] == 50
-    assert row["underruns"] == 1
-    assert row["min_depth"] == 2
-    assert row["prime_wait_ms"] == 900
-    assert row["recv_span_ms"] == 4200
-    assert row["max_gap_ms"] == 310
-    assert row["bytes_recv"] == 204800
-
-
-def test_set_turn_playback_without_stats_leaves_nulls(fresh_db):
-    """Pre-v2.9.6 firmware reports only periods/underruns — the margin
-    columns must read NULL ('never reported'), not 0 ('perfect')."""
-    turn_id = _mk_turn(fresh_db)
-    db.set_turn_playback(turn_id, periods=50, underruns=0)
-    row = db._q1("SELECT * FROM turns WHERE id = ?", (turn_id,))
-    assert row["playback_periods"] == 50
-    assert row["min_depth"] is None
-    assert row["recv_span_ms"] is None
-
-
-def test_set_turn_delivery(fresh_db):
-    turn_id = _mk_turn(fresh_db)
-    db.set_turn_delivery(turn_id, send_ms=30, delivery_ms=8200, eq_ms=140)
-    row = db._q1("SELECT * FROM turns WHERE id = ?", (turn_id,))
-    # The whole point of the pair: a near-zero socket write next to a
-    # multi-second delivery is the signature that misled 2026-07-20.
-    assert row["send_ms"] == 30
-    assert row["delivery_ms"] == 8200
-    assert row["eq_ms"] == 140
-
-
-def test_insert_turn_accepts_delivery_fields(fresh_db):
-    """Stats-before-persist path: the fields ride the initial insert."""
-    db.register_new_device("dev1", "1.2.3.4", "v2.9.6")
-    turn_id = db.insert_turn("dev1", {
-        "trigger": "wakeword(0.9)", "outcome": "ok",
-        "min_depth": 0, "delivery_ms": 11200, "recv_span_ms": 9000,
-    })
-    row = db._q1("SELECT * FROM turns WHERE id = ?", (turn_id,))
-    assert row["min_depth"] == 0
-    assert row["delivery_ms"] == 11200
-    assert row["recv_span_ms"] == 9000
 
 
 def test_record_device_stats_accumulates_link_metrics(fresh_db):
@@ -146,51 +62,6 @@ def test_link_speed_absent_does_not_poison_minimum(fresh_db):
     assert row["link_speed_min"] == 150
     assert row["link_speed_last"] == 150
 
-
-def test_stats_relay_allowlist_covers_every_device_stat():
-    """
-    em_controller's stats handler copies device stats into device.stats via
-    an explicit allowlist before record_device_stats sees them. A field can
-    therefore be present on the device AND handled by the DB writer and
-    still be silently dropped in between — which is exactly what happened
-    on 2026-07-20, caught only by watching a live OTA'd device report nulls.
-
-    Guard: every key record_device_stats reads must appear in the handler's
-    allowlist. Parses the source rather than importing em_controller, which
-    pulls in openwakeword/aiohttp and has no place in this suite.
-    """
-    import pathlib
-    import re
-
-    root = pathlib.Path(__file__).resolve().parents[1]
-    ctrl = (root / "em_controller.py").read_text()
-    dbsrc = (root / "em_db.py").read_text()
-
-    body = re.search(r'msg_type == "stats":(.*?)\n\s*if msg\.get\("ble"\)',
-                     ctrl, re.S)
-    assert body, "could not locate the stats handler allowlist"
-    allowlist = set(re.findall(r'"(\w+)":\s*msg\.get', body.group(1)))
-
-    # RTT is measured controller-side rather than relayed from the device
-    # message, so it reaches record_device_stats through Device.drain_rtt()
-    # merged into the same dict. Same failure mode, different source: a key
-    # the DB writer reads but drain_rtt never emits is silently always NULL.
-    drain = re.search(r"def drain_rtt\(.*?\n(?=    def |\n\n)", ctrl, re.S)
-    assert drain, "could not locate Device.drain_rtt"
-    allowlist |= set(re.findall(r'"(\w+)":', drain.group(0)))
-
-    record = re.search(r"def record_device_stats\(.*?\n(?=def )", dbsrc, re.S)
-    assert record, "could not locate record_device_stats"
-    consumed = set(re.findall(r'stats\.get\("(\w+)"\)', record.group(0)))
-
-    missing = sorted(consumed - allowlist)
-    assert not missing, (
-        f"record_device_stats reads {missing} but the em_controller stats "
-        f"handler never copies them — they will always be None"
-    )
-
-
-# ─── v9 — control-plane RTT ──────────────────────────────────────────────────
 
 def test_migrates_to_head(fresh_db):
     """Head of MIGRATIONS, so appending one without bumping its own
@@ -284,80 +155,6 @@ def test_excursion_rates_are_none_without_samples_in_that_state(fresh_db):
     assert m["rtt_excursion_pct_busy"] is None
 
 
-# ── v13 — on-device wake word shadow mode ────────────────────────────────────
-
-def test_migrates_to_v13(fresh_db):
-    assert int(db.get_config("schema_version")) >= 13
-
-
-def test_turns_has_shadow_columns(fresh_db):
-    cols = _cols("turns")
-    for c in ("dev_wake_score", "dev_wake_delta_ms", "dev_shadow"):
-        assert c in cols, f"turns.{c} missing"
-
-
-def test_wake_counters_has_shadow_columns(fresh_db):
-    cols = _cols("wake_counters")
-    for c in ("dev_frames", "dev_drops", "dev_crossings", "dev_max_score"):
-        assert c in cols, f"wake_counters.{c} missing"
-
-
-def test_shadow_turn_fields_round_trip(fresh_db):
-    """The v13 columns must survive insert_turn's dict→column mapping. A field
-    present in the record but absent from _TURN_COLUMNS is silently discarded,
-    which is exactly how a comparison feature ends up reporting nothing."""
-    turn_id = db.insert_turn("dev1", {
-        "ts": 1_800_000_000,
-        "trigger": "wakeword(0.71)",
-        "wake_score": 0.71,
-        "outcome": "ok",
-        "dev_wake_score": 0.63,
-        "dev_wake_delta_ms": -140,
-        "dev_shadow": 1,
-    })
-    row = db._q("SELECT * FROM turns WHERE id = ?", (turn_id,))[0]
-    assert row["dev_wake_score"] == 0.63
-    assert row["dev_wake_delta_ms"] == -140
-    assert row["dev_shadow"] == 1
-
-
-def test_shadow_counters_accumulate_and_max(fresh_db):
-    """Counters sum; the max score takes the maximum. Getting the second one
-    wrong (summing scores) produces a number that looks like a score and is
-    not — the same class of bug as the near-miss max."""
-    db.bump_wake_counters("dev2", dev_frames=100, dev_drops=2,
-                          dev_crossings=1, dev_max_score=0.4)
-    db.bump_wake_counters("dev2", dev_frames=50, dev_drops=1,
-                          dev_crossings=2, dev_max_score=0.9)
-    db.bump_wake_counters("dev2", dev_frames=25, dev_max_score=0.6)
-
-    rows = db.get_wake_counters("dev2", 0)
-    assert len(rows) == 1, "all three bumps belong to the same hour bucket"
-    r = rows[0]
-    assert r["dev_frames"] == 175
-    assert r["dev_drops"] == 3
-    assert r["dev_crossings"] == 3
-    assert r["dev_max_score"] == 0.9
-
-
-def test_shadow_counters_do_not_disturb_near_miss_columns(fresh_db):
-    """The dev_* arguments were added to an existing upsert that the wake loop
-    calls every 2s. A mistake in the ON CONFLICT list would corrupt near-miss
-    accounting, which has nothing to do with this feature."""
-    db.bump_wake_counters("dev3", near_misses=3, near_miss_max=0.44)
-    db.bump_wake_counters("dev3", dev_frames=10, dev_max_score=0.2)
-    r = db.get_wake_counters("dev3", 0)[0]
-    assert r["near_misses"] == 3
-    assert r["near_miss_max"] == 0.44
-    assert r["dev_frames"] == 10
-
-
-# ── v14 — thermals and CPU topology ──────────────────────────────────────────
-
-def test_migrates_to_v14(fresh_db):
-    assert int(db.get_config("schema_version")) >= 14
-
-
 def test_device_metrics_has_thermal_columns(fresh_db):
     cols = _cols("device_metrics")
     for c in ("cpu_temp_sum", "cpu_temp_samples", "cpu_temp_max", "max_temp_max",
@@ -409,38 +206,61 @@ def test_metrics_without_thermals_stay_null(fresh_db):
     assert m["thermal_limit_min"] is None
 
 
-# ── v15 — the device's own threshold, per turn ────────────────────────────────
+TRACE = {
+    "wake_model_sha256": "4eb745120ea56f5681eddbf788a0c69e1fd406d4694a04a4dba0c1e41d862d3f",
+    "policy_hash": "post_afe_1:abc",
+    "wake_attribution": "user",
+    "reference_coverage": 0.97,
+    "commit_route": "A",
+    "terminal_reason": "handled",
+    "commit_id": "c-1",
+}
 
-def test_migrates_to_v15(fresh_db):
-    assert int(db.get_config("schema_version")) >= 15
+
+def test_turn_decision_trace_round_trips(fresh_db):
+    """§11.3 trace columns survive insert_turn's key→column mapping and come
+    back through get_turns under the same keys."""
+    turn_id = db.insert_turn("dev1", {"ts": 1_800_000_000, "trigger": "wake",
+                                      "outcome": "ok", **TRACE})
+    rec = db.get_turns("dev1")[-1]
+    assert rec["turn_id"] == turn_id
+    for key, value in TRACE.items():
+        assert rec[key] == value
 
 
-def test_turns_has_dev_threshold(fresh_db):
-    assert "dev_threshold" in _cols("turns")
+def test_trace_is_null_when_unrecorded_and_history_columns_are_not_written(fresh_db):
+    """Missing trace fields read NULL (not measured), and the legacy shadow /
+    delivery columns keep history only: insert_turn ignores them (§18.4)."""
+    db.insert_turn("dev1", {"ts": 1_800_000_000, "outcome": "no_input",
+                            "dev_wake_score": 0.6, "delivery_ms": 900})
+    rec = db.get_turns("dev1")[-1]
+    assert all(rec[key] is None for key in TRACE)
+    assert rec["dev_wake_score"] is None and rec["delivery_ms"] is None
 
 
-def test_barge_in_turn_records_the_threshold_it_actually_cleared(fresh_db):
-    """
-    A wake that fires during playback clears bargeInThreshold, not owwThreshold.
-    Recording the nominal 0.5 produced rows that contradicted themselves —
-    wake_score 0.055 against wake_threshold 0.5, i.e. "woke below its own bar" —
-    and left the on-device comparison unable to tell a real miss from a question
-    the device was never asked.
-    """
-    turn_id = db.insert_turn("dev-b", {
-        "ts": 1_800_000_100,
-        "trigger": "wakeword(0.055)",
-        "wake_score": 0.055,
-        "wake_threshold": 0.05,   # the barge bar it cleared, not the nominal 0.5
-        "dev_shadow": 1,
-        "dev_threshold": 0.5,     # what the device was scoring against
-        "dev_wake_score": None,   # so it did not cross — but fairly so
-        "outcome": "ok",
-    })
-    r = db._q("SELECT * FROM turns WHERE id = ?", (turn_id,))[0]
-    assert r["wake_score"] >= r["wake_threshold"], \
-        "a turn must not record a score below the threshold it cleared"
-    assert r["dev_threshold"] == 0.5
-    # The comparison logic in em_api treats this as NOT comparable, because the
-    # controller's bar (0.10) is below the device's (0.5).
-    assert r["wake_threshold"] < r["dev_threshold"]
+def test_numpy_scores_are_stored_as_numbers(fresh_db):
+    np = pytest.importorskip("numpy")
+    db.insert_turn("dev1", {"ts": 1_800_000_000, "wake_score": np.float32(0.9),
+                            "reference_coverage": np.float64(0.5)})
+    rec = db.get_turns("dev1")[-1]
+    assert isinstance(rec["wake_score"], float)
+    assert rec["reference_coverage"] == 0.5
+
+
+def test_wake_stats_windows_accumulate_into_the_hour(fresh_db):
+    """§18.4 step 4: counts add, maxima take the maximum, and a window that did
+    not measure a maximum (None) leaves the stored one alone."""
+    db.bump_wake_counters("dev2", near_misses=2, near_miss_max=0.31, dev_hops=187,
+                          dev_drops=1, dev_crossings=1, dev_max_score=0.93,
+                          dev_max_infer_ms=131.4)
+    db.bump_wake_counters("dev2", near_misses=1, near_miss_max=0.2, dev_hops=188,
+                          dev_crossings=0, dev_max_score=0.4, dev_max_infer_ms=90.0)
+    db.bump_wake_counters("dev2", dev_hops=5, near_miss_max=None,
+                          dev_max_score=None, dev_max_infer_ms=None)
+    rows = db.get_wake_counters("dev2", 0)
+    assert len(rows) == 1
+    r = rows[0]
+    assert (r["near_misses"], r["dev_hops"], r["dev_drops"], r["dev_crossings"]) == (3, 380, 1, 1)
+    assert r["near_miss_max"] == 0.31
+    assert r["dev_max_score"] == 0.93
+    assert r["dev_max_infer_ms"] == 131

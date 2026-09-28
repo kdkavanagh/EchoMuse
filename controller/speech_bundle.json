@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "runtime": {
+    "package": "sherpa-onnx",
+    "version": "1.13.8",
+    "wheel": {
+      "path": "sherpa_onnx-1.13.8-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+      "size": 4400575,
+      "sha256": "6949773017647febc0c3696dffb2c67dd3febd4737b87e3dd135a42773704a06",
+      "url": "https://files.pythonhosted.org/packages/13/78/2f712b7408ddbb64614c20388912414705b728516224e737b63f2adec94a/sherpa_onnx-1.13.8-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl"
+    }
+  },
+  "asr": {
+    "name": "sherpa-onnx-streaming-zipformer-en-kroko-2025-08-06",
+    "archive": {
+      "path": "sherpa-onnx-streaming-zipformer-en-kroko-2025-08-06.tar.bz2",
+      "size": 57267600,
+      "sha256": "c8676e5ff9ac2a85296e53ee0fd4d5fb1db6770e7a7647166eeafe349ade6834",
+      "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-en-kroko-2025-08-06.tar.bz2"
+    },
+    "files": {
+      "encoder": {"path": "kroko/encoder.onnx", "size": 70092599, "sha256": "d4881c57449d581e0770fd53fa66c2fdc6cd167d92ece7c715e603defc96d9d4"},
+      "decoder": {"path": "kroko/decoder.onnx", "size": 617488, "sha256": "455ba38466fce8d5a57e7db68a323b684079ca4d9e1dd93a740d9b2429aae3b1"},
+      "joiner": {"path": "kroko/joiner.onnx", "size": 336817, "sha256": "d406f616736350e2a7df3e39398b78eb2fc1a2ca6973a19d3853fa3227e25b52"},
+      "tokens": {"path": "kroko/tokens.txt", "size": 6310, "sha256": "396dbeb5f4858875690716084f54e90d339679d0ba3e6b5b584f3d7589254d2d"}
+    },
+    "test_wav_member": "sherpa-onnx-streaming-zipformer-en-kroko-2025-08-06/test_wavs/0.wav"
+  },
+  "vad": {
+    "path": "silero_vad_v5.onnx",
+    "size": 2313101,
+    "sha256": "6b99cbfd39246b6706f98ec13c7c50c6b299181f2474fa05cbc8046acc274396",
+    "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad_v5.onnx"
+  },
+  "attribution": {
+    "path": "KROKO-ATTRIBUTION.txt",
+    "license": "CC-BY-SA",
+    "url": "https://huggingface.co/Banafo/Kroko-ASR"
+  }
+}

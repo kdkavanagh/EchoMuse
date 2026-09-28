@@ -342,32 +342,8 @@ def test_usage_reports_what_the_volume_is_carrying(tmp_path):
 # talking to Home Assistant, or one that never comes back from the mode.
 
 
-def test_collection_is_refused_at_the_single_turn_choke_point():
-    """
-    Wake word, dot button and HA's own start_conversation all meet at
-    _run_voice_locked. Guarding each trigger instead would leave whichever
-    one nobody remembered still streaming a room to Home Assistant.
-    """
-    src  = CONTROLLER.read_text()
-    body = src.split("async def _run_voice_locked", 1)[1].split("\nasync def ", 1)[0]
-    assert "device.collect_mode" in body, \
-        "_run_voice_locked must refuse to start a turn while collecting"
-    # Before the lock is taken and before anything is drained: refusing after
-    # would still pause music and take the speaker.
-    assert body.index("device.collect_mode") < body.index("voice_lock")
 
 
-def test_the_wake_model_is_not_scored_while_collecting():
-    """Not scoring IS the mode: a detection acted on would open a turn, and
-    a detection merely logged would cost inference on every device left
-    collecting for an afternoon."""
-    src  = CONTROLLER.read_text()
-    body = src.split("async def wake_word_listener", 1)[1].split("\nasync def ", 1)[0]
-    # `model` is an em_wake_scorer.WakeScorer; push() is the scoring call for
-    # both families. (It was `model.predict` while openWakeWord was the only
-    # backend — the invariant is unchanged, only the spelling.)
-    assert body.index("_collect_frame") < body.index("model.push"), \
-        "the collect branch must take the frame before the model scores it"
 
 
 def test_collection_survives_a_controller_restart():
@@ -388,12 +364,6 @@ def test_collection_is_not_a_config_key():
     assert "collect" not in SECTIONS.read_text().lower()
 
 
-def test_an_open_clip_is_kept_when_the_device_goes_away():
-    src = CONTROLLER.read_text()
-    assert "collect_teardown" in src
-    body = src.split("async def collect_teardown", 1)[1].split("\n# ", 1)[0]
-    assert "flush()" in body, \
-        "a disconnect must flush the open clip, not discard it"
 
 
 def test_the_mode_is_admin_only_and_the_reads_are_not():

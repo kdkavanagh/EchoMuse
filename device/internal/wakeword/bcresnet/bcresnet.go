@@ -1,74 +1,34 @@
-// Package bcresnet scores a wake word with a BC-ResNet model: one graph that
-// takes a fixed window of raw audio and emits one logit per class.
-//
-// It is the second wake-word engine on this device and it is shaped nothing
-// like the first. openWakeWord (the parent package) is a three-stage streaming
-// pipeline — melspectrogram, embedding, classifier head — where every 80ms
-// chunk advances a ring and produces a score. BC-ResNet carries its own log-mel
-// frontend inside the graph, takes 1.4s of audio at a time, and is therefore
-// run on a HOP: most chunks produce no score at all.
-//
-// That difference is the reason Push returns an `ok` flag rather than a score
-// alone. A chunk that was not judged is not a chunk that scored zero, and
-// collapsing the two would feed the crossing test and the max-score statistic
-// a stream of invented zeros.
-//
-// The buffering here is the whole algorithm, so — exactly as in the parent
-// package — inference sits behind an interface and this file never imports
-// onnxruntime. That is what lets it be tested on the host, where there is no
-// ARM runtime and no model.
-//
-// It is a deliberate port of the controller's em_wake_scorer.BcresnetScorer,
-// constant for constant, because the two score the same audio and any
-// divergence shows up as a disagreement that looks like a model problem.
+// Package bcresnet implements the deployed BC-ResNet artifact contract of
+// SPEC §5.1: the sidecar, the per-window preparation, and the wake probability.
+// It holds no streaming state; windowing, hops, and smoothing belong to
+// wakeword/detector.
 package bcresnet
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
-	"strings"
 )
 
+// Artifact constants (SPEC §5.1).
 const (
-	// DefaultHopChunks is how many 80ms chunks pass between scores. Two is
-	// 160ms, matching the controller's default: the window is 1.4s and
-	// consecutive windows overlap 89%, so scoring every chunk costs 2x the CPU
-	// to re-examine audio that has barely changed.
-	DefaultHopChunks = 2
-
-	// DefaultSmoothing averages the last N window scores, matching the
-	// reference streaming implementation. It removes the single-window spike
-	// that an overlapping window produces on a transient — a door click can
-	// land inside one window and nowhere near the next two.
-	DefaultSmoothing = 3
-
-	// PeakEps is the peak below which a window is NOT rescaled, in the same
-	// units as the training-time normalisation (floats in +/-1). The reference
-	// implementation owns this constant; a second value here would be a second
-	// definition of the model's level invariance.
-	PeakEps = 1e-4
-
-	// SilenceRMS is the level below which a window is not scored at all.
-	// Distinct from PeakEps and needed BECAUSE of it: a window peaking just
-	// above the guard is rescaled by up to ~8000x, so a merely-quiet room
-	// becomes full-scale noise fed to a detector. A muted device streams
-	// zero-filled frames and is caught here too.
-	SilenceRMS = 1e-4
+	// SampleRate is the only sample rate the graph accepts.
+	SampleRate = 16000
+	// WindowSamples is the graph input length: 1.4 s at 16 kHz.
+	WindowSamples = 22400
+	// RMSFloor: a window whose RMS (of int16/32768) is below this is not scored.
+	RMSFloor = 1e-4
+	// PeakGuard: a window whose peak is at or below this is not rescaled.
+	PeakGuard = 1e-4
+	// sidecarType is the sidecar's `type` value.
+	sidecarType = "bcresnet"
 )
 
-// Spec is the sidecar that makes a BC-ResNet .onnx runnable.
-//
-// The graph alone cannot say which of its logits is the wake word, and the
-// answer is not a convention: class order comes from sorting the training
-// directories, so the first real model produced labels ["noise", "ohphelia",
-// "unknown"] and a wake index of 1. Anything defaulting to 0 would score
-// "noise" and present as a detector that simply never fires.
-//
-// Field names match the JSON the exporter writes and the controller reads;
-// they are the same file, pushed to the device beside the model.
-type Spec struct {
+// Sidecar is the JSON file shipped beside the graph. Field names are the
+// exporter's.
+type Sidecar struct {
 	Type        string   `json:"type"`
 	SampleRate  int      `json:"sampleRate"`
 	Window      int      `json:"window"`
@@ -79,276 +39,175 @@ type Spec struct {
 	NormPeak    float64  `json:"normPeak"`
 }
 
-// WakeLabel is the class name the wake index selects, for logging.
-func (s Spec) WakeLabel() string {
-	if s.WakeIndex < 0 || s.WakeIndex >= len(s.Labels) {
-		return ""
-	}
-	return s.Labels[s.WakeIndex]
-}
-
-// Validate rejects a sidecar that cannot describe a runnable model.
-//
-// Every check here is a failure that would otherwise surface as silence: a
-// wake index past the end of the label list scores whatever happens to be at
-// that offset in the output tensor, and a window of zero divides by nothing
-// forever. Refusing at load time is what makes the log line name the file.
-func (s Spec) Validate() error {
-	if t := strings.TrimSpace(s.Type); t != "" && t != "bcresnet" {
-		return fmt.Errorf("sidecar type is %q, not \"bcresnet\"", t)
-	}
-	if s.Window <= 0 {
-		return fmt.Errorf("window must be positive, got %d", s.Window)
-	}
-	if s.SampleRate <= 0 {
-		return fmt.Errorf("sampleRate must be positive, got %d", s.SampleRate)
-	}
-	if len(s.Labels) == 0 {
-		return fmt.Errorf("labels is empty — nothing names the wake class")
-	}
-	if s.WakeIndex < 0 || s.WakeIndex >= len(s.Labels) {
-		return fmt.Errorf("wakeIndex %d is outside the %d labels %v",
-			s.WakeIndex, len(s.Labels), s.Labels)
-	}
-	if s.NormPeak <= 0 || s.NormPeak > 1 {
-		return fmt.Errorf("normPeak must be in (0,1], got %v", s.NormPeak)
-	}
-	return nil
-}
-
-// LoadSpec reads and validates a sidecar.
-func LoadSpec(path string) (Spec, error) {
-	var s Spec
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return s, fmt.Errorf("bcresnet: %w", err)
-	}
+// ParseSidecar decodes and validates a sidecar.
+func ParseSidecar(raw []byte) (Sidecar, error) {
+	var s Sidecar
 	if err := json.Unmarshal(raw, &s); err != nil {
-		return s, fmt.Errorf("bcresnet: %s is not valid JSON: %w", path, err)
+		return Sidecar{}, fmt.Errorf("bcresnet: sidecar is not valid JSON: %w", err)
 	}
 	if err := s.Validate(); err != nil {
-		return s, fmt.Errorf("bcresnet: %s: %w", path, err)
+		return Sidecar{}, err
 	}
 	return s, nil
 }
 
-// Inferer runs the model. `window` is the normalised window as float32 in
-// +/-1, length Spec.Window; the result is one logit per label.
-//
-// Deliberately the narrowest possible surface — the graph is a single input
-// and a single output, unlike the parent package's three-method Inferer — so
-// the host test can supply a closure.
-type Inferer interface {
-	Run(window []float32) ([]float32, error)
+// LoadSidecar reads and validates the sidecar at path.
+func LoadSidecar(path string) (Sidecar, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return Sidecar{}, fmt.Errorf("bcresnet: %w", err)
+	}
+	s, err := ParseSidecar(raw)
+	if err != nil {
+		return Sidecar{}, fmt.Errorf("%w (%s)", err, path)
+	}
+	return s, nil
 }
 
-// Detector holds the streaming state for one audio source.
-//
-// Not safe for concurrent use: like the parent package's Detector it is driven
-// from a single goroutine, which for shadow mode is the scorer goroutine.
-type Detector struct {
-	inf  Inferer
-	spec Spec
+// Validate enforces the SPEC §5.1 load rules that the sidecar alone decides:
+// 16 kHz, a 22,400-sample window, a wake index inside the labels, and a
+// normalization peak in (0, 1].
+func (s Sidecar) Validate() error {
+	switch {
+	case s.Type != sidecarType:
+		return fmt.Errorf("bcresnet: sidecar type %q, want %q", s.Type, sidecarType)
+	case s.SampleRate != SampleRate:
+		return fmt.Errorf("bcresnet: sidecar sampleRate %d, want %d", s.SampleRate, SampleRate)
+	case s.Window != WindowSamples:
+		return fmt.Errorf("bcresnet: sidecar window %d, want %d", s.Window, WindowSamples)
+	case len(s.Labels) == 0:
+		return errors.New("bcresnet: sidecar has no labels")
+	case s.WakeIndex < 0 || s.WakeIndex >= len(s.Labels):
+		return fmt.Errorf("bcresnet: sidecar wakeIndex %d outside %d labels", s.WakeIndex, len(s.Labels))
+	case !(s.NormPeak > 0 && s.NormPeak <= 1):
+		return fmt.Errorf("bcresnet: sidecar normPeak %v outside (0, 1]", s.NormPeak)
+	}
+	return nil
+}
 
-	hopChunks int
-	smoothing int
-	minRMS    float64
+// CheckGraphIO rejects a graph whose input length or output count disagrees
+// with the sidecar (SPEC §5.1). A negative dimension is dynamic and rejected:
+// the deployed graph fixes both.
+func (s Sidecar) CheckGraphIO(inputLen, outputCount int) error {
+	if inputLen != WindowSamples {
+		return fmt.Errorf("bcresnet: graph input length %d, want %d", inputLen, WindowSamples)
+	}
+	if outputCount != len(s.Labels) {
+		return fmt.Errorf("bcresnet: graph emits %d outputs, sidecar names %d labels", outputCount, len(s.Labels))
+	}
+	return nil
+}
 
-	buf      []int16 // ring of raw samples, newest at the end
-	filled   int
-	sinceHop int
-	recent   []float32
+// Prepare writes the SPEC §5.1 model input for one int16 window into dst
+// (both WindowSamples long): x = pcm/32768; if RMS(x) < RMSFloor it reports
+// false and dst is not a model input; otherwise, if peak(x) > PeakGuard, x is
+// scaled to peak normPeak.
+func Prepare(dst []float32, pcm []int16, normPeak float64) bool {
+	var sumSq float64
+	var peak float32
+	for i, v := range pcm {
+		x := float32(v) / 32768.0
+		dst[i] = x
+		sumSq += float64(x) * float64(x)
+		if x < 0 {
+			x = -x
+		}
+		if x > peak {
+			peak = x
+		}
+	}
+	if math.Sqrt(sumSq/float64(len(pcm))) < RMSFloor {
+		return false
+	}
+	normalizePeak(dst, peak, normPeak)
+	return true
+}
 
-	// scratch is the normalised window handed to the Inferer. Reused because
-	// inference runs 6.25 times a second forever and the steady state must not
-	// allocate — same reasoning as ort.model.out.
+// normalizePeak scales x to peak normPeak unless its peak is within the guard.
+// The gain is computed in float64 and applied in float32, as the controller's
+// numpy scorer does.
+func normalizePeak(x []float32, peak float32, normPeak float64) {
+	if peak <= PeakGuard {
+		return
+	}
+	g := float32(normPeak / float64(peak))
+	for i := range x {
+		x[i] *= g
+	}
+}
+
+// WakeProbability is softmax(logits − max(logits))[wakeIndex]. It returns NaN
+// when a logit is non-finite; callers treat that as an inference error.
+func WakeProbability(logits []float32, wakeIndex int) float64 {
+	m := math.Inf(-1)
+	for _, v := range logits {
+		f := float64(v)
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			return math.NaN()
+		}
+		m = math.Max(m, f)
+	}
+	var sum, wake float64
+	for i, v := range logits {
+		e := math.Exp(float64(v) - m)
+		sum += e
+		if i == wakeIndex {
+			wake = e
+		}
+	}
+	return wake / sum
+}
+
+// Inferer runs the graph on one prepared window and returns its logits. The
+// result may alias a buffer the next Run overwrites.
+type Inferer interface {
+	Run(window []float32) ([]float32, error)
+	Close() error
+}
+
+// Scorer turns an int16 window into a wake probability with one graph and its
+// sidecar. It is owned by one goroutine; Score does not allocate.
+type Scorer struct {
+	inf     Inferer
+	sidecar Sidecar
 	scratch []float32
 }
 
-// Options tunes the Detector. The zero value means "use the defaults".
-type Options struct {
-	HopChunks int
-	Smoothing int
-	MinRMS    float64
+// NewScorer pairs a loaded graph with its validated sidecar. The Scorer owns inf.
+func NewScorer(inf Inferer, sc Sidecar) (*Scorer, error) {
+	if err := sc.Validate(); err != nil {
+		return nil, err
+	}
+	return &Scorer{inf: inf, sidecar: sc, scratch: make([]float32, WindowSamples)}, nil
 }
 
-// New returns a Detector for spec. The spec is assumed validated (LoadSpec
-// does it); an invalid one is an error rather than a panic because it arrives
-// from a file on the device, not from this codebase.
-func New(inf Inferer, spec Spec, o Options) (*Detector, error) {
-	if inf == nil {
-		return nil, fmt.Errorf("bcresnet: nil Inferer")
-	}
-	if err := spec.Validate(); err != nil {
-		return nil, fmt.Errorf("bcresnet: %w", err)
-	}
-	if o.HopChunks <= 0 {
-		o.HopChunks = DefaultHopChunks
-	}
-	if o.Smoothing <= 0 {
-		o.Smoothing = DefaultSmoothing
-	}
-	if o.MinRMS <= 0 {
-		o.MinRMS = SilenceRMS
-	}
-	d := &Detector{
-		inf:       inf,
-		spec:      spec,
-		hopChunks: o.HopChunks,
-		smoothing: o.Smoothing,
-		minRMS:    o.MinRMS,
-		buf:       make([]int16, spec.Window),
-		scratch:   make([]float32, spec.Window),
-		recent:    make([]float32, 0, o.Smoothing),
-	}
-	d.Reset()
-	return d, nil
-}
+// Sidecar returns the scorer's sidecar.
+func (s *Scorer) Sidecar() Sidecar { return s.sidecar }
 
-// Spec returns the loaded sidecar.
-func (d *Detector) Spec() Spec { return d.spec }
-
-// Ready reports whether a full window has been collected since the last Reset.
-func (d *Detector) Ready() bool { return d.filled >= d.spec.Window }
-
-// Reset discards the rolling context: the window and the smoothing history.
-//
-// The buffer's contents are not zeroed, only disowned — `filled` is what makes
-// them unreadable, and a window is never scored until it has been refilled from
-// scratch. That also gives the refractory period for free: after a crossing the
-// caller resets, and the next score cannot arrive until a whole fresh window
-// exists.
-func (d *Detector) Reset() {
-	d.filled = 0
-	// So the first full window scores the moment it exists rather than one hop
-	// later. "Score as soon as there is something to score, then every hop" is
-	// the intended behaviour.
-	d.sinceHop = d.hopChunks - 1
-	d.recent = d.recent[:0]
-}
-
-// Push adds one chunk of 16kHz mono PCM and reports a smoothed wake
-// probability if this chunk produced one.
-//
-// ok=false means one of: the window is not full yet, this chunk is not a hop
-// boundary, or the window is below the silence floor. All three are "not
-// judged", which is why they share a return distinct from a score of 0.
-func (d *Detector) Push(samples []int16) (score float32, ok bool, err error) {
-	// No audio in, no state change. Without this an empty chunk still advances
-	// the hop counter, so the next real chunk could score early — harmless in
-	// practice (the mic never delivers one) but it makes the hop depend on call
-	// count rather than on audio. The controller's scorer has the same guard;
-	// the two must not disagree about what a frame is.
-	if len(samples) == 0 {
+// Score prepares pcm (WindowSamples long) and runs the graph. scored is false,
+// with a nil error, for a window below the RMS floor: the graph did not run.
+// A graph error, a logit count that disagrees with the labels, or a
+// non-finite probability is an error.
+func (s *Scorer) Score(pcm []int16) (prob float64, scored bool, err error) {
+	if len(pcm) != WindowSamples {
+		return 0, false, fmt.Errorf("bcresnet: window of %d samples, want %d", len(pcm), WindowSamples)
+	}
+	if !Prepare(s.scratch, pcm, s.sidecar.NormPeak) {
 		return 0, false, nil
 	}
-	d.append(samples)
-	if d.filled < d.spec.Window {
-		return 0, false, nil
-	}
-	d.sinceHop++
-	if d.sinceHop < d.hopChunks {
-		return 0, false, nil
-	}
-	d.sinceHop = 0
-	return d.score()
-}
-
-// append slides the window and copies in the new samples.
-func (d *Detector) append(samples []int16) {
-	n := len(samples)
-	w := d.spec.Window
-	if n == 0 {
-		return
-	}
-	if n >= w {
-		// A chunk larger than the whole window: keep only its tail. Cannot
-		// happen with an 80ms mic chunk, but the arithmetic below would be
-		// wrong rather than merely wasteful if it did.
-		copy(d.buf, samples[n-w:])
-		d.filled = w
-		return
-	}
-	copy(d.buf, d.buf[n:])
-	copy(d.buf[w-n:], samples)
-	if d.filled += n; d.filled > w {
-		d.filled = w
-	}
-}
-
-func (d *Detector) score() (float32, bool, error) {
-	// One pass for the sum of squares and the peak: this runs on every hop,
-	// forever, over 22400 samples.
-	var sumSq float64
-	peak := float32(0)
-	for i, s := range d.buf {
-		v := float32(s) / 32768.0
-		d.scratch[i] = v
-		sumSq += float64(v) * float64(v)
-		if a := float32(math.Abs(float64(v))); a > peak {
-			peak = a
-		}
-	}
-	rms := math.Sqrt(sumSq / float64(len(d.buf)))
-	if rms < d.minRMS {
-		// Not scored, and the smoothing history is deliberately left alone: a
-		// silent gap should not dilute the scores either side of it.
-		return 0, false, nil
-	}
-	if peak > PeakEps {
-		// The ratio is computed in float64 and narrowed once, matching the
-		// controller exactly: it divides a Python float by a Python float and
-		// applies the result to a float32 array. Dividing in float32 here
-		// instead differs by an ULP, which is invisible in a score and is
-		// precisely the kind of drift the parity fixture exists to catch.
-		g := float32(d.spec.NormPeak / float64(peak))
-		for i := range d.scratch {
-			d.scratch[i] *= g
-		}
-	}
-
-	logits, err := d.inf.Run(d.scratch)
+	logits, err := s.inf.Run(s.scratch)
 	if err != nil {
-		return 0, false, fmt.Errorf("bcresnet: run: %w", err)
+		return 0, true, fmt.Errorf("bcresnet: run: %w", err)
 	}
-	if len(logits) != len(d.spec.Labels) {
-		return 0, false, fmt.Errorf(
-			"bcresnet: model emits %d logits but the sidecar names %d labels "+
-				"%v — mismatched .onnx/.json pair",
-			len(logits), len(d.spec.Labels), d.spec.Labels)
+	if len(logits) != len(s.sidecar.Labels) {
+		return 0, true, fmt.Errorf("bcresnet: %d logits for %d labels", len(logits), len(s.sidecar.Labels))
 	}
-
-	p := softmax(logits)[d.spec.WakeIndex]
-	if len(d.recent) == d.smoothing {
-		copy(d.recent, d.recent[1:])
-		d.recent = d.recent[:d.smoothing-1]
+	p := WakeProbability(logits, s.sidecar.WakeIndex)
+	if math.IsNaN(p) || math.IsInf(p, 0) {
+		return 0, true, errors.New("bcresnet: non-finite output")
 	}
-	d.recent = append(d.recent, p)
-
-	var sum float32
-	for _, v := range d.recent {
-		sum += v
-	}
-	return sum / float32(len(d.recent)), true, nil
+	return p, true, nil
 }
 
-// softmax over one row, max-subtracted so a large logit cannot overflow.
-func softmax(logits []float32) []float32 {
-	max := logits[0]
-	for _, v := range logits[1:] {
-		if v > max {
-			max = v
-		}
-	}
-	out := make([]float32, len(logits))
-	var sum float64
-	for i, v := range logits {
-		e := math.Exp(float64(v - max))
-		out[i] = float32(e)
-		sum += e
-	}
-	for i := range out {
-		out[i] = float32(float64(out[i]) / sum)
-	}
-	return out
-}
+// Close releases the graph.
+func (s *Scorer) Close() error { return s.inf.Close() }

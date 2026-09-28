@@ -330,58 +330,14 @@ def test_pull_is_the_default_transport_because_push_needs_a_route_back():
     assert "_get_capture_recording" in api_src
 
 
-def test_a_delivery_failure_names_the_exception_type():
-    """
-    A bare asyncio.TimeoutError stringifies to the EMPTY STRING, so the log
-    read 'delivery failed:' with nothing after it — on precisely the failure
-    an unreachable webhook produces, which is the one that happened.
-    """
-    src = CONTROLLER.read_text()
-    assert "type(last).__name__" in src
 
 
 # ─── controller wiring (shape guards, as in test_samples.py) ──────────────────
 
-def test_voice_turns_are_refused_while_capturing():
-    """
-    The refusal has to sit at _run_voice_locked, where wake word, dot button
-    and HA's own start_conversation all meet. Guarding each trigger leaves
-    whichever one nobody remembered still streaming a room to Home Assistant.
-
-    Matched on the operands rather than the whole line: ambient recording
-    (em_ambient) joined the same condition, so pinning the exact spelling
-    would fail for a mode being ADDED to the guard this test exists to
-    protect.
-    """
-    src  = CONTROLLER.read_text()
-    body = src[src.index("async def _run_voice_locked"):][:4000]
-    assert "device.capture_mode" in body
-    assert "device.collect_mode" in body
 
 
-def test_the_frame_tap_sits_in_the_wake_listener_before_the_model():
-    """
-    Same tap point as collect mode: the audio is byte-for-byte what the wake
-    model scores, which is the whole reason these recordings are worth
-    training on. Before `model.push`, so a capturing device is not paying for
-    inference nothing may act on.
-    """
-    src  = CONTROLLER.read_text()
-    body = src[src.index("async def wake_word_listener"):]
-    tap   = body.index("_capture_frame(device, frame, rms)")
-    score = body.index("model.push")
-    assert tap < score
 
 
-def test_capture_state_reaches_every_panel_that_shows_a_device():
-    """
-    A capturing device answers nothing, which from any other panel is
-    indistinguishable from a broken one — and the person who armed it is not
-    necessarily the person who next asks it for the weather.
-    """
-    assert '"captureMode":      device.capture_mode' in CONTROLLER.read_text()
-    assert '"captureMode"' in API.read_text()
-    assert "CAPTURING" in JSX.read_text()
 
 
 def test_the_disarm_never_cancels_the_task_it_is_running_on():

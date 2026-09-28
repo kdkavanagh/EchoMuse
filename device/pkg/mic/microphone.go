@@ -1,26 +1,21 @@
+// Package mic is the capture boundary: one fully processed mono channel from
+// the native AFE (SPEC §4.1), 16 kHz S16, in 80 ms blocks stamped with the
+// CLOCK_MONOTONIC time at which each block completed.
 package mic
 
-import (
-	"context"
-)
-
-type AudioCallback func(audioData []byte)
-
-type Microphone interface {
-	Init() error
-	Listen(callback AudioCallback, context context.Context) error
+// Block is one completed capture period.
+type Block struct {
+	PCM    []int16 // 16 kHz mono; borrowed until the next Read
+	MonoNs int64   // CLOCK_MONOTONIC ns when the period completed
 }
 
-// Subscribable is implemented by mic backends that support multiple concurrent
-// readers via a fan-out model. The vadStreamHandler uses this to tap the
-// permanent capture stream without opening a second session.
-//
-// Every period handed out is one fully processed mono channel: Android's audio
-// HAL runs per-mic AEC, beamforming and SNR beam selection before EchoMuse ever
-// sees the stream (internal/bindings/slmic, docs/native-afe-migration.md). That
-// is the only shape callers ever get — there is no raw multi-channel backend
-// any more, and nothing downstream needs to ask which one it was given.
-type Subscribable interface {
-	Subscribe() chan []byte
-	Unsubscribe(ch chan []byte)
+// Microphone delivers capture blocks to its single consumer.
+type Microphone interface {
+	// Read blocks for the next completed period. It returns an error once
+	// the capture stream has ended.
+	Read() (Block, error)
+	// Drops counts periods lost because Read fell behind; the completion
+	// stamps of the blocks that follow expose the gap.
+	Drops() uint64
+	Close()
 }

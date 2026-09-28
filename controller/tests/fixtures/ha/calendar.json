@@ -1,0 +1,132 @@
+{
+  "source": [
+    "homeassistant/components/calendar/__init__.py (handle_calendar_event_create|update|delete|subscribe, WEBSOCKET_EVENT_SCHEMA with dtstart/dtend, CalendarEvent.as_dict, _event_dict_factory drops None, event_listener pushes null on fetch error, CalendarEventView + _api_event_dict_factory)",
+    "homeassistant/components/local_calendar/calendar.py (async_delete_event wraps EventStoreError as HomeAssistantError)",
+    "ical/store.py (EventStore.delete: 'No existing item with uid/recurrence_id: ...')"
+  ],
+  "create": {
+    "request": {
+      "type": "calendar/event/create",
+      "entity_id": "calendar.echomuse_office",
+      "event": {
+        "summary": "Wake up",
+        "dtstart": "2026-09-23T06:30:00-05:00",
+        "dtend": "2026-09-23T06:31:00-05:00",
+        "rrule": "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR",
+        "description": "echomuse: {\"id\":\"3f1c\"}"
+      }
+    },
+    "result": null
+  },
+  "update": {
+    "request": {
+      "type": "calendar/event/update",
+      "entity_id": "calendar.echomuse_office",
+      "uid": "a1b2c3d4-uid",
+      "recurrence_id": "20260924T063000",
+      "event": {
+        "summary": "Wake up",
+        "dtstart": "2026-09-24T06:45:00-05:00",
+        "dtend": "2026-09-24T06:46:00-05:00"
+      }
+    },
+    "result": null
+  },
+  "delete": {
+    "request": {
+      "type": "calendar/event/delete",
+      "entity_id": "calendar.echomuse_office",
+      "uid": "a1b2c3d4-uid",
+      "recurrence_id": "20260924T063000"
+    },
+    "result": null
+  },
+  "delete_not_found": {
+    "code": "failed",
+    "message": "Error while deleting event: No existing item with uid/recurrence_id: gone-uid/None"
+  },
+  "entity_not_found": {
+    "code": "not_found",
+    "message": "Entity not found"
+  },
+  "subscribe": {
+    "request": {
+      "type": "calendar/event/subscribe",
+      "entity_id": "calendar.echomuse_office",
+      "start": "2026-09-23T11:00:00+00:00",
+      "end": "2026-09-30T11:30:00+00:00"
+    },
+    "result": null,
+    "push": {
+      "events": [
+        {
+          "start": "2026-09-24T06:30:00-05:00",
+          "end": "2026-09-24T06:31:00-05:00",
+          "summary": "Wake up",
+          "description": "echomuse: {\"id\":\"3f1c\"}",
+          "uid": "a1b2c3d4-uid",
+          "recurrence_id": "20260924T063000",
+          "rrule": "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR",
+          "all_day": false
+        },
+        {
+          "start": "2026-09-25T09:00:00-05:00",
+          "end": "2026-09-25T09:01:00-05:00",
+          "summary": "Alarm",
+          "uid": "ui-created-uid",
+          "all_day": false
+        },
+        {
+          "start": "2026-09-26",
+          "end": "2026-09-27",
+          "summary": "Holiday",
+          "uid": "holiday-uid",
+          "all_day": true
+        }
+      ]
+    },
+    "push_failed": {
+      "events": null
+    }
+  },
+  "rest_events": {
+    "request": {
+      "method": "GET",
+      "path": "/api/calendars/calendar.echomuse_office",
+      "query": [
+        "start",
+        "end"
+      ]
+    },
+    "response": [
+      {
+        "start": {
+          "dateTime": "2026-07-01T06:30:00-05:00"
+        },
+        "end": {
+          "dateTime": "2026-07-01T06:31:00-05:00"
+        },
+        "summary": "Wake up",
+        "description": "echomuse: {\"id\":\"3f1c\"}",
+        "location": null,
+        "uid": "a1b2c3d4-uid",
+        "recurrence_id": "20260701T063000",
+        "rrule": "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR"
+      },
+      {
+        "start": {
+          "date": "2026-07-04"
+        },
+        "end": {
+          "date": "2026-07-05"
+        },
+        "summary": "Holiday",
+        "description": null,
+        "location": null,
+        "uid": "holiday-uid",
+        "recurrence_id": null,
+        "rrule": null
+      }
+    ]
+  }
+}

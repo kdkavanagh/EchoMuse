@@ -76,31 +76,43 @@ def test_dashboard_section_map_matches_python():
 
 # ─── Resolution ──────────────────────────────────────────────────────────────
 
+FLEET_MODEL = "4eb745120ea56f5681eddbf788a0c69e1fd406d4694a04a4dba0c1e41d862d3f"
+OTHER_MODEL = "f" * 64
+
+
 def _glob():
-    return {"owwThreshold": 0.5, "ledScene": "standard", "nsAsr": False,
-            "vadThreshold": 0.001, "bleProxyEnabled": False, "eqLoudness": False}
+    return {"wakeModel": FLEET_MODEL, "ledScene": "standard", "nsAsr": False,
+            "buttonMultiTapMs": 0, "bleProxyEnabled": False, "eqLoudness": False}
 
 
 def test_no_sections_is_pure_fleet():
-    dev = {"owwThreshold": 0.9, "ledScene": "pride"}
+    dev = {"wakeModel": OTHER_MODEL, "ledScene": "pride"}
     out = cs.merge(_glob(), dev, [])
-    assert out["owwThreshold"] == 0.5
+    assert out["wakeModel"] == FLEET_MODEL
     assert out["ledScene"] == "standard"
 
 
 def test_only_the_overridden_section_wins():
-    dev = {"owwThreshold": 0.9, "ledScene": "pride", "nsAsr": True}
+    dev = {"wakeModel": OTHER_MODEL, "ledScene": "pride", "nsAsr": True}
     out = cs.merge(_glob(), dev, ["ring"])
     assert out["ledScene"] == "pride"       # overridden section
-    assert out["owwThreshold"] == 0.5       # fleet
+    assert out["wakeModel"] == FLEET_MODEL  # fleet
     assert out["nsAsr"] is False            # fleet
 
 
-def test_all_sections_reproduces_the_old_full_override():
-    dev = {"owwThreshold": 0.9, "ledScene": "pride", "nsAsr": True}
+def test_all_sections_reproduces_a_full_override():
+    dev = {"wakeModel": OTHER_MODEL, "ledScene": "pride", "nsAsr": True}
     out = cs.merge(_glob(), dev, list(cs.SECTION_IDS))
     for k, v in dev.items():
         assert out[k] == v
+
+
+def test_removed_keys_are_neither_config_nor_scoped():
+    """SPEC §18.4: a REMOVED/REPLACED key must not survive as a default or as
+    a section member, or the dashboard would keep offering a dead control."""
+    mapped = {k for s in cs.SECTIONS.values() for k in s["keys"]}
+    assert not (em_db.REMOVED_CONFIG_KEYS & set(em_db.DEFAULT_DEVICE_CONFIG))
+    assert not (em_db.REMOVED_CONFIG_KEYS & mapped)
 
 
 def test_state_keys_always_come_from_the_device():

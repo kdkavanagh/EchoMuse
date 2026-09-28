@@ -1,463 +1,237 @@
-package bcresnet
+package bcresnet_test
 
 import (
-	"errors"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/wilbowes/EchoMuse/internal/wakeword/bcresnet"
+	"github.com/wilbowes/EchoMuse/internal/wakeword/bcresnet/bcresnettest"
 )
 
-// A small spec with a 4-chunk window, so a test can fill it in four Pushes
-// rather than seventeen. The real model's 22400 is not a whole number of
-// chunks; nothing here may assume it is.
-func testSpec() Spec {
-	return Spec{
-		Type:        "bcresnet",
-		SampleRate:  16000,
-		Window:      4 * 1280,
-		Labels:      []string{"noise", "ohphelia", "unknown"},
-		WakeIndex:   1,
-		NMels:       40,
-		ClipSeconds: 0.32,
-		NormPeak:    0.8,
-	}
-}
+const deployedSidecarSHA = "25da0c652c562bf0a45a8f34bb46e38788bfc689e31401f33950831a0f2af51f"
 
-// loud returns a chunk well above the silence floor.
-func loud(n int) []int16 {
-	s := make([]int16, n)
-	for i := range s {
-		s[i] = int16(8000 * math.Sin(float64(i)/12))
-	}
-	return s
-}
-
-type fakeInf struct {
-	logits []float32
-	calls  int
-	last   []float32
-	err    error
-}
-
-func (f *fakeInf) Run(w []float32) ([]float32, error) {
-	f.calls++
-	f.last = append(f.last[:0], w...)
-	if f.err != nil {
-		return nil, f.err
-	}
-	return f.logits, nil
-}
-
-func newDet(t *testing.T, inf Inferer, o Options) *Detector {
+func deployedSidecarBytes(t *testing.T) []byte {
 	t.Helper()
-	d, err := New(inf, testSpec(), o)
+	raw, err := os.ReadFile(filepath.Join(bcresnettest.Dir(), "bcresnet_audio.json"))
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatal(err)
 	}
-	return d
+	sum := sha256.Sum256(raw)
+	if got := hex.EncodeToString(sum[:]); got != deployedSidecarSHA {
+		t.Fatalf("testdata sidecar sha256 %s is not the deployed sidecar", got)
+	}
+	return raw
 }
 
-// ── the hop ────────────────────────────────────────────────────────────────
+func fixture(t *testing.T) *bcresnettest.Fixture {
+	t.Helper()
+	f, err := bcresnettest.Load()
+	if err != nil {
+		t.Fatalf("fixture: %v (regenerate with testdata/gen_fixture.py)", err)
+	}
+	if f.SidecarSHA256 != deployedSidecarSHA {
+		t.Fatalf("fixture was generated from sidecar %s", f.SidecarSHA256)
+	}
+	return f
+}
 
-func TestNoScoreUntilTheWindowIsFull(t *testing.T) {
-	inf := &fakeInf{logits: []float32{0, 5, 0}}
-	d := newDet(t, inf, Options{})
+func TestDeployedSidecarParses(t *testing.T) {
+	sc, err := bcresnet.ParseSidecar(deployedSidecarBytes(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sc.WakeIndex != 1 || sc.Labels[sc.WakeIndex] != "ohphelia" || sc.NormPeak != 0.8 {
+		t.Fatalf("unexpected deployed sidecar %+v", sc)
+	}
+	if err := sc.CheckGraphIO(bcresnet.WindowSamples, 3); err != nil {
+		t.Fatalf("deployed IO rejected: %v", err)
+	}
+}
 
-	for i := 0; i < 3; i++ {
-		if _, ok, err := d.Push(loud(1280)); ok || err != nil {
-			t.Fatalf("chunk %d: ok=%v err=%v, want no score", i, ok, err)
+func TestSidecarRejections(t *testing.T) {
+	base := deployedSidecarBytes(t)
+	cases := map[string]func(m map[string]any){
+		"type":            func(m map[string]any) { m["type"] = "oww" },
+		"missing type":    func(m map[string]any) { delete(m, "type") },
+		"48 kHz":          func(m map[string]any) { m["sampleRate"] = 48000 },
+		"window":          func(m map[string]any) { m["window"] = 22401 },
+		"no labels":       func(m map[string]any) { m["labels"] = []string{} },
+		"wakeIndex high":  func(m map[string]any) { m["wakeIndex"] = 3 },
+		"wakeIndex neg":   func(m map[string]any) { m["wakeIndex"] = -1 },
+		"normPeak zero":   func(m map[string]any) { m["normPeak"] = 0 },
+		"normPeak over 1": func(m map[string]any) { m["normPeak"] = 1.5 },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			var m map[string]any
+			if err := json.Unmarshal(base, &m); err != nil {
+				t.Fatal(err)
+			}
+			mutate(m)
+			raw, _ := json.Marshal(m)
+			if _, err := bcresnet.ParseSidecar(raw); err == nil {
+				t.Fatalf("accepted %s", raw)
+			}
+		})
+	}
+	if _, err := bcresnet.ParseSidecar([]byte("{")); err == nil {
+		t.Fatal("accepted invalid JSON")
+	}
+}
+
+func TestGraphIOMustMatchSidecar(t *testing.T) {
+	sc, err := bcresnet.ParseSidecar(deployedSidecarBytes(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sc.CheckGraphIO(bcresnet.WindowSamples, 2); err == nil {
+		t.Error("accepted 2 outputs for 3 labels")
+	}
+	if err := sc.CheckGraphIO(16000, 3); err == nil {
+		t.Error("accepted a 16,000-sample input")
+	}
+	if err := sc.CheckGraphIO(-1, 3); err == nil {
+		t.Error("accepted a dynamic input length")
+	}
+}
+
+// TestPrepareMatchesDeployedFixture checks SPEC §5.1 preparation against the
+// Python reference on the fixture windows, including one below the RMS floor.
+func TestPrepareMatchesDeployedFixture(t *testing.T) {
+	f := fixture(t)
+	dst := make([]float32, bcresnet.WindowSamples)
+	for _, w := range f.Windows {
+		t.Run(w.Name, func(t *testing.T) {
+			got := bcresnet.Prepare(dst, w.PCM(), 0.8)
+			if got != w.Scored {
+				t.Fatalf("scored=%v, reference %v (rms %g)", got, w.Scored, w.RMS)
+			}
+			if !got {
+				return
+			}
+			for k, want := range w.Probe {
+				if v := dst[k*f.ProbeStride]; v != float32(want) {
+					t.Fatalf("sample %d = %v, reference %v", k*f.ProbeStride, v, want)
+				}
+			}
+			var sum, sumSq float64
+			for _, v := range dst {
+				sum += float64(v)
+				sumSq += float64(v) * float64(v)
+			}
+			if math.Abs(sum-w.Sum) > 1e-6*math.Max(1, math.Abs(w.Sum)) || math.Abs(sumSq-w.SumSq) > 1e-6*w.SumSq {
+				t.Fatalf("sum %v / %v, reference %v / %v", sum, sumSq, w.Sum, w.SumSq)
+			}
+		})
+	}
+}
+
+func TestPrepareRMSFloorBoundary(t *testing.T) {
+	dst := make([]float32, bcresnet.WindowSamples)
+	pcm := make([]int16, bcresnet.WindowSamples)
+	fill := func(mag int16) {
+		for i := range pcm {
+			pcm[i] = mag
+			if i%2 == 1 {
+				pcm[i] = -mag
+			}
 		}
 	}
-	if inf.calls != 0 {
-		t.Fatalf("inference ran %d times before the window was full", inf.calls)
+	fill(3) // RMS 9.2e-5
+	if bcresnet.Prepare(dst, pcm, 0.8) {
+		t.Error("scored a window with RMS below 1e-4")
 	}
-	if _, ok, err := d.Push(loud(1280)); !ok || err != nil {
-		t.Fatalf("fourth chunk: ok=%v err=%v, want a score", ok, err)
+	fill(4) // RMS 1.2e-4
+	if !bcresnet.Prepare(dst, pcm, 0.8) {
+		t.Fatal("did not score a window with RMS above 1e-4")
+	}
+	if math.Abs(float64(dst[0])-0.8) > 1e-6 || math.Abs(float64(dst[1])+0.8) > 1e-6 {
+		t.Errorf("not scaled to peak 0.8: %v %v", dst[0], dst[1])
 	}
 }
 
-func TestScoresOnceTheWindowExistsThenEveryHop(t *testing.T) {
-	// "Score as soon as there is something to score, then every hop" — the
-	// first full window must not wait a hop, or every turn pays 160ms it
-	// need not.
-	inf := &fakeInf{logits: []float32{0, 5, 0}}
-	d := newDet(t, inf, Options{HopChunks: 2})
+type fakeInferer struct {
+	logits []float32
+	err    error
+	calls  int
+}
 
-	var got []bool
-	for i := 0; i < 10; i++ {
-		_, ok, err := d.Push(loud(1280))
+func (f *fakeInferer) Run([]float32) ([]float32, error) { f.calls++; return f.logits, f.err }
+func (f *fakeInferer) Close() error                     { return nil }
+
+func deployedSidecar(t *testing.T) bcresnet.Sidecar {
+	sc, err := bcresnet.ParseSidecar(deployedSidecarBytes(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sc
+}
+
+func TestScorerProbabilityFromDeployedLogits(t *testing.T) {
+	f := fixture(t)
+	for _, w := range f.Windows {
+		inf := &fakeInferer{}
+		for _, l := range w.Logits {
+			inf.logits = append(inf.logits, float32(l))
+		}
+		s, err := bcresnet.NewScorer(inf, deployedSidecar(t))
 		if err != nil {
 			t.Fatal(err)
 		}
-		got = append(got, ok)
-	}
-	want := []bool{false, false, false, true, false, true, false, true, false, true}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("chunk %d: ok=%v want %v (all: %v)", i, got[i], want[i], got)
+		p, scored, err := s.Score(w.PCM())
+		if err != nil {
+			t.Fatalf("%s: %v", w.Name, err)
+		}
+		if scored != w.Scored {
+			t.Fatalf("%s: scored=%v, reference %v", w.Name, scored, w.Scored)
+		}
+		if !scored {
+			if inf.calls != 0 {
+				t.Errorf("%s: graph ran on a window below the RMS floor", w.Name)
+			}
+			continue
+		}
+		if math.Abs(p-w.Prob) > 1e-7 {
+			t.Errorf("%s: prob %v, reference %v", w.Name, p, w.Prob)
 		}
 	}
 }
 
-func TestHopOfOneScoresEveryChunk(t *testing.T) {
-	inf := &fakeInf{logits: []float32{0, 5, 0}}
-	d := newDet(t, inf, Options{HopChunks: 1})
-	for i := 0; i < 4; i++ {
-		d.Push(loud(1280))
+func TestScorerErrors(t *testing.T) {
+	pcm := make([]int16, bcresnet.WindowSamples)
+	for i := range pcm {
+		pcm[i] = int16(1000 * (i%3 - 1))
 	}
-	for i := 0; i < 4; i++ {
-		if _, ok, _ := d.Push(loud(1280)); !ok {
-			t.Fatalf("chunk %d produced no score at hop=1", i)
+	cases := map[string][]float32{
+		"nan":         {0, float32(math.NaN()), 0},
+		"inf":         {float32(math.Inf(1)), 0, 0},
+		"logit count": {0, 1},
+	}
+	for name, logits := range cases {
+		s, err := bcresnet.NewScorer(&fakeInferer{logits: logits}, deployedSidecar(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := s.Score(pcm); err == nil {
+			t.Errorf("%s: no error", name)
 		}
 	}
-}
-
-// ── not judged is not zero ─────────────────────────────────────────────────
-
-func TestSilenceIsNotJudgedRatherThanScoredZero(t *testing.T) {
-	// A muted device streams zero-filled frames. Scoring them would report a
-	// confident 0.0 for audio nobody looked at, and — worse — the peak
-	// normalisation would amplify a near-silent window by up to ~8000x.
-	inf := &fakeInf{logits: []float32{0, 5, 0}}
-	d := newDet(t, inf, Options{})
-	for i := 0; i < 6; i++ {
-		if _, ok, err := d.Push(make([]int16, 1280)); ok || err != nil {
-			t.Fatalf("silent chunk %d: ok=%v err=%v", i, ok, err)
-		}
-	}
-	if inf.calls != 0 {
-		t.Fatalf("ran inference on %d silent windows", inf.calls)
+	s, _ := bcresnet.NewScorer(&fakeInferer{logits: []float32{0, 0, 0}}, deployedSidecar(t))
+	if _, _, err := s.Score(pcm[:100]); err == nil || !strings.Contains(err.Error(), "window") {
+		t.Errorf("short window: %v", err)
 	}
 }
 
-func TestASilentGapDoesNotDiluteTheScoresEitherSideOfIt(t *testing.T) {
-	inf := &fakeInf{logits: []float32{0, 5, 0}}
-	d := newDet(t, inf, Options{HopChunks: 1, Smoothing: 3})
-	for i := 0; i < 4; i++ {
-		d.Push(loud(1280))
+func TestWakeProbabilityIsShiftInvariant(t *testing.T) {
+	a := bcresnet.WakeProbability([]float32{0.5, 2, -1}, 1)
+	b := bcresnet.WakeProbability([]float32{1000.5, 1002, 999}, 1)
+	if math.Abs(a-b) > 1e-12 || math.IsNaN(b) {
+		t.Fatalf("softmax not max-subtracted: %v vs %v", a, b)
 	}
-	var before float32
-	for i := 0; i < 3; i++ {
-		before, _, _ = d.Push(loud(1280))
-	}
-	// A stretch of silence: not scored, and the history must survive it.
-	for i := 0; i < 3; i++ {
-		d.Push(make([]int16, 1280))
-	}
-	after, ok, _ := d.Push(loud(1280))
-	if !ok {
-		t.Fatal("no score after the silent gap")
-	}
-	if math.Abs(float64(after-before)) > 1e-6 {
-		t.Fatalf("score moved across a silent gap: %v -> %v", before, after)
-	}
-}
-
-// ── the maths ──────────────────────────────────────────────────────────────
-
-func TestSoftmaxPicksTheWakeIndexNotTheFirstLogit(t *testing.T) {
-	// The first real model sorts to ["noise","ohphelia","unknown"] with the
-	// wake word at index 1. Reading index 0 scores "noise" and presents as a
-	// detector that never fires.
-	inf := &fakeInf{logits: []float32{5, 0, 0}} // "noise" is the loud one
-	d := newDet(t, inf, Options{HopChunks: 1, Smoothing: 1})
-	for i := 0; i < 4; i++ {
-		d.Push(loud(1280))
-	}
-	score, ok, _ := d.Push(loud(1280))
-	if !ok {
-		t.Fatal("no score")
-	}
-	// e^0 / (e^5 + 2*e^0) — small, because the wake class did NOT win.
-	want := float32(1.0 / (math.Exp(5) + 2))
-	if math.Abs(float64(score-want)) > 1e-5 {
-		t.Fatalf("score %v, want %v — is it reading logit 0?", score, want)
-	}
-}
-
-func TestSoftmaxIsMaxSubtractedSoALargeLogitCannotOverflow(t *testing.T) {
-	inf := &fakeInf{logits: []float32{0, 800, 0}}
-	d := newDet(t, inf, Options{HopChunks: 1, Smoothing: 1})
-	for i := 0; i < 4; i++ {
-		d.Push(loud(1280))
-	}
-	score, ok, _ := d.Push(loud(1280))
-	if !ok || math.IsNaN(float64(score)) || math.IsInf(float64(score), 0) {
-		t.Fatalf("score=%v ok=%v — exp(800) overflowed", score, ok)
-	}
-	if score < 0.999 {
-		t.Fatalf("score %v, want ~1.0", score)
-	}
-}
-
-func TestTheWindowIsPeakNormalisedToTheSpecsLevel(t *testing.T) {
-	inf := &fakeInf{logits: []float32{0, 5, 0}}
-	d := newDet(t, inf, Options{HopChunks: 1})
-	for i := 0; i < 4; i++ {
-		d.Push(loud(1280))
-	}
-	d.Push(loud(1280))
-	if inf.calls == 0 {
-		t.Fatal("inference never ran")
-	}
-	var peak float32
-	for _, v := range inf.last {
-		if a := float32(math.Abs(float64(v))); a > peak {
-			peak = a
-		}
-	}
-	if math.Abs(float64(peak-0.8)) > 1e-5 {
-		t.Fatalf("window peak %v, want the spec's normPeak 0.8", peak)
-	}
-}
-
-func TestSmoothingAveragesTheLastNWindows(t *testing.T) {
-	inf := &fakeInf{logits: []float32{0, 5, 0}}
-	d := newDet(t, inf, Options{HopChunks: 1, Smoothing: 3})
-	for i := 0; i < 4; i++ {
-		d.Push(loud(1280))
-	}
-	one, _, _ := d.Push(loud(1280)) // history: [p]
-	// Now make the model answer 0 for the wake class twice.
-	inf.logits = []float32{5, 0, 0}
-	d.Push(loud(1280))
-	third, _, _ := d.Push(loud(1280))
-	// The mean of one high and two low scores must sit between them.
-	if !(third < one) {
-		t.Fatalf("smoothed score %v did not fall below the earlier %v", third, one)
-	}
-	if third <= 0 {
-		t.Fatalf("smoothed score %v discarded the earlier high window", third)
-	}
-}
-
-// ── the ring ───────────────────────────────────────────────────────────────
-
-func TestTheWindowKeepsTheNEWESTAudio(t *testing.T) {
-	inf := &fakeInf{logits: []float32{0, 5, 0}}
-	d := newDet(t, inf, Options{HopChunks: 1})
-	for i := 0; i < 4; i++ {
-		d.Push(loud(1280))
-	}
-	// A chunk of a distinctive constant level; it must appear at the END.
-	mark := make([]int16, 1280)
-	for i := range mark {
-		mark[i] = 4000
-	}
-	d.Push(mark)
-	tail := inf.last[len(inf.last)-1280:]
-	for i, v := range tail {
-		if v <= 0 {
-			t.Fatalf("tail sample %d is %v — the newest chunk is not at the end", i, v)
-		}
-	}
-}
-
-func TestAChunkLongerThanTheWindowKeepsOnlyItsTail(t *testing.T) {
-	inf := &fakeInf{logits: []float32{0, 5, 0}}
-	d := newDet(t, inf, Options{HopChunks: 1})
-	big := loud(4*1280 + 500)
-	if _, _, err := d.Push(big); err != nil {
-		t.Fatal(err)
-	}
-	if !d.Ready() {
-		t.Fatal("an oversized chunk did not fill the window")
-	}
-}
-
-func TestPartialChunksAccumulateIntoAWindow(t *testing.T) {
-	// The mic delivers 80ms chunks, but nothing in this package may depend on
-	// that: the real window (22400) is 17.5 chunks, so a whole-chunk
-	// assumption cannot be made anywhere.
-	inf := &fakeInf{logits: []float32{0, 5, 0}}
-	d := newDet(t, inf, Options{HopChunks: 1})
-	for i := 0; i < 8; i++ {
-		d.Push(loud(640))
-	}
-	if !d.Ready() {
-		t.Fatal("8 half-chunks did not fill a 4-chunk window")
-	}
-}
-
-func TestAnEmptyPushIsANoOp(t *testing.T) {
-	inf := &fakeInf{logits: []float32{0, 5, 0}}
-	d := newDet(t, inf, Options{HopChunks: 1})
-	for i := 0; i < 4; i++ {
-		d.Push(loud(1280))
-	}
-	if _, ok, err := d.Push(nil); ok || err != nil {
-		t.Fatalf("empty push: ok=%v err=%v", ok, err)
-	}
-}
-
-// ── reset is the refractory ────────────────────────────────────────────────
-
-func TestResetCostsAWholeWindowBeforeTheNextScore(t *testing.T) {
-	// This is the refractory period, obtained by mapping Reset faithfully
-	// rather than by a second mechanism that could disagree with it.
-	inf := &fakeInf{logits: []float32{0, 5, 0}}
-	d := newDet(t, inf, Options{HopChunks: 1})
-	for i := 0; i < 4; i++ {
-		d.Push(loud(1280))
-	}
-	if !d.Ready() {
-		t.Fatal("not ready before reset")
-	}
-	d.Reset()
-	if d.Ready() {
-		t.Fatal("Ready() true immediately after Reset")
-	}
-	for i := 0; i < 3; i++ {
-		if _, ok, _ := d.Push(loud(1280)); ok {
-			t.Fatalf("scored %d chunks after a reset, want a full window first", i+1)
-		}
-	}
-	if _, ok, _ := d.Push(loud(1280)); !ok {
-		t.Fatal("no score once the window was refilled")
-	}
-}
-
-// ── failures name themselves ───────────────────────────────────────────────
-
-func TestALogitCountMismatchIsReportedNotIndexed(t *testing.T) {
-	// A model and sidecar that disagree is the likely outcome of installing
-	// one and not the other. Reading past the end of the logits would panic
-	// on the audio path; a short read would silently score the wrong class.
-	inf := &fakeInf{logits: []float32{0, 5}} // two logits, three labels
-	d := newDet(t, inf, Options{HopChunks: 1})
-	for i := 0; i < 4; i++ {
-		d.Push(loud(1280))
-	}
-	_, ok, err := d.Push(loud(1280))
-	if ok || err == nil {
-		t.Fatalf("ok=%v err=%v, want a mismatch error", ok, err)
-	}
-	for _, want := range []string{"2 logits", "3 labels"} {
-		if !contains(err.Error(), want) {
-			t.Fatalf("error %q does not mention %q", err, want)
-		}
-	}
-}
-
-func TestAnInferenceErrorIsWrappedNotSwallowed(t *testing.T) {
-	boom := errors.New("session gone")
-	inf := &fakeInf{logits: []float32{0, 5, 0}, err: boom}
-	d := newDet(t, inf, Options{HopChunks: 1})
-	for i := 0; i < 4; i++ {
-		d.Push(loud(1280))
-	}
-	_, ok, err := d.Push(loud(1280))
-	if ok || !errors.Is(err, boom) {
-		t.Fatalf("ok=%v err=%v, want the inference error", ok, err)
-	}
-}
-
-func TestANilInfererIsRefused(t *testing.T) {
-	if _, err := New(nil, testSpec(), Options{}); err == nil {
-		t.Fatal("New accepted a nil Inferer")
-	}
-}
-
-// ── the sidecar ────────────────────────────────────────────────────────────
-
-func TestSpecValidateRejectsAWakeIndexPastTheLabels(t *testing.T) {
-	s := testSpec()
-	s.WakeIndex = 3
-	err := s.Validate()
-	if err == nil {
-		t.Fatal("accepted wakeIndex 3 for 3 labels")
-	}
-	if !contains(err.Error(), "wakeIndex") {
-		t.Fatalf("error %q does not name the field", err)
-	}
-}
-
-func TestSpecValidateRejectsTheEmptyAndTheImpossible(t *testing.T) {
-	for name, mutate := range map[string]func(*Spec){
-		"no window":     func(s *Spec) { s.Window = 0 },
-		"no rate":       func(s *Spec) { s.SampleRate = 0 },
-		"no labels":     func(s *Spec) { s.Labels = nil },
-		"negative wake": func(s *Spec) { s.WakeIndex = -1 },
-		"no normPeak":   func(s *Spec) { s.NormPeak = 0 },
-		"loud normPeak": func(s *Spec) { s.NormPeak = 1.5 },
-		"wrong type":    func(s *Spec) { s.Type = "oww" },
-	} {
-		s := testSpec()
-		mutate(&s)
-		if err := s.Validate(); err == nil {
-			t.Fatalf("%s: Validate accepted it", name)
-		}
-	}
-}
-
-func TestSpecTypeMayBeAbsent(t *testing.T) {
-	// The field is a courtesy for a human reading the file; the sidecar's
-	// EXISTENCE is what marks a model as BC-ResNet, at both ends.
-	s := testSpec()
-	s.Type = ""
-	if err := s.Validate(); err != nil {
-		t.Fatalf("Validate rejected a sidecar with no type: %v", err)
-	}
-}
-
-func TestLoadSpecReadsTheRealSidecarShape(t *testing.T) {
-	dir := t.TempDir()
-	p := filepath.Join(dir, "ophelia.json")
-	// Byte-for-byte the shape the exporter writes.
-	os.WriteFile(p, []byte(`{
-  "type": "bcresnet",
-  "sampleRate": 16000,
-  "window": 22400,
-  "labels": ["noise", "ohphelia", "unknown"],
-  "wakeIndex": 1,
-  "nMels": 40,
-  "clipSeconds": 1.4,
-  "normPeak": 0.8
-}`), 0o644)
-
-	s, err := LoadSpec(p)
-	if err != nil {
-		t.Fatalf("LoadSpec: %v", err)
-	}
-	if s.Window != 22400 || s.WakeIndex != 1 || s.WakeLabel() != "ohphelia" {
-		t.Fatalf("parsed %+v", s)
-	}
-	if s.NormPeak != 0.8 {
-		t.Fatalf("normPeak %v", s.NormPeak)
-	}
-}
-
-func TestLoadSpecNamesTheFileItCouldNotRead(t *testing.T) {
-	dir := t.TempDir()
-	p := filepath.Join(dir, "broken.json")
-	os.WriteFile(p, []byte(`{"window": `), 0o644)
-	_, err := LoadSpec(p)
-	if err == nil {
-		t.Fatal("accepted truncated JSON")
-	}
-	if !contains(err.Error(), "broken.json") {
-		t.Fatalf("error %q does not name the file", err)
-	}
-}
-
-func TestWakeLabelIsEmptyRatherThanPanickingOnABadIndex(t *testing.T) {
-	s := testSpec()
-	s.WakeIndex = 99
-	if got := s.WakeLabel(); got != "" {
-		t.Fatalf("WakeLabel() = %q", got)
-	}
-}
-
-func contains(s, sub string) bool {
-	return len(sub) == 0 || (len(s) >= len(sub) && indexOf(s, sub) >= 0)
-}
-
-func indexOf(s, sub string) int {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
-	}
-	return -1
 }

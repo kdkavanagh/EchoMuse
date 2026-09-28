@@ -2,45 +2,40 @@
 em_samples.py — continuous capture, cut into clips, for wake-word training
 ===========================================================================
 
-Training a custom wake word (`oww_forge/`) on synthetic TTS positives gets a
-model that works in the room the recordings were never made in. What it
-cannot supply is *this* speaker at *this* distance through *this* mic array,
-which is exactly the material that fixes a model that near-misses at 0.4 all
-evening. Collecting that used to mean sitting in front of a laptop with
-`arecord`, which records the wrong microphone.
+A BCResNet wake model (trained outside this repository, in `~/git/bcresnet`)
+is only as good as its real positives and negatives: *this* speaker at
+*this* distance through *this* mic array and front end. Recording that with
+a laptop and `arecord` records the wrong microphone.
 
-Sample collection mode records from the Echo instead. It needs nothing new
-from the device: the always-on wake stream is already continuous, ungated and
-AGC-free (see the mic pipeline notes in CLAUDE.md), so every 80ms frame of it
-already arrives at the controller whether anyone said anything or not. The
-whole feature is therefore what this module does with those frames — chop
-them into clips at the silences and write each clip to disk — plus a mode
-flag that stops the same frames from starting a voice turn.
+Sample collection mode records from the Echo instead. While it is armed the
+device's session actor holds a `diagnostic` uplink lease, so the Dot streams
+its live mic timeline — the native AFE's output, continuous and ungated —
+whether anyone said anything or not, and the actor accepts no wake. The
+feature is what this module does with those blocks — chop them into clips at
+the silences and write each clip to disk.
 
-**The audio is exactly what the wake model scores**, byte for byte, because
-it is tapped at the same point in `wake_word_listener`. That is the property
-that makes the clips worth training on: a sample captured through a different
-gain, denoiser or resampler teaches the model about a path the model will
-never see in service.
+**The audio is what the on-device wake detector scores**, sample for sample:
+the lease reads the same capture ring the detector consumes, and nothing on
+the controller applies gain, denoising or resampling before the tap. That is
+the property that makes the clips worth training on: a sample captured
+through a different path teaches the model about audio it never sees in
+service.
 
-Segmentation is energy-relative, for the reason `em_endpoint` is: an absolute
-RMS threshold is a room's property, not a setting, and one that works in a
-quiet study is deaf in a kitchen. The difference is which end it is measured
-from. The endpointer measures DOWN from a tracked maximum, because it already
-knows the speaker is talking and is asking when they stop. Here there is no
-wake word to anchor on and the question is the opposite one — *did anything
-louder than this room just happen* — so the threshold is measured UP from a
-tracked noise floor.
+Segmentation is energy-relative: an absolute RMS threshold is a room's
+property, not a setting, and one that works in a quiet study is deaf in a
+kitchen. There is no wake word to anchor on and the question is *did
+anything louder than this room just happen*, so the threshold is measured UP
+from a tracked noise floor.
 
 Both halves of that need bounding:
 
   - The floor is FROZEN while a clip is open. Otherwise a few seconds of
     speech drags it up and the clip closes on the speaker's own level.
-  - The floor is CLAMPED at `ABS_FLOOR_DB` for thresholding. A muted device
-    sends zero-filled frames (hardware mute still produces frames), and a
-    floor tracking true digital silence would put the open threshold at
-    -168dB, where thermal noise in the ADC is a shout. The tracker keeps its
-    real value; only the comparison is clamped.
+  - The floor is CLAMPED at `ABS_FLOOR_DB` for thresholding. Stretches of
+    digital silence (all-zero samples) do occur, and a floor tracking them
+    would put the open threshold at -168dB, where thermal noise in the ADC
+    is a shout. The tracker keeps its real value; only the comparison is
+    clamped.
 
 Pure logic and filesystem work — no numpy, no aiohttp, no db import, and the
 caller passes the frame RMS it has already computed. Storage mirrors
@@ -66,19 +61,18 @@ log = logging.getLogger("echomuse.samples")
 
 SAMPLES_SUBDIR = "samples"
 
-# Wire format of the wake stream (em_controller.CHUNK_BYTES is 80ms of it).
+# Wire format of the mic stream (EMA1 kind 1: 16 kHz mono PCM16).
 SAMPLE_RATE  = 16000
 SAMPLE_WIDTH = 2
 CHANNELS     = 1
 
 # How many clips to keep per device before the oldest are dropped. Sized for
-# a training set rather than a diagnostic: openWakeWord's own docs suggest a
-# few hundred real positives is where a custom model starts behaving, and a
-# 1s clip is ~32kB, so the whole cap is ~64MB per device.
+# a training set rather than a diagnostic: a 1s clip is ~32kB, so the whole
+# cap is ~64MB per device.
 KEEP_PER_DEVICE = 2000
 
 # dBFS reported for a digitally silent frame. Silence must read as a number,
-# never -inf — the same reason em_endpoint.DB_FLOOR exists.
+# never -inf.
 DB_FLOOR = -100.0
 
 # Lowest noise floor used for thresholding, whatever the tracker believes.
@@ -113,7 +107,7 @@ class SegmentConfig:
     # Below-threshold audio that ends a clip, and how much of it is kept.
     # Shorter than a turn endpointer's silence window on purpose: this is
     # cutting single words apart, not deciding when a sentence finished, and
-    # a long window welds "hey jarvis / what's the weather" into one clip.
+    # a long window welds "ophelia / what's the weather" into one clip.
     silence_ms: int = 400
     tail_ms:    int = 240
 

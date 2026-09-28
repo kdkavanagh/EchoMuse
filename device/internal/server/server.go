@@ -1,288 +1,184 @@
+// Package server owns the Dot's physical controls: layered LED ring, ADC
+// privacy mute, codec DAC volume, speaker amp and headphone routing. Audio
+// epochs, mixer, focus, wake and alerts belong to internal/supervisor.
 package server
 
 import (
 	"log"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	internalLed "github.com/wilbowes/EchoMuse/internal/bindings/led"
-	"github.com/wilbowes/EchoMuse/pkg/buttons"
+	internalled "github.com/wilbowes/EchoMuse/internal/bindings/led"
 	"github.com/wilbowes/EchoMuse/pkg/led"
-	"github.com/wilbowes/EchoMuse/pkg/mic"
-	"github.com/wilbowes/EchoMuse/pkg/speaker"
 	"golang.org/x/sys/unix"
 )
 
+const defaultStatePath = "/data/local/etc/echomuse/state.json"
+
+// Config wires the physical server. Nil Hardware selects Dot tinymix/GPIO;
+// an empty StatePath selects the persistent device path.
+type Config struct {
+	Hardware  Hardware
+	StatePath string
+}
+
+// Server is safe for concurrent use.
 type Server struct {
-	ledController    led.Controller
-	ledMu            sync.Mutex
-	buttonController buttons.Controller
-	mic              mic.Microphone
-	speaker          speaker.Speaker
-	volume           *volumeController
-	mute             *muteController
+	hw Hardware
 
-	// baseLEDs stores the controller-set ring state so the ring can be
-	// repainted after a volume arc or a mute ring has had it.
-	baseLEDs   [12]led.Led
-	baseLEDsMu sync.Mutex
+	ring   *ring
+	volume *volumeController
+	mute   *muteController
 
-	// anim owns the device-rendered ring animation (led_anim messages).
-	anim animator
-
-	// audioLevel holds the live speaker RMS as float64 bits — written by
-	// the speaker's ALSA pump via SetAudioLevel, read by the meter anim.
-	audioLevel atomic.Uint64
-
-	// volumeSeeded is true once the device has an authoritative volume this
-	// run: seeded from the controller's stored startupVolume on the first
-	// config push (SeedVolume), or set by any button press / volume_set
-	// before that. While false, the device must not report volume_state —
-	// the controller persists every report into startupVolume, and a boot-
-	// default report would clobber the saved value (the reboot-reset bug).
-	volumeSeeded atomic.Bool
+	mu             sync.Mutex
+	headphones     bool
+	alertAmpForced bool
 }
 
-func NewServer(buttonController buttons.Controller, microphone mic.Microphone, speaker speaker.Speaker) *Server {
-	server := &Server{
-		buttonController: buttonController,
-		mic:              microphone,
-		speaker:          speaker,
+// New builds the physical server and restores persisted privacy state. LED
+// hardware is attached later by InitLEDs after the native boot sequence.
+func New(cfg Config) *Server {
+	hw := cfg.Hardware
+	if hw == nil {
+		hw = systemHardware{}
 	}
-
-	// Volume controller uses a getter so it handles the nil-during-boot window safely
-	server.volume = newVolumeController(func() led.Controller {
-		server.ledMu.Lock()
-		defer server.ledMu.Unlock()
-		return server.ledController
-	})
-
-	// Mute controller — same LED getter pattern
-	server.mute = newMuteController(func() led.Controller {
-		server.ledMu.Lock()
-		defer server.ledMu.Unlock()
-		return server.ledController
-	}, nil)
-
-	// Give volume controller access to mute state so it can restore the red ring
-	server.volume.isMuted = func() bool {
-		return server.mute.IsMuted()
+	path := cfg.StatePath
+	if path == "" {
+		path = defaultStatePath
 	}
+	r := newRing()
+	s := &Server{hw: hw, ring: r}
+	s.volume = newVolumeController(hw, r)
+	s.mute = newMuteController(hw, r, path)
+	return s
+}
 
-	// When the volume arc's display window ends, hand the ring back to the
-	// last controller-set state (listening/thinking/playing mid-turn, all
-	// off when idle). SetLEDs keeps recording frames into baseLEDs during
-	// the window — it just doesn't paint them — so this repaint lands on
-	// the current animation frame, not a stale one.
-	server.volume.onDisplayExpire = func() {
-		server.paintBaseLEDs()
+// InitLEDs waits for the native LED boot sequence, claims the I2C ring, and
+// paints the currently sovereign local state.
+func (s *Server) InitLEDs() error {
+	if uptime, err := getUptime(); err == nil && uptime < 5*time.Second {
+		time.Sleep(5*time.Second - uptime)
 	}
-
-	// Restore persisted mute state before the persist hook is wired, so the
-	// restore itself doesn't rewrite the file. Mute is device-sovereign —
-	// it must come back with or without a controller.
-	if st, ok := loadDeviceState(statePath); ok && st.Muted {
-		server.mute.RestoreMuted() // ADC only; LEDs painted after init below
-	}
-	server.mute.persist = func() {
-		saveDeviceState(statePath, deviceState{Muted: server.mute.IsMuted()})
-	}
-
-	go func() {
-		uptime, err := getUptime()
-		// Reduced from 90 seconds as server is started at the end of the boot cycle anyway.
-		minUptime := time.Second * 5
-
-		if err != nil || uptime < minUptime {
-			// If we start too soon the native bootup from the echo will break (LEDs will spin forever)
-			stillWait := minUptime - uptime
-			log.Printf("Uptime is currently at %0.2fs, waiting %0.2fs for LED setup\n", uptime.Seconds(), stillWait.Seconds())
-			time.Sleep(stillWait)
-		}
-
-		ledController, err := internalLed.NewDefaultController()
-		if err != nil {
-			log.Fatalf("Failed to initialize LED controller: %v", err)
-		}
-
-		server.ledMu.Lock()
-		server.ledController = ledController
-		server.ledMu.Unlock()
-		clearLeds(ledController)
-
-		// Discrete red LED under the mic-off button (GPIO, separate from
-		// the ring) — export + off. Non-fatal: an unmuted boot without a
-		// button LED is cosmetic, everything else still works.
-		if err := internalLed.InitMuteButtonLED(); err != nil {
-			log.Printf("Mute button LED init failed: %v", err)
-		}
-
-		// A muted state restored from state.json was applied to the ADC
-		// before the LED hardware was ready — paint the red ring and
-		// button LED now.
-		if server.mute.IsMuted() {
-			server.mute.showMuteLEDs()
-			setMuteButtonLED(true)
-		}
-	}()
-
-	return server
-}
-
-// VolumeStepUp increases volume one step — called by button handler.
-// A button press makes the device's level authoritative (see volumeSeeded):
-// its change report updates the controller's stored value, and a config
-// push arriving later this run must not override it.
-func (s *Server) VolumeStepUp() {
-	s.volumeSeeded.Store(true)
-	s.volume.StepUp()
-}
-
-// VolumeStepDown decreases volume one step — called by button handler.
-func (s *Server) VolumeStepDown() {
-	s.volumeSeeded.Store(true)
-	s.volume.StepDown()
-}
-
-// SetVolume sets volume to an explicit level (0–volumeMax) — called by controller
-// command. Remote changes don't paint the volume arc: nobody is at the
-// device, and the ring lighting up unprompted reads as a glitch.
-func (s *Server) SetVolume(level int) {
-	s.volumeSeeded.Store(true)
-	s.volume.Set(level, false)
-}
-
-// SeedVolume restores the controller's stored startupVolume — the source of
-// truth for volume, kept current by the volume_state echo — on the first
-// config push of each run. Applying it on *every* push would race a live
-// volume change against a stale config snapshot, and going through Set()
-// (rather than the raw tinymix write this replaced) keeps the recorded
-// level, HA entity, and hardware in agreement.
-func (s *Server) SeedVolume(level int) {
-	if s.volumeSeeded.Swap(true) {
-		return
-	}
-	log.Printf("Seeding volume from controller startupVolume=%d", level)
-	s.volume.Set(level, false)
-}
-
-// VolumeSeeded reports whether the device has an authoritative volume this
-// run. Until it does, the connect-time volume_state report is suppressed —
-// see the volumeSeeded field comment.
-func (s *Server) VolumeSeeded() bool {
-	return s.volumeSeeded.Load()
-}
-
-// VolumeLevel returns the current volume level (0–volumeMax).
-func (s *Server) VolumeLevel() int {
-	return s.volume.Get()
-}
-
-// SetVolumeChangeCallback wires a callback invoked when volume changes.
-// The callback receives the new level (0–volumeMax).
-func (s *Server) SetVolumeChangeCallback(cb func(level int)) {
-	s.volume.SetOnVolumeChange(cb)
-}
-
-// MuteToggle toggles mic mute state — called by button handler.
-func (s *Server) MuteToggle() {
-	s.mute.Toggle()
-}
-
-// SetMuteChangeCallback wires a callback invoked when mute state changes.
-func (s *Server) SetMuteChangeCallback(cb func(muted bool)) {
-	s.mute.SetOnMuteChange(cb)
-}
-
-// IsMuted returns true when the mic is muted — used to block dot button.
-func (s *Server) IsMuted() bool {
-	return s.mute.IsMuted()
-}
-
-// CancelVolumeDisplay releases the volume arc's 2s hold on the ring so a
-// turn's listening frame can paint immediately. See volumeController.
-func (s *Server) CancelVolumeDisplay() {
-	s.volume.CancelDisplay()
-}
-
-// RestoreMuteRing re-applies the red mute ring. Called on reconnect to
-// recover the visual state that the orange pulse animation overwrote.
-func (s *Server) RestoreMuteRing() {
-	s.mute.showMuteLEDs()
-}
-
-func clearLeds(ledController led.Controller) {
-	numLEDs, err := ledController.GetNumLEDs()
+	c, err := internalled.NewDefaultController()
 	if err != nil {
-		log.Printf("clearLeds: failed to get LED count: %v", err)
-		return
+		return err
 	}
+	if err := internalled.InitMuteButtonLED(); err != nil {
+		log.Printf("[ring] mute button LED init: %v", err)
+	}
+	s.ring.SetController(c)
+	if s.mute.isMuted() {
+		_ = s.hw.SetMuteLED(true)
+	}
+	return nil
+}
 
-	leds := make([]led.Led, numLEDs)
-	for i := 0; i < numLEDs; i++ {
-		leds[i] = led.Led{
-			ID: i,
-			R:  0,
-			G:  0,
-			B:  0,
-		}
-	}
-	if err = ledController.SetLEDs(leds...); err != nil {
-		log.Printf("clearLeds: failed to set LEDs: %v", err)
+// SetLEDs applies a retained controller frame. Local privacy/alert/link/volume
+// layers may hide it but retain it for hand-back.
+func (s *Server) SetLEDs(values []led.Led) { s.ring.setPartial(values) }
+
+// StartAnim starts the retained controller animation.
+func (s *Server) StartAnim(spec AnimSpec) { s.ring.animate(LayerController, spec) }
+
+// ClearControllerLEDs ends controller-owned dialog indication. Local layers
+// (privacy, alert, disconnected/pending) remain (§11.2).
+func (s *Server) ClearControllerLEDs() { s.ring.clear(LayerController) }
+
+// LinkState is the device-local link indication.
+type LinkState uint8
+
+const (
+	LinkUp      LinkState = iota // session established: no link layer
+	LinkDown                     // disconnected: orange pulse
+	LinkPending                  // pending approval: slow white pulse
+)
+
+// SetLinkState paints or clears the device-local link layer.
+func (s *Server) SetLinkState(state LinkState) {
+	switch state {
+	case LinkPending:
+		s.ring.animate(LayerLink, AnimSpec{Pattern: "pulse", Colors: [][3]uint8{{80, 80, 80}}, PeriodMs: 2800})
+	case LinkDown:
+		s.ring.animate(LayerLink, AnimSpec{Pattern: "pulse", Colors: [][3]uint8{{200, 50, 0}}, PeriodMs: 2000})
+	default:
+		s.ring.clear(LayerLink)
 	}
 }
+
+// SetAlertIndication projects the locally executing occurrence. Foreground
+// pulses cyan; background/pending stays dim cyan. It survives link loss.
+func (s *Server) SetAlertIndication(active, foreground bool) {
+	switch {
+	case !active:
+		s.ring.clear(LayerAlert)
+	case foreground:
+		s.ring.animate(LayerAlert, AnimSpec{Pattern: "pulse", Colors: [][3]uint8{{0, 140, 220}}, PeriodMs: 900})
+	default:
+		s.ring.animate(LayerAlert, AnimSpec{Pattern: "solid", Colors: [][3]uint8{{0, 24, 38}}})
+	}
+}
+
+// SetAudioLevel drives controller meter animations from the final digital mix.
+func (s *Server) SetAudioLevel(rms float64) { s.ring.setAudioLevel(rms) }
+
+func (s *Server) VolumeStepUp()                        { s.volume.step(volumeStep) }
+func (s *Server) VolumeStepDown()                      { s.volume.step(-volumeStep) }
+func (s *Server) SetVolume(level int)                  { s.volume.setMedia(level, false) }
+func (s *Server) SeedVolume(level int)                 { s.volume.seed(level) }
+func (s *Server) CancelVolumeDisplay()                 { s.ring.cancelVolume() }
+func (s *Server) VolumeState() (int, bool)             { return s.volume.state() }
+func (s *Server) SetVolumeChangeCallback(cb func(int)) { s.volume.setCallback(cb) }
+
+func (s *Server) MuteToggle()                         { s.mute.toggle() }
+func (s *Server) IsMuted() bool                       { return s.mute.isMuted() }
+func (s *Server) SetMuteChangeCallback(cb func(bool)) { s.mute.setCallback(cb) }
+
+// SetAlertAudio applies the occurrence DAC override and alert speaker route.
+// A foreground alert forces the internal amp on even with headphones inserted
+// and restores the insertion-driven amp state on release (§16.5).
+func (s *Server) SetAlertAudio(active bool, id string, foreground bool, volume *float64) {
+	s.volume.setAlert(active, id, foreground, volume)
+	s.SetAlertIndication(active, foreground)
+
+	s.mu.Lock()
+	wantForce := active && foreground && s.headphones
+	switch {
+	case wantForce && !s.alertAmpForced:
+		if err := s.hw.SetSpeakerAmp(true); err != nil {
+			log.Printf("[speaker] force amp for alert: %v", err)
+		}
+		s.alertAmpForced = true
+	case !wantForce && s.alertAmpForced:
+		if err := s.hw.SetSpeakerAmp(!s.headphones); err != nil {
+			log.Printf("[speaker] restore amp after alert: %v", err)
+		}
+		s.alertAmpForced = false
+	}
+	s.mu.Unlock()
+}
+
+// SetHeadphones records the accessory switch and routes the internal amp
+// accordingly: off while a headphone is inserted (the kernel does not
+// restore it on removal), except while a foreground alert forces it on.
+func (s *Server) SetHeadphones(inserted bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.headphones = inserted
+	if s.alertAmpForced {
+		return
+	}
+	if err := s.hw.SetSpeakerAmp(!inserted); err != nil {
+		log.Printf("[speaker] amp for headphones=%v: %v", inserted, err)
+	}
+}
+
+// Close disables the amp after mixer shutdown.
+func (s *Server) Close() error { return s.hw.SetSpeakerAmp(false) }
 
 func getUptime() (time.Duration, error) {
 	var info unix.Sysinfo_t
 	if err := unix.Sysinfo(&info); err != nil {
-		return time.Duration(0), err
+		return 0, err
 	}
 	return time.Second * time.Duration(info.Uptime), nil
-}
-
-// SetLEDs applies LED state directly — called by the controller client.
-//
-// Two conditions suppress the hardware paint (state is still recorded in
-// baseLEDs so the ring can be restored later):
-//   - volume display window: the turn animations repaint continuously, so
-//     without this the volume arc survives ~one frame and reads as a
-//     glitch. The window's expiry repaints baseLEDs (see onDisplayExpire).
-//   - muted: the red ring is device-sovereign. Turns could not previously
-//     overlap mute (mic stopped), but mute-terminates-turn (2026-07-10)
-//     means the cancelled turn's LED cleanup arrives after the red ring
-//     is up — it must not clear it. Unmute clears the ring explicitly.
-func (s *Server) SetLEDs(leds []led.Led) {
-	s.baseLEDsMu.Lock()
-	for _, l := range leds {
-		if l.ID >= 0 && l.ID < 12 {
-			s.baseLEDs[l.ID] = l
-		}
-	}
-	s.baseLEDsMu.Unlock()
-	if s.volume.DisplayActive() || s.mute.IsMuted() {
-		return
-	}
-	s.paintBaseLEDs()
-}
-
-// paintBaseLEDs paints the ring from the stored controller state.
-func (s *Server) paintBaseLEDs() {
-	s.ledMu.Lock()
-	lc := s.ledController
-	s.ledMu.Unlock()
-	if lc == nil {
-		return
-	}
-	s.baseLEDsMu.Lock()
-	base := s.baseLEDs
-	s.baseLEDsMu.Unlock()
-	leds := make([]led.Led, len(base))
-	for i := range base {
-		leds[i] = base[i]
-		leds[i].ID = i
-	}
-	if err := lc.SetLEDs(leds...); err != nil {
-		log.Printf("SetLEDs error: %v", err)
-	}
 }

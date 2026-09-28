@@ -1,36 +1,18 @@
 /*
- * shim.h — the C half of the ONNX Runtime binding.
+ * shim.h — C half of the ONNX Runtime binding.
  *
- * Two reasons this file exists rather than calling ORT from Go directly:
+ * ORT's C API is a table of function pointers, which cgo cannot call, so each
+ * call has a wrapper here. The library is dlopen'd from a hash-named speech
+ * asset (SPEC §16.5), never linked.
  *
- *  1. ORT's C API is a struct of function pointers (OrtApi), and cgo cannot
- *     call a function pointer held in a C struct. Every call therefore needs a
- *     C-side wrapper, which is what most of this file is.
- *
- *  2. The library is dlopen'd at runtime, not linked. Nothing in the build
- *     references an ORT symbol, so the firmware links and boots on a device
- *     where libonnxruntime.so was never installed — em_ort_open simply fails
- *     and the caller falls back to controller-side wake word. Linking it
- *     properly would make a missing 12MB .so a boot failure, which on a device
- *     whose recovery story is "count fast exits and flip the A/B slot" is a
- *     bad trade.
- *
- * There is deliberately NO file-scope state here. An earlier version kept the
- * handle, the OrtApi and the OrtEnv in statics, which made a second Open with
- * a different path report a bookkeeping error ("already open") in place of the
- * real one — and made the missing-library path, the whole point of the dlopen
- * design, untestable once any library had loaded. Each em_runtime now owns its
- * handle, api and env, and every model carries the api pointer it was created
- * with.
- *
- * Error convention: every function returns char* — NULL on success, or a
- * malloc'd message the Go side turns into an error and frees. OrtStatus is
- * released here, at the point of failure, so no status can leak into Go.
+ * Every function returns NULL on success or a malloc'd message that the Go
+ * side converts and frees. OrtStatus never escapes this file.
  */
 #ifndef EM_ORT_SHIM_H
 #define EM_ORT_SHIM_H
 
 #include <dlfcn.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,9 +30,12 @@ typedef struct {
 typedef struct {
 	const OrtApi *api;
 	OrtSession *sess;
+	OrtMemoryInfo *mem;
 	char *in_name;
 	char *out_name;
-	int xnnpack; /* whether the XNNPACK provider attached to this session */
+	int64_t in_len;    /* last input dimension; -1 when dynamic */
+	int64_t out_count; /* last output dimension; -1 when dynamic */
+	int xnnpack;       /* whether the XNNPACK provider attached */
 } em_model;
 
 static char *em_dup(const char *s) {
@@ -60,7 +45,6 @@ static char *em_dup(const char *s) {
 	return p;
 }
 
-/* em_err converts an OrtStatus into a malloc'd message and releases it. */
 static char *em_err(const OrtApi *api, OrtStatus *st) {
 	if (!st) return NULL;
 	char *msg = em_dup(api->GetErrorMessage(st));
@@ -68,13 +52,11 @@ static char *em_err(const OrtApi *api, OrtStatus *st) {
 	return msg ? msg : em_dup("onnxruntime: error (out of memory copying message)");
 }
 
-/* em_ort_open dlopens the runtime and creates an OrtEnv for it. */
+/* em_ort_open dlopens the runtime and creates its environment. RTLD_LOCAL:
+ * the library statically links libc++, which must not leak into the process
+ * symbol namespace. */
 static char *em_ort_open(const char *path, em_runtime *out) {
 	memset(out, 0, sizeof(*out));
-
-	/* RTLD_LOCAL: nothing else in the process should resolve against ORT's
-	 * symbols, and libc++ is statically linked inside the .so, so exporting
-	 * them globally risks clashing with the toolchain's own runtime. */
 	void *dl = dlopen(path, RTLD_NOW | RTLD_LOCAL);
 	if (!dl) {
 		const char *e = dlerror();
@@ -82,226 +64,179 @@ static char *em_ort_open(const char *path, em_runtime *out) {
 	}
 	em_getapibase_fn base_fn = (em_getapibase_fn)dlsym(dl, "OrtGetApiBase");
 	if (!base_fn) {
-		const char *e = dlerror();
-		char *msg = em_dup(e ? e : "OrtGetApiBase not found");
 		dlclose(dl);
-		return msg;
+		return em_dup("OrtGetApiBase not found");
 	}
 	const OrtApiBase *base = base_fn();
-	if (!base) {
-		dlclose(dl);
-		return em_dup("OrtGetApiBase returned NULL");
-	}
-
-	/* GetApi(ORT_API_VERSION) is the documented compatibility contract: a
-	 * NEWER runtime honours an older requested version, an older one returns
-	 * NULL. That is why a 1.19 header works against the 1.23 library used for
-	 * host tests, and why a too-old library fails loudly here instead of
-	 * subtly. */
-	const OrtApi *api = base->GetApi(ORT_API_VERSION);
+	const OrtApi *api = base ? base->GetApi(ORT_API_VERSION) : NULL;
 	if (!api) {
-		char msg[192];
-		snprintf(msg, sizeof(msg),
-		         "onnxruntime is too old: it does not provide C API version %d (library reports %s)",
-		         ORT_API_VERSION, base->GetVersionString());
+		char msg[160];
+		snprintf(msg, sizeof(msg), "onnxruntime %s does not provide C API version %d",
+		         base ? base->GetVersionString() : "?", ORT_API_VERSION);
 		dlclose(dl);
 		return em_dup(msg);
 	}
-
 	OrtEnv *env = NULL;
-	OrtStatus *st = api->CreateEnv(ORT_LOGGING_LEVEL_ERROR, "echomuse", &env);
-	if (st) {
-		char *msg = em_err(api, st);
+	char *err = em_err(api, api->CreateEnv(ORT_LOGGING_LEVEL_ERROR, "echomuse", &env));
+	if (err) {
 		dlclose(dl);
-		return msg;
+		return err;
 	}
-
 	out->dl = dl;
 	out->api = api;
 	out->env = env;
 	return NULL;
 }
 
-/* em_ort_version reports the loaded library's version, e.g. "1.19.2". */
 static const char *em_ort_version(em_runtime *r) {
-	if (!r->dl) return "";
 	em_getapibase_fn base_fn = (em_getapibase_fn)dlsym(r->dl, "OrtGetApiBase");
-	if (!base_fn) return "";
-	return base_fn()->GetVersionString();
+	return base_fn ? base_fn()->GetVersionString() : "";
 }
 
-/*
- * em_model_load opens one model. The options are the measured optimum for a
- * duty-cycled wake word on this hardware, and two of them are counter-intuitive
- * enough to be worth stating here:
- *
- *   - allow_spinning=0. ORT's thread pool spin-waits for the next inference by
- *     default. In the ~60ms gap between 80ms frames that burns several times
- *     the CPU the inference itself needs (243% of a core measured on the
- *     device, against 36% with spinning off).
- *
- *   - threads=1. More threads halves latency and RAISES total CPU. We have
- *     51ms of headroom in an 80ms budget, so latency is free and CPU is not.
- *
- * XNNPACK is reachable only through the generic string-keyed EP API: the
- * Android AAR compiles the provider in but exports no
- * OrtSessionOptionsAppendExecutionProvider_Xnnpack symbol, so it looks
- * unavailable until asked for by name.
- */
-static char *em_model_load(em_runtime *r, const char *path, int threads, int xnnpack,
-                           int allow_spinning, em_model *out) {
+/* em_io_dim reads a rank-2 float tensor's last dimension. */
+static char *em_io_dim(const OrtApi *api, OrtTypeInfo *ti, int64_t *dim) {
+	const OrtTensorTypeAndShapeInfo *tsi = NULL;
+	char *err = em_err(api, api->CastTypeInfoToTensorInfo(ti, &tsi));
+	if (err) return err;
+	if (!tsi) return em_dup("graph input/output is not a tensor");
+	ONNXTensorElementDataType et;
+	size_t rank = 0;
+	if ((err = em_err(api, api->GetTensorElementType(tsi, &et))) ||
+	    (err = em_err(api, api->GetDimensionsCount(tsi, &rank))))
+		return err;
+	if (et != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) return em_dup("graph input/output is not float32");
+	if (rank != 2) return em_dup("graph input/output is not rank 2");
+	int64_t dims[2];
+	if ((err = em_err(api, api->GetDimensions(tsi, dims, 2)))) return err;
+	*dim = dims[1];
+	return NULL;
+}
+
+static void em_model_free(em_model *m);
+
+/* em_model_load creates one session with the SPEC §16.5 options: one
+ * intra-op thread, spinning off, sequential execution, ORT_ENABLE_ALL and the
+ * XNNPACK provider, which the Android build compiles in but exposes only
+ * through the string-keyed provider API. require_xnnpack=0 admits a runtime
+ * built without it (host tests only). */
+static char *em_model_load(em_runtime *r, const char *path, int require_xnnpack, em_model *out) {
 	const OrtApi *api = r->api;
-	if (!api) return em_dup("onnxruntime not open");
 	memset(out, 0, sizeof(*out));
 	out->api = api;
 
 	OrtSessionOptions *o = NULL;
 	char *err = em_err(api, api->CreateSessionOptions(&o));
 	if (err) return err;
-
-	if ((err = em_err(api, api->SetIntraOpNumThreads(o, threads))) ||
-	    (err = em_err(api, api->SetSessionGraphOptimizationLevel(o, ORT_ENABLE_ALL)))) {
+	if ((err = em_err(api, api->SetIntraOpNumThreads(o, 1))) ||
+	    (err = em_err(api, api->SetSessionExecutionMode(o, ORT_SEQUENTIAL))) ||
+	    (err = em_err(api, api->SetSessionGraphOptimizationLevel(o, ORT_ENABLE_ALL))) ||
+	    (err = em_err(api, api->AddSessionConfigEntry(o, "session.intra_op.allow_spinning", "0"))) ||
+	    (err = em_err(api, api->AddSessionConfigEntry(o, "session.inter_op.allow_spinning", "0")))) {
 		api->ReleaseSessionOptions(o);
 		return err;
 	}
-	if (!allow_spinning) {
-		const char *off = "0";
-		if ((err = em_err(api, api->AddSessionConfigEntry(o, "session.intra_op.allow_spinning", off))) ||
-		    (err = em_err(api, api->AddSessionConfigEntry(o, "session.inter_op.allow_spinning", off)))) {
+	const char *keys[] = {"intra_op_num_threads"};
+	const char *vals[] = {"1"};
+	OrtStatus *st = api->SessionOptionsAppendExecutionProvider(o, "XNNPACK", keys, vals, 1);
+	if (st) {
+		if (require_xnnpack) {
+			err = em_err(api, st);
 			api->ReleaseSessionOptions(o);
 			return err;
 		}
-	}
-
-	if (xnnpack) {
-		char tb[16];
-		snprintf(tb, sizeof(tb), "%d", threads);
-		const char *keys[] = {"intra_op_num_threads"};
-		const char *vals[] = {tb};
-		OrtStatus *st = api->SessionOptionsAppendExecutionProvider(o, "XNNPACK", keys, vals, 1);
-		if (st) {
-			/* Deliberately non-fatal: fall back to the CPU provider, which
-			 * produces bit-identical output for roughly 1.5x the CPU. */
-			api->ReleaseStatus(st);
-		} else {
-			out->xnnpack = 1;
-		}
+		api->ReleaseStatus(st);
+	} else {
+		out->xnnpack = 1;
 	}
 
 	OrtSession *sess = NULL;
-	if ((err = em_err(api, api->CreateSession(r->env, path, o, &sess)))) {
-		api->ReleaseSessionOptions(o);
-		return err;
-	}
+	err = em_err(api, api->CreateSession(r->env, path, o, &sess));
 	api->ReleaseSessionOptions(o);
+	if (err) return err;
+	out->sess = sess;
+
+	size_t n_in = 0, n_out = 0;
+	if ((err = em_err(api, api->SessionGetInputCount(sess, &n_in))) ||
+	    (err = em_err(api, api->SessionGetOutputCount(sess, &n_out))))
+		goto fail;
+	if (n_in != 1 || n_out != 1) {
+		err = em_dup("graph must have exactly one input and one output");
+		goto fail;
+	}
+
+	OrtTypeInfo *ti = NULL;
+	if ((err = em_err(api, api->SessionGetInputTypeInfo(sess, 0, &ti)))) goto fail;
+	err = em_io_dim(api, ti, &out->in_len);
+	api->ReleaseTypeInfo(ti);
+	if (err) goto fail;
+	if ((err = em_err(api, api->SessionGetOutputTypeInfo(sess, 0, &ti)))) goto fail;
+	err = em_io_dim(api, ti, &out->out_count);
+	api->ReleaseTypeInfo(ti);
+	if (err) goto fail;
 
 	OrtAllocator *al = NULL;
-	if ((err = em_err(api, api->GetAllocatorWithDefaultOptions(&al)))) {
-		api->ReleaseSession(sess);
-		return err;
-	}
-	char *in_name = NULL, *out_name = NULL;
-	if ((err = em_err(api, api->SessionGetInputName(sess, 0, al, &in_name))) ||
-	    (err = em_err(api, api->SessionGetOutputName(sess, 0, al, &out_name)))) {
-		api->ReleaseSession(sess);
-		return err;
-	}
-	out->sess = sess;
-	out->in_name = in_name;
-	out->out_name = out_name;
+	if ((err = em_err(api, api->GetAllocatorWithDefaultOptions(&al))) ||
+	    (err = em_err(api, api->SessionGetInputName(sess, 0, al, &out->in_name))) ||
+	    (err = em_err(api, api->SessionGetOutputName(sess, 0, al, &out->out_name))) ||
+	    (err = em_err(api, api->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &out->mem))))
+		goto fail;
 	return NULL;
+
+fail:
+	em_model_free(out);
+	return err;
 }
 
-/*
- * em_model_run executes one inference.
- *
- * `data` points at Go-owned memory and is only read for the duration of the
- * call (ORT wraps it without copying), which is what cgo's pointer rules
- * permit. The OUTPUT is copied into a fresh malloc'd buffer and the OrtValue
- * released before returning, so Go never holds a pointer into ORT's arena —
- * the alternative is handing back a pointer whose lifetime is tied to a C
- * object the garbage collector knows nothing about.
- */
-static char *em_model_run(em_model *m, const float *data, size_t n_in,
-                          const int64_t *shape, size_t ndim,
-                          float **out_data, size_t *out_n) {
+/* em_model_run executes one inference. `data` is Go memory read for the
+ * duration of the call; the output is copied into the Go buffer `dst` of
+ * capacity `cap`, so no C allocation outlives the call. */
+static char *em_model_run(em_model *m, const float *data, int64_t n_in,
+                          float *dst, size_t cap, size_t *out_n) {
 	const OrtApi *api = m->api;
-	if (!api || !m->sess) return em_dup("model is closed");
-	*out_data = NULL;
 	*out_n = 0;
-
-	OrtMemoryInfo *mi = NULL;
-	char *err = em_err(api, api->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &mi));
-	if (err) return err;
-
+	int64_t shape[2] = {1, n_in};
 	OrtValue *in = NULL, *out = NULL;
-	err = em_err(api, api->CreateTensorWithDataAsOrtValue(
-	                      mi, (void *)data, n_in * sizeof(float), shape, ndim,
-	                      ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &in));
-	api->ReleaseMemoryInfo(mi);
+	char *err = em_err(api, api->CreateTensorWithDataAsOrtValue(
+	                            m->mem, (void *)data, (size_t)n_in * sizeof(float), shape, 2,
+	                            ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &in));
 	if (err) return err;
-
-	err = em_err(api, api->Run(m->sess, NULL,
-	                           (const char *const *)&m->in_name, (const OrtValue *const *)&in, 1,
+	err = em_err(api, api->Run(m->sess, NULL, (const char *const *)&m->in_name,
+	                           (const OrtValue *const *)&in, 1,
 	                           (const char *const *)&m->out_name, 1, &out));
 	api->ReleaseValue(in);
 	if (err) return err;
 
 	OrtTensorTypeAndShapeInfo *ti = NULL;
-	if ((err = em_err(api, api->GetTensorTypeAndShape(out, &ti)))) {
-		api->ReleaseValue(out);
-		return err;
-	}
 	size_t count = 0;
-	err = em_err(api, api->GetTensorShapeElementCount(ti, &count));
-	api->ReleaseTensorTypeAndShapeInfo(ti);
-	if (err) {
-		api->ReleaseValue(out);
-		return err;
-	}
-
 	float *src = NULL;
-	if ((err = em_err(api, api->GetTensorMutableData(out, (void **)&src)))) {
-		api->ReleaseValue(out);
-		return err;
+	if (!(err = em_err(api, api->GetTensorTypeAndShape(out, &ti)))) {
+		err = em_err(api, api->GetTensorShapeElementCount(ti, &count));
+		api->ReleaseTensorTypeAndShapeInfo(ti);
 	}
-	float *copy = (float *)malloc(count * sizeof(float));
-	if (!copy) {
-		api->ReleaseValue(out);
-		return em_dup("out of memory copying model output");
+	if (!err) err = em_err(api, api->GetTensorMutableData(out, (void **)&src));
+	if (!err && count > cap) err = em_dup("graph output larger than expected");
+	if (!err) {
+		memcpy(dst, src, count * sizeof(float));
+		*out_n = count;
 	}
-	memcpy(copy, src, count * sizeof(float));
 	api->ReleaseValue(out);
-
-	*out_data = copy;
-	*out_n = count;
-	return NULL;
+	return err;
 }
 
 static void em_model_free(em_model *m) {
 	const OrtApi *api = m->api;
-	if (!api || !m->sess) return;
-	api->ReleaseSession(m->sess);
-	m->sess = NULL;
-
-	/* in_name/out_name came from the default allocator. AllocatorFree is
-	 * warn_unused_result: nothing useful can be done about a failure while
-	 * tearing down, but the status still has to be released or freeing the
-	 * names would itself leak. */
+	if (!api) return;
+	if (m->sess) api->ReleaseSession(m->sess);
+	if (m->mem) api->ReleaseMemoryInfo(m->mem);
 	OrtAllocator *al = NULL;
 	OrtStatus *st = api->GetAllocatorWithDefaultOptions(&al);
 	if (st) {
 		api->ReleaseStatus(st);
-		return;
+	} else {
+		if (m->in_name) api->ReleaseStatus(api->AllocatorFree(al, m->in_name));
+		if (m->out_name) api->ReleaseStatus(api->AllocatorFree(al, m->out_name));
 	}
-	if (m->in_name) {
-		api->ReleaseStatus(api->AllocatorFree(al, m->in_name));
-		m->in_name = NULL;
-	}
-	if (m->out_name) {
-		api->ReleaseStatus(api->AllocatorFree(al, m->out_name));
-		m->out_name = NULL;
-	}
+	memset(m, 0, sizeof(*m));
 }
 
 #endif /* EM_ORT_SHIM_H */

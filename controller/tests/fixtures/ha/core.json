@@ -1,0 +1,186 @@
+{
+  "source": [
+    "homeassistant/components/websocket_api/messages.py (result_message, error_message, event_message)",
+    "homeassistant/components/websocket_api/commands.py (handle_get_config, handle_subscribe_events, handle_unsubscribe_events, handle_fire_event, handle_call_service)",
+    "homeassistant/core_config.py (Config.as_dict)"
+  ],
+  "get_config": {
+    "request": {
+      "type": "get_config"
+    },
+    "result": {
+      "allowlist_external_dirs": [
+        "/config/www",
+        "/media"
+      ],
+      "allowlist_external_urls": [],
+      "components": [
+        "api",
+        "assist_pipeline",
+        "assist_satellite",
+        "calendar",
+        "config",
+        "conversation",
+        "esphome",
+        "homeassistant",
+        "http",
+        "intent",
+        "script",
+        "stt",
+        "tts",
+        "websocket_api"
+      ],
+      "config_dir": "/config",
+      "config_source": "storage",
+      "country": "US",
+      "currency": "USD",
+      "debug": false,
+      "elevation": 180,
+      "external_url": null,
+      "internal_url": null,
+      "language": "en",
+      "latitude": 41.88,
+      "location_name": "Home",
+      "longitude": -87.63,
+      "radius": 100,
+      "recovery_mode": false,
+      "safe_mode": false,
+      "state": "RUNNING",
+      "time_zone": "America/Chicago",
+      "unit_system": {
+        "length": "km",
+        "accumulated_precipitation": "mm",
+        "area": "m\u00b2",
+        "mass": "g",
+        "pressure": "Pa",
+        "temperature": "\u00b0C",
+        "volume": "L",
+        "wind_speed": "m/s"
+      },
+      "version": "2026.8.1",
+      "whitelist_external_dirs": [
+        "/config/www",
+        "/media"
+      ]
+    }
+  },
+  "subscribe_events": {
+    "request": {
+      "type": "subscribe_events",
+      "event_type": "echomuse_alert_request"
+    },
+    "result": null,
+    "event": {
+      "event_type": "echomuse_alert_request",
+      "data": {
+        "request_id": "01K5ZC8Q9V|set_alarm|{\"time\":\"07:00:00\",\"days\":[],\"name\":\"\",\"speaker\":\"\"}",
+        "action": "set_alarm",
+        "args": {
+          "time": "07:00:00",
+          "days": [],
+          "name": "",
+          "speaker": ""
+        }
+      },
+      "origin": "LOCAL",
+      "time_fired": "2026-09-23T11:30:00.123456+00:00",
+      "context": {
+        "id": "01K5ZC8Q9V",
+        "parent_id": null,
+        "user_id": null
+      }
+    }
+  },
+  "unsubscribe_events": {
+    "request": {
+      "type": "unsubscribe_events",
+      "subscription": "<subscription id>"
+    },
+    "result": null,
+    "not_found": {
+      "code": "not_found",
+      "message": "Subscription not found."
+    }
+  },
+  "fire_event": {
+    "request": {
+      "type": "fire_event",
+      "event_type": "echomuse_alert_result",
+      "event_data": {
+        "request_id": "01K5ZC8Q9V|set_alarm|{}",
+        "result": {
+          "ok": true
+        }
+      }
+    },
+    "result": {
+      "context": {
+        "id": "01K5ZC9A00",
+        "parent_id": null,
+        "user_id": "8c1f0e"
+      }
+    }
+  },
+  "call_service": {
+    "request": {
+      "type": "call_service",
+      "domain": "script",
+      "service": "reload",
+      "return_response": false
+    },
+    "result": {
+      "context": {
+        "id": "01K5ZCA111",
+        "parent_id": null,
+        "user_id": "8c1f0e"
+      }
+    }
+  },
+  "call_service_response": {
+    "request": {
+      "type": "call_service",
+      "domain": "script",
+      "service": "echomuse_list_alarms",
+      "service_data": {
+        "speaker": "Office"
+      },
+      "return_response": true
+    },
+    "result": {
+      "context": {
+        "id": "01K5ZCA222",
+        "parent_id": null,
+        "user_id": "8c1f0e"
+      },
+      "response": {
+        "ok": true,
+        "alarms": []
+      }
+    }
+  },
+  "call_service_not_found": {
+    "code": "not_found",
+    "message": "Service script.nope not found."
+  },
+  "select_option": {
+    "request": {
+      "type": "call_service",
+      "domain": "select",
+      "service": "select_option",
+      "target": {
+        "entity_id": "select.office_finished_speaking_detection"
+      },
+      "service_data": {
+        "option": "relaxed"
+      },
+      "return_response": false
+    },
+    "result": {
+      "context": {
+        "id": "01K5ZCA333",
+        "parent_id": null,
+        "user_id": "8c1f0e"
+      }
+    }
+  }
+}

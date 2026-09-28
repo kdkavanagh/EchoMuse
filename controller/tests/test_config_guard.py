@@ -1,21 +1,16 @@
 """
 Guard against the config-clobber trap.
 
-Config POSTs REPLACE the stored dict rather than merging. That is safe for
-the dashboard, which always submits the complete config, and a trap for any
-caller that submits a partial one. On 2026-07-20 a POST carrying the single
-key wakeArbitrationMs reset all 26 fleet settings to defaults: the wake
-model reverted hey_mycroft -> hey_jarvis (so the real wake word stopped
-working), owwThreshold dropped 0.5 -> 0.3 (so devices false-woke on ordinary
-conversation), and AEC, barge-in, NS, beamforming, the BLE proxy and the EQ
-curve all switched off.
+Config POSTs replace the stored dict rather than merging: safe for the
+dashboard, which submits the complete config, and destructive for a caller
+that submits one key. `_dropped_keys` makes such a write refuse instead of
+silently resetting every omitted setting.
 
-These tests exercise the pure key-set logic directly rather than standing up
-an aiohttp app — em_api pulls in the whole controller stack, which this
-suite deliberately keeps out. The handler wiring is a two-line call into
-this function on each of the two write paths.
+The pure key-set logic is exercised directly; em_api pulls in the whole
+controller stack, which this suite keeps out.
 """
 
+import ast
 import re
 from pathlib import Path
 
@@ -25,20 +20,10 @@ CONTROLLER = Path(__file__).resolve().parents[1]
 
 
 def _load_dropped_keys():
-    """
-    Extract _dropped_keys from em_api source and exec it in isolation.
-    Importing em_api would drag in aiohttp/openwakeword; the function is
-    self-contained (stdlib only), so this keeps the test honest without the
-    dependency weight.
-
-    Uses AST rather than a regex: a regex over function boundaries broke the
-    moment a neighbouring decorator moved, and — worse — silently widened to
-    swallow decorated handlers. Decorators are deliberately NOT applied here,
-    which is exactly why the separate decorator-placement tests below exist.
-    """
-    import ast
-    src = (CONTROLLER / "em_api.py").read_text()
-    tree = ast.parse(src)
+    """Exec `_dropped_keys` from em_api's source in isolation (stdlib only).
+    Decorators are stripped here, which is why the placement tests below
+    parse the real file."""
+    tree = ast.parse((CONTROLLER / "em_api.py").read_text())
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name == "_dropped_keys":
             node.decorator_list = []
@@ -51,59 +36,41 @@ def _load_dropped_keys():
 
 dropped_keys = _load_dropped_keys()
 
-# The real fleet config as it stood before the incident, kept verbatim —
-# including the mic-chain keys that no longer exist (the audio HAL owns that
-# chain now). The logic under test is pure key-set arithmetic and does not
-# know what any key means, and the count below is the count from the incident.
+# A stored fleet config after the schema-22 cutover.
 LIVE_CONFIG = {
-    "adcDigitalGain": 88, "adcMicpga": 40, "micGainDb": 24,
-    "aecEnabled": True, "aecDelayMs": 0, "aecTailMs": 300,
-    "startupVolume": 85, "vadThreshold": 0.001, "vadSpeechMs": 32,
-    "vadSilenceMs": 900, "owwThreshold": 0.5, "bargeInEnabled": True,
-    "bargeInThreshold": 0.05, "owwModel": "hey_mycroft_v0.1",
-    "owwSpeexNs": False, "nsAsr": True, "bleProxyEnabled": True,
-    "beamformingEnabled": True, "beamAngle": -1,
-    "eqBands": [0, 3, 2, 0, -2, 3, 7, 0], "eqLoudness": True,
-    "ledScene": "standard", "ledListenColor": "#00b400",
-    "ledThinkColor": "#00c800", "agcEnabled": True, "nsEnabled": False,
+    "wakeModel": "4eb745120ea56f5681eddbf788a0c69e1fd406d4694a04a4dba0c1e41d862d3f",
+    "wakeArbitrationMs": 700, "wakeSound": False, "saveWakeClips": False,
+    "nsAsr": True, "saveUtterances": False, "extendedUtterances": False,
+    "timerSound": "chime", "alarmSound": "chime", "timerRingSeconds": 900,
+    "timerRingGapSeconds": 2.0, "startupVolume": 85, "duckDb": -18.0,
+    "bleProxyEnabled": True, "eqBands": [0, 3, 2, 0, -2, 3, 7, 0],
+    "eqLoudness": True, "ledScene": "standard",
 }
 
 
-def test_the_exact_body_that_caused_the_incident_is_caught():
-    """The literal payload I sent on 2026-07-20."""
-    dropped = dropped_keys({"wakeArbitrationMs": 700}, LIVE_CONFIG)
-    assert len(dropped) == 26
-    # The two that turned into audible symptoms.
-    assert "owwModel" in dropped
-    assert "owwThreshold" in dropped
+def test_a_one_key_write_is_caught_and_names_what_it_would_reset():
+    dropped = dropped_keys({"wakeArbitrationMs": 500}, LIVE_CONFIG)
+    assert len(dropped) == len(LIVE_CONFIG) - 1
+    assert "wakeModel" in dropped and "alarmSound" in dropped
 
 
 def test_full_config_write_drops_nothing():
-    """How the dashboard behaves — must stay a no-op."""
-    body = dict(LIVE_CONFIG)
-    body["wakeArbitrationMs"] = 700
-    assert dropped_keys(body, LIVE_CONFIG) == []
-
-
-def test_read_modify_write_is_the_safe_pattern():
-    """The pattern the error message tells callers to use."""
-    body = {**LIVE_CONFIG, "owwThreshold": 0.6}
+    body = {**LIVE_CONFIG, "wakeArbitrationMs": 500}
     assert dropped_keys(body, LIVE_CONFIG) == []
 
 
 def test_dropping_a_single_key_is_still_caught():
-    body = {k: v for k, v in LIVE_CONFIG.items() if k != "aecEnabled"}
-    assert dropped_keys(body, LIVE_CONFIG) == ["aecEnabled"]
+    body = {k: v for k, v in LIVE_CONFIG.items() if k != "alarmSound"}
+    assert dropped_keys(body, LIVE_CONFIG) == ["alarmSound"]
 
 
 def test_empty_stored_config_permits_anything():
-    """First write on a fresh install has nothing to destroy."""
-    assert dropped_keys({"owwThreshold": 0.5}, {}) == []
+    """A fresh install has nothing to destroy."""
+    assert dropped_keys({"wakeArbitrationMs": 700}, {}) == []
 
 
 def test_result_is_sorted_for_a_stable_error_message():
-    body = {"micGainDb": 24}
-    out = dropped_keys(body, LIVE_CONFIG)
+    out = dropped_keys({"nsAsr": False}, LIVE_CONFIG)
     assert out == sorted(out)
 
 
@@ -124,26 +91,6 @@ def test_both_write_paths_are_guarded(path, handler):
     assert "would_drop_keys" in body, f"{handler} does not refuse the write"
 
 
-def test_new_default_key_does_not_block_a_stale_dashboard_save():
-    """
-    Regression for a false positive found while writing this guard.
-
-    get_global_device_config() underlays DEFAULT_DEVICE_CONFIG, so if the
-    guard compared against that view, a controller upgrade adding a new
-    default (exactly what wakeArbitrationMs was) would make every save from
-    an already-open dashboard tab look like a deletion of that key and be
-    refused. Comparing against the RAW stored config — what an operator has
-    actually persisted — keeps legitimate saves working while still
-    catching a genuinely destructive partial write.
-    """
-    raw_stored = {k: v for k, v in LIVE_CONFIG.items()}   # no new key yet
-    stale_dashboard_body = dict(raw_stored)               # lacks the new default
-    assert dropped_keys(stale_dashboard_body, raw_stored) == []
-
-    # ...while the destructive partial write is still refused.
-    assert len(dropped_keys({"wakeArbitrationMs": 700}, raw_stored)) == 26
-
-
 def test_guard_reads_raw_stored_config_not_the_underlaid_view():
     """The guard must call the raw accessor, or the false positive returns."""
     src = (CONTROLLER / "em_api.py").read_text()
@@ -152,27 +99,17 @@ def test_guard_reads_raw_stored_config_not_the_underlaid_view():
     assert "get_global_device_config_raw" in m.group(0)
 
 
-# ── decorator-placement guards ────────────────────────────────────────────
+# ── decorator placement ───────────────────────────────────────────────────
 #
-# Inserting a helper immediately above an already-decorated handler silently
-# steals its decorator: on 2026-07-20 `_dropped_keys` was written directly
-# under `@auth.require_admin`, so the decorator bound to the helper instead
-# and `_post_global_config` was left with NO admin requirement — an auth
-# bypass on a config-write endpoint. It surfaced only as a 500 in live
-# testing, because the helper was then called with two args while wrapped to
-# take a request.
-#
-# The unit tests above could not catch it: they exec the extracted source
-# text, which drops decorators entirely, so they were exercising a different
-# function than production. These parse the real file instead.
+# A helper inserted directly above a decorated handler steals its decorator,
+# leaving the handler unauthenticated. The tests above strip decorators, so
+# these parse the real file.
 
 def _ast_tree():
-    import ast
     return ast.parse((CONTROLLER / "em_api.py").read_text())
 
 
 def _decorators_of(name):
-    import ast
     for n in ast.walk(_ast_tree()):
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name:
             return [getattr(d, "id", getattr(d, "attr", "?")) for d in n.decorator_list]

@@ -1,25 +1,19 @@
 """
 Config sections — the unit of fleet-vs-device scoping.
 
-A device used to be all-or-nothing: `use_global_config` was one boolean, so
-you either inherited the entire fleet config or overrode every key of it.
-That got unwieldy as the config grew — wanting a device-specific ring scene
-meant forking its mic gain, wake threshold and EQ too, and they then stopped
-tracking fleet changes forever.
-
-Scoping is now per section. A device stores the SET of sections it overrides;
-its effective config is the fleet config with the device's own values layered
-over it for those sections only. Everything else keeps following the fleet.
+A device stores the SET of sections it overrides; its effective config is the
+fleet config with the device's own values layered over it for those sections
+only. Everything else follows the fleet.
 
 This module is the single source of truth for which key belongs to which
-section. `controller/static/dashboard.jsx` carries a mirror of SECTIONS for
-rendering, and tests/test_config_sections.py fails if the two drift or if any
-config key ends up belonging to no section.
+section (SPEC §18.4). `controller/static/dashboard.jsx` mirrors SECTIONS for
+rendering; tests/test_config_sections.py fails if the two drift or if any
+config key belongs to no section.
 """
 
-# Section id → (display label, config keys). Ids are stored in the DB, so
-# they are API surface: renaming one needs a migration. Labels are display
-# only and must match the dashboard Stage titles.
+# Section id → (display label, config keys). Ids are stored in the DB, so they
+# are API surface: renaming one needs a migration. Labels are display only and
+# match the dashboard Stage titles.
 SECTIONS: dict[str, dict] = {
     "playback": {
         "label": "Playback",
@@ -27,36 +21,15 @@ SECTIONS: dict[str, dict] = {
     },
     "wakeword": {
         "label": "Wake word",
-        "keys": [
-            "owwModel", "owwThreshold", "owwSpeexNs", "nearMissThreshold",
-            "bargeInEnabled", "bargeInThreshold", "wakeArbitrationMs",
-            "owwOnDevice",
-            # The chime a wake fires. Here rather than in "playback": that
-            # section is how audio SOUNDS (EQ, duck depth), and this is part
-            # of what a wake does — a device taking its own wake behaviour
-            # should take this with it.
-            "wakeSound",
-            # Whether the pre-detection audio that crossed the threshold is
-            # kept. Here rather than beside saveUtterances in "microphones":
-            # that key is about the mic stream a turn records, and this one
-            # is about the wake decision itself — a device taking its own
-            # threshold and model should take the evidence for them too.
-            "saveWakeClips",
-        ],
+        # wakeModel is the active registry graph's SHA-256 (§5.1); its
+        # thresholds belong to the registry entry, not to config.
+        "keys": ["wakeModel", "saveWakeClips", "wakeArbitrationMs", "wakeSound"],
     },
     "microphones": {
-        "label": "Microphones",
-        # Mic gain, beamforming, echo cancellation and AGC are NOT here, and
-        # are not config anywhere: Android's audio HAL owns all four, and its
-        # tuning lives in /system/etc/AFE.cfg on a read-only partition. What
-        # remains in this section is everything the CONTROLLER decides about
-        # the mic stream after it arrives.
-        "keys": [
-            "nsAsr",
-            "saveUtterances",
-            "endpointRelative", "endpointLowPerMil", "endpointSilenceMs",
-            "endpointBackporchMs", "maxSpeechMs",
-        ],
+        "label": "Speech",
+        # Everything the controller decides about the STT copy. Gain,
+        # beamforming, AEC and AGC belong to the native AFE (§4.1).
+        "keys": ["nsAsr", "saveUtterances", "extendedUtterances"],
     },
     "ring": {
         "label": "Ring",
@@ -67,41 +40,28 @@ SECTIONS: dict[str, dict] = {
         ],
     },
     "advanced": {
-        "label": "Advanced",
-        "keys": [
-            "vadThreshold", "vadSpeechMs", "vadSilenceMs",
-            # Already the button-turn section; these decide whether they happen.
-            "buttonSingleTapEvent", "buttonMultiTapMs",
-        ],
+        "label": "Button",
+        "keys": ["buttonSingleTapEvent", "buttonMultiTapMs"],
     },
     "bluetooth": {
         "label": "Bluetooth",
         "keys": ["bleProxyEnabled"],
     },
-    # Not folded into "ring": that section is the LED ring. Sharing one
-    # would mean a device could not take its own alarm sound without
-    # forking its LED scene too.
+    # Separate from "ring" (the LED ring) so a device can take its own alert
+    # sounds without forking its LED scene.
     "timers": {
         "label": "Timers",
-        "keys": [
-            "timerSound", "timerRingSeconds",
-            "timerRingGapSeconds", "timerRingBurstSeconds",
-        ],
+        "keys": ["timerSound", "timerRingSeconds", "timerRingGapSeconds", "alarmSound"],
     },
 }
 
-# Keys that live in the config dict but are NOT user-facing settings, and so
+# Keys that live in the config dict but are device STATE, not settings: they
 # belong to no section and are never fleet-inherited.
 #
-# startupVolume is persisted device STATE wearing a config key's clothes: the
-# controller writes it automatically from every volume_state report, and the
-# device re-applies it via SeedVolume on the first config push per run. That
-# round trip is what makes volume survive a reboot, so the key has to stay —
-# but it is not something you set, and it was never meaningfully editable
-# (SeedVolume ignores later pushes, so the old dashboard slider did nothing
-# until the device restarted and was overwritten by any real volume change).
-# Fleet default 85 still does one real job: the starting point for a device
-# that has never reported.
+# startupVolume: the controller writes it from every volume report and the
+# device re-applies it on its first config per run, which is how volume
+# survives a reboot. The fleet value 85 is the start for a device that has
+# never reported.
 STATE_KEYS: frozenset[str] = frozenset({"startupVolume"})
 
 SECTION_IDS: tuple[str, ...] = tuple(SECTIONS)

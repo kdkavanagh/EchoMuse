@@ -105,12 +105,30 @@ const API = {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-// owwModel display label: stock names ("hey_jarvis_v0.1") and custom model
-// file paths ("/app/data/oww_models/hey_clara.onnx") both prettify.
-function wwModelLabel(v) {
-  if (!v) return '—';
-  if (v.endsWith('.onnx')) v = v.split('/').pop().replace(/\.onnx$/, '');
-  return v.replace(/_v[\d.]+$/, '').replace(/_/g, ' ');
+// A graph SHA-256 is the registry key (§5.1); eight hex digits are enough to
+// tell entries apart on screen.
+function shortSha(sha) {
+  return sha ? sha.slice(0, 8) : '—';
+}
+
+// Registry entry label: its spoken wake phrase plus the short graph hash.
+// `models` is the /api/wake_models list; an unknown hash still shows itself.
+function wakeModelLabel(models, sha) {
+  if (!sha) return '—';
+  const m = (models || []).find(x => x.graph_sha256 === sha);
+  return m ? `${m.wake_phrase} · ${shortSha(sha)}` : shortSha(sha);
+}
+
+// The BCResNet registry (GET /api/wake_models → {active, models}). Fetched per
+// consumer; `reload` re-reads it after an upload or delete.
+function useWakeRegistry() {
+  const [registry, setRegistry] = useState({ active: null, models: [], loaded: false });
+  const reload = useCallback(async () => {
+    try { setRegistry({ ...(await API.get('/api/wake_models')), loaded: true }); }
+    catch (e) { /* signed-out or controller restarting: keep the last list */ }
+  }, []);
+  useEffect(() => { reload(); }, [reload]);
+  return [registry, reload];
 }
 
 function uptime(s) {
@@ -130,20 +148,51 @@ function relTime(ts) {
   return `${Math.floor(d / 86400000)}d ago`;
 }
 
-// Controller-generated device log lines (`device_log` on the shared events
-// socket) are the only progress channel a long shell-plane operation has —
-// the POST that starts it does not return until it is finished. Components
-// that need to watch them live subscribe here instead of having the whole
+// Every message on the shared events socket is re-emitted here, so a panel
+// that needs live updates (alerts, timers) subscribes instead of having the
 // stream drilled down through props.
-const _logSubs = new Set();
-function subscribeDeviceLog(fn) { _logSubs.add(fn); return () => _logSubs.delete(fn); }
-function _emitDeviceLog(deviceId, entry) {
-  _logSubs.forEach(fn => { try { fn(deviceId, entry); } catch (e) { console.error(e); } });
+const _eventSubs = new Set();
+function subscribeEvents(fn) { _eventSubs.add(fn); return () => _eventSubs.delete(fn); }
+function _emitEvent(msg) {
+  _eventSubs.forEach(fn => { try { fn(msg); } catch (e) { console.error(e); } });
 }
+
+// Why a control is unavailable on a connected device that lacks a capability
+// (§11.1). Features are gated on the capability set the device announced in
+// session.hello, never on its firmware version.
+const CAPABILITY_REASONS = {
+  device_wake_v1:      'this firmware has no on-device wake detector — update it',
+  render_progress_v1:  'this firmware cannot play device-local sounds — update it',
+  focus_leases_v1:     'this firmware cannot duck music under a response — update it',
+  alert_cache_v1:      'this Echo cannot hold a wakelock, so it cannot keep alarms armed while offline',
+  uplink_leases_v1:    'this firmware cannot open diagnostic audio leases — update it',
+  button_hold:         'this firmware has no action-button event for a tap to fire — update it',
+};
+
+// The reason `cap` is missing, or null when the control is available.
+// `capabilities` null means "no live device to ask" (the fleet view, or an
+// offline device whose settings apply when it returns): nothing is gated.
+function capabilityGap(capabilities, cap) {
+  if (!Array.isArray(capabilities) || capabilities.includes(cap)) return null;
+  return CAPABILITY_REASONS[cap] || `needs the ${cap} capability — update this Echo`;
+}
+
+// The live capability set to gate on: null unless a current-protocol session
+// is up (see capabilityGap).
+function liveCapabilities(d) {
+  return d.connected && !d.upgrade_required ? (d.capabilities || []) : null;
+}
+
+// Simulated LED colour for a device the controller cannot use: offline, or on
+// firmware that must be upgraded first.
+const UNUSABLE_DOT = '#d4703a';
 
 function deviceState(d) {
   if (!d.approved)  return { key: 'pending',   label: 'Pending',   color: 'var(--accent-hi)', dot: '#8ab0d0' };
-  if (!d.connected) return { key: 'offline',   label: 'Offline',   color: 'var(--warn)', dot: '#d4703a' };
+  if (!d.connected) return { key: 'offline',   label: 'Offline',   color: 'var(--warn)', dot: UNUSABLE_DOT };
+  // Old firmware on the upgrade-only legacy handler (§12): it runs no turns,
+  // alerts or audio until a firmware update replaces it.
+  if (d.upgrade_required) return { key: 'upgrade', label: 'Upgrade', color: 'var(--warn)', dot: UNUSABLE_DOT };
   if (d.muted)      return { key: 'muted',     label: 'Muted',     color: 'var(--error)', dot: '#c04040' };
   if (d.speaking)   return { key: 'speaking',  label: 'Speaking',  color: 'var(--accent)', dot: '#4080d0' };
   if (d.thinking)   return { key: 'thinking',  label: 'Thinking',  color: 'var(--warn)', dot: '#a08020' };
@@ -368,38 +417,6 @@ function Toggle({ label, sub, value, onChange, disabled = false }) {
   );
 }
 
-// A segmented choice, for settings with more than two states. Written as
-// buttons rather than a native <select> so the unavailable options stay
-// VISIBLE and disabled: the capability rule is that a device lacking a feature
-// shows the control with the reason, and a native select would hide the option
-// entirely, which reads as the feature not existing at all.
-function Select({ label, sub, value, options, onChange }) {
-  return (
-    <div style={{ marginBottom: 20, minWidth: 0 }}>
-      <div style={{ marginBottom: 7, minWidth: 0 }}>
-        <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, color: 'var(--text2)' }}>{label}</span>
-      </div>
-      <div style={{ display: 'flex', gap: 6, minWidth: 0 }}>
-        {options.map(o => (
-          <button
-            key={o.value}
-            className={'em-pill em-pill--small' + (o.value === value ? ' em-pill--accent' : '')}
-            disabled={!!o.disabled}
-            style={{ flex: 1, minWidth: 0 }}
-            onClick={() => { if (!o.disabled) onChange(o.value); }}>
-            {o.label}
-          </button>
-        ))}
-      </div>
-      {sub && (
-        <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: 'var(--muted)', marginTop: 7 }}>
-          {sub}
-        </div>
-      )}
-    </div>
-  );
-}
-
 // ─── EQ frequency response curve ─────────────────────────────────────────────
 
 function EqCurve({ bands, fs = 22050 }) {
@@ -596,7 +613,7 @@ function LedRing({ state, size = 120 }) {
   const stateKey = state?.key || 'idle';
   const stateColor = state?.dot || '#aaaaaa';
   const isPending = stateKey === 'pending';
-  const isOffline = stateKey === 'offline';
+  const isOffline = stateKey === 'offline' || stateKey === 'upgrade';
 
   const ledColor = isPending ? '#c8c8c8'
                  : isOffline ? '#d4703a'
@@ -761,7 +778,7 @@ function Shell({ deviceId, token, height = 320 }) {
   );
 }
 
-// ─── Turn observability (Status tab) ─────────────────────────────────────────
+// ─── Turn observability (Activity tab) ───────────────────────────────────────
 // Stat tiles + a stage-breakdown bar per recent turn. Colors validated
 // (dataviz six-checks) against the panel surface #dfdbd3: CVD ΔE 26.3,
 // contrast ≥3:1, chroma ≥0.1. Identity is never color-alone: legend + the
@@ -772,19 +789,164 @@ const TURN_STAGES = [
   { key: 'respond',    label: 'Respond',    color: '#96660a' },
 ];
 
+// Stage durations of one turn row. The row stores durations, not offsets:
+// audio_ms is the committed span (the whole open time when nothing
+// committed), stt_ms the STT run, and respond is intent dispatch → first TTS
+// URL. An unmeasured stage (null) contributes nothing.
 function turnSegments(t) {
-  // Stage durations from the trace timestamps; -1 = never reached.
-  const vad = t.vad_end_ms >= 0 ? t.vad_end_ms : -1;
-  const stt = t.stt_ms     >= 0 ? t.stt_ms     : -1;
-  const tts = t.tts_url_ms >= 0 ? t.tts_url_ms : -1;
-  const listen     = vad >= 0 ? vad : Math.max(t.total_ms || 0, 0);
-  const transcribe = (stt >= 0 && vad >= 0) ? Math.max(stt - vad, 0) : 0;
-  const respond    = (tts >= 0 && stt >= 0) ? Math.max(tts - stt, 0) : 0;
+  const ms = v => (typeof v === 'number' && v > 0 ? v : 0);
+  const listen     = t.commit_id ? ms(t.audio_ms) : ms(t.total_ms);
+  const transcribe = ms(t.stt_ms);
+  const respond    = ms(t.tts_url_ms);
   return { listen, transcribe, respond, shown: listen + transcribe + respond };
 }
 
-function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, nearMisses, stateLabel, stateColor }) {
-  const [hover, setHover] = useState(null); // index into `recent`
+// Terminal reasons (§7) that mean a wake candidate was refused rather than a
+// user's request failing: reported, but not counted against success.
+const REFUSED_WAKE = new Set(['self_output', 'echo_only', 'unverified_wake',
+                              'verifier_timeout', 'arbitration_lost']);
+
+// Endings that are neither success nor failure: a silent reply window
+// expiring, or a newer wake/button press taking the turn over.
+const NEUTRAL_END = new Set(['reply_timeout', 'superseded']);
+
+function turnReasonColor(reason) {
+  if (reason === 'completed') return 'var(--ok)';
+  if (REFUSED_WAKE.has(reason) || NEUTRAL_END.has(reason)) return 'var(--muted)';
+  return 'var(--warn)';
+}
+
+// A row from before the post-AFE cutover has no terminal reason (every
+// current turn is persisted at CLOSING with one); its ending is its legacy
+// outcome, where "ok" meant success.
+const isLegacyTurn = t => t.terminal_reason == null;
+function turnEnd(t) {
+  if (!isLegacyTurn(t)) return { label: t.terminal_reason, color: turnReasonColor(t.terminal_reason) };
+  const label = t.outcome || 'unknown';
+  return { label, color: label === 'ok' ? 'var(--ok)' : label === 'cancelled' ? 'var(--muted)' : 'var(--warn)' };
+}
+const turnSucceeded = t => (isLegacyTurn(t) ? t.outcome === 'ok' : t.terminal_reason === 'completed');
+
+// Turn times always carry the date: the list spans days.
+const fmtTurnWhen = ts => new Date(ts * 1000).toLocaleString([], {
+  month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+const fmtTurnWhenFull = ts => new Date(ts * 1000).toLocaleString([], {
+  weekday: 'short', year: 'numeric', month: 'short', day: 'numeric',
+  hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
+// How the endpoint reducer ended the utterance (§16.6 routes).
+const COMMIT_ROUTES = {
+  A: 'pause after the command',
+  B: 'complete command under background speech',
+  R: 'pause in a reply to a Home Assistant prompt',
+  fallback: 'stable complete prefix while speech continued',
+};
+
+// Who took the request after transcription.
+const TURN_HANDLERS = {
+  ha: 'Home Assistant intent',
+  alarm: 'EchoMuse alarm engine',
+  clarification: 'EchoMuse (asked for AM or PM)',
+  local_command: 'Local command on the controller (Home Assistant not involved)',
+};
+
+const TRIGGERS = {
+  wake: 'Wake word', button: 'Action button', reply: 'Reply (no wake word)',
+  ha_reply: 'Reply to a Home Assistant prompt',
+};
+
+// One turn, stage by stage: what woke it, what the controller's streaming
+// recognizer heard and why it stopped listening, what Home Assistant
+// transcribed and what was sent on, who handled it and what was said back.
+// A stage that never ran (a refused wake, no speech, a failed STT) is
+// omitted rather than shown empty.
+function TurnDetail({ turn: t }) {
+  const mono = "'DM Mono',monospace";
+  // Pre-cutover rows stored negative sentinels for unmeasured stages.
+  const measured = v => typeof v === 'number' && v >= 0;
+  const fmtS = ms => (measured(ms) ? (ms / 1000).toFixed(2) + ' s' : '—');
+  const quote = s => (s ? <span style={{ color: 'var(--text)' }}>“{s}”</span> : <span style={{ color: 'var(--muted)' }}>—</span>);
+  const refused = REFUSED_WAKE.has(t.terminal_reason);
+  const legacy = isLegacyTurn(t);
+  const end = turnEnd(t);
+  const stage = (label, body) => (
+    <div style={{ display: 'grid', gridTemplateColumns: '112px 1fr', gap: 12, padding: '5px 0', borderTop: '1px solid var(--track)' }}>
+      <span style={{ color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.08em', fontSize: 9, paddingTop: 1 }}>{label}</span>
+      <div>{body}</div>
+    </div>
+  );
+  const handledByHa = t.outcome === 'ha';
+  const agent = t.intent_local == null ? null : t.intent_local ? "HA's built-in agent" : 'the conversation agent';
+  return (
+    <div style={{ marginTop: 10, background: 'var(--hairline)', border: '1px solid var(--track)', borderRadius: 6, padding: '8px 12px', fontFamily: mono, fontSize: 10, color: 'var(--text2)', lineHeight: 1.7 }}>
+      <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', paddingBottom: 4 }}>
+        <span style={{ color: 'var(--text)' }}>{fmtTurnWhenFull(t.ts)}</span>
+        <span>{TRIGGERS[t.trigger] || t.trigger}</span>
+        <span style={{ color: end.color }}>{end.label.replace(/_/g, ' ')}</span>
+        {legacy && <span style={{ color: 'var(--muted)' }}>recorded before the post-AFE cutover</span>}
+        <span style={{ marginLeft: 'auto' }}>total {fmtS(t.total_ms)}</span>
+      </div>
+
+      {t.trigger === 'wake' && stage('Wake', <>
+        {t.wake_model || '—'} ({shortSha(t.wake_model_sha256)}) · score {t.wake_score != null ? t.wake_score.toFixed(3) : '—'}
+        {' '}/ threshold {t.wake_threshold != null ? t.wake_threshold.toFixed(2) : '—'}
+        {' · '}{refused ? <span style={{ color: 'var(--warn)' }}>refused: {t.terminal_reason.replace(/_/g, ' ')}</span>
+          : legacy ? null
+          : t.wake_attribution === 'verified' ? 'heard while the Echo was playing; verified' : 'heard while idle'}
+      </>)}
+
+      {!refused && !legacy && stage('Heard (EchoMuse)', <>
+        {quote(t.asr_text)}
+        <div style={{ color: 'var(--muted)' }}>
+          {t.commit_route
+            ? <>ended: {COMMIT_ROUTES[t.commit_route] || t.commit_route}
+                {t.endpoint_class ? <> · text judged {t.endpoint_class.replace(/_/g, ' ')}</> : null}
+                {' · '}waited {fmtS(t.endpoint_ms)} after speech · utterance {fmtS(t.audio_ms)}</>
+            : <>not committed — {end.label.replace(/_/g, ' ')}</>}
+        </div>
+      </>)}
+
+      {(t.stt_raw != null || (legacy && (t.stt_text || measured(t.stt_ms)))) && stage('Transcribed (HA)', <>
+        {quote(t.stt_raw ?? t.stt_text)}
+        <div style={{ color: 'var(--muted)' }}>
+          speech-to-text {fmtS(t.stt_ms)}
+          {t.stt_raw != null && t.stt_text != null && t.stt_text !== t.stt_raw && <> · sent on as {quote(t.stt_text)} (wake word removed)</>}
+        </div>
+      </>)}
+
+      {t.outcome && !legacy && stage('Handled by', <>
+        {TURN_HANDLERS[t.outcome] || t.outcome.replace(/_/g, ' ')}
+        {t.outcome === 'local_command' && t.stt_text ? <> · {quote(t.stt_text)}</> : null}
+        {handledByHa && (agent || t.response_type || measured(t.intent_ms)) && (
+          <div style={{ color: 'var(--muted)' }}>
+            {[agent && `answered by ${agent}`, t.response_type && t.response_type.replace(/_/g, ' '),
+              measured(t.intent_ms) && `intent ${fmtS(t.intent_ms)}`].filter(Boolean).join(' · ')}
+          </div>
+        )}
+      </>)}
+
+      {(t.response_text || measured(t.tts_url_ms) || measured(t.playback_ms)) && stage('Spoke', <>
+        {quote(t.response_text)}
+        {(measured(t.tts_url_ms) || measured(t.playback_ms)) && (
+          <div style={{ color: 'var(--muted)' }}>
+            {[measured(t.tts_url_ms) && `audio ready ${fmtS(t.tts_url_ms)} after dispatch`,
+              measured(t.playback_ms) && `played ${fmtS(t.playback_ms)}`].filter(Boolean).join(' · ')}
+          </div>
+        )}
+      </>)}
+
+      <div style={{ borderTop: '1px solid var(--track)', paddingTop: 4, color: 'var(--muted)', fontSize: 9 }}>
+        reference coverage {t.reference_coverage != null ? `${Math.round(t.reference_coverage * 100)}%` : '—'}
+        {t.policy_hash ? <> · policy {t.policy_hash}</> : null}
+        {t.commit_id ? <> · commit {shortSha(t.commit_id)}</> : null}
+      </div>
+    </div>
+  );
+}
+
+function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, stateLabel, stateColor }) {
+  const [hover, setHover] = useState(null);       // index into `recent`
+  const [selected, setSelected] = useState(null); // turn_id; null follows the newest
   const mono = "'DM Mono',monospace";
 
   // Saved audio — play in place or download the WAV. Both go through one
@@ -893,9 +1055,17 @@ function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, nearMis
   const anyAudio = turns.some(t => t.audio_file);
   const anyWake  = turns.some(t => t.wake_file);
 
-  const ok = turns.filter(t => t.outcome === 'ok');
-  const successPct = turns.length ? Math.round(ok.length / turns.length * 100) : null;
-  const replies = ok.map(t => t.tts_url_ms).filter(v => v >= 0).sort((a, b) => a - b);
+  // Success is over requests, so refused wake candidates and superseded turns
+  // are left out of the denominator; refusals get their own tile.
+  const refused = turns.filter(t => REFUSED_WAKE.has(t.terminal_reason));
+  const requests = turns.filter(t => !REFUSED_WAKE.has(t.terminal_reason) && t.terminal_reason !== 'superseded');
+  const done = requests.filter(turnSucceeded);
+  const successPct = requests.length ? Math.round(done.length / requests.length * 100) : null;
+  // Commit → TTS URL (STT run plus intent), for completed turns that measured both.
+  const replies = done
+    .filter(t => typeof t.stt_ms === 'number' && typeof t.tts_url_ms === 'number')
+    .map(t => t.stt_ms + t.tts_url_ms)
+    .sort((a, b) => a - b);
   const medianReply = replies.length ? replies[Math.floor(replies.length / 2)] : null;
   const fmtS = ms => (ms / 1000).toFixed(1) + 's';
 
@@ -904,6 +1074,8 @@ function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, nearMis
   // rest of the tab) out of view.
   const recent = turns.slice().reverse();
   const scale = Math.max(3000, ...recent.map(t => turnSegments(t).shown));
+  // The detailed turn: the one clicked while it is still in the list, else the newest.
+  const shown = recent.find(t => t.turn_id === selected) || recent[0] || null;
 
   // The row controls are bare glyphs rather than Pills: four of them share
   // the last column of a 14px-tall row, and anything with a border in there
@@ -919,10 +1091,8 @@ function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, nearMis
         <Lcd label="Success" value={successPct != null ? successPct + '%' : '—'}
              color={successPct == null ? 'var(--lcd-dim)' : successPct >= 80 ? 'var(--lcd-green)' : 'var(--lcd-amber)'} size={16}/>
         <Lcd label="Median reply" value={medianReply != null ? fmtS(medianReply) : '—'} color="var(--lcd-dim)" size={16}/>
-        <Lcd label="Near-misses" value={nearMisses != null ? nearMisses : '—'}
-             color={nearMisses > 0 ? 'var(--lcd-amber)' : 'var(--lcd-dim)'} size={16}/>
-        <Lcd label="Underruns" value={turns.reduce((s, t) => s + (t.underruns || 0), 0)}
-             color={turns.some(t => t.underruns > 0) ? 'var(--lcd-amber)' : 'var(--lcd-dim)'} size={16}/>
+        <Lcd label="Refused wakes" value={refused.length}
+             color={refused.length > 0 ? 'var(--lcd-amber)' : 'var(--lcd-dim)'} size={16}/>
       </div>
 
       {recent.length === 0 ? (
@@ -970,13 +1140,15 @@ function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, nearMis
           <div style={{ maxHeight: 230, overflowY: 'auto', paddingRight: 4 }}>
           {recent.map((t, i) => {
             const seg = turnSegments(t);
-            const time = new Date(t.ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-            const failed = t.outcome !== 'ok';
+            const end = turnEnd(t);
+            const isSel = shown && t.turn_id === shown.turn_id;
             return (
-              <div key={i}
+              <div key={t.turn_id}
+                onClick={() => setSelected(t.turn_id)}
                 onMouseEnter={() => setHover(i)} onMouseLeave={() => setHover(null)}
-                style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '3px 0', cursor: 'default', background: hover === i ? 'var(--hairline)' : 'transparent', borderRadius: 4 }}>
-                <span style={{ fontFamily: mono, fontSize: 9, color: 'var(--muted)', width: 38, flexShrink: 0, textAlign: 'right' }}>{time}</span>
+                style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '3px 0', cursor: 'pointer', borderRadius: 4,
+                  background: isSel ? 'var(--accent-tint)' : hover === i ? 'var(--hairline)' : 'transparent' }}>
+                <span style={{ fontFamily: mono, fontSize: 9, color: 'var(--muted)', width: 86, flexShrink: 0, textAlign: 'right', whiteSpace: 'nowrap' }}>{fmtTurnWhen(t.ts)}</span>
                 <div style={{ flex: 1, display: 'flex', height: 14, alignItems: 'stretch' }}>
                   {TURN_STAGES.map(s => seg[s.key] > 0 && (
                     <div key={s.key} style={{
@@ -986,8 +1158,8 @@ function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, nearMis
                   ))}
                 </div>
                 <span style={{ fontFamily: mono, fontSize: 9, color: 'var(--text2)', width: 34, flexShrink: 0 }}>{fmtS(seg.shown)}</span>
-                <span style={{ fontFamily: mono, fontSize: 8, textTransform: 'uppercase', letterSpacing: '0.08em', width: 62, flexShrink: 0, color: failed ? 'var(--warn)' : 'var(--ok)' }}>
-                  {t.outcome === 'ok' ? 'ok' : (t.outcome || '?').replace(/_/g, ' ')}
+                <span style={{ fontFamily: mono, fontSize: 8, textTransform: 'uppercase', letterSpacing: '0.08em', width: 62, flexShrink: 0, color: end.color }}>
+                  {end.label.replace(/_/g, ' ')}
                 </span>
                 {/* The turn's saved audio, in the order it happened: the wake
                     clip that opened the turn, then the utterance that
@@ -997,23 +1169,23 @@ function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, nearMis
                     which is why each pair tests its own key. */}
                 <span style={{ width: 60, flexShrink: 0, display: 'flex', gap: 4, justifyContent: 'flex-end' }}>
                   {t.wake_file && !gone.has(clipKey(t, WAKE)) && (<>
-                    <button onClick={() => toggleAudio(t, WAKE)}
+                    <button onClick={e => { e.stopPropagation(); toggleAudio(t, WAKE); }}
                       title={playing === clipKey(t, WAKE) ? 'Stop'
                         : 'Play the 1.4s that crossed the wake threshold — what triggered it, not the command'}
                       style={{ ...glyphBtn, color: playing === clipKey(t, WAKE) ? 'var(--warn)' : 'var(--lcd-amber)' }}>
                       {playing === clipKey(t, WAKE) ? '▮' : '▷'}
                     </button>
-                    <button onClick={() => downloadAudio(t, WAKE)}
+                    <button onClick={e => { e.stopPropagation(); downloadAudio(t, WAKE); }}
                       title="Download the wake clip — a false trigger belongs in wake-word training"
                       style={{ ...glyphBtn, color: 'var(--muted)' }}>⤓</button>
                   </>)}
                   {t.audio_file && !gone.has(clipKey(t, MIC)) && (<>
-                    <button onClick={() => toggleAudio(t, MIC)}
+                    <button onClick={e => { e.stopPropagation(); toggleAudio(t, MIC); }}
                       title={playing === clipKey(t, MIC) ? 'Stop' : 'Play the mic audio for this turn'}
                       style={{ ...glyphBtn, color: playing === clipKey(t, MIC) ? 'var(--warn)' : 'var(--text2)' }}>
                       {playing === clipKey(t, MIC) ? '▮' : '▶'}
                     </button>
-                    <button onClick={() => downloadAudio(t, MIC)} title="Download the WAV"
+                    <button onClick={e => { e.stopPropagation(); downloadAudio(t, MIC); }} title="Download the WAV"
                       style={{ ...glyphBtn, color: 'var(--muted)' }}>⤓</button>
                   </>)}
                 </span>
@@ -1022,25 +1194,8 @@ function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, nearMis
           })}
           </div>
 
-          {/* Hover detail */}
-          {hover != null && recent[hover] && (() => {
-            const t = recent[hover]; const seg = turnSegments(t);
-            return (
-              <div style={{ marginTop: 10, background: 'var(--hairline)', border: '1px solid var(--track)', borderRadius: 6, padding: '8px 12px', fontFamily: mono, fontSize: 10, color: 'var(--text2)', lineHeight: 1.7 }}>
-                <span style={{ color: 'var(--muted)' }}>{t.trigger}</span>
-                {' · '}listening {fmtS(seg.listen)} · transcribe {fmtS(seg.transcribe)} · respond {fmtS(seg.respond)} · total {fmtS(Math.max(t.total_ms, 0))}
-                {t.wake_model ? <><br/>wake {t.wake_model.replace(/\.[a-z]+$/, '').split('/').pop()} score {t.wake_score?.toFixed(3)} (thr {t.wake_threshold?.toFixed(2)}) · noise floor {t.noise_floor?.toFixed(4)}</> : null}
-                {t.dev_shadow ? <><br/>device {t.dev_wake_score != null
-                  ? `score ${t.dev_wake_score.toFixed(3)}${t.dev_wake_delta_ms != null ? ` (${t.dev_wake_delta_ms >= 0 ? '+' : ''}${t.dev_wake_delta_ms}ms)` : ''}`
-                  : `no cross${t.dev_threshold != null ? ` (thr ${t.dev_threshold.toFixed(2)})` : ''}`}</> : null}
-                {String(t.trigger || '').startsWith('wakeword-dev') ? <><br/>controller {t.ctrl_wake_score != null
-                  ? `score ${t.ctrl_wake_score.toFixed(3)}${t.ctrl_wake_delta_ms != null ? ` (${t.ctrl_wake_delta_ms >= 0 ? '+' : ''}${t.ctrl_wake_delta_ms}ms)` : ''}`
-                  : 'no cross'}</> : null}
-                {t.underruns != null ? <>{t.wake_model ? ' · ' : <br/>}underruns <span style={{ color: t.underruns > 0 ? 'var(--warn)' : 'inherit' }}>{t.underruns}</span></> : null}
-                {t.stt_text ? <><br/>“{t.stt_text.length > 90 ? t.stt_text.slice(0, 90) + '…' : t.stt_text}”</> : null}
-              </div>
-            );
-          })()}
+          {/* Stage-by-stage detail of the selected turn (the newest until one is clicked) */}
+          {shown && <TurnDetail turn={shown}/>}
         </div>
       )}
     </div>
@@ -1719,6 +1874,273 @@ function AmbientPanel({ device, isAdmin }) {
   );
 }
 
+// Device wake telemetry is the last `wake.stats` report (§11.1). A missing
+// measurement stays unavailable rather than looking like a healthy zero.
+function WakeHealth({ device, registry, expected }) {
+  const w = device.wake_stats;
+  const gap = capabilityGap(liveCapabilities(device), 'device_wake_v1');
+  const unavailable = gap || w?.wake_unavailable;
+  const mono = "'DM Mono',monospace";
+  const reason = gap || (w?.wake_unavailable
+    ? `${w.wake_unavailable.replace(/_/g, ' ')}${w.detail ? ` — ${w.detail}` : ''}`
+    : w ? 'ready' : 'waiting for the first wake report');
+  const near = w?.near_misses || [];
+  const nearPeak = near.reduce((n, x) => Math.max(n, Number(x.peak) || 0), 0);
+  return (
+    <Panel label={`Wake health — ${wakeModelLabel(registry.models, expected)}`}>
+      <div className="em-grid2" style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:'0 24px' }}>
+        <div>
+          <div style={{ display:'flex', justifyContent:'space-between', padding:'8px 0', borderBottom:'1px solid var(--hairline)' }}>
+            <span style={{ fontFamily:mono, fontSize:11, color:'var(--muted)' }}>Availability</span>
+            <span style={{ fontFamily:mono, fontSize:11, color:unavailable ? 'var(--warn)' : 'var(--ok)' }}>{reason}</span>
+          </div>
+          <div style={{ display:'flex', justifyContent:'space-between', padding:'8px 0', borderBottom:'1px solid var(--hairline)' }}>
+            <span style={{ fontFamily:mono, fontSize:11, color:'var(--muted)' }}>Installed graph</span>
+            <span style={{ fontFamily:mono, fontSize:11, color:w?.graph_sha256 && expected && w.graph_sha256 !== expected ? 'var(--warn)' : 'var(--text2)' }}>
+              {shortSha(w?.graph_sha256)}
+            </span>
+          </div>
+          <div style={{ display:'flex', justifyContent:'space-between', padding:'8px 0' }}>
+            <span style={{ fontFamily:mono, fontSize:11, color:'var(--muted)' }}>Last report</span>
+            <span style={{ fontFamily:mono, fontSize:11, color:'var(--text2)' }}>
+              {w?.received_ms ? relTime(w.received_ms / 1000) : '—'}
+            </span>
+          </div>
+        </div>
+        <div style={{ display:'flex', gap:10, flexWrap:'wrap' }}>
+          <Lcd label="Max inference" value={w?.infer_max_ms != null ? w.infer_max_ms.toFixed(1) : '—'} color="var(--lcd-dim)" size={14}/>
+          <Lcd label="Overruns" value={w?.hops_dropped ?? '—'} color={(w?.hops_dropped || 0) > 0 ? 'var(--lcd-amber)' : 'var(--lcd-dim)'} size={14}/>
+          <Lcd label="Near misses" value={w ? near.length : '—'} color={near.length ? 'var(--lcd-amber)' : 'var(--lcd-dim)'} size={14}/>
+          <Lcd label="Near-miss peak" value={w ? nearPeak.toFixed(3) : '—'} color="var(--lcd-dim)" size={14}/>
+          <Lcd label="Candidates" value={w?.candidates_opened ?? '—'} color="var(--lcd-dim)" size={14}/>
+          <Lcd label="Inference errors" value={w?.inference_errors ?? '—'} color={(w?.inference_errors || 0) > 0 ? 'var(--lcd-amber)' : 'var(--lcd-dim)'} size={14}/>
+        </div>
+      </div>
+    </Panel>
+  );
+}
+
+function formatAlertTime(value) {
+  if (!value) return '—';
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? value : d.toLocaleString([], {
+    weekday:'short', month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'
+  });
+}
+
+// Timers are display copies; alarms and every dashboard operation go through
+// AlertEngine (§10.5). The panel never manufactures a ring from a countdown.
+function AlertPanel({ device, isAdmin }) {
+  const [payload, setPayload] = useState(null);
+  const [calendarUrl, setCalendarUrl] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [name, setName] = useState('');
+  const [time, setTime] = useState('07:00');
+  const [date, setDate] = useState('');
+  const [days, setDays] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState(null);
+  const mono = "'DM Mono',monospace";
+
+  const load = useCallback(async () => {
+    try {
+      const [a, h] = await Promise.all([
+        API.get(`/api/devices/${device.device_id}/alerts`),
+        API.get('/api/ha/status').catch(() => null),
+      ]);
+      setPayload(a);
+      setCalendarUrl(h?.calendar_url || null);
+    } catch (e) {
+      setResult({ ok:false, text:e.error || 'Alert status is unavailable' });
+    }
+    setLoading(false);
+  }, [device.device_id]);
+
+  // The engine republishes its timer display copies once a second (§10.8), so
+  // those events update the list in place; every other alert event refetches.
+  useEffect(() => {
+    load();
+    return subscribeEvents(msg => {
+      if (msg.type === 'alerts' && msg.device_id === device.device_id) {
+        if (msg.kind === 'timers' && Array.isArray(msg.data?.timers)) {
+          setPayload(p => p?.status ? { ...p, status:{ ...p.status, timers:msg.data.timers } } : p);
+        } else {
+          load();
+        }
+      }
+      if (msg.type === 'ha_status') setPayload(p => p ? { ...p, ha:msg.features } : p);
+    });
+  }, [load, device.device_id]);
+
+  const status = payload?.status;
+  const timers = status?.timers || [];
+  const occurrences = status?.occurrences || [];
+  const pending = (status?.operations || []).filter(x => x.state === 'pending');
+  const recent = (status?.operations || []).filter(x => x.state !== 'pending').slice(0, 8);
+  const alertState = status?.alert_state;
+  const active = alertState?.active;
+  const features = payload?.ha || {};
+
+  async function createAlarm() {
+    setBusy(true); setResult(null);
+    try {
+      const r = await API.post(`/api/devices/${device.device_id}/alarms`, {
+        time, days, name:name.trim(), date:date || null,
+      });
+      setResult({ ok:!!r.ok, text:r.ok
+        ? (r.delivery_pending ? 'Stored in Home Assistant; delivery to the Echo is pending.'
+          : r.armed_on_endpoint ? 'Stored in Home Assistant and armed on the Echo.'
+          : r.pending ? 'Home Assistant is still confirming this alarm.' : 'Alarm saved.')
+        : (r.error || 'Alarm was not saved') });
+      if (r.ok) { setName(''); setDate(''); await load(); }
+    } catch (e) { setResult({ ok:false, text:e.error || 'Alarm was not saved' }); }
+    setBusy(false);
+  }
+
+  async function cancelAlarm(o) {
+    // The engine cancels whole schedules matched by name and time (§10.3).
+    if (!confirm(`Cancel "${o.label}"? A repeating alarm is removed with every future occurrence.`)) return;
+    setBusy(true); setResult(null);
+    const matchTime = String(o.due_local || '').match(/T(\d\d:\d\d(?::\d\d)?)/)?.[1] || '';
+    try {
+      const r = await API.post(`/api/devices/${device.device_id}/alarms/cancel`, {
+        name:o.label, time:matchTime, all:false,
+      });
+      setResult({ ok:!!r.ok, text:r.ok
+        ? (r.delivery_pending ? 'Removed from Home Assistant; cancellation delivery is pending.' : 'Alarm cancelled.')
+        : (r.error || 'Alarm was not cancelled') });
+      await load();
+    } catch (e) { setResult({ ok:false, text:e.error || 'Alarm was not cancelled' }); }
+    setBusy(false);
+  }
+
+  const featureEntries = Object.entries(features);
+  return (
+    <div style={{ minHeight:'100%', display:'flex', flexDirection:'column', gap:16 }}>
+      <div className="em-grid2" style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:16 }}>
+        <Panel label="Now">
+          {active ? (
+            <div>
+              <div style={{ fontFamily:mono, fontSize:13, color:'var(--warn)', marginBottom:6 }}>
+                {active.kind === 'timer' ? 'Timer' : 'Alarm'} ringing · {active.name || active.id}
+              </div>
+              <div style={{ fontFamily:mono, fontSize:10, color:'var(--muted)' }}>
+                {active.foreground ? 'foreground' : 'background while a turn is open'}
+              </div>
+            </div>
+          ) : <div style={{ fontFamily:mono, fontSize:11, color:'var(--muted)' }}>Nothing is ringing.</div>}
+          <div style={{ marginTop:14 }}>
+            {timers.length === 0 ? (
+              <div style={{ fontFamily:mono, fontSize:10, color:'var(--muted)' }}>
+                No active Home Assistant timers in this controller&apos;s display copy.
+              </div>
+            ) : timers.map(t => {
+              const left = Math.max(0, t.remaining_seconds || 0);
+              return <div key={t.id} style={{ display:'flex', justifyContent:'space-between', padding:'7px 0', borderTop:'1px solid var(--hairline)' }}>
+                <span style={{ fontFamily:mono, fontSize:11, color:'var(--text2)' }}>{t.name || 'Timer'}</span>
+                <span style={{ fontFamily:mono, fontSize:11, color:'var(--lcd-green)' }}>
+                  {Math.floor(left/60)}:{String(left%60).padStart(2,'0')}{t.active ? '' : ' · paused'}
+                </span>
+              </div>;
+            })}
+          </div>
+        </Panel>
+        <Panel label="Delivery health">
+          <div style={{ fontFamily:mono, fontSize:10, lineHeight:1.8, color:'var(--text2)' }}>
+            <div>Calendar subscription {status ? <span style={{ color:status.calendar_live ? 'var(--ok)' : 'var(--warn)' }}>{status.calendar_live ? 'live' : 'unavailable'}</span> : '—'}</div>
+            <div>Endpoint {status ? <span style={{ color:status.online ? 'var(--ok)' : 'var(--warn)' }}>{status.online ? 'online' : 'offline'}</span> : '—'}</div>
+            <div>Delivery sequence {status ? `${status.acked_sequence} / ${status.sequence}` : '—'}</div>
+            <div>Clock <span style={{ color:alertState?.clock_trusted ? 'var(--ok)' : 'var(--warn)' }}>{alertState ? (alertState.clock_trusted ? 'trusted' : 'untrusted') : '—'}</span></div>
+            <div>Wakelock <span style={{ color:alertState?.wakelock === 'held' || alertState?.wakelock === 'released' ? 'var(--ok)' : 'var(--warn)' }}>{alertState?.wakelock || '—'}</span></div>
+            <div>Alert store <span style={{ color:alertState?.store === 'ok' ? 'var(--ok)' : 'var(--warn)' }}>{alertState?.store || '—'}</span></div>
+          </div>
+          {(status?.flags || []).map(flag => (
+            <div key={flag} style={{ marginTop:6, fontFamily:mono, fontSize:9, color:'var(--warn)' }}>{flag.replace(/_/g,' ')}</div>
+          ))}
+        </Panel>
+      </div>
+
+      <Panel label="Alarm schedules and occurrences">
+        {loading ? <div style={{ fontFamily:mono, fontSize:11, color:'var(--muted)' }}>Loading…</div>
+        : !status ? <div style={{ fontFamily:mono, fontSize:11, color:'var(--warn)' }}>This endpoint&apos;s alarm calendar is unavailable.</div>
+        : occurrences.length === 0 ? <div style={{ fontFamily:mono, fontSize:11, color:'var(--muted)' }}>No upcoming alarms.</div>
+        : occurrences.map(o => (
+          <div key={o.occurrence_id} style={{ display:'flex', alignItems:'center', gap:12, padding:'9px 0', borderBottom:'1px solid var(--hairline)' }}>
+            <div style={{ flex:1, minWidth:0 }}>
+              <div style={{ fontFamily:"'DM Sans',sans-serif", fontSize:12, fontWeight:600, color:'var(--text2)' }}>{o.label}</div>
+              <div style={{ fontFamily:mono, fontSize:9, color:'var(--muted)', marginTop:2 }}>
+                {formatAlertTime(o.due_local)} · schedule {shortSha(o.schedule_id)}
+              </div>
+            </div>
+            <span style={{ fontFamily:mono, fontSize:9, color:o.armed_on_endpoint ? 'var(--ok)' : 'var(--warn)' }}>
+              {o.armed_on_endpoint ? 'armed on endpoint' : o.delivery_pending ? 'delivery pending' : o.stored_in_ha ? 'stored in HA' : 'unconfirmed'}
+            </span>
+            {isAdmin && <Pill small danger disabled={busy} onClick={() => cancelAlarm(o)}>Cancel</Pill>}
+          </div>
+        ))}
+        {isAdmin && (
+          <div style={{ marginTop:18, paddingTop:14, borderTop:'1px solid var(--hairline)' }}>
+            <div className="em-grid2" style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:12 }}>
+              <label style={{ fontFamily:mono, fontSize:10, color:'var(--text2)' }}>Time
+                <input type="time" value={time} onChange={e => setTime(e.target.value)} style={{ display:'block', width:'100%', marginTop:5, boxSizing:'border-box' }}/>
+              </label>
+              <label style={{ fontFamily:mono, fontSize:10, color:'var(--text2)' }}>Name
+                <input type="text" value={name} maxLength={120} placeholder="Alarm" onChange={e => setName(e.target.value)} style={{ display:'block', width:'100%', marginTop:5, boxSizing:'border-box' }}/>
+              </label>
+            </div>
+            <div style={{ display:'flex', alignItems:'center', gap:8, flexWrap:'wrap', marginTop:12 }}>
+              {['mon','tue','wed','thu','fri','sat','sun'].map(d => (
+                <button key={d} className={'em-pill em-pill--small' + (days.includes(d) ? ' em-pill--accent' : '')}
+                  onClick={() => { setDate(''); setDays(xs => xs.includes(d) ? xs.filter(x => x !== d) : [...xs,d]); }}>
+                  {d}
+                </button>
+              ))}
+              <label style={{ marginLeft:'auto', fontFamily:mono, fontSize:9, color:'var(--muted)' }}>
+                one date <input type="date" value={date} disabled={days.length > 0} onChange={e => { setDays([]); setDate(e.target.value); }} style={{ marginLeft:6 }}/>
+              </label>
+            </div>
+            <div style={{ display:'flex', alignItems:'center', gap:10, marginTop:14 }}>
+              <Pill accent disabled={busy || !time} onClick={createAlarm}>{busy ? 'Working…' : 'Create alarm'}</Pill>
+              <span style={{ fontFamily:mono, fontSize:9, color:'var(--muted)' }}>
+                {days.length ? `Repeats ${days.join(', ')}` : date ? `One time on ${date}` : 'One time at the next occurrence'}
+              </span>
+            </div>
+          </div>
+        )}
+        {result && <div style={{ marginTop:12, fontFamily:mono, fontSize:10, color:result.ok ? 'var(--ok)' : 'var(--error)' }}>{result.text}</div>}
+      </Panel>
+
+      <div className="em-grid2" style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:16 }}>
+        <Panel label="Home Assistant provisioning">
+          {featureEntries.length === 0 ? <div style={{ fontFamily:mono, fontSize:10, color:'var(--muted)' }}>No provisioning report.</div>
+          : featureEntries.map(([key, value]) => (
+            <div key={key} style={{ display:'flex', justifyContent:'space-between', gap:12, padding:'6px 0', borderBottom:'1px solid var(--hairline)' }}>
+              <span style={{ fontFamily:mono, fontSize:10, color:'var(--text2)' }}>{key.replace(/_/g,' ')}</span>
+              <span style={{ fontFamily:mono, fontSize:9, color:value?.ok ? 'var(--ok)' : 'var(--warn)', textAlign:'right' }}>
+                {value?.ok ? 'ready' : value?.detail || 'unavailable'}
+              </span>
+            </div>
+          ))}
+          {calendarUrl && <a href={calendarUrl} target="_blank" rel="noreferrer" style={{ display:'inline-block', marginTop:12, fontFamily:mono, fontSize:10, color:'var(--accent)' }}>Open Home Assistant calendar editor →</a>}
+        </Panel>
+        <Panel label={`Journal operations · ${pending.length} pending`}>
+          {[...pending, ...recent].length === 0 ? <div style={{ fontFamily:mono, fontSize:10, color:'var(--muted)' }}>No operations in the last 24 hours.</div>
+          : [...pending, ...recent].map(op => (
+            <div key={op.op_id} style={{ padding:'6px 0', borderBottom:'1px solid var(--hairline)' }}>
+              <div style={{ display:'flex', justifyContent:'space-between', gap:10 }}>
+                <span style={{ fontFamily:mono, fontSize:10, color:'var(--text2)' }}>{op.action.replace(/_/g,' ')}</span>
+                <span style={{ fontFamily:mono, fontSize:9, color:op.state === 'pending' ? 'var(--warn)' : op.state === 'applied' ? 'var(--ok)' : 'var(--error)' }}>{op.state} · step {op.step}</span>
+              </div>
+              <div style={{ fontFamily:mono, fontSize:8, color:'var(--muted)', marginTop:2 }}>{shortSha(op.op_id)} · {op.source} · {new Date(op.created_ms).toLocaleTimeString()}</div>
+            </div>
+          ))}
+        </Panel>
+      </div>
+    </div>
+  );
+}
+
+
 
 // ─── Device detail modal ──────────────────────────────────────────────────────
 
@@ -1751,25 +2173,25 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
   const [deleting, setDeleting] = useState(false);
   const [securing, setSecuring] = useState(false);
   const [debloating, setDebloating] = useState(false);
-  const [assets, setAssets] = useState(null);
-  const [installing, setInstalling] = useState(false);
-  // Wake word asset install progress: bytes confirmed sent, the file in
-  // flight, the controller's own narration, and the final outcome.
-  const [assetSent, setAssetSent]     = useState(0);
-  const [assetNow, setAssetNow]       = useState(null);
-  const [assetLog, setAssetLog]       = useState([]);
-  const [assetResult, setAssetResult] = useState(null);
   const fileInputRef = useRef(null);
   const [turns, setTurns] = useState([]);
+  const [registry] = useWakeRegistry();
   const state = deviceState(device);
-  const needsUpdate = device.firmware_ver && release?.version && device.firmware_ver !== release.version;
+  // A device on the legacy handler must update whatever the release says:
+  // its firmware cannot speak protocol v1 at any version it reports (§12).
+  const needsUpdate = !!device.upgrade_required
+    || !!(device.firmware_ver && release?.version && device.firmware_ver !== release.version);
 
   // "samples" is admin-only for the reason the endpoint behind it is: the
   // mode suspends the assistant on this device, which is not something a
   // read-only viewer should be able to do to everyone else in the house.
-  const TABS = device.approved
-    ? (isAdmin ? ['status', 'activity', 'samples', 'config', 'console', 'updates', 'logs'] : ['status', 'activity', 'config', 'logs'])
-    : ['approve'];
+  // A device awaiting its protocol-v1 firmware has nothing to configure or
+  // observe yet: it gets status, the update, its console and logs.
+  const TABS = !device.approved ? ['approve']
+    : device.upgrade_required
+      ? (isAdmin ? ['status', 'updates', 'console', 'logs'] : ['status', 'logs'])
+      : (isAdmin ? ['status', 'activity', 'alerts', 'samples', 'config', 'console', 'updates', 'logs']
+                 : ['status', 'activity', 'alerts', 'config', 'logs']);
 
   useEffect(() => {
     if (tab === 'logs') {
@@ -1780,11 +2202,6 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
     }
     if (tab === 'updates') {
       API.get('/api/releases/latest').then(setRelease).catch(() => {});
-      // Asset state costs a device shell round trip, so it is fetched on tab
-      // entry rather than polled — unlike a release, it only changes when
-      // someone acts on it here.
-      API.get(`/api/devices/${device.device_id}/oww_assets`)
-        .then(setAssets).catch(() => setAssets(null));
     }
   }, [tab, device.device_id]);
 
@@ -1885,65 +2302,6 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
             + 'watch the device log for details.');
     } catch(e) { alert(e.error || 'Debloat failed'); }
     setTimeout(() => setDebloating(false), 8000);
-  }
-
-  async function doInstallAssets() {
-    // Up to ~15MB over the shell plane, which is minutes on a marginal link —
-    // far too long to sit behind a spinner and then a browser alert().
-    //
-    // The POST does not return until the whole sync is done, so its own
-    // response cannot drive a bar. The controller narrates each file to the
-    // device log as it goes (`_sync_oww_assets.say`), and those lines arrive
-    // on the events socket — so progress is derived by watching for its
-    // "sending <name> (<n>MB)…" line and charging that file's bytes to the
-    // total as it completes. Byte-weighted, not file-count: the runtime is
-    // 12.3MB of a ~15MB job, so counting files would jump 0→50% for the
-    // trivial half and then appear frozen for the long one.
-    const sizes = Object.fromEntries((assets?.required || []).map(a => [a.name, a.size]));
-    const queue = (assets?.missing || []).slice();
-    const total = queue.reduce((n, name) => n + (sizes[name] || 0), 0);
-
-    setInstalling(true);
-    setAssetResult(null);
-    setAssetLog([]);
-    setAssetSent(0);
-    setAssetNow(queue.length ? null : 'Checking what the device needs…');
-
-    let sent = 0, current = null;
-    const unsub = subscribeDeviceLog((id, entry) => {
-      if (id !== device.device_id) return;
-      const m = /^Wake word assets: (.*)$/.exec(entry.message || '');
-      if (!m) return;
-      const text = m[1];
-      setAssetLog(l => [...l.slice(-40), { level: entry.level, text }]);
-      const sending = /^sending (\S+)/.exec(text);
-      if (sending) {
-        // The previously-announced file is done once the next one starts.
-        if (current) { sent += sizes[current] || 0; setAssetSent(sent); }
-        current = sending[1];
-        setAssetNow(current);
-      }
-    });
-
-    try {
-      const res = await API.post(`/api/devices/${device.device_id}/oww_assets`, {});
-      const n = (res.pushed || []).length;
-      setAssetSent(total);
-      setAssetNow(null);
-      setAssetResult({ ok: true, text: n === 0
-        ? 'Already up to date — nothing needed installing.'
-        : `Installed ${n} file${n === 1 ? '' : 's'}. Restart the device to start scoring on-device.` });
-      setAssets(await API.get(`/api/devices/${device.device_id}/oww_assets`));
-    } catch(e) {
-      setAssetNow(null);
-      // Partial progress is left on screen deliberately: which file it died on
-      // is the useful part, and md5-then-rename means nothing half-written was
-      // left behind to worry about.
-      setAssetResult({ ok: false, text: e.error || 'Install failed.' });
-    } finally {
-      unsub();
-      setInstalling(false);
-    }
   }
 
   async function doUpdate() {
@@ -2115,7 +2473,7 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                   const ipStr = device.connected ? (ip || '—') : (ip ? `${ip} (last seen)` : '—');
                   return <>{ipStr} · {device.device_id} · {device.firmware_ver || 'unknown'}</>;
                 })()}
-                {needsUpdate && <span style={{ color: 'var(--warn)', marginLeft: 10 }}>Update available</span>}
+                {needsUpdate && <span style={{ color: 'var(--warn)', marginLeft: 10 }}>{device.upgrade_required ? 'Upgrade required' : 'Update available'}</span>}
               </div>
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
@@ -2156,6 +2514,17 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                       style={{ display: 'inline-block', pointerEvents: 'none',
                                fontFamily: "'DM Mono',monospace", letterSpacing: '0.05em' }}>
                   CAPTURING
+                </span>
+              )}
+              {/* §11.3: microphone audio leaves the device outside a turn only
+                  under a diagnostic lease, and the dashboard says so while it
+                  is open. */}
+              {device.diagnostic && (
+                <span className="em-pill em-pill--small em-pill--danger"
+                      title="A diagnostic lease is streaming live microphone audio; wakes are refused"
+                      style={{ display: 'inline-block', pointerEvents: 'none',
+                               fontFamily: "'DM Mono',monospace", letterSpacing: '0.05em' }}>
+                  MIC LIVE
                 </span>
               )}
               {isAdmin && !confirmDelete && (
@@ -2246,10 +2615,22 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
             const stoPct   = s?.storageTotalMb ? s.storageUsedMb/s.storageTotalMb*100 : null;
             const stoText  = s?.storageTotalMb != null
               ? `${(s.storageUsedMb/1024).toFixed(1)} / ${(s.storageTotalMb/1024).toFixed(1)} GB` : null;
-            const cfgEff = effectiveConfig(globalConfig, device);
-            const wwLabel = wwModelLabel(cfgEff.owwModel);
             return (
               <div style={{ minHeight:'100%', display:'flex', flexDirection:'column', gap:16 }}>
+                {device.upgrade_required && (
+                  <Panel label="Upgrade required">
+                    <div style={{ fontFamily:"'DM Mono',monospace", fontSize:11, color:'var(--text2)', lineHeight:1.6, marginBottom: isAdmin ? 12 : 0 }}>
+                      This Echo runs firmware from before protocol v1. Until it is
+                      updated it takes no voice turns, rings no timers or alarms and
+                      plays nothing — the controller only offers it the update.
+                    </div>
+                    {isAdmin && (
+                      <Pill accent disabled={pushing} onClick={() => { setTab('updates'); doUpdate(); }}>
+                        {pushing ? 'Updating…' : 'Update firmware'}
+                      </Pill>
+                    )}
+                  </Panel>
+                )}
                 <div className="em-grid2" style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:16 }}>
                   <Panel label="Device">
                     {row('IP', (() => {
@@ -2340,6 +2721,10 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                     {!s && <div style={{ fontFamily:"'DM Mono',monospace", fontSize:9, color:'var(--muted)', marginTop:8 }}>waiting for device stats…</div>}
                   </Panel>
                 </div>
+                {!device.upgrade_required && device.approved && (
+                  <WakeHealth device={device} registry={registry}
+                    expected={effectiveConfig(globalConfig, device).wakeModel || registry.active}/>
+                )}
                 {device.bleProxy && (() => {
                   const b  = s?.ble || null;          // device-side scanner stats
                   const bp = device.bleProxy;         // controller-side proxy state
@@ -2373,16 +2758,18 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
               useful, was cramped at the bottom of Status). */}
           {tab === 'activity' && (() => {
             const cfgEff = effectiveConfig(globalConfig, device);
-            const wwLabel = wwModelLabel(cfgEff.owwModel);
+            const model = registry.models.find(m => m.graph_sha256 === cfgEff.wakeModel);
+            const thr = model
+              ? ` · idle ${model.thresholds.idle.toFixed(2)} / playback ${model.thresholds.playback.toFixed(2)}`
+              : '';
             return (
               <div style={{ minHeight:'100%', display:'flex', flexDirection:'column' }}>
-                <Panel label={`Voice activity — ${wwLabel} @ ${cfgEff.owwThreshold != null ? cfgEff.owwThreshold.toFixed(2) : '—'}`} style={{ flex:1 }}>
+                <Panel label={`Voice activity — ${wakeModelLabel(registry.models, cfgEff.wakeModel)}${thr}`} style={{ flex:1 }}>
                   <TurnObservability
                     turns={turns}
                     deviceId={device.device_id}
                     deviceLabel={device.label}
                     recordingsOn={cfgEff.saveUtterances}
-                    nearMisses={device.owwNearMisses}
                     stateLabel={state.label.toUpperCase()}
                     stateColor={state.dot}
                   />
@@ -2390,6 +2777,9 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
               </div>
             );
           })()}
+
+          {/* ALERTS — timers, this endpoint's alarms and their delivery */}
+          {tab === 'alerts' && <AlertPanel device={device} isAdmin={isAdmin}/>}
 
           {/* SAMPLES — wake-word training capture */}
           {tab === 'samples' && <SamplesTab device={device} isAdmin={isAdmin}/>}
@@ -2439,15 +2829,9 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                 onChange={(k, v) => setConf(k, v)}
                 disabled={!isAdmin}
                 sections={sections}
-                shadowCapable={!device.connected || !!device.owwShadowCapable}
-                triggerCapable={!device.connected || !!device.owwTriggerCapable}
-                mixCapable={!device.connected || !!device.audioMixCapable}
-                holdCapable={!device.connected || !!device.buttonHoldCapable}
-                wakeSoundCapable={!device.connected || !!device.wakeSoundCapable}
-                bcresnetCapable={!device.connected || !!device.owwBcresnetCapable}
+                capabilities={liveCapabilities(device)}
                 deviceId={device.device_id}
-                deviceConnected={!!device.connected}
-                deviceRinging={!!device.ringing}
+                deviceConnected={!!device.connected && !device.upgrade_required}
                 onScopeChange={(id, local) => {
                   setSections(prev => local
                     ? [...prev, id]
@@ -2620,129 +3004,6 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                 </Panel>
               )}
 
-
-              {/* On-device wake word assets.
-
-                  Separate from firmware on purpose: the runtime is 12.3MB and
-                  changes far less often than the binary, so it is not in the
-                  OTA payload. That makes it invisible unless something says
-                  so — a device can be configured for on-device scoring and
-                  silently not be doing it, which is the failure this panel
-                  exists to make legible. */}
-              {isAdmin && device.owwShadowCapable && (
-                <Panel label="On-device wake word">
-                  <div style={{ display:'flex', alignItems:'center', gap:12, flexWrap:'wrap', marginBottom:12 }}>
-                    <span style={{ fontFamily:"'DM Mono',monospace", fontSize:11,
-                      color: !assets ? 'var(--muted)'
-                           : assets.status === 'installed' ? 'var(--ok)'
-                           : assets.status === 'blocked' ? 'var(--error)'
-                           : assets.status === 'unknown' ? 'var(--muted)'
-                           : 'var(--warn)' }}>
-                      {!assets ? 'checking…'
-                        : assets.status === 'installed' ? 'Installed'
-                        : assets.status === 'outdated' ? 'Out of date'
-                        : assets.status === 'blocked' ? 'Not enough space'
-                        : assets.status === 'unknown' ? 'Device offline — state unknown'
-                        : 'Not installed'}
-                    </span>
-                    {assets?.free_mb != null && (
-                      <span style={{ fontFamily:"'DM Mono',monospace", fontSize:9, color:'var(--muted)' }}>
-                        {assets.free_mb}MB free
-                      </span>
-                    )}
-                  </div>
-                  <div style={{ fontFamily:"'DM Mono',monospace", fontSize:10, color:'var(--muted)', lineHeight:1.6, marginBottom:14 }}>
-                    The ONNX runtime and wake models the device needs to score
-                    locally (~15MB). They are not part of the firmware, so they
-                    install separately and survive updates. Scoring only starts
-                    after a device restart.
-                  </div>
-                  {assets?.blocked && (
-                    <div style={{ fontFamily:"'DM Mono',monospace", fontSize:10, color:'var(--error)', marginBottom:12 }}>
-                      {assets.blocked}
-                    </div>
-                  )}
-                  {(assets?.problems || []).map((p, i) => (
-                    <div key={i} style={{ fontFamily:"'DM Mono',monospace", fontSize:10, color:'var(--warn)', marginBottom:8 }}>
-                      {p}
-                    </div>
-                  ))}
-                  <Pill small
-                        disabled={!device.connected || installing || assets?.status === 'installed'}
-                        onClick={doInstallAssets}>
-                    {installing ? 'Installing…'
-                      : assets?.status === 'installed' ? 'Installed'
-                      : assets?.status === 'outdated' ? 'Update assets'
-                      : 'Install assets'}
-                  </Pill>
-                  {!installing && assets?.missing?.length > 0 && (
-                    <span style={{ fontFamily:"'DM Mono',monospace", fontSize:9, color:'var(--muted)', marginLeft:10 }}>
-                      {assets.missing.length} file(s) to send
-                    </span>
-                  )}
-
-                  {/* Progress. Determinate whenever the GET told us what is
-                      missing; indeterminate only in the brief window before
-                      the first file is announced. */}
-                  {installing && (() => {
-                    const sizes = Object.fromEntries((assets?.required || []).map(a => [a.name, a.size]));
-                    const total = (assets?.missing || []).reduce((n, nm) => n + (sizes[nm] || 0), 0);
-                    const pct   = total > 0 ? Math.min(100, Math.round(assetSent / total * 100)) : 0;
-                    return (
-                      <div style={{ marginTop: 14 }}>
-                        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'baseline', marginBottom:6 }}>
-                          <span style={{ fontFamily:"'DM Mono',monospace", fontSize:10, color:'var(--text2)' }}>
-                            {assetNow ? `Sending ${assetNow}…` : 'Working…'}
-                          </span>
-                          {total > 0 && (
-                            <span style={{ fontFamily:"'DM Mono',monospace", fontSize:10, color:'var(--muted)' }}>
-                              {(assetSent/1024/1024).toFixed(1)} / {(total/1024/1024).toFixed(1)} MB
-                            </span>
-                          )}
-                        </div>
-                        <div style={{ height:6, borderRadius:3, background:'var(--lcd-bg)', border:'1px solid var(--lcd-line)', overflow:'hidden', boxShadow:'inset 0 1px 3px rgba(0,0,0,0.5)' }}>
-                          {/* No size known yet — fill it dimly rather than
-                              animate, which would need a keyframe this
-                              stylesheet does not have and would overstate
-                              how much the bar knows. */}
-                          <div style={{ height:'100%', width:`${total > 0 ? pct : 100}%`,
-                                        background: total > 0 ? 'linear-gradient(90deg,var(--accent-hi),var(--accent-lit))' : 'var(--accent-deep)',
-                                        transition:'width 0.3s ease' }}/>
-                        </div>
-                      </div>
-                    );
-                  })()}
-
-                  {/* The controller's own narration, in place of an alert().
-                      Kept after the run so a failure can be read, not just
-                      acknowledged and lost. */}
-                  {assetLog.length > 0 && (
-                    <div style={{ marginTop:12, maxHeight:120, overflowY:'auto', background:'var(--lcd-bg)', border:'1px solid var(--lcd-line)', borderRadius:6, padding:'8px 10px', boxShadow:'inset 0 2px 4px rgba(0,0,0,0.5)' }}>
-                      {assetLog.map((l, i) => (
-                        <div key={i} style={{ fontFamily:"'DM Mono',monospace", fontSize:10, lineHeight:1.6,
-                          color: l.level === 'error' ? 'var(--error)' : l.level === 'warn' ? 'var(--warn)' : 'var(--lcd-green)' }}>
-                          {l.text}
-                        </div>
-                      ))}
-                    </div>
-                  )}
-
-                  {assetResult && (
-                    <div style={{ marginTop:12, display:'flex', gap:8, alignItems:'flex-start',
-                                  border:`1px solid ${assetResult.ok ? 'var(--ok)' : 'var(--error)'}`,
-                                  background: assetResult.ok ? 'rgba(40,96,64,0.10)' : 'rgba(154,48,32,0.10)',
-                                  borderRadius:6, padding:'10px 12px' }}>
-                      <span style={{ fontFamily:"'DM Mono',monospace", fontSize:12, color: assetResult.ok ? 'var(--ok)' : 'var(--error)' }}>
-                        {assetResult.ok ? '●' : '✕'}
-                      </span>
-                      <span style={{ fontFamily:"'DM Sans',sans-serif", fontSize:12, color:'var(--text2)', lineHeight:1.5 }}>
-                        {assetResult.text}
-                      </span>
-                    </div>
-                  )}
-                </Panel>
-              )}
-
               {/* Activity console — always present so the layout never jumps
                   when a deploy starts */}
               <div className="em-inset" style={{ '--em-inset-pad':'14px', fontFamily:"'DM Mono',monospace", fontSize:12, minHeight:96, flex:1 }}>
@@ -2813,7 +3074,10 @@ function Card({ device, onClick }) {
             <div style={{ display: 'inline-flex', alignItems: 'center', background: 'linear-gradient(160deg,var(--lcd-face),var(--lcd-deep))', border: '1px solid var(--lcd-line)', borderRadius: 3, padding: '3px 6px', paddingRight: 'calc(6px - 0.1em)', fontFamily: "'DM Mono',monospace", fontSize: 9, lineHeight: 1, color: 'var(--accent-lit)', letterSpacing: '0.1em' }}>PENDING</div>
           )}
           {!isPending && device.firmware_ver && (
-            <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: 'var(--muted)' }}>{device.firmware_ver}</div>
+            <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: device.upgrade_required ? 'var(--warn)' : 'var(--muted)' }}
+                 title={device.upgrade_required ? 'Pre-v1 firmware — open the device to update it' : undefined}>
+              {device.upgrade_required ? `${device.firmware_ver} · upgrade required` : device.firmware_ver}
+            </div>
           )}
         </div>
       </div>
@@ -3148,12 +3412,6 @@ const _WIZARD_STEPS = [
   { id: 'debloat',         label: 'Debloat',           desc: 'Hide non-essential Amazon packages and stop background daemons (~130MB RAM freed).' },
   { id: 'wifi',            label: 'Configure WiFi',    desc: 'Connect the device to your local WiFi network.' },
   { id: 'install_em',      label: 'Install EchoMuse',  desc: 'Push server binary and startup script to device.' },
-  // Mandatory, not skippable. Every provisioned device carries the runtime,
-  // which removes a whole class of "I enabled on-device wake word and nothing
-  // happened" — the assets are not in the firmware, so without this step the
-  // capability is advertised by a device that cannot actually use it. USB is
-  // also much better suited to 15MB than the shell plane.
-  { id: 'install_oww',     label: 'Wake Word Assets',  desc: 'Push the ONNX runtime and wake models (~15MB) used for on-device wake word detection.' },
 ];
 
 // ── WifiPanel ──
@@ -4795,60 +5053,9 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
         addLog('TLS credentials installed — device will connect over wss.', 'ok');
       }
     }
-    // NO reboot here. This step used to end the wizard, so it rebooted, closed
-    // the connection and cleared `adb` — and when the wake word asset step was
-    // appended after it, that step's auto-run gate (`&& adb`) was false, so it
-    // silently never fired and the wizard just sat on it. The finishing reboot
-    // belongs to whichever step is genuinely last; it now lives in
-    // runInstallOwwAssets. Anything added after that must move it again.
-    addLog('Staying connected — the wake word assets install next, then the device reboots.');
-  }
-
-  // ── Step executor ──
-  async function runInstallOwwAssets(c) {
-    // Pushed over USB rather than through the shell plane: a freshly-flashed
-    // device is not connected to the controller yet, and 15MB of base64
-    // heredoc would be slow. Same bytes and same destination as the field
-    // path — only the transport differs.
-    addLog('Fetching wake word assets from controller…');
-    const manifest = await API.get('/api/provision/oww_assets');
-    (manifest.problems || []).forEach(p => addLog(`  ⚠ ${p}`, 'error'));
-    if (!manifest.assets || manifest.assets.length === 0) {
-      throw new Error('Controller has no wake word assets to install. '
-        + 'Its image may predate them — rebuild or update the controller.');
-    }
-
-    await c.shell(`su -c "mkdir -p ${manifest.dir}"`);
-    for (const a of manifest.assets) {
-      addLog(`Pushing ${a.name} (${(a.size/1024/1024).toFixed(1)} MB)…`);
-      const resp = await fetch(ingressPath(`/api/provision/oww_asset/${encodeURIComponent(a.name)}`),
-                               { headers: { Authorization: `Bearer ${token}` } });
-      if (!resp.ok) throw new Error(`Controller returned ${resp.status} fetching ${a.name}.`);
-      const buf = await resp.arrayBuffer();
-      // Staged in /sdcard because adb cannot write under /data directly, then
-      // moved with su — the same two-step the binary install uses.
-      await c.push('/sdcard/em_oww_asset', new Uint8Array(buf),
-        pct => setProgress({ label: `Uploading ${a.name}`, pct }));
-      setProgress(null);
-
-      // md5 is the only definition of success: a truncated push produces a
-      // file of plausible size that fails later at dlopen, with an error that
-      // names nothing useful.
-      const got = (await c.shell('su -c "busybox md5sum /sdcard/em_oww_asset" 2>/dev/null')).trim().split(/\s+/)[0];
-      if (got !== a.md5) {
-        await c.shell('su -c "rm -f /sdcard/em_oww_asset"');
-        throw new Error(`${a.name} arrived corrupted (md5 ${got || 'unreadable'}, expected ${a.md5}).`);
-      }
-      await c.shell(`su -c "mv /sdcard/em_oww_asset ${manifest.dir}/${a.name} && chmod 644 ${manifest.dir}/${a.name}"`);
-      addLog(`  ✓ ${a.name}`);
-    }
-    addLog('Wake word assets installed. On-device scoring is off by default — '
-         + 'enable it per device under Config → Wake word.', 'ok');
-
-    // The finishing reboot lives in the LAST step, deliberately — it closes
-    // the ADB connection, so any step after it can never run. Keeping it on
-    // the success path (not in a finally) means a failure above leaves the
-    // connection alive and the Retry button usable.
+    // Finish provisioning only after the binary, startup payload and TLS
+    // credentials are verified. A successful reboot lets the supervisor fetch
+    // the content-addressed speech assets named by session.ready (§16.5).
     addLog('Rebooting device to finish provisioning…');
     expectDisconnect.current = true;
     try { await c.shell('su -c reboot'); } catch {}
@@ -4856,6 +5063,8 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     setAdb(null);
     addLog('Device rebooting. It will appear in the controller dashboard within ~30s via mDNS.', 'ok');
   }
+
+  // ── Step executor ──
 
   async function runStep(stepIdx, useLatest) {
     // Captured up front. If the cable is pulled mid-step the handler above
@@ -4894,7 +5103,6 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
         case  9: await runDebloat(c); break;
         case 10: await runConfigWifi(c, wifiSsid, wifiPsk); break;
         case 11: await runInstallEchoMuse(c, binaryFile, useLatest); break;
-        case 12: await runInstallOwwAssets(c); break;
       }
       if (abandoned()) return;
       markStep(stepIdx, 'done');
@@ -4935,18 +5143,11 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
   // Step 8 (disable_alexa) is now before WiFi so Alexa can't phone home.
   // Step 9 (debloat) rides the same connected-and-rooted state.
   useEffect(() => {
-    // Step 12 (wake word assets) auto-runs: it needs no input, and making it
-    // a button people can leave unpressed defeats the point of it being
-    // mandatory.
-    const autoSteps = new Set([2, 4, 7, 8, 9, 12]);
+    const autoSteps = new Set([2, 4, 7, 8, 9]);
     if (!autoSteps.has(step) || running || stepState[step] !== 'pending') return;
     if (adb) { runStep(step); return; }
-    // An auto step with no connection used to be a no-op, so the wizard sat on
-    // it looking busy forever — which is exactly how the wake word asset step
-    // failed on 2026-07-31, reached only after the previous step had rebooted
-    // the device out from under it. A step that cannot start must SAY so.
     addLog(`"${_WIZARD_STEPS[step].label}" needs an ADB connection and there isn't one — `
-         + `the previous step disconnected the device. Reconnect and click Retry.`, 'error');
+         + `reconnect the device and click Retry.`, 'error');
     markStep(step, 'error');
   }, [step, running, adb]);
 
@@ -5300,12 +5501,12 @@ const STAGE_MONO = "'DM Mono',monospace";
 // be silently wrong.
 const CONFIG_SECTIONS = {
   "playback": ["eqBands", "eqLoudness", "duckDb"],
-  "wakeword": ["owwModel", "owwThreshold", "owwSpeexNs", "nearMissThreshold", "saveWakeClips", "bargeInEnabled", "bargeInThreshold", "wakeArbitrationMs", "owwOnDevice", "wakeSound"],
-  "microphones": ["nsAsr", "saveUtterances", "endpointRelative", "endpointLowPerMil", "endpointSilenceMs", "endpointBackporchMs", "maxSpeechMs"],
+  "wakeword": ["wakeModel", "saveWakeClips", "wakeArbitrationMs", "wakeSound"],
+  "microphones": ["nsAsr", "saveUtterances", "extendedUtterances"],
   "ring": ["ledScene", "ledListenColor", "ledThinkColor", "meterAttack", "meterDecay", "meterFloor", "meterGamma", "meterRef", "meterCurve"],
-  "advanced": ["vadThreshold", "vadSpeechMs", "vadSilenceMs", "buttonSingleTapEvent", "buttonMultiTapMs"],
+  "advanced": ["buttonSingleTapEvent", "buttonMultiTapMs"],
   "bluetooth": ["bleProxyEnabled"],
-  "timers": ["timerSound", "timerRingSeconds", "timerRingGapSeconds", "timerRingBurstSeconds"]
+  "timers": ["timerSound", "timerRingSeconds", "timerRingGapSeconds", "alarmSound"]
 };
 
 // Display labels for the section ids, and the reverse key -> section index
@@ -5314,8 +5515,8 @@ const CONFIG_SECTIONS = {
 // kept apart so a device can take its own alarm sound without forking its
 // LED scene too.
 const SECTION_LABELS = {
-  playback: 'Playback', wakeword: 'Wake word', microphones: 'Microphones',
-  ring: 'Ring', advanced: 'Advanced', bluetooth: 'Bluetooth',
+  playback: 'Playback', wakeword: 'Wake word', microphones: 'Speech',
+  ring: 'Ring', advanced: 'Button', bluetooth: 'Bluetooth',
   timers: 'Timers',
 };
 const KEY_SECTION = {};
@@ -5421,187 +5622,260 @@ function StageAdvanced({ open, onToggle, disabledStyle, children }) {
   );
 }
 
-// Mirrors em_shadow.normalise_mode: an unrecognised stored value renders as
-// "Controller" rather than leaving every segment unselected, which would look
-// like a control that had lost its value.
-function onDeviceMode(config) {
-  const v = String(config.owwOnDevice ?? 'off').toLowerCase();
-  return ['off', 'shadow', 'on'].includes(v) ? v : 'off';
+function WakeModelPicker({ value, onChange, disabled }) {
+  const [registry, reload] = useWakeRegistry();
+  const [uploadOpen, setUploadOpen] = useState(false);
+  const [graph, setGraph] = useState(null);
+  const [sidecar, setSidecar] = useState(null);
+  const [wakePhrase, setWakePhrase] = useState('ophelia');
+  const [verifyCore, setVerifyCore] = useState('ophel');
+  const [thresholds, setThresholds] = useState({
+    idle:0.90, playback:0.65, reference:0.30, near_miss:0.17,
+  });
+  const [uploading, setUploading] = useState(false);
+  const [validation, setValidation] = useState(null);
+  const mono = "'DM Mono',monospace";
+
+  async function upload() {
+    if (!graph || !sidecar) {
+      setValidation({ ok:false, text:'Choose both the BCResNet .onnx graph and its .json sidecar.' });
+      return;
+    }
+    setUploading(true); setValidation(null);
+    try {
+      const form = new FormData();
+      form.append('graph', graph);
+      form.append('sidecar', sidecar);
+      Object.entries(thresholds).forEach(([k, v]) => form.append(k, String(v)));
+      form.append('wake_phrase', wakePhrase.trim().toLowerCase());
+      form.append('verify_core', verifyCore.trim().toLowerCase());
+      const r = await API.postForm('/api/wake_models/upload', form);
+      await reload();
+      const probe = Math.max(...Object.values(r.model?.probe || {}).map(Number).filter(Number.isFinite), 0);
+      setValidation({ ok:true, text:`Validated ${shortSha(r.model?.graph_sha256)} · probe max ${probe.toFixed(4)}. Select it below to activate.` });
+      setGraph(null); setSidecar(null);
+    } catch (e) {
+      setValidation({ ok:false, text:e.error || 'Model validation failed' });
+    }
+    setUploading(false);
+  }
+
+  async function remove(model) {
+    if (!confirm(`Delete registry model ${model.wake_phrase} (${shortSha(model.graph_sha256)})?`)) return;
+    try {
+      await API.del(`/api/wake_models/${encodeURIComponent(model.graph_sha256)}`);
+      await reload();
+    } catch (e) { setValidation({ ok:false, text:e.error || 'Model is still in use' }); }
+  }
+
+  const missing = registry.loaded && value && !registry.models.some(m => m.graph_sha256 === value);
+  return (
+    <div>
+      <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fill,minmax(190px,1fr))', gap:8 }}>
+        {registry.models.map(m => {
+          const selected = value === m.graph_sha256;
+          const probe = Math.max(...Object.values(m.probe || {}).map(Number).filter(Number.isFinite), 0);
+          return (
+            <div key={m.graph_sha256} onClick={() => !disabled && onChange(m.graph_sha256)} style={{
+              background:selected ? 'linear-gradient(160deg,var(--accent-tint),var(--accent-line))' : 'linear-gradient(160deg,var(--raised),var(--surface))',
+              border:`1px solid ${selected ? 'var(--accent)' : 'var(--border-soft)'}`,
+              borderRadius:8, padding:'10px 12px', cursor:disabled ? 'default' : 'pointer', position:'relative',
+            }}>
+              <div style={{ display:'flex', justifyContent:'space-between', gap:8 }}>
+                <div style={{ fontFamily:"'DM Sans',sans-serif", fontSize:12, fontWeight:600, color:'var(--text2)' }}>{m.wake_phrase}</div>
+                {m.active && <span style={{ fontFamily:mono, fontSize:8, color:'var(--ok)', textTransform:'uppercase' }}>active</span>}
+              </div>
+              <div style={{ fontFamily:mono, fontSize:9, color:'var(--muted)', marginTop:3 }}>graph {shortSha(m.graph_sha256)} · sidecar {shortSha(m.sidecar_sha256)}</div>
+              <div style={{ fontFamily:mono, fontSize:8, color:'var(--muted)', marginTop:6, lineHeight:1.5 }}>
+                idle {m.thresholds.idle.toFixed(2)} · playback {m.thresholds.playback.toFixed(2)}<br/>
+                reference {m.thresholds.reference.toFixed(2)} · near miss {m.thresholds.near_miss.toFixed(2)}<br/>
+                validation probe max {probe.toFixed(4)}
+              </div>
+              {!disabled && !selected && !(m.in_use_by || []).length && (
+                <button onClick={e => { e.stopPropagation(); remove(m); }} title="Delete model"
+                  style={{ position:'absolute', right:7, bottom:5, background:'none', border:'none', color:'var(--muted)', cursor:'pointer' }}>×</button>
+              )}
+            </div>
+          );
+        })}
+        {missing && (
+          <div style={{ border:'1px solid var(--error)', borderRadius:8, padding:'10px 12px' }}>
+            <div style={{ fontFamily:mono, fontSize:10, color:'var(--error)' }}>Missing registry model</div>
+            <div style={{ fontFamily:mono, fontSize:9, color:'var(--muted)', marginTop:3 }}>{value}</div>
+          </div>
+        )}
+        <div onClick={() => !disabled && setUploadOpen(x => !x)} style={{
+          border:'1px dashed var(--border-hard)', borderRadius:8, padding:'10px 12px',
+          cursor:disabled ? 'default' : 'pointer', background:'var(--surface)',
+        }}>
+          <div style={{ fontFamily:"'DM Sans',sans-serif", fontSize:12, fontWeight:600, color:'var(--text2)' }}>+ BCResNet model</div>
+          <div style={{ fontFamily:mono, fontSize:9, color:'var(--muted)', marginTop:3 }}>upload and validate graph + sidecar</div>
+        </div>
+      </div>
+      {uploadOpen && (
+        <div style={{ marginTop:12, border:'1px solid var(--border-soft)', borderRadius:8, padding:12 }}>
+          <div className="em-grid2" style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:12 }}>
+            <label style={{ fontFamily:mono, fontSize:9, color:'var(--text2)' }}>ONNX graph
+              <input type="file" accept=".onnx" onChange={e => setGraph(e.target.files[0] || null)} style={{ display:'block', marginTop:5, maxWidth:'100%' }}/>
+            </label>
+            <label style={{ fontFamily:mono, fontSize:9, color:'var(--text2)' }}>JSON sidecar
+              <input type="file" accept=".json" onChange={e => setSidecar(e.target.files[0] || null)} style={{ display:'block', marginTop:5, maxWidth:'100%' }}/>
+            </label>
+            <label style={{ fontFamily:mono, fontSize:9, color:'var(--text2)' }}>Wake phrase
+              <input value={wakePhrase} onChange={e => setWakePhrase(e.target.value)} style={{ display:'block', width:'100%', marginTop:5, boxSizing:'border-box' }}/>
+            </label>
+            <label style={{ fontFamily:mono, fontSize:9, color:'var(--text2)' }}>Verification core
+              <input value={verifyCore} onChange={e => setVerifyCore(e.target.value)} style={{ display:'block', width:'100%', marginTop:5, boxSizing:'border-box' }}/>
+            </label>
+          </div>
+          <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:8, marginTop:12 }}>
+            {Object.entries(thresholds).map(([key, v]) => (
+              <label key={key} style={{ fontFamily:mono, fontSize:8, color:'var(--muted)' }}>{key.replace('_',' ')}
+                <input type="number" min="0.01" max="0.99" step="0.01" value={v}
+                  onChange={e => setThresholds(t => ({ ...t, [key]:Number(e.target.value) }))}
+                  style={{ display:'block', width:'100%', marginTop:4, boxSizing:'border-box' }}/>
+              </label>
+            ))}
+          </div>
+          <div style={{ display:'flex', alignItems:'center', gap:10, marginTop:12 }}>
+            <Pill accent disabled={uploading || !graph || !sidecar} onClick={upload}>{uploading ? 'Validating…' : 'Validate & add'}</Pill>
+            <span style={{ fontFamily:mono, fontSize:9, color:'var(--muted)' }}>Validation checks graph IO, sidecar agreement and silence/noise/tone probes.</span>
+          </div>
+          {validation && <div style={{ marginTop:10, fontFamily:mono, fontSize:9, color:validation.ok ? 'var(--ok)' : 'var(--error)' }}>{validation.text}</div>}
+        </div>
+      )}
+    </div>
+  );
 }
 
+function useSounds() {
+  const [catalog, setCatalog] = useState({ sounds:[], default_id:'default', unresolved:[], loaded:false });
+  const reload = useCallback(async () => {
+    try { setCatalog({ ...(await API.get('/api/sounds')), loaded:true }); } catch {}
+  }, []);
+  useEffect(() => { reload(); }, [reload]);
+  return [catalog, reload];
+}
+
+function SoundPicker({ label, configKey, value, onChange, disabled, catalog, reload, deviceId, deviceConnected, capabilities }) {
+  const fileRef = useRef(null);
+  const [previewing, setPreviewing] = useState(null);
+  const [message, setMessage] = useState(null);
+  const mono = "'DM Mono',monospace";
+  const previewGap = deviceId && !deviceConnected ? 'device offline' : capabilityGap(capabilities, 'render_progress_v1');
+  const missing = catalog.loaded && value && !catalog.sounds.some(s => s.id === value);
+  // §18.4: an unresolvable effective sound stays stored but rings the
+  // device's built-in fallback; em_sounds reports it per config scope.
+  const unresolved = (catalog.unresolved || []).some(u =>
+    u.key === configKey && u.scope === (deviceId || 'global'));
+
+  async function upload(file) {
+    if (!file) return;
+    const id = (file.name.replace(/\.[^.]+$/, '') || 'sound')
+      .replace(/[^A-Za-z0-9_.-]/g, '-').slice(0,64) || 'sound';
+    const form = new FormData();
+    form.append('sound', file); form.append('id', id);
+    try {
+      const r = await API.postForm('/api/sounds/upload', form);
+      await reload();
+      if (r.sound?.id) onChange(r.sound.id);
+    } catch (e) { setMessage({ ok:false, text:e.error || 'Sound upload failed' }); }
+  }
+
+  async function remove(sound) {
+    if (!confirm(`Delete sound "${sound.id}"?`)) return;
+    try { await API.del(`/api/sounds/${encodeURIComponent(sound.id)}`); await reload(); }
+    catch (e) { setMessage({ ok:false, text:e.error || 'Sound is still in use' }); }
+  }
+
+  async function preview(soundId) {
+    if (!deviceId || previewGap) return;
+    if (previewing === soundId) {
+      await API.post(`/api/devices/${deviceId}/sounds/stop`, {}).catch(() => {});
+      setPreviewing(null); return;
+    }
+    try {
+      const r = await API.post(`/api/devices/${deviceId}/sounds/preview`, { sound_id:soundId });
+      if (!r.ok) throw r;
+      setPreviewing(soundId);
+      setTimeout(() => setPreviewing(x => x === soundId ? null : x), 10000);
+    } catch (e) { setMessage({ ok:false, text:e.error || 'Preview unavailable' }); }
+  }
+
+  return (
+    <div style={{ marginBottom:16 }}>
+      <div style={{ fontFamily:mono, fontSize:10, color:'var(--text2)', marginBottom:7 }}>{label}</div>
+      <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fill,minmax(140px,1fr))', gap:8 }}>
+        <div onClick={() => !disabled && onChange('')} style={{
+          background:!value ? 'linear-gradient(160deg,var(--accent-tint),var(--accent-line))' : 'var(--surface)',
+          border:`1px solid ${!value ? 'var(--accent)' : 'var(--border-soft)'}`, borderRadius:8, padding:'8px 10px',
+          cursor:disabled ? 'default' : 'pointer',
+        }}>
+          <div style={{ fontFamily:"'DM Sans',sans-serif", fontSize:12, fontWeight:600, color:'var(--text2)' }}>Default</div>
+          <div style={{ fontFamily:mono, fontSize:8, color:'var(--muted)', marginTop:3 }}>catalog “{catalog.default_id || 'default'}”, then built-in fallback</div>
+        </div>
+        {[...catalog.sounds, ...(missing ? [{ id:value, missing:true }] : [])].map(s => (
+          <div key={s.id} onClick={() => !disabled && onChange(s.id)} style={{
+            background:value === s.id ? 'linear-gradient(160deg,var(--accent-tint),var(--accent-line))' : 'var(--surface)',
+            border:`1px solid ${value === s.id ? 'var(--accent)' : s.missing ? 'var(--error)' : 'var(--border-soft)'}`,
+            borderRadius:8, padding:'8px 10px', position:'relative', cursor:disabled ? 'default' : 'pointer',
+          }}>
+            <div style={{ fontFamily:"'DM Sans',sans-serif", fontSize:12, fontWeight:600, color:'var(--text2)' }}>{s.id}</div>
+            <div style={{ fontFamily:mono, fontSize:8, color:s.missing ? 'var(--error)' : 'var(--muted)', marginTop:3 }}>
+              {s.missing ? 'missing — built-in fallback'
+                : `${s.seconds != null ? `${s.seconds}s` : 'duration unavailable'}${s.shortened ? ' · shortened to 10s' : ''}`}
+            </div>
+            {!disabled && !s.missing && value !== s.id && (
+              <button onClick={e => { e.stopPropagation(); remove(s); }} title="Delete sound"
+                style={{ position:'absolute', top:3, right:5, background:'none', border:'none', color:'var(--muted)', cursor:'pointer' }}>×</button>
+            )}
+            {deviceId && !s.missing && (
+              <button onClick={e => { e.stopPropagation(); preview(s.id); }} disabled={!!previewGap}
+                title={previewGap || 'Play this sound once on the device'}
+                style={{ marginTop:7, background:'none', border:'none', padding:0, fontFamily:mono, fontSize:8, color:previewGap ? 'var(--muted)' : 'var(--accent)', cursor:previewGap ? 'default' : 'pointer' }}>
+                {previewing === s.id ? '■ stop preview' : '▶ preview'}
+              </button>
+            )}
+          </div>
+        ))}
+        <div onClick={() => !disabled && fileRef.current?.click()} style={{ border:'1px dashed var(--border-hard)', borderRadius:8, padding:'8px 10px', cursor:disabled ? 'default' : 'pointer' }}>
+          <div style={{ fontFamily:"'DM Sans',sans-serif", fontSize:12, fontWeight:600, color:'var(--text2)' }}>+ Upload sound</div>
+          <div style={{ fontFamily:mono, fontSize:8, color:'var(--muted)', marginTop:3 }}>mp3, wav, flac, ogg, m4a</div>
+          <input ref={fileRef} type="file" accept=".mp3,.wav,.flac,.ogg,.m4a,audio/*" style={{ display:'none' }}
+            onChange={e => { upload(e.target.files[0]); e.target.value=''; }}/>
+        </div>
+      </div>
+      {unresolved && <div style={{ marginTop:6, fontFamily:mono, fontSize:9, color:'var(--warn)' }}>This sound cannot be resolved; rings use the built-in fallback tone.</div>}
+      {deviceId && previewGap && <div style={{ marginTop:6, fontFamily:mono, fontSize:9, color:'var(--muted)' }}>Preview unavailable: {previewGap}</div>}
+      {message && <div style={{ marginTop:6, fontFamily:mono, fontSize:9, color:message.ok ? 'var(--ok)' : 'var(--error)' }}>{message.text}</div>}
+    </div>
+  );
+}
+
+
 function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
-                            shadowCapable = true, mixCapable = true,
-                            holdCapable = true, triggerCapable = true,
-                            wakeSoundCapable = true, bcresnetCapable = true,
-                            deviceId = null,
-                            deviceConnected = false, deviceRinging = false }) {
-  // deviceId is null in the fleet-config view, where "ring this device now"
-  // has no subject — the Test control is hidden there rather than disabled,
-  // because there is nothing the user could do to enable it.
-  // shadowCapable defaults TRUE because this form is also the fleet-config
-  // view, where there is no single device whose capability could gate a
-  // control. Referencing a `device` here is what blank-screened the Config
-  // tab: the prop does not exist, so `device.connected` threw during render.
-  // sections == null means the fleet-config view: nothing to inherit from, so
-  // no per-section switches and every control is live.
+                            capabilities = null, deviceId = null, deviceConnected = false }) {
+  // sections == null is the fleet view: nothing to inherit from, so every
+  // control is live and no capability is guessed for a particular device.
   const scoped = Array.isArray(sections);
   const isLocal = id => !scoped || sections.includes(id);
-
-  // Writes are gated by the OWNING SECTION rather than per control. Deriving
-  // the section from the key means every existing and future control becomes
-  // read-only automatically when its section follows the fleet — there is no
-  // per-input plumbing to forget.
   const set = (k, v) => {
     if (disabled) return;
     if (scoped && !isLocal(KEY_SECTION[k])) return;
     onChange(k, v);
   };
-
-  // Per-stage props: the Fleet/Device switch, and the dimming for a stage
-  // that is currently inheriting.
   const scopeEl = id => scoped
     ? <ScopeToggle local={isLocal(id)} disabled={disabled}
         onChange={local => onScopeChange && onScopeChange(id, local)}/>
     : null;
   const secStyle = id => (disabled || !isLocal(id))
-    ? { opacity: 0.45, pointerEvents: 'none' }
+    ? { opacity:0.45, pointerEvents:'none' }
     : {};
-
-  const WW_MODELS = [
-    { value: 'hey_jarvis_v0.1',   label: 'Hey Jarvis'   },
-    { value: 'alexa_v0.1',        label: 'Alexa'         },
-    { value: 'hey_mycroft_v0.1',  label: 'Hey Mycroft'   },
-    { value: 'hey_rhasspy_v0.1',  label: 'Hey Rhasspy'   },
-  ];
-
-  // Custom models discovered in the controller's data volume (oww_forge
-  // output). Tile value = absolute file path — openwakeword accepts paths
-  // in place of stock names, so no other plumbing is needed.
-  const [customModels, setCustomModels] = useState([]);
-  const wwFileRef = useRef(null);
-  const loadCustomModels = useCallback(async () => {
-    try { setCustomModels((await API.get('/api/oww_models')).models || []); }
-    catch (e) { /* endpoint requires auth; list just stays empty */ }
-  }, []);
-  useEffect(() => { loadCustomModels(); }, [loadCustomModels]);
-
-  // The picker accepts .onnx and .json together, because a BC-ResNet model is
-  // BOTH files: the .onnx cannot say which of its logits is the wake word, so
-  // the controller refuses it without its sidecar rather than guess. An
-  // openWakeWord model is still just the one file — selecting a .json with it
-  // is harmless and selecting only a .json is the one case worth naming.
-  async function uploadWakeModel(files) {
-    const picked = Array.from(files || []);
-    if (!picked.length) return;
-    const model   = picked.find(f => f.name.endsWith('.onnx'));
-    const sidecar = picked.find(f => f.name.endsWith('.json'));
-    if (!model) {
-      alert('Select the .onnx model (a BC-ResNet model needs its .json alongside it).');
-      return;
-    }
-    try {
-      const form = new FormData();
-      form.append('model', model);
-      if (sidecar) form.append('sidecar', sidecar);
-      const resp = await API.postForm('/api/oww_models/upload', form);
-      await loadCustomModels();
-      if (resp.model?.path) set('owwModel', resp.model.path);
-    } catch (e) { alert(e.error || 'Model upload failed'); }
-  }
-
-  async function deleteWakeModel(m) {
-    if (!confirm(`Delete wake model "${m.name}"?`)) return;
-    try {
-      await API.del(`/api/oww_models/${encodeURIComponent(m.file)}`);
-      await loadCustomModels();
-    } catch (e) { alert(e.error || 'Delete failed'); }
-  }
-
-  // Timer ring sounds, stored in the same data volume as the wake models.
-  // An empty timerSound means "fleet default, else the built-in chime" —
-  // resolved controller-side (em_sounds.ring_pcm), so the tile for it is
-  // labelled by what it falls back to rather than pretending to be a file.
-  const [sounds, setSounds] = useState([]);
-  // Optimistic local flag, cleared by the real `ringing` state arriving over
-  // the events WebSocket. A ring ends on its own (wake word, or the
-  // timeout), so local state alone would leave the button offering to stop
-  // something that already stopped.
-  const [ringRequested, setRingRequested] = useState(false);
-  const ringing = deviceRinging || ringRequested;
-  useEffect(() => { if (deviceRinging) setRingRequested(false); }, [deviceRinging]);
-  const soundFileRef = useRef(null);
-  const loadSounds = useCallback(async () => {
-    try { setSounds((await API.get('/api/sounds')).sounds || []); }
-    catch (e) { /* endpoint requires auth; list just stays empty */ }
-  }, []);
-  useEffect(() => { loadSounds(); }, [loadSounds]);
-
-  async function uploadSound(file) {
-    if (!file) return;
-    // Named after the file so two uploads don't silently overwrite each
-    // other; sanitised the same way the server will sanitise it, so the
-    // tile that appears is the id that was actually stored.
-    const id = (file.name.replace(/\.[^.]+$/, '') || 'timer')
-      .replace(/[^A-Za-z0-9_.-]/g, '-').slice(0, 64) || 'timer';
-    try {
-      const form = new FormData();
-      form.append('sound', file);
-      form.append('id', id);
-      const resp = await API.postForm('/api/sounds/upload', form);
-      await loadSounds();
-      if (resp.sound?.id) set('timerSound', resp.sound.id);
-    } catch (e) { alert(e.error || 'Sound upload failed'); }
-  }
-
-  async function deleteSound(s) {
-    if (!confirm(`Delete timer sound "${s.id}"?`)) return;
-    try {
-      await API.del(`/api/sounds/${encodeURIComponent(s.id)}`);
-      await loadSounds();
-    } catch (e) { alert(e.error || 'Delete failed'); }
-  }
-
-  // Test rings for real — same loop, same wake-word stop — because what the
-  // user needs to know is whether they can live with it going off and
-  // whether they can make it stop, not whether the file decodes.
-  async function testRing() {
-    if (!deviceId) return;
-    setRingRequested(true);
-    try { await API.post(`/api/devices/${deviceId}/sounds/test`, {}); }
-    catch (e) { alert(e.error || 'Could not ring'); setRingRequested(false); }
-  }
-  async function stopRing() {
-    if (!deviceId) return;
-    try { await API.post(`/api/devices/${deviceId}/sounds/stop`, {}); }
-    catch (e) { /* already stopped is not worth an alert */ }
-    setRingRequested(false);
-  }
-
-  // A selected sound that has since been deleted still needs a visible tile:
-  // silently showing "Built-in" for a config that says otherwise is how you
-  // fail to notice your alarm changed.
-  const orphanSound = (config.timerSound || '')
-    && !sounds.some(s => s.id === config.timerSound)
-    ? { id: config.timerSound, missing: true }
-    : null;
-
-  // A selected custom model that no longer exists on disk (or a bare-metal
-  // path from before a Docker move) still needs a visible, selected tile.
-  const orphanModel = (config.owwModel || '').endsWith('.onnx')
-    && !customModels.some(m => m.path === config.owwModel)
-    ? { name: wwModelLabel(config.owwModel), file: config.owwModel.split('/').pop(), path: config.owwModel, missing: true }
-    : null;
-
-  // Which engine the selected model needs. Decided by the model's `type` from
-  // the server (which reads the sidecar on disk), never by the filename — the
-  // name is user-chosen. An orphan or stock model is openWakeWord, which is
-  // also the right answer for every model predating BC-ResNet support.
-  const bcresnetSelected = customModels.some(
-    m => m.path === config.owwModel && m.type === 'bcresnet');
-  // On-device scoring needs the firmware to carry the engine the sidecar will
-  // select. Two separate facts — the model's family and the device's engines —
-  // so a device that CAN run BC-ResNet keeps every on-device option.
-  const engineMissing = bcresnetSelected && !bcresnetCapable;
+  const wakeGap = capabilityGap(capabilities, 'device_wake_v1');
+  const renderGap = capabilityGap(capabilities, 'render_progress_v1');
+  const focusGap = capabilityGap(capabilities, 'focus_leases_v1');
+  const holdGap = capabilityGap(capabilities, 'button_hold');
+  const [catalog, reloadSounds] = useSounds();
 
   const bands = config.eqBands ?? [0,0,0,0,0,0,0,0];
   const RING_SCENES = [
@@ -5614,30 +5888,22 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
   const EQ_PRESETS = [['Flat',[0,0,0,0,0,0,0,0]], ['Clarity',[0,0,0,0,0,7,4,2]], ['Warmth',[0,3,2,0,-2,0,0,0]]];
   const activeEqPreset = (EQ_PRESETS.find(([, vals]) => JSON.stringify(vals) === JSON.stringify(bands)) || [null])[0];
 
-  const [advMics, setAdvMics] = useState(false);
   const [advRing, setAdvRing] = useState(false);
 
   const inputStyle = disabled ? { opacity: 0.45, pointerEvents: 'none' } : {};
   const mono = "'DM Mono',monospace";
 
-  // Small header for subsections inside the combined Advanced stage.
-  const subHeader = (text, first) => (
-    <div style={{ fontFamily: mono, fontSize: 9, color: 'var(--muted)', textTransform: 'uppercase',
-      letterSpacing: '0.15em', marginTop: first ? 0 : 18, marginBottom: 10 }}>{text}</div>
-  );
 
   // Ordered by how often each section gets touched: playback and wake word
-  // are everyday knobs, mic capture is set-and-forget, and the button-turn
-  // internals live in one Advanced bucket at the end. (Stages used to be
-  // ordered by signal flow with ▼ connectors — dropped when the order
-  // switched to relevance.)
+  // are everyday knobs, the speech copy is set-and-forget, and the button
+  // gestures come after the LED ring.
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
 
       {/* 01 PLAYBACK */}
       <Stage n="01" title="Playback"
         chips={<><ScopeChip tone="controller">Controller</ScopeChip><ScopeChip tone="device">Speaker</ScopeChip></>}
-        desc="Response audio: Home Assistant TTS → parametric EQ → resample → device speaker. Presets set the faders; drag any fader for a custom curve."
+        desc="Audio the controller streams to the speaker — Home Assistant responses and music — passes through this EQ. Alarms and timers ring from the Echo itself and are not equalised. Presets set the faders; drag any fader for a custom curve."
         scope={scopeEl('playback')} dim={secStyle('playback')}>
         <div className="em-grid2" style={{ display: 'grid', gridTemplateColumns: '1.4fr 1fr', gap: 28, alignItems: 'start' }}>
           <div>
@@ -5657,10 +5923,8 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
               <Toggle label="Speech boost" sub="presence boost for voice" value={config.eqLoudness ?? false} onChange={v => set('eqLoudness', v)}/>
             </div>
             <div style={inputStyle}>
-              <Slider label="Duck depth" disabled={!mixCapable}
-                sub={mixCapable
-                  ? "how far music drops under a voice response — it keeps playing instead of pausing"
-                  : "needs firmware that mixes music and voice (v2.10.0+)"}
+              <Slider label="Duck depth" disabled={!!focusGap}
+                sub={focusGap || "how far music drops under a voice response — content keeps playing under the dialog focus lease"}
                 value={config.duckDb ?? -18} min={-40} max={0} step={1} unit="dB"
                 onChange={v => set('duckDb', v)}/>
             </div>
@@ -5682,197 +5946,46 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
 
       {/* 02 WAKE WORD */}
       <Stage n="02" title="Wake word"
-        chips={<ScopeChip tone="controller">Controller</ScopeChip>}
-        desc="The controller scores the continuous mic stream. The wake threshold is the score a detection must reach — attempts that score close but miss are counted as near-misses (Status tab)."
+        chips={<><ScopeChip tone="device">Device</ScopeChip><ScopeChip tone="controller">Registry</ScopeChip></>}
+        desc="The Echo scores BCResNet every 160 ms. Thresholds and verification words belong to each validated registry model; choosing a model names its graph SHA-256 to every device."
         scope={scopeEl('wakeword')} dim={secStyle('wakeword')}>
-        <div className="em-grid2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 24, alignItems: 'start' }}>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, ...inputStyle }}>
-            {WW_MODELS.map(m => (
-              <div key={m.value} onClick={() => set('owwModel', m.value)} style={{
-                background: config.owwModel === m.value
-                  ? 'linear-gradient(160deg,var(--accent-tint),var(--accent-line))'
-                  : 'linear-gradient(160deg,var(--raised),var(--surface))',
-                border: `1px solid ${config.owwModel === m.value ? 'var(--accent)' : 'var(--border-soft)'}`,
-                borderRadius: 8, padding: '8px 10px',
-                cursor: disabled ? 'default' : 'pointer',
-                transition: 'border-color 0.15s, background 0.15s',
-              }}>
-                <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 12, fontWeight: 600, color: 'var(--lcd-line)' }}>{m.label}</div>
-                <div style={{ fontFamily: mono, fontSize: 9, color: 'var(--muted)', marginTop: 2 }}>{m.value}</div>
-              </div>
-            ))}
-            {[...customModels, ...(orphanModel ? [orphanModel] : [])].map(m => (
-              <div key={m.path} onClick={() => set('owwModel', m.path)} style={{
-                background: config.owwModel === m.path
-                  ? 'linear-gradient(160deg,var(--accent-tint),var(--accent-line))'
-                  : 'linear-gradient(160deg,var(--raised),var(--surface))',
-                border: `1px solid ${config.owwModel === m.path ? 'var(--accent)' : 'var(--border-soft)'}`,
-                borderRadius: 8, padding: '8px 10px', position: 'relative',
-                cursor: disabled ? 'default' : 'pointer',
-                transition: 'border-color 0.15s, background 0.15s',
-              }}>
-                <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 12, fontWeight: 600, color: 'var(--lcd-line)' }}>{wwModelLabel(m.path)}</div>
-                <div style={{ fontFamily: mono, fontSize: 9, color: m.missing ? 'var(--error)' : 'var(--muted)', marginTop: 2 }}>
-                  {m.missing ? 'missing file'
-                    : m.type === 'bcresnet' ? `BC-ResNet · ${m.file}`
-                    : `custom · ${m.file}`}
-                </div>
-                {!disabled && !m.missing && config.owwModel !== m.path && (
-                  <div onClick={e => { e.stopPropagation(); deleteWakeModel(m); }}
-                    title="Delete model"
-                    style={{ position: 'absolute', top: 4, right: 7, fontFamily: mono, fontSize: 11,
-                      color: 'var(--muted)', cursor: 'pointer' }}>×</div>
-                )}
-              </div>
-            ))}
-            <div onClick={() => { if (!disabled) wwFileRef.current?.click(); }} style={{
-              background: 'linear-gradient(160deg,var(--raised),var(--surface))',
-              border: '1px dashed var(--border-hard)', borderRadius: 8, padding: '8px 10px',
-              cursor: disabled ? 'default' : 'pointer', opacity: 0.85,
-            }}>
-              <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 12, fontWeight: 600, color: 'var(--text2)' }}>+ Custom model</div>
-              <div style={{ fontFamily: mono, fontSize: 9, color: 'var(--muted)', marginTop: 2 }}>upload .onnx (+ .json)</div>
-              <input ref={wwFileRef} type="file" accept=".onnx,.json" multiple style={{ display: 'none' }}
-                onChange={e => { uploadWakeModel(e.target.files); e.target.value = ''; }}/>
-            </div>
-          </div>
-          <div>
-            {/* The threshold itself, not a 1-9 "sensitivity" derived from
-                it. That mapping quantised to 0.1 and ran 0.2..1.0, so its
-                eager end was a bar no softmax reaches — a detector that
-                never fires — and the values a BC-ResNet model actually
-                needs were unreachable between steps. Measured on this
-                fleet, BC-ResNet wakes score 0.60-0.89 against openWakeWord's
-                0.10-0.998 over the same turns, so one engine's entire useful
-                range fell inside two positions of the old slider. The number
-                is what every other surface already reports anyway (the
-                Activity panel header, the fleet JSON, every near-miss log
-                line), so showing a different unit here only made the two
-                harder to compare. Floor is 0.05 to match the near-miss
-                floor below which nothing is even counted. */}
-            <div style={inputStyle}>
-              <Slider label="Wake threshold"
-                sub="score a wake word must reach — low is eager, high is precise"
-                value={config.owwThreshold ?? 0.5}
-                min={0.05} max={0.95} step={0.01}
-                formatValue={v => Number(v).toFixed(2)}
-                onChange={v => set('owwThreshold', v)}/>
-            </div>
-            <div style={{ marginTop: 16, ...inputStyle }}>
-              {/* The chime is compiled into the firmware and played from
-                  there, so this control is offered only where that firmware
-                  is — an older build ignores the message and the toggle
-                  would be a setting that silently does nothing. */}
-              <Toggle label="Wake chime"
-                sub={wakeSoundCapable
-                  ? 'the Echo plays a short sound the moment it hears you — from the device, so it does not wait on the network'
-                  : 'needs newer firmware on this Echo — the sound ships inside it'}
-                value={wakeSoundCapable && (config.wakeSound ?? false)}
-                disabled={!wakeSoundCapable}
-                onChange={v => set('wakeSound', v)}/>
-              {/* Speex NS is a feature of openWakeWord's own frontend, so it
-                  has nowhere to apply on a BC-ResNet model — that graph
-                  carries its log-mel frontend inside it and is fed the raw
-                  window. Disabled with the reason rather than left as a
-                  toggle that moves and changes nothing. */}
-              <Toggle label="Speex denoise"
-                sub={bcresnetSelected
-                  ? 'openWakeWord only — a BC-ResNet model has its own frontend and is scored on raw audio'
-                  : 'cleans audio before scoring — try in noisy rooms'}
-                value={!bcresnetSelected && (config.owwSpeexNs ?? false)}
-                disabled={bcresnetSelected}
-                onChange={v => set('owwSpeexNs', v)}/>
-              {/* Sits with the threshold control because it is how you
-                  tune it: a threshold is only ever wrong about audio you
-                  can hear, and a false trigger is gone the moment it is
-                  logged unless the frames that scored it were kept. */}
-              <Toggle label="Save wake clips"
-                sub="keeps the 1.4 seconds of audio that crossed the threshold, for the last few hundred wakes — download a false trigger from Activity and feed it back into wake-word training"
-                value={config.saveWakeClips ?? false}
-                onChange={v => set('saveWakeClips', v)}/>
-              <Toggle label="Barge-in" sub="wake word interrupts responses and music — timer alarms always listen" value={config.bargeInEnabled ?? false} onChange={v => set('bargeInEnabled', v)}/>
-              <Slider label="Barge threshold" sub="wake confidence needed over playback, including timer alarms — raise it if audio cuts itself short" value={config.bargeInThreshold ?? 0.05} min={0.05} max={0.9} step={0.05} onChange={v => set('bargeInThreshold', v)}/>
-              <Slider label="Arbitration window" sub="ms that the first Echo to hear you silences the others — no added delay; 0 disables" value={config.wakeArbitrationMs ?? 700} min={0} max={2000} step={50} unit="ms" onChange={v => set('wakeArbitrationMs', v)}/>
-              {/* Score floor for the Activity tab's near-miss counter —
-                  below it a frame is ordinary room noise and is not counted
-                  or logged at all. Same scale as Wake threshold above, so
-                  it shares that slider's 0.01 step; default 0.05 matches
-                  what was previously hardcoded in the wake loop. */}
-              <Slider label="Near-miss floor" sub="score above this but below the wake threshold counts as a near-miss in Activity — raise it in a noisy room so the counter tracks real attempts" value={config.nearMissThreshold ?? 0.05} min={0.01} max={0.5} step={0.01} formatValue={v => Number(v).toFixed(2)} onChange={v => set('nearMissThreshold', v)}/>
-              {/* Three modes, so a select rather than a toggle. Each option is
-                  offered only when the device says it can do it — capability,
-                  not firmware version, because a control that silently does
-                  nothing reads as a broken feature rather than an unsupported
-                  one. "Trigger" needs oww_trigger on top of oww_shadow: shadow
-                  shipped first and there is firmware in the field that scores
-                  and reports without being able to act on it. */}
-              <Select
-                label="Wake word detection"
-                sub={engineMissing
-                  ? 'this Echo\'s firmware has no BC-ResNet engine — update it, or pick an openWakeWord model'
-                  : !shadowCapable
-                  ? 'needs newer firmware on this Echo — the controller listens for now'
-                  : (config.owwOnDevice ?? 'off') === 'on'
-                    ? 'the Echo decides — no network hop before it hears you, and it keeps working through a controller restart. The controller still scores alongside it, so Activity shows whether they agreed'
-                    : (config.owwOnDevice ?? 'off') === 'shadow'
-                      ? 'the Echo scores alongside the controller and reports what it would have heard, without acting on it — compare in Activity before trusting it'
-                      : 'the controller listens; the Echo just streams audio'}
-                value={onDeviceMode(config)}
-                options={[
-                  { value: 'off',    label: 'Controller' },
-                  // Also refused for a BC-ResNet model: the device would score
-                  // whichever openWakeWord classifier is installed while the
-                  // controller scores something else, and every turn would
-                  // record a disagreement about a model the device was never
-                  // given. em_shadow.effective_mode degrades a stored value
-                  // the same way, so a model switched after the fact does not
-                  // leave the mode live.
-                  { value: 'shadow', label: 'Both (compare)', disabled: !shadowCapable || engineMissing },
-                  // Needs the runtime + models installed as well as the
-                  // capability, which the Updates tab does — hence the hint
-                  // rather than a hard block we cannot verify from here.
-                  { value: 'on',     label: 'On device',      disabled: !triggerCapable || engineMissing },
-                ]}
-                onChange={v => set('owwOnDevice', v)}/>
-              {(config.owwOnDevice ?? 'off') !== 'off' && shadowCapable && !engineMissing && (
-                <div className="em-label" style={{ marginTop: 6, color: 'var(--muted)' }}>
-                  Needs the wake word runtime installed on this Echo (Updates tab) — costs ~0.4 of a core while it runs.
-                </div>
-              )}
-            </div>
-          </div>
+        <WakeModelPicker value={config.wakeModel || ''} onChange={v => set('wakeModel', v)} disabled={disabled || !!wakeGap}/>
+        {wakeGap && <div style={{ marginTop:8, fontFamily:mono, fontSize:9, color:'var(--warn)' }}>Wake controls unavailable: {wakeGap}</div>}
+        <div className="em-grid2" style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:'0 24px', marginTop:16, ...inputStyle }}>
+          <Toggle label="Wake chime"
+            sub={renderGap || 'plays the built-in confirmation earcon immediately after an accepted wake'}
+            value={!renderGap && (config.wakeSound ?? false)}
+            disabled={!!renderGap}
+            onChange={v => set('wakeSound', v)}/>
+          <Toggle label="Save wake clips"
+            sub="keeps bounded candidate audio for tuning; play or download it from Activity"
+            value={config.saveWakeClips ?? false}
+            onChange={v => set('saveWakeClips', v)}/>
+          <Slider label="Arbitration window"
+            sub="the first Echo to claim a wake suppresses the others; 0 disables"
+            value={config.wakeArbitrationMs ?? 700} min={0} max={2000} step={50} unit="ms"
+            onChange={v => set('wakeArbitrationMs', v)}/>
         </div>
       </Stage>
 
-      {/* 03 MICROPHONES */}
-      <Stage n="03" title="Microphones"
-        chips={<ScopeChip tone="device">Device</ScopeChip>}
-        desc="What the controller does with the sound the Echo sends it. The array itself — which microphone, how much gain, echo cancellation, noise reduction — is handled by the Echo's own audio software and is not adjustable from here."
+      {/* 03 SPEECH (section id "microphones") */}
+      <Stage n="03" title="Speech"
+        chips={<ScopeChip tone="controller">Speech copy</ScopeChip>}
+        desc="The copy of each utterance the controller sends to Home Assistant speech-to-text, and whether it is kept. The Echo's own audio front end owns capture, beamforming and echo cancellation; nothing here changes what it hears."
         scope={scopeEl('microphones')} dim={secStyle('microphones')}>
-        <StageAdvanced open={advMics} onToggle={() => setAdvMics(o => !o)} disabledStyle={inputStyle}>
-          <div className="em-grid2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px 24px' }}>
-            {/* The mic chain itself — gain, beamforming, echo cancellation,
-                auto gain — belongs to the Echo's own audio software and has no
-                controls here. Its tuning lives on a read-only system
-                partition. What remains on this stage is everything the
-                CONTROLLER decides about the stream after it arrives. */}
-            <Toggle label="Noise suppression" sub="a second denoise on the speech-to-text audio only — the Echo already denoises the mic, so this stacks on top; helps fans/hum, not TV speech" value={config.nsAsr ?? false} onChange={v => set('nsAsr', v)}/>
-            <Toggle label="Save utterances" sub="keeps the last 10 turns' mic audio on the server — play or download from Activity" value={config.saveUtterances ?? false} onChange={v => set('saveUtterances', v)}/>
-            <Toggle label="Stop on quiet" sub="ends a turn when the loudest voice stops, so a TV in the background can't hold it open" value={config.endpointRelative ?? true} onChange={v => set('endpointRelative', v)}/>
-            <Slider label="Stop sensitivity" disabled={!(config.endpointRelative ?? true)}
-              sub="higher ends turns sooner and ignores quieter background speech; lower is safer for a soft talker"
-              value={config.endpointLowPerMil ?? 400} min={100} max={700} step={25} onChange={v => set('endpointLowPerMil', v)}/>
-            <Slider label="Pause before stopping" disabled={!(config.endpointRelative ?? true)}
-              sub="quiet needed to end a turn — raise if it cuts you off mid-sentence; below 1000 it starts deciding ordinary turns too, not just stuck ones"
-              value={config.endpointSilenceMs ?? 1200} min={800} max={3000} step={100} unit="ms" onChange={v => set('endpointSilenceMs', v)}/>
-            <Slider label="Trailing audio" disabled={!(config.endpointRelative ?? true)}
-              sub="kept after the stop decision — raise if answers come back missing your last word"
-              value={config.endpointBackporchMs ?? 250} min={0} max={1000} step={50} unit="ms" onChange={v => set('endpointBackporchMs', v)}/>
-            <Slider label="Max turn length"
-              sub="hard cap on one spoken command — the answer is still given, on what was heard"
-              value={config.maxSpeechMs ?? 12000} min={4000} max={20000} step={1000} unit="ms" onChange={v => set('maxSpeechMs', v)}/>
-          </div>
-        </StageAdvanced>
+        <div className="em-grid2" style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:'0 24px', ...inputStyle }}>
+          <Toggle label="Noise suppression"
+            sub="apply DTLN only to the copy sent to speech-to-text"
+            value={config.nsAsr ?? false} onChange={v => set('nsAsr', v)}/>
+          <Toggle label="Save utterances"
+            sub="keep bounded mic recordings on the controller; play or download them from Activity"
+            value={config.saveUtterances ?? false} onChange={v => set('saveUtterances', v)}/>
+          <Toggle label="Extended utterances"
+            sub={(config.extendedUtterances ?? false)
+              ? 'allow up to 30 seconds for dictation and long requests'
+              : 'standard 15-second limit; turn on for dictation and long requests'}
+            value={config.extendedUtterances ?? false} onChange={v => set('extendedUtterances', v)}/>
+        </div>
       </Stage>
 
       {/* 04 RING */}
@@ -5958,30 +6071,22 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
         </StageAdvanced>
       </Stage>
 
-      {/* 05 ADVANCED — button-turn internals: processing + speech gate */}
-      <Stage n="05" title="Advanced"
-        chips={<><ScopeChip tone="device">Device</ScopeChip><ScopeChip>Button turns only</ScopeChip></>}
-        desc="Everything here affects only bounded button-press turns — except the action button setting, which decides whether a tap starts one at all. Wake-word turns stream continuously — Home Assistant's VAD endpoints them, and the controller closes accidental wakes after 5s of silence relative to the room's measured noise floor — so none of these settings touch the wake path."
+      {/* 05 BUTTON (section id "advanced") */}
+      <Stage n="05" title="Button"
+        chips={<ScopeChip tone="device">Action button</ScopeChip>}
+        desc="What a tap on the action button does: start a voice turn, or fire Home Assistant's action-button event."
         scope={scopeEl('advanced')} dim={secStyle('advanced')}>
-        {subHeader('Action button', true)}
-        <div className="em-grid2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0 24px', ...inputStyle }}>
-          {/* Offered only when the device says it can measure a hold. */}
+        <div className="em-grid2" style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:'0 24px', ...inputStyle }}>
           <Toggle label="Tap sends an event"
-            sub={holdCapable
-              ? "tap fires the HA action-button event instead of starting a turn — hold still fires 'long'; the button can no longer cancel a response. A tap is easy to trigger by accident and the button is unauthenticated — bind destructive automations to 'long' instead"
-              : 'needs newer firmware on this Echo — it has no action-button event for a tap to fire'}
-            value={holdCapable && (config.buttonSingleTapEvent ?? false)}
-            onChange={holdCapable ? (v => set('buttonSingleTapEvent', v)) : (() => {})}/>
-          <Slider label="Multi-tap window" sub="0 = off. Coalesces quick taps into double/triple, at the cost of delaying every tap by this much. Needs 'Tap sends an event'" value={config.buttonMultiTapMs ?? 0} min={0} max={600} step={50} unit="ms" disabled={!(holdCapable && (config.buttonSingleTapEvent ?? false))} onChange={v => set('buttonMultiTapMs', v)}/>
-        </div>
-        {subHeader('Turn processing')}
-        <div className="em-grid2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0 24px', ...inputStyle }}>
-        </div>
-        {subHeader('Speech gate')}
-        <div className="em-grid2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '4px 20px', ...inputStyle }}>
-          <Slider label="Threshold" sub="RMS above this = speech (pre-gain units)" value={config.vadThreshold ?? 0.001} min={0.0001} max={0.02} step={0.0001} onChange={v => set('vadThreshold', v)}/>
-          <Slider label="Speech gate" sub="speech needed to open" value={config.vadSpeechMs ?? 160} min={32} max={320} step={32} unit="ms" onChange={v => set('vadSpeechMs', v)}/>
-          <Slider label="Silence gate" sub="silence needed to close" value={config.vadSilenceMs ?? 800} min={200} max={2000} step={100} unit="ms" onChange={v => set('vadSilenceMs', v)}/>
+            sub={holdGap || "tap fires the Home Assistant action-button event instead of starting a turn; bind destructive actions to a hold"}
+            value={!holdGap && (config.buttonSingleTapEvent ?? false)}
+            disabled={!!holdGap}
+            onChange={v => set('buttonSingleTapEvent', v)}/>
+          <Slider label="Multi-tap window"
+            sub="0 = off; coalesces quick taps at the cost of delaying each tap"
+            value={config.buttonMultiTapMs ?? 0} min={0} max={600} step={50} unit="ms"
+            disabled={!!holdGap || !(config.buttonSingleTapEvent ?? false)}
+            onChange={v => set('buttonMultiTapMs', v)}/>
         </div>
       </Stage>
 
@@ -5995,75 +6100,28 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
         </div>
       </Stage>
 
-      {/* 07 TIMERS */}
-      <Stage n="07" title="Timers"
-        chips={<ScopeChip tone="controller">Controller</ScopeChip>}
-        desc="What this Echo does when a Home Assistant timer runs out. Home Assistant keeps the clock and tells us once, at the moment it expires — it then forgets the timer entirely, so stopping the ring is up to the device: say the wake word and it goes quiet (that wake word is used up stopping it, so say it again to actually ask for something). The cut-off exists because nothing else in the system would ever stop it if the room is empty."
+      {/* 07 TIMERS AND ALARMS */}
+      <Stage n="07" title="Timers & alarms"
+        chips={<><ScopeChip tone="controller">HA clocks</ScopeChip><ScopeChip tone="device">Rings</ScopeChip></>}
+        desc="Home Assistant owns timer countdowns and alarm calendars. A ring loops the whole selected sound; alarms without their own sound use the default alarm sound. Preview plays a sound once on this Echo."
         scope={scopeEl('timers')} dim={secStyle('timers')}>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(140px,1fr))', gap: 8, ...inputStyle }}>
-          <div onClick={() => set('timerSound', '')} style={{
-            background: !config.timerSound
-              ? 'linear-gradient(160deg,var(--accent-tint),var(--accent-line))'
-              : 'linear-gradient(160deg,var(--raised),var(--surface))',
-            border: `1px solid ${!config.timerSound ? 'var(--accent)' : 'var(--border-soft)'}`,
-            borderRadius: 8, padding: '8px 10px',
-            cursor: disabled ? 'default' : 'pointer',
-            transition: 'border-color 0.15s, background 0.15s',
-          }}>
-            <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 12, fontWeight: 600, color: 'var(--lcd-line)' }}>Built-in chime</div>
-            <div style={{ fontFamily: mono, fontSize: 9, color: 'var(--muted)', marginTop: 2 }}>two tones · always available</div>
-          </div>
-          {[...sounds, ...(orphanSound ? [orphanSound] : [])].map(s => (
-            <div key={s.id} onClick={() => set('timerSound', s.id)} style={{
-              background: config.timerSound === s.id
-                ? 'linear-gradient(160deg,var(--accent-tint),var(--accent-line))'
-                : 'linear-gradient(160deg,var(--raised),var(--surface))',
-              border: `1px solid ${config.timerSound === s.id ? 'var(--accent)' : 'var(--border-soft)'}`,
-              borderRadius: 8, padding: '8px 10px', position: 'relative',
-              cursor: disabled ? 'default' : 'pointer',
-              transition: 'border-color 0.15s, background 0.15s',
-            }}>
-              <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 12, fontWeight: 600, color: 'var(--lcd-line)' }}>{s.id}</div>
-              <div style={{ fontFamily: mono, fontSize: 9, color: s.missing ? 'var(--error)' : 'var(--muted)', marginTop: 2 }}>
-                {s.missing ? 'missing file — rings the chime'
-                  : `${s.file}${s.seconds ? ` · ${s.seconds}s` : ''}`}
-              </div>
-              {!disabled && !s.missing && config.timerSound !== s.id && (
-                <div onClick={e => { e.stopPropagation(); deleteSound(s); }}
-                  title="Delete sound"
-                  style={{ position: 'absolute', top: 4, right: 7, fontFamily: mono, fontSize: 11,
-                    color: 'var(--muted)', cursor: 'pointer' }}>×</div>
-              )}
-            </div>
-          ))}
-          <div onClick={() => { if (!disabled) soundFileRef.current?.click(); }} style={{
-            background: 'linear-gradient(160deg,var(--raised),var(--surface))',
-            border: '1px dashed var(--border-hard)', borderRadius: 8, padding: '8px 10px',
-            cursor: disabled ? 'default' : 'pointer', opacity: 0.85,
-          }}>
-            <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 12, fontWeight: 600, color: 'var(--text2)' }}>+ Upload sound</div>
-            <div style={{ fontFamily: mono, fontSize: 9, color: 'var(--muted)', marginTop: 2 }}>mp3, wav, flac, ogg, m4a</div>
-            <input ref={soundFileRef} type="file" accept=".mp3,.wav,.flac,.ogg,.m4a,audio/*" style={{ display: 'none' }}
-              onChange={e => { uploadSound(e.target.files[0]); e.target.value = ''; }}/>
-          </div>
+        <SoundPicker label="Timer sound" configKey="timerSound" value={config.timerSound || ''} onChange={v => set('timerSound', v)}
+          disabled={disabled} catalog={catalog} reload={reloadSounds} deviceId={deviceId}
+          deviceConnected={deviceConnected} capabilities={capabilities}/>
+        <SoundPicker label="Default alarm sound" configKey="alarmSound" value={config.alarmSound || ''} onChange={v => set('alarmSound', v)}
+          disabled={disabled} catalog={catalog} reload={reloadSounds} deviceId={deviceId}
+          deviceConnected={deviceConnected} capabilities={capabilities}/>
+        <div className="em-grid2" style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:'0 24px', ...inputStyle }}>
+          <Slider label="Gap between repeats"
+            sub="quiet between complete timer-sound loops"
+            value={config.timerRingGapSeconds ?? 2.0} min={0} max={10} step={0.1} unit="s"
+            onChange={v => set('timerRingGapSeconds', v)}/>
+          <Slider label="Timer ring limit"
+            sub="how long an unanswered timer may ring"
+            value={config.timerRingSeconds ?? 900} min={30} max={1800} step={30}
+            formatValue={v => v >= 60 ? `${Math.round(v/60)} min` : `${v}s`}
+            onChange={v => set('timerRingSeconds', v)}/>
         </div>
-        <div style={{ marginTop: 16, ...inputStyle }}>
-          <Slider label="Burst length" sub="a shorter sound repeats to fill this — how insistent each round sounds" value={config.timerRingBurstSeconds ?? 1.2} min={0.5} max={6} step={0.1} unit="s" onChange={v => set('timerRingBurstSeconds', v)}/>
-          <Slider label="Gap between bursts" sub="a quiet fallback; wake listening stays active while the alarm itself is sounding" value={config.timerRingGapSeconds ?? 2.0} min={0.5} max={8} step={0.1} unit="s" onChange={v => set('timerRingGapSeconds', v)}/>
-          <Slider label="Stop ringing after" sub="gives up if nobody says the wake word — Home Assistant has already discarded the timer by then, so nothing else would" value={config.timerRingSeconds ?? 60} min={5} max={300} step={5} unit="s" onChange={v => set('timerRingSeconds', v)}/>
-        </div>
-        {deviceId && (
-          <div style={{ marginTop: 14, display: 'flex', gap: 10, alignItems: 'center' }}>
-            <Pill disabled={!deviceConnected} onClick={ringing ? stopRing : testRing}>
-              {ringing ? 'Stop ringing' : 'Test ring'}
-            </Pill>
-            <span style={{ fontFamily: mono, fontSize: 9, color: 'var(--muted)' }}>
-              {deviceConnected
-                ? 'rings for real — say the wake word to stop it'
-                : 'device offline'}
-            </span>
-          </div>
-        )}
       </Stage>
     </div>
   );
@@ -6093,7 +6151,7 @@ function DeployAllModal({ release, devices, deployState, onStarted, onDismiss, o
   const target = view?.version || release?.version;
   const byId = Object.fromEntries(devices.map(d => [d.device_id, d]));
   const eligible = devices.filter(d =>
-    d.approved && d.connected && d.firmware_ver !== release?.version);
+    d.approved && d.connected && (d.upgrade_required || d.firmware_ver !== release?.version));
 
   const SKIP_REASONS = {
     not_approved:       'not approved',
@@ -6316,7 +6374,7 @@ function SettingsPanel({ globalConfig, onGlobalConfigChange, onClose, username, 
               <div style={{ fontFamily:"'DM Mono',monospace", fontSize:10, color:'var(--muted)', marginBottom:20, lineHeight:1.6 }}>
                 Default config applied to all devices unless overridden per-device.
               </div>
-              <DeviceConfigForm config={config} onChange={setConf} disabled={false}/>
+              <DeviceConfigForm config={config} onChange={setConf} disabled={!isAdmin}/>
               {dirty && (
                 <div style={{ display:'flex', gap:10, marginTop:24 }}>
                   <Pill accent disabled={saving} onClick={saveGlobalConfig}>{saving ? 'Saving…' : 'Save & push to fleet'}</Pill>
@@ -6475,6 +6533,7 @@ function App() {
 
     ws.onmessage = e => {
       const msg = JSON.parse(e.data);
+      _emitEvent(msg);
       switch(msg.type) {
         case 'snapshot':
           setDevices(msg.devices);
@@ -6488,7 +6547,9 @@ function App() {
           }
           break;
         case 'device_log':
-          _emitDeviceLog(msg.device_id, msg.entry);
+        case 'alerts':
+        case 'ha_status':
+          // Detail panels consume these through subscribeEvents.
           break;
         case 'device_connected':
           setDevices(prev => prev.map(d =>
@@ -6551,7 +6612,8 @@ function App() {
   const online   = devices.filter(d => d.connected).length;
   const approved = devices.filter(d => d.approved);
   const pending  = devices.filter(d => !d.approved);
-  const updates  = approved.filter(d => d.firmware_ver && release?.version && d.firmware_ver !== release.version).length;
+  const updates  = approved.filter(d => d.upgrade_required
+    || (d.firmware_ver && release?.version && d.firmware_ver !== release.version)).length;
   const active   = approved.filter(d => d.speaking || d.listening || d.thinking).length;
 
   const selectedDevice = selected ? devices.find(d => d.device_id === selected) : null;
