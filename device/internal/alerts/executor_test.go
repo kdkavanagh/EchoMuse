@@ -224,6 +224,43 @@ func TestQueueOrdersAlarmsAndTimerRings(t *testing.T) {
 	}
 }
 
+// The controller's voice stop and LLM tool calls carry UUIDv5 op_ids
+// (uuid5(NAMESPACE_URL, …)); rejecting them left "<wake> stop" unable to stop
+// a ringing timer.
+func TestActAcceptsTheControllersUUIDv5OpIDs(t *testing.T) {
+	h := newHarness(t)
+	h.trust()
+	if err := h.e.HandleTimerRing(TimerRing{RingID: "t", Name: "tea", Sound: SoundFallback, LoopGapMs: 2000, MaxRingMs: 900000}); err != nil {
+		t.Fatal(err)
+	}
+	h.e.Poll()
+	if h.activeID() != "t" {
+		t.Fatalf("timer not ringing: %+v", h.active())
+	}
+	for _, bad := range []string{"not-a-uuid", strings.ToUpper(NewUUID4().String()), "6ba7b811-9dad-11d1-00b4-00c04fd430c8"} {
+		if r := h.e.Act(bad, "t", actionDismiss, "voice"); r.Status != StatusRejected || r.Error != "invalid_op_id" {
+			t.Fatalf("op_id %q: %+v", bad, r)
+		}
+	}
+	voice := UUID5(NamespaceURL, "turn-1|dismiss").String()
+	r := h.e.Act(voice, "t", actionDismiss, "voice")
+	if r.Status != StatusApplied || r.Ended == nil || r.Ended.ID != "t" || r.OpID != voice {
+		t.Fatalf("voice stop with a UUIDv5 op_id: %+v", r)
+	}
+	h.e.Poll()
+	if h.active() != nil {
+		t.Fatal("timer still ringing")
+	}
+
+	a := alarm("wake", h.utcNow()+minute(1))
+	h.install("E1", 1, a)
+	h.advanceTo(a.dueUTC)
+	llm := UUID5(NamespaceURL, "request-1").String()
+	if r := h.e.Act(llm, a.occID(), actionDismiss, "llm"); r.Status != StatusDurable || r.Operation == nil || r.Operation.OpID != llm {
+		t.Fatalf("llm dismiss with a UUIDv5 op_id: %+v", r)
+	}
+}
+
 func TestCatchUpWindowAndMissedExpiry(t *testing.T) {
 	h := newHarness(t)
 	h.trust()

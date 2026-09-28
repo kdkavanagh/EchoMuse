@@ -57,7 +57,12 @@ or alarms.
 - **Activity** — the voice-turn history: what was heard, the transcript, how
   the turn ended, and the audio of each turn when **Save utterances** or
   **Save wake clips** is on. The header names the wake model with its idle and
-  playback thresholds, and a counter shows **Refused wakes**. History is kept in the
+  playback thresholds, and a counter shows **Refused wakes**. A turn whose
+  answer asked a follow-up question is marked `?` (colored by what became of
+  it: answered, no reply within 7 s, cut off, no microphone, …) and its reply
+  `↩`; each links to the other, and **Follow-ups answered** counts them. Each
+  turn also shows how its spoken answer ended and the trace id of its
+  controller log line (`turn <id> trace`). History is kept in the
   controller's database. Daily turn summaries, hourly wake counters and hourly
   hardware metrics (CPU, memory, WiFi signal) for up to 180 days are available
   from `/api/devices/{id}/activity?days=N`.

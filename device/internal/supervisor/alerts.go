@@ -95,6 +95,42 @@ func (s *Supervisor) alertRing(env proto.Envelope) {
 		return
 	}
 	s.ack(env, proto.AckAccepted, "")
+	// A sound that was not installed rings as the fallback (§16.5); install it
+	// in the background so the next ring uses it.
+	if _, installed := s.ex.PreviewPCM(r.Sound); !installed && isSHA256(r.Sound) {
+		s.wantSounds(r.Sound)
+		s.fetchAlertAssets()
+	}
+}
+
+// alertPrefetch installs the named alert sounds ahead of need: the controller
+// names the timer sound here, because alert.ring names it only as the timer
+// finishes, too late to fetch before the ring starts.
+func (s *Supervisor) alertPrefetch(env proto.Envelope) {
+	var b proto.AlertPrefetch
+	if err := json.Unmarshal(env.Body, &b); err != nil {
+		s.ack(env, proto.AckRejected, codeInvalid)
+		return
+	}
+	for _, sha := range b.Sounds {
+		if !isSHA256(sha) {
+			s.ack(env, proto.AckRejected, codeInvalid)
+			return
+		}
+	}
+	s.ack(env, proto.AckAccepted, "")
+	s.wantSounds(b.Sounds...)
+	s.fetchAlertAssets()
+}
+
+// wantSounds queues alert sounds no armed alarm needs (previews, timer
+// sounds) for the next fetch pass.
+func (s *Supervisor) wantSounds(shas ...string) {
+	s.mu.Lock()
+	for _, sha := range shas {
+		s.soundWant[sha] = true
+	}
+	s.mu.Unlock()
 }
 
 func (s *Supervisor) alertOpResult(env proto.Envelope) {
@@ -119,9 +155,9 @@ func (s *Supervisor) clockReply(env proto.Envelope) {
 	}
 }
 
-// fetchAlertAssets installs missing alert sounds (armed alarms and requested
-// previews) over the session's assets socket, one fetch pass at a time.
-// Until installed, the executor rings the built-in fallback (§16.5).
+// fetchAlertAssets installs missing alert sounds (armed alarms, previews and
+// prefetched timer sounds) over the session's assets socket, one fetch pass
+// at a time. Until installed, the executor rings the built-in fallback (§16.5).
 func (s *Supervisor) fetchAlertAssets() {
 	s.mu.Lock()
 	sess, ctx := s.session, s.sessCtx
@@ -140,7 +176,7 @@ func (s *Supervisor) fetchAlertAssets() {
 func (s *Supervisor) fetchAlertAssetsFrom(ctx context.Context, tr assets.Transport) {
 	want := s.ex.MissingSounds()
 	s.mu.Lock()
-	for sha := range s.previewWant {
+	for sha := range s.soundWant {
 		want = append(want, sha)
 	}
 	s.mu.Unlock()
@@ -177,6 +213,6 @@ func (s *Supervisor) fetchAlertAssetsFrom(ctx context.Context, tr assets.Transpo
 
 func (s *Supervisor) fetched(sha string) {
 	s.mu.Lock()
-	delete(s.previewWant, sha)
+	delete(s.soundWant, sha)
 	s.mu.Unlock()
 }

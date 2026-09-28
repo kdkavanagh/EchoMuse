@@ -29,6 +29,7 @@ func (s *Supervisor) Hello() proto.SessionHello {
 		caps = append(caps, proto.CapAlertCache)
 	}
 	caps = append(caps, retainedCapabilities...)
+	caps = append(caps, proto.CapAlertPrefetch)
 	if s.cfg.AmbientReadable() {
 		caps = append(caps, proto.CapAmbientLight)
 	}
@@ -174,6 +175,8 @@ func (s *Supervisor) Control(env proto.Envelope) {
 		s.alertAct(env)
 	case proto.TypeAlertRing:
 		s.alertRing(env)
+	case proto.TypeAlertPrefetch:
+		s.alertPrefetch(env)
 	case proto.TypeAlertOpResult:
 		s.alertOpResult(env)
 	case proto.TypeClockReply:

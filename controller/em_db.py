@@ -733,6 +733,23 @@ MIGRATIONS: list[str] = [
     ALTER TABLE turns ADD COLUMN response_text TEXT;
     UPDATE system_config SET value = '24' WHERE key = 'schema_version';
     """,
+
+    # ── v25 — follow-up questions on the Activity page ───────────────────────
+    #
+    # A turn whose answer asked a question (HA continue_conversation, or an
+    # EchoMuse clarification) records what became of it in `continuation`:
+    # `pending` with the row, then one final value written when the reply
+    # window resolves. `playback_reason` is how the spoken answer ended
+    # (drained, cancelled, ...), `turn_uuid` the actor's turn id that trace
+    # logs name, and `reply_to` the turn_uuid of the question a turn answered.
+    """
+    ALTER TABLE turns ADD COLUMN turn_uuid TEXT;
+    ALTER TABLE turns ADD COLUMN conversation_id TEXT;
+    ALTER TABLE turns ADD COLUMN reply_to TEXT;
+    ALTER TABLE turns ADD COLUMN continuation TEXT;
+    ALTER TABLE turns ADD COLUMN playback_reason TEXT;
+    UPDATE system_config SET value = '25' WHERE key = 'schema_version';
+    """,
 ]
 
 # Post-migration fixups that need Python rather than SQL. Keyed by the schema
@@ -1809,7 +1826,8 @@ def get_device_logs(
 
 # Turn dict keys ↔ column names written by insert_turn. "trigger" is stored
 # as trigger_type because TRIGGER is an SQLite keyword. The §11.3 decision
-# trace arrived in schema 22, the per-stage Activity detail in schema 24.
+# trace arrived in schema 22, the per-stage Activity detail in schema 24, the
+# follow-up question detail in schema 25.
 _TURN_COLUMNS = {
     "trigger":            "trigger_type",
     "wake_model":         "wake_model",
@@ -1838,6 +1856,11 @@ _TURN_COLUMNS = {
     "intent_local":       "intent_local",    # 1: HA's built-in agent answered; 0: the conversation agent
     "response_type":      "response_type",   # HA intent response_type
     "response_text":      "response_text",   # the spoken answer
+    "playback_reason":    "playback_reason", # how the spoken answer ended: drained | cancelled | failed | …
+    "turn_uuid":          "turn_uuid",       # the actor's turn id (the key of the logged trace)
+    "conversation_id":    "conversation_id", # HA conversation the turn ran in
+    "reply_to":           "reply_to",        # turn_uuid of the question this turn answered
+    "continuation":       "continuation",    # fate of the question this turn asked (em_session FOLLOWUP_*)
 }
 
 # Columns get_turns returns but nothing writes any more (SPEC §18.4 step 3):
@@ -1908,6 +1931,15 @@ def set_turn_wake(turn_id: int, wake_file: Optional[str]) -> None:
         conn.execute(
             "UPDATE turns SET wake_file = ? WHERE id = ?",
             (wake_file, turn_id),
+        )
+
+
+def set_turn_continuation(turn_id: int, continuation: str) -> None:
+    """Replace a turn's `pending` follow-up with its final outcome."""
+    with _tx() as conn:
+        conn.execute(
+            "UPDATE turns SET continuation = ? WHERE id = ?",
+            (continuation, turn_id),
         )
 
 

@@ -180,6 +180,7 @@ class _Endpoint:
     worker: asyncio.Task | None = None
     # Delivery.
     online: bool = False
+    prefetch: bool = False          # the device installs sounds alert.prefetch names
     delivered: dict[str, tuple[dict, int]] = field(default_factory=dict)
     delivered_valid: bool = False   # `delivered` is known to equal the device cache
     schedule_rev: dict[str, int] = field(default_factory=dict)
@@ -772,12 +773,15 @@ class AlertEngine:
 
     # ── device messages (WIRE §4.1, §4.7) ────────────────────────────────
 
-    async def on_session_hello(self, endpoint_id: str, alerts: dict) -> None:
-        """`session.hello.alerts`: snapshot on an epoch/sequence mismatch."""
+    async def on_session_hello(self, endpoint_id: str, alerts: dict, *,
+                               capabilities: Iterable[str] = ()) -> None:
+        """`session.hello.alerts`: snapshot on an epoch/sequence mismatch; then the
+        timer sound, so a first ring does not fall back for want of it."""
         ep = self._eps.get(endpoint_id)
         if ep is None:
             return
         ep.online = True
+        ep.prefetch = "alert_prefetch" in capabilities
         dev_epoch, dev_acked = alerts.get("delivery_epoch"), alerts.get("acked_sequence")
         if dev_epoch == ep.epoch and isinstance(dev_acked, int) and 0 <= dev_acked <= ep.sequence:
             ep.acked = dev_acked
@@ -786,6 +790,7 @@ class AlertEngine:
             ep.delivered_valid = False
         if ep.materialized:
             await self._deliver(ep)
+        await self._prefetch_timer_sound(ep)
 
     def on_session_lost(self, endpoint_id: str) -> None:
         ep = self._eps.get(endpoint_id)
@@ -1347,7 +1352,9 @@ class AlertEngine:
         else:
             ep.timers.pop(timer_id, None)
         self.notify(endpoint_id, "timers", {"timers": self.timers(endpoint_id)})
-        if event == "finished":
+        if event == "started":
+            await self._prefetch_timer_sound(ep)      # timerSound may have changed since hello
+        elif event == "finished":
             await self._ring_timer(ep, timer_id, name)
 
     def timers(self, endpoint_id: str) -> list[dict]:
@@ -1388,6 +1395,20 @@ class AlertEngine:
             log.warning("alerts: timer_ring_undeliverable %s on %s: %s", timer_id, ep.endpoint_id, error)
             self.notify(ep.endpoint_id, "timer_ring_undeliverable",
                         {"timer_id": timer_id, "name": name, "error": error})
+
+    async def _prefetch_timer_sound(self, ep: _Endpoint) -> None:
+        """Have the device install the timer sound before a ring needs it: `alert.ring`
+        names it only as the timer finishes, and a missing asset rings the fallback
+        tone (§16.5). The device skips a sound it already holds."""
+        if not (ep.online and ep.prefetch):
+            return
+        sound = self._sound(ep, "timer")
+        if sound == FALLBACK_SOUND:
+            return
+        try:
+            await self.send(ep.endpoint_id, "alert.prefetch", {"sounds": [sound]}, generation=0)
+        except Exception as err:  # the session layer owns transport errors
+            log.info("alerts: timer sound prefetch on %s not sent: %s", ep.endpoint_id, err)
 
     # ── sounds, flags, status ─────────────────────────────────────────────
 

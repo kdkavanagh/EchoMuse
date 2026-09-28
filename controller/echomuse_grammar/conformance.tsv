@@ -41802,3 +41802,44 @@ pm please	reply	unknown
 	reply	unknown
 tea or coffee	reply	unknown
 no thank you	reply	unknown
+# hand-written alarm_query
+what alarms do i have	alarm_query	complete
+what alarms are set	alarm_query	complete
+which alarms are set	alarm_query	complete
+what alarms have i got	alarm_query	complete
+do i have any alarms	alarm_query	complete
+do i have any alarms set	alarm_query	complete
+have i got any alarms	alarm_query	complete
+are there any alarms set	alarm_query	complete
+how many alarms do i have	alarm_query	complete
+how many alarms are set	alarm_query	complete
+list my alarms	alarm_query	complete
+show me my alarms	alarm_query	complete
+tell me my alarms	alarm_query	complete
+check my alarms	alarm_query	complete
+read me all my alarms	alarm_query	complete
+what are my alarms	alarm_query	complete
+what's my alarm set for	alarm_query	needs_more
+alarm status	alarm_query	complete
+status of my alarms	alarm_query	complete
+when is my alarm	alarm_query	complete
+when's my next alarm	alarm_query	complete
+whens my alarm	alarm_query	complete
+what time is my alarm	alarm_query	complete
+what time is my next alarm set	alarm_query	complete
+is my alarm set	alarm_query	complete
+is there an alarm set	alarm_query	complete
+what time does my alarm go off	alarm_query	complete
+when will my next alarm go off	alarm_query	complete
+do i have an alarm set	alarm_query	complete
+what alarms do i have please	alarm_query	complete
+what time is my alarm set for	alarm_query	needs_more
+can you tell me my alarms	alarm_query	complete
+how much time is left	alarm_query	unknown
+what timers do i have	alarm_query	unknown
+what timers and alarms do i have	alarm_query	unknown
+set an alarm for 7 am	alarm_query	unknown
+cancel my alarm	alarm_query	unknown
+what time is it	alarm_query	unknown
+when is my appointment	alarm_query	unknown
+	alarm_query	unknown

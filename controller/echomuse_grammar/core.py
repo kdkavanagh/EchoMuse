@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Iterable, Literal, Mapping, Sequence
 
+from .alerts import parse_alarm_query
 from .normalize import normalize, tokens
 from .timer_data import SKIP_WORDS, SLOT_RANGES, TIMER_PATTERNS
 
@@ -28,8 +29,9 @@ class Result:
 
     ``family`` is None only for ``unknown`` from :func:`classify`. ``parse`` is
     family-specific: timer → tuple of matching HA intent names, alarm →
-    :class:`AlarmParse`, home → :class:`HomeParse`, local → :class:`LocalParse`,
-    reply → the selected choice value; None when no parse exists.
+    :class:`AlarmParse`, alarm_query → :class:`AlarmQuery`, home → :class:`HomeParse`,
+    local → :class:`LocalParse`, reply → the selected choice value; None when no
+    parse exists.
     """
 
     klass: Literal["complete", "extendable", "needs_more", "unknown"]
@@ -529,7 +531,7 @@ def _reply(text: str, choices: Sequence[Choice | Mapping[str, Any]] | None) -> R
     return Result(UNKNOWN, "reply")
 
 
-FAMILIES = ("reply", "alarm", "timer", "home", "local")
+FAMILIES = ("reply", "alarm", "timer", "alarm_query", "home", "local")
 _RANK = {UNKNOWN: 0, NEEDS_MORE: 1, EXTENDABLE: 2, COMPLETE: 3}
 
 
@@ -543,6 +545,9 @@ def family_result(family: str, text: str, vocabulary: Iterable[str] = (),
         result = _alarm_result(text)
     elif family == "timer":
         result = _timer(text, vocabulary)
+    elif family == "alarm_query":
+        parsed = parse_alarm_query(text)
+        result = Result(COMPLETE, "alarm_query", parsed) if parsed is not None else Result(UNKNOWN, "alarm_query")
     elif family == "home":
         result = _home(text, vocabulary)
     elif family == "local":

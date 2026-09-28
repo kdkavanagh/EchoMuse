@@ -46,6 +46,9 @@ const (
 	CapButtons      = "buttons"
 	CapButtonHold   = "button_hold"
 	CapAmbientLight = "ambient_light"
+
+	// CapAlertPrefetch: the device installs the sounds alert.prefetch names.
+	CapAlertPrefetch = "alert_prefetch"
 )
 
 // Message types (WIRE §4).
@@ -91,6 +94,7 @@ const (
 	TypeAlertOpResult  = "alert.op_result"
 	TypeAlertAct       = "alert.act"
 	TypeAlertRing      = "alert.ring"
+	TypeAlertPrefetch  = "alert.prefetch"
 	TypeAlertRingEnded = "alert.ring_ended"
 	TypeAlertState     = "alert.state"
 
@@ -304,8 +308,11 @@ type RenderStart struct {
 	Announcement bool    `json:"announcement"`
 }
 
+// RenderEnd ends a network playback. EndFrame is the source frame after the
+// last one sent: audio before it may still be in flight on the audio socket.
 type RenderEnd struct {
-	PlaybackID string `json:"playback_id"`
+	PlaybackID string  `json:"playback_id"`
+	EndFrame   NullU64 `json:"end_frame"`
 }
 
 type RenderCancel struct {
@@ -455,4 +462,10 @@ type AlertAct struct {
 	TargetID string `json:"target_id"`
 	Action   string `json:"action"` // dismiss | snooze
 	Source   string `json:"source"`
+}
+
+// AlertPrefetch names alert sounds (SHA-256) to install before anything
+// rings them: alert.ring names the timer sound only when the timer finishes.
+type AlertPrefetch struct {
+	Sounds []string `json:"sounds"`
 }

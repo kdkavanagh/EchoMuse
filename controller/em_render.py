@@ -66,6 +66,7 @@ class Playback:
         self.finished: asyncio.Future[dict] = loop.create_future()
         self.last_progress: dict | None = None
         self.completed_frames = 0
+        self.sent_frames = 0          # frames of a network source sent to the device
         self._client = client
         self._start_sent = False
         self._cancel_sent = False
@@ -267,7 +268,11 @@ class RenderClient:
                 await self._link.send_audio(frame)
                 sequence += 1
                 sent += n
-            await self._send("render.end", {"playback_id": playback.playback_id}, playback)
+                playback.sent_frames = sent
+            # The tail may still be in flight on the audio socket when render.end
+            # arrives on the control socket: end_frame says how much audio to wait for.
+            await self._send("render.end", {"playback_id": playback.playback_id,
+                                            "end_frame": tl.format_u64(sent)}, playback)
         except asyncio.CancelledError:
             raise
         except LinkClosed:

@@ -102,7 +102,7 @@ is never filled.
 ```json
 {"capabilities":["audio_timeline_v1","uplink_leases_v1","device_wake_v1",
   "render_reference_v1","render_progress_v1","focus_leases_v1","alert_cache_v1",
-  "turn_protocol_v1","leds","led_anim","buttons","button_hold","ambient_light"],
+  "turn_protocol_v1","leds","led_anim","buttons","button_hold","alert_prefetch","ambient_light"],
  "firmware_version":"v3.0.0","boot_id":"<proc boot_id>","protocols":[1],
  "ip":"10.0.0.5","ambient_light_status":{},
  "privacy":{"muted":false,"capture_epoch":"123"},
@@ -141,7 +141,7 @@ trusted, then every 10 min.
 **`command.ack`** both:
 `{"message_id":"<acked message's id>","status":"accepted|applied|durable|rejected","error":"code|null"}`.
 The device acks every C→D `focus.*`, `render.*`, `uplink.*`, `alert.act`,
-`alert.ring`: `accepted` on receipt, `rejected` with a code on refusal; `alert.act`
+`alert.ring`, `alert.prefetch`: `accepted` on receipt, `rejected` with a code on refusal; `alert.act`
 on an alarm acks `durable` once journaled. The controller acks `wake.candidate`
 (`accepted`, which releases the candidate lease's audio, or `rejected`).
 
@@ -165,8 +165,12 @@ audio socket with this epoch and generation; the device FIFO holds 128 writes
 and primes 24 before starting. Local sources (`earcon`, `alert_preview`) play
 `local_asset` immediately, no prime.
 
-**`render.end`** C→D `{"playback_id":"…"}`: no more audio for this playback;
-the device drains it and reports `render.finished` `drained`.
+**`render.end`** C→D `{"playback_id":"…","end_frame":"<u64>"}`: no audio
+follows `end_frame`, the source frame after the last one sent. The audio
+before it may still be in flight on the audio socket, so the device keeps
+accepting contiguous packets up to `end_frame`, drains once all of it has
+arrived, and reports `render.finished` `drained`; a packet past `end_frame` is
+dropped. `end_frame` absent or null: the audio already received is all there is.
 
 **`render.cancel`** C→D, gen = playback generation:
 `{"playback_id":"…","reason":"…"}`. Idempotent. Discards FIFO, reports
@@ -299,12 +303,23 @@ the controller answers **`alert.op_result`** C→D
 device may drop the operation once the occurrence is no longer delivered.
 
 **`alert.act`** C→D: `{"op_id":"uuid","target_id":"<occurrence or ring id>","action":"dismiss|snooze","source":"voice|entity|llm|dashboard"}`.
+`op_id` is any canonical lowercase RFC 4122 UUID: the controller sends UUIDv5
+for voice commands and LLM tool calls (architecture §16.7) and UUIDv4 otherwise.
 Alarms go through the journaled local-operation path (`command.ack durable`,
 then an `alert.local_operation` with the same `op_id`); timer rings stop
 (`command.ack applied`).
 
 **`alert.ring`** C→D (timers only, not persisted):
 `{"ring_id":"<HA timer id>","name":"pasta","sound":"<sha256>|builtin:fallback","loop_gap_ms":2000,"max_ring_ms":900000}`.
+A sound the device has not installed rings as the fallback; the device fetches it
+in the background for later rings.
+
+**`alert.prefetch`** C→D, only to a device announcing `alert_prefetch`:
+`{"sounds":["<sha256>",…]}`. The device installs each missing sound from
+`/device/v1/assets` in the background; `rejected` `invalid` when any entry is not
+a SHA-256. The controller sends the effective timer sound after `session.hello`
+and whenever an HA timer starts, so a timer rings its configured sound rather
+than the fallback.
 
 **`alert.ring_ended`** D→C: `{"id":"…","kind":"timer|alarm","reason":"stopped|button|entity|limit|preempted|restart"}`.
 

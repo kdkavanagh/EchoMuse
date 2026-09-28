@@ -98,8 +98,10 @@ def test_pacing_fifo_bound_and_render_end_at_eof():
         await asyncio.wait_for(link.end.wait(), 1.0)
         assert len(link.packets) == 90
         assert link.max_in_flight <= em_render.MAX_IN_FLIGHT
-        assert link.commands[-1][:3] == (
-            "render.end", {"playback_id": playback.playback_id}, 17)
+        # end_frame: the device waits for audio still in flight behind render.end.
+        assert link.commands[-1][:3] == ("render.end", {
+            "playback_id": playback.playback_id,
+            "end_frame": tl.format_u64(90 * em_render.PACKET_FRAMES)}, 17)
         assert link.starts[0][0]["epoch"] == tl.format_u64(link.packets[0].epoch)
         assert all(packet.generation == 17 for packet in link.packets)
         assert playback.started.done()

@@ -1016,6 +1016,21 @@ class HaClient:
         finally:
             self._channels.pop(run.msg_id, None)
 
+    async def handle_intent(self, name: str, slots: dict[str, Any], device_id: str | None) -> dict:
+        """Run one of HA's intents directly, through the stock `POST /api/intent/handle`,
+        for the speaker's HA device (EchoMuse's own timer grammar, §10.8). No conversation
+        agent reads it. Returns HA's intent response; raises `HaError` when HA refused
+        the request or the intent failed. `HaUnavailable` once the request may have been
+        sent means its outcome is unknown: never resend it."""
+        response = await self._rest_ok("POST", "/intent/handle",
+                                       json_body={"name": name, "data": slots, "device_id": device_id})
+        if not isinstance(response, dict):
+            raise HaError("bad_response", f"{name}: {response!r}")
+        if response.get("response_type") == "error":
+            speech = ((response.get("speech") or {}).get("plain") or {}).get("speech")
+            raise HaError(str((response.get("data") or {}).get("code", "failed_to_handle")), str(speech or name))
+        return response
+
     # ── calendar (§16.4, §10.4) ──
 
     async def calendar_create(self, entity_id: str, event: dict) -> None:
@@ -1241,6 +1256,9 @@ class HaClient:
         async def timers() -> None:
             components(*_TIMER_COMPONENTS)
             await self.command({"type": "config/device_registry/list"})
+            # Voice timer starts and status questions go through the stock intent API
+            # with a device (§10.8); a status question changes nothing.
+            await self.handle_intent("HassTimerStatus", {}, None)
 
         checks = {"voice": voice, "calendar": calendar, "scripts": scripts,
                   "vocabulary": vocabulary, "timers": timers}

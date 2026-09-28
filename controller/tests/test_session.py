@@ -23,7 +23,7 @@ from em_audio_timeline import (
     build_cells,
     build_packet,
 )
-from em_ha_client import IntentEnded, RunEnded, TtsReady
+from em_ha_client import HaUnavailable, IntentEnded, RunEnded, TtsReady
 from em_session import ActorDeps, SessionActor
 from em_speech_worker import (
     AsrPayload,
@@ -59,6 +59,7 @@ def run(coro):
 
 class FakeLink:
     closed = False
+    render: "FakeRender | None" = None
 
     def __init__(self):
         self.sent: list[tuple[str, dict, int]] = []
@@ -67,6 +68,10 @@ class FakeLink:
 
     async def send(self, msg_type, body, *, generation=0):
         self.sent.append((msg_type, body, generation))
+        if msg_type == "focus.acquire" and body["focus"] == "dialog_input" and self.render is not None:
+            # The device's focus policy (WIRE §4.3, SPEC §6.2): dialog input cancels current dialog output.
+            for playback in self.render.streams:
+                playback.finish("cancelled")
         return str(uuid.uuid4())
 
     async def request(self, msg_type, body, *, generation=0, timeout=2.0):
@@ -90,6 +95,8 @@ class FakePlayback:
         self.started = loop.create_future()
         self.finished = loop.create_future()
         self.last_progress = None
+        self.completed_frames = 0
+        self.sent_frames = 0
 
     @property
     def done(self):
@@ -166,6 +173,15 @@ class FakeHa:
         self.intents: list[tuple[str, str | None]] = []
         self.tts: list[str] = []
         self.next_run = FakeRun()
+        self.handled: list[tuple[str, dict, str | None]] = []
+        self.intent_responses: dict[str, object] = {}   # intent name → response dict or exception
+
+    async def handle_intent(self, name, slots, device_id):
+        self.handled.append((name, slots, device_id))
+        response = self.intent_responses.get(name, {"response_type": "action_done"})
+        if isinstance(response, Exception):
+            raise response
+        return response
 
     async def run_stt(self, pipeline_id, device_id, pcm):
         self.stt_calls.append(pcm)
@@ -286,10 +302,15 @@ class FakeWorker:
 class FakeAlerts:
     def __init__(self):
         self.calls = []
+        self.alarms: list[dict] = []
+        self.set_result: dict = {"ok": True}
 
     async def set_alarm(self, *args, **kwargs):
         self.calls.append(("set_alarm", args, kwargs))
-        return {"ok": True}
+        return self.set_result
+
+    def list_alarms(self, endpoint_id):
+        return {"ok": True, "alarms": self.alarms}
 
 
 class Device:
@@ -358,10 +379,14 @@ class Harness:
         self.reply_events: list = []
         self.events = []
         self.config = {"wakeSound": True, "wakeArbitrationMs": 700, **(config or {})}
+        self.link.render = self.render
 
         async def persist(row):
             self.rows.append(row)
             return len(self.rows)
+
+        async def record_continuation(row_id, outcome):
+            self.rows[row_id - 1]["continuation"] = outcome
 
         async def pipeline():
             return "p1"
@@ -374,7 +399,8 @@ class Harness:
         self.actor = SessionActor("dev1", ActorDeps(
             ha=self.ha, worker=self.worker, registry=FakeRegistry(), alerts=self.alerts, arbiter=self.arbiter,
             config=lambda: self.config, ha_device_id=lambda: "hadev", pipeline_id=pipeline,
-            vocabulary=lambda: None, esphome_reply=esphome_reply, persist_turn=persist))
+            vocabulary=lambda: None, esphome_reply=esphome_reply, persist_turn=persist,
+            record_continuation=record_continuation))
         self.worker.actor = self.actor
         self.actor.add_listener(self.events.append)
         self.device = Device(self.actor)
@@ -648,11 +674,167 @@ def test_a_button_turn_opens_its_own_lease_from_the_press_minus_300_ms():
     run(main())
 
 
+def test_a_timer_cancel_home_assistant_may_have_received_is_never_resent():
+    async def main():
+        h = Harness()
+        h.ha.stt_text = "Cancel all timers."
+        h.ha.intent_responses["HassTimerStatus"] = timer_status(
+            ha_timer("a", 5, 192), ha_timer("b", 10, 480), ha_timer("k", 5, 30, device="kitchen"))
+        h.ha.intent_responses["HassCancelTimer"] = HaUnavailable("timed out")
+        await button_turn(h, PRESS + 50_000)
+        await h.wait_for(lambda: h.rows)
+        assert h.rows[0]["terminal_reason"] == "outcome_unknown"
+        assert [n for n, _, _ in h.ha.handled] == ["HassTimerStatus", "HassCancelTimer"] and h.ha.intents == []
+        await h.wait_for(lambda: h.ha.tts)
+        assert h.ha.tts == [em_session.LINE_UNKNOWN]
+        await h.actor.close()
+    run(main())
+
+
+def test_alarm_questions_are_answered_from_the_alert_engine_and_timer_questions_go_to_home_assistant():
+    async def main():
+        h = Harness()
+        h.ha.stt_text = "When's my next alarm?"
+        h.alerts.alarms = [{"name": "Alarm", "kind": "alarm", "due": "2030-01-02T07:00:00+00:00",
+                            "repeats": [], "schedule_id": "s1"}]
+        await button_turn(h, PRESS + 50_000)
+        await h.wait_for(lambda: h.render.streams)
+        assert h.render.urls() == ["tts://Your next alarm is 7 AM on January 2."]
+        assert h.ha.handled == [] and h.ha.intents == []
+        h.render.streams[0].finish("drained")
+        await h.wait_for(lambda: h.rows)
+        assert h.rows[0]["outcome"] == "alarm_query"
+        await h.actor.close()
+
+        # HA's own local HassTimerStatus intent answers timer questions.
+        h = Harness()
+        h.ha.stt_text = "How much time is left?"
+        h.ha.next_run = FakeRun([IntentEnded("Your 5 minute timer has 3 minutes left.", "c", False,
+                                             "action_done", True), TtsReady("http://ha/tts/1", False), RunEnded()])
+        await button_turn(h, PRESS + 50_000)
+        await h.wait_for(lambda: h.render.streams)
+        assert h.ha.intents == [("How much time is left?", None)] and h.ha.handled == []
+        await h.actor.close()
+    run(main())
+
+
+def ha_timer(id_, minutes, left, name="", device="hadev", seconds=0):
+    return {"id": id_, "name": name, "device_id": device, "is_active": True, "total_seconds_left": left,
+            "start_hours": 0, "start_minutes": minutes, "start_seconds": seconds}
+
+
+def timer_status(*timers):
+    return {"response_type": "action_done", "speech_slots": {"timers": list(timers)}}
+
+
+def cancels(h: Harness) -> list[tuple[str, dict]]:
+    return [(n, s) for n, s, _ in h.ha.handled if n != "HassTimerStatus"]
+
+
+def test_cancel_the_timer_names_the_one_it_cancelled_which_home_assistant_cannot():
+    async def main():
+        h = Harness()
+        h.ha.stt_text = "Cancel the timer."
+        h.ha.intent_responses["HassTimerStatus"] = timer_status(
+            ha_timer("a", 0, 4, seconds=5), ha_timer("k", 5, 30, device="kitchen"))
+        await button_turn(h, PRESS + 50_000)
+        await h.wait_for(lambda: h.render.streams)
+        assert cancels(h) == [("HassCancelTimer", {"start_seconds": 5})] and h.ha.intents == []
+        assert h.render.urls() == ["tts://5 second timer cancelled."]
+        await h.actor.close()
+    run(main())
+
+
+def test_a_timer_cancel_by_length_goes_to_home_assistants_local_intent():
+    async def main():
+        h = Harness()
+        h.ha.stt_text = "Cancel the 10 minute timer."
+        h.ha.next_run = FakeRun([IntentEnded("10 minute timer cancelled.", "c", False, "action_done", True),
+                                 TtsReady("http://ha/tts/1", False), RunEnded()])
+        await button_turn(h, PRESS + 50_000)
+        await h.wait_for(lambda: h.render.streams)
+        assert h.ha.intents == [("Cancel the 10 minute timer.", None)] and h.ha.handled == []
+        await h.actor.close()
+    run(main())
+
+
+def test_cancel_all_timers_cancels_and_names_only_this_speakers_timers():
+    async def main():
+        for timers, expected in (
+            # HassCancelAllTimers would cancel the kitchen's timer too.
+            ((ha_timer("a", 5, 192), ha_timer("b", 10, 480), ha_timer("k", 5, 30, device="kitchen")),
+             [("HassCancelTimer", {"start_minutes": 5}), ("HassCancelTimer", {"start_minutes": 10})]),
+            ((ha_timer("a", 5, 192), ha_timer("b", 10, 480)), [("HassCancelAllTimers", {})]),
+        ):
+            h = Harness()
+            h.ha.stt_text = "Cancel all my timers."
+            h.ha.intent_responses["HassTimerStatus"] = timer_status(*timers)
+            await button_turn(h, PRESS + 50_000)
+            await h.wait_for(lambda: h.render.streams)
+            assert cancels(h) == expected and h.ha.intents == []
+            assert h.render.urls() == ["tts://5 minute and 10 minute timers cancelled."]
+            await h.actor.close()
+    run(main())
+
+
+def test_cancel_the_timer_with_several_running_asks_which_and_the_reply_picks_it_without_a_wake_word():
+    async def main():
+        h = Harness()
+        h.ha.stt_text = "Cancel the timer."
+        h.ha.intent_responses["HassTimerStatus"] = timer_status(ha_timer("a", 5, 192), ha_timer("b", 10, 480))
+        await button_turn(h, PRESS + 50_000)
+        await h.wait_for(lambda: h.render.streams)
+        assert h.render.urls() == ["tts://Which one? Your 5 minute timer or your 10 minute timer?"]
+        assert [name for name, _, _ in h.ha.handled] == ["HassTimerStatus"]
+        base = PRESS + 50_000
+        await h.feed(base, base + 24_000)
+        h.render.streams[0].finish("drained")
+        await h.wait_for(lambda: h.actor.state == "EXPECT_REPLY")
+        answer = (base + 26_112, base + 35_840)
+        h.worker.vad = speech(answer)
+        h.device.level = levels(answer)
+        h.worker.tokens = [("▁THE", base + 27_000), ("▁TEN", base + 29_000), ("▁MINUTE", base + 31_000),
+                           ("▁ONE", base + 33_000)]
+        h.ha.stt_text = "The ten minute one."
+        await h.feed(base + 24_000, base + 80_000)
+        await h.wait_for(lambda: len(h.render.streams) == 2)
+        assert h.ha.handled[-1] == ("HassCancelTimer", {"start_minutes": 10}, "hadev")
+        assert h.render.urls()[1] == "tts://10 minute timer cancelled."
+        h.render.streams[1].finish("drained")
+        await h.wait_for(lambda: len(h.rows) == 2)
+        question, reply = h.rows
+        assert question["outcome"] == "clarification" and question["continuation"] == "answered"
+        assert reply["trigger"] == "reply" and reply["outcome"] == "timer"
+        assert h.ha.intents == []                        # no conversation agent at any step
+        await h.actor.close()
+    run(main())
+
+
+def test_a_voice_alarm_is_confirmed_with_the_time_the_alert_engine_scheduled():
+    async def main():
+        h = Harness()
+        h.ha.stt_text = "Set an alarm for 7 AM."
+        h.alerts.set_result = {"ok": True, "first_due": "2030-01-02T07:00:00+00:00", "days": []}
+        await button_turn(h, PRESS + 50_000)
+        await h.wait_for(lambda: h.render.streams)
+        assert [c[0] for c in h.alerts.calls] == ["set_alarm"] and h.ha.intents == []
+        assert h.render.urls() == ["tts://Alarm set for 7 AM on January 2."]
+        h.render.streams[0].finish("drained")
+        await h.wait_for(lambda: h.rows)
+        assert h.rows[0]["outcome"] == "alarm" and h.rows[0]["response_text"] == "Alarm set for 7 AM on January 2."
+        await h.actor.close()
+    run(main())
+
+
+def reply_focus(h: Harness, owner: str) -> list[dict]:
+    return [b for b, _ in h.link.of("focus.acquire") if b["owner"] == owner and b["focus"] == "dialog_input"]
+
+
 def test_ha_turn_with_continue_conversation_opens_a_reply_window_that_times_out():
     async def main():
         h = Harness()
         h.ha.next_run = FakeRun([
-            IntentEnded("It is noon.", "conv-1", True, "action_done", False),
+            IntentEnded("Which TV?", "conv-1", True, "action_done", False),
             TtsReady("http://ha/tts/1", False), RunEnded()])
         await button_turn(h, PRESS + 50_000)
         await h.wait_for(lambda: h.render.streams)
@@ -661,14 +843,95 @@ def test_ha_turn_with_continue_conversation_opens_a_reply_window_that_times_out(
         assert response.source == "http://ha/tts/1" and h.actor.state == "SPEAKING"
         reply_open = [b for b, _ in h.link.of("uplink.open") if b["reason"] == "reply"]
         assert reply_open and reply_open[0]["streams"] == {"mic": "live", "cells": "live", "reference": "live"}
+        # The question keeps playing: input focus, which the device answers by cancelling
+        # dialog output, waits for the drain.
+        assert not response.done and reply_focus(h, reply_open[0]["owner"]) == []
         response.finish("drained")
         await h.wait_for(lambda: h.actor.state == "EXPECT_REPLY")
-        assert h.rows and h.rows[0]["terminal_reason"] == "completed" and h.rows[0]["commit_route"] == "A"
+        assert len(reply_focus(h, reply_open[0]["owner"])) == 1
+        await h.wait_for(lambda: h.rows)
+        row = h.rows[0]
+        assert row["terminal_reason"] == "completed" and row["commit_route"] == "A"
+        assert row["continuation"] == "pending" and row["playback_reason"] == "drained"
+        assert row["conversation_id"] == "conv-1" and row["reply_to"] is None
         await h.wait_for(lambda: h.actor.state == "IDLE", timeout=3)
         assert h.terminals()[-1] == "reply_timeout"
         closes = [b for b, _ in h.link.of("uplink.close") if b["lease_id"] == reply_open[0]["lease_id"]]
         assert closes == [{"lease_id": reply_open[0]["lease_id"], "reason": "closed"}]
         assert len(h.ha.intents) == 1                      # a silent window never dispatches
+        await h.wait_for(lambda: h.rows[0]["continuation"] == "reply_timeout")
+        await h.actor.close()
+    run(main())
+
+
+def test_an_answer_to_home_assistants_question_is_sent_on_in_its_conversation_without_a_wake_word():
+    async def main():
+        h = Harness()
+        h.ha.next_run = FakeRun([
+            IntentEnded("Which TV?", "conv-1", True, "action_done", False),
+            TtsReady("http://ha/tts/1", False), RunEnded()])
+        await button_turn(h, PRESS + 50_000)
+        await h.wait_for(lambda: h.render.streams)
+        base = PRESS + 50_000
+        await h.feed(base, base + 24_000)                    # quiet question tail
+        h.render.streams[0].finish("drained")
+        await h.wait_for(lambda: h.actor.state == "EXPECT_REPLY")
+        answer = (base + 26_112, base + 35_840)
+        h.worker.vad = speech(answer)
+        h.device.level = levels(answer)
+        h.worker.tokens = [("▁LIVING", base + 29_000), ("▁ROOM", base + 32_000)]
+        h.ha.stt_text = "The living room."
+        h.ha.next_run = FakeRun([IntentEnded("Turned off.", "conv-1", False, "action_done", False),
+                                 TtsReady("http://ha/tts/2", False), RunEnded()])
+        await h.feed(base + 24_000, base + 80_000)
+        await h.wait_for(lambda: len(h.render.streams) == 2)
+        assert h.ha.intents[1] == ("The living room.", "conv-1")
+        h.render.streams[1].finish("drained")
+        await h.wait_for(lambda: len(h.rows) == 2)
+        question, reply = h.rows
+        assert question["continuation"] == "answered"
+        assert reply["trigger"] == "reply" and reply["reply_to"] == question["turn_uuid"]
+        assert reply["conversation_id"] == "conv-1" and reply["continuation"] is None
+        await h.actor.close()
+    run(main())
+
+
+def test_a_streamed_answer_that_ends_in_a_question_watches_for_a_reply_while_it_plays():
+    async def main():
+        h = Harness()
+        run_ = FakeRun([TtsReady("http://ha/tts/s", True)])
+        h.ha.next_run = run_
+        await button_turn(h, PRESS + 50_000)
+        await h.wait_for(lambda: h.render.streams)          # audible before intent-end
+        assert not [b for b, _ in h.link.of("uplink.open") if b["reason"] == "reply"]
+        run_.queue.put_nowait(IntentEnded("It is noon. Anything else?", "conv-1", True, "action_done", False))
+        run_.queue.put_nowait(RunEnded())
+        await h.wait_for(lambda: [b for b, _ in h.link.of("uplink.open") if b["reason"] == "reply"])
+        response = h.render.streams[0]
+        assert not response.done
+        response.finish("drained")
+        await h.wait_for(lambda: h.actor.state == "EXPECT_REPLY")
+        await h.actor.close()
+    run(main())
+
+
+def test_a_question_whose_audio_is_cancelled_drops_its_reply_expectation():
+    async def main():
+        h = Harness()
+        h.ha.next_run = FakeRun([
+            IntentEnded("Which TV?", "conv-1", True, "action_done", False),
+            TtsReady("http://ha/tts/1", False), RunEnded()])
+        await button_turn(h, PRESS + 50_000)
+        await h.wait_for(lambda: h.render.streams)
+        reply_open = [b for b, _ in h.link.of("uplink.open") if b["reason"] == "reply"]
+        h.render.streams[0].finish("cancelled")
+        await h.wait_for(lambda: h.rows)
+        assert h.actor.state == "IDLE" and not h.actor.turn_active
+        row = h.rows[0]
+        assert row["continuation"] == "prompt_cancelled" and row["playback_reason"] == "cancelled"
+        closes = [b for b, _ in h.link.of("uplink.close") if b["lease_id"] == reply_open[0]["lease_id"]]
+        assert closes == [{"lease_id": reply_open[0]["lease_id"], "reason": "closed"}]
+        assert reply_focus(h, reply_open[0]["owner"]) == []
         await h.actor.close()
     run(main())
 

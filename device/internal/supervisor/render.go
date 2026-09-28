@@ -176,9 +176,7 @@ func (s *Supervisor) renderStart(env proto.Envelope) {
 		}
 		pcm, installed := s.ex.PreviewPCM(asset)
 		if !installed && isSHA256(asset) {
-			s.mu.Lock()
-			s.previewWant[asset] = true
-			s.mu.Unlock()
+			s.wantSounds(asset)
 		}
 		v.PCM = pcm
 	default:
@@ -215,7 +213,7 @@ func (s *Supervisor) renderEnd(env proto.Envelope) {
 		s.ack(env, proto.AckRejected, codeInvalid)
 		return
 	}
-	s.ackErr(env, s.mix.End(b.PlaybackID, env.Generation), endCode)
+	s.ackErr(env, s.mix.End(b.PlaybackID, env.Generation, b.EndFrame.V), endCode)
 }
 
 // renderCancel is idempotent: an unknown or finished playback is accepted.

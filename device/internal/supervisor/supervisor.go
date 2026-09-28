@@ -181,7 +181,7 @@ type Supervisor struct {
 	alertState   alerts.AlertState
 	alertFocusID string
 	unfetchable  map[string]bool // alert sounds the controller lacks, this session
-	previewWant  map[string]bool
+	soundWant    map[string]bool // alert sounds no armed alarm needs: previews, prefetched timer sounds
 	pressEpoch   proto.NullU64
 	pressSample  proto.NullU64
 
@@ -218,7 +218,7 @@ func Assemble(cfg Config, d Deps) (*Supervisor, error) {
 		renderFit:  clockfit.New(render.SampleRate, int64(render.SinkFrames)*int64(time.Second)/render.SampleRate),
 		candidates: map[string]candidateState{}, candidateAck: map[string]string{},
 		playbacks: map[string]playbackState{}, leases: map[string]struct{}{},
-		unfetchable: map[string]bool{}, previewWant: map[string]bool{},
+		unfetchable: map[string]bool{}, soundWant: map[string]bool{},
 		muted: cfg.Physical.IsMuted(),
 	}
 	s.masks = cells.NewMaskHistory(s.timeline.Fit(), s.renderFit)

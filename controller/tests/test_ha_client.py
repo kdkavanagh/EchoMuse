@@ -68,6 +68,7 @@ class FakeHA:
         self.app.router.add_post("/api/config/config_entries/flow/{flow_id}", self.flow_submit)
         self.app.router.add_get("/api/config/config_entries/flow_handlers", self.flow_handlers)
         self.app.router.add_get("/api/states/{entity}", self.state_rest)
+        self.app.router.add_post("/api/intent/handle", self.intent_rest)
         self.runner: web.AppRunner | None = None
         self.base_url = ""
         self.websockets: set[web.WebSocketResponse] = set()
@@ -84,6 +85,7 @@ class FakeHA:
         self.fail_types: set[str] = set()
         self.fail_stt_once = False
         self._stt_fail_consumed = False
+        self.timers_running = False
         self._stt: dict[web.WebSocketResponse, tuple[int, int, str]] = {}
         self._correlate: list[tuple[web.WebSocketResponse, dict]] = []
 
@@ -315,6 +317,17 @@ class FakeHA:
         self.rest_requests.append((request.method, request.path, None))
         return web.json_response(FIXTURES["registries"]["entity_state"]["response"])
 
+    async def intent_rest(self, request: web.Request) -> web.Response:
+        self._assert_rest_auth(request)
+        body = await request.json()
+        self.rest_requests.append((request.method, request.path, body))
+        fixture = FIXTURES["intent"]
+        if body["name"] == "HassStartTimer":
+            key = "start" if body.get("device_id") else "start_unsupported"
+        else:
+            key = "status" if self.timers_running else "status_empty"
+        return web.json_response(fixture[key]["response"])
+
 
 @asynccontextmanager
 async def running(fake: FakeHA | None = None):
@@ -439,6 +452,26 @@ def test_tts_only_and_pipeline_resolution():
             assert url == fake.base_url + "/api/tts_proxy/Vn6uQ8.flac"
             sent = [r for r in fake.requests if r["type"] == "assist_pipeline/run"][-1]
             assert _without_id(sent) == FIXTURES["assist_pipeline"]["tts_run"]["request"]
+    run(scenario())
+
+
+def test_intents_run_for_the_speakers_device_and_an_intent_failure_raises():
+    async def scenario():
+        async with running() as (fake, client):
+            fixture = FIXTURES["intent"]
+            start = fixture["start"]["request"]["body"]
+            assert await client.handle_intent(start["name"], start["data"], DEVICE_ID) == \
+                fixture["start"]["response"]
+            assert fake.rest_requests[-1] == ("POST", "/api/intent/handle", start)
+            fake.timers_running = True
+            status = await client.handle_intent("HassTimerStatus", {}, DEVICE_ID)
+            assert fake.rest_requests[-1][2] == fixture["status"]["request"]["body"]
+            assert [t["name"] for t in status["speech_slots"]["timers"]] == ["probe", ""]
+            # HA answers a failed intent with HTTP 200 and an error response.
+            with pytest.raises(HaError) as raised:
+                await client.handle_intent("HassStartTimer", {"minutes": 1}, None)
+            assert raised.value.code == "failed_to_handle"
+            assert "does not support timers" in raised.value.message
     run(scenario())
 
 

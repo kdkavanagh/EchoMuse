@@ -40,6 +40,7 @@ import em_ambient
 import em_volume
 import em_sounds
 import em_device_assets
+import em_device_link
 import em_wake_registry
 import em_support
 from version import VERSION as CONTROLLER_VERSION
@@ -2711,7 +2712,10 @@ async def _release_shell_ws(device_id: str, live=None) -> None:
             pass
     _shell_pending.pop(device_id, None)
     if live is not None:
-        await live.send("shell_close", {})
+        try:
+            await live.send("shell_close", {})
+        except em_device_link.LinkClosed:
+            pass    # the session is gone (an OTA flip restarts the server): no shell left to close
     lock = _shell_lock.get(device_id)
     if lock and lock.locked():
         try:

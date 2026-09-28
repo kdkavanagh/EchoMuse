@@ -829,7 +829,9 @@ func (e *Executor) HandleTimerRing(r TimerRing) error {
 
 // Act stops or snoozes exactly the named occurrence or timer ring (WIRE
 // alert.act, the physical button with source "button"). An empty opID is
-// replaced by a fresh UUIDv4. An alarm dismiss/snooze fades the ring within
+// replaced by a fresh UUIDv4. Any canonical RFC 4122 UUID is a valid opID:
+// the controller mints UUIDv5 for voice commands and LLM tool calls (SPEC
+// §16.7) and UUIDv4 elsewhere. An alarm dismiss/snooze fades the ring within
 // 10 ms, then journals the operation, with a snooze's child in the same
 // transaction, before reporting StatusDurable (SPEC §10.7). Snooze applies
 // only to a ringing alarm. A timer ring is stopped without persistence.
@@ -839,7 +841,7 @@ func (e *Executor) Act(opID, targetID, action, source string) ActResult {
 	}
 	res := ActResult{OpID: opID, Status: StatusRejected}
 	u, err := ParseUUID(opID)
-	if err != nil || u.String() != opID || u[6]>>4 != 4 || u[8]>>6 != 2 {
+	if err != nil || u.String() != opID || u[8]>>6 != 2 {
 		res.Error = "invalid_op_id"
 		return res
 	}

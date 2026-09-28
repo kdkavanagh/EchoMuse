@@ -65,7 +65,8 @@ type playback struct {
 	lastSample int16 // last mixed source sample, used for a synthetic cancel fade
 
 	next     uint64 // expected first frame of the next packet
-	ended    bool   // render.end received (always true for local sources)
+	ended    bool   // no more audio follows (render.end and all audio through its end frame; local: always)
+	endFrame uint64 // render.end's end frame while audio before it is still in flight; 0: none
 	started  bool
 	paused   bool
 	starving bool
@@ -374,16 +375,27 @@ func (m *Mixer) pumpLocked(epoch uint64, generation uint32, first uint64, pcm []
 		return ErrFIFOFull
 	}
 	p.next += uint64(len(pcm))
+	if p.endFrame != 0 && p.next >= p.endFrame {
+		p.ended, p.endFrame = true, 0
+	}
 	return nil
 }
 
-// End marks that no more audio follows (render.end); the playback drains.
-func (m *Mixer) End(id string, generation uint32) error {
+// End marks that no audio follows endFrame, the source frame after the last
+// one sent (render.end). Audio travels on its own socket, so the tail before
+// endFrame may still arrive after render.end: the playback keeps accepting it
+// and drains only once it has. An endFrame of 0 (not sent) ends at the audio
+// already received.
+func (m *Mixer) End(id string, generation uint32, endFrame uint64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	p := m.findLocked(id, generation)
 	if p == nil {
 		return ErrStale
+	}
+	if p.fifo != nil && p.next < endFrame {
+		p.endFrame = endFrame
+		return nil
 	}
 	p.ended = true
 	return nil

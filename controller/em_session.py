@@ -21,17 +21,19 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncIterator, Awaitable, Callable, Coroutine, TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 import numpy as np
 
 import echomuse_grammar
+import em_alert_speech
 import em_db
 import em_recordings
+import em_timers
 import em_wakeclips
-from echomuse_grammar import AMPM_CHOICES, AlarmParse, Choice, CommandContext
+from echomuse_grammar import AMPM_CHOICES, AlarmParse, Choice, CommandContext, AlarmQuery, TimerCancel
 from em_attribution import (
     CELL,
     COVERAGE_FULL,
@@ -101,6 +103,7 @@ if TYPE_CHECKING:
 log = logging.getLogger("echomuse.session")
 
 SAMPLE_RATE = 16_000
+RENDER_RATE = 48_000             # dialog output PCM (em_media.RATE)
 
 # §7 / §9 / §16.2 / §16.6 deadlines (seconds of loop time unless noted).
 WAKE_VERIFY_S = 0.700            # verification deadline from receipt of wake.candidate
@@ -116,6 +119,14 @@ REPLY_CHAIN_S = 60.0
 ACTOR_TICK_S = 0.050
 LOCAL_ACT_TIMEOUT_S = 2.0
 PERSIST_SHUTDOWN_S = 2.0         # shutdown waits this long for pending turn rows (§11.3)
+
+# What became of the follow-up question a turn asked (turns.continuation, §9.1).
+# `pending` goes out with the asking turn's row and is replaced by exactly one
+# final value: answered | wake | reply_timeout | prompt_cancelled | prompt_failed
+# | no_mic | chain_limit | interrupted | superseded | muted | session_lost.
+FOLLOWUP_PENDING = "pending"
+# Terminal reasons of a turn whose spoken question never finished.
+FOLLOWUP_PROMPT_FAILED = frozenset({"response_timeout", "ha_error", "outcome_unknown"})
 
 # Sample-time bounds on evidence the actor waits for.
 ECHO_WAIT = SAMPLE_RATE          # reference for a cell's echo label: wait ≤1 s of mic time
@@ -178,6 +189,7 @@ class ActorDeps:
     vocabulary: Callable[[], "Vocabulary | None"]
     esphome_reply: Callable[[bytes], AsyncIterator[object]]
     persist_turn: Callable[[dict], Awaitable[int]]
+    record_continuation: Callable[[int, str], Awaitable[None]]   # (row id, final follow-up outcome)
 
 
 @dataclass(frozen=True)
@@ -284,6 +296,7 @@ class _Expectation:
     prompt: "Playback | None" = None
     deadline: float | None = None
     drain_pending: bool = False
+    origin: "_Turn | None" = None     # the turn that asked; its row records what became of the question
 
 
 @dataclass
@@ -304,6 +317,10 @@ class _Turn:
     task: asyncio.Task | None = None
     run: object | None = None
     playback: "Playback | None" = None
+    playback_reason: str | None = None        # how the spoken response ended (render.finished reason, or a limit)
+    audible_at: float | None = None           # monotonic time the response became audible
+    continuation: str | None = None           # fate of the follow-up this turn asked for; None: it asked none
+    persisted: asyncio.Task | None = None     # the row write; its result is the row id
     wake_db: float | None = None
     wake_clip: bytes | None = None
     stt_copy: bytes | None = None
@@ -559,7 +576,7 @@ class SessionActor:
     async def _shutdown(self) -> None:
         if self._turn is not None:
             await self._finish_turn(self._turn, "session_lost", feedback=False)
-        await self._drop_expectation()
+        await self._drop_expectation("session_lost")
         if self._persists:
             await asyncio.wait(list(self._persists), timeout=PERSIST_SHUTDOWN_S)
         for task in list(self._tasks):
@@ -577,7 +594,7 @@ class SessionActor:
         self._candidate = None
         if self._turn is not None:
             await self._finish_turn(self._turn, "session_lost")
-        await self._drop_expectation()
+        await self._drop_expectation("session_lost")
         self._runtimes.clear()
         self._diagnostic_lease = None
         self._alert_foreground = None
@@ -599,7 +616,7 @@ class SessionActor:
         self._diagnostic_lease = None
         if self._turn is not None:
             await self._finish_turn(self._turn, "muted")
-        await self._drop_expectation()
+        await self._drop_expectation("muted")
         self._runtimes.clear()
         if self._turn is None:
             self._set_state("IDLE")
@@ -874,6 +891,7 @@ class SessionActor:
         now = asyncio.get_running_loop().time()
         if (exp.deadline is not None and now >= exp.deadline) or now - exp.chain_started >= REPLY_CHAIN_S:
             return None
+        self._settle(exp, "wake")
         return exp
 
     async def _supersede(self) -> None:
@@ -881,7 +899,7 @@ class SessionActor:
         self._generation += 1
         if self._turn is not None:
             await self._finish_turn(self._turn, "superseded", feedback=False)
-        await self._drop_expectation()
+        await self._drop_expectation("superseded")
         if self._dialog_playback is not None and not self._dialog_playback.done:
             await self._dialog_playback.cancel("interrupted")
 
@@ -929,6 +947,9 @@ class SessionActor:
         self._generation += 1
         if exp.prompt is not None and not exp.prompt.done:
             await exp.prompt.cancel("early_answer")
+        self._settle(exp, "answered")
+        # The reply turn (id = exp.owner) holds input focus before the asking turn releases its own.
+        await self._acquire_focus(exp.owner, "dialog_input", self._generation)
         if self._turn is not None:
             await self._finish_turn(self._turn, "completed", feedback=False)
         self._expectation = None
@@ -1351,6 +1372,14 @@ class SessionActor:
         if alarm is not None:
             await self._alarm(turn, alarm)
             return
+        question = echomuse_grammar.parse_alarm_query(turn.stt_text)
+        if question is not None:
+            await self._alarm_query(turn, question)
+            return
+        cancel = echomuse_grammar.parse_timer_cancel(turn.stt_text)
+        if cancel is not None and (cancel.all or (cancel.start is None and cancel.name is None)) \
+                and await self._cancel_timer(turn, cancel):
+            return
         turn.outcome = "ha"
         self.awaiting_intent = True
         started = time.monotonic()
@@ -1415,9 +1444,13 @@ class SessionActor:
         turn.response_type = intent.response_type
         turn.intent_local = intent.processed_locally
         turn.conversation_id = intent.conversation_id or turn.conversation_id
-        if intent.continue_conversation and self._chain_allowed(turn):
-            turn.next_expectation = self._new_expectation("reply", turn.conversation_id, turn.turn_id,
-                                                          previous=self._chain_parent(turn))
+        if intent.continue_conversation:
+            if self._chain_allowed(turn):
+                turn.next_expectation = self._new_expectation("reply", turn.conversation_id, turn.turn_id,
+                                                              previous=self._chain_parent(turn), origin=turn)
+                await self._watch_reply(turn)     # a streamed response can already be audible
+            else:
+                turn.continuation = "chain_limit"
         if tts is None and intent.speech:
             try:
                 async with asyncio.timeout(RESPONSE_START_S):
@@ -1456,6 +1489,12 @@ class SessionActor:
             return
         exp = turn.next_expectation
         if exp is None or reason == "cancelled":
+            if exp is not None:
+                # A cancelled prompt invalidates its expectation (§9.1); an early answer would
+                # already have taken the turn over, so nothing owns the next utterance.
+                self._settle(exp, "prompt_cancelled")
+                if exp is self._expectation:
+                    await self._drop_expectation("prompt_cancelled")
             await self._finish_turn(turn, "completed", feedback=False)
             return
         await self._continue(turn, exp)
@@ -1473,21 +1512,31 @@ class SessionActor:
     async def _play_response(self, turn: _Turn, url: str, start_timeout: float) -> str:
         """The turn's response as dialog output; the reply lease opens when its audio starts (§9.1)."""
         async def started() -> None:
+            turn.audible_at = time.monotonic()
             self._set_state("SPEAKING")
-            exp = turn.next_expectation
-            if exp is not None:
-                exp.prompt = turn.playback
-                self._expectation = exp       # early answers are watched while the prompt plays
-                await self._open_expectation_lease(exp)
+            await self._watch_reply(turn)
 
         def bind(playback: "Playback") -> None:
             turn.playback = playback
 
-        started_at = time.monotonic()
         reason = await self._play_dialog(turn.turn_id, turn.generation, url, bind=bind, started=started,
                                          start_timeout=start_timeout, fence=lambda: self._current(turn))
-        turn.timings["playback_ms"] = round((time.monotonic() - started_at) * 1000)
+        turn.playback_reason = reason
+        if turn.audible_at is not None:
+            turn.timings["playback_ms"] = round((time.monotonic() - turn.audible_at) * 1000)
         return reason
+
+    async def _watch_reply(self, turn: _Turn) -> None:
+        """An audible response that asks a question: open its reply lease so early answers are
+        watched while it plays (§9.1). Input focus waits for the drain: taking it now would cancel
+        the question itself on the device (§6.2)."""
+        exp = turn.next_expectation
+        if (exp is None or exp is self._expectation or turn.audible_at is None
+                or turn.playback is None or turn.playback.done):
+            return
+        exp.prompt = turn.playback
+        self._expectation = exp
+        await self._open_expectation_lease(exp)
 
     async def _continue(self, turn: _Turn, exp: _Expectation) -> None:
         """Turn the drained response into a live reply expectation, then close the turn."""
@@ -1495,19 +1544,30 @@ class SessionActor:
         if exp.runtime is None:
             await self._open_expectation_lease(exp)
         if exp.runtime is None:
+            self._settle(exp, "no_mic")
             self._expectation = None
             await self._release_owner(exp.owner)
             await self._finish_turn(turn, "completed", feedback=False)
             return
+        # Input focus passes to the expectation before the turn releases its own: no restore blip.
+        await self._hold_reply_focus(exp)
         await self._finish_turn(turn, "completed", feedback=False)
         await self._begin_window(exp)
+
+    async def _hold_reply_focus(self, exp: _Expectation) -> None:
+        """Dialog-input focus for a live expectation whose prompt has drained (§6.2 "Expected reply")."""
+        if exp is self._expectation and exp.runtime is not None:
+            await self._acquire_focus(exp.owner, "dialog_input", exp.generation)
 
     async def _begin_window(self, exp: _Expectation) -> None:
         """After the guarded drain (or without prompt audio): 7 s window and onset scan (§16.2, §16.6)."""
         if exp is not self._expectation or exp.runtime is None:
             return
+        await self._hold_reply_focus(exp)
         exp.deadline = asyncio.get_running_loop().time() + REPLY_S
         self._set_state("EXPECT_REPLY")
+        log.info("[%s] reply window open for %s", self.device_id,
+                 exp.origin.turn_id if exp.origin is not None else exp.source)
         timeline = self._timeline(exp.runtime)
         drain = timeline.mic.frontier if timeline is not None else None
         if drain is None:
@@ -1544,8 +1604,11 @@ class SessionActor:
                 await self._finish_turn(turn, "outcome_unknown")
             return
         if ack.get("status") == "rejected":
-            # The captured occurrence already ended (queue moved on or it expired).
-            log.info("[%s] alert.act %s rejected: %s", self.device_id, action, ack.get("error"))
+            # unknown_target/already_handled: the captured occurrence already ended (queue moved
+            # on or it expired). Anything else means the ring is still going.
+            error = ack.get("error")
+            log.log(logging.INFO if error in ("unknown_target", "already_handled") else logging.WARNING,
+                    "[%s] alert.act %s on %s rejected: %s", self.device_id, action, turn.context_target, error)
         if self._current(turn):
             await self._finish_turn(turn, "completed", feedback=False)
 
@@ -1555,7 +1618,7 @@ class SessionActor:
         if parsed.missing == "ampm":
             exp = self._new_expectation("reply", turn.conversation_id, turn.turn_id,
                                         previous=self._chain_parent(turn), choices=AMPM_CHOICES,
-                                        pending={"parse": parsed, "turn_id": turn.turn_id})
+                                        pending={"parse": parsed, "turn_id": turn.turn_id}, origin=turn)
             turn.outcome = "clarification"
             turn.response_text = LINE_AMPM
             await self._finish_turn(turn, "completed", feedback=False)
@@ -1587,10 +1650,11 @@ class SessionActor:
             log.warning("[%s] voice alarm failed: %s", self.device_id, result.get("error"))
             await self._finish_turn(turn, "ha_error")
             return
-        line = self._alarm_line(parsed, result)
-        turn.response_text = line
-        await self._finish_turn(turn, "completed", feedback=False)
-        self._spawn(self._speak(line, turn.turn_id, turn.generation))
+        if parsed.action == "set":
+            line = em_alert_speech.alarm_set_line(parsed, result, datetime.now(timezone.utc))
+        else:
+            line = em_alert_speech.alarm_cancel_line(result)
+        await self._answer(turn, line)
 
     async def _cancel_only_alarm(self, op_id: str) -> dict:
         """"cancel my alarm" names no time: it cancels only when exactly one alarm exists."""
@@ -1611,17 +1675,136 @@ class SessionActor:
         today = datetime.now(ZoneInfo(await self.deps.ha.time_zone())).date()
         return today if days == "today" else today + timedelta(days=1)
 
-    @staticmethod
-    def _alarm_line(parsed: AlarmParse, result: dict) -> str:
-        if not result.get("ok"):
-            return "Which alarm? Say its time." if result.get("error") == "which alarm" \
-                else "I couldn't find that alarm."
-        if parsed.action == "set":
-            hour = parsed.hour24 % 12 or 12
-            minute = f":{parsed.minute:02d}" if parsed.minute else ""
-            return f"Alarm set for {hour}{minute} {'AM' if parsed.hour24 < 12 else 'PM'}."
-        count = len(result.get("cancelled") or [])
-        return "Alarm cancelled." if count <= 1 else f"Cancelled {count} alarms."
+    async def _alarm_query(self, turn: _Turn, query: AlarmQuery) -> None:
+        """Alarm questions, answered from the alert engine without a conversation agent (§10.5).
+        Timer questions are HA's own local `HassTimerStatus` intent."""
+        turn.outcome = "alarm_query"
+        alarms = self.deps.alerts.list_alarms(self.device_id)
+        await self._answer(turn, em_alert_speech.alarms_line(alarms["alarms"], datetime.now(timezone.utc),
+                                                             next_only=query.next_only)
+                           if alarms.get("ok") else em_alert_speech.LINE_ALARMS_UNAVAILABLE)
+
+    async def _timers(self, turn: _Turn) -> tuple[list[dict], list[dict]] | None:
+        """(this speaker's timers, every timer in HA) from HA's own `HassTimerStatus`, which
+        reports every device's timers; None when HA could not say."""
+        device = self.deps.ha_device_id()
+        started = time.monotonic()
+        try:
+            response = await self.deps.ha.handle_intent("HassTimerStatus", {}, device)
+        except (HaUnavailable, HaError) as exc:
+            log.warning("[%s] HassTimerStatus failed: %s", self.device_id, exc)
+            return None
+        turn.timings["intent_ms"] = round((time.monotonic() - started) * 1000)
+        turn.response_type = response.get("response_type")
+        every = (response.get("speech_slots") or {}).get("timers") or []
+        return [t for t in every if t.get("device_id") == device], every
+
+    async def _cancel_timer(self, turn: _Turn, cancel: TimerCancel) -> bool:
+        """§10.8: the cancels HA's own intents cannot answer. HA's `HassCancelTimer` response
+        cannot say which timer it cancelled, so a bare "cancel the timer" is resolved here:
+        this speaker's only timer is cancelled and named ("5 second timer cancelled"),
+        several ask which one. "Cancel all timers" cancels only this speaker's and names
+        them (HA's `HassCancelAllTimers` cancels every timer in HA). False: HA could not
+        list the timers, so HA handles the sentence as an ordinary turn."""
+        listed = await self._timers(turn)
+        if not self._current(turn) or listed is None:
+            return not self._current(turn)
+        mine, every = listed
+        turn.outcome = "timer"
+        if cancel.all:
+            await self._cancel_timers(turn, mine, every)
+        elif len(mine) > 1:
+            await self._ask_which_timer(turn, mine)
+        elif mine:
+            await self._cancel_one_timer(turn, mine[0], every)
+        else:
+            await self._answer(turn, em_alert_speech.LINE_NO_TIMERS)
+        return True
+
+    async def _ask_which_timer(self, turn: _Turn, timers: list[dict]) -> None:
+        """ "Which one? Your 5 minute timer or your 10 minute timer?", with a reply window."""
+        line = em_alert_speech.which_timer_line(timers)
+        exp = self._new_expectation("reply", turn.conversation_id, turn.turn_id,
+                                    previous=self._chain_parent(turn), choices=em_timers.choices(timers),
+                                    pending={"timers": timers, "again": em_alert_speech.LINE_WHICH_TIMER_AGAIN},
+                                    origin=turn)
+        turn.outcome = "clarification"
+        turn.response_text = line
+        await self._finish_turn(turn, "completed", feedback=False)
+        self._spawn(self._prompt(exp, line))
+
+    async def _cancel_one_timer(self, turn: _Turn, timer: dict, every: list[dict]) -> None:
+        device = self.deps.ha_device_id()
+        slots = em_timers.cancel_slots(timer, every, device)
+        if slots is None:
+            twins = sum(1 for t in every if t.get("device_id") == device
+                        and em_timers.matches(t, em_timers.start_of(timer), timer.get("name") or None))
+            await self._answer(turn, em_alert_speech.timers_indistinct_line(timer, twins))
+            return
+        done = await self._run_timer_cancel(turn, "HassCancelTimer", slots)
+        if done is not None:
+            await self._answer(turn, em_alert_speech.timer_cancelled_line(timer) if done
+                               else em_alert_speech.LINE_TIMER_NOT_CANCELLED)
+
+    async def _cancel_timers(self, turn: _Turn, mine: list[dict], every: list[dict]) -> None:
+        """Cancel every timer of this speaker. HA's `HassCancelAllTimers` cancels every timer in
+        HA, so it runs only when all of them are this speaker's; otherwise one at a time."""
+        if not mine:
+            await self._answer(turn, em_alert_speech.LINE_NO_TIMERS)
+            return
+        if len(mine) == len(every):
+            done = await self._run_timer_cancel(turn, "HassCancelAllTimers", {})
+            if done is not None:
+                await self._answer(turn, em_alert_speech.timers_cancelled_line(mine if done else [], len(mine)))
+            return
+        device, cancelled = self.deps.ha_device_id(), []
+        for timer in mine:
+            slots = em_timers.cancel_slots(timer, every, device)
+            if slots is None:
+                continue
+            done = await self._run_timer_cancel(turn, "HassCancelTimer", slots)
+            if done is None:
+                return
+            if done:
+                every = [t for t in every if t.get("id") != timer.get("id")]
+                cancelled.append(timer)
+        await self._answer(turn, em_alert_speech.timers_cancelled_line(cancelled, len(mine)))
+
+    async def _run_timer_cancel(self, turn: _Turn, intent: str, slots: dict) -> bool | None:
+        """Run one cancel intent: True done, False refused (HA no longer finds the timer, it
+        just finished), None once the turn has ended. A cancel whose request may have
+        reached HA without an answer is never resent: the turn ends `outcome_unknown`."""
+        try:
+            await self.deps.ha.handle_intent(intent, slots, self.deps.ha_device_id())
+        except HaUnavailable as exc:
+            log.warning("[%s] %s outcome unknown: %s", self.device_id, intent, exc)
+            if self._current(turn):
+                await self._finish_turn(turn, "outcome_unknown")
+            return None
+        except HaError as exc:
+            log.warning("[%s] %s %s refused: %s", self.device_id, intent, slots, exc)
+            return False if self._current(turn) else None
+        return True if self._current(turn) else None
+
+    async def _answer(self, turn: _Turn, line: str) -> None:
+        """EchoMuse's own answer (a confirmation or status) as the turn's spoken response,
+        so the turn's row records what was said and how it played (§11.3)."""
+        turn.response_text = line
+        started = time.monotonic()
+        url = await self._tts(line)
+        if not self._current(turn):
+            return
+        if url is None:
+            turn.playback_reason = "failed"
+            self._cue(ERROR_CUE)
+        else:
+            turn.timings["tts_url_ms"] = round((time.monotonic() - started) * 1000)
+            reason = await self._play_response(turn, url, RESPONSE_START_S)
+            if not self._current(turn):
+                return
+            if reason not in ("drained", "cancelled"):
+                self._cue(ERROR_CUE)
+        await self._finish_turn(turn, "completed", feedback=False)
 
     async def _answer_choice(self, turn: _Turn, exp: _Expectation) -> None:
         """§16.6 Choices: select, re-prompt once, or leave it."""
@@ -1635,19 +1818,52 @@ class SessionActor:
             turn.outcome = "alarm"
             await self._apply_alarm(turn, completed, str(pending.get("turn_id")))
             return
+        if "timers" in pending:
+            offered = pending["timers"]
+            if value is None:
+                # A full command answers too: "cancel the 5 minute timer", "cancel both timers".
+                cancel = echomuse_grammar.parse_timer_cancel(turn.stt_text)
+                if cancel is not None:
+                    picked = [i for i, t in enumerate(offered) if em_timers.matches(t, cancel.start, cancel.name)]
+                    value = em_timers.ALL if cancel.all else picked[0] if len(picked) == 1 else None
+            if value is not None and value != em_timers.NONE:
+                await self._cancel_chosen_timers(turn, offered, value)
+                return
         turn.outcome = "clarification"
-        if not exp.reprompted:
+        if value is None and not exp.reprompted:
+            again = pending.get("again", LINE_AMPM_AGAIN)
             retry = self._new_expectation("reply", exp.conversation_id, exp.originating_turn_id,
-                                          previous=exp, choices=exp.choices, pending=exp.pending_operation)
+                                          previous=exp, choices=exp.choices, pending=exp.pending_operation,
+                                          origin=turn)
             retry.reprompted = True
             retry.chain_count = exp.chain_count
-            turn.response_text = LINE_AMPM_AGAIN
+            turn.response_text = again
             await self._finish_turn(turn, "completed", feedback=False)
-            self._spawn(self._prompt(retry, LINE_AMPM_AGAIN))
+            self._spawn(self._prompt(retry, again))
             return
         turn.response_text = LINE_LEFT_IT
         await self._finish_turn(turn, "completed", feedback=False)
         self._spawn(self._speak(LINE_LEFT_IT, turn.turn_id, turn.generation))
+
+    async def _cancel_chosen_timers(self, turn: _Turn, offered: list[dict], value: object) -> None:
+        """The reply to "which one?": one offered timer, or all of them, as they are now."""
+        turn.outcome = "timer"
+        listed = await self._timers(turn)
+        if not self._current(turn):
+            return
+        if listed is None:
+            await self._finish_turn(turn, "ha_error")
+            return
+        mine, every = listed
+        chosen = offered if value == em_timers.ALL else [offered[value]]
+        ids = {t.get("id") for t in chosen}
+        still = [t for t in mine if t.get("id") in ids]
+        if value == em_timers.ALL:
+            await self._cancel_timers(turn, still, every)
+        elif still:
+            await self._cancel_one_timer(turn, still[0], every)
+        else:
+            await self._answer(turn, em_alert_speech.timer_gone_line(chosen[0]))
 
     # --- expectations ---------------------------------------------------------------------------
 
@@ -1664,18 +1880,41 @@ class SessionActor:
 
     def _new_expectation(self, source: str, conversation_id: str | None, originating_turn_id: str | None,
                          *, previous: _Expectation | None = None, choices: tuple[Choice, ...] | None = None,
-                         pending: dict | None = None) -> _Expectation:
+                         pending: dict | None = None, origin: _Turn | None = None) -> _Expectation:
         now = asyncio.get_running_loop().time()
+        if origin is not None:
+            origin.continuation = FOLLOWUP_PENDING
         return _Expectation(
             expectation_id=str(uuid.uuid4()), owner=str(uuid.uuid4()), generation=self._generation,
             source=source, conversation_id=conversation_id, originating_turn_id=originating_turn_id,
             chain_started=previous.chain_started if previous is not None else now,
             chain_count=previous.chain_count + 1 if previous is not None else 1,
-            choices=choices, pending_operation=pending,
+            choices=choices, pending_operation=pending, origin=origin,
         )
 
+    def _settle(self, exp: _Expectation, outcome: str) -> None:
+        """Record what became of `exp` on the asking turn's row. The first final outcome wins."""
+        origin = exp.origin
+        if origin is None or origin.continuation != FOLLOWUP_PENDING:
+            return
+        origin.continuation = outcome
+        log.info("[%s] follow-up to turn %s: %s", self.device_id, origin.turn_id, outcome)
+        if origin.persisted is not None:
+            self._persists.add(self._spawn(self._record_continuation(origin)))
+
+    async def _record_continuation(self, turn: _Turn) -> None:
+        row_id = await asyncio.shield(turn.persisted)
+        if row_id is None:
+            return
+        try:
+            await self.deps.record_continuation(row_id, turn.continuation)
+        except Exception:
+            log.exception("[%s] follow-up outcome of turn %s not recorded", self.device_id, turn.turn_id)
+
     async def _open_expectation_lease(self, exp: _Expectation) -> None:
-        """The `reply` lease: live mic, cells, and reference, with dialog-input focus (§9.1)."""
+        """The `reply` uplink lease: live mic, cells, and reference (§9.1). No focus: dialog-input
+        focus cancels current dialog output on the device (§6.2), so `_hold_reply_focus` takes it
+        only once the prompt has drained or an early answer has cut it off."""
         if exp.runtime is not None or self.uplink is None or self.link is None or self._muted:
             return
         epoch = self.uplink.streams.current("mic")
@@ -1690,11 +1929,11 @@ class SessionActor:
         runtime = self._new_runtime(lease_id)
         runtime.assembler.require_echo_from(0)
         exp.runtime = runtime
-        await self._acquire_focus(exp.owner, "dialog_input", exp.generation)
 
     async def _prompt(self, exp: _Expectation, text: str) -> None:
         """An EchoMuse question: TTS-only prompt, then its reply window."""
         if self.link is None:
+            self._settle(exp, "session_lost")
             return
         self._expectation = exp
         self._set_state("SPEAKING")
@@ -1703,7 +1942,7 @@ class SessionActor:
             return
         if url is None:
             self._cue(ERROR_CUE)
-            await self._end_expectation("ha_error")
+            await self._end_expectation("ha_error", outcome="prompt_failed")
             return
 
         async def started() -> None:
@@ -1713,28 +1952,33 @@ class SessionActor:
             exp.prompt = playback
 
         reason = await self._play_dialog(exp.owner, exp.generation, url, bind=bind, started=started,
+                                         drained=lambda: self._hold_reply_focus(exp),
                                          fence=lambda: exp is self._expectation)
         if exp is not self._expectation:
             return
         if reason != "drained" or exp.runtime is None:
             # A failed prompt invalidates its expectation (§9.1).
-            await self._end_expectation("response_timeout" if reason != "cancelled" else "interrupted")
+            outcome = ("prompt_cancelled" if reason == "cancelled" else "no_mic" if reason == "drained"
+                       else "prompt_failed")
+            await self._end_expectation("response_timeout" if reason != "cancelled" else "interrupted",
+                                        outcome=outcome)
             return
         await self._begin_window(exp)
 
-    async def _end_expectation(self, reason: str) -> None:
+    async def _end_expectation(self, reason: str, *, outcome: str | None = None) -> None:
         """Close the live expectation without a turn; a silent window never dispatches (§9.1)."""
         if self._expectation is None:
             return
-        await self._drop_expectation()
+        await self._drop_expectation(outcome or reason)
         self._emit(ActorEvent("terminal", self.state, reason, self._dialog_active))
         if self._turn is None:
             self._set_state("IDLE")
 
-    async def _drop_expectation(self) -> None:
+    async def _drop_expectation(self, outcome: str) -> None:
         exp, self._expectation = self._expectation, None
         if exp is None:
             return
+        self._settle(exp, outcome)
         if exp.prompt is not None and not exp.prompt.done:
             await exp.prompt.cancel("expectation_closed")
         if exp.runtime is not None:
@@ -1772,7 +2016,8 @@ class SessionActor:
                     exp.prompt = playback
 
                 reason = await self._play_dialog(owner, generation, item.url, announcement=True, bind=bind,
-                                                 started=started, fence=lambda: exp is self._expectation)
+                                                 started=started, drained=lambda: self._hold_reply_focus(exp),
+                                                 fence=lambda: exp is self._expectation)
                 if exp is not self._expectation:
                     return
                 if reason != "drained" or exp.runtime is None:
@@ -1788,12 +2033,15 @@ class SessionActor:
     async def _play_dialog(self, owner: str, generation: int, url: str, *, announcement: bool = False,
                            bind: Callable[["Playback"], None] | None = None,
                            started: Callable[[], Awaitable[None]] | None = None,
+                           drained: Callable[[], Awaitable[None]] | None = None,
                            start_timeout: float = RESPONSE_START_S,
                            fence: Callable[[], bool] = lambda: True) -> str:
         """Play `url` as dialog output under a dialog_output lease for `owner`.
 
         Returns the finish reason (`drained`, `cancelled`, `failed`, `underrun`),
         `response_timeout` for §7's start/progress/length limits, or `fenced`.
+        `drained` runs after a drain and before the dialog_output lease is released,
+        so focus a prompt hands on never lapses in between.
         """
         render = self.render
         if render is None:
@@ -1821,7 +2069,8 @@ class SessionActor:
                 return "fenced"
             if started is not None:
                 await started()
-            last, last_at = playback.last_progress, time.monotonic()
+            audible = last_at = time.monotonic()
+            last = playback.last_progress
             while not playback.done:
                 await asyncio.wait({playback.finished}, timeout=0.05)
                 if not fence():
@@ -1835,7 +2084,14 @@ class SessionActor:
                 if not playback.done and now - began >= RESPONSE_TOTAL_S:
                     await playback.cancel("response_timeout")
                     return "response_timeout"
-            return playback.finished.result().get("reason", "failed")
+            reason = playback.finished.result().get("reason", "failed")
+            # Whether the whole answer was heard: frames the device completed against frames sent.
+            log.info("[%s] dialog output %s: %.2f s of %.2f s sent completed, %.2f s audible",
+                     self.device_id, reason, playback.completed_frames / RENDER_RATE,
+                     playback.sent_frames / RENDER_RATE, time.monotonic() - audible)
+            if reason == "drained" and drained is not None and fence():
+                await drained()
+            return reason
         finally:
             await self._release_owner(owner, only="dialog_output")
 
@@ -1882,9 +2138,13 @@ class SessionActor:
         await self._close_uplink(turn.runtime.lease_id, "closed")
         self._release_runtime(turn.runtime.lease_id)
         next_exp = turn.next_expectation
-        if next_exp is not None and next_exp is self._expectation and reason != "completed":
-            await self._drop_expectation()      # a failed prompt invalidates its expectation (§9.1)
-        elif next_exp is not None and next_exp is not self._expectation:
+        if next_exp is not None and reason != "completed":
+            # A question that was never fully asked invalidates its expectation (§9.1).
+            outcome = "prompt_failed" if reason in FOLLOWUP_PROMPT_FAILED else reason
+            self._settle(next_exp, outcome)
+            if next_exp is self._expectation:
+                await self._drop_expectation(outcome)
+        if next_exp is not None and next_exp is not self._expectation:
             if next_exp.runtime is not None:
                 await self._close_uplink(next_exp.runtime.lease_id, "closed")
                 self._release_runtime(next_exp.runtime.lease_id)
@@ -1898,7 +2158,8 @@ class SessionActor:
             self._turn = None
         self._set_state("CLOSING")
         self._emit(ActorEvent("terminal", self.state, reason, self._dialog_active))
-        self._persists.add(self._spawn(self._persist(turn)))
+        turn.persisted = self._spawn(self._persist(turn))
+        self._persists.add(turn.persisted)
         if feedback:
             self._feedback(turn, reason)
         if self._turn is None:
@@ -1920,7 +2181,7 @@ class SessionActor:
         elif reason in CLARIFY_REASONS:
             if self._chain_allowed(turn):
                 exp = self._new_expectation("reply", turn.conversation_id, turn.turn_id,
-                                            previous=self._chain_parent(turn))
+                                            previous=self._chain_parent(turn), origin=turn)
                 self._spawn(self._prompt(exp, LINE_SORRY))
             else:
                 self._spawn(self._speak(LINE_SORRY, turn.turn_id, turn.generation))
@@ -1936,8 +2197,9 @@ class SessionActor:
             return None
         return timeline.mic.read(a, b).tobytes()
 
-    async def _persist(self, turn: _Turn) -> None:
-        """The turn row with its §11.3 decision trace; utterance WAV and wake clip when enabled."""
+    async def _persist(self, turn: _Turn) -> int | None:
+        """The turn row with its §11.3 decision trace; utterance WAV and wake clip when enabled.
+        Returns the row id (None when the row was not written)."""
         candidate, commit = turn.candidate, turn.commit
         row = {
             "ts": time.time() - (asyncio.get_running_loop().time() - turn.opened),
@@ -1957,6 +2219,7 @@ class SessionActor:
             "intent_ms": turn.timings.get("intent_ms"),
             "tts_url_ms": turn.timings.get("tts_url_ms"),
             "playback_ms": turn.timings.get("playback_ms"),
+            "playback_reason": turn.playback_reason,
             "audio_ms": turn.timings.get("audio_ms"),
             "endpoint_ms": (round((commit.decided_at - commit.boundary) * 1000 / SAMPLE_RATE)
                             if commit is not None else None),
@@ -1968,6 +2231,10 @@ class SessionActor:
             "commit_route": commit.route if commit is not None else None,
             "terminal_reason": turn.terminal,
             "commit_id": commit.commit_id if commit is not None else None,
+            "turn_uuid": turn.turn_id,
+            "conversation_id": turn.conversation_id,
+            "reply_to": turn.expectation.originating_turn_id if turn.expectation is not None else None,
+            "continuation": turn.continuation,
         }
         log.info("[%s] turn %s trace %s", self.device_id, turn.turn_id, json.dumps({
             "turn_id": turn.turn_id, "generation": turn.generation, "trigger": turn.trigger,
@@ -1982,7 +2249,7 @@ class SessionActor:
             row_id = await self.deps.persist_turn(row)
         except Exception:
             log.exception("[%s] turn row not persisted", self.device_id)
-            return
+            return None
         cfg = self.deps.config() or {}
         loop = asyncio.get_running_loop()
         for enabled, pcm, save, link in (
@@ -1997,6 +2264,7 @@ class SessionActor:
                     await loop.run_in_executor(None, link, row_id, name)
             except Exception:
                 log.exception("[%s] turn %s audio not saved", self.device_id, row_id)
+        return row_id
 
     async def _persist_candidate(self, candidate: _Candidate, reason: str) -> None:
         """A rejected candidate is a turn row with its attribution reason and no audio (§11.3)."""

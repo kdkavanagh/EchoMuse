@@ -69,10 +69,11 @@ def normalize(text: str) -> str:
     punctuation such as ``7:30`` splits), whitespace collapses, ``a.m.``/``a m``
     become ``am`` (likewise pm), and English number words through 99 become
     decimal tokens. Apostrophes inside words and the timer spelling ``1/2``
-    are kept, so negations such as ``don't`` survive as their own token.
+    are kept, so negations such as ``don't`` survive as their own token; a
+    typographic apostrophe is the same as ``'``.
     """
 
-    value = _AMPM.sub(lambda match: f"{match.group(1).lower()}m", text.casefold())
+    value = _AMPM.sub(lambda match: f"{match.group(1).lower()}m", text.casefold().replace("\u2019", "'"))
     value = _DIGIT_AMPM.sub(r" \1", value)
     value = _PUNCTUATION.sub(" ", value.replace("-", " "))
     words = [word.strip("'/") for word in value.split()]

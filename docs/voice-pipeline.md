@@ -269,10 +269,13 @@ your first command word is never cut off. Instead the controller
 (`em_wake_phrase`) removes the wake word from the **text**: the live
 transcript shows where it was said, and everything up to and including the
 closest match to "Ophelia" near that position in HA's transcript is removed.
-"Ophelia, what does Ophelia mean?" becomes "what does Ophelia mean?". If no
-match is found, nothing is removed; a leftover "Ophelia," is harmless.
+"Ophelia, what does Ophelia mean?" becomes "what does Ophelia mean?". The live
+recognizer can miss a quiet wake word entirely; then the match is sought at
+the start of HA's transcript instead. A leftover "Ophelia," would stop Home
+Assistant's built-in sentences from matching and hand the request to your
+conversation agent.
 
-Then the request goes to one of three places:
+Then the request goes to one of four places:
 
 1. **Local commands** ("stop", "cancel", "snooze", "stop the timer") while
    something was ringing or speaking when you woke it: handled on the spot,
@@ -281,7 +284,13 @@ Then the request goes to one of three places:
    [Interrupting](#interrupting-barge-in-and-ophelia-stop).
 2. **Alarm commands** ("set an alarm for 7 am on weekdays"): handled by the
    controller's alert engine. See [Timers and alarms](#timers-and-alarms).
-3. **Everything else**, including every timer command: on to Home Assistant.
+3. **Alarm questions and the timer cancels Home Assistant cannot answer**
+   ("when's my next alarm", "cancel the timer", "cancel all timers"):
+   answered by the controller, the cancels through Home Assistant's own timer
+   intents, without the conversation agent. See
+   [Timers and alarms](#timers-and-alarms).
+4. **Everything else**, including every other timer command: on to Home
+   Assistant.
 
 ## Stage 10 — Understanding and action
 
@@ -390,7 +399,27 @@ Assistant.
 ## Timers and alarms
 
 **Timers** work exactly as on Home Assistant's own voice satellites. Home
-Assistant holds every timer; timer commands are ordinary requests. When a
+Assistant holds every timer; timer commands are ordinary requests, answered by
+Home Assistant's own timer intents without the LLM. Its built-in sentences miss
+common phrasings, so the Home Assistant configuration adds custom sentences
+(`custom_sentences/en/timers.yaml`) for them:
+
+- "Set a timer for 5 hour, 15 min", "set a 5 and a half hour timer", "set a
+  timer for 5 min, 10 second": "Timer set for 5 hours and 15 minutes."
+- "How much time is left [on the 5 minute timer]?", "What timers do I have?":
+  "You have 2 timers: a 5 minute timer with 3 minutes left and a 10 minute
+  timer with 8 minutes left."
+- "Cancel the 5 second timer": "5 second timer cancelled." Likewise "add 2
+  min to the timer", "pause the 5 minute timer", "resume my timer".
+
+The controller answers the two cancels Home Assistant's own answer can't name:
+"cancel the timer" cancels this speaker's only timer and says which ("5
+second timer cancelled."), or with several asks "Which one? Your 5 minute
+timer or your 10 minute timer?" (answer without the wake word: "the 10
+minute one", "both", or "never mind"); "cancel all timers" cancels only this
+speaker's timers and names them.
+
+When a
 timer finishes, the controller tells the Dot to ring: it loops the
 **Timer sound** with a pause (**Gap between repeats**) between loops, for at most the
 **Timer ring limit** (default 15 minutes). Music pauses while it rings. The

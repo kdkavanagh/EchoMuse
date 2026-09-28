@@ -14,7 +14,7 @@ import logging
 import math
 import time
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Protocol
+from typing import Any, Awaitable, Callable, Iterable, Protocol
 
 import em_button
 import em_capture
@@ -72,7 +72,8 @@ class Actor(Protocol):
 
 
 class Alerts(Protocol):
-    async def on_session_hello(self, endpoint_id: str, alerts: dict) -> None: ...
+    async def on_session_hello(self, endpoint_id: str, alerts: dict, *,
+                               capabilities: Iterable[str] = ()) -> None: ...
     def on_session_lost(self, endpoint_id: str) -> None: ...
     async def on_alert_ack(self, endpoint_id: str, body: dict) -> None: ...
     def on_alert_state(self, endpoint_id: str, body: dict) -> None: ...
@@ -416,7 +417,8 @@ class Device:
         volume = link.hello.get("volume") or {}
         self.volume = _integer(volume.get("level"))
         self.actor.attach(link, self.render)
-        await self.host.alerts.on_session_hello(self.device_id, link.hello.get("alerts") or {})
+        await self.host.alerts.on_session_hello(self.device_id, link.hello.get("alerts") or {},
+                                                capabilities=self.capabilities)
         await self.apply_config(self.config)
         await self.host.connected(self)
         self._start_ping()

@@ -20,7 +20,7 @@ the device wire protocol is [docs/protocol-v1.md](../docs/protocol-v1.md).
   admin user) in `.env`; the controller refuses to start without them. The
   add-on needs nothing: it now declares `homeassistant_api: true` and uses the
   Supervisor token.
-- **Settings are migrated automatically** (schema v22–v24, each one
+- **Settings are migrated automatically** (schema v22–v25, each one
   transaction). Removed settings are deleted from fleet and device configs;
   see below.
 
@@ -46,7 +46,9 @@ the device wire protocol is [docs/protocol-v1.md](../docs/protocol-v1.md).
   (`post_afe_1`) decides when you stopped talking. Home Assistant then runs a
   speech-to-text-only pass on the committed audio and a separate intent/TTS
   pass. The wake word is removed from the transcript, never cut from the
-  audio. Utterances are capped at 15 s, or 30 s with the new **Extended
+  audio; when the streaming recognizer misses a quiet wake word, it is still
+  removed from the start of HA's transcript, so local sentences keep matching.
+  Utterances are capped at 15 s, or 30 s with the new **Extended
   utterances** toggle.
 - **"Ophelia, stop" / "Ophelia, snooze"** stop or snooze a ringing alert. A
   bare wake word no longer stops a ring; a tap on the action button still
@@ -56,6 +58,23 @@ the device wire protocol is [docs/protocol-v1.md](../docs/protocol-v1.md).
   configured gap until stopped or until the ring limit (`timerRingSeconds`,
   new default 900 s; a stored value of the old default 60 is raised to 900).
   The LED ring shows the first timer's remaining time.
+- **Timers answer without the LLM, and say what they did.** Timer commands
+  are Home Assistant's own timer intents. The Home Assistant configuration
+  adds local custom sentences (`custom_sentences/en/timers.yaml`) for the
+  phrasings its built-in ones miss: "set a timer for 5 hour, 15 min", "set a
+  5 and a half hour timer", "5 min, 10 second" ("Timer set for 5 hours and
+  15 minutes."); "how much time is left", "what timers do I have" ("You have
+  2 timers: a 5 minute timer with 3 minutes left and a 10 minute timer with
+  8 minutes left."); "cancel the 5 min timer" ("5 minute timer cancelled."),
+  add/remove time, pause, resume. EchoMuse answers the two cancels HA's own
+  answer cannot name, through HA's timer intents: "cancel the timer" cancels
+  the speaker's only timer and says which, or asks "Which one? Your 5 minute
+  timer or your 10 minute timer?" and takes the answer without the wake
+  word; "cancel all timers" cancels only this speaker's timers and names
+  them. Alarm questions ("when's my next alarm?") are answered from the
+  alert engine, and a voice alarm answers with its first due time ("Alarm
+  set for 7 AM tomorrow."). The Activity tab shows these turns as handled by
+  the timer cancel or the alarm question, with the HA intent time.
 - **Alarms live in Home Assistant.** The controller creates one Local
   Calendar per speaker ("EchoMuse &lt;name&gt;"); every alarm is an event on
   it and can be edited in HA's calendar. It installs five scripts exposed to
@@ -82,6 +101,16 @@ the device wire protocol is [docs/protocol-v1.md](../docs/protocol-v1.md).
   per-stage times. Schema v24 adds these turn columns. `tts_url_ms` is now
   dispatch → first response-audio URL; the new `intent_ms` is dispatch →
   intent result. Rows from before the cutover show their old outcome.
+- **Activity tab, follow-up questions.** A turn whose answer asked a
+  question (Home Assistant's `continue_conversation`, or EchoMuse's own
+  "AM or PM?") shows what became of it — answered, a wake took over, no reply
+  within 7 s, cut off before it finished, no microphone, chain limit — with a
+  link to the reply turn; the reply links back to the question. The row list
+  marks askers `?` and replies `↩`, a **Follow-ups answered** tile counts
+  them, and each turn shows how its spoken answer ended (played to the end,
+  cut off, …) and the trace id its controller log line carries. Schema v25
+  adds `turn_uuid`, `conversation_id`, `reply_to`, `continuation` and
+  `playback_reason`; `playback_ms` now measures audible time.
 - **Controller image:** removed `openwakeword`, `speexdsp-ns`, `tqdm`,
   `scikit-learn`, `requests`; added `sherpa-onnx` and the speech bundle (with
   the Kroko model's CC-BY-SA attribution). The image is built from the
@@ -110,6 +139,40 @@ the device wire protocol is [docs/protocol-v1.md](../docs/protocol-v1.md).
   quiet, Stop sensitivity, Pause before stopping, Trailing audio, Max turn
   length; VAD Threshold, Speech gate, Silence gate; Burst length; "ring this
   device now".
+
+**Fixed during the cutover**
+
+- **Follow-up questions never listened.** The reply window took dialog-input
+  focus as soon as the question started playing, and the Dot answers that by
+  cutting off dialog output — so the question was silenced, no reply window
+  opened, and the half-open expectation left the ring showing "listening"
+  (with a live reply lease) until the next wake. Input focus now passes to
+  the reply window only when the question has finished (or an early answer
+  cuts it off); a question that is cut off drops its expectation. A streamed
+  answer that turns out to be a question starts watching for an early reply
+  as soon as Home Assistant says so.
+- **"Ophelia, stop" did not stop a ringing timer** (or alarm), and neither
+  did the LLM's `echomuse_dismiss_alert`: the firmware accepted only UUIDv4
+  operation IDs, but voice and LLM operations use UUIDv5. Firmware now
+  accepts any RFC 4122 UUID; a non-benign `alert.act` rejection is logged as
+  a warning.
+- **Timers rang the built-in fallback tone instead of the Timer sound.** The
+  Dot fetched only the sounds of armed alarms, and `alert.ring` names the
+  timer sound only as the timer finishes. The controller now sends
+  `alert.prefetch` with the timer sound when a Dot connects and when a timer
+  starts (firmware capability `alert_prefetch`), and a ring whose sound is
+  missing fetches it for the next ring.
+- **Short spoken answers were cut off after about a second.** `render.end`
+  travels on the control socket and overtook the tail of the audio on the
+  audio socket; the Dot then dropped the late audio. A 1.8 s "Timer set for 5
+  minutes." played 0.96 s. `render.end` now carries `end_frame` and the Dot
+  plays every frame up to it (the same line now plays 1.80 s of 1.80 s).
+  Each dialog playback logs how much of the audio sent was played.
+- **A successful firmware update was reported as failed** ("OTA exception:
+  … is offline"): the slot flip restarts the server, closing the session, and
+  closing the update's shell on that dead session raised — skipping the
+  reconnect check and leaving the device's shell lock held, so the next
+  update could not open a shell until the controller restarted.
 
 ### Earlier in this release
 

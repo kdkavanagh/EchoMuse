@@ -1,0 +1,140 @@
+{
+  "source": [
+    "homeassistant/components/intent/__init__.py (IntentHandleView: name, data, language, assistant, device_id, satellite_id; IntentHandleError/MatchFailedError become an error response with HTTP 200)",
+    "homeassistant/components/intent/timers.py (StartTimerIntentHandler, TimerStatusIntentHandler speech_slots)",
+    "Captured from the live HA 2026.8.1 on 2026-09-28 with the Office satellite device"
+  ],
+  "status_empty": {
+    "request": {
+      "method": "POST",
+      "path": "/api/intent/handle",
+      "body": {
+        "name": "HassTimerStatus",
+        "data": {},
+        "device_id": "b285ec5e94b98f4c1cbeabf926be4b77"
+      }
+    },
+    "response": {
+      "speech": {},
+      "card": {},
+      "language": "en",
+      "response_type": "action_done",
+      "speech_slots": {
+        "timers": []
+      },
+      "data": {
+        "success": [],
+        "failed": []
+      }
+    }
+  },
+  "start": {
+    "request": {
+      "method": "POST",
+      "path": "/api/intent/handle",
+      "body": {
+        "name": "HassStartTimer",
+        "data": {
+          "minutes": 30,
+          "name": "probe"
+        },
+        "device_id": "b285ec5e94b98f4c1cbeabf926be4b77"
+      }
+    },
+    "response": {
+      "speech": {},
+      "card": {},
+      "language": "en",
+      "response_type": "action_done",
+      "data": {
+        "success": [],
+        "failed": []
+      }
+    }
+  },
+  "status": {
+    "request": {
+      "method": "POST",
+      "path": "/api/intent/handle",
+      "body": {
+        "name": "HassTimerStatus",
+        "data": {},
+        "device_id": "b285ec5e94b98f4c1cbeabf926be4b77"
+      }
+    },
+    "response": {
+      "speech": {},
+      "card": {},
+      "language": "en",
+      "response_type": "action_done",
+      "speech_slots": {
+        "timers": [
+          {
+            "id": "01M3K1TGA83CVJSCYZ5YGB3C4B",
+            "name": "probe",
+            "device_id": "b285ec5e94b98f4c1cbeabf926be4b77",
+            "language": "en",
+            "start_hours": 0,
+            "start_minutes": 30,
+            "start_seconds": 0,
+            "is_active": true,
+            "hours_left": 0,
+            "minutes_left": 30,
+            "seconds_left": 0,
+            "rounded_hours_left": 0,
+            "rounded_minutes_left": 30,
+            "rounded_seconds_left": 0,
+            "total_seconds_left": 1800
+          },
+          {
+            "id": "01M3K1TGAA2NH6DKW3D8BZRG4F",
+            "name": "",
+            "device_id": "b285ec5e94b98f4c1cbeabf926be4b77",
+            "language": "en",
+            "start_hours": 1,
+            "start_minutes": 5,
+            "start_seconds": 0,
+            "is_active": true,
+            "hours_left": 1,
+            "minutes_left": 5,
+            "seconds_left": 0,
+            "rounded_hours_left": 1,
+            "rounded_minutes_left": 0,
+            "rounded_seconds_left": 0,
+            "total_seconds_left": 3900
+          }
+        ]
+      },
+      "data": {
+        "success": [],
+        "failed": []
+      }
+    }
+  },
+  "start_unsupported": {
+    "request": {
+      "method": "POST",
+      "path": "/api/intent/handle",
+      "body": {
+        "name": "HassStartTimer",
+        "data": {
+          "minutes": 1
+        }
+      }
+    },
+    "response": {
+      "speech": {
+        "plain": {
+          "speech": "Device does not support timers: device_id=None",
+          "extra_data": null
+        }
+      },
+      "card": {},
+      "language": "en",
+      "response_type": "error",
+      "data": {
+        "code": "failed_to_handle"
+      }
+    }
+  }
+}

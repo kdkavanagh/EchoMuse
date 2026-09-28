@@ -325,6 +325,26 @@ HAND_CASES = {
         ("the second", "needs_more"), ("the", "needs_more"), ("pm please", "unknown"),
         ("", "unknown"), ("tea or coffee", "unknown"), ("no thank you", "unknown"),
     ],
+    "alarm_query": [
+        ("what alarms do i have", "complete"), ("what alarms are set", "complete"),
+        ("which alarms are set", "complete"), ("what alarms have i got", "complete"),
+        ("do i have any alarms", "complete"), ("do i have any alarms set", "complete"),
+        ("have i got any alarms", "complete"), ("are there any alarms set", "complete"),
+        ("how many alarms do i have", "complete"), ("how many alarms are set", "complete"),
+        ("list my alarms", "complete"), ("show me my alarms", "complete"), ("tell me my alarms", "complete"),
+        ("check my alarms", "complete"), ("read me all my alarms", "complete"), ("what are my alarms", "complete"),
+        ("what's my alarm set for", "needs_more"), ("alarm status", "complete"), ("status of my alarms", "complete"),
+        ("when is my alarm", "complete"), ("when's my next alarm", "complete"), ("whens my alarm", "complete"),
+        ("what time is my alarm", "complete"), ("what time is my next alarm set", "complete"),
+        ("is my alarm set", "complete"), ("is there an alarm set", "complete"),
+        ("what time does my alarm go off", "complete"), ("when will my next alarm go off", "complete"),
+        ("do i have an alarm set", "complete"), ("what alarms do i have please", "complete"),
+        ("what time is my alarm set for", "needs_more"), ("can you tell me my alarms", "complete"),
+        ("how much time is left", "unknown"), ("what timers do i have", "unknown"),
+        ("what timers and alarms do i have", "unknown"), ("set an alarm for 7 am", "unknown"),
+        ("cancel my alarm", "unknown"), ("what time is it", "unknown"), ("when is my appointment", "unknown"),
+        ("", "unknown"),
+    ],
 }
 
 

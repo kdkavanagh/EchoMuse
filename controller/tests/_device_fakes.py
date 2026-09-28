@@ -108,7 +108,7 @@ class FakeAlerts:
     def __init__(self) -> None:
         self.calls: list[tuple] = []
 
-    async def on_session_hello(self, endpoint_id, alerts):
+    async def on_session_hello(self, endpoint_id, alerts, *, capabilities=()):
         self.calls.append(("hello", endpoint_id, alerts))
 
     def on_session_lost(self, endpoint_id):

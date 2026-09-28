@@ -167,10 +167,45 @@ func TestNetworkSourceWaitsForPrimeUnlessEnded(t *testing.T) {
 
 	r.must(r.m.Start(Playback{ID: "tts", Generation: 1, Class: DialogOutput, Epoch: 8}))
 	r.pumpConst(8, 1, 0, 100, 500)
-	r.must(r.m.End("tts", 1))
+	r.must(r.m.End("tts", 1, 0))
 	r.step(1)
 	if r.masks[11]&MaskDialog == 0 {
 		t.Fatal("an ended clip shorter than the prime did not play")
+	}
+}
+
+// render.end travels on the control socket and can overtake the tail of the
+// audio on the audio socket: a 1.8 s answer used to play only what had
+// arrived (about the 1 s prime) and drop the rest as audio after the end.
+func TestRenderEndBeforeTheLastAudioStillPlaysEveryFrameSent(t *testing.T) {
+	r := newRig(t, nil, true)
+	r.must(r.m.Start(Playback{ID: "tts", Generation: 1, Class: DialogOutput, Epoch: 8}))
+	const total = 86_400 // 1.8 s
+	arrived := r.pumpConst(8, 1, 0, primeFrames/2, 700)
+	r.must(r.m.End("tts", 1, total))
+	r.step(20)
+	if len(r.events(EventStart)) != 0 {
+		t.Fatal("started on a partial clip whose tail is still in flight")
+	}
+	r.pumpConst(8, 1, arrived, total-int(arrived), 700)
+	if err := r.m.Pump(8, 1, total, []int16{1}); !errors.Is(err, ErrEnded) {
+		t.Fatalf("audio past the end frame = %v, want ErrEnded", err)
+	}
+	for i := 0; i < 400 && len(r.finished) == 0; i++ {
+		r.step(1)
+		r.sink.completeAll()
+	}
+	if len(r.finished) != 1 || r.finished[0].Reason != Drained {
+		t.Fatalf("finished = %+v, want one drained", r.finished)
+	}
+	played := 0
+	for _, v := range r.out {
+		if v == 700 {
+			played++
+		}
+	}
+	if played != total {
+		t.Fatalf("played %d frames, want all %d sent", played, total)
 	}
 }
 
@@ -277,10 +312,10 @@ func TestGenerationFencing(t *testing.T) {
 	if err := r.m.Pump(11, 3, 5, []int16{1}); !errors.Is(err, ErrDiscontinuous) {
 		t.Fatalf("gap = %v", err)
 	}
-	if err := r.m.End("tts", 2); !errors.Is(err, ErrStale) {
+	if err := r.m.End("tts", 2, 0); !errors.Is(err, ErrStale) {
 		t.Fatalf("end with older generation = %v", err)
 	}
-	r.must(r.m.End("tts", 3))
+	r.must(r.m.End("tts", 3, 0))
 	if err := r.m.Pump(11, 3, 2, []int16{1}); !errors.Is(err, ErrEnded) {
 		t.Fatalf("audio after end = %v", err)
 	}
@@ -371,7 +406,7 @@ func TestTapMaskAndContiguousIndices(t *testing.T) {
 	startContent(r, 100, 100_000)
 	r.must(r.m.Start(Playback{ID: "tts", Generation: 1, Class: DialogOutput, Epoch: 8}))
 	r.pumpConst(8, 1, 0, 5000, 100)
-	r.must(r.m.End("tts", 1))
+	r.must(r.m.End("tts", 1, 0))
 	r.must(r.m.Start(Playback{ID: "chime", Generation: 1, Class: Earcon, PCM: make([]int16, 5000)}))
 	r.step(1)
 	if got := r.masks[len(r.masks)-1]; got != MaskContent|MaskAlert|MaskDialog|MaskEarcon {

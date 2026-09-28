@@ -846,6 +846,8 @@ const COMMIT_ROUTES = {
 const TURN_HANDLERS = {
   ha: 'Home Assistant intent',
   alarm: 'EchoMuse alarm engine',
+  timer: 'EchoMuse timer cancel → Home Assistant HassCancelTimer (no conversation agent)',
+  alarm_query: 'EchoMuse alarm question (alarm engine)',
   clarification: 'EchoMuse (asked for AM or PM)',
   local_command: 'Local command on the controller (Home Assistant not involved)',
 };
@@ -855,12 +857,38 @@ const TRIGGERS = {
   ha_reply: 'Reply to a Home Assistant prompt',
 };
 
+// What became of a question a turn's answer asked (turns.continuation, the
+// controller's FOLLOWUP_* outcomes): [explanation, color].
+const FOLLOWUPS = {
+  pending:          ['reply window open', 'var(--muted)'],
+  answered:         ['answered without the wake word', 'var(--ok)'],
+  wake:             ['a wake word or button press took over, with the question as context', 'var(--ok)'],
+  reply_timeout:    ['no reply within the 7 s reply window', 'var(--muted)'],
+  prompt_cancelled: ['the question was cut off before it finished, so no reply window opened', 'var(--warn)'],
+  prompt_failed:    ['the question never finished playing (speech failed or timed out)', 'var(--warn)'],
+  no_mic:           ['no reply window: the microphone stream was unavailable', 'var(--warn)'],
+  chain_limit:      ['no reply window: already 5 replies or 60 s without the wake word', 'var(--muted)'],
+  interrupted:      ['the reply window’s microphone stream ended early', 'var(--warn)'],
+  superseded:       ['a newer wake or button press ended it', 'var(--muted)'],
+  muted:            ['the microphone was muted', 'var(--muted)'],
+  session_lost:     ['the device disconnected', 'var(--warn)'],
+};
+const followup = key => FOLLOWUPS[key] || [key.replace(/_/g, ' '), 'var(--muted)'];
+// Outcomes that mean the follow-up machinery failed rather than the user not answering.
+const FOLLOWUP_BROKEN = new Set(['prompt_cancelled', 'prompt_failed', 'no_mic', 'interrupted', 'session_lost']);
+
+// How the spoken answer ended (render.finished reason, or a response limit).
+const PLAYBACK_ENDS = {
+  drained: 'played to the end', cancelled: 'cut off', failed: 'failed to play',
+  underrun: 'ran out of audio', response_timeout: 'stalled or timed out', fenced: 'superseded',
+};
+
 // One turn, stage by stage: what woke it, what the controller's streaming
 // recognizer heard and why it stopped listening, what Home Assistant
-// transcribed and what was sent on, who handled it and what was said back.
-// A stage that never ran (a refused wake, no speech, a failed STT) is
-// omitted rather than shown empty.
-function TurnDetail({ turn: t }) {
+// transcribed and what was sent on, who handled it, what was said back, and
+// what became of any follow-up question. A stage that never ran (a refused
+// wake, no speech, a failed STT) is omitted rather than shown empty.
+function TurnDetail({ turn: t, turns, onSelect }) {
   const mono = "'DM Mono',monospace";
   // Pre-cutover rows stored negative sentinels for unmeasured stages.
   const measured = v => typeof v === 'number' && v >= 0;
@@ -869,13 +897,23 @@ function TurnDetail({ turn: t }) {
   const refused = REFUSED_WAKE.has(t.terminal_reason);
   const legacy = isLegacyTurn(t);
   const end = turnEnd(t);
+  // Follow-ups link the question and its reply by the controller's turn id.
+  const question = t.reply_to ? turns.find(x => x.turn_uuid === t.reply_to) : null;
+  const answers = t.turn_uuid ? turns.filter(x => x.reply_to === t.turn_uuid) : [];
+  const jump = (x, label) => (
+    <button key={x.turn_id} onClick={() => onSelect(x.turn_id)}
+      style={{ background: 'none', border: 'none', padding: 0, cursor: 'pointer', font: 'inherit', color: 'var(--accent)', textDecoration: 'underline' }}>
+      {label}
+    </button>
+  );
   const stage = (label, body) => (
     <div style={{ display: 'grid', gridTemplateColumns: '112px 1fr', gap: 12, padding: '5px 0', borderTop: '1px solid var(--track)' }}>
       <span style={{ color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.08em', fontSize: 9, paddingTop: 1 }}>{label}</span>
       <div>{body}</div>
     </div>
   );
-  const handledByHa = t.outcome === 'ha';
+  // Turns that ran an HA intent: its conversation run, or EchoMuse's HassTimerStatus/HassCancelTimer.
+  const handledByHa = ['ha', 'timer'].includes(t.outcome);
   const agent = t.intent_local == null ? null : t.intent_local ? "HA's built-in agent" : 'the conversation agent';
   return (
     <div style={{ marginTop: 10, background: 'var(--hairline)', border: '1px solid var(--track)', borderRadius: 6, padding: '8px 12px', fontFamily: mono, fontSize: 10, color: 'var(--text2)', lineHeight: 1.7 }}>
@@ -925,12 +963,42 @@ function TurnDetail({ turn: t }) {
         )}
       </>)}
 
-      {(t.response_text || measured(t.tts_url_ms) || measured(t.playback_ms)) && stage('Spoke', <>
+      {(t.response_text || measured(t.tts_url_ms) || measured(t.playback_ms) || t.playback_reason) && stage('Spoke', <>
         {quote(t.response_text)}
-        {(measured(t.tts_url_ms) || measured(t.playback_ms)) && (
+        {(measured(t.tts_url_ms) || measured(t.playback_ms) || t.playback_reason) && (
           <div style={{ color: 'var(--muted)' }}>
             {[measured(t.tts_url_ms) && `audio ready ${fmtS(t.tts_url_ms)} after dispatch`,
-              measured(t.playback_ms) && `played ${fmtS(t.playback_ms)}`].filter(Boolean).join(' · ')}
+              measured(t.playback_ms) && `audible ${fmtS(t.playback_ms)}`].filter(Boolean).join(' · ')}
+            {t.playback_reason && <>
+              {(measured(t.tts_url_ms) || measured(t.playback_ms)) && ' · '}
+              <span style={{ color: t.playback_reason === 'drained' ? undefined : 'var(--warn)' }}>
+                {PLAYBACK_ENDS[t.playback_reason] || t.playback_reason.replace(/_/g, ' ')}
+              </span>
+            </>}
+          </div>
+        )}
+      </>)}
+
+      {(t.continuation || t.reply_to) && stage('Follow-up', <>
+        {t.reply_to && (
+          <div>
+            answered the question {question
+              ? <>{quote(question.response_text)} from {jump(question, fmtTurnWhen(question.ts))}</>
+              : 'of a turn no longer in this list'}
+          </div>
+        )}
+        {t.continuation && (
+          <div>
+            <span style={{ color: 'var(--muted)' }}>
+              {t.outcome === 'ha' ? 'Home Assistant asked a follow-up' : 'EchoMuse asked a follow-up'}:{' '}
+            </span>
+            <span style={{ color: followup(t.continuation)[1] }}>{followup(t.continuation)[0]}</span>
+            {answers.map(a => <React.Fragment key={a.turn_id}> · {jump(a, `reply at ${fmtTurnWhen(a.ts)}`)}</React.Fragment>)}
+          </div>
+        )}
+        {t.conversation_id && (
+          <div style={{ color: 'var(--muted)' }} title={t.conversation_id}>
+            HA conversation …{t.conversation_id.slice(-8)}
           </div>
         )}
       </>)}
@@ -939,6 +1007,7 @@ function TurnDetail({ turn: t }) {
         reference coverage {t.reference_coverage != null ? `${Math.round(t.reference_coverage * 100)}%` : '—'}
         {t.policy_hash ? <> · policy {t.policy_hash}</> : null}
         {t.commit_id ? <> · commit {shortSha(t.commit_id)}</> : null}
+        {t.turn_uuid ? <> · <span title={`controller log: "turn ${t.turn_uuid} trace"`}>trace {shortSha(t.turn_uuid)}</span></> : null}
       </div>
     </div>
   );
@@ -1068,6 +1137,11 @@ function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, stateLa
     .sort((a, b) => a - b);
   const medianReply = replies.length ? replies[Math.floor(replies.length / 2)] : null;
   const fmtS = ms => (ms / 1000).toFixed(1) + 's';
+  // Follow-up questions whose fate is known; a broken one (cut off, no mic,
+  // disconnected) is a fault, not a user who stayed quiet.
+  const asked = turns.filter(t => t.continuation && t.continuation !== 'pending');
+  const answered = asked.filter(t => t.continuation === 'answered' || t.continuation === 'wake');
+  const brokenFollowups = asked.filter(t => FOLLOWUP_BROKEN.has(t.continuation));
 
   // All buffered turns (up to 50), newest first — rendered inside their own
   // scrollable box so a long history never scrolls the stat tiles (or the
@@ -1093,6 +1167,8 @@ function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, stateLa
         <Lcd label="Median reply" value={medianReply != null ? fmtS(medianReply) : '—'} color="var(--lcd-dim)" size={16}/>
         <Lcd label="Refused wakes" value={refused.length}
              color={refused.length > 0 ? 'var(--lcd-amber)' : 'var(--lcd-dim)'} size={16}/>
+        <Lcd label="Follow-ups answered" value={asked.length ? `${answered.length}/${asked.length}` : '—'}
+             color={brokenFollowups.length > 0 ? 'var(--lcd-amber)' : 'var(--lcd-dim)'} size={16}/>
       </div>
 
       {recent.length === 0 ? (
@@ -1158,6 +1234,13 @@ function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, stateLa
                   ))}
                 </div>
                 <span style={{ fontFamily: mono, fontSize: 9, color: 'var(--text2)', width: 34, flexShrink: 0 }}>{fmtS(seg.shown)}</span>
+                {/* ↩ answered a question; ? asked one, colored by what became of it. */}
+                <span style={{ fontFamily: mono, fontSize: 10, width: 10, flexShrink: 0, textAlign: 'center',
+                  color: t.continuation ? followup(t.continuation)[1] : 'var(--text2)' }}
+                  title={t.continuation ? `Asked a follow-up: ${followup(t.continuation)[0]}`
+                    : t.reply_to ? 'Answered a follow-up question' : undefined}>
+                  {t.continuation ? '?' : t.reply_to ? '↩' : ''}
+                </span>
                 <span style={{ fontFamily: mono, fontSize: 8, textTransform: 'uppercase', letterSpacing: '0.08em', width: 62, flexShrink: 0, color: end.color }}>
                   {end.label.replace(/_/g, ' ')}
                 </span>
@@ -1195,7 +1278,7 @@ function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, stateLa
           </div>
 
           {/* Stage-by-stage detail of the selected turn (the newest until one is clicked) */}
-          {shown && <TurnDetail turn={shown}/>}
+          {shown && <TurnDetail turn={shown} turns={turns} onSelect={setSelected}/>}
         </div>
       )}
     </div>

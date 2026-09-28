@@ -231,7 +231,8 @@ async def _provision(device: em_device.Device) -> None:
         log.warning("[%s] calendar provisioning failed: %s", device.device_id, err)
         return
     if fresh and device.link is not None and not device.link.closed:
-        await _alerts.on_session_hello(device.device_id, device.link.hello.get("alerts") or {})
+        await _alerts.on_session_hello(device.device_id, device.link.hello.get("alerts") or {},
+                                       capabilities=device.capabilities)
 
 
 async def _on_ha_connected() -> None:
@@ -346,6 +347,8 @@ class _Host:
             vocabulary=lambda: _ha.vocabulary,
             esphome_reply=lambda pcm: esphome.esphome_reply(device_id, pcm),
             persist_turn=lambda rec: _persist_turn(device_id, rec),
+            record_continuation=lambda row_id, outcome: asyncio.to_thread(
+                db.set_turn_continuation, row_id, outcome),
         )
         return em_session.SessionActor(device_id, deps)
 

@@ -1,5 +1,6 @@
-"""EchoMuse endpoint-completeness and alarm grammar (§16.6)."""
+"""EchoMuse endpoint-completeness grammar and its authoritative parses (§16.6)."""
 
+from .alerts import AlarmQuery, TimerCancel, parse_alarm_query, parse_timer_cancel
 from .core import (
     AMPM_CHOICES,
     COMPLETE,
@@ -30,6 +31,7 @@ __all__ = (
     "NEEDS_MORE",
     "UNKNOWN",
     "AlarmParse",
+    "AlarmQuery",
     "Choice",
     "CommandContext",
     "HomeParse",
@@ -37,11 +39,14 @@ __all__ = (
     "Result",
     "SOURCE_SHA256",
     "TEMPLATE_VERSION",
+    "TimerCancel",
     "classify",
     "family_result",
     "match_choice",
     "match_local_command",
     "normalize",
     "parse_alarm",
+    "parse_alarm_query",
+    "parse_timer_cancel",
     "tokens",
 )

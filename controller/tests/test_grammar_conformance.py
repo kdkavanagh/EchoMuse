@@ -10,15 +10,19 @@ import pytest
 from echomuse_grammar import (
     AMPM_CHOICES,
     AlarmParse,
+    AlarmQuery,
     Choice,
     CommandContext,
     TEMPLATE_VERSION,
+    TimerCancel,
     classify,
     family_result,
     match_choice,
     match_local_command,
     normalize,
     parse_alarm,
+    parse_alarm_query,
+    parse_timer_cancel,
 )
 
 CORPUS = Path(__file__).resolve().parents[1] / "echomuse_grammar" / "conformance.tsv"
@@ -54,7 +58,7 @@ def test_corpus_shape() -> None:
     header = CORPUS.read_text(encoding="utf-8").splitlines()[:2]
     assert f"home-assistant-intents {TEMPLATE_VERSION}" in header[1]
     counts = Counter(family for _, family, _ in CASES)
-    assert set(counts) == {"timer", "alarm", "local", "home", "reply"}
+    assert set(counts) == {"timer", "alarm", "alarm_query", "local", "home", "reply"}
     assert all(counts[family] >= 40 for family in counts)
 
 
@@ -76,6 +80,7 @@ def test_every_corpus_line_reproduces() -> None:
         ("ninety nine", "99"),
         ("Don't stop.", "don't stop"),
         ("a timer for 1/2 an hour", "a timer for 1/2 an hour"),
+        ("When\u2019s my alarm?", "when's my alarm"),
     ],
 )
 def test_normalize(text: str, expected: str) -> None:
@@ -106,6 +111,49 @@ def test_normalize(text: str, expected: str) -> None:
 )
 def test_parse_alarm(text: str, parse: AlarmParse | None) -> None:
     assert parse_alarm(text) == parse
+
+
+@pytest.mark.parametrize(
+    ("text", "parse"),
+    [
+        ("Cancel the timer.", TimerCancel()),
+        ("stop my timer", TimerCancel()),
+        ("turn off the timer", TimerCancel()),
+        ("cancel the five-minute timer", TimerCancel((0, 5, 0))),
+        ("cancel the hour and a half timer", TimerCancel((1, 30, 0))),
+        ("cancel the 10 minute pasta timer", TimerCancel((0, 10, 0), "pasta")),
+        ("cancel the timer called chicken wings", TimerCancel(None, "chicken wings")),
+        ("cancel the timer for 10 minutes", TimerCancel((0, 10, 0))),
+        ("cancel all of my timers", TimerCancel(all=True)),
+        ("cancel both timers", TimerCancel(all=True)),
+        ("cancel every timer", TimerCancel(all=True)),
+        ("can you cancel the timers please", TimerCancel(all=True)),
+        ("cancel", None),
+        ("cancel the alarm", None),
+        ("cancel the 5 minute", None),
+        ("cancel the timer and turn on the lights", None),
+        ("set a timer for 5 minutes", None),
+    ],
+)
+def test_parse_timer_cancel(text: str, parse: TimerCancel | None) -> None:
+    assert parse_timer_cancel(text) == parse
+
+
+@pytest.mark.parametrize(
+    ("text", "parse"),
+    [
+        ("what alarms are set", AlarmQuery()),
+        ("when's my next alarm", AlarmQuery(next_only=True)),
+        ("what time is my alarm set for", AlarmQuery()),
+        ("do I have any alarms", AlarmQuery()),
+        # Timer questions are HA's local HassTimerStatus intent.
+        ("How much time is left?", None),
+        ("what timers and alarms do I have", None),
+        ("what time is it", None),
+    ],
+)
+def test_parse_alarm_query(text: str, parse: AlarmQuery | None) -> None:
+    assert parse_alarm_query(text) == parse
 
 
 PASTA_TIMER = CommandContext("alert", "timer", "pasta")
@@ -164,6 +212,8 @@ def test_match_choice() -> None:
         ("switch off the kitchen", "extendable", "home"),
         ("kitchen lights on", "complete", "home"),
         ("stop the timer", "complete", "timer"),
+        ("what alarms do i have", "complete", "alarm_query"),
+        ("how much time is left", "complete", "timer"),
     ],
 )
 def test_classify_across_families(text: str, klass: str, family: str | None) -> None:

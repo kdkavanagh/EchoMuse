@@ -2,6 +2,9 @@ package supervisor
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"os"
@@ -42,9 +45,10 @@ type ackRec struct {
 }
 
 type fakeSession struct {
-	mu   sync.Mutex
-	msgs []sent
-	acks []ackRec
+	mu     sync.Mutex
+	msgs   []sent
+	acks   []ackRec
+	assets assets.Transport // nil: the controller has no assets
 }
 
 func (f *fakeSession) Send(typ string, gen uint32, body any) (string, error) {
@@ -70,8 +74,14 @@ func (f *fakeSession) Ack(id, status string, code *string) error {
 	return nil
 }
 
-func (f *fakeSession) Audio() client.AudioSink  { return nopAudio{} }
-func (f *fakeSession) Assets() assets.Transport { return missingAssets{} }
+func (f *fakeSession) Audio() client.AudioSink { return nopAudio{} }
+
+func (f *fakeSession) Assets() assets.Transport {
+	if f.assets != nil {
+		return f.assets
+	}
+	return missingAssets{}
+}
 
 func (f *fakeSession) of(typ string) []sent {
 	f.mu.Lock()
@@ -114,6 +124,38 @@ type missingAssets struct{}
 
 func (missingAssets) Fetch(context.Context, string, int64, io.Writer) (int64, error) {
 	return 0, assets.ErrNotFound
+}
+
+// servedAssets is a controller holding exactly these assets by SHA-256.
+type servedAssets map[string][]byte
+
+func (s servedAssets) Fetch(_ context.Context, sha string, offset int64, w io.Writer) (int64, error) {
+	data, ok := s[sha]
+	if !ok {
+		return 0, assets.ErrNotFound
+	}
+	_, err := w.Write(data[offset:])
+	return int64(len(data)), err
+}
+
+// alertWAV is a valid alert asset (48 kHz mono PCM16) and its SHA-256.
+func alertWAV(samples int) ([]byte, string) {
+	b := binary.LittleEndian.AppendUint32([]byte("RIFF"), uint32(36+2*samples))
+	b = append(b, "WAVEfmt "...)
+	b = binary.LittleEndian.AppendUint32(b, 16)
+	b = binary.LittleEndian.AppendUint16(b, 1)
+	b = binary.LittleEndian.AppendUint16(b, 1)
+	b = binary.LittleEndian.AppendUint32(b, 48000)
+	b = binary.LittleEndian.AppendUint32(b, 96000)
+	b = binary.LittleEndian.AppendUint16(b, 2)
+	b = binary.LittleEndian.AppendUint16(b, 16)
+	b = append(b, "data"...)
+	b = binary.LittleEndian.AppendUint32(b, uint32(2*samples))
+	for i := range samples {
+		b = binary.LittleEndian.AppendUint16(b, uint16(int16(i%200*100)))
+	}
+	sum := sha256.Sum256(b)
+	return b, hex.EncodeToString(sum[:])
 }
 
 type epochCall struct{ mic, ref, micRingEnd uint64 }
@@ -658,7 +700,8 @@ func TestHelloCapabilities(t *testing.T) {
 	h := newHarness(t, opts{})
 	hello := h.s.Hello()
 	for _, c := range []string{"audio_timeline_v1", "uplink_leases_v1", "device_wake_v1", "render_reference_v1",
-		"render_progress_v1", "focus_leases_v1", "alert_cache_v1", "turn_protocol_v1", "leds", "led_anim", "buttons", "button_hold"} {
+		"render_progress_v1", "focus_leases_v1", "alert_cache_v1", "turn_protocol_v1", "leds", "led_anim", "buttons", "button_hold",
+		"alert_prefetch"} {
 		if !has(hello.Capabilities, c) {
 			t.Errorf("missing %s in %v", c, hello.Capabilities)
 		}
@@ -702,5 +745,30 @@ func TestSessionLossEndsLeasesAndReadyResendsAlertState(t *testing.T) {
 	h.ready()
 	if st := h.sess.of(proto.TypeAlertState); len(st) != 1 {
 		t.Fatalf("alert.state after ready: %v", h.sess.types())
+	}
+}
+
+// alert.ring names the timer sound only as the timer finishes, and a missing
+// asset rings the fallback (§16.5): alert.prefetch installs it beforehand.
+func TestAlertPrefetchInstallsTheTimerSoundBeforeItRings(t *testing.T) {
+	h := newHarness(t, opts{})
+	h.ready()
+	wav, sha := alertWAV(4800)
+	h.sess.assets = servedAssets{sha: wav}
+	h.expectAck(h.control(proto.TypeAlertPrefetch, 0, proto.AlertPrefetch{Sounds: []string{"builtin:fallback"}}),
+		proto.AckRejected, codeInvalid)
+	if _, installed := h.s.ex.PreviewPCM(sha); installed {
+		t.Fatal("sound installed before the prefetch")
+	}
+	h.expectAck(h.control(proto.TypeAlertPrefetch, 0, proto.AlertPrefetch{Sounds: []string{sha}}), proto.AckAccepted, "")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, installed := h.s.ex.PreviewPCM(sha); installed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("prefetched sound never installed")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

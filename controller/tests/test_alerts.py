@@ -830,6 +830,23 @@ def test_timer_display_copy_ring_missed_and_undeliverable():
     run(go())
 
 
+def test_the_timer_sound_is_prefetched_on_connect_and_timer_start_only_by_capable_devices():
+    async def go():
+        rig = Rig()
+        await rig.up(online=True)                           # hello without alert_prefetch
+        e = rig.engine
+        await e.on_timer_event("dev1", "started", "t1", "Tea", 60, 60, True)
+        assert rig.of("alert.prefetch") == []
+        e.on_session_lost("dev1")
+        await e.on_session_hello("dev1", {"delivery_epoch": None, "acked_sequence": 0},
+                                 capabilities=frozenset({"alert_prefetch"}))
+        assert rig.of("alert.prefetch") == [{"sounds": [TIMER_SOUND]}]
+        await e.on_timer_event("dev1", "started", "t2", "Pasta", 60, 60, True)
+        await e.on_timer_event("dev1", "updated", "t2", "Pasta", 60, 50, False)
+        assert rig.of("alert.prefetch") == [{"sounds": [TIMER_SOUND]}] * 2
+    run(go())
+
+
 # ── LLM relay (§16.7) ───────────────────────────────────────────────────────
 
 async def relay(rig, request_id, action, args):
