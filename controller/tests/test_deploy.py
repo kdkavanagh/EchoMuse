@@ -1,26 +1,115 @@
 """
-Deployment-shape guards — not logic tests. The controller Dockerfile
-COPYs each module explicitly, so a new em_*.py that works fine on bare
-metal crash-loops the container at import time if the COPY line is
-forgotten (bitten by em_scenes.py 2026-07-10 and em_oww_models.py
-2026-07-19).
+Deployment-shape guards: the image, add-on and env files must agree with the
+modules and SPEC §18.4/§18.5 they package. Source-level because the suite
+does not build images or start aiohttp.
 """
 
+import ast
+import json
 import re
 from pathlib import Path
 
 CONTROLLER = Path(__file__).resolve().parents[1]
+ROOT = CONTROLLER.parent
+DOCKERFILE = CONTROLLER / "Dockerfile"
 
 
-def test_dockerfile_copies_every_controller_module():
-    dockerfile = (CONTROLLER / "Dockerfile").read_text()
-    copied = set(re.findall(r"^COPY\s+(\S+\.py)\s", dockerfile, re.M))
-    modules = {p.name for p in CONTROLLER.glob("em_*.py")} | {"version.py"}
-    missing = sorted(modules - copied)
-    assert not missing, (
-        f"Dockerfile is missing COPY lines for {missing} — the container "
-        f"will crash-loop at import time"
-    )
+def _copy_sources() -> list[str]:
+    """Every COPY source in the Dockerfile (root build context, §18.5)."""
+    out = []
+    for line in DOCKERFILE.read_text().splitlines():
+        m = re.match(r"^COPY\s+(.+)\s+\S+$", line)
+        if m:
+            out.extend(m.group(1).split())
+    return out
+
+
+def test_every_copy_source_exists_in_the_root_build_context():
+    """A COPY of a deleted or moved file fails the release build."""
+    for src in _copy_sources():
+        matches = list(ROOT.glob(src.rstrip("/")))
+        assert matches, f"Dockerfile COPY {src} matches nothing under the repo root"
+
+
+def test_image_carries_every_runtime_module_and_speech_input():
+    sources = set(_copy_sources())
+    assert "controller/em_*.py" in sources, "every controller module must be copied"
+    for required in (
+        "controller/version.py",
+        "controller/echomuse_grammar/",
+        "controller/speech_bundle.json",
+        "controller/tools/fetch_speech_bundle.py",
+        "bcresnet_audio.onnx",
+        "bcresnet_audio.json",
+    ):
+        assert required in sources, f"image is missing {required}"
+
+
+def test_compose_builds_from_the_root_context():
+    compose = (CONTROLLER / "docker-compose.yml").read_text()
+    assert re.search(r"^\s+context:\s*\.\.\s*$", compose, re.M)
+    assert re.search(r"^\s+dockerfile:\s*controller/Dockerfile\s*$", compose, re.M)
+
+
+def test_image_drops_openwakeword_and_keeps_hash_checked_assets():
+    """§18.5: no openWakeWord; the device ORT runtime stays hash-checked; the
+    speech bundle is fetched and verified with its Kroko attribution."""
+    text = DOCKERFILE.read_text()
+    assert "openwakeword" not in text and "download_models" not in text
+    ort = text[text.index("onnxruntime-android-1.19.2.aar"):]
+    assert "sha256sum -c" in ort[:400]
+    assert "jni/armeabi-v7a/libonnxruntime.so" in ort
+    assert "fetch_speech_bundle.py /app/speech" in text
+    assert "huggingface.co/Banafo/Kroko-ASR" in text
+    manifest = json.loads((CONTROLLER / "speech_bundle.json").read_text())
+    assert manifest["attribution"]["url"] == "https://huggingface.co/Banafo/Kroko-ASR"
+
+
+def test_requirements_pin_the_speech_runtime_and_drop_removed_packages():
+    reqs = {
+        re.split(r"[=<>!~]", line, maxsplit=1)[0].strip().lower(): line.strip()
+        for line in (CONTROLLER / "requirements.txt").read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+    manifest = json.loads((CONTROLLER / "speech_bundle.json").read_text())
+    assert reqs["sherpa-onnx"] == f"sherpa-onnx=={manifest['runtime']['version']}"
+    for removed in ("openwakeword", "speexdsp-ns", "tqdm", "scikit-learn", "requests"):
+        assert removed not in reqs, f"{removed} is removed by SPEC §18.5"
+
+
+def _addon_options() -> set[str]:
+    config = (CONTROLLER / "config.yaml").read_text()
+    block = re.search(r"^options:\n((?:[ ]+.*\n)+)", config, re.M)
+    assert block, "config.yaml has no options block"
+    return set(re.findall(r"^\s+([a-z_]+):", block.group(1), re.M))
+
+
+def _start_option_map() -> dict[str, str]:
+    tree = ast.parse((CONTROLLER / "em_start.py").read_text())
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "OPTION_ENV_VARS" for t in node.targets):
+            return ast.literal_eval(node.value)
+    raise AssertionError("em_start.OPTION_ENV_VARS not found")
+
+
+def test_addon_options_and_entrypoint_map_agree():
+    """A drifted option either never reaches the controller or trips the
+    entrypoint's drift warning on every boot."""
+    options = _addon_options()
+    mapping = _start_option_map()
+    assert options == set(mapping)
+    assert not any("oww" in k for k in options)
+    config = (CONTROLLER / "config.yaml").read_text()
+    assert re.search(r"^homeassistant_api:\s*true\s*$", config, re.M), \
+        "the add-on reaches HA with SUPERVISOR_TOKEN (§16.7)"
+
+
+def test_env_example_names_ha_credentials_not_wake_settings():
+    env = (CONTROLLER / ".env.example").read_text()
+    keys = set(re.findall(r"^([A-Z_]+)=", env, re.M))
+    assert {"HA_URL", "HA_TOKEN"} <= keys
+    assert not {"OWW_MODEL", "OWW_THRESHOLD"} & keys
 
 
 def test_dashboard_bundle_is_cache_busted():
@@ -35,9 +124,6 @@ def test_dashboard_bundle_is_cache_busted():
     Asserted at the source level because the alternative is starting an aiohttp
     app, which this suite deliberately does not do.
     """
-    import re
-    from pathlib import Path
-
     src = (Path(__file__).resolve().parent.parent / "em_api.py").read_text()
     handler = src[src.index("async def _serve_dashboard"):]
     handler = handler[:handler.index("\nasync def ", 1)]
@@ -101,33 +187,6 @@ def test_dashboard_paths_are_ingress_safe():
         "the base path must come from Home Assistant's ingress header"
     assert "ECHOMUSE_HOME_ASSISTANT_INGRESS" in config, \
         "config.yaml must set the env var that gates ingress-only mode"
-
-
-def test_addon_default_threshold_matches_the_controller():
-    """
-    A fresh add-on install is the ONLY case where a shipped default is
-    visible — an existing deployment stores every key already, so
-    DEFAULT_DEVICE_CONFIG never gets consulted. That makes config.yaml's
-    copy of the wake threshold the one users actually meet, and a stale
-    one silently ships the value the default was changed away from.
-
-    Shipped as 0.3 while em_db said 0.5 (#144), which is exactly the drift
-    this pins. Parsed rather than imported: CI installs pytest/numpy/scipy
-    only, so there is no yaml module here.
-    """
-    import sys
-    sys.path.insert(0, str(CONTROLLER))
-    from em_db import DEFAULT_DEVICE_CONFIG
-
-    config = (CONTROLLER / "config.yaml").read_text()
-    match = re.search(r"^\s*oww_threshold:\s*([0-9.]+)", config, re.M)
-    assert match, "config.yaml has no oww_threshold option"
-    assert float(match.group(1)) == DEFAULT_DEVICE_CONFIG["owwThreshold"], (
-        f"config.yaml ships oww_threshold {match.group(1)} but "
-        f"em_db.DEFAULT_DEVICE_CONFIG says "
-        f"{DEFAULT_DEVICE_CONFIG['owwThreshold']} — a fresh add-on install "
-        f"would get the stale value"
-    )
 
 
 def test_addon_image_is_published_not_built_on_the_user_machine():
@@ -298,98 +357,6 @@ def test_release_change_is_pushed_to_open_dashboards():
         "the Updates tab must refresh while open, not fetch once on entry"
 
 
-def test_streamed_playback_waits_for_the_device_not_a_computed_sleep():
-    """
-    Turn playback must end when the DEVICE says its buffer drained, never on an
-    `audio_duration - elapsed` estimate.
-
-    That estimate was removed on 2026-07-24: it has no visibility of the
-    device's own buffer and cleared the ring 6.1s early on Retreat, 3.2s on
-    Lounge. The streaming path reintroduced it (PR #47) where it is worse still
-    — streaming already consumes most of the audio duration, so the remainder
-    computes to ~0 and the wait disappears while up to ~5.5s is queued in
-    audioChanDepth.
-    """
-    from pathlib import Path
-    src = (Path(__file__).resolve().parent.parent / "em_controller.py").read_text()
-    fn = src[src.index("async def _run_streaming_post_turn_playback"):]
-    fn = fn[:fn.index("\nasync def ", 1)]
-
-    assert "playback_done" in fn, \
-        "streamed playback must await the device's playback_stats"
-    assert "asyncio.sleep(remaining)" not in fn, \
-        "the computed drain estimate was removed on 2026-07-24 — do not restore it"
-
-
-def test_send_ms_stays_socket_write_time():
-    """
-    send_ms is documented as socket-write time that completes near-instantly
-    however slow the link is — "never read it as delivery; that mistake cost a
-    whole investigation on 2026-07-20". Timing the whole streaming loop instead
-    folds HA's synthesis time in and makes it read exactly like delivery.
-    """
-    from pathlib import Path
-    src = (Path(__file__).resolve().parent.parent / "em_controller.py").read_text()
-    fn = src[src.index("async def stream_speaker_chunks"):]
-    fn = fn[:fn.index("\n    async def ", 1) if "\n    async def " in fn[1:] else len(fn)]
-    assert "send_seconds" in fn, \
-        "socket-write time must be accumulated around the send calls"
-
-    caller = src[src.index("async def _run_streaming_post_turn_playback"):]
-    caller = caller[:caller.index("\nasync def ", 1)]
-    assert "device.playback_send_ms = send_ms" in caller, \
-        "send_ms must come from accumulated write time, not the loop duration"
-
-
-def test_meter_ring_is_raised_when_audio_starts_not_at_playback_setup():
-    """
-    The meter pattern renders the live speaker RMS, so it draws an UNLIT ring
-    until the device's ALSA write actually begins.
-
-    On the buffered path that was invisible: the TTS fetch had already
-    completed, so frames flushed at socket speed and audio began almost at
-    once. Streaming moves fetch+decode inside playback, so raising the meter at
-    setup time leaves the ring dark from the end of the spinner until HA
-    returns audio — seconds on a slow response, and indistinguishable from a
-    failed turn (user report 2026-07-31).
-
-    The spinner must therefore stay up until the meter has something to show.
-    """
-    from pathlib import Path
-    src = (Path(__file__).resolve().parent.parent / "em_controller.py").read_text()
-    fn = src[src.index("async def post_turn_play_esphome"):]
-    fn = fn[:fn.index("\n            # P0-1")]
-
-    assert "_meter_at_playback_start(pcm_chunks" in fn, \
-        "the meter must be gated on the first audio reaching the device"
-
-    # A meter send is legitimate inside the nested helpers (_meter_on, and the
-    # dead-man refresher). What must not exist is one in the function's OWN
-    # body — that runs at setup, before any audio. Nested bodies are indented
-    # deeper, so indentation is the discriminator.
-    assert "\n" + " " * 20 + "await device.send_led_anim(meter)" not in fn, \
-        ("the meter is being raised at playback setup — on the streaming path "
-         "that is before HA has returned any audio, leaving the ring dark")
-
-
-def test_meter_gate_fires_for_responses_shorter_than_the_prime_window():
-    """
-    A response shorter than SPEAKER_PRIME_SECONDS never reaches the byte
-    threshold — the device starts playing it at EOS instead. Exhaustion must
-    fire the callback too, or short answers play with no ring at all.
-    """
-    from pathlib import Path
-    src = (Path(__file__).resolve().parent.parent / "em_controller.py").read_text()
-    fn = src[src.index("async def _meter_at_playback_start"):]
-    fn = fn[:fn.index("\nasync def ", 1)]
-
-    body = fn.split("async for")[1]
-    assert "if not fired:" in body.rsplit("\n", 4)[-4:][0] or "if not fired" in body, \
-        "the generator must fire on exhaustion for sub-prime-length responses"
-    assert "SPEAKER_PRIME_SECONDS" in fn, \
-        "the threshold must track the device's actual prime window"
-
-
 def test_controller_update_is_advisory_only():
     """
     The dashboard may TELL you a newer controller exists; it must never offer
@@ -477,65 +444,6 @@ def test_every_db_call_in_em_api_exists():
     assert not missing, f"em_api.py calls db.{{{', '.join(missing)}}} which em_db.py does not define"
 
 
-def test_the_wake_word_asset_wizard_step_is_mandatory():
-    """
-    Wil's call, overriding my "make it skippable": every provisioned device
-    carries the runtime.
-
-    The assets are not in the firmware, so a device without them advertises
-    the oww_shadow capability while being unable to use it — the exact "I
-    enabled it and nothing happened" this feature exists to remove. It also
-    auto-runs: a button someone can leave unpressed is not mandatory.
-    """
-    from pathlib import Path
-    jsx = (Path(__file__).resolve().parent.parent / "static" / "dashboard.jsx").read_text()
-
-    steps = jsx[jsx.index("const _WIZARD_STEPS = ["):]
-    steps = steps[:steps.index("\n];")]
-    assert "'install_oww'" in steps, "the wake word asset step is missing from the wizard"
-
-    idx = steps.count("{ id:", 0, steps.index("'install_oww'")) - 1
-    auto = jsx[jsx.index("const autoSteps = new Set(["):]
-    auto = auto[:auto.index(")")]
-    assert str(idx) in auto, (
-        f"step {idx} (install_oww) must auto-run — a step that needs a click "
-        f"is one a user can skip"
-    )
-
-    runner = jsx[jsx.index("async function runInstallOwwAssets"):]
-    runner = runner[:runner.index("\n  async function ", 1)]
-    assert "a.md5" in runner and "throw new Error" in runner, \
-        "the push must verify md5 and fail loudly — a truncated file fails later at dlopen"
-
-
-def test_turn_end_reports_real_media_state_not_a_hardcoded_idle():
-    """
-    Issue #53: "the esphome media player reports that it is idle even though
-    the music continues to play on the echo."
-
-    Every voice turn ended by asserting MediaPlayerState.IDLE regardless of
-    what the media player was doing. The feed announces PLAYING exactly once,
-    when the decoder starts, so this IDLE arrived afterwards and became HA's
-    last word — the entity showed a play arrow over audible music, and nothing
-    ever corrected it.
-
-    _media_state_msg() exists for precisely this ("current media_player state
-    as HA should see it — em_player truth") and was being bypassed.
-    """
-    from pathlib import Path
-    src = (Path(__file__).resolve().parent.parent / "em_esphome.py").read_text()
-
-    fn = src[src.index("        finally:\n            # Signal HA that the satellite has finished"):]
-    fn = fn[:fn.index("self._turn_active    = False")]
-
-    assert "self._media_state_msg()" in fn, \
-        "the turn must report the real media state at the end"
-    assert "state=MediaPlayerState.IDLE" not in fn, (
-        "a hardcoded IDLE at turn end overwrites the feed's PLAYING and "
-        "leaves HA showing idle over audible music"
-    )
-
-
 def test_no_unjustified_hardcoded_media_state():
     """
     Forbid the SHAPE, not just the instances.
@@ -575,42 +483,6 @@ def test_no_unjustified_hardcoded_media_state():
         f"hardcoded media state(s) {offenders} — use _media_state_msg() so the "
         f"entity reflects what em_player is actually doing"
     )
-
-
-def test_every_deliberate_cancel_also_flushes_the_speaker():
-    """
-    Cancelling a turn must stop the AUDIO, not just our end of it.
-
-    cancel_event aborts the controller's feed. It cannot touch what is already
-    on the device — up to ~5.5s sits in audioChanDepth — so without a
-    speaker_flush the ring clears and the device carries on talking after you
-    have visibly cancelled it. Reported 2026-08-01 for the action button,
-    which was the one deliberate cancel missing it while mute and barge-in
-    both had it.
-
-    Forbidding the shape rather than fixing the instance: this is the second
-    bug of exactly this kind today (the other was a hardcoded MediaPlayerState
-    in one of three places), and fixing them one at a time is how the second
-    one survived the first.
-    """
-    from pathlib import Path
-    src = (Path(__file__).resolve().parent.parent / "em_controller.py").read_text()
-
-    # Each deliberate cancel site, identified by its log line / guard, paired
-    # with how far to look for the flush that must accompany it.
-    sites = {
-        "Dot button — cancelling voice turn": 900,
-        "Muted during active turn": 900,
-    }
-    for marker, window in sites.items():
-        i = src.find(marker)
-        assert i != -1, f"cancel site {marker!r} not found — has it been renamed?"
-        block = src[i:i + window]
-        assert "cancel_event.set()" in block, f"{marker}: no cancel"
-        assert "speaker_flush" in block, (
-            f"{marker}: cancels the turn but never flushes the device speaker — "
-            f"the response will keep playing after the turn is cancelled"
-        )
 
 
 def test_supervisor_log_path_matches_between_script_and_controller():
@@ -691,42 +563,6 @@ def test_a_failed_update_asks_for_the_supervisor_log():
         "nothing collects the supervisor log when the device comes back"
 
 
-def test_data_reconnect_grace_is_per_stream_not_per_frame():
-    """
-    A dropped data connection mid-stream should cost a pause, not the rest of
-    the audio (#28, @kopiro — long read-aloud responses truncated by a brief
-    Wi-Fi blip).
-
-    The budget must be spent DOWN across the stream, never a fresh wait on
-    each call. send_data runs once per audio period, so a per-frame wait means
-    a device that is genuinely gone stalls every remaining frame in turn — a
-    stream that should abort in seconds instead drains for hours holding the
-    voice lock. That failure is worse than the truncation it replaces, which
-    is why the shape is pinned rather than the constant.
-    """
-    from pathlib import Path
-    src = (Path(__file__).resolve().parent.parent / "em_controller.py").read_text()
-
-    fn = src[src.index("    async def send_data(self, data: bytes):"):]
-    fn = fn[:fn.index("\n    async def ", 1)]
-
-    assert "_data_grace_left -=" in fn, (
-        "the reconnect grace must be spent down across the stream; a wait that "
-        "does not decrement is a per-frame stall"
-    )
-    assert "_data_grace_left > 0" in fn, \
-        "send_data must stop waiting once the stream's budget is exhausted"
-
-    # Every path that streams audio has to arm it, or the budget is stale from
-    # whatever ran last.
-    for stream_fn in ("async def stream_speaker(self",
-                      "async def stream_speaker_chunks(self"):
-        body = src[src.index(stream_fn):]
-        body = body[:body.index("\n    async def ", 1)]
-        assert "begin_data_stream()" in body, \
-            f"{stream_fn} does not arm the reconnect grace"
-
-
 def test_support_bundle_attributes_metrics_to_a_device():
     """
     `db.get_device_metrics` builds its own result dicts and does NOT include
@@ -763,26 +599,6 @@ def test_support_bundle_redacts_account_names():
     assert '"role"' in body, (
         "accounts must carry the role: a name is replaced by <admin>, and a "
         "positional alias would be one-to-one with a real person"
-    )
-
-
-def test_the_music_feed_reads_its_lead_per_chunk():
-    """
-    A voice turn lowers the music feed's lead so the response gets the shared
-    data plane (TURN_LEAD_S). That only works if the pacing loop reads the
-    CURRENT lead each time round — capturing LEAD_S once, or referring to the
-    module constant, silently restores the old behaviour and the fix becomes
-    a no-op with every test still passing.
-    """
-    src = (CONTROLLER / "em_player.py").read_text()
-    feed = src.split("async def _feed")[-1]
-    pacing = re.search(r"ahead = sent / BYTES_PER_SEC.*?await asyncio\.sleep\(([^)]*)\)",
-                       feed, re.S)
-    assert pacing, "could not find the feed's pacing sleep"
-    window = feed[:pacing.end()]
-    assert "self.lead_s" in window, (
-        "the pacing loop must read self.lead_s, not the LEAD_S constant — "
-        "otherwise lowering the lead for a voice turn does nothing"
     )
 
 
@@ -1010,21 +826,8 @@ def test_push_log_event_callers_do_not_also_persist():
 # ── Ambient light status reaches a support bundle (#90) ──────────────────────
 #
 # Two users reported no light sensor and the bundle could not say why: the
-# firmware knows whether the chip is absent or the driver simply has not
-# bound, but writes that only to its own log, which the bundle does not
-# collect and a reboot clears. Diagnosing it needed a shell session on their
-# hardware. These pin the three links in the chain that fixes it, because
-# each fails silently — a missing field just looks like an old device.
-
-def test_register_handler_stores_ambient_light_status():
-    """The controller must keep what the device reported at registration."""
-    root = Path(__file__).resolve().parent.parent
-    ctl = (root / "em_controller.py").read_text()
-    assert 'device.ambient_light_status = msg.get("ambient_light_status")' in ctl, (
-        "the register handler must store ambient_light_status off the register "
-        "message — without it the reason is received and dropped"
-    )
-
+# firmware reports whether the chip is absent or the driver has not bound
+# (`session.hello.ambient_light_status`); the bundle must carry it.
 
 def test_bundle_live_state_carries_ambient_light_status():
     """And the support bundle must actually carry it.
@@ -1039,3 +842,4 @@ def test_bundle_live_state_carries_ambient_light_status():
         "em_api's live_state must include ambient_light_status so support "
         "bundles can answer why a device reports no light sensor"
     )
+

@@ -1,8 +1,10 @@
 # EchoMuse
 
-Runs the EchoMuse controller — wake word detection, fleet dashboard, and
-Home Assistant integration for rooted Echo Dot 2nd Gen devices — as a Home
-Assistant add-on instead of a separate docker-compose deployment.
+Runs the EchoMuse controller — speech handling, alarms and timers, fleet
+dashboard, and Home Assistant integration for rooted Echo Dot 2nd Gen
+devices — as a Home Assistant add-on instead of a separate docker-compose
+deployment. The add-on reaches Home Assistant through the Supervisor, so no
+access token is needed.
 
 ## Installation
 
@@ -15,8 +17,10 @@ Assistant add-on instead of a separate docker-compose deployment.
    rooted Echo Dot. It finds this controller automatically — no manual IP
    entry on the device side.
 5. Approve the device in the dashboard once it appears as pending. Home
-   Assistant then discovers it automatically via the built-in ESPHome
-   integration.
+   Assistant then discovers it via the built-in ESPHome integration, and the
+   controller creates the device's alarm calendar and installs its alarm
+   scripts. A device showing **Upgrade required** needs its firmware updated
+   from its device page before it does anything else.
 
 ## Configuration
 

@@ -1,14 +1,11 @@
 """
 DTLN streaming noise suppression — controller-side, ASR-bound audio only.
 
-P0-3 closure (2026-07-12): the device's vendored RNNoise was never usable
-(48kHz-native model fed 16kHz audio) and stays off. Per the agreed
-architecture the device is a dumb transducer and NS lives here, applied
-ONLY to the audio streamed to HA's STT during a voice turn
-(em_esphome._stream_mic_audio, behind the per-device `nsAsr` config flag).
-The always-on wake stream is never denoised — openwakeword is trained on
-noisy audio, and all controller-side adaptation on that stream is
-measurement-only (noise floor tracking).
+The device's vendored RNNoise was never usable (48kHz-native model fed
+16kHz audio) and is gone; capture processing belongs to the native AFE.
+NS lives here, applied ONLY to the STT copy of a committed utterance
+(em_stt_copy, behind the per-device `nsAsr` config flag). Wake, endpoint,
+attribution and reference evidence all keep the canonical, undenoised PCM.
 
 Model: DTLN (github.com/breizhn/DTLN, MIT) — dual-signal LSTM, ~1M params,
 16kHz-native, shipped as two stacked ONNX models with explicit LSTM state
@@ -81,7 +78,7 @@ def _get_sessions():
     (stateless — LSTM state is an explicit tensor owned by each
     StreamingDenoiser). Single-threaded sessions: each inference is ~0.1ms
     on one core; thread fan-out would cost more than it saves and this
-    runs in the shared default executor alongside openwakeword.
+    runs in the shared default executor.
     """
     global _sessions, _load_failed
     if _sessions is not None:

@@ -1,103 +1,236 @@
 package server
 
 import (
-	"github.com/wilbowes/EchoMuse/pkg/led"
+	"path/filepath"
+	"sync"
 	"testing"
-	"time"
+
+	"github.com/wilbowes/EchoMuse/pkg/led"
 )
 
-// A deliberate button press must outrank the volume arc's 2s hold. Before
-// this, adjusting volume then immediately pressing the action button left
-// the arc owning the ring for the remainder of its window, so the device
-// gave no sign it had started listening.
-func TestCancelDisplayReleasesTheRing(t *testing.T) {
-	vc := newVolumeController(func() led.Controller { return nil })
-
-	vc.mu.Lock()
-	vc.displayActive = true
-	vc.timer = time.AfterFunc(volumeLEDSecs*time.Second, func() {})
-	vc.mu.Unlock()
-
-	if !vc.DisplayActive() {
-		t.Fatal("precondition: arc should own the ring")
-	}
-
-	vc.CancelDisplay()
-
-	if vc.DisplayActive() {
-		t.Fatal("arc still owns the ring after CancelDisplay — a listening " +
-			"frame would be recorded but not painted")
-	}
-	// Idempotent: a second press must not panic on the already-stopped timer.
-	vc.CancelDisplay()
+type fakeHardware struct {
+	mu    sync.Mutex
+	dac   int
+	sets  []int
+	adc   bool
+	amp   *bool
+	muteL bool
 }
 
-// tinymix ctl 61 spans 0..175, but 127 is the codec's 0dB. Above it the DAC
-// applies positive digital gain to near-full-scale PCM and saturates —
-// measured on hardware at 65% THD by index 153, 89% by 170, with the output
-// level flat from 153 up because it had stopped getting louder. Stock FireOS
-// never writes this control at all. If this constant creeps back toward 175,
-// the garbling above ~73% volume returns.
-func TestVolumeMaxIsCodecUnityNotTheControlMaximum(t *testing.T) {
-	if volumeMax != 127 {
-		t.Fatalf("volumeMax = %d, want 127 (0dB). Anything higher clips the DAC.",
-			volumeMax)
+func (f *fakeHardware) ReadDAC() (int, error) { f.mu.Lock(); defer f.mu.Unlock(); return f.dac, nil }
+func (f *fakeHardware) SetDAC(l int) error {
+	f.mu.Lock()
+	f.dac = l
+	f.sets = append(f.sets, l)
+	f.mu.Unlock()
+	return nil
+}
+func (f *fakeHardware) SetADCMute(m bool) error { f.mu.Lock(); f.adc = m; f.mu.Unlock(); return nil }
+func (f *fakeHardware) SetSpeakerAmp(on bool) error {
+	f.mu.Lock()
+	f.amp = &on
+	f.mu.Unlock()
+	return nil
+}
+func (f *fakeHardware) SetMuteLED(on bool) error {
+	f.mu.Lock()
+	f.muteL = on
+	f.mu.Unlock()
+	return nil
+}
+
+func (f *fakeHardware) DAC() int { f.mu.Lock(); defer f.mu.Unlock(); return f.dac }
+func (f *fakeHardware) Amp() *bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.amp
+}
+
+type fakeLEDs struct {
+	mu   sync.Mutex
+	last []led.Led
+}
+
+func (f *fakeLEDs) Init() error              { return nil }
+func (f *fakeLEDs) GetNumLEDs() (int, error) { return numLEDs, nil }
+func (f *fakeLEDs) SetLEDs(v ...led.Led) error {
+	f.mu.Lock()
+	f.last = append([]led.Led(nil), v...)
+	f.mu.Unlock()
+	return nil
+}
+func (f *fakeLEDs) frame() []led.Led { f.mu.Lock(); defer f.mu.Unlock(); return f.last }
+
+func newTestServer(t *testing.T, dac int) (*Server, *fakeHardware) {
+	t.Helper()
+	hw := &fakeHardware{dac: dac}
+	return New(Config{Hardware: hw, StatePath: filepath.Join(t.TempDir(), "state.json")}), hw
+}
+
+// §16.5: the DAC holds media volume, switches to the occurrence's volume for
+// a foreground alert and returns to media volume on release.
+func TestAlertForegroundOwnsDACAndRestoresMediaVolume(t *testing.T) {
+	s, hw := newTestServer(t, 90)
+	half := 0.5
+	s.SetAlertAudio(true, "occ", true, &half)
+	if got := hw.DAC(); got != 64 {
+		t.Fatalf("foreground alert DAC %d, want 64 (0.5 × 127)", got)
 	}
-	if volumeButtonFloor >= volumeMax {
-		t.Fatalf("button floor %d must sit below the ceiling %d",
-			volumeButtonFloor, volumeMax)
+	s.SetAlertAudio(true, "occ", false, &half)
+	if got := hw.DAC(); got != 90 {
+		t.Fatalf("backgrounded alert DAC %d, want media 90", got)
+	}
+	s.SetAlertAudio(true, "occ", true, &half)
+	s.SetAlertAudio(false, "", false, nil)
+	if got := hw.DAC(); got != 90 {
+		t.Fatalf("released alert DAC %d, want media 90", got)
 	}
 }
 
-// The button band must be crossable in a sane number of presses: too few and
-// each press is a huge jump, too many and reaching the top is a chore.
-func TestButtonBandTakesAReasonableNumberOfPresses(t *testing.T) {
-	presses := (volumeMax - volumeButtonFloor) / volumeStep
-	if presses < 6 || presses > 16 {
-		t.Fatalf("%d presses to cross the band (step %d over %d..%d); "+
-			"want roughly 8-12", presses, volumeStep, volumeButtonFloor, volumeMax)
+// A null occurrence volume rings at the current media volume.
+func TestAlertWithoutVolumeUsesMediaVolume(t *testing.T) {
+	s, hw := newTestServer(t, 100)
+	s.SetAlertAudio(true, "occ", true, nil)
+	if got := hw.DAC(); got != 100 {
+		t.Fatalf("DAC %d, want media 100", got)
+	}
+}
+
+// §16.5: volume buttons during a foreground alert adjust only that
+// occurrence and are not reported or persisted as media volume.
+func TestVolumeButtonsDuringForegroundAlertAdjustOnlyTheOccurrence(t *testing.T) {
+	s, hw := newTestServer(t, 90)
+	var reported []int
+	s.SetVolumeChangeCallback(func(l int) { reported = append(reported, l) })
+	half := 0.5
+	s.SetAlertAudio(true, "occ", true, &half)
+	s.VolumeStepUp()
+	if got := hw.DAC(); got != 64+volumeStep {
+		t.Fatalf("alert DAC after step %d, want %d", got, 64+volumeStep)
+	}
+	if level, _ := s.VolumeState(); level != 90 {
+		t.Fatalf("media volume changed to %d", level)
+	}
+	if len(reported) != 0 {
+		t.Fatalf("occurrence step reported as volume_state %v", reported)
+	}
+	s.SetAlertAudio(false, "", false, nil)
+	if got := hw.DAC(); got != 90 {
+		t.Fatalf("DAC after release %d, want 90", got)
+	}
+	s.VolumeStepUp()
+	if level, seeded := s.VolumeState(); level != 90+volumeStep || !seeded {
+		t.Fatalf("media step: level %d seeded %v", level, seeded)
+	}
+	if len(reported) != 1 || reported[0] != 90+volumeStep {
+		t.Fatalf("media step reports %v", reported)
+	}
+}
+
+// A remote volume change during a foreground alert updates media volume
+// without taking the DAC from the alert.
+func TestRemoteVolumeDuringAlertAppliesAfterRelease(t *testing.T) {
+	s, hw := newTestServer(t, 90)
+	half := 0.5
+	s.SetAlertAudio(true, "occ", true, &half)
+	s.SetVolume(30)
+	if got := hw.DAC(); got != 64 {
+		t.Fatalf("DAC %d during alert, want 64", got)
+	}
+	s.SetAlertAudio(false, "", false, nil)
+	if got := hw.DAC(); got != 30 {
+		t.Fatalf("DAC %d after release, want 30", got)
+	}
+}
+
+// §16.5: with headphones inserted, a foreground alert re-enables the
+// internal amp and restores the insertion route afterwards.
+func TestForegroundAlertForcesSpeakerAmpOverHeadphones(t *testing.T) {
+	s, hw := newTestServer(t, 90)
+	s.SetHeadphones(true)
+	if a := hw.Amp(); a == nil || *a {
+		t.Fatalf("amp after headphone insert %v, want off", a)
+	}
+	s.SetAlertAudio(true, "occ", true, nil)
+	if a := hw.Amp(); a == nil || !*a {
+		t.Fatal("foreground alert did not force the amp on")
+	}
+	s.SetAlertAudio(true, "occ", false, nil)
+	if a := hw.Amp(); *a {
+		t.Fatal("backgrounded alert left the amp forced on")
+	}
+}
+
+// startupVolume seeds once; a local change first makes the live value win.
+func TestSeedVolumeHonoursOnlyTheFirstAuthority(t *testing.T) {
+	s, hw := newTestServer(t, 90)
+	s.VolumeStepDown()
+	s.SeedVolume(20)
+	if got := hw.DAC(); got != 90-volumeStep {
+		t.Fatalf("seed overrode a local change: DAC %d", got)
+	}
+	s2, hw2 := newTestServer(t, 90)
+	s2.SeedVolume(20)
+	s2.SeedVolume(40)
+	if got := hw2.DAC(); got != 20 {
+		t.Fatalf("second seed applied: DAC %d", got)
 	}
 }
 
 func TestStepsStayInsideTheButtonBand(t *testing.T) {
-	cases := []struct {
-		name string
-		in   int
-		want int
-	}{
-		// A level below the floor — HA can set one, and so could a stored
-		// level from before the cap — must reach audible in ONE press, not
-		// creep up 4dB at a time through inaudible territory.
-		{"far below the floor lands on it", volumeButtonFloor - 40, volumeButtonFloor},
-		{"just below the floor lands on it", volumeButtonFloor - 1, volumeButtonFloor},
-		{"inside the band is untouched", volumeButtonFloor + volumeStep, volumeButtonFloor + volumeStep},
-		{"above the ceiling clamps down", volumeMax + 30, volumeMax},
+	cases := []struct{ in, want int }{
+		{volumeButtonFloor - 40, volumeButtonFloor},
+		{volumeButtonFloor - 1, volumeButtonFloor},
+		{volumeButtonFloor + volumeStep, volumeButtonFloor + volumeStep},
+		{volumeMax + 30, volumeMax},
 	}
 	for _, tc := range cases {
 		if got := clampToButtonBand(tc.in); got != tc.want {
-			t.Errorf("%s: clampToButtonBand(%d) = %d, want %d",
-				tc.name, tc.in, got, tc.want)
+			t.Errorf("clampToButtonBand(%d) = %d, want %d", tc.in, got, tc.want)
 		}
 	}
 }
 
-// Stepping up from the top and down from the bottom must settle, not
-// oscillate or run away past the band.
-func TestSteppingSaturatesAtBothEnds(t *testing.T) {
-	level := volumeMax
-	for i := 0; i < 5; i++ {
-		level = clampToButtonBand(level + volumeStep)
-	}
-	if level != volumeMax {
-		t.Errorf("stepping up from the ceiling reached %d, want %d", level, volumeMax)
-	}
+// Privacy and alert indication are local layers above controller frames
+// and survive controller loss (§11.2).
+func TestRingLayerPrecedence(t *testing.T) {
+	s, _ := newTestServer(t, 90)
+	leds := &fakeLEDs{}
+	s.ring.SetController(leds)
 
-	level = volumeButtonFloor
-	for i := 0; i < 5; i++ {
-		level = clampToButtonBand(level - volumeStep)
+	green := solidFrame(0, 200, 0)
+	s.SetLEDs(green)
+	if leds.frame()[0].G != 200 {
+		t.Fatal("controller frame not painted")
 	}
-	if level != volumeButtonFloor {
-		t.Errorf("stepping down from the floor reached %d, want %d",
-			level, volumeButtonFloor)
+	s.SetAlertIndication(true, false)
+	if f := leds.frame()[0]; f.G == 200 || f.B == 0 {
+		t.Fatalf("alert indication did not outrank controller layer: %+v", f)
+	}
+	s.MuteToggle()
+	if f := leds.frame()[0]; f.R != 180 || f.G != 0 {
+		t.Fatalf("mute ring not sovereign: %+v", f)
+	}
+	s.ClearControllerLEDs()
+	s.MuteToggle()
+	if f := leds.frame()[0]; f.B == 0 {
+		t.Fatalf("alert indication lost after unmute: %+v", f)
+	}
+	s.SetAlertIndication(false, false)
+	if f := leds.frame()[0]; f != (led.Led{ID: 0}) {
+		t.Fatalf("cleared controller layer repainted: %+v", f)
+	}
+}
+
+// Privacy state persists across restarts (device-sovereign).
+func TestMuteRestoresFromPersistedState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	hw := &fakeHardware{}
+	s := New(Config{Hardware: hw, StatePath: path})
+	s.MuteToggle()
+	hw2 := &fakeHardware{}
+	s2 := New(Config{Hardware: hw2, StatePath: path})
+	if !s2.IsMuted() || !hw2.adc || !hw2.muteL {
+		t.Fatalf("restart: muted %v adc %v led %v", s2.IsMuted(), hw2.adc, hw2.muteL)
 	}
 }

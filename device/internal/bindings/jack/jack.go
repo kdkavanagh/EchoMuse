@@ -17,9 +17,10 @@
 //     mutes the internal speaker amp so the Dot is not also playing to the
 //     room.
 //   - Nothing turns it back ON when the plug is removed. That is the bug this
-//     package exists for (issue #80). PcmSpeaker.Init is the only thing that
-//     ever sets it, so before this the speaker stayed dead until the next
-//     boot — which is why users reported that only a reboot restored it.
+//     package exists for (issue #80). The speaker backend sets it once at
+//     startup and nowhere else, so before this the speaker stayed dead until
+//     the next boot — which is why users reported that only a reboot restored
+//     it.
 package jack
 
 import (

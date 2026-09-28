@@ -1,53 +1,17 @@
-# EchoMuse Controller — Python dependencies
-#
-# Install with:
-#   pip install -r requirements.txt
-#
-# Tested with Python 3.12.
-# WebSocket server (device connections)
+# EchoMuse Controller — Python 3.12 dependencies
+# WebSocket device link and HTTP API/dashboard
 websockets==16.0
-# HTTP API + dashboard server
 aiohttp==3.13.5
-# Password hashing
+# Password hashing and device-link TLS credentials
 bcrypt==5.0.0
-# Device-link TLS: CA + server cert generation (em_pki.py). The controller
-# runs fine without it (plain ws only, wss listener disabled) but the
-# published image always ships it.
 cryptography==44.0.1
-# mDNS advertisement (_emcontroller._tcp.local)
-#
-# Held at >=0.149.12 for three advisories against 0.148.0, all unauthenticated
-# denial of service reachable by anything on the local link — which for this
-# project is the same network segment the devices discover the controller on,
-# so the attack surface is exactly where the dependency is used:
-#   PYSEC-2026-3436  recursion blowup on chained DNS name-compression pointers
-#   PYSEC-2026-3437  unbounded log dedup retaining raw packets, keyed on the
-#                    peer's source port so every packet makes a fresh key
-#   PYSEC-2026-3435  unbounded deferred truncated-query queues, O(N) per arrival
-# None has an in-process workaround; the fix is the upgrade.
-#
-# 0.149.17 rather than 0.150.0: the smallest jump that clears all three, on a
-# dependency the whole fleet's discovery depends on.
+# mDNS (0.149.17 fixes three unauthenticated LAN denial-of-service issues)
 zeroconf==0.149.17
-# Wake word inference — openwakeword deps installed manually to avoid
-# tflite-runtime which has no Python 3.12 x86_64 build.
-# openwakeword itself is installed via --no-deps in the Dockerfile.
+# Audio/evidence math and BCResNet controller-side reference scoring
 numpy==2.4.4
 scipy
-tqdm
-scikit-learn
-requests
-# speexdsp-ns: openwakeword's optional built-in noise suppressor (Q1,
-# 2026-07-05 review). 16kHz-native, applied only to the wake-word path —
-# confirmed installable for python:3.12-slim x86_64 (manylinux_2_28 wheel,
-# no build step needed) before wiring the owwSpeexNs config toggle.
-speexdsp-ns==0.1.2
-# ONNX runtime for openwakeword inference — CPU build, plenty for wake word
-# scoring and what the published Docker image ships. For NVIDIA GPU inference
-# swap in onnxruntime-gpu==1.20.1 (the Dockerfile does this automatically
-# when built with --build-arg GPU=1).
 onnxruntime==1.20.1
-# Protobuf runtime — required by esphome/vendor/api_pb2.py (vendored from
-# aioesphomeapi==45.3.1). Not pulled in transitively since we vendor only
-# the two generated files rather than depending on the full aioesphomeapi package.
+# Pinned streaming ASR runtime for the §16.6 Kroko speech bundle
+sherpa-onnx==1.13.8
+# Vendored ESPHome protobuf messages
 protobuf>=4.21.0

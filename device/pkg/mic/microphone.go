@@ -1,38 +1,21 @@
+// Package mic is the capture boundary: one fully processed mono channel from
+// the native AFE (SPEC §4.1), 16 kHz S16, in 80 ms blocks stamped with the
+// CLOCK_MONOTONIC time at which each block completed.
 package mic
 
-import (
-	"context"
-)
+// Block is one completed capture period.
+type Block struct {
+	PCM    []int16 // 16 kHz mono; borrowed until the next Read
+	MonoNs int64   // CLOCK_MONOTONIC ns when the period completed
+}
 
-type AudioCallback func(audioData []byte)
-
+// Microphone delivers capture blocks to its single consumer.
 type Microphone interface {
-	Init() error
-	Listen(callback AudioCallback, context context.Context) error
-}
-
-// Subscribable is implemented by mic backends that support multiple concurrent
-// readers via a fan-out model (i.e. PcmMicrophone). The vadStreamHandler uses
-// this to tap the permanent ALSA stream without opening a second PCM session.
-type Subscribable interface {
-	Subscribe() chan []byte
-	Unsubscribe(ch chan []byte)
-}
-
-// PassthroughReporter is implemented by backends whose fanned-out periods are
-// already one fully processed mono channel — the native-AFE backend
-// (internal/bindings/slmic), where Android's audio HAL has already run
-// per-mic AEC and beamforming before EchoMuse ever sees the stream (see
-// docs/native-afe-migration.md).
-//
-// A backend that does NOT implement this (PcmMicrophone) delivers raw
-// interleaved multi-channel capture instead, and callers must run it through
-// internal/beamformer before it means anything. Feeding an already-mono
-// stream to the beamformer would misinterpret its bytes as interleaved
-// channels — silently wrong, not just redundant — so this has to be an
-// explicit, backend-declared fact rather than inferred from buffer length.
-// A nil check (the backend doesn't implement the interface at all) is
-// equivalent to reporting false.
-type PassthroughReporter interface {
-	Passthrough() bool
+	// Read blocks for the next completed period. It returns an error once
+	// the capture stream has ended.
+	Read() (Block, error)
+	// Drops counts periods lost because Read fell behind; the completion
+	// stamps of the blocks that follow expose the gap.
+	Drops() uint64
+	Close()
 }

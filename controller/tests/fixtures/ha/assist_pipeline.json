@@ -1,0 +1,477 @@
+{
+  "source": [
+    "homeassistant/components/assist_pipeline/websocket_api.py (websocket_run: schema, runner_data.stt_binary_handler_id, empty chunk ends stt_stream, timeout error event)",
+    "homeassistant/components/assist_pipeline/pipeline.py (PipelineEventType, PipelineEvent, PipelineRun.start/end, speech_to_text, recognize_intent, text_to_speech, PipelineInput.execute)",
+    "homeassistant/components/websocket_api/http.py (binary frame: first byte handler id, remainder payload)",
+    "homeassistant/components/conversation/models.py (ConversationResult.as_dict)",
+    "homeassistant/helpers/intent.py (IntentResponse.as_dict)",
+    "homeassistant/components/tts/__init__.py (ResultStream.url = /api/tts_proxy/<token>)"
+  ],
+  "pipeline_list": {
+    "request": {
+      "type": "assist_pipeline/pipeline/list"
+    },
+    "result": {
+      "pipelines": [
+        {
+          "conversation_engine": "conversation.home_assistant",
+          "conversation_language": "en",
+          "id": "01hmd0v9ffh9ze4dbrz9mw0gks",
+          "language": "en",
+          "name": "Home Assistant",
+          "stt_engine": null,
+          "stt_language": null,
+          "tts_engine": null,
+          "tts_language": null,
+          "tts_voice": null,
+          "wake_word_entity": null,
+          "wake_word_id": null,
+          "prefer_local_intents": false
+        },
+        {
+          "conversation_engine": "conversation.claude_conversation",
+          "conversation_language": "en",
+          "id": "01hnpec9vt52ec4dkkxqa89z46",
+          "language": "en",
+          "name": "STT",
+          "stt_engine": "stt.faster_whisper",
+          "stt_language": "en",
+          "tts_engine": "tts.elevenlabs_text_to_speech",
+          "tts_language": "en",
+          "tts_voice": "Rachel",
+          "wake_word_entity": null,
+          "wake_word_id": null,
+          "prefer_local_intents": true
+        }
+      ],
+      "preferred_pipeline": "01hnpec9vt52ec4dkkxqa89z46"
+    }
+  },
+  "stt_run": {
+    "request": {
+      "type": "assist_pipeline/run",
+      "start_stage": "stt",
+      "end_stage": "stt",
+      "input": {
+        "sample_rate": 16000,
+        "no_vad": true
+      },
+      "pipeline": "01hnpec9vt52ec4dkkxqa89z46",
+      "device_id": "b285ec5e94b98f4c1cbeabf926be4b77",
+      "timeout": 15
+    },
+    "result": null,
+    "events_before_audio": [
+      {
+        "type": "run-start",
+        "data": {
+          "pipeline": "01hnpec9vt52ec4dkkxqa89z46",
+          "language": "en",
+          "conversation_id": "01K5ZCC000CONV",
+          "runner_data": {
+            "stt_binary_handler_id": 1,
+            "timeout": 15
+          }
+        },
+        "timestamp": "2026-09-23T11:30:00.123456+00:00"
+      },
+      {
+        "type": "stt-start",
+        "data": {
+          "engine": "stt.faster_whisper",
+          "metadata": {
+            "language": "en",
+            "format": "wav",
+            "codec": "pcm",
+            "bit_rate": 16,
+            "sample_rate": 16000,
+            "channel": 1
+          },
+          "audio_processing": {
+            "requires_external_vad": true,
+            "prefers_auto_gain_enabled": false,
+            "prefers_noise_reduction_enabled": false
+          }
+        },
+        "timestamp": "2026-09-23T11:30:00.123456+00:00"
+      }
+    ],
+    "events_after_audio": [
+      {
+        "type": "stt-end",
+        "data": {
+          "stt_output": {
+            "text": " Ophelia, turn on the kitchen lights."
+          }
+        },
+        "timestamp": "2026-09-23T11:30:00.123456+00:00"
+      },
+      {
+        "type": "run-end",
+        "data": null,
+        "timestamp": "2026-09-23T11:30:00.123456+00:00"
+      }
+    ]
+  },
+  "stt_error_run": {
+    "events_after_audio": [
+      {
+        "type": "error",
+        "data": {
+          "code": "stt-no-text-recognized",
+          "message": "No text recognized"
+        },
+        "timestamp": "2026-09-23T11:30:00.123456+00:00"
+      },
+      {
+        "type": "run-end",
+        "data": null,
+        "timestamp": "2026-09-23T11:30:00.123456+00:00"
+      }
+    ]
+  },
+  "intent_tts_run": {
+    "request": {
+      "type": "assist_pipeline/run",
+      "start_stage": "intent",
+      "end_stage": "tts",
+      "input": {
+        "text": "turn on the kitchen lights"
+      },
+      "pipeline": "01hnpec9vt52ec4dkkxqa89z46",
+      "device_id": "b285ec5e94b98f4c1cbeabf926be4b77",
+      "conversation_id": null,
+      "timeout": 30
+    },
+    "result": null,
+    "events": [
+      {
+        "type": "run-start",
+        "data": {
+          "pipeline": "01hnpec9vt52ec4dkkxqa89z46",
+          "language": "en",
+          "conversation_id": "01K5ZCB000CONV",
+          "runner_data": {
+            "stt_binary_handler_id": null,
+            "timeout": 30
+          },
+          "tts_output": {
+            "token": "Vn6uQ8.flac",
+            "url": "/api/tts_proxy/Vn6uQ8.flac",
+            "mime_type": "audio/flac",
+            "stream_response": false
+          }
+        },
+        "timestamp": "2026-09-23T11:30:00.123456+00:00"
+      },
+      {
+        "type": "intent-start",
+        "data": {
+          "engine": "conversation.claude_conversation",
+          "language": "en",
+          "intent_input": "turn on the kitchen lights",
+          "conversation_id": "01K5ZCB000CONV",
+          "device_id": "b285ec5e94b98f4c1cbeabf926be4b77",
+          "satellite_id": null,
+          "prefer_local_intents": true
+        },
+        "timestamp": "2026-09-23T11:30:00.123456+00:00"
+      },
+      {
+        "type": "intent-end",
+        "data": {
+          "processed_locally": true,
+          "intent_output": {
+            "response": {
+              "speech": {
+                "plain": {
+                  "speech": "Turned on the kitchen lights.",
+                  "extra_data": null
+                }
+              },
+              "card": {},
+              "language": "en",
+              "response_type": "action_done",
+              "data": {
+                "targets": [],
+                "success": [
+                  {
+                    "name": "Kitchen Lights",
+                    "type": "entity",
+                    "id": "light.kitchen"
+                  }
+                ],
+                "failed": []
+              }
+            },
+            "conversation_id": "01K5ZCB000CONV",
+            "continue_conversation": false
+          }
+        },
+        "timestamp": "2026-09-23T11:30:00.123456+00:00"
+      },
+      {
+        "type": "tts-start",
+        "data": {
+          "engine": "tts.elevenlabs_text_to_speech",
+          "language": "en",
+          "voice": "Rachel",
+          "tts_input": "Turned on the kitchen lights.",
+          "acknowledge_override": false
+        },
+        "timestamp": "2026-09-23T11:30:00.123456+00:00"
+      },
+      {
+        "type": "tts-end",
+        "data": {
+          "tts_output": {
+            "media_id": "media-source://tts/-stream-/Vn6uQ8.flac",
+            "token": "Vn6uQ8.flac",
+            "url": "/api/tts_proxy/Vn6uQ8.flac",
+            "mime_type": "audio/flac"
+          }
+        },
+        "timestamp": "2026-09-23T11:30:00.123456+00:00"
+      },
+      {
+        "type": "run-end",
+        "data": null,
+        "timestamp": "2026-09-23T11:30:00.123456+00:00"
+      }
+    ]
+  },
+  "intent_tts_streaming_run": {
+    "events": [
+      {
+        "type": "run-start",
+        "data": {
+          "pipeline": "01hnpec9vt52ec4dkkxqa89z46",
+          "language": "en",
+          "conversation_id": "01K5ZCD000CONV",
+          "runner_data": {
+            "stt_binary_handler_id": null,
+            "timeout": 30
+          },
+          "tts_output": {
+            "token": "Vn6uQ8.flac",
+            "url": "/api/tts_proxy/Vn6uQ8.flac",
+            "mime_type": "audio/flac",
+            "stream_response": true
+          }
+        },
+        "timestamp": "2026-09-23T11:30:00.123456+00:00"
+      },
+      {
+        "type": "intent-start",
+        "data": {
+          "engine": "conversation.claude_conversation",
+          "language": "en",
+          "intent_input": "tell me a story",
+          "conversation_id": "01K5ZCD000CONV",
+          "device_id": "b285ec5e94b98f4c1cbeabf926be4b77",
+          "satellite_id": null,
+          "prefer_local_intents": true
+        },
+        "timestamp": "2026-09-23T11:30:00.123456+00:00"
+      },
+      {
+        "type": "intent-progress",
+        "data": {
+          "chat_log_delta": {
+            "role": "assistant"
+          }
+        },
+        "timestamp": "2026-09-23T11:30:00.123456+00:00"
+      },
+      {
+        "type": "intent-progress",
+        "data": {
+          "chat_log_delta": {
+            "content": "Once upon a time, in a kingdom far away, "
+          }
+        },
+        "timestamp": "2026-09-23T11:30:00.123456+00:00"
+      },
+      {
+        "type": "intent-progress",
+        "data": {
+          "tts_start_streaming": true
+        },
+        "timestamp": "2026-09-23T11:30:00.123456+00:00"
+      },
+      {
+        "type": "intent-end",
+        "data": {
+          "processed_locally": false,
+          "intent_output": {
+            "response": {
+              "speech": {
+                "plain": {
+                  "speech": "Once upon a time, in a kingdom far away, there lived a fox. Shall I go on?",
+                  "extra_data": null
+                }
+              },
+              "card": {},
+              "language": "en",
+              "response_type": "action_done",
+              "data": {
+                "targets": [],
+                "success": [],
+                "failed": []
+              }
+            },
+            "conversation_id": "01K5ZCD000CONV",
+            "continue_conversation": true
+          }
+        },
+        "timestamp": "2026-09-23T11:30:00.123456+00:00"
+      },
+      {
+        "type": "tts-start",
+        "data": {
+          "engine": "tts.elevenlabs_text_to_speech",
+          "language": "en",
+          "voice": "Rachel",
+          "tts_input": "Once upon a time, in a kingdom far away, there lived a fox. Shall I go on?",
+          "acknowledge_override": false
+        },
+        "timestamp": "2026-09-23T11:30:00.123456+00:00"
+      },
+      {
+        "type": "tts-end",
+        "data": {
+          "tts_output": {
+            "media_id": "media-source://tts/-stream-/Vn6uQ8.flac",
+            "token": "Vn6uQ8.flac",
+            "url": "/api/tts_proxy/Vn6uQ8.flac",
+            "mime_type": "audio/flac"
+          }
+        },
+        "timestamp": "2026-09-23T11:30:00.123456+00:00"
+      },
+      {
+        "type": "run-end",
+        "data": null,
+        "timestamp": "2026-09-23T11:30:00.123456+00:00"
+      }
+    ]
+  },
+  "intent_error_run": {
+    "events": [
+      {
+        "type": "run-start",
+        "data": {
+          "pipeline": "01hnpec9vt52ec4dkkxqa89z46",
+          "language": "en",
+          "conversation_id": "01K5ZCE000CONV",
+          "runner_data": {
+            "stt_binary_handler_id": null,
+            "timeout": 30
+          },
+          "tts_output": {
+            "token": "Vn6uQ8.flac",
+            "url": "/api/tts_proxy/Vn6uQ8.flac",
+            "mime_type": "audio/flac",
+            "stream_response": false
+          }
+        },
+        "timestamp": "2026-09-23T11:30:00.123456+00:00"
+      },
+      {
+        "type": "intent-start",
+        "data": {
+          "engine": "conversation.claude_conversation",
+          "language": "en",
+          "intent_input": "turn on the kitchen lights",
+          "conversation_id": "01K5ZCE000CONV",
+          "device_id": "b285ec5e94b98f4c1cbeabf926be4b77",
+          "satellite_id": null,
+          "prefer_local_intents": true
+        },
+        "timestamp": "2026-09-23T11:30:00.123456+00:00"
+      },
+      {
+        "type": "error",
+        "data": {
+          "code": "intent-failed",
+          "message": "Unexpected error during intent recognition"
+        },
+        "timestamp": "2026-09-23T11:30:00.123456+00:00"
+      },
+      {
+        "type": "run-end",
+        "data": null,
+        "timestamp": "2026-09-23T11:30:00.123456+00:00"
+      }
+    ]
+  },
+  "run_rejected": {
+    "error": {
+      "code": "pipeline-not-found",
+      "message": "Pipeline not found: id=missing"
+    }
+  },
+  "tts_run": {
+    "request": {
+      "type": "assist_pipeline/run",
+      "start_stage": "tts",
+      "end_stage": "tts",
+      "input": {
+        "text": "Alarm set for 7 AM."
+      },
+      "pipeline": "01hnpec9vt52ec4dkkxqa89z46",
+      "device_id": "b285ec5e94b98f4c1cbeabf926be4b77",
+      "timeout": 30
+    },
+    "result": null,
+    "events": [
+      {
+        "type": "run-start",
+        "data": {
+          "pipeline": "01hnpec9vt52ec4dkkxqa89z46",
+          "language": "en",
+          "conversation_id": "01K5ZCF000CONV",
+          "runner_data": {
+            "stt_binary_handler_id": null,
+            "timeout": 300
+          },
+          "tts_output": {
+            "token": "Vn6uQ8.flac",
+            "url": "/api/tts_proxy/Vn6uQ8.flac",
+            "mime_type": "audio/flac",
+            "stream_response": false
+          }
+        },
+        "timestamp": "2026-09-23T11:30:00.123456+00:00"
+      },
+      {
+        "type": "tts-start",
+        "data": {
+          "engine": "tts.elevenlabs_text_to_speech",
+          "language": "en",
+          "voice": "Rachel",
+          "tts_input": "Alarm set for 7 AM.",
+          "acknowledge_override": false
+        },
+        "timestamp": "2026-09-23T11:30:00.123456+00:00"
+      },
+      {
+        "type": "tts-end",
+        "data": {
+          "tts_output": {
+            "media_id": "media-source://tts/-stream-/Vn6uQ8.flac",
+            "token": "Vn6uQ8.flac",
+            "url": "/api/tts_proxy/Vn6uQ8.flac",
+            "mime_type": "audio/flac"
+          }
+        },
+        "timestamp": "2026-09-23T11:30:00.123456+00:00"
+      },
+      {
+        "type": "run-end",
+        "data": null,
+        "timestamp": "2026-09-23T11:30:00.123456+00:00"
+      }
+    ]
+  }
+}

@@ -1,10 +1,11 @@
 services:
   echomuse-controller:
     build:
-      context: .
+      # Root context is required for the deployed BCResNet registry seed.
+      context: ..
+      dockerfile: controller/Dockerfile
       args:
-        # CUDA onnxruntime for wake-word inference on this host's GPU.
-        # The published GHCR image (docker-compose.deploy.yml) is CPU-only.
+        # CUDA controller inference on this host. The published image is CPU.
         GPU: "1"
     container_name: echomuse-controller
     restart: unless-stopped

@@ -29,261 +29,103 @@ import time
 from contextlib import contextmanager
 from typing import Optional
 
+import em_alerts
+import em_ambient
 import em_config_sections
 import em_recordings
+import em_samples
+import em_sounds
+import em_wakeclips
 
 log = logging.getLogger("echomuse.db")
 
 # ─── Default device config ────────────────────────────────────────────────────
 
+# The deployed BCResNet graph (SPEC §5.1 [D1]); migration 22 makes it the
+# fleet's wakeModel and the controller seeds the registry with it.
+DEPLOYED_WAKE_MODEL = "4eb745120ea56f5681eddbf788a0c69e1fd406d4694a04a4dba0c1e41d862d3f"
+
+# Every key a config scope may hold (SPEC §18.4). Keys ride the device
+# `config` message only where the device uses them; the rest are controller-
+# side. Sections: em_config_sections.SECTIONS.
 DEFAULT_DEVICE_CONFIG = {
-    # owwOnDevice: on-device wake word scoring. "off" or "shadow".
-    # Shadow scores the wake stream on the device and reports what it WOULD
-    # have detected, without acting on it, so the two can be compared on the
-    # same audio. Default off and it should stay that way: it costs ~38% of one
-    # core permanently on top of the ~18-20% mic-pipeline baseline, and it
-    # needs ONNX Runtime plus the models installed on the device out of band
-    # (they are not in the firmware). Enable on ONE device at a time.
-    "owwOnDevice":      "off",
-    # wakeSound: play a short confirmation chime on the Echo the moment a
-    # wake word is accepted — the "I heard you" that the ring alone gives
-    # only to someone looking at the device.
-    #
-    # The audio is compiled into the firmware and played from there
-    # (device/internal/cue); only the decision crosses the wire. That is the
-    # opposite call to timerSound above, and deliberately: a timer cannot
-    # ring without the controller anyway (HA pushes the FINISHED event
-    # through us), while a wake needs nothing from anyone once it has been
-    # accepted, and it is the one piece of feedback whose whole value is
-    # arriving promptly.
-    #
-    # Default OFF. This is an audible behaviour change on every device it
-    # reaches, it is a matter of taste rather than correctness, and a fleet
-    # that started chiming after an ordinary controller upgrade would be a
-    # surprise nobody asked for. Requires the "wake_sound" capability —
-    # older firmware would simply ignore the message, so the dashboard shows
-    # it disabled with the reason rather than as a toggle that does nothing.
+    # Confirmation chime on an accepted wake, played by the device as an
+    # `earcon` source (§11.2). Off by default: an audible change on every
+    # device it reaches is a decision, not an upgrade side effect.
     "wakeSound":        False,
-    "adcDigitalGain":   88,
-    "adcMicpga":        40,
-    # micGainDb: fixed digital gain (dB) the device applies to the full
-    # 24-bit capture before quantising to the 16-bit stream. Sized from
-    # 20h fleet logs (2026-07-07): speech RMS at wake detection was
-    # 0.0001–0.0006 FS (~3–20 LSB in 16-bit — the old S24→S16 truncation
-    # discarded most of the signal), loudest observed chunk 0.0035 FS, so
-    # +24dB (×16) lifts speech into a usable range with ample clipping
-    # headroom. Device clamps to [0, 42]; clipped-sample count appears in
-    # the device's periodic VAD diag log. Note: the device interprets
-    # vadThreshold in pre-gain units (threshold is scaled by the gain
-    # internally), so this can be tuned without retuning vadThreshold.
-    "micGainDb":        24,
-    # AEC (speexdsp, device-side, whole mic path incl. wake stream).
-    # Default ON, and coupled to bargeInEnabled below: with barge-in the mic
-    # streams throughout playback, and AEC is the only thing stopping the
-    # device waking on its own TTS. Turning one on without the other is the
-    # self-trigger case the barge threshold reasoning assumes away, so if
-    # this goes back to False, bargeInEnabled must go with it.
-    # ~14dB attenuation per response, held across turns since v2.7.8; check
-    # the [aec] att= logs when tuning.
-    # aecDelayMs: 0, measured on hardware 2026-07-08 — the mic side reads
-    # 160ms ALSA batches, which eats most of the speaker's write-to-ear
-    # latency; the filter tail absorbs the remainder. (The original 250
-    # guess made the echo arrive *before* its reference — non-causal, zero
-    # cancellation.) aecTailMs is the adaptive filter length (residual
-    # delay + room reverb). Device clamps: delay 0–1000, tail 50–500.
-    "aecEnabled":       True,
-    "aecDelayMs":       0,
-    "aecTailMs":        300,
+    # Device state, not a setting (em_config_sections.STATE_KEYS).
     "startupVolume":    85,
-    # vadThreshold: 0.001 (normalised RMS pre-AGC).
-    # Q2 fix (2026-07-05 review, tracked as B6): this was drifted to 0.003 in
-    # a previous "reconciliation" that got it backwards — 0.003 sits *above*
-    # the measured conversational speech range (0.0004–0.0010 at 1.3m per
-    # SETUP.md's handoff table), meaning a fresh device or a config reset
-    # would fail to gate speech at all at normal distance. 0.001 is the
-    # value actually validated during the v2.6.3 speech-quality session and
-    # confirmed working in both quiet-office and TV-on-lounge testing — it's
-    # also what the dashboard slider's own fallback already defaulted to
-    # (config.vadThreshold ?? 0.001 in dashboard.jsx), so this closes a
-    # three-way mismatch between the DB default, this comment, and the UI
-    # rather than resolving it in favour of the wrong side. Raise to
-    # 0.003–0.005 only in genuinely noisy rooms (TV, music) via the
-    # dashboard, not as the shipped default.
-    "vadThreshold":     0.001,
-    "vadSpeechMs":      32,
-    # vadSilenceMs: 900ms — up from 600. Prevents premature endpoint on
-    # natural mid-sentence pauses. Dashboard UI already defaults to 800;
-    # this closes the DB/UI mismatch. Tune up to 1200 if sentences still
-    # get clipped; 600 caused the "must finish quickly" behaviour.
-    "vadSilenceMs":     900,
     # True: a tap fires "single" on the HA event entity instead of starting a
-    # turn. Gives up cancel-by-tap; mute still cancels. Hold is unaffected.
+    # turn. Hold is unaffected.
     "buttonSingleTapEvent": False,
     # Window (ms) for coalescing taps into double/triple; 0 disables. Delays
-    # every tap by this much, which is why it needs buttonSingleTapEvent — the
-    # delay is only acceptable once a tap is an event rather than speech.
-    # 300ms is a reasonable starting point.
+    # every tap, which is why it needs buttonSingleTapEvent.
     "buttonMultiTapMs": 0,
-    # owwThreshold: 0.5 — openwakeword's own recommended default, and what
-    # this fleet independently converged on. It was 0.3, which is measurably
-    # too sensitive: of 519 fleet-hours that recorded a near miss while
-    # running 0.5, 212 peaked at >= 0.3, clustered hard against the ceiling
-    # (0.4992, 0.4987, 0.4971, ...). Every one of those would have fired a
-    # spurious turn on a default install — ring up, HA pipeline run, most
-    # likely ending no_speech. Lower it per device if a custom wake model
-    # trades recall for false positives (see oww_forge/README.md).
-    "owwThreshold":     0.5,
-    # Barge-in (§3.2, controller-side): wake word spoken during TTS playback
-    # cancels it and starts a fresh turn. Requires device AEC (aecEnabled)
-    # on — with barge-in the mic streams through playback, and AEC is what
-    # stops the device hearing itself — so aecEnabled above defaults on with
-    # it, and the two move together. bargeInThreshold is used as-is,
-    # deliberately BELOW the normal wake threshold: the echo at the mic is
-    # ~25dB louder than the person talking over it, so speech-over-TTS wake
-    # scores are inherently depressed (~0.10–0.12 measured), while post-AEC
-    # self-echo scores only 0.004 (0.055 worst-case unconverged) — there is
-    # no self-trigger risk down to ~0.08.
-    #
-    # That 0.004 is STALE and the margin is wider than it says: v2.7.8 made
-    # the filter hold convergence across turns, so self-echo measures
-    # 0.002–0.003. 0.10 sat awkwardly close to real speech-over-TTS scores,
-    # which is the wrong way to be wrong — barge-in that never fires is
-    # undiagnosable from the outside ("it just ignores me"), while barge-in
-    # that fires too eagerly is self-evident and adjustable. 0.05 is the
-    # dashboard slider floor, so the only way to tune from here is UP, which
-    # is the direction the visible failure asks for.
-    #
-    # Watch one interaction: the beamformer locks a different mic per turn
-    # and each has its own echo path, so AEC re-converges per turn (per-
-    # channel filter states are the unbuilt fix) — and the one measured
-    # self-echo figure above 0.05 is that unconverged case at 0.055. The
-    # symptom would be a device cutting its own response short. This fleet
-    # runs 0.05 with beamforming and AEC both on and does not do that.
-    "bargeInEnabled":   True,
-    "bargeInThreshold": 0.05,
-    # How far music is attenuated while a voice turn plays OVER it, on
-    # firmware that can mix the two planes (the "audio_mix" capability).
-    # Ducking replaces pausing there: the music feed runs 4s ahead of
-    # realtime, so pausing costs a seek that a Music Assistant flow stream
-    # cannot perform. A taste parameter — it wants tuning by ear in a real
-    # room, like the LED meter curve, not a firmware push per attempt.
+    # Dialog ducks content by this much (§6.2); also the provisional-duck depth
+    # of a wake candidate over content (§16.1).
     "duckDb": -18.0,
-    "owwModel":         "hey_jarvis_v0.1",
-    # Multi-device wake SUPPRESSION window (ms), not a wait. The first
-    # device to detect answers immediately; any other device detecting
-    # within this window stands down. 0 disables. Costs no latency to
-    # anyone — see em_arbiter for why first-detector beats best-SNR.
-    # 700ms: the observed spread between devices hearing one utterance is
-    # ~200ms (device mic batching is 160ms), and the window also needs to
-    # cover a device that hears the winner's TTS a moment later.
+    # Active wake graph: a WakeRegistry SHA-256 (§5.1). Thresholds belong to
+    # the registry entry.
+    "wakeModel":        DEPLOYED_WAKE_MODEL,
+    # Multi-device wake suppression window (ms): the first claimant answers,
+    # others within the window stand down (em_arbiter, §5.3). 0 disables.
     "wakeArbitrationMs": 700,
-    # owwSpeexNs: openwakeword's built-in speexdsp noise suppressor (Q1,
-    # 2026-07-05 review). 16kHz-native, applied controller-side, only to
-    # the wake-word detection path — cannot affect STT audio since STT
-    # never sees it. Defaults False, but no longer for the original reason:
-    # the packaging blocker cleared (pinned speexdsp-ns==0.1.2 in
-    # requirements.txt, imports cleanly in the image), so the noisy-room
-    # A/B this is waiting on is now actually runnable. Off until someone
-    # runs it — not off because it cannot be turned on.
-    "owwSpeexNs":       False,
-    # nsAsr: DTLN noise suppression (em_ns.py), controller-side, applied
-    # ONLY to the turn audio streamed to HA's STT — the wake stream and
-    # all noise-floor measurement stay raw. Helps steady noise (fan, AC,
-    # hum) at marginal SNR; does little against competing speech (TV) —
-    # that's the beamformer's job. Default off, and the A/B that was
-    # "pending" has since run with a result that is NOT yet reconciled: with
-    # NS on, recordings showed 8-15% of samples at exact digital zero at a
-    # healthy signal level (the gate chewing speech); with it off, 0.3%.
-    # That is a candidate cause of the choppy-audio reports (#137). This
-    # fleet nonetheless runs it on, with one device explicitly overriding to
-    # off — so treat "on" as unvalidated rather than recommended until
-    # someone listens to a pair of recordings and decides.
-    # Models are vendored into the Docker image, so if the
-    # files are missing (bare-metal without NS_MODEL_DIR) the flag
-    # degrades to raw streaming with a warning.
+    # DTLN noise suppression on the STT copy only (em_ns, §16.7).
     "nsAsr":            False,
-    # saveUtterances: keep the mic audio of the last few voice turns
-    # (em_recordings.KEEP_PER_DEVICE) as WAVs, downloadable from the
-    # Activity tab. Diagnostic tooling for "is my mic any good" — the
-    # question you otherwise have to answer by inference from a bad
-    # transcript. Default OFF and deliberately so: this is the only feature
-    # that writes recognisable speech to disk, and turning it on should be
-    # a decision, not a default someone discovers later. Controller-side
-    # only (the device never sees the audio again); the key rides the
-    # config channel and the device ignores it, same as wakeArbitrationMs.
+    # Keep recent utterances (the uploaded STT copy) as WAVs. Off by default:
+    # the only feature that writes recognisable speech to disk.
     "saveUtterances":   False,
-    # timerSound: which uploaded sound (em_sounds id) an expired Home
-    # Assistant timer rings with. Empty means the fleet "default" upload if
-    # there is one, and the synthesised two-tone chime if there is not — a
-    # timer must never fire silently, so the fallback chain has no end that
-    # produces no sound. Controller-side only; the device never stores the
-    # audio (HA pushes the FINISHED event through the controller regardless,
-    # so on-device storage would buy no autonomy).
+    # Keep each accepted candidate's wake clip (support −300 ms … support_end).
+    "saveWakeClips":    False,
+    # Utterance cap: false → 15 s, true → 30 s (§16.6).
+    "extendedUtterances": False,
+    # Alert sounds are em_sounds catalog IDs. Empty = the fleet "default"
+    # upload if present, else the device's built-in fallback tone (§16.5).
+    # timerSound rings HA timers; alarmSound rings alarm events without their
+    # own `echomuse:` sound and is the sound of new alarms (§16.7).
     "timerSound":       "",
-    # timerRingSeconds: how long to keep ringing before giving up. This is a
-    # safety cap, not a preference: HA discards the timer as it fires
-    # (TimerManager._timer_finished pops it), so if nobody is home to say
-    # the wake word, nothing else in the system would ever stop the ring.
-    "timerRingSeconds": 60,
-    # The ring's cadence, and the reason it is two keys rather than one.
-    # timerRingGapSeconds is the SILENCE between bursts, which is also the
-    # only window the wake word gets — openWakeWord needs ~1.4s of context
-    # and the ring resets its model each time the sound stops, so dropping
-    # this much below 1.5 trades away the ability to stop the alarm. Buy
-    # urgency with timerRingBurstSeconds instead: a sound shorter than this
-    # repeats to fill it, so one 0.6s chime becomes a burst of two rather
-    # than a lone chirp. Both measured against the first cut, which was a
-    # 0.6s chime every 3.1s and read as "less frequent than before".
-    "timerRingGapSeconds":   2.0,
-    "timerRingBurstSeconds": 1.2,
-    # bleProxyEnabled: BLE proxy (device-side passive scan over the raw HCI
-    # transport, forwarded to HA as a separate ESPHome bluetooth_proxy
-    # device — em_ble_proxy.py). Default off: enabling durably disables the
-    # Android Bluetooth stack on the device (required — /dev/stpbt is
-    # single-owner) and brings up a second ESPHome listener + mDNS entry.
+    "alarmSound":       "",
+    # Timer ring limit (s): HA discards a timer as it fires, so nothing else
+    # would stop an unattended ring (§10.8).
+    "timerRingSeconds": 900,
+    # Silence between repeats of the timer sound (s).
+    "timerRingGapSeconds": 2.0,
+    # BLE proxy over the raw HCI transport (em_ble_proxy). Enabling durably
+    # disables the Android Bluetooth stack on the device.
     "bleProxyEnabled":  False,
-    # beamformingEnabled: True — ch6 (centre/omni) hears the wake word, then
-    # the turn locks to the best perimeter mic. The flag ONLY gates Lock():
-    # unlocked is always ch6 and the wake path never locks, so the wake
-    # stream is ch6 either way (beamformer.go). It cannot splice wake audio.
-    #
-    # This was False, on a comment describing the every-32ms reselection that
-    # be2f16d (v2.6.3 P0-2) had already fixed in the same commit. The real
-    # reason recorded there was that onset discrimination was unreliable at
-    # <=1.5m, "re-enable once P0-3/P0-4 are addressed" — P0-3 closed
-    # 2026-07-12 (DTLN) and v2.7.2's lock-back selection fixed the decayed-
-    # spike picks that caused most of the wrong-lock risk. Nobody went back.
-    # Meanwhile this fleet has run True since the 2026-07-20 config restore
-    # with no reported regression, so True is the value with field evidence
-    # behind it and False is the one that has not been run in months.
-    "beamformingEnabled": True,
-    "beamAngle":        -1,
+    # EQ applies to controller-rendered content and dialog, not to device-
+    # executed alerts (§18.4).
     "eqBands":          [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
     "eqLoudness":       False,
-    # LED ring scene (controller-side rendering — see em_scenes.py).
-    # ledListenColor/ledThinkColor only apply when ledScene is "custom".
+    # LED ring scene (em_scenes). Colours apply only to the "custom" scene.
     "ledScene":         "standard",
     "ledListenColor":   "#00b400",
     "ledThinkColor":    "#00c800",
-    # Playback "meter" ring response curve — how hard the ring throbs with
-    # the speaker level. Device-side defaults live in animator.go
-    # (meterDefaults) and these mirror them; both are clamped independently.
-    # Exposed as config because it is a taste parameter that needs several
-    # passes in a real room, and a firmware OTA per pass is not a sane
-    # tuning loop. See docs/led-ring-states.md.
-    "meterAttack":      0.6,   # envelope rise per 40ms tick
-    "meterDecay":       0.30,  # fall per tick; ~133ms tracks syllable rate
+    # Playback meter ring response; mirrors animator.go meterDefaults.
+    "meterAttack":      0.6,   # envelope rise per 40 ms tick
+    "meterDecay":       0.30,  # fall per tick
     "meterFloor":       0.06,  # perceptual brightness at silence
-    "meterGamma":       2.2,   # >1 expands the dark end so the swing reads
+    "meterGamma":       2.2,   # >1 expands the dark end
     "meterRef":         0.22,  # speaker RMS mapped to full brightness
     "meterCurve":       0.7,   # <1 lifts quiet consonants
-    # agcEnabled: automatic gain control (lockMic/button turn streams only).
-    # Disable to hear raw mic levels. (nsEnabled/RNNoise removed 2026-07-12
-    # with the device-side RNNoise code — a stale nsEnabled key in stored
-    # configs is harmless: new firmware ignores unknown fields, and old
-    # firmware keeps honouring the stored False until it's OTA'd.)
-    "agcEnabled":       True,
 }
+
+# Keys deleted from every config scope; the API rejects them by name.
+# v22: the pre-cutover wake/endpoint keys (SPEC §18.4).
+_V22_REMOVED_KEYS: frozenset[str] = frozenset({
+    "owwModel", "owwThreshold", "bargeInThreshold", "nearMissThreshold",
+    "owwOnDevice", "owwSpeexNs", "bargeInEnabled",
+    "endpointRelative", "endpointLowPerMil", "endpointSilenceMs", "endpointBackporchMs",
+    "maxSpeechMs", "vadThreshold", "vadSpeechMs", "vadSilenceMs",
+    "timerRingBurstSeconds",
+})
+# v23: microphone-processing keys. The native AFE owns gain, AGC, echo
+# cancellation and beamforming (§4.1); nothing reads these.
+_V23_REMOVED_KEYS: frozenset[str] = frozenset({
+    "micGainDb", "adcDigitalGain", "adcMicpga", "agcEnabled",
+    "aecEnabled", "aecDelayMs", "aecTailMs", "beamformingEnabled", "beamAngle",
+})
+REMOVED_CONFIG_KEYS: frozenset[str] = _V22_REMOVED_KEYS | _V23_REMOVED_KEYS
 
 # Maximum log rows retained per device. Older rows are pruned on insert.
 LOG_RETENTION = 10_000
@@ -766,6 +608,131 @@ MIGRATIONS: list[str] = [
 
     UPDATE system_config SET value = '17' WHERE key = 'schema_version';
     """,
+
+    # ── v18 — wake-word sample collection mode ──────────────────────────────
+    #
+    # A device in collect mode streams its wake audio to disk as training
+    # clips (em_samples) and starts no voice turns at all. A COLUMN rather
+    # than a config key, deliberately: config is section-scoped and
+    # fleet-inherited by default, so a key here would let one toggle in the
+    # fleet panel silence every Echo in the house at once. This is a mode
+    # someone puts ONE device into for an afternoon.
+    #
+    # Persisted rather than held in memory because the mode outlives the
+    # process that was asked for it: someone walks the house saying the wake
+    # word for twenty minutes, and a controller restart in the middle must
+    # not silently turn collection off — it would look like it was still
+    # running and record nothing.
+    """
+    ALTER TABLE devices ADD COLUMN collect_mode INTEGER NOT NULL DEFAULT 0;
+
+    UPDATE system_config SET value = '18' WHERE key = 'schema_version';
+    """,
+
+    # ── v19 — ambient recording mode ────────────────────────────────────────
+    #
+    # The other half of a training set: collect mode captures the wake word
+    # and cuts at the silences, this one holds the mic open and hands back a
+    # single WAV of the whole session (em_ambient) — room noise, which has no
+    # onsets to cut on and is worthless once it has been chopped up.
+    #
+    # A column for both of v18's reasons, which apply unchanged: it is a
+    # per-device mode rather than fleet-inherited config, and it outlives the
+    # process. The restart case is stronger here, not weaker — someone leaves
+    # a room recording for an hour, and a controller that came back with the
+    # mode silently off would show a device that is recording nothing while
+    # its ring says otherwise. On reconnect the mode is re-armed and a NEW
+    # file is started; the interrupted one is recovered from its `.part` by
+    # em_ambient.recover rather than lost.
+    """
+    ALTER TABLE devices ADD COLUMN ambient_mode INTEGER NOT NULL DEFAULT 0;
+
+    UPDATE system_config SET value = '19' WHERE key = 'schema_version';
+    """,
+
+    # ── v20 — wake clips ────────────────────────────────────────────────────
+    #
+    # The audio that crossed the wake threshold, kept per turn (em_wakeclips)
+    # so a false positive can be listened to, and collected as BCResNet
+    # training material (trained outside this repo, in ~/git/bcresnet).
+    # Neither the turn row nor its utterance recording contains the sound
+    # that triggered the wake.
+    #
+    # A COLUMN on turns rather than a device column, unlike v18/v19: this is
+    # not a mode, it is an artefact of one turn, and the row that shows the
+    # false positive is the row that should link to its own audio. Retention
+    # is by file count per device (em_wakeclips.KEEP_PER_DEVICE), a shorter
+    # window than TURN_RETENTION, so a non-NULL wake_file on an older row is
+    # a claim to CHECK and every reader resolves it through em_wakeclips —
+    # exactly as v12's audio_file is treated.
+    """
+    ALTER TABLE turns ADD COLUMN wake_file TEXT;
+
+    UPDATE system_config SET value = '20' WHERE key = 'schema_version';
+    """,
+
+    # ── v21 — timer rings use the ordinary barge-in path ────────────────────
+    #
+    # ringBargeIn used to decide whether the wake detector ran while a timer
+    # chime was audible. That made the default alarm impossible to stop by
+    # voice except during a configured quiet gap. Ring audio is playback and
+    # now always uses bargeInThreshold, so the separate switch has no valid
+    # meaning. Remove it from fleet and per-device JSON rather than leaving a
+    # dead setting that APIs keep round-tripping forever.
+    """
+    UPDATE system_config SET value = '21' WHERE key = 'schema_version';
+    """,
+
+    # ── v22 — post-AFE cutover (SPEC §18.4) ─────────────────────────────────
+    #
+    # Decision-trace columns on turns (§11.3), the device-reported hop count
+    # in wake_counters, and the alert journal/delivery tables (§16.3). The
+    # shadow/device-wake turn columns keep their history and are no longer
+    # written. Config rewrites and the alert-sound export run in _fixup_v22,
+    # inside this migration's transaction.
+    """
+    ALTER TABLE turns ADD COLUMN wake_model_sha256 TEXT;
+    ALTER TABLE turns ADD COLUMN policy_hash TEXT;
+    ALTER TABLE turns ADD COLUMN wake_attribution TEXT;
+    ALTER TABLE turns ADD COLUMN reference_coverage REAL;
+    ALTER TABLE turns ADD COLUMN commit_route TEXT;
+    ALTER TABLE turns ADD COLUMN terminal_reason TEXT;
+    ALTER TABLE turns ADD COLUMN commit_id TEXT;
+
+    ALTER TABLE wake_counters ADD COLUMN dev_hops INTEGER NOT NULL DEFAULT 0;
+    """
+    + em_alerts.ALERT_SCHEMA_SQL
+    + """
+    UPDATE system_config SET value = '22' WHERE key = 'schema_version';
+    """,
+
+    # ── v23 — drop microphone-processing config keys ────────────────────────
+    #
+    # Nine keys the native AFE made meaningless were still stored in fleet
+    # and device config. The API rejects keys it does not know, so every
+    # dashboard save that round-tripped them failed. _fixup_v23 deletes them.
+    """
+    UPDATE system_config SET value = '23' WHERE key = 'schema_version';
+    """,
+
+    # ── v24 — per-stage turn detail for the Activity page ────────────────────
+    #
+    # What the controller's streaming ASR heard (the text that ended the
+    # utterance), how the endpoint decided (grammar class, silence waited),
+    # HA's transcript before wake-phrase removal, and the intent result: the
+    # spoken answer, HA's response type, whether HA's built-in agent answered,
+    # and the intent time. stt_text keeps meaning "the text that was routed".
+    """
+    ALTER TABLE turns ADD COLUMN asr_text TEXT;
+    ALTER TABLE turns ADD COLUMN endpoint_class TEXT;
+    ALTER TABLE turns ADD COLUMN endpoint_ms INTEGER;
+    ALTER TABLE turns ADD COLUMN stt_raw TEXT;
+    ALTER TABLE turns ADD COLUMN intent_ms INTEGER;
+    ALTER TABLE turns ADD COLUMN intent_local INTEGER;
+    ALTER TABLE turns ADD COLUMN response_type TEXT;
+    ALTER TABLE turns ADD COLUMN response_text TEXT;
+    UPDATE system_config SET value = '24' WHERE key = 'schema_version';
+    """,
 ]
 
 # Post-migration fixups that need Python rather than SQL. Keyed by the schema
@@ -791,23 +758,200 @@ def _fixup_v11(conn) -> None:
             )
 
 
-_MIGRATION_FIXUPS = {11: _fixup_v11}
+def _fixup_v21(conn) -> None:
+    removed = "ringBargeIn"
+    changed = 0
+
+    row = conn.execute(
+        "SELECT value FROM system_config WHERE key = 'global_device_config'"
+    ).fetchone()
+    if row is not None:
+        try:
+            cfg = json.loads(row["value"] or "{}") or {}
+        except (json.JSONDecodeError, TypeError):
+            cfg = None
+        if cfg is not None and removed in cfg:
+            cfg.pop(removed)
+            conn.execute(
+                "UPDATE system_config SET value = ? "
+                "WHERE key = 'global_device_config'",
+                (json.dumps(cfg),),
+            )
+            changed += 1
+
+    for row in conn.execute("SELECT device_id, config FROM devices").fetchall():
+        try:
+            cfg = json.loads(row["config"] or "{}") or {}
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if removed not in cfg:
+            continue
+        cfg.pop(removed)
+        conn.execute(
+            "UPDATE devices SET config = ? WHERE device_id = ?",
+            (json.dumps(cfg), row["device_id"]),
+        )
+        changed += 1
+
+    if changed:
+        log.info(f"[db] v21: removed ringBargeIn from {changed} config scope(s)")
+
+
+# Values schema 21 fell back to when a scope did not store the key; migration
+# 22 reads the OLD effective value, so it must not see today's defaults.
+_V21_MAX_SPEECH_MS = 12_000
+_V21_TIMER_RING_SECONDS = 60
+# §18.4: an old cap of 0 (none) or above this becomes extendedUtterances=true.
+_EXTENDED_ABOVE_MS = 15_000
+
+
+def _json_dict(text) -> Optional[dict]:
+    """Parsed JSON object, {} for empty, None for anything unparseable."""
+    try:
+        value = json.loads(text or "{}") or {}
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _extended_utterances(max_speech_ms) -> bool:
+    try:
+        ms = int(max_speech_ms)
+    except (TypeError, ValueError):
+        ms = _V21_MAX_SPEECH_MS
+    return ms == 0 or ms > _EXTENDED_ABOVE_MS
+
+
+def _rewrite_scope_v22(cfg: dict) -> dict:
+    """One scope's stored config without the v22 removed keys, and with the old
+    default ring limit moved to the new default (§18.4 steps 1–2)."""
+    out = {k: v for k, v in cfg.items() if k not in _V22_REMOVED_KEYS}
+    if out.get("timerRingSeconds") == _V21_TIMER_RING_SECONDS:
+        out["timerRingSeconds"] = DEFAULT_DEVICE_CONFIG["timerRingSeconds"]
+    return out
+
+
+def _fixup_v22(conn) -> None:
+    """
+    SPEC §18.4 config rewrite and alert-sound export.
+
+    Fleet: removed keys deleted, `wakeModel` = the deployed graph,
+    `extendedUtterances` from the old effective `maxSpeechMs`, `alarmSound`
+    initialised from `timerSound`. Devices: removed keys deleted; a device
+    that overrides the microphones section gets `extendedUtterances` from its
+    own old effective cap. Then every effective timerSound/alarmSound ID plus
+    `default` is exported as an alert asset before the transaction commits;
+    a missing or undecodable ID stays stored and resolves to the fallback.
+    """
+    row = conn.execute(
+        "SELECT value FROM system_config WHERE key = 'global_device_config'"
+    ).fetchone()
+    fleet = _json_dict(row["value"] if row is not None else None)
+    if fleet is None:
+        log.warning("[db] v22: fleet config JSON unreadable — rewriting from defaults")
+        fleet = {}
+    fleet_max_speech = fleet.get("maxSpeechMs", _V21_MAX_SPEECH_MS)
+
+    new_fleet = _rewrite_scope_v22(fleet)
+    new_fleet["wakeModel"] = DEPLOYED_WAKE_MODEL
+    new_fleet["extendedUtterances"] = _extended_utterances(fleet_max_speech)
+    new_fleet["alarmSound"] = fleet.get("timerSound", DEFAULT_DEVICE_CONFIG["timerSound"])
+    conn.execute(
+        "INSERT OR REPLACE INTO system_config (key, value) "
+        "VALUES ('global_device_config', ?)",
+        (json.dumps(new_fleet),),
+    )
+    fleet_effective = {**DEFAULT_DEVICE_CONFIG, **new_fleet}
+
+    sound_ids = {em_sounds.DEFAULT_ID}
+    for row in conn.execute(
+        "SELECT device_id, config, config_sections FROM devices"
+    ).fetchall():
+        cfg = _json_dict(row["config"])
+        if cfg is None:
+            log.warning(f"[db] v22: config JSON unreadable for {row['device_id']} — left as is")
+            continue
+        try:
+            sections = em_config_sections.normalise(json.loads(row["config_sections"] or "[]"))
+        except (json.JSONDecodeError, TypeError):
+            sections = []
+        new = _rewrite_scope_v22(cfg)
+        if "microphones" in sections:
+            new["extendedUtterances"] = _extended_utterances(
+                cfg.get("maxSpeechMs", fleet_max_speech))
+        if new != cfg:
+            conn.execute(
+                "UPDATE devices SET config = ? WHERE device_id = ?",
+                (json.dumps(new), row["device_id"]),
+            )
+        effective = em_config_sections.merge(fleet_effective, new, sections)
+        sound_ids.update((effective["timerSound"], effective["alarmSound"]))
+    sound_ids.update((fleet_effective["timerSound"], fleet_effective["alarmSound"]))
+    sound_ids.discard("")
+
+    directory = em_sounds.sounds_dir(_db_path)
+    for sound_id in sorted(sound_ids):
+        try:
+            exported = em_sounds.export(sound_id, directory)
+        except em_sounds.ExportError as e:
+            if sound_id != em_sounds.DEFAULT_ID or em_sounds.source_path(sound_id, directory):
+                log.warning(f"[db] v22: sound {sound_id!r} not exported ({e}) — "
+                            f"rings with {em_sounds.FALLBACK}")
+            continue
+        if exported.shortened:
+            log.warning(f"[db] v22: sound {sound_id!r} is longer than "
+                        f"{em_sounds.ALERT_MAX_SECONDS} s — its alert asset is cut")
+
+
+def _fixup_v23(conn) -> None:
+    """Delete _V23_REMOVED_KEYS from the fleet config and every device config.
+    Unreadable JSON is left as is: there is nothing to strip safely."""
+    row = conn.execute(
+        "SELECT value FROM system_config WHERE key = 'global_device_config'"
+    ).fetchone()
+    fleet = _json_dict(row["value"] if row is not None else None)
+    if fleet is not None and _V23_REMOVED_KEYS & fleet.keys():
+        conn.execute(
+            "UPDATE system_config SET value = ? WHERE key = 'global_device_config'",
+            (json.dumps({k: v for k, v in fleet.items() if k not in _V23_REMOVED_KEYS}),),
+        )
+    for row in conn.execute("SELECT device_id, config FROM devices").fetchall():
+        cfg = _json_dict(row["config"])
+        if cfg is not None and _V23_REMOVED_KEYS & cfg.keys():
+            conn.execute(
+                "UPDATE devices SET config = ? WHERE device_id = ?",
+                (json.dumps({k: v for k, v in cfg.items() if k not in _V23_REMOVED_KEYS}),
+                 row["device_id"]),
+            )
+
+
+_MIGRATION_FIXUPS = {11: _fixup_v11, 21: _fixup_v21, 22: _fixup_v22, 23: _fixup_v23}
 
 # ─── Connection management ────────────────────────────────────────────────────
 
 _db_path: str = ""
 _conn: Optional[sqlite3.Connection] = None
 
-# We share ONE sqlite3.Connection across the run_in_executor thread pool
-# (check_same_thread=False). WAL allows concurrent readers only across
-# *separate* connections — on a single shared connection object, ANY two
-# concurrent operations (read-vs-write or write-vs-write) are a use-from-two-
-# threads misuse that SQLite rejects with SQLITE_MISUSE ("bad parameter or
-# other API misuse"). So every access — reads (_q/_q1) AND write transactions
-# (_tx) — must serialise through this one lock. (Guarding only writes was a
-# latent bug: a read racing a write-commit crashed concurrent OTAs during a
-# fleet deploy-all — 2026-07-12.)
+# ONE sqlite3.Connection shared across the run_in_executor pool
+# (check_same_thread=False). Two concurrent operations on one connection
+# object are a misuse SQLite rejects (SQLITE_MISUSE), so every access — reads
+# (_q/_q1) and write transactions (_tx) — serialises through this lock.
 _db_lock = threading.Lock()
+
+# em_alerts.AlertEngine's journal runs on its own connection to the same file
+# (connect_alerts), serialised by its own lock; WAL lets the two connections
+# read concurrently and SQLite's busy timeout orders their writes.
+alerts_lock = threading.Lock()
+
+
+def connect_alerts() -> sqlite3.Connection:
+    """A second connection to the initialised database for AlertEngine
+    (`AlertEngine(conn, ..., db_lock=alerts_lock)`). Call after init()."""
+    assert _db_path, "db.init() has not been called"
+    conn = sqlite3.connect(_db_path, check_same_thread=False, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
 
 
 def init(path: str = "echomuse.db") -> None:
@@ -954,10 +1098,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
         version = current + i + 1
         log.info(f"Applying migration v{version}")
         try:
-            conn.executescript(sql)
-            # Some migrations need data work that SQL cannot express (e.g.
-            # pruning JSON config against the section map). Runs inside the
-            # same transaction as its DDL so a failure rolls both back.
+            # executescript() commits any open transaction and then runs in
+            # autocommit mode, so the explicit BEGIN is what makes the DDL,
+            # the schema_version bump and the Python fixup one transaction:
+            # a failure anywhere rolls all three back and the next start
+            # resumes from the last committed version.
+            conn.executescript("BEGIN;\n" + sql)
             fixup = _MIGRATION_FIXUPS.get(version)
             if fixup is not None:
                 fixup(conn)
@@ -1155,6 +1301,46 @@ def set_device_label(device_id: str, label: str) -> None:
         )
 
 
+def get_collect_mode(device_id: str) -> bool:
+    """
+    Whether this device is collecting wake-word training samples.
+
+    A device in collect mode answers nothing — see the v18 migration for why
+    this is a column rather than a config key.
+    """
+    row = _q1("SELECT collect_mode FROM devices WHERE device_id = ?", (device_id,))
+    return bool(row["collect_mode"]) if row is not None else False
+
+
+def set_collect_mode(device_id: str, enabled: bool) -> None:
+    """Arm or disarm sample collection for a device."""
+    with _tx() as conn:
+        conn.execute(
+            "UPDATE devices SET collect_mode = ? WHERE device_id = ?",
+            (1 if enabled else 0, device_id),
+        )
+
+
+def get_ambient_mode(device_id: str) -> bool:
+    """
+    Whether this device is recording ambient room audio.
+
+    Answers nothing while it is on, exactly like collect mode — see the v19
+    migration for why this is a column too.
+    """
+    row = _q1("SELECT ambient_mode FROM devices WHERE device_id = ?", (device_id,))
+    return bool(row["ambient_mode"]) if row is not None else False
+
+
+def set_ambient_mode(device_id: str, enabled: bool) -> None:
+    """Arm or disarm ambient recording for a device."""
+    with _tx() as conn:
+        conn.execute(
+            "UPDATE devices SET ambient_mode = ? WHERE device_id = ?",
+            (1 if enabled else 0, device_id),
+        )
+
+
 def set_device_config(device_id: str, config: dict) -> None:
     """
     Persist updated config for a device.
@@ -1203,8 +1389,8 @@ def get_global_device_config() -> dict:
         return dict(DEFAULT_DEVICE_CONFIG)
     if not stored:
         return dict(DEFAULT_DEVICE_CONFIG)
-    # Underlay defaults so keys added after the stored config was last
-    # saved (e.g. micGainDb) are still pushed with their default value
+    # Underlay defaults so keys added after the stored config was last saved
+    # are still pushed with their default value
     # instead of silently falling back to whatever the device binary's
     # env default happens to be.
     return {**DEFAULT_DEVICE_CONFIG, **stored}
@@ -1374,7 +1560,8 @@ def delete_device(device_id: str) -> None:
     This is a hard delete — use with care. Logs are removed first to
     satisfy the foreign key constraint.
 
-    Saved utterance recordings live on disk rather than in the DB, so no
+    Saved utterance recordings, collected wake-word samples, ambient
+    recordings and wake clips live on disk rather than in the DB, so no
     cascade reaches them — they are unlinked explicitly here. Leaving a
     deleted device's speech behind on the volume is the one leftover that
     actually matters.
@@ -1388,6 +1575,24 @@ def delete_device(device_id: str) -> None:
             log.info(f"[db] Removed {removed} recording(s) for {device_id}")
     except Exception as e:
         log.warning(f"[db] Recording cleanup failed for {device_id}: {e}")
+    try:
+        removed = em_samples.delete_device(device_id)
+        if removed:
+            log.info(f"[db] Removed {removed} collected sample(s) for {device_id}")
+    except Exception as e:
+        log.warning(f"[db] Sample cleanup failed for {device_id}: {e}")
+    try:
+        removed = em_ambient.delete_device(device_id)
+        if removed:
+            log.info(f"[db] Removed {removed} ambient recording(s) for {device_id}")
+    except Exception as e:
+        log.warning(f"[db] Ambient cleanup failed for {device_id}: {e}")
+    try:
+        removed = em_wakeclips.delete_device(device_id)
+        if removed:
+            log.info(f"[db] Removed {removed} wake clip(s) for {device_id}")
+    except Exception as e:
+        log.warning(f"[db] Wake clip cleanup failed for {device_id}: {e}")
     log.info(f"[db] Device deleted: {device_id}")
 
 
@@ -1602,74 +1807,65 @@ def get_device_logs(
 # metrics). Written from the voice pipeline via run_in_executor; read by the
 # /api/devices/{id}/turns and /api/devices/{id}/activity endpoints.
 
-# Turn dict keys ↔ column names. "trigger" is the dict key used everywhere
-# in the pipeline and API (matches the pre-persistence turn_record shape);
-# the column is trigger_type because TRIGGER is an SQLite keyword.
+# Turn dict keys ↔ column names written by insert_turn. "trigger" is stored
+# as trigger_type because TRIGGER is an SQLite keyword. The §11.3 decision
+# trace arrived in schema 22, the per-stage Activity detail in schema 24.
 _TURN_COLUMNS = {
-    "trigger":          "trigger_type",
-    "wake_model":       "wake_model",
-    "wake_score":       "wake_score",
-    "wake_threshold":   "wake_threshold",
-    "noise_floor":      "noise_floor",
-    "outcome":          "outcome",
-    "stt_text":         "stt_text",
-    "total_ms":         "total_ms",
-    "vad_end_ms":       "vad_end_ms",
-    "stt_ms":           "stt_ms",
-    "tts_url_ms":       "tts_url_ms",
-    "tts_fetch_ms":     "tts_fetch_ms",
-    "playback_ms":      "playback_ms",
-    "audio_ms":         "audio_ms",
-    "tts_bytes":        "tts_bytes",
-    "underruns":        "underruns",
-    "playback_periods": "playback_periods",
-    # v7 delivery instrumentation — present only when the device's
-    # playback_stats arrived before the turn row was written (the common
-    # case: its buffer drains ahead of our overestimated drain sleep).
-    "min_depth":        "min_depth",
-    "prime_wait_ms":    "prime_wait_ms",
-    "recv_span_ms":     "recv_span_ms",
-    "max_gap_ms":       "max_gap_ms",
-    "bytes_recv":       "bytes_recv",
-    "send_ms":          "send_ms",
-    "delivery_ms":      "delivery_ms",
-    "eq_ms":            "eq_ms",
-    # v13 — on-device shadow comparison. dev_shadow is the "was the device
-    # scoring at all" flag that stops a NULL dev_wake_score from being read as
-    # a miss when it is really absence of data.
-    "dev_wake_score":    "dev_wake_score",
-    "dev_wake_delta_ms": "dev_wake_delta_ms",
-    "dev_shadow":        "dev_shadow",
-    # v15 — the threshold the device was scoring against, so a non-crossing can
-    # be judged rather than assumed to be a miss.
-    "dev_threshold":     "dev_threshold",
-    # v17 — the inverse comparison, populated only on device-triggered turns:
-    # did THIS controller detect the same utterance, and how far apart.
-    "ctrl_wake_score":    "ctrl_wake_score",
-    "ctrl_wake_delta_ms": "ctrl_wake_delta_ms",
-    # v12 — filename of the saved utterance WAV, written by set_turn_audio
-    # after the insert (the name is keyed on the rowid). Always NULL at
-    # insert time; listed here so get_turns returns it.
-    "audio_file":       "audio_file",
+    "trigger":            "trigger_type",
+    "wake_model":         "wake_model",
+    "wake_score":         "wake_score",
+    "wake_threshold":     "wake_threshold",
+    "outcome":            "outcome",
+    "stt_text":           "stt_text",
+    "total_ms":           "total_ms",
+    "stt_ms":             "stt_ms",
+    "tts_url_ms":         "tts_url_ms",
+    "tts_fetch_ms":       "tts_fetch_ms",
+    "playback_ms":        "playback_ms",
+    "audio_ms":           "audio_ms",
+    "wake_model_sha256":  "wake_model_sha256",
+    "policy_hash":        "policy_hash",
+    "wake_attribution":   "wake_attribution",
+    "reference_coverage": "reference_coverage",
+    "commit_route":       "commit_route",
+    "terminal_reason":    "terminal_reason",
+    "commit_id":          "commit_id",
+    "asr_text":           "asr_text",        # controller streaming transcript, wake word included
+    "endpoint_class":     "endpoint_class",  # grammar class of the committed text
+    "endpoint_ms":        "endpoint_ms",     # silence waited after the last command speech
+    "stt_raw":            "stt_raw",         # HA transcript before wake-phrase removal
+    "intent_ms":          "intent_ms",       # dispatch → intent-end
+    "intent_local":       "intent_local",    # 1: HA's built-in agent answered; 0: the conversation agent
+    "response_type":      "response_type",   # HA intent response_type
+    "response_text":      "response_text",   # the spoken answer
 }
+
+# Columns get_turns returns but nothing writes any more (SPEC §18.4 step 3):
+# the legacy data-plane delivery measurements and the shadow/device-wake
+# comparison. They keep their history. audio_file/wake_file are written after
+# the insert by set_turn_audio/set_turn_wake (their names embed the rowid).
+_TURN_READ_ONLY_COLUMNS = (
+    "noise_floor", "vad_end_ms", "tts_bytes", "underruns", "playback_periods",
+    "min_depth", "prime_wait_ms", "recv_span_ms", "max_gap_ms", "bytes_recv",
+    "send_ms", "delivery_ms", "eq_ms",
+    "dev_wake_score", "dev_wake_delta_ms", "dev_shadow", "dev_threshold",
+    "ctrl_wake_score", "ctrl_wake_delta_ms",
+    "audio_file", "wake_file",
+)
 
 
 def _py(v):
-    """
-    Coerce numpy scalars to Python natives. The voice pipeline handles
-    numpy float32 scores; sqlite3 silently stores those as a 4-byte BLOB,
-    which poisons the row for JSON serialisation and SQL MAX() comparisons
-    (bit us 2026-07-14). Anything with .item() is a numpy scalar.
-    """
+    """Numpy scalars to Python natives: sqlite3 stores a numpy float32 as a
+    BLOB, which breaks JSON serialisation and SQL MAX()."""
     return v.item() if hasattr(v, "item") else v
 
 
 def insert_turn(device_id: str, rec: dict) -> int:
     """
-    Persist one completed voice turn. rec is the turn_record dict built in
-    em_esphome (missing keys stored as NULL). Returns the new rowid so a
-    late playback_stats report can attach to this turn. Prunes to
-    TURN_RETENTION rows per device.
+    Persist one completed voice turn. `rec` keys are those of _TURN_COLUMNS
+    plus optional `ts` (epoch s); missing keys are NULL, other keys ignored.
+    Returns the rowid (set_turn_audio/set_turn_wake attach files by it).
+    Prunes to TURN_RETENTION rows per device.
     """
     cols   = ["device_id", "ts"] + list(_TURN_COLUMNS.values())
     values = [device_id, _py(rec.get("ts", time.time()))] + [
@@ -1697,40 +1893,8 @@ def insert_turn(device_id: str, rec: dict) -> int:
         return cur.lastrowid
 
 
-def set_turn_playback(turn_id: int, periods: int, underruns: int,
-                      stats: Optional[dict] = None) -> None:
-    """
-    Attach the device's playback_stats report to a persisted turn.
-
-    stats carries the v7 delivery-margin fields when the firmware sends them
-    (>= v2.9.6); older firmware reports only periods/underruns and the extra
-    columns stay NULL, which reads as "never reported" rather than zero.
-    """
-    stats = stats or {}
-    with _tx() as conn:
-        conn.execute(
-            "UPDATE turns SET playback_periods = ?, underruns = ?, "
-            "min_depth = ?, prime_wait_ms = ?, recv_span_ms = ?, "
-            "max_gap_ms = ?, bytes_recv = ? WHERE id = ?",
-            (
-                periods, underruns,
-                stats.get("minDepth"), stats.get("primeWaitMs"),
-                stats.get("recvSpanMs"), stats.get("maxGapMs"),
-                stats.get("bytesRecv"),
-                turn_id,
-            ),
-        )
-
-
 def set_turn_audio(turn_id: int, audio_file: Optional[str]) -> None:
-    """
-    Attach a saved utterance recording to a persisted turn.
-
-    Separate from insert_turn because the filename is keyed on the rowid
-    that insert_turn returns — naming by timestamp instead would collide
-    across devices and give the download endpoint nothing to bind the file
-    to its turn with.
-    """
+    """Attach a saved utterance recording (named by rowid) to a turn."""
     with _tx() as conn:
         conn.execute(
             "UPDATE turns SET audio_file = ? WHERE id = ?",
@@ -1738,20 +1902,12 @@ def set_turn_audio(turn_id: int, audio_file: Optional[str]) -> None:
         )
 
 
-def set_turn_delivery(turn_id: int, send_ms: int, delivery_ms: int,
-                      eq_ms: int) -> None:
-    """
-    Attach controller-measured playback timings to a persisted turn.
-
-    Separate from set_turn_playback because the two arrive from different
-    sides at different moments: this is known as soon as the controller has
-    finished sending, the device's report lands whenever its buffer drains.
-    """
+def set_turn_wake(turn_id: int, wake_file: Optional[str]) -> None:
+    """Attach a saved wake clip (named by rowid) to a turn."""
     with _tx() as conn:
         conn.execute(
-            "UPDATE turns SET send_ms = ?, delivery_ms = ?, eq_ms = ? "
-            "WHERE id = ?",
-            (send_ms, delivery_ms, eq_ms, turn_id),
+            "UPDATE turns SET wake_file = ? WHERE id = ?",
+            (wake_file, turn_id),
         )
 
 
@@ -1761,9 +1917,9 @@ def get_turns(
     since: Optional[float] = None,
 ) -> list[dict]:
     """
-    Recent turns for a device as turn_record-shaped dicts (plus turn_id),
-    oldest first (newest last — the order turn_history and the API use).
-    since: optional epoch-seconds lower bound.
+    Recent turns for a device, oldest first: {turn_id, ts} plus every
+    _TURN_COLUMNS key and every _TURN_READ_ONLY_COLUMNS column (NULL = not
+    recorded). since: optional epoch-seconds lower bound.
     """
     if since is not None:
         rows = _q(
@@ -1781,51 +1937,55 @@ def get_turns(
         rec = {"turn_id": row["id"], "ts": row["ts"]}
         for key, col in _TURN_COLUMNS.items():
             rec[key] = row[col]
+        for col in _TURN_READ_ONLY_COLUMNS:
+            rec[col] = row[col]
         out.append(rec)
     return out
 
 
 def bump_wake_counters(
     device_id: str,
+    *,
     near_misses: int = 0,
-    near_miss_max: float = 0.0,
-    underruns: int = 0,
-    dev_frames: int = 0,
+    near_miss_max: Optional[float] = None,
+    dev_hops: int = 0,
     dev_drops: int = 0,
     dev_crossings: int = 0,
-    dev_max_score: float = 0.0,
-    dev_max_infer_ms: int = 0,
-    dev_max_gap_ms: int = 0,
+    dev_max_score: Optional[float] = None,
+    dev_max_infer_ms: Optional[float] = None,
 ) -> None:
     """
-    Accumulate into the current hour's wake_counters row (upsert).
-
-    The dev_* arguments are the on-device shadow window summary (schema v13),
-    which rides the device's existing ~30s stats report — so on-device scoring
-    adds one upsert per 30s per device and nothing per audio frame.
+    Accumulate one device `wake.stats` window into the current hour's
+    wake_counters row (SPEC §18.4 step 4): near_misses/near_miss_max from its
+    near-miss episodes, dev_hops = hops_scored, dev_drops = hops_dropped
+    (wake_overrun), dev_crossings = candidates_opened, dev_max_score =
+    peak_smoothed, dev_max_infer_ms = infer_max_ms. Counts add; maxima take the
+    max, and None (not measured this window) leaves the stored maximum alone.
     """
+    def _max(v):
+        return 0 if v is None else _py(v)
+
     hour_ts = int(time.time()) // 3600 * 3600
     with _tx() as conn:
         conn.execute(
             """
             INSERT INTO wake_counters (device_id, hour_ts, near_misses, near_miss_max,
-                                       underruns, dev_frames, dev_drops, dev_crossings,
-                                       dev_max_score, dev_max_infer_ms, dev_max_gap_ms)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                       dev_hops, dev_drops, dev_crossings,
+                                       dev_max_score, dev_max_infer_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (device_id, hour_ts) DO UPDATE SET
-                near_misses   = near_misses + excluded.near_misses,
-                near_miss_max = MAX(near_miss_max, excluded.near_miss_max),
-                underruns     = underruns + excluded.underruns,
-                dev_frames    = dev_frames + excluded.dev_frames,
-                dev_drops     = dev_drops + excluded.dev_drops,
-                dev_crossings = dev_crossings + excluded.dev_crossings,
-                dev_max_score = MAX(dev_max_score, excluded.dev_max_score),
-                dev_max_infer_ms = MAX(dev_max_infer_ms, excluded.dev_max_infer_ms),
-                dev_max_gap_ms   = MAX(dev_max_gap_ms, excluded.dev_max_gap_ms)
+                near_misses      = near_misses + excluded.near_misses,
+                near_miss_max    = MAX(near_miss_max, excluded.near_miss_max),
+                dev_hops         = dev_hops + excluded.dev_hops,
+                dev_drops        = dev_drops + excluded.dev_drops,
+                dev_crossings    = dev_crossings + excluded.dev_crossings,
+                dev_max_score    = MAX(dev_max_score, excluded.dev_max_score),
+                dev_max_infer_ms = MAX(dev_max_infer_ms, excluded.dev_max_infer_ms)
             """,
-            (device_id, hour_ts, _py(near_misses), _py(near_miss_max), _py(underruns),
-             _py(dev_frames), _py(dev_drops), _py(dev_crossings), _py(dev_max_score),
-             _py(dev_max_infer_ms), _py(dev_max_gap_ms)),
+            (device_id, hour_ts, _py(near_misses), _max(near_miss_max),
+             _py(dev_hops), _py(dev_drops), _py(dev_crossings),
+             _max(dev_max_score),
+             _max(None if dev_max_infer_ms is None else round(_py(dev_max_infer_ms)))),
         )
         conn.execute(
             "DELETE FROM wake_counters WHERE hour_ts < ?",

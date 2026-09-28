@@ -1,0 +1,14 @@
+{
+  "type": "bcresnet",
+  "sampleRate": 16000,
+  "window": 22400,
+  "labels": [
+    "noise",
+    "ohphelia",
+    "unknown"
+  ],
+  "wakeIndex": 1,
+  "nMels": 40,
+  "clipSeconds": 1.4,
+  "normPeak": 0.8
+}

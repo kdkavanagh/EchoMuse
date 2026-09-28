@@ -1,322 +1,87 @@
-"""
-Device/controller compatibility is negotiated by CAPABILITY, not version.
-
-The two halves of this project ship on independent version schemes (device
-`v*`, controller `controller-v*`), so any given moment can pair new firmware
-with an old controller or the reverse. Version comparison would mean encoding
-release history into the controller and getting it wrong the first time
-someone runs a dev build; a capability is the device stating what it
-implements.
-
-That only works if both sides spell the capability identically. A typo makes
-the feature permanently unavailable and looks exactly like a device that does
-not support it — silent, and the sort of thing you debug from the wrong end.
-So the strings are asserted to match across the two languages, the same way
-CONFIG_SECTIONS is mirrored between Python and dashboard.jsx.
-"""
+"""Capability negotiation (SPEC §11.1): admission requires the exact v1 set,
+and every UI capability derives from the announced set, never a version."""
 
 import re
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent.parent
-CONTROL_GO = ROOT / "device" / "internal" / "client" / "control.go"
-CONTROLLER = ROOT / "controller" / "em_controller.py"
-API = ROOT / "controller" / "em_api.py"
-ESPHOME = ROOT / "controller" / "em_esphome.py"
+import pytest
+
+pytest.importorskip("websockets")
+
+import em_device  # noqa: E402
+from _device_fakes import ALL_V1, FakeLink, FakeStore, hello, make_hub, run  # noqa: E402
+
+ROOT = Path(__file__).resolve().parents[2]
+PROTO_GO = ROOT / "device" / "internal" / "proto" / "proto.go"
+SPEC = ROOT / "docs" / "post-afe-audio-architecture.md"
 
 
-def device_capabilities() -> list[str]:
-    """
-    Every capability the firmware can announce.
-
-    Read from the whole capabilities() function rather than a single literal:
-    the list is no longer fixed — "ambient_light" is appended only when the
-    hardware actually has a readable sensor, because the controller advertises
-    an HA entity off the back of it. A parser that only understood one literal
-    would silently stop covering the conditional ones, which is the direction
-    that hides a typo rather than surfacing it.
-    """
-    src = CONTROL_GO.read_text()
-    m = re.search(r'func capabilities\(\) \[\]string \{(.*?)\n\}', src, re.S)
-    assert m, "could not find func capabilities() in control.go"
-    return re.findall(r'"([a-z_]+)"', m.group(1))
+def _go_capabilities() -> set[str]:
+    return set(re.findall(r'\bCap\w+\s*=\s*"([a-z0-9_]+)"', PROTO_GO.read_text()))
 
 
-def test_device_announces_expected_capabilities():
-    caps = device_capabilities()
-    for expected in ("mic", "speaker", "leds", "led_anim", "buttons", "oww_shadow"):
-        assert expected in caps, f"firmware no longer announces {expected!r}"
+def test_required_set_is_the_spec_list_and_the_firmware_declares_it():
+    spec = SPEC.read_text()
+    block = spec[spec.index("### 11.1 Capability cutover"):]
+    block = block[block.index("```text") + 7:]
+    listed = set(block[:block.index("```")].split())
+    assert em_device.REQUIRED_CAPABILITIES == listed
+    assert em_device.REQUIRED_CAPABILITIES <= _go_capabilities()
 
 
-def test_every_capability_the_controller_checks_is_one_the_device_sends():
-    """
-    A controller checking for a capability string the device never sends is a
-    feature that is silently off forever. This catches the typo direction that
-    the device-side test cannot.
-    """
-    caps = set(device_capabilities())
-    # Two idioms, both scanned: `"<cap>" in (self.capabilities or [])` on
-    # Device in em_controller, and _device_has("<cap>") on the ESPHome
-    # satellite, which decides which HA entities get advertised. A typo in
-    # either is an entity that never appears or never fires, with no error
-    # anywhere — exactly what this test exists to catch.
-    checked = set(re.findall(r'"([a-z_]+)"\s+in\s+\(self\.capabilities',
-                             CONTROLLER.read_text()))
-    checked |= set(re.findall(r'_device_has\(\s*"([a-z_]+)"\s*\)',
-                              ESPHOME.read_text()))
-    assert checked, "no capability checks found — has the idiom changed?"
-    unknown = checked - caps
-    assert not unknown, (
-        f"controller checks capabilities the firmware never announces: {sorted(unknown)}. "
-        f"Device sends: {sorted(caps)}"
-    )
+def test_every_capability_the_controller_tests_is_one_the_firmware_can_send():
+    checked = set()
+    for name in ("em_device.py", "em_esphome.py"):
+        src = (ROOT / "controller" / name).read_text()
+        checked |= set(re.findall(r'"([a-z0-9_]+)" in self\.capabilities', src))
+        checked |= set(re.findall(r'_device_has\("([a-z0-9_]+)"\)', src))
+    assert checked, "no capability checks found"
+    assert checked <= _go_capabilities()
 
 
-def test_shadow_capability_is_surfaced_to_the_dashboard():
-    """
-    The dashboard must be able to tell "cannot" from "off", or it offers a
-    toggle that silently does nothing on older firmware — which reads as a
-    broken feature rather than an unsupported one.
-    """
-    assert "oww_shadow_capable" in CONTROLLER.read_text(), \
-        "em_controller must expose the shadow capability as a property"
-    assert "owwShadowCapable" in API.read_text(), \
-        "/api/devices must surface the shadow capability"
-    jsx = (ROOT / "controller" / "static" / "dashboard.jsx").read_text()
-    assert "owwShadowCapable" in jsx, \
-        "the dashboard must gate the on-device toggle on the capability"
+def _admit(hello_body):
+    store = FakeStore()
+    store.add("DEV1", approved=True)
+    hub, _, _ = make_hub(store)
+    return run(hub.admit(hello_body, device_id="DEV1", peer_ip="10.0.0.5",
+                         secure=True, token=None))
 
 
-def test_triggering_is_a_separate_capability_from_scoring():
-    """
-    Shadow shipped first, so there is firmware in the field that scores the
-    wake word and reports it while having no code to act on it. Gating "on"
-    behind oww_shadow alone would offer those devices a mode that leaves them
-    scoring perfectly and never answering — the "I enabled it and nothing
-    happened" the capability rule exists to prevent.
-    """
-    caps = device_capabilities()
-    assert "oww_trigger" in caps, "firmware no longer announces oww_trigger"
-    assert "oww_shadow" in caps, \
-        "oww_trigger must not replace oww_shadow — shadow is still a mode"
-    assert "oww_trigger_capable" in CONTROLLER.read_text(), \
-        "em_controller must expose the trigger capability as a property"
-    assert "owwTriggerCapable" in API.read_text(), \
-        "/api/devices must surface the trigger capability"
-    assert "owwTriggerCapable" in (ROOT / "controller" / "static" / "dashboard.jsx").read_text(), \
-        "the dashboard must gate the 'On device' option on the capability"
+@pytest.mark.parametrize("missing", ALL_V1)
+def test_admission_rejects_a_hello_missing_any_v1_capability(missing):
+    caps = [c for c in ALL_V1 if c != missing] + ["leds", "led_anim"]
+    assert _admit(hello(caps)) == em_device.em_device_link.Rejected("protocol")
 
 
-def test_the_wake_chime_is_gated_on_the_firmware_that_carries_it():
-    """
-    The chime is embedded in the firmware and played from a `wake_sound`
-    control message, so a device that predates it ignores the message
-    entirely — no error, no sound, nothing in any log the user reads. That is
-    exactly the shape a version comparison gets wrong and a capability gets
-    right.
-
-    Both halves are pinned: the device announcing it, and the controller
-    refusing to send unless it did. The message being harmless to an old
-    device is not a reason to send it blind — "the chime is off" and "this
-    Echo cannot chime" are different answers, and only one of them is fixed
-    by turning the setting on.
-    """
-    caps = device_capabilities()
-    assert "wake_sound" in caps, "firmware no longer announces wake_sound"
-    assert "wake_sound_capable" in CONTROLLER.read_text(), \
-        "em_controller must expose the wake-sound capability as a property"
-    assert "wakeSoundCapable" in API.read_text(), \
-        "/api/devices must surface the wake-sound capability"
-    jsx = (ROOT / "controller" / "static" / "dashboard.jsx").read_text()
-    assert "wakeSoundCapable" in jsx, \
-        "the dashboard must gate the wake chime toggle on the capability"
+def test_admission_accepts_the_full_set_whatever_the_version_string():
+    result = _admit(hello(firmware_version="dev-20260101-0000"))
+    assert isinstance(result, em_device.em_device_link.Admitted)
 
 
-def test_the_wake_chime_is_audio_the_device_already_has():
-    """
-    The whole point of this feature is that the sound does not travel: the
-    clip lives in the firmware (device/internal/cue) and only the DECISION
-    crosses the link, so the feedback never waits on a link with measured
-    1.1–2.6s RTT excursions.
-
-    Pinned because the tempting "fix" for any future change to the sound is
-    to stream it from the controller like em_sounds does for a timer ring —
-    which would work, and would quietly turn the one piece of instant
-    feedback in the system into another thing that can arrive late.
-    """
-    pcm = ROOT / "device" / "internal" / "cue" / "wake_word_triggered.pcm"
-    assert pcm.exists(), "the embedded wake chime is missing"
-    assert pcm.stat().st_size > 1000, "the embedded wake chime looks like a stub"
-
-    control = CONTROL_GO.read_text()
-    assert 'case "wake_sound":' in control, \
-        "the device must handle the wake_sound control message"
-
-    controller = CONTROLLER.read_text()
-    m = re.search(r'async def play_wake_sound\(self\):(.*?)\n    async def',
-                  controller, re.S)
-    assert m, "em_controller.Device must still have play_wake_sound"
-    body = m.group(1)
-    assert '"type": "wake_sound"' in body, \
-        "play_wake_sound must send the wake_sound control message"
-    assert "send_data" not in body and "stream_speaker" not in body, \
-        "the chime must not be streamed as audio — it is already on the device"
+@pytest.mark.parametrize("bad", [{"protocols": [2]}, {"protocols": None},
+                                 {"capabilities": "audio_timeline_v1"}])
+def test_admission_rejects_a_malformed_or_unsupported_hello(bad):
+    body = hello()
+    body.update(bad)
+    assert _admit(body) == em_device.em_device_link.Rejected("protocol")
 
 
-def test_native_afe_capability_is_surfaced_to_the_dashboard():
-    """
-    docs/native-afe-migration.md's bypass table: beamformingEnabled,
-    aecEnabled, agcEnabled and the mic gain controls do nothing while the
-    native-AFE backend is running, so the dashboard must be able to tell that
-    apart from an ordinary device — the same "cannot vs off" reasoning as
-    oww_shadow, just with the polarity inverted (this capability being present
-    is what DISABLES controls, not what offers a new one).
-    """
-    assert "native_afe_capable" in CONTROLLER.read_text(), \
-        "em_controller must expose the native-AFE capability as a property"
-    assert "nativeAfeCapable" in API.read_text(), \
-        "/api/devices must surface the native-AFE capability"
-    jsx = (ROOT / "controller" / "static" / "dashboard.jsx").read_text()
-    assert "nativeAfeCapable" in jsx and "afeActive" in jsx, \
-        "the dashboard must gate the beamformer/AEC/AGC/gain controls on the capability"
-
-
-def test_the_toggle_control_actually_honours_disabled():
-    """
-    "Disabled with the reason, never a control that silently does nothing" is
-    the whole rule the bypass table above is enforced by — and for the first
-    release of it, Toggle did not take a `disabled` prop at all (only Slider
-    did). Beamforming, Echo cancel and Auto gain therefore rendered greyed
-    with their reason, read as off, and WROTE THE OPPOSITE VALUE into config
-    when clicked: worse than doing nothing, because the setting silently
-    disagreed with what the control showed.
-
-    Asserted against the component rather than the call sites, because the
-    call sites already looked correct while the bug was live.
-    """
-    jsx = (ROOT / "controller" / "static" / "dashboard.jsx").read_text()
-    m = re.search(r'function Toggle\(\{(.*?)\}\)', jsx, re.S)
-    assert m, "dashboard.jsx must still define a Toggle component"
-    assert "disabled" in m.group(1), \
-        "Toggle must accept a `disabled` prop — every caller that passes one " \
-        "is relying on it to refuse the write, not merely to grey the switch"
-
-    body = jsx[m.end():jsx.index("\n}", m.end())]
-    assert re.search(r'if\s*\(!disabled\)|disabled\s*\?\s*undefined|disabled\s*\|\|', body), \
-        "Toggle's click handler must check `disabled` before calling onChange — " \
-        "styling it grey while still writing the value is the bug this pins"
-
-
-def test_native_afe_toggle_is_gated_on_the_backend_capability_not_the_active_one():
-    """
-    native_afe_backend is a fixed fact about the BUILD (compiled-in backends
-    + a start_server.sh new enough to check the marker); native_afe reflects
-    only whether the AFE happens to be running right now. The dashboard's
-    toggle — which offers to turn it ON — has to gate on the former: gating
-    on the latter would mean the control to enable it only appears once it
-    is already enabled.
-    """
-    assert "native_afe_backend" in CONTROLLER.read_text(), \
-        "em_controller must expose the native-AFE backend capability as a property"
-    assert "nativeAfeBackendCapable" in API.read_text(), \
-        "/api/devices must surface the native-AFE backend capability"
-    jsx = (ROOT / "controller" / "static" / "dashboard.jsx").read_text()
-    assert "nativeAfeBackendCapable" in jsx, \
-        "the dashboard must gate the native-AFE toggle on the backend capability"
-
-
-def test_capabilities_reported_before_the_server_exists_are_not_lost():
-    """
-    A device registers BEFORE its ESPHome server is created — the listener
-    only comes up once the device is present — so the capability push finds
-    no server. Dropping it there built the entity list from an empty set, and
-    that list is a ONE-SHOT at ListEntities time: HA caches it and the sensor
-    is absent for the life of the connection.
-
-    Observed on Retreat, 2026-08-03: registered 05:25:33, server created
-    05:25:34, no ambient light entity in HA afterwards. The same race resolves
-    differently on each controller restart, which is why the graph came and
-    went rather than simply never working.
-
-    Read as source, not imported: em_esphome pulls in zeroconf and aiohttp,
-    which this suite deliberately does without.
-    """
-    src = ESPHOME.read_text()
-    setter = re.search(r"def set_device_capabilities\(.*?\n(?=\n\ndef |\Z)", src, re.S)
-    assert setter, "could not find set_device_capabilities"
-    body = setter.group(0)
-    # The store must happen unconditionally — not inside the "if server" arm,
-    # which is exactly what dropped it.
-    store = re.search(r"^\s{4}_pending_caps\[device_id\]\s*=", body, re.M)
-    assert store, (
-        "set_device_capabilities must hold the capabilities unconditionally; "
-        "pushing them only when a server already exists loses them"
-    )
-
-
-def test_the_pending_capabilities_are_applied_when_the_server_is_built():
-    """
-    Guard against the two halves drifting: holding the value is only useful
-    if server creation applies it to the same attribute the ListEntities gate
-    reads (_device_has → srv.capabilities).
-    """
-    src = ESPHOME.read_text()
-    create = re.search(r"async def _register_device_server\(.*?\n(?=\n\nasync def |\n\ndef |\Z)",
-                       src, re.S)
-    assert create, "could not find _register_device_server"
-    body = create.group(0)
-    assert "_pending_caps" in body, \
-        "server creation must seed capabilities from the pending map"
-    assert "set_capabilities" in body, \
-        "and must apply them via the same setter the entity gate reads"
-
-
-def test_a_capability_that_changes_later_rebuilds_the_entity_list():
-    """
-    The other half of the one-shot problem, and `_pending_caps` does not reach
-    it: when capabilities change AFTER HA has enumerated, the server has the
-    new list but HA read the entity list once at connect and never asks again.
-
-    Reachable in normal operation rather than only in theory. `als.resolve()`
-    deliberately does not cache a negative result, because the first lookup
-    happens moments after a cold boot when sysfs is least likely to be
-    complete — so a device can register without `ambient_light` and acquire it
-    on a later scan. Before this, that device kept the entity list from the
-    registration that missed the sensor, and the only cure was a controller
-    restart that happened to win the race (#90).
-
-    Bouncing the HA connection is the documented remedy; `update_oww_model`
-    does the same for the wake word configuration, and HA redials in seconds.
-    """
-    src = ESPHOME.read_text()
-    setter = re.search(r"def set_device_capabilities\(.*?\n(?=\n\ndef |\Z)", src, re.S)
-    assert setter, "could not find set_device_capabilities"
-    body = setter.group(0)
-
-    assert "disconnect()" in body, (
-        "a capability change after ListEntities must bounce the HA connection, "
-        "or the new entity never appears for the life of that connection"
-    )
-    # It must be conditional on an actual change. Bouncing on every register
-    # would drop HA's connection on every device reconnect.
-    assert re.search(r"if\s+set\(caps\)\s*==\s*before", body), (
-        "the bounce must be gated on the capability set actually changing; "
-        "bouncing unconditionally disconnects HA on every device reconnect"
-    )
-
-
-def test_the_api_can_tell_no_sensor_from_no_reading():
-    """
-    0 lux is a real reading from a covered sensor, so absence cannot be
-    expressed as a value: whether the device HAS the sensor has to be a
-    separate field from what it read.
-
-    Asserted on the API rather than the dashboard deliberately. A first
-    attempt put this on the Status tab, which pushed the panel past its
-    height and gave the page a scrollbar — what the device panel should show
-    is its own question, tracked separately. The API field stands on its own
-    merits regardless of who renders it.
-    """
-    api = (Path(__file__).resolve().parent.parent / "em_api.py").read_text()
-    assert "ambientLightCapable" in api, \
-        "/api/devices must report whether the device found its ALS"
+@pytest.mark.parametrize("prop, cap", [
+    ("led_anim_capable", "led_anim"),
+    ("button_hold_capable", "button_hold"),
+    ("ambient_light_capable", "ambient_light"),
+])
+def test_ui_capability_properties_follow_the_announced_set(prop, cap):
+    async def scenario():
+        store = FakeStore()
+        store.add("DEV1", approved=True)
+        hub, _, _ = make_hub(store)
+        device = await hub.ensure("DEV1", "Office")
+        for caps, version, expected in ((ALL_V1, "v99.0.0", False),
+                                        (ALL_V1 + [cap], "v0.0.1", True)):
+            link = FakeLink(hello(sorted(set(caps)), firmware_version=version))
+            await device._ready(link)
+            assert getattr(device, prop) is expected
+            device._lost(link, "closed")
+        await device.close()
+    run(scenario())

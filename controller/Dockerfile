@@ -7,28 +7,17 @@ WORKDIR /app
 # Install curl for vendoring JS dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends curl ffmpeg && rm -rf /var/lib/apt/lists/*
 # Install Python dependencies
-COPY requirements.txt .
+COPY controller/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 # GPU=1 swaps the CPU onnxruntime from requirements.txt for the CUDA build
-# (both provide the same `onnxruntime` import, so they can't coexist).
-# Local docker-compose.yml sets it; the published GHCR image is CPU-only.
-#
-# The two packages DO NOT share a version line, so this pin cannot be kept
-# in lockstep with requirements.txt by matching the string. onnxruntime
-# publishes 1.20.1 and no 1.20.2; onnxruntime-gpu publishes 1.20.0 and
-# 1.20.2 and no longer publishes 1.20.1 — it was there when this was
-# written and has since gone. The failure only ever surfaces on a fresh
-# local GPU build (the published image is CPU-only and never runs this
-# line), which is why it sat here unnoticed until 2026-08-10.
+# (both provide the `onnxruntime` import, so they cannot coexist). Local
+# docker-compose.yml sets it; the published image is CPU-only. The GPU package
+# has its own version line (no 1.20.1), so the pins differ deliberately.
 ARG GPU=0
 RUN if [ "$GPU" = "1" ]; then \
       pip uninstall -y onnxruntime && \
       pip install --no-cache-dir onnxruntime-gpu==1.20.2; \
     fi
-# Install openwakeword without deps — tflite-runtime has no Python 3.12
-# x86_64 build; onnxruntime handles inference instead
-RUN pip install --no-cache-dir --no-deps openwakeword==0.6.0 && \
-    python3 -c "import openwakeword; openwakeword.utils.download_models()"
 # Vendor JS dependencies — served locally, no CDN needed at runtime
 RUN mkdir -p /app/static/vendor/fonts && \
     curl -sfL -o /app/static/vendor/react.min.js \
@@ -55,36 +44,18 @@ RUN mkdir -p /app/static/vendor/fonts && \
 # describe only outside a container).
 ARG EM_CONTROLLER_VERSION=dev
 ENV EM_CONTROLLER_VERSION=$EM_CONTROLLER_VERSION
-# Controller source
-COPY em_controller.py .
-COPY em_api.py .
-COPY em_db.py .
-COPY em_auth.py .
-COPY em_eq.py .
-COPY em_scenes.py .
-COPY em_support.py .
-COPY em_shadow.py .
-COPY em_ns.py .
-COPY em_pki.py .
-COPY em_linkauth.py .
-COPY em_esphome.py .
-COPY em_ble_proxy.py .
-COPY em_oww_assets.py  ./
-COPY em_oww_models.py .
-COPY em_arbiter.py .
-COPY em_button.py .
-COPY em_tap_burst.py .
-COPY em_player.py .
-COPY em_config_sections.py .
-COPY em_recordings.py .
-COPY em_turnclock.py .
-COPY em_sounds.py .
-COPY em_volume.py .
-COPY version.py .
-# ESPHome native API subpackage (frame protocol, message registry, vendored protobuf)
-COPY esphome/ ./esphome/
-# Device payloads (start_server.sh etc.) — canonical copies served to devices
-COPY device_payloads/ ./device_payloads/
+# Controller source. The root build context is required for the deployed
+# BCResNet registry seed below; Compose and the release workflow name this
+# Dockerfile explicitly.
+COPY controller/em_*.py ./
+COPY controller/version.py .
+COPY controller/esphome/ ./esphome/
+COPY controller/device_payloads/ ./device_payloads/
+COPY controller/echomuse_grammar/ ./echomuse_grammar/
+COPY controller/speech_bundle.json .
+COPY controller/tools/fetch_speech_bundle.py ./tools/fetch_speech_bundle.py
+# Verified deployed graph + sidecar: the registry seed (§5.1, §18.5).
+COPY bcresnet_audio.onnx bcresnet_audio.json ./
 
 # DTLN noise-suppression models (em_ns.py) — vendored at build time like the
 # JS deps above; pinned to a commit so builds are reproducible. MIT licensed.
@@ -94,32 +65,29 @@ RUN mkdir -p /app/models/dtln && \
     curl -sfL -o /app/models/dtln/model_2.onnx \
       https://raw.githubusercontent.com/breizhn/DTLN/1de1f15a8b5b7e1c44905618ff2ef70ca8277fbc/pretrained_model/model_2.onnx
 
-# ONNX Runtime for the DEVICE (armeabi-v7a) — on-device wake word assets.
-#
-# NOT a controller dependency: it is a 12.3MB ARM shared library the
-# controller only ever *distributes*, because it is deliberately absent from
-# the firmware (12.3MB would double the OTA payload and both A/B slots).
-# Vendored so devices never need internet, and pinned by AAR sha256 so a
-# rebuild cannot silently change what gets installed on a device — a
-# byte-for-byte match against what is already fielded is how the provenance
-# of the hand-installed copy was confirmed. MIT licensed.
-#
-# Extracted with Python's zipfile because unzip is not in the slim base.
-RUN mkdir -p /app/models/oww_runtime && \
+# Device ONNX Runtime (armeabi-v7a 1.19.2, §16.5): served to devices as a
+# hash-named speech asset over /device/v1/assets, never loaded here. Pinned by
+# the AAR's SHA-256; em_device_assets re-verifies the extracted library
+# (174233cf…) at startup. MIT licensed. Extracted with zipfile (no unzip in
+# the slim base).
+RUN mkdir -p /app/models/ort_android && \
     curl -sfL -o /tmp/ort.aar \
       https://repo1.maven.org/maven2/com/microsoft/onnxruntime/onnxruntime-android/1.19.2/onnxruntime-android-1.19.2.aar && \
     echo "84737dd1fdb715f0ee695c0a9864f6949b66ecb4c46ca733bc9211bf0c2a7b5f  /tmp/ort.aar" | sha256sum -c - && \
-    python -c "import zipfile, shutil; z = zipfile.ZipFile('/tmp/ort.aar'); shutil.copyfileobj(z.open('jni/armeabi-v7a/libonnxruntime.so'), open('/app/models/oww_runtime/libonnxruntime.so', 'wb'))" && \
+    python -c "import zipfile, shutil; z = zipfile.ZipFile('/tmp/ort.aar'); shutil.copyfileobj(z.open('jni/armeabi-v7a/libonnxruntime.so'), open('/app/models/ort_android/libonnxruntime.so', 'wb'))" && \
     rm /tmp/ort.aar
+
+# Hash-pinned §16.6 controller speech bundle: Kroko streaming ASR (CC-BY-SA),
+# Silero v5 (MIT), and the sherpa-onnx wheel (Apache-2.0). The fetcher verifies
+# every download and writes Kroko attribution linking
+# https://huggingface.co/Banafo/Kroko-ASR into /app/speech.
+RUN python ./tools/fetch_speech_bundle.py /app/speech
+
 # Dashboard SPA — placeholder is index.html, full dashboard is dashboard.html
-COPY static/ ./static/
+COPY controller/static/ ./static/
 # Compile JSX dashboard with esbuild
 RUN EARCH="$(dpkg --print-architecture)" && case "$EARCH" in amd64) EPKG=linux-x64 ;; arm64) EPKG=linux-arm64 ;; *) echo "unsupported arch: $EARCH" >&2; exit 1 ;; esac && curl -sfL -o /tmp/esbuild.tar.gz "https://registry.npmjs.org/@esbuild/${EPKG}/-/${EPKG}-0.20.2.tgz" &&     tar -xz -C /tmp -f /tmp/esbuild.tar.gz &&     install -m755 /tmp/package/bin/esbuild /usr/local/bin/esbuild &&     esbuild /app/static/dashboard.jsx       --bundle=false       --jsx=transform       --jsx-factory=React.createElement       --jsx-fragment=React.Fragment       --outfile=/app/static/dashboard.js &&     rm -rf /tmp/esbuild.tar.gz /tmp/package /usr/local/bin/esbuild
 # Database persisted via volume mount
 # docker run -v ~/EchoMuse/controller/data:/app/data ...
 # Set DB_PATH=/app/data/echomuse.db in environment
-COPY em_start.py .
-# em_start.py bridges /data/options.json (Home Assistant add-on config) into
-# the env vars em_controller.py already reads, then execs into it — a no-op
-# outside the add-on, where /data/options.json doesn't exist.
 CMD ["python", "-u", "em_start.py"]

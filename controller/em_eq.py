@@ -19,7 +19,7 @@ Band centre frequencies and types:
   7: 8000 Hz  — high shelf
 
 All filter design uses the Audio EQ Cookbook by Robert Bristow-Johnson.
-High-pass uses scipy.signal.butter (already a dependency via openwakeword).
+High-pass uses scipy.signal.butter.
 
 Usage:
     import em_eq

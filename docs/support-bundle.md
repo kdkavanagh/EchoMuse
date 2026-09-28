@@ -43,12 +43,12 @@ on a regular expression.
 | Controller version, schema version | Almost every "is this fixed?" question starts here. |
 | Device serials | Nothing correlates without them. They identify your hardware to you; they are not otherwise meaningful. |
 | Firmware version, rollback slot, approval state | Tells us whether a fix is even present on that device. |
-| **Capabilities** (`mic`, `oww_shadow`, `ambient_light`…) | Decides which Home Assistant entities exist at all. "The light sensor didn't appear" is answered here in one line. |
+| **Capabilities** (`device_wake_v1`, `alert_cache_v1`, `ambient_light`…) | Decides which features and Home Assistant entities exist at all. "The light sensor didn't appear" is answered here in one line. |
 | Configuration — thresholds, EQ, LED scenes, wake model | Behaviour, not identity. Keys whose *name* looks credential-shaped are redacted anyway. |
 | Turn metadata — outcome, wake score, stage latencies, underruns | What happened and how long each stage took. No words, just timings and outcomes. |
 | Hourly metrics per device — CPU, memory, storage, temperature, RSSI, RTT | Trends. Signal strength is included; the network's name is not. |
 | The controller's own CPU (1m/5m/1h), memory, storage and uptime | A device starving for audio can be the host running out of CPU, memory or disk. The three windows separate "busy right now" from "busy earlier", which need different answers. Sizes and counts only, never paths. |
-| Wake counters — near-misses, on-device drops, inference timings | Wake-word behaviour without any audio. |
+| Wake counters — near-misses, on-device overruns, inference timings | Wake-word behaviour without any audio. |
 | Recent controller log lines, sanitised | What the controller itself was doing — the part that explains most "it did the wrong thing" reports. Quoted text and URLs removed. |
 | Recent per-device log lines, sanitised | What each device reported. Repetitive memory dumps are thinned so they cannot crowd out the rest. |
 

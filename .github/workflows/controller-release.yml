@@ -18,7 +18,7 @@ name: Controller Release (Docker image)
 # could not work on one at all — building locally was the only route, and
 # until #81 even that failed on the hard-coded x86-64 esbuild download.
 # Every Python dependency resolves to a prebuilt aarch64 wheel on this base
-# image, including speexdsp-ns and onnxruntime, so the arm64 build compiles
+# image, including onnxruntime and sherpa-onnx, so the arm64 build compiles
 # nothing; it is emulated with QEMU, which costs time on the runner and
 # nothing at run time.
 
@@ -97,7 +97,10 @@ jobs:
         id: build
         uses: docker/build-push-action@v6
         with:
-          context: controller
+          # Root context: the image seeds the wake registry from the
+          # repository-root bcresnet_audio.onnx/.json (SPEC §5.1, §18.5).
+          context: .
+          file: controller/Dockerfile
           push: true
           platforms: linux/amd64,linux/arm64
           build-args: |
@@ -110,9 +113,9 @@ jobs:
       # ── Supply chain ────────────────────────────────────────────────────
       #
       # The image is what users actually run, and it is the only place the
-      # full dependency set exists: requirements.txt leaves four packages
-      # unpinned, openwakeword is installed with --no-deps, and the Debian
-      # base contributes ffmpeg and curl. So the SBOM is generated from the
+      # full dependency set exists: requirements.txt leaves scipy and
+      # protobuf unpinned, and the Debian base contributes ffmpeg and curl.
+      # So the SBOM is generated from the
       # built image, never from requirements.txt.
       #
       # amd64 only. The two architectures install the same wheels from the

@@ -8,6 +8,7 @@ per device and never appears in the dashboard, and nothing else would notice.
 import json
 import re
 from pathlib import Path
+import sqlite3
 
 import pytest
 
@@ -75,31 +76,43 @@ def test_dashboard_section_map_matches_python():
 
 # ─── Resolution ──────────────────────────────────────────────────────────────
 
+FLEET_MODEL = "4eb745120ea56f5681eddbf788a0c69e1fd406d4694a04a4dba0c1e41d862d3f"
+OTHER_MODEL = "f" * 64
+
+
 def _glob():
-    return {"owwThreshold": 0.5, "ledScene": "standard", "micGainDb": 24,
-            "agcEnabled": True, "bleProxyEnabled": False, "eqLoudness": False}
+    return {"wakeModel": FLEET_MODEL, "ledScene": "standard", "nsAsr": False,
+            "buttonMultiTapMs": 0, "bleProxyEnabled": False, "eqLoudness": False}
 
 
 def test_no_sections_is_pure_fleet():
-    dev = {"owwThreshold": 0.9, "ledScene": "pride"}
+    dev = {"wakeModel": OTHER_MODEL, "ledScene": "pride"}
     out = cs.merge(_glob(), dev, [])
-    assert out["owwThreshold"] == 0.5
+    assert out["wakeModel"] == FLEET_MODEL
     assert out["ledScene"] == "standard"
 
 
 def test_only_the_overridden_section_wins():
-    dev = {"owwThreshold": 0.9, "ledScene": "pride", "micGainDb": 40}
+    dev = {"wakeModel": OTHER_MODEL, "ledScene": "pride", "nsAsr": True}
     out = cs.merge(_glob(), dev, ["ring"])
     assert out["ledScene"] == "pride"       # overridden section
-    assert out["owwThreshold"] == 0.5       # fleet
-    assert out["micGainDb"] == 24           # fleet
+    assert out["wakeModel"] == FLEET_MODEL  # fleet
+    assert out["nsAsr"] is False            # fleet
 
 
-def test_all_sections_reproduces_the_old_full_override():
-    dev = {"owwThreshold": 0.9, "ledScene": "pride", "micGainDb": 40}
+def test_all_sections_reproduces_a_full_override():
+    dev = {"wakeModel": OTHER_MODEL, "ledScene": "pride", "nsAsr": True}
     out = cs.merge(_glob(), dev, list(cs.SECTION_IDS))
     for k, v in dev.items():
         assert out[k] == v
+
+
+def test_removed_keys_are_neither_config_nor_scoped():
+    """SPEC §18.4: a REMOVED/REPLACED key must not survive as a default or as
+    a section member, or the dashboard would keep offering a dead control."""
+    mapped = {k for s in cs.SECTIONS.values() for k in s["keys"]}
+    assert not (em_db.REMOVED_CONFIG_KEYS & set(em_db.DEFAULT_DEVICE_CONFIG))
+    assert not (em_db.REMOVED_CONFIG_KEYS & mapped)
 
 
 def test_state_keys_always_come_from_the_device():
@@ -148,7 +161,7 @@ def test_v8_backfill_is_lossless(tmp_path, use_global, expected):
     with em_db._tx() as conn:
         conn.execute(
             "UPDATE devices SET use_global_config = ?, config = ? WHERE device_id = 'dev1'",
-            (use_global, json.dumps({"ledScene": "pride", "micGainDb": 40})),
+            (use_global, json.dumps({"ledScene": "pride", "nsAsr": True})),
         )
         conn.execute(
             "UPDATE devices SET config_sections = ? WHERE device_id = 'dev1'",
@@ -160,7 +173,7 @@ def test_v8_backfill_is_lossless(tmp_path, use_global, expected):
         assert eff["ledScene"] == em_db.DEFAULT_DEVICE_CONFIG["ledScene"]
     else:
         assert eff["ledScene"] == "pride"
-        assert eff["micGainDb"] == 40
+        assert eff["nsAsr"] is True
 
 
 def test_reverting_a_section_discards_its_values(tmp_path):
@@ -171,12 +184,12 @@ def test_reverting_a_section_discards_its_values(tmp_path):
     em_db.init(str(tmp_path / "t.db"))
     em_db.register_new_device("dev1", "10.0.0.9", "vtest")
     em_db.set_device_config_sections("dev1", ["ring", "microphones"])
-    em_db.set_device_config("dev1", {"ledScene": "pride", "micGainDb": 40})
+    em_db.set_device_config("dev1", {"ledScene": "pride", "nsAsr": True})
 
     em_db.set_device_config_sections("dev1", ["microphones"])
     stored = em_db.get_device_config("dev1")
     assert "ledScene" not in stored, "reverted section left a shadow value"
-    assert stored["micGainDb"] == 40, "still-overridden section lost its value"
+    assert stored["nsAsr"] is True, "still-overridden section lost its value"
 
     # And re-overriding starts from the fleet, not the discarded value.
     em_db.set_device_config_sections("dev1", ["ring", "microphones"])
@@ -213,7 +226,7 @@ def test_v11_prunes_out_of_scope_values_from_migrated_rows(tmp_path, monkeypatch
         conn.execute(
             "UPDATE devices SET config_sections = '[]', config = ? WHERE device_id = 'dev1'",
             (json.dumps({"ledScene": "malevolent", "owwModel": "hey_mycroft_v0.1",
-                         "micGainDb": 40, "startupVolume": 42}),),
+                         "nsAsr": True, "startupVolume": 42}),),
         )
         conn.execute("UPDATE system_config SET value = '10' WHERE key = 'schema_version'")
 
@@ -228,9 +241,40 @@ def test_v11_prunes_out_of_scope_values_from_migrated_rows(tmp_path, monkeypatch
     stored = em_db.get_device_config("dev1")
     assert "ledScene" not in stored, "out-of-scope value survived the prune"
     assert "owwModel" not in stored
-    assert "micGainDb" not in stored
+    assert "nsAsr" not in stored
     # State keys are never section-scoped and must survive.
     assert stored["startupVolume"] == 42
+
+
+
+def test_v21_removes_the_obsolete_timer_barge_switch():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        CREATE TABLE system_config (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE devices (device_id TEXT PRIMARY KEY, config TEXT);
+        """
+    )
+    conn.execute(
+        "INSERT INTO system_config VALUES ('global_device_config', ?)",
+        (json.dumps({"owwThreshold": 0.9, "ringBargeIn": False}),),
+    )
+    conn.execute(
+        "INSERT INTO devices VALUES ('dev1', ?)",
+        (json.dumps({"ringBargeIn": True, "owwModel": "ophelia"}),),
+    )
+
+    em_db._fixup_v21(conn)
+
+    fleet = json.loads(conn.execute(
+        "SELECT value FROM system_config WHERE key = 'global_device_config'"
+    ).fetchone()["value"])
+    device = json.loads(conn.execute(
+        "SELECT config FROM devices WHERE device_id = 'dev1'"
+    ).fetchone()["config"])
+    assert fleet == {"owwThreshold": 0.9}
+    assert device == {"owwModel": "ophelia"}
 
 
 def test_config_form_does_not_reference_a_device_it_never_receives():

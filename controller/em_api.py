@@ -1,39 +1,14 @@
-"""
-em_api.py — EchoMuse Controller HTTP API + Dashboard
-=====================================================
+"""EchoMuse dashboard and authenticated HTTP API.
 
-aiohttp web application running in the same asyncio event loop as the
-WebSocket controller. Serves:
-
-  /                         — dashboard SPA (static/index.html)
-  /setup                    — first-run admin account creation
-  /api/auth/*               — login, logout, current user
-  /api/devices/*            — fleet management, config, logs, OTA
-  /api/releases/*           — GitHub release tracking and deployment
-  /api/system/*             — controller status and config
-  WS /api/events            — live push: device state, logs, pending
-  WS /api/devices/{id}/shell — proxied root shell on device
-
-Path routing is handled by the existing websockets router in
-em_controller.py — aiohttp handles /api/* and /, websockets handles
-/control, /data, and /shell/{device_id}.
-
-Usage (from em_controller.py main()):
-    import em_api
-    runner = await em_api.create_runner(devices_ref)
-    await runner.setup()
-    site = web.TCPSite(runner, host, port + 1)   # or same port via middleware
-    await site.start()
-    ...
-    await runner.cleanup()
-
-The _devices dict reference is passed in so the API can merge live
-state with persisted DB state without coupling to a global.
+The device protocol sockets are owned by em_controller; this module serves the
+SPA, fleet/configuration/diagnostic APIs, update and provisioning infrastructure,
+and the dashboard event and shell WebSockets.
 """
 
 import asyncio
 import hashlib
 import html as _html
+import io
 import json
 import logging
 import os
@@ -43,26 +18,29 @@ import shutil
 import sqlite3 as _sqlite3
 import tempfile
 import time
+import zipfile
+from datetime import date
 from pathlib import Path
 from typing import Any, Optional
 
 import aiohttp
 from aiohttp import web
-import websockets
 
 import em_db as db
 import em_auth as auth
 import em_ble_proxy
 import em_config_sections as sections_mod
-import em_oww_assets
-import em_oww_models
 import em_pki
 import em_player
 import em_recordings
+import em_capture
+import em_samples
+import em_wakeclips
+import em_ambient
 import em_volume
-import em_scenes
-import em_shadow
 import em_sounds
+import em_device_assets
+import em_wake_registry
 import em_support
 from version import VERSION as CONTROLLER_VERSION
 from version import compare as _compare_versions
@@ -150,6 +128,28 @@ _controller_cache_ts: float = 0.0
 
 # Reference to the live devices dict from em_controller — set by init().
 _devices: dict = {}
+
+
+def _online(device_id: str):
+    """The connected Device (v1 or upgrade-only legacy), otherwise None."""
+    device = _devices.get(device_id)
+    return device if device is not None and device.online else None
+
+
+def _v1(device_id: str):
+    """A connected v1 Device, otherwise None; diagnostics/alerts need v1."""
+    device = _online(device_id)
+    return device if device is not None and device.link is not None else None
+
+
+def _parse_free_mb(df_line: str) -> int | None:
+    """Available MiB from a BusyBox `df -m` row; wrapped device names make
+    numeric field indexes unstable, so anchor on the percentage field."""
+    fields = (df_line or "").split()
+    for i, field in enumerate(fields):
+        if field.endswith("%") and i > 0 and fields[i - 1].isdigit():
+            return int(fields[i - 1])
+    return None
 
 # Device-link TLS material directory — set by em_controller.main() once
 # em_pki.ensure_pki() succeeds. None = TLS listener not running (no
@@ -285,25 +285,60 @@ async def create_app() -> web.Application:
     app.router.add_get("/api/devices/{id}/turns",         _get_device_turns)
     app.router.add_get("/api/devices/{id}/activity",      _get_device_activity)
     app.router.add_get("/api/devices/{id}/turns/{turn}/audio", _get_turn_audio)
+    # Wake clips — the pre-detection audio that crossed the threshold. The
+    # per-turn WAV sits beside the turn's utterance because that is the pair
+    # you look at together; the archive and the purge are device-wide.
+    # wakeclips.zip before wakeclips for the file's ordering rule, though
+    # here they are two distinct literal segments and cannot collide.
+    app.router.add_get("/api/devices/{id}/turns/{turn}/wake", _get_turn_wake_audio)
+    app.router.add_get("/api/devices/{id}/wakeclips.zip",  _get_wakeclips_zip)
+    app.router.add_delete("/api/devices/{id}/wakeclips",   _delete_wakeclips)
+    # Wake-word sample collection. samples.zip before samples/{name} — the
+    # two cannot collide (different segment counts), but the file's ordering
+    # rule is worth keeping honest.
+    app.router.add_post("/api/devices/{id}/collect",      _post_device_collect)
+    app.router.add_get("/api/devices/{id}/samples.zip",   _get_samples_zip)
+    app.router.add_get("/api/devices/{id}/samples",       _get_samples)
+    app.router.add_delete("/api/devices/{id}/samples",    _delete_samples)
+    app.router.add_get("/api/devices/{id}/samples/{name}", _get_sample_audio)
+    app.router.add_delete("/api/devices/{id}/samples/{name}", _delete_sample)
+    # Ambient recording — the mic held open, one file per session. `/ambient`
+    # before `/ambient/{name}` for the same ordering reason as above.
+    app.router.add_post("/api/devices/{id}/ambient",          _post_device_ambient)
+    app.router.add_get("/api/devices/{id}/ambient",           _get_ambient)
+    app.router.add_delete("/api/devices/{id}/ambient",        _delete_ambient_all)
+    app.router.add_get("/api/devices/{id}/ambient/{name}",    _get_ambient_audio)
+    app.router.add_delete("/api/devices/{id}/ambient/{name}", _delete_ambient)
+    # Script-driven capture. The mode, then windows inside it — see em_capture.
+    # /window/stop before /window: aiohttp matches in registration order and
+    # the two would otherwise be ambiguous only by luck.
+    app.router.add_get("/api/devices/{id}/capture",             _get_device_capture)
+    app.router.add_post("/api/devices/{id}/capture",            _post_device_capture)
+    app.router.add_post("/api/devices/{id}/capture/window/stop", _post_capture_window_stop)
+    app.router.add_get("/api/devices/{id}/capture/recording",   _get_capture_recording)
+    app.router.add_post("/api/devices/{id}/capture/window",     _post_capture_window)
     app.router.add_post("/api/devices/{id}/wifi",         _post_device_wifi)
     app.router.add_post("/api/devices/{id}/wifi/scan",    _post_device_wifi_scan)
     app.router.add_post("/api/devices/{id}/update",       _post_device_update)
     app.router.add_post("/api/devices/{id}/rollback",     _post_device_rollback)
-    app.router.add_post("/api/devices/{id}/native_afe",   _post_device_native_afe)
     app.router.add_post("/api/releases/upload",           _post_upload_binary)
 
-    # Custom wake-word models (oww_forge output → data/oww_models/)
-    app.router.add_get("/api/oww_models",             _get_oww_models)
-    app.router.add_post("/api/oww_models/upload",     _post_oww_model_upload)
-    app.router.add_delete("/api/oww_models/{file}",   _delete_oww_model)
-    app.router.add_get("/api/sounds",                 _get_sounds)
-    app.router.add_post("/api/sounds/upload",         _post_sound_upload)
-    app.router.add_delete("/api/sounds/{id}",         _delete_sound)
-    app.router.add_post("/api/devices/{id}/sounds/test", _post_sound_test)
-    app.router.add_post("/api/devices/{id}/sounds/stop", _post_sound_stop)
+    # Content-addressed BCResNet registry and per-device named speech assets.
+    app.router.add_get("/api/wake_models",             _get_wake_models)
+    app.router.add_post("/api/wake_models/upload",     _post_wake_model_upload)
+    app.router.add_delete("/api/wake_models/{sha256}", _delete_wake_model)
+    app.router.add_get("/api/devices/{id}/speech_assets", _get_speech_assets)
+
+    # Alert sound catalog and alert panel.
+    app.router.add_get("/api/sounds",                    _get_sounds)
+    app.router.add_post("/api/sounds/upload",            _post_sound_upload)
+    app.router.add_delete("/api/sounds/{id}",            _delete_sound)
+    app.router.add_post("/api/devices/{id}/sounds/preview", _post_sound_preview)
+    app.router.add_post("/api/devices/{id}/sounds/stop",    _post_sound_stop)
+    app.router.add_get("/api/devices/{id}/alerts",       _get_device_alerts)
+    app.router.add_post("/api/devices/{id}/alarms",      _post_alarm)
+    app.router.add_post("/api/devices/{id}/alarms/cancel", _post_alarm_cancel)
     app.router.add_get("/api/devices/{id}/shell",         _ws_shell)
-    app.router.add_get("/api/devices/{id}/oww_assets",    _get_oww_assets)
-    app.router.add_post("/api/devices/{id}/oww_assets",   _post_oww_assets)
 
     # Releases
     app.router.add_get("/api/releases/latest",   _get_latest_release)
@@ -320,6 +355,7 @@ async def create_app() -> web.Application:
     app.router.add_get("/api/system/status",    _get_system_status)
     app.router.add_get("/api/system/config",    _get_system_config)
     app.router.add_patch("/api/system/config",  _patch_system_config)
+    app.router.add_get("/api/ha/status",        _get_ha_status)
 
     # Provisioning
     app.router.add_get("/api/provision/start_script", _get_provision_start_script)
@@ -327,8 +363,6 @@ async def create_app() -> web.Application:
     app.router.add_get("/api/provision/debloat_packages", _get_provision_debloat_packages)
     app.router.add_get("/api/provision/magisk_db",    _get_provision_magisk_db)
     app.router.add_get("/api/provision/latest_binary", _get_provision_latest_binary)
-    app.router.add_get("/api/provision/oww_assets",    _get_provision_oww_manifest)
-    app.router.add_get("/api/provision/oww_asset/{name}", _get_provision_oww_asset)
     app.router.add_post("/api/provision/tls_credentials", _post_provision_tls_credentials)
     app.router.add_post("/api/provision/diagnostics",     _post_provision_diagnostics)
     app.router.add_post("/api/devices/{id}/secure_link",  _post_secure_link)
@@ -378,7 +412,7 @@ async def _error_middleware(request: web.Request, handler):
         return e.to_response()
     except web.HTTPException:
         raise  # let aiohttp handle its own HTTP exceptions normally
-    except Exception as e:
+    except Exception:
         log.exception(f"Unhandled error in {request.method} {request.path}")
         return _error("internal_error", "An internal error occurred", 500)
 
@@ -610,154 +644,625 @@ def _slug(text: str) -> str:
     return out or "device"
 
 
-@auth.require_auth
-async def _get_device_activity(request: web.Request) -> web.Response:
-    """GET /api/devices/{id}/activity?days=7 — aggregated activity stats
-    for trend review: per-day turn buckets (counts, outcomes, latency
-    percentiles, wake scores, underruns), per-wake-model rollups, hourly
-    near-miss counters, and hourly hardware metrics (CPU/RAM/storage/RSSI)."""
+# ─── Wake-word sample collection ──────────────────────────────────────────────
+#
+# Collection mode itself (em_samples, em_controller.set_collect_mode) plus the
+# read side: list, play, download, delete. The mode is persisted on the device
+# row rather than in its config — see the schema v18 migration.
+
+
+@auth.require_admin
+async def _post_device_collect(request: web.Request) -> web.Response:
+    """
+    POST /api/devices/{id}/collect — body {"enabled": bool}
+
+    Puts a device into (or out of) wake-word sample collection: its mic
+    stream is cut into training clips on the controller and it starts no
+    voice turns at all until this is switched off.
+
+    Admin-only and one device at a time, because it SUSPENDS the assistant
+    on that device. A device that answers nothing looks broken to everyone
+    else in the house, so this is a deliberate act with a state the
+    dashboard shows on every panel.
+
+    Persisted even when the device is offline: arming a device that is
+    rebooting is a reasonable thing to do, and the mode is re-applied by
+    handle_control on its next connect.
+    """
     device_id = request.match_info["id"]
     try:
-        days = min(int(request.query.get("days", 7)), 180)
+        body = await request.json()
+    except Exception:
+        body = {}
+    enabled = bool(body.get("enabled"))
+
+    loop = asyncio.get_event_loop()
+    row  = await loop.run_in_executor(None, db.get_device, device_id)
+    if row is None:
+        return _error("device_not_found", f"No device: {device_id}", 404)
+    if not row["approved"]:
+        return _error("not_approved",
+                      "Approve this device before collecting from it", 409)
+    # The mirror of the guard in _post_device_ambient: the two modes want the
+    # same frames for opposite purposes, so they are mutually exclusive at
+    # the API rather than resolved by a precedence rule nobody can see.
+    if enabled and bool(row["ambient_mode"]):
+        return _error("recording_ambient",
+                      "Stop ambient recording on this device first", 409)
+
+    connected = _online(device_id)
+    if enabled and connected is not None and connected.link is None:
+        return _error("upgrade_required", "Device firmware must be upgraded", 409)
+    await loop.run_in_executor(None, db.set_collect_mode, device_id, enabled)
+
+    live = connected if connected is not None and connected.link is not None else None
+    if live is not None:
+        # Lazy import — em_controller imports em_api at module level. It
+        # writes the device log line itself, since it is the thing that
+        # knows the mode actually took effect (and how many clips a session
+        # produced on the way out).
+        import em_controller
+        await em_controller.set_collect_mode(live, enabled)
+    else:
+        await _push_log_event(
+            device_id, "info", "controller",
+            f"Sample collection {'armed' if enabled else 'disarmed'} — "
+            f"device offline, takes effect on its next connect",
+        )
+    return _ok({
+        "enabled":   enabled,
+        "connected": live is not None,
+        "samples":   await loop.run_in_executor(
+            None, em_samples.usage, device_id
+        ),
+        # Both training corpora this device is filling, so the dashboard can
+        # show what arming (or disarming) collection is costing the volume
+        # without a second round trip. Wake clips accrue independently of
+        # collect mode — they are here because this is the one response that
+        # already reports per-feature disk use.
+        "wakeclips": await loop.run_in_executor(
+            None, em_wakeclips.usage, device_id
+        ),
+    })
+
+
+@auth.require_auth
+async def _get_samples(request: web.Request) -> web.Response:
+    """
+    GET /api/devices/{id}/samples — the clips collected from this device,
+    newest first, with the mode's own state alongside.
+
+    Served from the filesystem rather than a table: the files ARE the
+    record, and a DB row that disagreed with the volume (a restored backup,
+    a hand-deleted file) would be a second source of truth for no gain.
+    """
+    device_id = request.match_info["id"]
+    loop = asyncio.get_event_loop()
+    row  = await loop.run_in_executor(None, db.get_device, device_id)
+    if row is None:
+        return _error("device_not_found", f"No device: {device_id}", 404)
+    clips = await loop.run_in_executor(None, em_samples.list_for, device_id)
+    live  = _online(device_id)
+    # What the segmenter is hearing, while it is hearing it. Without this,
+    # "I turned it on and got nothing" has no answer short of a log tail:
+    # a room whose floor sits 3dB under the open threshold and one where the
+    # mic is muted produce the same empty list. `dropped_short` separates a
+    # third case — something IS crossing the threshold, and it is a click.
+    seg = getattr(live, "collect_seg", None) if live else None
+    return _ok({
+        "enabled":  bool(row["collect_mode"]),
+        "clips":    clips,
+        "count":    len(clips),
+        "bytes":    sum(c["bytes"] for c in clips),
+        "ms":       sum(c["ms"] for c in clips),
+        "keep":     em_samples.KEEP_PER_DEVICE,
+        # Session counters live on the connection, so they reset when the
+        # device does — the file count above is the durable number.
+        "session":  getattr(live, "collect_clips", 0) if live else 0,
+        "live": None if seg is None else {
+            "floor_db":      round(seg.floor_db, 1),
+            "open_db":       round(seg.open_db, 1),
+            "frames":        seg.stats.frames,
+            "dropped_short": seg.stats.dropped_short,
+            "truncated":     seg.stats.truncated,
+        },
+    })
+
+
+@auth.require_auth
+async def _get_sample_audio(request: web.Request) -> web.Response:
+    """GET /api/devices/{id}/samples/{name} — one clip, as a WAV.
+
+    em_samples.resolve re-checks that the name belongs to the device in the
+    URL: both come from the path, so without it a name from one device
+    would reach another's audio."""
+    device_id = request.match_info["id"]
+    name      = request.match_info["name"]
+    path = em_samples.resolve(device_id, name)
+    if path is None:
+        return _error("no_sample", "No such sample", 404)
+    label = _slug(device_id)
+    return web.FileResponse(
+        path,
+        headers={
+            "Content-Type":        "audio/wav",
+            "Content-Disposition": f'attachment; filename="{label}-{name}"',
+            # Immutable once written, but the retention cap means a name can
+            # stop resolving — private and brief, never shared.
+            "Cache-Control":       "private, max-age=60",
+        },
+    )
+
+
+@auth.require_auth
+async def _get_samples_zip(request: web.Request) -> web.Response:
+    """
+    GET /api/devices/{id}/samples.zip — every clip in one archive.
+
+    This is what the feature is FOR: the clips are training input, and a
+    training run wants the set, not one file at a time. Built in memory in
+    an executor — the retention cap bounds it at ~64MB, and streaming a zip
+    would mean either holding the response open across a prune or writing a
+    temporary file on the same volume the clips live on.
+    """
+    device_id = request.match_info["id"]
+    loop = asyncio.get_event_loop()
+    row  = await loop.run_in_executor(None, db.get_device, device_id)
+    if row is None:
+        return _error("device_not_found", f"No device: {device_id}", 404)
+
+    label = _slug(row["label"] or device_id)
+
+    def _build() -> bytes | None:
+        clips = em_samples.list_for(device_id)
+        if not clips:
+            return None
+        buf = io.BytesIO()
+        # ZIP_STORED: WAV of speech does not compress meaningfully and
+        # deflating 64MB would hold a worker for seconds.
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
+            for clip in clips:
+                path = em_samples.resolve(device_id, clip["name"])
+                if path is None:
+                    continue      # pruned between listing and reading
+                z.write(path, arcname=f"{label}/{clip['name']}")
+        return buf.getvalue()
+
+    blob = await loop.run_in_executor(None, _build)
+    if blob is None:
+        return _error("no_samples", "No samples collected yet", 404)
+    return web.Response(
+        body=blob,
+        headers={
+            "Content-Type":        "application/zip",
+            "Content-Disposition": f'attachment; filename="{label}-samples.zip"',
+            "Cache-Control":       "no-store",
+        },
+    )
+
+
+@auth.require_admin
+async def _delete_sample(request: web.Request) -> web.Response:
+    """DELETE /api/devices/{id}/samples/{name} — drop one clip.
+
+    Triage: a clip that caught the dishwasher rather than the wake word is
+    worse than no clip, because it trains the model toward it."""
+    device_id = request.match_info["id"]
+    name      = request.match_info["name"]
+    path = em_samples.resolve(device_id, name)
+    if path is None:
+        return _error("no_sample", "No such sample", 404)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, path.unlink)
+    return _ok({"deleted": name})
+
+
+@auth.require_admin
+async def _delete_samples(request: web.Request) -> web.Response:
+    """DELETE /api/devices/{id}/samples — drop every clip for this device."""
+    device_id = request.match_info["id"]
+    loop = asyncio.get_event_loop()
+    row  = await loop.run_in_executor(None, db.get_device, device_id)
+    if row is None:
+        return _error("device_not_found", f"No device: {device_id}", 404)
+    removed = await loop.run_in_executor(None, em_samples.delete_all, device_id)
+    await _push_log_event(
+        device_id, "info", "controller",
+        f"Deleted {removed} collected sample(s)",
+    )
+    return _ok({"deleted": removed})
+
+
+# ─── Wake clips ───────────────────────────────────────────────────────────────
+#
+# Accepted-candidate support audio kept per turn when saveWakeClips is on.
+# Sample collection gathers prompted wake words; this captures production
+# detections for model evaluation and false-positive triage.
+
+
+@auth.require_auth
+async def _get_turn_wake_audio(request: web.Request) -> web.Response:
+    """GET /api/devices/{id}/turns/{turn}/wake — the pre-detection audio that
+    triggered one voice turn, as a downloadable WAV.
+
+    Only turns detected while saveWakeClips was on have one, and only the
+    newest em_wakeclips.KEEP_PER_DEVICE per device survive — that window is
+    shorter than the turns table's, so a turn row can carry a wake_file whose
+    file is already pruned. A 404 here is an ordinary outcome, not an error
+    state.
+
+    The filename is derived from (device, turn) rather than taken from the
+    row: em_wakeclips.resolve then re-checks that the file belongs to the
+    device in the URL, so a turn id from another device can't be used to
+    reach its audio."""
+    device_id = request.match_info["id"]
+    try:
+        turn_id = int(request.match_info["turn"])
+    except ValueError:
+        return _error("bad_request", "turn must be an integer", 400)
+
+    loop = asyncio.get_event_loop()
+    row  = await loop.run_in_executor(None, db.get_device, device_id)
+    if row is None:
+        return _error("device_not_found", f"No device: {device_id}", 404)
+
+    path = em_wakeclips.resolve(device_id, em_wakeclips.filename(turn_id))
+    if path is None:
+        return _error("no_wake_clip",
+                      "No saved wake clip for this turn", 404)
+
+    label = _slug(row["label"] or device_id)
+    return web.FileResponse(
+        path,
+        headers={
+            "Content-Type":        "audio/wav",
+            "Content-Disposition": f'attachment; filename="{label}-wake{turn_id}.wav"',
+            # Immutable once written and unique per turn, but the retention
+            # window means a name can stop resolving — so cache privately and
+            # briefly, never shared.
+            "Cache-Control":       "private, max-age=60",
+        },
+    )
+
+
+@auth.require_auth
+async def _get_wakeclips_zip(request: web.Request) -> web.Response:
+    """
+    GET /api/devices/{id}/wakeclips.zip — every wake clip in one archive.
+
+    This is what the feature is FOR: the clips are training input, and a
+    training run wants the set, not one false positive at a time. The
+    per-turn endpoint above is for deciding whether a clip belongs in the
+    set; this is how the set leaves the controller. Built in memory in an
+    executor — KEEP_PER_DEVICE bounds it at ~23MB, and streaming a zip would
+    mean either holding the response open across a prune or writing a
+    temporary file on the same volume the clips live on.
+    """
+    device_id = request.match_info["id"]
+    loop = asyncio.get_event_loop()
+    row  = await loop.run_in_executor(None, db.get_device, device_id)
+    if row is None:
+        return _error("device_not_found", f"No device: {device_id}", 404)
+
+    label = _slug(row["label"] or device_id)
+
+    def _build() -> bytes | None:
+        clips = em_wakeclips.list_for(device_id)
+        if not clips:
+            return None
+        buf = io.BytesIO()
+        # ZIP_STORED: WAV of speech does not compress meaningfully and
+        # deflating tens of MB would hold a worker for seconds.
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
+            for clip in clips:
+                path = em_wakeclips.resolve(device_id, clip["name"])
+                if path is None:
+                    continue      # pruned between listing and reading
+                z.write(path, arcname=f"{label}/{clip['name']}")
+        return buf.getvalue()
+
+    blob = await loop.run_in_executor(None, _build)
+    if blob is None:
+        return _error("no_wake_clips", "No wake clips saved yet", 404)
+    return web.Response(
+        body=blob,
+        headers={
+            "Content-Type":        "application/zip",
+            "Content-Disposition": f'attachment; filename="{label}-wakeclips.zip"',
+            "Cache-Control":       "no-store",
+        },
+    )
+
+
+@auth.require_admin
+async def _delete_wakeclips(request: web.Request) -> web.Response:
+    """DELETE /api/devices/{id}/wakeclips — drop every wake clip for this
+    device.
+
+    The turn rows keep their wake_file: the column records that a clip was
+    written, and rewriting history to hide a file someone deleted on purpose
+    would cost a write per turn to say nothing the 404 does not already."""
+    device_id = request.match_info["id"]
+    loop = asyncio.get_event_loop()
+    row  = await loop.run_in_executor(None, db.get_device, device_id)
+    if row is None:
+        return _error("device_not_found", f"No device: {device_id}", 404)
+    removed = await loop.run_in_executor(None, em_wakeclips.delete_all, device_id)
+    await _push_log_event(
+        device_id, "info", "controller",
+        f"Deleted {removed} wake clip(s)",
+    )
+    return _ok({"deleted": removed})
+
+
+# ─── Ambient recording ────────────────────────────────────────────────────────
+#
+# The mode (em_ambient, em_controller.set_ambient_mode) plus the read side.
+# Same shape as sample collection above and persisted the same way (schema
+# v19) — the difference is what comes out: one WAV covering the whole session
+# rather than a set of clips, so there is no archive endpoint. One recording
+# IS the artefact, and zipping ~350MB of them in memory from a dashboard
+# click is a way to take the controller down.
+
+
+@auth.require_admin
+async def _post_device_ambient(request: web.Request) -> web.Response:
+    """
+    POST /api/devices/{id}/ambient — body {"enabled": bool}
+
+    Holds this device's mic open and writes everything it hears to one file;
+    switching it off finalises that file and lists it. This is the room-noise
+    half of a training set — the negatives a wake model is mixed against, and
+    material for evaluating room-noise policy.
+
+    Admin-only and one device at a time, for collect mode's reasons: it
+    SUSPENDS the assistant on that device, and a device that answers nothing
+    looks broken to everyone else in the house.
+
+    Refused while sample collection is on, rather than silently sharing the
+    stream: the two modes want the same frames for opposite purposes, and a
+    user who armed both would get an ambient file full of the wake word they
+    were saying for the segmenter.
+
+    Persisted even when the device is offline — handle_control re-arms it on
+    the next connect, in a new file.
+    """
+    device_id = request.match_info["id"]
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    enabled = bool(body.get("enabled"))
+
+    loop = asyncio.get_event_loop()
+    row  = await loop.run_in_executor(None, db.get_device, device_id)
+    if row is None:
+        return _error("device_not_found", f"No device: {device_id}", 404)
+    if not row["approved"]:
+        return _error("not_approved",
+                      "Approve this device before recording from it", 409)
+    if enabled and bool(row["collect_mode"]):
+        return _error("collecting",
+                      "Stop wake-word sample collection on this device first",
+                      409)
+
+    connected = _online(device_id)
+    if enabled and connected is not None and connected.link is None:
+        return _error("upgrade_required", "Device firmware must be upgraded", 409)
+    await loop.run_in_executor(None, db.set_ambient_mode, device_id, enabled)
+
+    live = connected if connected is not None and connected.link is not None else None
+    if live is not None:
+        # Lazy import — em_controller imports em_api at module level. It
+        # writes the device log line itself: it is the thing that knows
+        # whether a file was opened, and which one was kept on the way out.
+        import em_controller
+        await em_controller.set_ambient_mode(live, enabled)
+    else:
+        await _push_log_event(
+            device_id, "info", "controller",
+            f"Ambient recording {'armed' if enabled else 'disarmed'} — "
+            f"device offline, takes effect on its next connect",
+        )
+    return _ok({
+        "enabled":   enabled,
+        "connected": live is not None,
+        # A live device reports what actually happened: arming can fail if
+        # the file cannot be opened, and reporting the request back would be
+        # a dashboard showing a recording that is not running.
+        "recording": bool(getattr(live, "ambient_mode", False)) if live else False,
+        "usage":     await loop.run_in_executor(
+            None, em_ambient.usage, device_id
+        ),
+    })
+
+
+@auth.require_auth
+async def _get_ambient(request: web.Request) -> web.Response:
+    """
+    GET /api/devices/{id}/ambient — this device's finished recordings,
+    newest first, with the mode's own state alongside.
+
+    The recording currently open is NOT in the list — it is a `.part` until
+    it is closed, and half a WAV is not something to hand a browser. Its
+    elapsed length is reported separately as `live`, which is the only
+    feedback a mode with one artefact at the end can give while it runs.
+    """
+    device_id = request.match_info["id"]
+    loop = asyncio.get_event_loop()
+    row  = await loop.run_in_executor(None, db.get_device, device_id)
+    if row is None:
+        return _error("device_not_found", f"No device: {device_id}", 404)
+    items = await loop.run_in_executor(None, em_ambient.list_for, device_id)
+    live  = _online(device_id)
+    rec   = getattr(live, "ambient_rec", None) if live else None
+    return _ok({
+        "enabled":  bool(row["ambient_mode"]),
+        "clips":    items,
+        "count":    len(items),
+        "bytes":    sum(i["bytes"] for i in items),
+        "ms":       sum(i["ms"] for i in items),
+        "keep":     em_ambient.KEEP_PER_DEVICE,
+        "maxMs":    em_ambient.MAX_RECORDING_MS,
+        "session":  getattr(live, "ambient_files", 0) if live else 0,
+        "live": None if rec is None else {
+            "ms":         rec.duration_ms,
+            "bytes":      rec.data_bytes,
+            "startedMs":  rec.started_ms,
+        },
+    })
+
+
+@auth.require_auth
+async def _get_ambient_audio(request: web.Request) -> web.Response:
+    """GET /api/devices/{id}/ambient/{name} — one recording, as a WAV.
+
+    Served with FileResponse rather than read into memory: these are tens of
+    megabytes each, which is exactly the size that must not be buffered per
+    request. em_ambient.resolve re-checks that the name belongs to the device
+    in the URL — both come from the path."""
+    device_id = request.match_info["id"]
+    name      = request.match_info["name"]
+    path = em_ambient.resolve(device_id, name)
+    if path is None:
+        return _error("no_recording", "No such recording", 404)
+    label = _slug(device_id)
+    return web.FileResponse(
+        path,
+        headers={
+            "Content-Type":        "audio/wav",
+            "Content-Disposition": f'attachment; filename="{label}-ambient-{name}"',
+            "Cache-Control":       "private, max-age=60",
+        },
+    )
+
+
+@auth.require_admin
+async def _delete_ambient(request: web.Request) -> web.Response:
+    """DELETE /api/devices/{id}/ambient/{name} — drop one recording.
+
+    These are the largest artefacts the controller stores, and one that
+    caught a houseful of guests rather than a quiet room is worth nothing
+    but disk."""
+    device_id = request.match_info["id"]
+    name      = request.match_info["name"]
+    path = em_ambient.resolve(device_id, name)
+    if path is None:
+        return _error("no_recording", "No such recording", 404)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, path.unlink)
+    return _ok({"deleted": name})
+
+
+@auth.require_admin
+async def _delete_ambient_all(request: web.Request) -> web.Response:
+    """DELETE /api/devices/{id}/ambient — drop every recording for a device.
+
+    The recording currently open is untouched: it is not one of these files
+    yet, and stopping the mode is how you end it."""
+    device_id = request.match_info["id"]
+    loop = asyncio.get_event_loop()
+    row  = await loop.run_in_executor(None, db.get_device, device_id)
+    if row is None:
+        return _error("device_not_found", f"No device: {device_id}", 404)
+    removed = await loop.run_in_executor(None, em_ambient.delete_all, device_id)
+    await _push_log_event(
+        device_id, "info", "controller",
+        f"Deleted {removed} ambient recording(s)",
+    )
+    return _ok({"deleted": removed})
+
+
+@auth.require_auth
+async def _get_device_activity(request: web.Request) -> web.Response:
+    """GET /api/devices/{id}/activity?days=7 — turn and device-wake rollups."""
+    device_id = request.match_info["id"]
+    try:
+        days = min(max(int(request.query.get("days", 7)), 1), 180)
     except ValueError:
         return _error("bad_request", "days must be an integer", 400)
     since = time.time() - days * 86400
+    loop = asyncio.get_running_loop()
+    turns, raw_counters, metrics = await asyncio.gather(
+        loop.run_in_executor(None, db.get_turns, device_id, 50_000, since),
+        loop.run_in_executor(None, db.get_wake_counters, device_id, since),
+        loop.run_in_executor(None, db.get_device_metrics, device_id, since),
+    )
+    counters = [dict(row) for row in raw_counters]
 
-    loop     = asyncio.get_event_loop()
-    turns    = await loop.run_in_executor(
-        None, lambda: db.get_turns(device_id, 50_000, since)
-    )
-    counters = await loop.run_in_executor(
-        None, lambda: db.get_wake_counters(device_id, since)
-    )
-    metrics  = await loop.run_in_executor(
-        None, lambda: db.get_device_metrics(device_id, since)
-    )
-
-    def pct(sorted_vals, p):
-        if not sorted_vals:
+    def pct(sorted_values, p):
+        if not sorted_values:
             return None
-        return sorted_vals[min(len(sorted_vals) - 1, int(len(sorted_vals) * p))]
+        return sorted_values[min(len(sorted_values) - 1,
+                                 int(len(sorted_values) * p))]
 
-    # Per-day buckets (local time), oldest first.
     day_buckets: dict[str, list[dict]] = {}
-    for t in turns:
-        day = time.strftime("%Y-%m-%d", time.localtime(t["ts"]))
-        day_buckets.setdefault(day, []).append(t)
+    for turn in turns:
+        day = time.strftime("%Y-%m-%d", time.localtime(turn["ts"]))
+        day_buckets.setdefault(day, []).append(turn)
 
     days_out = []
     for day in sorted(day_buckets):
-        ts_list   = day_buckets[day]
-        ok        = [t for t in ts_list if t["outcome"] == "ok"]
-        totals    = sorted(t["total_ms"] for t in ok if (t["total_ms"] or 0) > 0)
-        scores    = [t["wake_score"] for t in ts_list if t["wake_score"] is not None]
-        underruns = sum(t["underruns"] or 0 for t in ts_list)
+        bucket = day_buckets[day]
+        ok = [turn for turn in bucket if turn.get("outcome") == "ok"]
+        totals = sorted(turn["total_ms"] for turn in ok if (turn.get("total_ms") or 0) > 0)
+        scores = [turn["wake_score"] for turn in bucket
+                  if turn.get("wake_score") is not None]
         outcomes: dict[str, int] = {}
-        for t in ts_list:
-            outcomes[t["outcome"] or "?"] = outcomes.get(t["outcome"] or "?", 0) + 1
+        terminal: dict[str, int] = {}
+        routes: dict[str, int] = {}
+        attribution: dict[str, int] = {}
+        for turn in bucket:
+            for value, dest in ((turn.get("outcome") or "?", outcomes),
+                                (turn.get("terminal_reason") or "?", terminal),
+                                (turn.get("commit_route") or "?", routes),
+                                (turn.get("wake_attribution") or "?", attribution)):
+                dest[value] = dest.get(value, 0) + 1
         days_out.append({
-            "date":           day,
-            "turns":          len(ts_list),
-            "ok":             len(ok),
-            "outcomes":       outcomes,
-            "total_ms_p50":   pct(totals, 0.50),
-            "total_ms_p95":   pct(totals, 0.95),
+            "date": day,
+            "turns": len(bucket),
+            "ok": len(ok),
+            "outcomes": outcomes,
+            "terminal_reasons": terminal,
+            "commit_routes": routes,
+            "attributions": attribution,
+            "total_ms_p50": pct(totals, 0.50),
+            "total_ms_p95": pct(totals, 0.95),
             "wake_score_avg": round(sum(scores) / len(scores), 3) if scores else None,
             "wake_score_min": round(min(scores), 3) if scores else None,
-            "underruns":      underruns,
+            "underruns": sum(turn.get("underruns") or 0 for turn in bucket),
         })
 
-    # Per-wake-model rollup — supports A/B-ing custom OWW models.
-    models: dict[str, dict] = {}
-    for t in turns:
-        if not t["wake_model"]:
+    model_rollups: dict[str, dict] = {}
+    for turn in turns:
+        graph = turn.get("wake_model_sha256")
+        if not graph:
             continue
-        m = models.setdefault(
-            t["wake_model"], {"turns": 0, "score_sum": 0.0, "score_min": None}
-        )
-        m["turns"] += 1
-        if t["wake_score"] is not None:
-            m["score_sum"] += t["wake_score"]
-            m["score_min"] = (
-                t["wake_score"] if m["score_min"] is None
-                else min(m["score_min"], t["wake_score"])
-            )
+        model = model_rollups.setdefault(graph, {"turns": 0, "scores": []})
+        model["turns"] += 1
+        if turn.get("wake_score") is not None:
+            model["scores"].append(turn["wake_score"])
     models_out = {
-        name: {
-            "turns":     m["turns"],
-            "score_avg": round(m["score_sum"] / m["turns"], 3) if m["turns"] else None,
-            "score_min": m["score_min"],
+        graph: {
+            "turns": model["turns"],
+            "score_avg": (round(sum(model["scores"]) / len(model["scores"]), 3)
+                          if model["scores"] else None),
+            "score_min": min(model["scores"]) if model["scores"] else None,
         }
-        for name, m in models.items()
+        for graph, model in model_rollups.items()
     }
-
-    # On-device shadow comparison (schema v13) — the verdict, computed here so
-    # a reader is not left to derive it from raw columns.
-    #
-    # Denominator is turns where the device was KNOWN to be scoring
-    # (dev_shadow=1); a NULL score on those is a genuine miss, whereas a NULL
-    # anywhere else is absence of data and must not be counted either way.
-    scoring    = [t for t in turns if (t["dev_shadow"] or 0) == 1]
-    # A turn is only COMPARABLE if the device was scoring against a bar this
-    # controller's wake would have cleared. During playback the controller drops
-    # to bargeInThreshold, so a turn that fired at 0.055 was never something a
-    # device scoring against 0.5 could have caught — counting those as misses
-    # made the agreement figure pessimistic, which is how this was found.
-    # A device that reports no threshold (older firmware) is also not comparable:
-    # unknown, rather than guessed at.
-    def _comparable(t) -> bool:
-        dev_thr = t["dev_threshold"]
-        if dev_thr is None:
-            return False
-        wake_thr = t["wake_threshold"]
-        return wake_thr is not None and wake_thr >= dev_thr
-
-    compared   = [t for t in scoring if _comparable(t)]
-    incomparable = len(scoring) - len(compared)
-    agreed     = [t for t in compared if t["dev_wake_score"] is not None]
-    deltas     = sorted(t["dev_wake_delta_ms"] for t in agreed
-                        if t["dev_wake_delta_ms"] is not None)
-    dev_scores = [t["dev_wake_score"] for t in agreed]
-    crossings  = sum(r["dev_crossings"] or 0 for r in counters)
-    shadow_out = {
-        "turns_scoring":  len(scoring),
-        "turns_compared": len(compared),
-        # Turns where the device was scoring but the comparison is not valid —
-        # the controller used a lower (barge-in) bar, or the device's threshold
-        # is unknown. Reported rather than hidden: a large number here means the
-        # agreement figure is describing a small slice of reality.
-        "not_comparable": incomparable,
-        "agreed":         len(agreed),
-        "missed":         len(compared) - len(agreed),
-        "agreement_pct":  round(100.0 * len(agreed) / len(compared), 1) if compared else None,
-        # Signed: negative means the device crossed FIRST, which is the
-        # expected direction — it scores the frame it just captured while the
-        # controller scores the same frame after a network hop.
-        "delta_ms_p50":   pct(deltas, 0.50),
-        "delta_ms_p95":   pct(deltas, 0.95),
-        "dev_score_avg":  round(sum(dev_scores) / len(dev_scores), 3) if dev_scores else None,
-        "dev_score_min":  round(min(dev_scores), 3) if dev_scores else None,
-        "crossings":      crossings,
-        # Crossings that never matched a turn. This is the false-accept side of
-        # the comparison, which per-turn rows structurally cannot show — but it
-        # is an ESTIMATE, not a count: the hourly counters and the turn rows are
-        # pruned on different schedules (WAKE_COUNTER_RETENTION_DAYS vs
-        # TURN_RETENTION rows), so over a long window this drifts. Treat a
-        # small number as noise and a large one as worth investigating.
-        "unmatched_crossings": max(0, crossings - len(agreed)),
-        "frames":         sum(r["dev_frames"] or 0 for r in counters),
-        # Nonzero drops mean the device could not keep up, so every figure
-        # above is describing a subset of the audio.
-        "drops":          sum(r["dev_drops"] or 0 for r in counters),
+    device_wake = {
+        "hops": sum(row.get("dev_hops") or 0 for row in counters),
+        "overruns": sum(row.get("dev_drops") or 0 for row in counters),
+        "candidates": sum(row.get("dev_crossings") or 0 for row in counters),
+        "near_misses": sum(row.get("near_misses") or 0 for row in counters),
+        "near_miss_max": max((row.get("near_miss_max") or 0 for row in counters), default=0),
+        "max_infer_ms": max((row.get("dev_max_infer_ms") or 0 for row in counters), default=0),
+        "max_score": max((row.get("dev_max_score") or 0 for row in counters), default=0),
     }
-
-    return _ok({
-        "days":          days_out,
-        "wake_models":   models_out,
-        "wake_counters": [dict(r) for r in counters],
-        "metrics":       metrics,
-        "shadow":        shadow_out,
-    })
+    return _ok({"days": days_out, "wake_models": models_out,
+                "wake_counters": counters, "device_wake": device_wake,
+                "metrics": metrics})
 
 
 @auth.require_admin
@@ -773,6 +1278,9 @@ async def _patch_device(request: web.Request) -> web.Response:
         return _error("device_not_found", f"No device: {device_id}", 404)
 
     await loop.run_in_executor(None, db.set_device_label, device_id, label)
+    device = _devices.get(device_id)
+    if device is not None:
+        device.label = label
     await _push_event({"type": "device_update", "device_id": device_id,
                        "state": {"label": label}})
     return _ok({"device_id": device_id, "label": label})
@@ -788,6 +1296,8 @@ async def _delete_device(request: web.Request) -> web.Response:
         return _error("device_not_found", f"No device: {device_id}", 404)
 
     await loop.run_in_executor(None, db.delete_device, device_id)
+    import em_controller
+    await em_controller.remove_device(device_id)
     # Row gone → reconcile tears down any BT proxy listener/mDNS for it.
     await em_ble_proxy.reconcile(device_id)
     await _push_event({"type": "device_deleted", "device_id": device_id})
@@ -796,229 +1306,156 @@ async def _delete_device(request: web.Request) -> web.Response:
 
 @auth.require_admin
 async def _post_approve(request: web.Request) -> web.Response:
-    """
-    POST /api/devices/{id}/approve
-
-    Body: {label, config?}
-    Approves the device, assigns a label, and optionally overrides config.
-    If the device is currently connected in pending state it will be
-    accepted on its next retry (within 30s).
-    """
+    """Approve a pending device, assign its label, and optionally set config."""
     device_id = request.match_info["id"]
-    body   = await _json_body(request)
-    label  = _require_str(body, "label")
-    config = body.get("config")  # optional
-
-    loop = asyncio.get_event_loop()
+    body = await _json_body(request)
+    label = _require_str(body, "label")
+    config = body.get("config")
+    if config is not None and not isinstance(config, dict):
+        return _error("bad_request", "config must be an object", 400)
+    if config:
+        error = _validate_config(config)
+        if error is not None:
+            return error
+    loop = asyncio.get_running_loop()
     row = await loop.run_in_executor(None, db.get_device, device_id)
     if row is None:
         return _error("device_not_found", f"No device: {device_id}", 404)
     if row["approved"]:
         return _error("already_approved", "Device is already approved", 409)
-
     await loop.run_in_executor(None, db.approve_device, device_id, label, config)
     await _push_event({"type": "device_approved", "device_id": device_id,
                        "label": label})
     return _ok({"device_id": device_id, "label": label})
 
 
-async def _apply_live_config(device_id: str, live, effective: dict) -> None:
-    """
-    Push an effective config to a connected device and refresh the
-    controller-side mirrors of it.
+async def _apply_live_config(device_id: str, device, effective: dict) -> bool:
+    """Apply a full effective config through the Device-owned fanout."""
+    if not device.online:
+        return False
+    try:
+        await device.apply_config(effective)
+    except Exception:
+        # A session can close between the online check and send. Persisted
+        # config is still authoritative and will apply at the next admission.
+        if not device.online:
+            log.info("[api] %s disconnected during config apply", device_id)
+            return False
+        raise
+    return True
 
-    Extracted because the per-device and fleet endpoints both did this
-    inline, and a mirror added to one but not the other is a bug that reads
-    as working — the same shape as the v7 stats-relay miss (PR #23). Take
-    the EFFECTIVE config, never a request body: with per-section scoping a
-    body is partial by design, and a device must always be sent the whole
-    resolved picture.
-    """
-    await live.send_control({"type": "config", **effective})
-    if "owwThreshold" in effective:
-        live.oww_threshold = float(effective["owwThreshold"])
-    if "owwModel" in effective:
-        live.oww_model = effective["owwModel"]
-        # Refresh HA's wake-word dropdown (lazy import — em_esphome imports
-        # em_api at module level).
-        import em_esphome
-        em_esphome.update_oww_model(device_id, effective["owwModel"])
-    if "owwSpeexNs" in effective:
-        live.oww_speex_ns = bool(effective["owwSpeexNs"])
-    if "nsAsr" in effective:
-        live.ns_asr = bool(effective["nsAsr"])
-    if "saveUtterances" in effective:
-        live.save_utterances = bool(effective["saveUtterances"])
-    if "bargeInEnabled" in effective:
-        live.barge_in_enabled = bool(effective["bargeInEnabled"])
-    if "bargeInThreshold" in effective:
-        live.barge_threshold = float(effective["bargeInThreshold"])
-    if "aecEnabled" in effective:
-        # Mirrors handle_control's initial read (em_controller.py) — the
-        # wake_word_listener's timer-ring branch reads live.aec_enabled to
-        # decide whether to score audible ring frames or drop-and-reset, and
-        # without this a live AEC toggle left that decision on whatever the
-        # device reported at connect until the next reconnect.
-        live.aec_enabled = bool(effective["aecEnabled"])
-    if "buttonSingleTapEvent" in effective:
-        live.button_single_tap_event = bool(effective["buttonSingleTapEvent"])
-    if "buttonMultiTapMs" in effective:
-        live.button_multi_tap_ms = int(effective["buttonMultiTapMs"])
-    if "wakeArbitrationMs" in effective:
-        live.wake_arb_ms = int(effective["wakeArbitrationMs"])
-    if "wakeSound" in effective:
-        live.wake_sound = bool(effective["wakeSound"])
-    if "owwOnDevice" in effective:
-        # Resolved against the CAPABILITY, not taken at face value: "on"
-        # against firmware that cannot trigger would stop this controller
-        # acting on its own detections while waiting for wakes the device has
-        # no code to send, leaving it deaf. em_shadow.effective_mode degrades
-        # that to shadow.
-        live.oww_on_device = em_shadow.effective_mode(
-            effective["owwOnDevice"], live.oww_trigger_capable
-        )
-    if "timerSound" in effective:
-        live.timer_sound = effective["timerSound"] or None
-    if "timerRingSeconds" in effective:
-        live.timer_ring_seconds = int(effective["timerRingSeconds"])
-    if "timerRingGapSeconds" in effective:
-        live.timer_ring_gap = float(effective["timerRingGapSeconds"])
-    if "timerRingBurstSeconds" in effective:
-        live.timer_ring_burst = float(effective["timerRingBurstSeconds"])
-    if "eqBands" in effective:
-        live.eq_bands = effective["eqBands"]
-    if "eqLoudness" in effective:
-        live.eq_loudness = bool(effective["eqLoudness"])
-    live.led_scene = em_scenes.resolve(effective)
+
+def _validate_config(values: dict) -> web.Response | None:
+    """Validate config keys and post-AFE keys before any persistence."""
+    for key in values:
+        if key in db.REMOVED_CONFIG_KEYS:
+            return _error("removed_config_key",
+                          f"Configuration key '{key}' was removed", 400)
+        if key not in db.DEFAULT_DEVICE_CONFIG:
+            return _error("unknown_config_key",
+                          f"Unknown configuration key: {key}", 400)
+    if "wakeModel" in values:
+        value = values["wakeModel"]
+        if not isinstance(value, str):
+            return _error("invalid_config", "wakeModel must be a graph SHA-256", 400)
+        try:
+            _wake_registry().get(value)
+        except em_wake_registry.RegistryError:
+            return _error("unknown_wake_model",
+                          f"wakeModel is not registered: {value}", 400)
+    if "extendedUtterances" in values and not isinstance(values["extendedUtterances"], bool):
+        return _error("invalid_config", "extendedUtterances must be boolean", 400)
+    for key in _SOUND_KEYS:
+        if key not in values:
+            continue
+        value = values[key]
+        if value in (None, ""):
+            continue
+        if not isinstance(value, str) or em_sounds.safe_sound_id(value) is None:
+            return _error("invalid_config", f"{key} must be a valid sound id or empty", 400)
+    if "timerRingSeconds" in values:
+        value = values["timerRingSeconds"]
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 3600:
+            return _error("invalid_config",
+                          "timerRingSeconds must be an integer from 1 through 3600", 400)
+    return None
 
 
 @auth.require_auth
 async def _get_device_config(request: web.Request) -> web.Response:
-    """GET /api/devices/{id}/config — effective config, scoping, and fleet view."""
+    """GET /api/devices/{id}/config — effective config and section scoping."""
     device_id = request.match_info["id"]
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     row = await loop.run_in_executor(None, db.get_device, device_id)
     if row is None:
         return _error("device_not_found", f"No device: {device_id}", 404)
-    config = await loop.run_in_executor(None, db.get_effective_device_config, device_id)
-    sections = await loop.run_in_executor(None, db.get_device_config_sections, device_id)
-    return _ok({
-        "config":            config,
-        "config_sections":   sections,
-        # Compat view for older readers: no overridden sections == fleet.
-        "use_global_config": not sections,
-    })
+    config, section_ids = await asyncio.gather(
+        loop.run_in_executor(None, db.get_effective_device_config, device_id),
+        loop.run_in_executor(None, db.get_device_config_sections, device_id),
+    )
+    return _ok({"config": config, "config_sections": section_ids,
+                "use_global_config": not section_ids})
 
 
 @auth.require_admin
 async def _post_device_config(request: web.Request) -> web.Response:
-    """
-    POST /api/devices/{id}/config
-
-    Body may include config_sections (list of section ids this device
-    overrides), any config fields, and — for older clients —
-    use_global_config (bool).
-
-    Scoping is per section (see em_config_sections). Values supplied for a
-    section the device does not override are ignored: the device follows the
-    fleet there, and storing shadow values would silently resurrect them if
-    the section were ever switched back.
-
-    use_global_config is accepted as a compat alias: true == override
-    nothing, false == override everything. That is exactly what the boolean
-    meant before v8.
-
-    If neither key is present the device's current scoping is left alone and
-    only the in-scope values are updated.
-    """
+    """POST a device config. Values outside overridden sections are ignored;
+    every accepted key must be part of the post-AFE schema."""
     device_id = request.match_info["id"]
     body = await _json_body(request)
-
-    loop = asyncio.get_event_loop()
-    row = await loop.run_in_executor(None, db.get_device, device_id)
-    if row is None:
+    loop = asyncio.get_running_loop()
+    if await loop.run_in_executor(None, db.get_device, device_id) is None:
         return _error("device_not_found", f"No device: {device_id}", 404)
 
-    sections_body     = body.pop("config_sections", None)
-    use_global        = body.pop("use_global_config", None)
-    explicit_replace  = bool(body.pop("replace", False))
+    sections_body = body.pop("config_sections", None)
+    use_global = body.pop("use_global_config", None)
+    explicit_replace = bool(body.pop("replace", False))
+    error = _validate_config(body)
+    if error is not None:
+        return error
 
-    # Compat: map the old boolean onto the section model.
     if sections_body is None and use_global is not None:
+        if not isinstance(use_global, bool):
+            return _error("bad_request", "use_global_config must be boolean", 400)
         sections_body = [] if use_global else list(sections_mod.SECTION_IDS)
-
     if sections_body is None:
         new_sections = await loop.run_in_executor(
-            None, db.get_device_config_sections, device_id
-        )
+            None, db.get_device_config_sections, device_id)
     else:
         if not isinstance(sections_body, list):
             return _error("bad_request", "config_sections must be a list", 400)
-        unknown = [s for s in sections_body if s not in sections_mod.SECTIONS]
+        unknown = [section for section in sections_body
+                   if section not in sections_mod.SECTIONS]
         if unknown:
-            return _error(
-                "bad_request",
-                f"Unknown config section(s): {', '.join(map(str, unknown))}. "
-                f"Valid: {', '.join(sections_mod.SECTION_IDS)}.",
-                400,
-            )
+            return _error("bad_request",
+                          f"Unknown config section(s): {', '.join(map(str, unknown))}", 400)
         new_sections = sections_mod.normalise(sections_body)
 
     in_scope = sections_mod.keys_for(new_sections) | sections_mod.STATE_KEYS
-
-    # Same replace-not-merge trap as the global endpoint (see _dropped_keys),
-    # but scoped: only keys that REMAIN in scope can be accidentally dropped.
-    # Keys leaving scope are being deliberately handed back to the fleet, and
-    # flagging those would make every legitimate un-override a 409.
     stored = await loop.run_in_executor(None, db.get_device_config, device_id)
-    stored_in_scope = {k: v for k, v in stored.items() if k in in_scope}
+    stored_in_scope = {key: value for key, value in stored.items() if key in in_scope}
     dropped = _dropped_keys(body, stored_in_scope)
     if dropped and not explicit_replace:
-        return _error(
-            "would_drop_keys",
-            f"This body would delete {len(dropped)} existing setting(s): "
-            f"{', '.join(dropped)}. Config POSTs replace rather than "
-            f"merge — send the full config (read-modify-write), or pass "
-            f"replace=true if the deletion is intended.",
-            409,
-        )
+        return _error("would_drop_keys",
+                      "This body would delete existing setting(s): " + ", ".join(dropped), 409)
 
-    # Apply scoping first: set_device_config_sections prunes the values of
-    # any section no longer overridden, so what follows writes into an
-    # already-clean picture.
     if sections_body is not None:
         await loop.run_in_executor(
-            None, db.set_device_config_sections, device_id, new_sections
-        )
-    values = {k: v for k, v in body.items() if k in in_scope}
+            None, db.set_device_config_sections, device_id, new_sections)
+    values = {key: value for key, value in body.items() if key in in_scope}
     if values:
         current = await loop.run_in_executor(None, db.get_device_config, device_id)
-        await loop.run_in_executor(
-            None, db.set_device_config, device_id, {**current, **values}
-        )
+        await loop.run_in_executor(None, db.set_device_config, device_id,
+                                   {**current, **values})
+    config = await loop.run_in_executor(None, db.get_effective_device_config, device_id)
 
-    config = await loop.run_in_executor(
-        None, db.get_effective_device_config, device_id
-    )
-
-    # Push the EFFECTIVE config — with per-section scoping the body is
-    # partial by design, so the device must be sent the resolved picture.
-    pushed = False
-    live = _devices.get(device_id)
-    if live is not None:
-        await _apply_live_config(device_id, live, config)
-        log.info(f"[api] Config pushed to live device: {device_id}")
-        pushed = True
-
-    # BT proxy lifecycle follows bleProxyEnabled in the *effective* config —
-    # reconcile unconditionally (idempotent): re-scoping a section changes the
-    # effective value without the key appearing in the body.
+    device = _devices.get(device_id)
+    pushed = bool(device is not None and await _apply_live_config(device_id, device, config))
     await em_ble_proxy.reconcile(device_id)
-
-    await _push_event({"type": "device_update", "device_id": device_id,
-                       "state": {"config": config,
-                                 "config_sections": new_sections,
-                                 "use_global_config": not new_sections}})
+    await push_device_update(device_id, {
+        "config": config, "config_sections": new_sections,
+        "use_global_config": not new_sections,
+    })
     return _ok({"device_id": device_id, "config": config,
                 "config_sections": new_sections,
                 "use_global_config": not new_sections, "pushed": pushed})
@@ -1053,7 +1490,7 @@ async def _post_device_wifi(request: web.Request) -> web.Response:
         return _error("invalid_credentials",
                       f"WPA passphrase must be 8–63 characters (got {len(psk)})", 400)
 
-    live = _devices.get(device_id)
+    live = _online(device_id)
     if live is None:
         return _error("device_offline", "Device is not connected", 409)
 
@@ -1065,7 +1502,7 @@ async def _post_device_wifi(request: web.Request) -> web.Response:
 
     st["pending"] = {"ssid": ssid, "started_at": time.time()}
     st["last_result"] = None
-    await live.send_control({"type": "wifi_change", "ssid": ssid, "psk": psk})
+    await live.send("wifi_change", {"ssid": ssid, "psk": psk})
     db.log_device(device_id, "info", "controller", f'WiFi change to "{ssid}" requested')
     await _push_event({"type": "device_update", "device_id": device_id,
                        "state": {"wifi": st}})
@@ -1083,7 +1520,7 @@ async def _post_device_wifi_scan(request: web.Request) -> web.Response:
     takes ~5s).
     """
     device_id = request.match_info["id"]
-    live = _devices.get(device_id)
+    live = _online(device_id)
     if live is None:
         return _error("device_offline", "Device is not connected", 409)
     if getattr(live, "wifi_scan_future", None) is not None:
@@ -1092,7 +1529,7 @@ async def _post_device_wifi_scan(request: web.Request) -> web.Response:
     fut = asyncio.get_event_loop().create_future()
     live.wifi_scan_future = fut
     try:
-        await live.send_control({"type": "wifi_scan"})
+        await live.send("wifi_scan", {})
         msg = await asyncio.wait_for(fut, timeout=20)
     except asyncio.TimeoutError:
         return _error("scan_timeout",
@@ -1150,6 +1587,200 @@ async def _get_device_logs(request: web.Request) -> web.Response:
     return _ok(entries)
 
 
+# ─── Script-driven capture ────────────────────────────────────────────────────
+#
+# The mode (em_controller.set_capture_mode) plus windows inside it. Unlike
+# sample collection this is NOT persisted and cannot be armed on an offline
+# device: the webhook is a running process's address, so there is nothing
+# useful to remember about it — see em_capture's docstring.
+
+
+def _live_capture_device(device_id: str):
+    """The connected v1 Device, or None."""
+    return _v1(device_id)
+
+
+@auth.require_admin
+async def _post_device_capture(request: web.Request) -> web.Response:
+    """
+    POST /api/devices/{id}/capture — body
+        {"enabled": true, "webhook": "http://host:port/clip", "idle_s": 300}
+
+    Puts a device into (or out of) script-driven capture: it starts no voice
+    turns, and every recording window opened below is POSTed to `webhook` as
+    a WAV.
+
+    Admin-only for the same reason collect mode is — it SUSPENDS the
+    assistant on that device — and additionally requires the device to be
+    CONNECTED, which collect mode does not. Arming an offline device is
+    meaningful there (the mode is persisted and re-applied on connect) and
+    meaningless here: there is nothing to persist, and the caller is a script
+    that is about to start playing audio at a device that is not listening.
+    """
+    device_id = request.match_info["id"]
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    enabled = bool(body.get("enabled"))
+
+    loop = asyncio.get_event_loop()
+    row  = await loop.run_in_executor(None, db.get_device, device_id)
+    if row is None:
+        return _error("device_not_found", f"No device: {device_id}", 404)
+
+    live = _live_capture_device(device_id)
+    import em_controller
+
+    if not enabled:
+        if live is not None:
+            await em_controller.set_capture_mode(live, False)
+        return _ok(em_controller.capture_state(live))
+
+    if not row["approved"]:
+        return _error("not_approved",
+                      "Approve this device before capturing from it", 409)
+    if live is None:
+        if _online(device_id) is not None:
+            return _error("upgrade_required", "Device firmware must be upgraded", 409)
+        return _error("not_connected",
+                      "Capture mode needs a connected device — it is not "
+                      "persisted and cannot be armed in advance", 409)
+
+    # Absent webhook means PULL: the controller holds each finished recording
+    # and the caller collects it from /capture/recording. That is the mode
+    # that works everywhere — push needs a route from the controller back to
+    # the caller, which a controller on a macvlan network does not have.
+    webhook = body.get("webhook") or None
+    if webhook is not None and not em_capture.valid_webhook(webhook):
+        return _error("bad_webhook",
+                      "webhook must be an http(s) URL with a host", 400)
+
+    await em_controller.set_capture_mode(
+        live, True, webhook=webhook, idle_s=body.get("idle_s"),
+    )
+    return _ok(em_controller.capture_state(live))
+
+
+@auth.require_admin
+async def _post_capture_window(request: web.Request) -> web.Response:
+    """
+    POST /api/devices/{id}/capture/window — body {"tag": "...", "max_ms": N}
+
+    Opens a recording window. Returns its session id, which the caller can
+    pass back to /capture/window/stop so a stop cannot land on the wrong
+    window if the previous one already closed itself on `max_ms`.
+
+    `tag` is opaque here and comes straight back on the delivery as
+    `X-EM-Tag`: correlation is the caller's business, and a tag format the
+    controller understood would be a second copy to drift.
+    """
+    device_id = request.match_info["id"]
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    live = _live_capture_device(device_id)
+    if live is None:
+        return _error("not_connected", f"Device not connected: {device_id}", 409)
+    if not getattr(live, "capture_mode", False):
+        return _error("not_capturing",
+                      "Arm capture mode before opening a window", 409)
+
+    import em_controller
+    window = await em_controller.open_capture_window(
+        live,
+        tag=str(body.get("tag") or ""),
+        max_ms=em_capture.clamp_max_ms(body.get("max_ms")),
+    )
+    return _ok({
+        "session": window.session,
+        "tag":     window.tag,
+        "max_ms":  window.max_ms,
+    })
+
+
+@auth.require_admin
+async def _post_capture_window_stop(request: web.Request) -> web.Response:
+    """
+    POST /api/devices/{id}/capture/window/stop — body {"session": "..."} 
+
+    Closes the open window and queues it for delivery. An unknown or already
+    finished session is not an error: the window closing itself on `max_ms`
+    is a normal outcome, and the caller finds out from the delivery either
+    way.
+    """
+    device_id = request.match_info["id"]
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    live = _live_capture_device(device_id)
+    if live is None:
+        return _error("not_connected", f"Device not connected: {device_id}", 409)
+
+    import em_controller
+    closed = await em_controller.close_capture_window(
+        live, session=(body.get("session") or None)
+    )
+    return _ok({"closed": closed, **em_controller.capture_state(live)})
+
+
+@auth.require_admin
+async def _get_capture_recording(request: web.Request) -> web.Response:
+    """
+    GET /api/devices/{id}/capture/recording?session=…&wait=…
+
+    Collect one finished recording, as a WAV, with the same `X-EM-*` headers
+    the webhook delivery carries — so a driver can use either transport
+    without a second parser.
+
+    This is the PULL half of delivery, and on some deployments it is the only
+    half that can work: a controller on a macvlan network cannot reach its
+    own Docker host, so a webhook served by the machine driving the run times
+    out every time. Pull needs no route back.
+
+    Long-polls up to `wait` seconds (default 30, capped at 120). 404 means
+    nothing arrived in that time, which is an ordinary answer rather than an
+    error — the driver decides whether to retry or record the cell as failed.
+    """
+    device_id = request.match_info["id"]
+    live = _live_capture_device(device_id)
+    if live is None:
+        return _error("not_connected", f"Device not connected: {device_id}", 409)
+    if not getattr(live, "capture_mode", False):
+        return _error("not_capturing", "Capture mode is not armed", 409)
+
+    session = request.query.get("session") or None
+    try:
+        wait_s = float(request.query.get("wait", 30))
+    except ValueError:
+        wait_s = 30.0
+    wait_s = max(0.0, min(wait_s, 120.0))
+
+    import em_controller
+    result = await em_controller.take_recording(live, session, wait_s)
+    if result is None:
+        return _error("no_recording", "No recording available", 404)
+    return web.Response(
+        body=result.wav(),
+        headers=em_capture.headers(result, device_id),
+    )
+
+
+@auth.require_auth
+async def _get_device_capture(request: web.Request) -> web.Response:
+    """GET /api/devices/{id}/capture — the mode's live state.
+
+    Everything here is per-connection, so an offline device reports the mode
+    off rather than a stale sink."""
+    device_id = request.match_info["id"]
+    import em_controller
+    return _ok(em_controller.capture_state(_live_capture_device(device_id)))
+
+
 # ─── OTA: update + rollback ───────────────────────────────────────────────────
 
 @auth.require_admin
@@ -1192,7 +1823,7 @@ async def _post_device_update(request: web.Request) -> web.Response:
     if row is None:
         return _error("device_not_found", f"No device: {device_id}", 404)
 
-    live = _devices.get(device_id)
+    live = _online(device_id)
     if live is None:
         return _error("device_offline", "Device is not connected", 409)
 
@@ -1222,7 +1853,7 @@ async def _post_device_rollback(request: web.Request) -> web.Response:
         return _error("no_rollback_available",
                       "No previous version recorded — cannot roll back", 404)
 
-    live = _devices.get(device_id)
+    live = _online(device_id)
     if live is None:
         return _error("device_offline", "Device is not connected", 409)
 
@@ -1231,84 +1862,6 @@ async def _post_device_rollback(request: web.Request) -> web.Response:
 
     asyncio.create_task(_run_rollback(device_id, row["firmware_previous"]))
     return _ok({"status": "started", "rolling_back_to": row["firmware_previous"]}, status=202)
-
-
-# Path start_server.sh checks (docs/native-afe-migration.md's "Opting a
-# device in") — presence exports EM_NATIVE_AFE=1 for that boot. Data, not
-# script, so it survives the OTA-time canonical-payload re-sync that would
-# silently erase a hand-edited export in the script itself.
-NATIVE_AFE_MARKER = "/data/local/etc/echomuse/native_afe.enabled"
-
-
-@auth.require_admin
-async def _post_device_native_afe(request: web.Request) -> web.Response:
-    """
-    POST /api/devices/{id}/native_afe
-
-    Body: {"enabled": bool, "reboot": bool (default false)}
-
-    Writes or removes the on-device native-AFE opt-in marker. This ALONE
-    changes nothing: EM_NATIVE_AFE is read once at the Go binary's own
-    startup (docs/native-afe-migration.md — a boot-time choice, not a live
-    config push), and start_server.sh's own shell keeps its old inode open
-    regardless of anything short of a real restart of THAT script, not just
-    the server it supervises. Pass "reboot": true to also apply it now.
-
-    Gated on native_afe_backend, not native_afe: the backend capability is a
-    fixed fact about this build (compiled-in code + a start_server.sh new
-    enough to have the marker check), where native_afe reflects only whether
-    the AFE path happens to be running right this second — gating on the
-    latter would mean the toggle to turn it ON only appears once it is
-    already on.
-    """
-    device_id = request.match_info["id"]
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    enabled = bool(body.get("enabled"))
-    do_reboot = bool(body.get("reboot"))
-
-    live = _devices.get(device_id)
-    if live is None:
-        return _error("device_offline", "Device is not connected", 409)
-
-    if not getattr(live, "native_afe_backend_capable", False):
-        return _error("not_supported",
-                      "This firmware's start_server.sh predates the native-AFE "
-                      "opt-in marker — OTA it first", 409)
-
-    if device_id in _updates_in_progress:
-        return _error("update_in_progress", "An update is already in progress", 409)
-
-    if enabled:
-        cmd = (f"mkdir -p {DEVICE_TLS_DIR} && touch {NATIVE_AFE_MARKER} && "
-               f"test -f {NATIVE_AFE_MARKER} && echo MARKER_SET")
-    else:
-        cmd = (f"rm -f {NATIVE_AFE_MARKER}; "
-               f"test -f {NATIVE_AFE_MARKER} && echo STILL_PRESENT || echo MARKER_CLEARED")
-    result = await _shell_run(live, cmd)
-
-    want = "MARKER_SET" if enabled else "MARKER_CLEARED"
-    if want not in result:
-        return _error("marker_write_failed",
-                      f"Could not confirm the marker was "
-                      f"{'set' if enabled else 'cleared'} "
-                      f"(device shell reported: {result.strip() or 'nothing'})", 502)
-
-    await _push_log_event(
-        device_id, "info", "controller",
-        f"native AFE opt-in marker {'set' if enabled else 'cleared'} — "
-        f"takes effect on next reboot" + (" (rebooting now)" if do_reboot else ""))
-
-    if do_reboot:
-        # The shell dies the instant `reboot` executes on the device side, so
-        # no response will ever arrive — same shape as the OTA slot-flip's
-        # `kill $PPID` (see _run_update), a short timeout rather than
-        # something to meaningfully await a result from.
-        await _shell_run(live, "reboot", timeout=5.0)
-
-    return _ok({"status": "ok", "marker": enabled, "rebooting": do_reboot})
 
 
 @auth.require_admin
@@ -1347,255 +1900,419 @@ async def _post_upload_binary(request: web.Request) -> web.Response:
         return _error("upload_failed", str(e), 500)
 
 
-# ─── Custom wake-word models ─────────────────────────────────────────────────
+# ─── Wake model registry ─────────────────────────────────────────────────────
+
+_wake_registry_lock = asyncio.Lock()
+
+
+def _wake_registry():
+    # Lazy import: em_controller imports this module during startup.
+    import em_controller
+    return em_controller.registry()
+
+
+def _wake_model_users(graph_sha256: str) -> list[str]:
+    """Fleet and effective device scopes that select this graph."""
+    users: list[str] = []
+    if db.get_global_device_config().get("wakeModel") == graph_sha256:
+        users.append("global")
+    for row in db.get_all_devices():
+        device_id = row["device_id"]
+        if db.get_effective_device_config(device_id).get("wakeModel") == graph_sha256:
+            users.append(device_id)
+    return users
+
+
+def _wake_model_json(model, active: str | None, users: list[str]) -> dict:
+    return {**model.to_dict(), "active": model.graph_sha256 == active,
+            "in_use_by": users}
 
 
 @auth.require_auth
-async def _get_oww_models(request: web.Request) -> web.Response:
-    """
-    GET /api/oww_models
-
-    Custom models discovered in the data volume's oww_models/ dir.
-    `path` is the value to store in owwModel config.
-    """
+async def _get_wake_models(request: web.Request) -> web.Response:
+    """GET /api/wake_models — registered BCResNet pairs and active graph."""
+    registry = _wake_registry()
+    active = registry.active_sha256
+    loop = asyncio.get_running_loop()
+    models = registry.list()
+    users = await asyncio.gather(*(
+        loop.run_in_executor(None, _wake_model_users, model.graph_sha256)
+        for model in models
+    ))
     return _ok({
-        "models": em_oww_models.scan(),
-        "dir":    str(em_oww_models.models_dir()),
+        "active": active,
+        "models": [_wake_model_json(model, active, used)
+                   for model, used in zip(models, users)],
+        "max_graph_bytes": em_wake_registry.MAX_GRAPH_BYTES,
+        "max_sidecar_bytes": em_wake_registry.MAX_SIDECAR_BYTES,
     })
 
 
-@auth.require_admin
-async def _post_oww_model_upload(request: web.Request) -> web.Response:
-    """
-    POST /api/oww_models/upload (multipart: field name "model", .onnx file)
+async def _read_part(field, limit: int) -> bytes | None:
+    """Read one multipart part without retaining bytes beyond its limit."""
+    out = bytearray()
+    while True:
+        block = await field.read_chunk()
+        if not block:
+            return bytes(out)
+        out.extend(block)
+        if len(out) > limit:
+            return None
 
-    Installs an openWakeWord model into the persisted models dir. The
-    file lands atomically (tmp + rename) so a wake-listener reload can
-    never see a half-written model.
-    """
+
+@auth.require_admin
+async def _post_wake_model_upload(request: web.Request) -> web.Response:
+    """POST /api/wake_models/upload — validate, probe, and register a graph pair."""
     try:
         reader = await request.multipart()
-        field  = await reader.next()
-        if field is None or field.name != "model":
-            return _error("invalid_upload", "Expected multipart field 'model'", 400)
-        fname = em_oww_models.safe_model_filename(field.filename or "")
-        if fname is None:
-            return _error("invalid_filename",
-                          "Model must be a .onnx file with a simple name "
-                          "(letters, digits, _ - . only)", 400)
-        data = await field.read()
-        if not data:
-            return _error("empty_upload", "Uploaded model is empty", 400)
-        if len(data) > em_oww_models.MAX_MODEL_BYTES:
-            return _error("too_large", "Model exceeds 20 MB limit", 413)
+    except Exception:
+        return _error("invalid_upload", "Expected multipart form data", 400)
 
-        directory = em_oww_models.models_dir()
-        directory.mkdir(parents=True, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(dir=directory, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "wb") as f:
-                f.write(data)
-            os.replace(tmp_path, directory / fname)
-        except BaseException:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
-        log.info(f"[api] Wake model installed: {fname} ({len(data):,} bytes)")
-        entry = next((m for m in em_oww_models.scan() if m["file"] == fname), None)
-        return _ok({"model": entry}, status=201)
-    except Exception as e:
-        log.error(f"[api] Model upload error: {e}")
-        return _error("upload_failed", str(e), 500)
+    raw: dict[str, bytes | None] = {}
+    text: dict[str, str] = {}
+    while True:
+        field = await reader.next()
+        if field is None:
+            break
+        if field.name == "graph":
+            raw["graph"] = await _read_part(field, em_wake_registry.MAX_GRAPH_BYTES)
+            if raw["graph"] is None:
+                return _error("too_large", "Graph exceeds the upload limit", 413)
+        elif field.name == "sidecar":
+            raw["sidecar"] = await _read_part(field, em_wake_registry.MAX_SIDECAR_BYTES)
+            if raw["sidecar"] is None:
+                return _error("too_large", "Sidecar exceeds the upload limit", 413)
+        elif field.name in {"idle", "playback", "reference", "near_miss",
+                            "wake_phrase", "verify_core"}:
+            value = await _read_part(field, 1024)
+            if value is None:
+                return _error("invalid_upload", f"Field {field.name} is too long", 400)
+            text[field.name] = value.decode("utf-8", "replace").strip()
+        else:
+            await field.release()
+
+    required = {"graph", "sidecar"}
+    missing = sorted(required - raw.keys())
+    missing += sorted({"idle", "playback", "reference", "near_miss",
+                       "wake_phrase", "verify_core"} - text.keys())
+    if missing:
+        return _error("invalid_upload", f"Missing multipart field(s): {', '.join(missing)}", 400)
+    if not raw["graph"] or not raw["sidecar"]:
+        return _error("invalid_upload", "Graph and sidecar must not be empty", 400)
+    try:
+        thresholds = em_wake_registry.Thresholds(
+            idle=float(text["idle"]), playback=float(text["playback"]),
+            reference=float(text["reference"]), near_miss=float(text["near_miss"]),
+        )
+    except (TypeError, ValueError, em_wake_registry.RegistryError) as exc:
+        return _error("invalid_model", str(exc), 400)
+
+    registry = _wake_registry()
+
+    def register():
+        with tempfile.TemporaryDirectory(prefix="wake-upload-") as directory:
+            graph = Path(directory) / "graph.onnx"
+            sidecar = Path(directory) / "sidecar.json"
+            graph.write_bytes(raw["graph"])
+            sidecar.write_bytes(raw["sidecar"])
+            return registry.register(graph, sidecar, thresholds,
+                                     text["wake_phrase"], text["verify_core"])
+
+    try:
+        async with _wake_registry_lock:
+            model = await asyncio.get_running_loop().run_in_executor(None, register)
+    except em_wake_registry.RegistryError as exc:
+        return _error("invalid_model", str(exc), 400)
+
+    users = await asyncio.get_running_loop().run_in_executor(
+        None, _wake_model_users, model.graph_sha256)
+    return _ok({"model": _wake_model_json(model, registry.active_sha256, users)})
 
 
 @auth.require_admin
-async def _delete_oww_model(request: web.Request) -> web.Response:
-    """
-    DELETE /api/oww_models/{file}
+async def _delete_wake_model(request: web.Request) -> web.Response:
+    """DELETE /api/wake_models/{sha256}; selected graphs cannot be removed."""
+    graph_sha256 = request.match_info["sha256"]
+    registry = _wake_registry()
+    try:
+        registry.get(graph_sha256)
+    except em_wake_registry.RegistryError:
+        return _error("not_found", "No such wake model", 404)
 
-    Refuses (409) while any device config or the global default still
-    points at the model — deleting under a live listener would fail its
-    next reload.
-    """
-    fname = em_oww_models.safe_model_filename(request.match_info["file"])
-    if fname is None:
-        return _error("invalid_filename", "Bad model filename", 400)
-    path = em_oww_models.models_dir() / fname
-    if not path.is_file():
-        return _error("not_found", "No such model", 404)
+    async with _wake_registry_lock:
+        users = await asyncio.get_running_loop().run_in_executor(
+            None, _wake_model_users, graph_sha256)
+        if users:
+            return _error("model_in_use",
+                          f"Wake model is selected by: {', '.join(users)}", 409)
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                None, registry.delete, graph_sha256)
+        except em_wake_registry.RegistryError as exc:
+            return _error("model_in_use", str(exc), 409)
+    return _ok({"deleted": graph_sha256})
 
-    configs: dict[str, dict] = {"global": db.get_global_device_config()}
+
+@auth.require_auth
+async def _get_speech_assets(request: web.Request) -> web.Response:
+    """GET /api/devices/{id}/speech_assets — named, installed, and wake state."""
+    device_id = request.match_info["id"]
+    row = await asyncio.get_running_loop().run_in_executor(None, db.get_device, device_id)
+    if row is None:
+        return _error("device_not_found", f"No device: {device_id}", 404)
+
+    import em_controller
+    named = None
+    named_error = None
+    try:
+        effective = await asyncio.get_running_loop().run_in_executor(
+            None, db.get_effective_device_config, device_id)
+        named = em_controller.device_assets().speech_assets(
+            em_controller.registry().for_config(effective)).wire()
+    except em_wake_registry.RegistryError as exc:
+        # No active registered graph: the named set is unavailable (null),
+        # never guessed (§8.1).
+        named_error = str(exc)
+
+    device = _devices.get(device_id)
+    live = device if device is not None and device.online else None
+    hello = live.link.hello if live is not None and live.link is not None else None
+    wake_stats = device.wake_stats if device is not None else None
+    installed = (em_device_assets.installed_speech_assets(hello.get("assets") or [], named, wake_stats)
+                 if hello is not None else None)
+    missing = ([digest for digest in named.values() if digest not in set(installed)]
+               if named is not None and installed is not None else None)
+    return _ok({
+        "device_id": device_id,
+        "connected": live is not None,
+        "named": named,
+        "named_error": named_error,
+        "installed": installed,
+        "missing": missing,
+        "wake_stats": wake_stats,
+    })
+
+
+# ─── Alert sound catalog ──────────────────────────────────────────────────────
+
+_SOUND_KEYS = ("timerSound", "alarmSound")
+
+
+def _sound_configs() -> dict[str, dict]:
+    configs = {"global": db.get_global_device_config_raw()}
     for row in db.get_all_devices():
         configs[row["device_id"]] = db.get_device_config(row["device_id"])
-    users = em_oww_models.in_use_by(str(path), configs)
-    if users:
-        return _error("model_in_use",
-                      f"Model is selected by: {', '.join(users)}", 409)
-
-    path.unlink()
-    log.info(f"[api] Wake model deleted: {fname}")
-    return _ok({"deleted": fname})
+    return configs
 
 
-# ─── Notification sounds (timer ring) ─────────────────────────────────────────
+def _unresolved_sounds(configs: dict[str, dict]) -> list[dict]:
+    unresolved = []
+    for scope, config in configs.items():
+        for key in _SOUND_KEYS:
+            sound_id = config.get(key)
+            if not sound_id:
+                continue
+            _, flagged = em_sounds.alert_asset(sound_id)
+            if flagged:
+                unresolved.append({"scope": scope, "key": key, "sound_id": sound_id})
+    return unresolved
 
 
 @auth.require_auth
 async def _get_sounds(request: web.Request) -> web.Response:
-    """
-    GET /api/sounds
-
-    Uploaded ring sounds in the data volume's sounds/ dir. `id` is the
-    value to store in timerSound config. The built-in chime is reported
-    separately: it has no file, and offering it as a deletable row would
-    invite someone to try.
-    """
+    """GET /api/sounds — catalog entries and unresolved configured IDs."""
+    loop = asyncio.get_running_loop()
+    sounds, configs = await asyncio.gather(
+        loop.run_in_executor(None, em_sounds.scan),
+        loop.run_in_executor(None, _sound_configs),
+    )
+    unresolved = await loop.run_in_executor(None, _unresolved_sounds, configs)
     return _ok({
-        "sounds":    em_sounds.scan(),
-        "dir":       str(em_sounds.sounds_dir()),
+        "sounds": sounds,
+        "dir": str(em_sounds.sounds_dir()),
         "default_id": em_sounds.DEFAULT_ID,
-        "formats":   list(em_sounds.ALLOWED_SUFFIXES),
+        "formats": list(em_sounds.ALLOWED_SUFFIXES),
         "max_bytes": em_sounds.MAX_UPLOAD_BYTES,
+        "unresolved": unresolved,
     })
 
 
 @auth.require_admin
 async def _post_sound_upload(request: web.Request) -> web.Response:
-    """
-    POST /api/sounds/upload (multipart: field "sound", optional field "id")
-
-    Stores a ring sound and decodes it once so the first ring is not the
-    slow one. A decode failure is a 400, not a 500: the usual cause is a
-    file that is not really audio, and the user needs ffmpeg's reason.
-    """
+    """POST /api/sounds/upload — store and export one alert asset (§16.5)."""
     try:
         reader = await request.multipart()
-        sound_id = None
-        data = None
-        suffix = None
-        while True:
-            field = await reader.next()
-            if field is None:
-                break
-            if field.name == "id":
-                sound_id = (await field.read(decode=True)).decode("utf-8", "replace").strip()
-            elif field.name == "sound":
-                suffix = em_sounds.safe_upload_suffix(field.filename or "")
-                if suffix is None:
-                    return _error(
-                        "invalid_filename",
-                        "Sound must be one of: "
-                        + ", ".join(em_sounds.ALLOWED_SUFFIXES),
-                        400,
-                    )
-                data = await field.read()
-        if data is None:
-            return _error("invalid_upload", "Expected multipart field 'sound'", 400)
-        if not data:
-            return _error("empty_upload", "Uploaded sound is empty", 400)
-        if len(data) > em_sounds.MAX_UPLOAD_BYTES:
-            return _error(
-                "too_large",
-                f"Sound exceeds {em_sounds.MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit",
-                413,
-            )
+    except Exception:
+        return _error("invalid_upload", "Expected multipart form data", 400)
+    sound_id = None
+    suffix = None
+    data = None
+    while True:
+        field = await reader.next()
+        if field is None:
+            break
+        if field.name == "id":
+            sound_id = (await field.read()).decode("utf-8", "replace").strip()
+        elif field.name == "sound":
+            suffix = em_sounds.safe_upload_suffix(field.filename or "")
+            if suffix is None:
+                return _error("invalid_filename",
+                              "Sound must be one of: " + ", ".join(em_sounds.ALLOWED_SUFFIXES), 400)
+            data = await _read_part(field, em_sounds.MAX_UPLOAD_BYTES)
+            if data is None:
+                return _error("too_large", "Sound exceeds the upload limit", 413)
+        else:
+            await field.release()
+    if data is None:
+        return _error("invalid_upload", "Expected multipart field 'sound'", 400)
+    if not data:
+        return _error("empty_upload", "Uploaded sound is empty", 400)
+    sid = em_sounds.safe_sound_id(sound_id or em_sounds.DEFAULT_ID)
+    if sid is None:
+        return _error("invalid_id", "Sound id must be letters, digits, _ - . only", 400)
 
-        sid = em_sounds.safe_sound_id(sound_id or em_sounds.DEFAULT_ID)
-        if sid is None:
-            return _error("invalid_id",
-                          "Sound id must be letters, digits, _ - . only", 400)
-
-        loop = asyncio.get_event_loop()
-        dest = await loop.run_in_executor(
-            None, lambda: em_sounds.store(sid, suffix, data)
-        )
-        # Decode now so the failure surfaces here, at upload, rather than at
-        # 6am when the timer goes off and the ring silently falls back.
-        try:
-            pcm = await em_sounds.decode(dest)
-        except Exception as e:
-            em_sounds.delete(sid)
-            return _error("decode_failed", f"Could not decode audio: {e}", 400)
-        await loop.run_in_executor(
-            None, lambda: em_sounds.cache_path(dest).write_bytes(pcm)
-        )
-        await loop.run_in_executor(
-            None, lambda: em_sounds._write_cache_stamp(dest, em_sounds.cache_path(dest))
-        )
-        log.info(
-            f"[api] Ring sound installed: {dest.name} ({len(data):,} bytes, "
-            f"{em_sounds.duration_seconds(len(pcm)):.1f}s)"
-        )
-        entry = next((s for s in em_sounds.scan() if s["id"] == sid), None)
-        return _ok({"sound": entry}, status=201)
-    except Exception as e:
-        log.error(f"[api] Sound upload error: {e}")
-        return _error("upload_failed", str(e), 500)
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, em_sounds.store, sid, suffix, data)
+    try:
+        exported = await loop.run_in_executor(None, em_sounds.export, sid)
+    except em_sounds.ExportError as exc:
+        await loop.run_in_executor(None, em_sounds.delete, sid)
+        return _error("decode_failed", str(exc), 400)
+    entry = next((item for item in await loop.run_in_executor(None, em_sounds.scan)
+                  if item["id"] == sid), None)
+    log.info("[api] Alert sound installed: %s (%d bytes, %.3fs%s)",
+             sid, len(data), exported.seconds, ", shortened" if exported.shortened else "")
+    return _ok({"sound": entry}, status=201)
 
 
 @auth.require_admin
 async def _delete_sound(request: web.Request) -> web.Response:
-    """
-    DELETE /api/sounds/{id}
-
-    Refuses (409) while any device or the fleet default still selects it.
-    Unlike a wake model, a dangling reference here would not break — the
-    ring falls back to the built-in chime — but silently changing what a
-    user's alarm sounds like is worse than making them clear it first.
-    """
+    """DELETE /api/sounds/{id}; refuse while any stored scope selects it."""
     sid = em_sounds.safe_sound_id(request.match_info["id"])
     if sid is None:
         return _error("invalid_id", "Bad sound id", 400)
-    if em_sounds.source_path(sid) is None:
+    loop = asyncio.get_running_loop()
+    sounds, configs = await asyncio.gather(
+        loop.run_in_executor(None, em_sounds.scan),
+        loop.run_in_executor(None, _sound_configs),
+    )
+    if not any(item["id"] == sid for item in sounds):
         return _error("not_found", "No such sound", 404)
-
-    configs: dict[str, dict] = {"global": db.get_global_device_config()}
-    for row in db.get_all_devices():
-        configs[row["device_id"]] = db.get_device_config(row["device_id"])
-    users = em_sounds.in_use_by(sid, configs)
+    users = await loop.run_in_executor(None, em_sounds.in_use_by, sid, configs)
     if users:
-        return _error("sound_in_use",
-                      f"Sound is selected by: {', '.join(users)}", 409)
-
-    em_sounds.delete(sid)
-    log.info(f"[api] Ring sound deleted: {sid}")
+        return _error("sound_in_use", f"Sound is selected by: {', '.join(users)}", 409)
+    await loop.run_in_executor(None, em_sounds.delete, sid)
     return _ok({"deleted": sid})
 
 
+def _v1_response(device_id: str):
+    """(device, error response) for a route that needs a v1 session."""
+    device = _online(device_id)
+    if device is None:
+        return None, _error("device_offline", "Device is not connected", 409)
+    if device.link is None:
+        return None, _error("upgrade_required", "Device firmware must be upgraded", 409)
+    return device, None
+
+
 @auth.require_auth
-async def _post_sound_test(request: web.Request) -> web.Response:
-    """
-    POST /api/devices/{id}/sounds/test
-
-    Ring this device now, exactly as an expired timer would — same loop,
-    same wake-word stop. "Play it once quietly" would test a code path
-    nobody ever hits; what the user wants to know is whether they can live
-    with this sound going off, and whether they can make it stop.
-    """
-    device_id = request.match_info["id"]
-    live = _devices.get(device_id)
-    if live is None:
-        return _error("device_offline", "Device is not connected", 409)
-    if live.timer_ringing:
-        return _error("already_ringing", "Device is already ringing", 409)
-
+async def _post_sound_preview(request: web.Request) -> web.Response:
+    """POST /api/devices/{id}/sounds/preview — alert-class local preview."""
+    body = await _json_body(request)
+    sound_id = _require_str(body, "sound_id")
+    if em_sounds.safe_sound_id(sound_id) is None:
+        return _error("invalid_id", "Bad sound id", 400)
+    device, error = _v1_response(request.match_info["id"])
+    if error is not None:
+        return error
     import em_controller
-    await em_controller.start_timer_ring(live, "test")
-    return _ok({"ringing": True, "sound": live.timer_sound or "built-in"})
+    result = await em_controller.preview_sound(device, sound_id)
+    if result.get("error") == "offline":
+        return _error("device_offline", "Device disconnected", 409)
+    return _ok(result)
 
 
 @auth.require_auth
 async def _post_sound_stop(request: web.Request) -> web.Response:
-    """POST /api/devices/{id}/sounds/stop — silence a ring from the UI."""
-    device_id = request.match_info["id"]
-    live = _devices.get(device_id)
-    if live is None:
-        return _error("device_offline", "Device is not connected", 409)
+    """POST /api/devices/{id}/sounds/stop — stop the current preview."""
+    device, error = _v1_response(request.match_info["id"])
+    if error is not None:
+        return error
     import em_controller
-    stopped = await em_controller.stop_timer_ring(live)
-    return _ok({"stopped": stopped})
+    await em_controller.stop_preview(device)
+    return _ok({"stopped": True})
+
+
+# ─── Alerts panel ─────────────────────────────────────────────────────────────
+
+def _alert_status(endpoint_id: str) -> dict | None:
+    import em_controller
+    status = em_controller.alerts().status(endpoint_id)
+    if status is None:
+        return None
+    status = {**status}
+    occurrences = []
+    for occurrence in status.get("occurrences") or []:
+        armed = bool(occurrence.get("armed_on_endpoint"))
+        occurrences.append({**occurrence, "stored_in_ha": True,
+                            "delivery_pending": not armed})
+    status["occurrences"] = occurrences
+    return status
+
+
+@auth.require_auth
+async def _get_device_alerts(request: web.Request) -> web.Response:
+    """GET /api/devices/{id}/alerts — one endpoint's full alert panel."""
+    device_id = request.match_info["id"]
+    row = await asyncio.get_running_loop().run_in_executor(None, db.get_device, device_id)
+    if row is None:
+        return _error("device_not_found", f"No device: {device_id}", 404)
+    import em_controller
+    return _ok({"status": _alert_status(device_id), "ha": em_controller.ha_status()})
+
+
+@auth.require_admin
+async def _post_alarm(request: web.Request) -> web.Response:
+    """POST /api/devices/{id}/alarms — dashboard entry to AlertEngine."""
+    device_id = request.match_info["id"]
+    body = await _json_body(request)
+    alarm_time = _require_str(body, "time")
+    days = body.get("days", [])
+    if not isinstance(days, list) or not all(isinstance(day, str) for day in days):
+        return _error("bad_request", "days must be a list of weekday names", 400)
+    name = body.get("name") or ""
+    if not isinstance(name, str):
+        return _error("bad_request", "name must be a string", 400)
+    on_date = None
+    if body.get("date") not in (None, ""):
+        try:
+            on_date = date.fromisoformat(body["date"])
+        except (TypeError, ValueError):
+            return _error("bad_request", "date must be YYYY-MM-DD", 400)
+    if await asyncio.get_running_loop().run_in_executor(None, db.get_device, device_id) is None:
+        return _error("device_not_found", f"No device: {device_id}", 404)
+    import em_controller
+    result = await em_controller.alerts().set_alarm(
+        device_id, alarm_time, days, name, on_date=on_date, source="dashboard")
+    return _ok(result)
+
+
+@auth.require_admin
+async def _post_alarm_cancel(request: web.Request) -> web.Response:
+    """POST /api/devices/{id}/alarms/cancel — cancel matching schedules."""
+    device_id = request.match_info["id"]
+    body = await _json_body(request)
+    name = body.get("name") or ""
+    alarm_time = body.get("time") or ""
+    if not isinstance(name, str) or not isinstance(alarm_time, str):
+        return _error("bad_request", "name and time must be strings", 400)
+    if await asyncio.get_running_loop().run_in_executor(None, db.get_device, device_id) is None:
+        return _error("device_not_found", f"No device: {device_id}", 404)
+    import em_controller
+    result = await em_controller.alerts().cancel_alarm(
+        device_id, name=name, time=alarm_time, all_alarms=bool(body.get("all")),
+        source="dashboard")
+    return _ok(result)
 
 
 # ─── OTA background tasks ─────────────────────────────────────────────────────
@@ -1668,7 +2385,7 @@ async def _run_update(device_id: str, release: dict,
         current_ver = row["firmware_ver"] if row else None
         await loop.run_in_executor(None, db.set_firmware_previous, device_id, current_ver)
 
-        live = _devices.get(device_id)
+        live = _online(device_id)
         if live is None:
             await _update_failed(device_id,
                                  "Device disconnected before update could start")
@@ -1732,7 +2449,7 @@ async def _run_update(device_id: str, release: dict,
         free_mb = None
         for line in (free_out or "").splitlines():
             if line.startswith("FREE"):
-                free_mb = em_oww_assets.parse_free_mb(line[5:])
+                free_mb = _parse_free_mb(line[5:])
                 break
         if free_mb is not None and free_mb < need_mb:
             await _update_failed(
@@ -1769,7 +2486,7 @@ async def _run_update(device_id: str, release: dict,
         # Atomic symlink flip + service restart
         await _push_log_event(device_id, "info", "controller",
                               f"Flipping symlink → {inactive_slot} and restarting")
-        result = await _shell_run(live,
+        await _shell_run(live,
             f"ln -sf {inactive_slot} /data/local/bin/server && "
             f"kill $PPID"
         )
@@ -1842,7 +2559,7 @@ async def _run_rollback(device_id: str, target_version: str) -> None:
         await _push_log_event(device_id, "info", "controller",
                               f"Rolling back to {target_version}")
 
-        live = _devices.get(device_id)
+        live = _online(device_id)
         if live is None:
             await _update_failed(device_id,
                                  "Device disconnected before rollback")
@@ -1871,7 +2588,7 @@ async def _run_rollback(device_id: str, target_version: str) -> None:
         await _push_log_event(device_id, "info", "controller",
                               f"Flipping {active_slot} → {inactive_slot}")
 
-        result = await _shell_run(live,
+        await _shell_run(live,
             f"ln -sf {inactive_slot} /data/local/bin/server && "
             f"kill $PPID"
         )
@@ -1929,7 +2646,7 @@ async def _monitor_reconnect(
     await asyncio.sleep(8)  # give device time to stop and restart
 
     while time.monotonic() < deadline:
-        if device_id in _devices:
+        if _online(device_id) is not None:
             row = await loop.run_in_executor(None, db.get_device, device_id)
             if row:
                 running = row["firmware_ver"]
@@ -1967,7 +2684,7 @@ async def _get_device_shell_ws(live) -> object:
     _shell_pending[device_id] = future
     # Deliberately do NOT set _shell_dashboard — signals programmatic mode.
 
-    await live.send_control({"type": "shell_open"})
+    await live.send("shell_open", {})
     try:
         ws = await asyncio.wait_for(future, timeout=15.0)
         _shell_ws[device_id] = ws
@@ -1994,7 +2711,7 @@ async def _release_shell_ws(device_id: str, live=None) -> None:
             pass
     _shell_pending.pop(device_id, None)
     if live is not None:
-        await live.send_control({"type": "shell_close"})
+        await live.send("shell_close", {})
     lock = _shell_lock.get(device_id)
     if lock and lock.locked():
         try:
@@ -2245,7 +2962,7 @@ async def _stream_file_to_device(live, data: bytes, dest: str,
 
         # Close heredoc; shell now executes the decode pipeline
         await ws.send(f"{DELIM}\n")
-        log.info(f"[api] Heredoc sent — waiting for TRANSFER_OK")
+        log.info("[api] Heredoc sent — waiting for TRANSFER_OK")
 
         # Wait for confirmation (decode of ~13 MB on ARM takes a few seconds)
         deadline    = time.monotonic() + 120
@@ -2555,7 +3272,7 @@ async def _ws_shell(request: web.Request) -> web.WebSocketResponse:
     if user["role"] != "admin":
         raise web.HTTPForbidden()
 
-    live = _devices.get(device_id)
+    live = _online(device_id)
     if live is None:
         raise web.HTTPConflict(reason="Device is not connected")
 
@@ -2586,14 +3303,14 @@ async def _ws_shell(request: web.Request) -> web.WebSocketResponse:
         # opens the legacy pipe; handle_shell reports the established mode
         # to the dashboard via shell_meta. Programmatic sessions
         # (_get_device_shell_ws) deliberately do not set it.
-        await live.send_control({"type": "shell_open", "pty": True})
+        await live.send("shell_open", {"pty": True})
         await done_future
     except Exception as e:
         log.warning(f"[api] Shell session error ({device_id}): {e}")
     finally:
         _shell_pending.pop(device_id, None)
         _shell_dashboard.pop(device_id, None)
-        await live.send_control({"type": "shell_close"})
+        await live.send("shell_close", {})
         log.info(f"[api] Shell session closed: {device_id}")
         await _push_log_event(device_id, "info", "controller",
                               f"Shell session closed by {user['username']}")
@@ -2654,7 +3371,10 @@ async def _post_deploy_all(request: web.Request) -> web.Response:
     skipped = []
     loop = asyncio.get_event_loop()
 
-    for device_id, live in list(_devices.items()):
+    for device_id, device in list(_devices.items()):
+        if not device.online:
+            skipped.append({"device_id": device_id, "reason": "offline"})
+            continue
         row = await loop.run_in_executor(None, db.get_device, device_id)
         if row is None or not row["approved"]:
             skipped.append({"device_id": device_id, "reason": "not_approved"})
@@ -2878,7 +3598,7 @@ async def _post_secure_link(request: web.Request) -> web.Response:
         return _error("tls_unavailable",
                       "Device-link TLS is not active on this controller", 503)
     device_id = request.match_info["id"]
-    live = _devices.get(device_id)
+    live = _online(device_id)
     if live is None:
         return _error("device_offline", f"Device not connected: {device_id}", 409)
 
@@ -2902,7 +3622,7 @@ async def _post_debloat(request: web.Request) -> web.Response:
     pressing it twice costs a `pm list packages` and nothing else.
     """
     device_id = request.match_info["id"]
-    live = _devices.get(device_id)
+    live = _online(device_id)
     if live is None:
         return _error("device_offline", f"Device not connected: {device_id}", 409)
 
@@ -2926,7 +3646,7 @@ def _log_task_exception_api(task: asyncio.Task) -> None:
 async def _run_secure_link(device_id: str) -> None:
     """Background task: install TLS credentials on a live device."""
     loop = asyncio.get_event_loop()
-    live = _devices.get(device_id)
+    live = _online(device_id)
     if live is None:
         return
     try:
@@ -2952,12 +3672,9 @@ async def _run_secure_link(device_id: str) -> None:
         await _push_log_event(
             device_id, "info", "controller",
             "Secure link: credentials installed — bouncing connection to switch to wss")
-        # The Go client reloads credentials on every dial, so a reconnect
-        # is enough to move to the TLS listener.
-        try:
-            await live.control_ws.close()
-        except Exception:
-            pass
+        # The device reloads credentials on every dial, so a reconnect is
+        # enough to move to the TLS listener.
+        await live.disconnect()
     except Exception as e:
         log.exception(f"[api] Secure link failed for {device_id}: {e}")
         await _push_log_event(device_id, "error", "controller",
@@ -2988,7 +3705,7 @@ async def _get_system_status(request: web.Request) -> web.Response:
         # Peak asyncio event-loop stall since start (ms). Non-trivial values
         # mean the controller itself delayed speaker frames and LED updates.
         "loop_lag_peak_ms": round(_ctrl._loop_lag_peak_ms, 1),
-        "connected":      len(_devices),
+        "connected":      sum(1 for d in list(_devices.values()) if d.online),
         "total_devices":  len(all_rows),
         "pending":        sum(1 for r in all_rows if not r["approved"]),
         "approval_mode":  db.get_config("device_approval", "strict"),
@@ -3005,7 +3722,25 @@ async def _get_system_status(request: web.Request) -> web.Response:
             if r["firmware_ver"] and release
             and r["firmware_ver"] != release["version"]
         ),
+        "speech": _ctrl.speech_worker_status(),
     })
+
+
+def _ha_calendar_url() -> str | None:
+    """HA's calendar panel: HA_URL when configured; under add-on ingress the
+    dashboard shares HA's origin, so the panel path is absolute."""
+    base = os.environ.get("HA_URL", "").strip().rstrip("/")
+    if base:
+        return f"{base}/calendar"
+    return "/calendar" if INGRESS_ONLY else None
+
+
+@auth.require_auth
+async def _get_ha_status(request: web.Request) -> web.Response:
+    """GET /api/ha/status — per-feature HA probe results (SPEC §16.7: a failure
+    disables only the dependent feature) and where HA's calendar UI lives."""
+    import em_controller
+    return _ok({"features": em_controller.ha_status(), "calendar_url": _ha_calendar_url()})
 
 
 @auth.require_admin
@@ -3057,89 +3792,48 @@ async def _patch_system_config(request: web.Request) -> web.Response:
 
 @auth.require_auth
 async def _get_global_config(request: web.Request) -> web.Response:
-    """GET /api/global/config — fleet-wide default device config."""
-    loop = asyncio.get_event_loop()
-    config = await loop.run_in_executor(None, db.get_global_device_config)
+    """GET /api/global/config — fleet-wide effective defaults."""
+    config = await asyncio.get_running_loop().run_in_executor(
+        None, db.get_global_device_config)
     return _ok(config)
 
 
 def _dropped_keys(incoming: dict, stored: dict) -> list[str]:
-    """
-    Keys present in the stored config that the incoming body would delete.
-
-    Config POSTs REPLACE the stored dict — they do not merge. That is fine
-    for the dashboard, which always submits the complete config, and a trap
-    for anything that submits a partial one: on 2026-07-20 a POST carrying a
-    single key silently reset all 26 fleet settings to defaults, taking the
-    wake model from hey_mycroft back to hey_jarvis and dropping owwThreshold
-    0.5 -> 0.3, which surfaced as devices false-waking on ordinary
-    conversation. Callers that genuinely intend a destructive write pass
-    replace=true; everything else is refused before anything is persisted.
-    """
+    """Stored keys a replacement body would delete."""
     return sorted(set(stored) - set(incoming))
 
 
 @auth.require_admin
 async def _post_global_config(request: web.Request) -> web.Response:
-    """
-    POST /api/global/config
-
-    Persists new fleet-wide device defaults, then pushes each connected
-    device its freshly resolved EFFECTIVE config.
-
-    Since v8 that means every connected device, not just fully-inheriting
-    ones: a device overriding only Ring still follows the fleet for
-    Microphones, Wake word and the rest, so it has to receive this change.
-    Each device gets its own resolved config rather than the raw body —
-    sending the body would blow away exactly the overrides being respected.
-
-    The body REPLACES the stored config. A body that would drop existing
-    keys is refused with 409 unless it sets replace=true — see
-    _dropped_keys.
-    """
+    """Replace fleet defaults and apply each connected device's effective config."""
     config = await _json_body(request)
-    loop = asyncio.get_event_loop()
-
     explicit_replace = bool(config.pop("replace", False))
-    # Raw (defaults NOT underlaid): see get_global_device_config_raw — a
-    # newly-added default must not look like a key this body is deleting.
+    error = _validate_config(config)
+    if error is not None:
+        return error
+    loop = asyncio.get_running_loop()
     stored = await loop.run_in_executor(None, db.get_global_device_config_raw)
     dropped = _dropped_keys(config, stored)
     if dropped and not explicit_replace:
-        return _error(
-            "would_drop_keys",
-            f"This body would delete {len(dropped)} existing setting(s): "
-            f"{', '.join(dropped)}. Config POSTs replace rather than merge — "
-            f"send the full config (read-modify-write), or pass replace=true "
-            f"if the deletion is intended.",
-            409,
-        )
-
+        return _error("would_drop_keys",
+                      "This body would delete existing setting(s): " + ", ".join(dropped), 409)
     await loop.run_in_executor(None, db.set_global_device_config, config)
+    saved = await loop.run_in_executor(None, db.get_global_device_config)
 
-    # Push every connected device its own resolved effective config.
     pushed = []
-    for device_id, live in list(_devices.items()):
+    for device_id, device in list(_devices.items()):
+        if not device.online:
+            continue
         effective = await loop.run_in_executor(
-            None, db.get_effective_device_config, device_id
-        )
-        await _apply_live_config(device_id, live, effective)
-        pushed.append(device_id)
+            None, db.get_effective_device_config, device_id)
+        if await _apply_live_config(device_id, device, effective):
+            pushed.append(device_id)
 
-    if pushed:
-        log.info(f"[api] Global config pushed to {len(pushed)} device(s): {pushed}")
-
-    # Reconcile BT proxies for every approved device — offline ones included
-    # (proxy mDNS/port lifecycle is independent of the device connection,
-    # unlike the config push above). No longer filtered on inheritance: a
-    # device overriding some other section still tracks the fleet's
-    # bleProxyEnabled, and reconcile is idempotent either way.
     all_rows = await loop.run_in_executor(None, db.get_all_devices)
     for row in all_rows:
         if row["approved"]:
             await em_ble_proxy.reconcile(row["device_id"])
-
-    return _ok({"config": config, "pushed_to": pushed})
+    return _ok({"config": saved, "pushed_to": pushed})
 
 
 # ─── Auth — change password ───────────────────────────────────────────────────
@@ -3258,6 +3952,21 @@ async def _push_log_event(
             "message": message,
         },
     })
+
+
+async def push_device_update(device_id: str, state: dict) -> None:
+    """Broadcast a partial device JSON (same keys as _merge_device)."""
+    await _push_event({"type": "device_update", "device_id": device_id, "state": state})
+
+
+async def push_alerts(device_id: str, kind: str, data: dict) -> None:
+    """Broadcast an AlertEngine notification (`kind` = its notify code)."""
+    await _push_event({"type": "alerts", "device_id": device_id, "kind": kind, "data": data})
+
+
+async def push_ha_status(features: dict) -> None:
+    """Broadcast a changed em_controller.ha_status()."""
+    await _push_event({"type": "ha_status", "features": features})
 
 
 # ─── GitHub release fetching ──────────────────────────────────────────────────
@@ -3536,238 +4245,6 @@ async def _get_controller_release(request: web.Request) -> web.Response:
 
 
 
-# ─── On-device wake word assets ───────────────────────────────────────────────
-#
-# The runtime and models are not in the firmware (see em_oww_assets), so they
-# have to be installed. This is the field transport; the provisioning wizard
-# pushes the same bytes over ADB from the browser, which is far better suited
-# to 15MB than the shell plane, and both drive the same idempotent plan.
-
-
-async def _oww_device_state(live) -> dict:
-    """
-    What is actually installed on a device, and how much room it has.
-
-    One shell round trip. `md5sum` is asked for per file rather than with a
-    glob so a missing directory yields an empty inventory rather than an
-    error line that could be mistaken for one.
-    """
-    d = em_oww_assets.DEVICE_DIR
-    out = await _shell_run(live, (
-        f'for f in {d}/*.so {d}/*.onnx; do '
-        f'[ -f "$f" ] && echo "$(busybox md5sum "$f" | busybox cut -d\" \" -f1) '
-        f'$(busybox stat -c %Y "$f") $f"; done; '
-        f'echo "FREE $(busybox df -m /data | busybox tail -1)"'
-    ), timeout=120.0)
-
-    free_mb = None
-    lines = []
-    for line in out.splitlines():
-        if line.startswith("FREE "):
-            # The whole df row, parsed in Python: the available column's INDEX
-            # is not stable (busybox wraps a long filesystem name onto its own
-            # line) and an awk field number silently yielded "65%" here, which
-            # read as no measurement and quietly disabled the space check.
-            free_mb = em_oww_assets.parse_free_mb(line[5:])
-        else:
-            lines.append(line)
-    return {
-        "installed": em_oww_assets.parse_device_listing("\n".join(lines)),
-        "free_mb": free_mb,
-    }
-
-
-def _oww_wanted_models(device_id: str) -> list[str]:
-    """
-    The models a device should carry, most important first.
-
-    The configured one is pinned and therefore first. Nothing else is added:
-    extra slots exist so that models a user has already installed survive a
-    switch, not so the controller can push models nobody asked for.
-    """
-    cfg = db.get_effective_device_config(device_id) or {}
-    model = (cfg.get("owwModel") or "").strip()
-    return [model] if model else []
-
-
-async def _sync_oww_assets(live, device_id: str, progress=None) -> dict:
-    """
-    Make a device's asset directory match what it needs. Idempotent.
-
-    Push to `.part` then rename only once md5 matches, so an interrupted
-    transfer can never leave a file the device would try to dlopen. md5 is
-    the ONLY definition of success — the shell transport has produced files
-    of the right length and the wrong content, and a corrupt
-    libonnxruntime.so fails at dlopen with an error that names nothing.
-    """
-    async def say(level: str, msg: str):
-        log.info(f"[api] [{device_id}] oww assets: {msg}")
-        await _push_log_event(device_id, level, "controller", f"Wake word assets: {msg}")
-        if progress:
-            await progress(level, msg)
-
-    desired, problems = em_oww_assets.desired_assets(_oww_wanted_models(device_id))
-    for p in problems:
-        await say("warn", p)
-    if not desired:
-        return {"ok": False, "error": "; ".join(problems) or "nothing to install"}
-
-    state = await _oww_device_state(live)
-    plan = em_oww_assets.plan_sync(desired, state["installed"], state["free_mb"])
-
-    if plan.blocked:
-        await say("error", plan.blocked)
-        return {"ok": False, "error": plan.blocked}
-
-    if plan.is_noop:
-        await say("info", "already up to date")
-        return {"ok": True, "pushed": [], "pruned": [], "problems": problems}
-
-    d = em_oww_assets.DEVICE_DIR
-    await _shell_run(live, f"mkdir -p {d}")
-
-    pushed = []
-    for asset in plan.push:
-        mb = asset.size / (1024 * 1024)
-        await say("info", f"sending {asset.name} ({mb:.1f}MB)…")
-        try:
-            data = asset.source.read_bytes()
-        except OSError as e:
-            await say("error", f"{asset.name} unreadable on the controller: {e}")
-            return {"ok": False, "error": f"{asset.name}: {e}"}
-
-        dest = em_oww_assets.device_path(asset.name)
-        part = f"{dest}.part"
-        pushed = await _stream_file_to_device(live, data, part, mode="644")
-        if not pushed:
-            await say("error", f"{asset.name} transfer failed: {pushed}")
-            return {"ok": False, "error": f"{asset.name}: {pushed}"}
-
-        res = await _shell_run(live, (
-            f'GOT=$(busybox md5sum {part} | busybox cut -d" " -f1); '
-            f'if [ "$GOT" = "{asset.md5}" ]; then mv {part} {dest} && '
-            f'chmod 644 {dest} && echo OK; else rm -f {part}; echo "BAD:$GOT"; fi'
-        ), timeout=120.0)
-        if "OK" not in res:
-            await say("error", f"{asset.name} verify failed ({res.strip() or 'no output'})")
-            return {"ok": False, "error": f"{asset.name}: md5 mismatch"}
-        pushed.append(asset.name)
-
-    for name in plan.prune:
-        await _shell_run(live, f"rm -f {em_oww_assets.device_path(name)}")
-    if plan.prune:
-        await say("info", f"removed unused: {', '.join(plan.prune)}")
-
-    # Touch the selected classifier so LRU eviction sees it as most recent
-    # even on a sync that did not need to re-push it.
-    sel = next((a for a in desired if a.kind == "classifier"), None)
-    if sel:
-        await _shell_run(live, f"touch {em_oww_assets.device_path(sel.name)}")
-
-    await say("info", f"installed {len(pushed)} file(s) — "
-                      f"restart the device to start scoring")
-    return {"ok": True, "pushed": pushed, "pruned": plan.prune, "problems": problems}
-
-
-async def _get_oww_assets(request: web.Request) -> web.Response:
-    """GET /api/devices/{id}/oww_assets — what is installed, and what is needed."""
-    device_id = request.match_info["id"]
-    live = _devices.get(device_id)
-
-    desired, problems = em_oww_assets.desired_assets(_oww_wanted_models(device_id))
-    payload = {
-        "device_dir": em_oww_assets.DEVICE_DIR,
-        "problems": problems,
-        "required": [
-            {"name": a.name, "kind": a.kind, "size": a.size, "md5": a.md5}
-            for a in desired
-        ],
-        "connected": live is not None,
-    }
-    if live is None:
-        # Not an error: the state is simply unknowable, and saying "not
-        # installed" for an offline device would be a guess that reads as fact.
-        payload.update({"status": "unknown", "installed": None, "free_mb": None})
-        return _ok(payload)
-
-    state = await _oww_device_state(live)
-    plan = em_oww_assets.plan_sync(desired, state["installed"], state["free_mb"])
-    payload.update({
-        "installed": {k: v[0] for k, v in state["installed"].items()},
-        "free_mb": state["free_mb"],
-        "missing": [a.name for a in plan.push],
-        "prunable": plan.prune,
-        "blocked": plan.blocked,
-        "status": ("blocked" if plan.blocked
-                   else "installed" if plan.is_noop
-                   else "outdated" if plan.keep
-                   else "absent"),
-    })
-    return _ok(payload)
-
-
-@auth.require_admin
-async def _post_oww_assets(request: web.Request) -> web.Response:
-    """POST /api/devices/{id}/oww_assets — install or update them."""
-    device_id = request.match_info["id"]
-    live = _devices.get(device_id)
-    if live is None:
-        return _error("device_offline", "Device is not connected", 409)
-    result = await _sync_oww_assets(live, device_id)
-    if not result.get("ok"):
-        return _error("sync_failed", result.get("error", "sync failed"), 500)
-    return _ok(result)
-
-
-
-@auth.require_auth
-async def _get_provision_oww_manifest(request: web.Request) -> web.Response:
-    """
-    GET /api/provision/oww_assets — what the wizard should push, and where.
-
-    The wizard pushes over ADB from the browser rather than through the shell
-    plane: a freshly-flashed device is not in _devices yet, and USB is far
-    better suited to 15MB than a base64 heredoc. Same bytes, same md5s, same
-    destination as the field path — only the transport differs.
-    """
-    fleet = db.get_global_device_config() or {}
-    models = [m for m in [fleet.get("owwModel") or ""] if m]
-    desired, problems = em_oww_assets.desired_assets(models)
-    return _ok({
-        "dir": em_oww_assets.DEVICE_DIR,
-        "problems": problems,
-        "assets": [{"name": a.name, "size": a.size, "md5": a.md5} for a in desired],
-    })
-
-
-@auth.require_auth
-async def _get_provision_oww_asset(request: web.Request) -> web.Response:
-    """
-    GET /api/provision/oww_asset/{name} — the bytes of one asset.
-
-    Serves only names the manifest just listed, resolved from the manifest
-    rather than from the request: the filename is user-supplied, and joining
-    it onto a directory is how a path traversal gets written by accident.
-    """
-    name = request.match_info["name"]
-    fleet = db.get_global_device_config() or {}
-    desired, _ = em_oww_assets.desired_assets(
-        [m for m in [fleet.get("owwModel") or ""] if m])
-    asset = next((a for a in desired if a.name == name), None)
-    if asset is None:
-        return _error("not_found", f"{name} is not a current asset", 404)
-    try:
-        data = asset.source.read_bytes()
-    except OSError as e:
-        return _error("unreadable", str(e), 500)
-    return web.Response(
-        body=data,
-        content_type="application/octet-stream",
-        headers={"X-Asset-MD5": asset.md5},
-    )
-
-
-
 def _read_first_line(path: str) -> str:
     with open(path) as fh:
         return fh.readline().strip()
@@ -3890,6 +4367,18 @@ def _controller_stats() -> dict:
         stats["recordings_mb"] = round(total / 1048576.0, 1)
     except OSError:
         pass
+    try:
+        # rglob, not iterdir: the wake store is nested one directory per
+        # device, so a flat listing would count nothing but subdirectories.
+        # Reported separately from recordings_mb because the two grow for
+        # different reasons — utterance retention is a fixed handful per
+        # device, while this fills up in proportion to how badly a wake
+        # threshold is tuned, which is exactly the thing worth noticing.
+        total = sum(f.stat().st_size
+                    for f in em_wakeclips.wakes_dir().rglob("*.wav"))
+        stats["wakeclips_mb"] = round(total / 1048576.0, 1)
+    except OSError:
+        pass
 
     return stats
 
@@ -3952,27 +4441,26 @@ async def _get_support_bundle(request: web.Request) -> web.Response:
         did = row["device_id"]
         device_configs[did] = await loop.run_in_executor(
             None, db.get_effective_device_config, did)
-        live = _devices.get(did)
+        device = _devices.get(did)
+        live = device if device is not None and device.online else None
+        hello = live.link.hello if live is not None and live.link is not None else {}
         live_state[did] = {
-            "connected":    live is not None,
-            # Capabilities decide which HA entities are advertised at all,
-            # which is the first thing to check when one is "missing".
-            "capabilities": list(getattr(live, "capabilities", []) or []) if live else [],
-            # When ambient_light is missing from the list above, this says
-            # WHY: no_chip (hardware revision without the part), no_attribute
-            # (driver has not bound), or ok. None means firmware too old to
-            # report it — not a fault. Carries the i2c device names it saw,
-            # which is what makes a no_chip answer checkable rather than
-            # merely asserted, and identifies an unfamiliar board revision
-            # the first time one turns up (#90).
-            "ambient_light_status": getattr(live, "ambient_light_status", None) if live else None,
-            "muted":        getattr(live, "muted", None) if live else None,
-            "rtt_ms":       getattr(live, "rtt_last_ms", None) if live else None,
-            "volume":       getattr(live, "volume", None) if live else None,
+            "connected":        live is not None,
+            "upgrade_required": bool(live is not None and live.upgrade_required),
+            # Capabilities decide which HA entities and controls exist.
+            "capabilities":     sorted(live.capabilities) if live is not None else [],
+            # Why ambient_light is absent: no_chip, no_attribute, or ok (#90).
+            "ambient_light_status": hello.get("ambient_light_status"),
+            "muted":        live.muted if live is not None else None,
+            "rtt_ms":       live.rtt_last_ms if live is not None else None,
+            "volume":       live.volume if live is not None else None,
             "media_state":  em_player.state(did),
-            "stats":        em_support.redact_stats(live.stats if live else None),
+            "stats":        em_support.redact_stats(live.stats if live is not None else None),
+            "wake_stats":   device.wake_stats if device is not None else None,
+            "alert_state":  live.alert_state if live is not None else None,
         }
-        turns += await loop.run_in_executor(None, db.get_turns, did, 50, since)
+        turns += [dict(t, device_id=did)
+                  for t in await loop.run_in_executor(None, db.get_turns, did, 50, since)]
         # get_device_metrics resolves its own rows and does NOT carry the
         # device, so without this every device's hours pooled into one
         # anonymous list — six devices' CPU and memory with no way to tell
@@ -4107,7 +4595,7 @@ async def _collect_supervisor_log(device_id: str) -> None:
     so the evidence arrives where someone would look, instead of sitting in a
     file nobody knows to read.
     """
-    live = _devices.get(device_id)
+    live = _online(device_id)
     if live is None:
         return
     out = await _shell_run(live, f"busybox tail -c 4096 {SUPERVISOR_LOG}", timeout=30.0)
@@ -4199,20 +4687,20 @@ def _error(code: str, message: str, status: int) -> web.Response:
 # ─── Request helpers ──────────────────────────────────────────────────────────
 
 async def _json_body(request: web.Request) -> dict:
-    """
-    Parse the request body as JSON.
-    Returns 400 if body is missing or not valid JSON.
-    """
+    """The request body as a JSON object; 400 when missing, invalid, or not an object."""
     try:
-        return await request.json()
+        body = await request.json()
     except Exception:
+        body = None
+    if not isinstance(body, dict):
         raise web.HTTPBadRequest(
             content_type="application/json",
             body=json.dumps({
-                "error": "Request body must be valid JSON",
+                "error": "Request body must be a JSON object",
                 "code":  "invalid_json",
             }),
         )
+    return body
 
 
 def _require_str(body: dict, key: str) -> str:
@@ -4266,16 +4754,26 @@ def _row_sections(row) -> list:
         return []
 
 
+# Actor states (em_session.SessionActor.state) the dashboard shows as listening
+# or thinking; SPEAKING is shown as speaking.
+_LISTENING_STATES = frozenset({"ARMED", "LISTENING", "END_PENDING", "EXPECT_REPLY"})
+_THINKING_STATES = frozenset({"COMMITTED", "THINKING"})
+
+
 def _merge_device(row) -> dict:
     """
-    Merge a DB device row with live in-memory state.
+    One device's dashboard JSON: the DB row plus live Device state.
 
-    DB row provides persistent fields (label, config, firmware_ver etc).
-    Live _devices dict provides transient state (connected, speaking,
-    muted, listening, thinking).
+    Live fields describe the current connection and are null/false/empty while
+    the device is offline; `wake_stats` is the last report received (it carries
+    `received_ms`), so it survives a disconnect.
     """
     device_id = row["device_id"]
-    live = _devices.get(device_id)
+    device = _devices.get(device_id)
+    live = device if device is not None and device.online else None
+    turn_state = live.actor.state if live is not None and live.link is not None else None
+    alert_state = live.alert_state if live is not None else None
+    sections = _row_sections(row)
 
     return {
         # Persistent
@@ -4288,78 +4786,56 @@ def _merge_device(row) -> dict:
         "first_seen":         row["first_seen"],
         "last_seen":          row["last_seen"],
         "config":             json.loads(row["config"] or "{}"),
-        "config_sections":    _row_sections(row),
-        # Compat view for older readers: no overridden sections == fleet.
-        "use_global_config":  not _row_sections(row),
+        "config_sections":    sections,
+        "use_global_config":  not sections,
         "esphome_port":       row["esphome_api_port"],
         "ble_proxy_port":     row["ble_proxy_port"],
-        # Live — defaults when device is not connected
-        "connected":        live is not None,
-        "speaking":         live.speaking  if live else False,
-        "muted":            getattr(live, "muted",     False) if live else False,
-        "listening":        getattr(live, "listening", False) if live else False,
-        "thinking":         getattr(live, "thinking",  False) if live else False,
-        "ringing":          getattr(live, "timer_ringing", False) if live else False,
-        "stats":            live.stats if live else None,
-        # Control-plane round trip, controller-measured. The RF counters are
-        # structurally zero on this hardware (the MTK driver populates
-        # neither retries nor noise), so this is the only latency signal.
-        "rttMs":            getattr(live, "rtt_last_ms", None) if live else None,
-        # Volume is persisted device state, not config (see
-        # em_config_sections.STATE_KEYS): the live level while connected,
-        # otherwise the last one the device reported, so an offline device
-        # still shows where it will come back.
-        "volume":           (live.volume if live is not None
-                             else _stored_volume(row)),
-        # Controller-side BT proxy state — non-None only while the device's
-        # bleProxyEnabled config has a proxy server instantiated.
-        "bleProxy":         em_ble_proxy.get_status(device_id),
-        # Device-link security: token issued (persistent) + whether the
-        # current control connection came in over the TLS listener (live).
-        "linkTokenIssued":  bool(row["token"]) if "token" in row.keys() else False,
-        "linkTls":          getattr(live, "secure", False) if live else False,
-        # Q4 fix (2026-07-05 review): near-miss counter — same lifecycle as
-        # the rest of this "Live" section (resets on reconnect, since it
-        # lives on the per-connection Device object, not the DB row).
-        "owwNearMisses":    getattr(live, "oww_near_misses", 0) if live else 0,
-        # What this firmware can be asked to do, by capability rather than by
-        # version comparison. Drives whether the dashboard OFFERS on-device
-        # scoring: a toggle that silently does nothing on old firmware is worse
-        # than no toggle, because it looks like the feature is broken.
-        "owwShadowCapable": getattr(live, "oww_shadow_capable", False) if live else False,
-        # Separate from shadow: firmware in the field scores and reports
-        # without being able to act on it, and offering those "on" produces a
-        # device that never answers.
-        "owwTriggerCapable": getattr(live, "oww_trigger_capable", False) if live else False,
-        "audioMixCapable": getattr(live, "audio_mix_capable", False) if live else False,
-        # Native AFE (docs/native-afe-migration.md): whether this device's
-        # audio is running through Android's audio HAL right now. Drives the
-        # dashboard disabling the beamformer/AEC/AGC/gain controls that path
-        # bypasses — "disabled with the reason", never a control that
-        # silently does nothing.
-        "nativeAfeCapable": getattr(live, "native_afe_capable", False) if live else False,
-        # Fixed build property (opt-in mechanism exists at all), distinct
-        # from the runtime state above — gates whether the dashboard offers
-        # the toggle in the first place.
-        "nativeAfeBackendCapable": getattr(live, "native_afe_backend_capable", False) if live else False,
-        # Gates the tap-as-event toggle — see em_button.decide.
-        "buttonHoldCapable": getattr(live, "button_hold_capable", False) if live else False,
-        # Gates the wake confirmation chime: the audio is embedded in the
-        # firmware, so older builds ignore the message entirely.
-        "wakeSoundCapable": getattr(live, "wake_sound_capable", False) if live else False,
-        # Whether the device found its ambient light sensor. Reported so the
-        # dashboard can tell "no sensor" apart from "sensor present, no reading
-        # yet" — which is the question #90 had to be answered by hand, because
-        # nothing on screen showed the lux value at all and the only way to
-        # check was a support bundle.
-        "ambientLightCapable":
-            "ambient_light" in (getattr(live, "capabilities", []) or []) if live else False,
-        # WiFi change state (survives the reconnect a change causes)
-        "wifi":             wifi_state(device_id),
-        # Update state
+        # Live connection
+        "connected":          live is not None,
+        "upgrade_required":   bool(live is not None and live.upgrade_required),
+        # Capability names (SPEC §11.1): a control whose capability is absent
+        # is shown disabled with the reason, never as a silent no-op.
+        "capabilities":       sorted(live.capabilities) if live is not None else [],
+        "missing_capabilities": sorted(live.missing_capabilities) if live is not None else [],
+        "firmware_version":   live.firmware_version if live is not None else None,
+        "turn_state":         turn_state,
+        "speaking":           turn_state == "SPEAKING",
+        "listening":          turn_state in _LISTENING_STATES,
+        "thinking":           turn_state in _THINKING_STATES,
+        "muted":              live.muted if live is not None else None,
+        # Live level while connected, otherwise the last one the device
+        # reported (persisted as startupVolume), as an HA 0..1 float.
+        "volume":             (em_volume.device_level_to_ha(live.volume)
+                               if live is not None and live.volume is not None
+                               else _stored_volume(row)),
+        "ambient":            live.ambient if live is not None else None,
+        "alert_state":        alert_state,
+        "ringing":            (alert_state.get("active") is not None
+                               if alert_state is not None else None),
+        "wake_stats":         device.wake_stats if device is not None else None,
+        # A diagnostic uplink lease is held, so the device answers no wake (§4.4).
+        "diagnostic":         bool(live is not None and live.diagnostic),
+        "stats":              live.stats if live is not None else None,
+        # Recording modes. collect/ambient are persisted device-row columns
+        # (armed whether or not the device is up); counters are per connection.
+        "collectMode":        bool(row["collect_mode"]),
+        "collectClips":       getattr(live, "collect_clips", 0) if live is not None else 0,
+        "collectLastMs":      getattr(live, "collect_last_ms", None) if live is not None else None,
+        "ambientMode":        bool(row["ambient_mode"]),
+        "ambientFiles":       getattr(live, "ambient_files", 0) if live is not None else 0,
+        "ambientMs":          (getattr(live.ambient_rec, "duration_ms", 0)
+                               if live is not None and getattr(live, "ambient_rec", None) is not None
+                               else 0),
+        # Script-driven capture is live-only; nothing is persisted.
+        "captureMode":        bool(getattr(live, "capture_mode", False)) if live is not None else False,
+        "captureDelivered":   getattr(live, "capture_delivered", 0) if live is not None else 0,
+        # Controller-measured control-plane round trip.
+        "rttMs":              live.rtt_last_ms if live is not None else None,
+        "bleProxy":           em_ble_proxy.get_status(device_id),
+        "linkTokenIssued":    bool(row["token"]),
+        "linkTls":            bool(live is not None and live.secure),
+        "wifi":               wifi_state(device_id),
         "update_in_progress": device_id in _updates_in_progress,
-        # Last OTA/rollback failure (None when the last attempt succeeded or
-        # none was made) — lets the dashboard show a terminal ✗ state instead
-        # of "updating…" forever when an update aborts.
+        # Last OTA/rollback failure; None when the last attempt succeeded.
         "update_error":       _update_errors.get(device_id),
     }

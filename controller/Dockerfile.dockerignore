@@ -1,0 +1,12 @@
+# The build context is the repository root (for the root bcresnet_audio.*
+# registry seed). Send only what the Dockerfile COPYs.
+*
+!bcresnet_audio.onnx
+!bcresnet_audio.json
+!controller/
+controller/tests
+controller/data
+controller/echomuse.db*
+controller/static/dashboard.js
+**/__pycache__
+**/*.pyc

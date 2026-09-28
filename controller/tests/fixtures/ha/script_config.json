@@ -1,0 +1,53 @@
+{
+  "source": [
+    "homeassistant/components/config/script.py (EditScriptConfigView, post_write_hook reloads script)",
+    "homeassistant/components/config/view.py (BaseEditConfigView.get/post: 404 'Resource not found', 400 'Message malformed: ...', 200 {\"result\":\"ok\"})"
+  ],
+  "get": {
+    "request": {
+      "method": "GET",
+      "path": "/api/config/script/config/echomuse_set_alarm"
+    },
+    "response": {
+      "alias": "Set an alarm on an EchoMuse speaker",
+      "mode": "parallel",
+      "fields": {
+        "time": {
+          "required": true,
+          "selector": {
+            "time": {}
+          }
+        }
+      },
+      "variables": {
+        "echomuse_revision": 1
+      },
+      "sequence": [
+        {
+          "stop": "done"
+        }
+      ]
+    }
+  },
+  "get_missing": {
+    "status": 404,
+    "response": {
+      "message": "Resource not found"
+    }
+  },
+  "post": {
+    "request": {
+      "method": "POST",
+      "path": "/api/config/script/config/echomuse_set_alarm"
+    },
+    "response": {
+      "result": "ok"
+    }
+  },
+  "post_invalid": {
+    "status": 400,
+    "response": {
+      "message": "Message malformed: extra keys not allowed @ data['bogus']"
+    }
+  }
+}

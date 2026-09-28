@@ -6,9 +6,8 @@
 # replaced — the embedded file is a build artefact that happens to be
 # committed, in the same spirit as internal/wakeword/testdata's fixture.
 #
-# 48kHz mono S16_LE is not a choice: it is the device's wire and output
-# format (see internal/bindings/speaker and slspeaker), so anything else
-# would need resampling on an ARMv7 core during a voice turn.
+# 48kHz mono S16_LE is the render mixer's native format, so anything else
+# would require device-side resampling.
 set -eu
 cd "$(dirname "$0")"
 

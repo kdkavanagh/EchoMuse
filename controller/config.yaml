@@ -24,6 +24,7 @@ arch:
 # docker-compose deployment sets network_mode: host. Without it, devices on
 # the LAN cannot find or connect to the controller.
 host_network: true
+homeassistant_api: true
 ingress: true
 ingress_port: 8768
 panel_icon: mdi:microphone-message
@@ -39,11 +40,6 @@ options:
   server_ip: ""
   mdns_name: "echomuse"
   esphome_project_version: "2.0.0"
-  oww_model: "hey_jarvis"
-  # Keep in step with em_db.DEFAULT_DEVICE_CONFIG["owwThreshold"] — a fresh
-  # add-on install is precisely the case that default exists for, and
-  # test_addon_default_threshold_matches_the_controller pins the pair.
-  oww_threshold: 0.5
   require_device_tls: false
   device_approval: "strict"
 schema:
@@ -51,7 +47,5 @@ schema:
   server_ip: "str"
   mdns_name: "match(^[a-z0-9][a-z0-9-]{0,62}$)"
   esphome_project_version: "str"
-  oww_model: "str"
-  oww_threshold: "float(0,1)"
   require_device_tls: "bool"
   device_approval: "list(strict|auto)"

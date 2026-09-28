@@ -7,6 +7,13 @@ controller/static/vendor/
 controller/static/dashboard.js
 .claude/
 scratchpad/
+.venv/
+
+# Wake-word clips pulled off a device (e.g. the dashboard's wakeclips.zip or
+# samples.zip, unpacked here). These are recordings of real people saying
+# the wake phrase; they belong in a training set, never in the repo.
+wake_clips/
+wake_clips_rejected/
 
 # DTLN NS models (vendored into the Docker image at build time; bare-metal
 # dev drops them here or points NS_MODEL_DIR elsewhere)
@@ -20,3 +27,9 @@ controller/models/
 *.db
 *.db-wal
 *.db-shm
+
+# Timer ring sound uploads. sounds_dir() is the DB's parent + /sounds, so a
+# bare-metal run puts them in controller/sounds/ — inside this repo. Uploads
+# are user audio and some of it is extracted vendor earcons, which must not
+# be redistributed from a public repo.
+controller/sounds/
