@@ -207,10 +207,14 @@ def strip_final(final_text: str, streaming_start: int, wake_phrase: str) -> str:
 def final_command_text(
     final_text: str, *, wake_initiated: bool, streaming_window: Window | None, wake_phrase: str
 ) -> str:
-    """Steps 1–3: the HA transcript routed onward. Only wake-initiated turns strip anything."""
-    if not wake_initiated or streaming_window is None:
+    """Steps 1–3: the HA transcript routed onward. Only wake-initiated turns strip anything.
+
+    When the streaming transcript has no window (Kroko can drop a quiet wake word),
+    step 3 runs with `s` = 0: the wake word is assumed to open the utterance.
+    """
+    if not wake_initiated:
         return final_text
-    return strip_final(final_text, streaming_window.start, wake_phrase)
+    return strip_final(final_text, streaming_window.start if streaming_window is not None else 0, wake_phrase)
 
 
 def command_text(transcript: StreamingTranscript, window: Window | None) -> CommandText:

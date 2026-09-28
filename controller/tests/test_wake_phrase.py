@@ -97,13 +97,21 @@ def test_button_and_reply_turns_never_strip():
     assert final_command_text(text, wake_initiated=False, streaming_window=found, wake_phrase="ophelia") == text
 
 
-def test_missing_streaming_match_never_strips():
-    transcript = stream(["turn", " off", " the", " lights"])
+@pytest.mark.parametrize(
+    "final,expected",
+    [
+        ("Ophelia, what's the weather?", "what's the weather?"),
+        ("Okay Ophelia, what's the weather?", "what's the weather?"),
+        ("what does Ophelia mean?", "what does Ophelia mean?"),
+        ("Damn it, Ophelia, turn off the lights.", "Damn it, Ophelia, turn off the lights."),
+    ],
+)
+def test_missing_streaming_match_strips_only_at_utterance_start(final, expected):
+    # Kroko dropped the quiet wake word (turn 433): no streaming window, so s = 0.
+    transcript = stream(["What's", " the", " weather?"])
     found = locate_streaming(transcript, "ophelia", 10_000)
     assert found is None
-    assert final_command_text(
-        "Ophelia, turn off the lights.", wake_initiated=True, streaming_window=found, wake_phrase="ophelia"
-    ) == "Ophelia, turn off the lights."
+    assert final_command_text(final, wake_initiated=True, streaming_window=found, wake_phrase="ophelia") == expected
 
 
 def test_oh_feel_ya_is_not_a_wake_match():
