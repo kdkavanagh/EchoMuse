@@ -122,6 +122,31 @@ def test_route_b_complete_command_under_background_speech():
     assert committed.route == "B" and committed.redecode_required
 
 
+@pytest.mark.parametrize(
+    ("prefix", "ends"),
+    [
+        ("tell me a story", True),  # unknown
+        ("set a timer for", True),  # needs_more
+        ("turn off", False),  # extendable: its 1,216 ms pause could end inside a soft stretch
+    ],
+)
+def test_route_a_counts_background_speech_as_pause_only_for_long_pause_text(prefix, ends):
+    # Office turn 460: a free-form question, then a TV 10+ dB down that kept talking.
+    r = reducer()
+    r.observe([classified(i, CellClass.COMMAND_SPEECH) for i in range(6)])
+    r.observe([classified(i, CellClass.BACKGROUND_SPEECH, command=False) for i in range(6, 62)])
+    pause_end = 6 * CELL + 28_672  # 1,792 ms after the last command cell
+    early = r.step(
+        frontier=pause_end - CELL, valid_audio_end=pause_end - CELL, stable=stable(prefix, through_sample=pause_end - CELL)
+    )
+    assert early.pending is None
+    got = r.step(frontier=pause_end, valid_audio_end=pause_end, stable=stable(prefix, through_sample=pause_end))
+    if ends:
+        assert got.pending.route == "A" and got.pending.boundary == 6 * CELL
+    else:
+        assert got.pending is None and got.state == EndpointState.LISTENING
+
+
 @pytest.mark.parametrize(("tail", "routed"), [("in the", False), ("and the news tonight", True)])
 def test_route_b_requires_tail_that_does_not_extend_the_parse(tail, routed):
     # §16.6: route B holds only when prefix + tail parses `unknown` (TV words); an extending tail blocks it.

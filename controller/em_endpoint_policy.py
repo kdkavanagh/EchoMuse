@@ -29,6 +29,13 @@ PAUSE_WINDOW_CELLS = 19
 PAUSE_QUIET_CELLS = 15
 MIN_TRAILING_BLANKS = 10  # one blank frame = 40 ms
 
+# Route A's 15-of-19 vote. `background_speech` joins it only for text whose
+# pause is the long one: 1,792 ms outlasts any soft stretch inside a command,
+# the complete/extendable pauses do not, and route B already ends a complete
+# command under background speech.
+PAUSE_QUIET = frozenset({CellClass.NON_SPEECH, CellClass.SELF_OUTPUT})
+BACKGROUND_PAUSE_CLASSES = frozenset({GrammarClass.NEEDS_MORE, GrammarClass.UNKNOWN})
+
 ROUTE_A_PAUSE = {
     GrammarClass.COMPLETE: 9_728,  # 608 ms
     GrammarClass.EXTENDABLE: 19_456,  # 1,216 ms
@@ -289,12 +296,17 @@ class EndpointReducer:
     def _route_a(self, frontier: int, stable: StableText, cells: list[ClassifiedCell]) -> Pending | None:
         if len(self._command_ends) < MIN_COMMAND_CELLS or not stable.prefix or len(cells) < PAUSE_WINDOW_CELLS:
             return None
-        quiet = (CellClass.NON_SPEECH, CellClass.SELF_OUTPUT)
-        if sum(c.cls in quiet for c in cells[-PAUSE_WINDOW_CELLS:]) < PAUSE_QUIET_CELLS:
+        window = cells[-PAUSE_WINDOW_CELLS:]
+        quiet = sum(c.cls in PAUSE_QUIET for c in window)
+        background = sum(c.cls == CellClass.BACKGROUND_SPEECH for c in window)
+        if quiet + background < PAUSE_QUIET_CELLS:
             return None
         if stable.trailing_blank_frames < MIN_TRAILING_BLANKS:
             return None
-        if frontier - self._command_ends[-1] < ROUTE_A_PAUSE[self.completeness(stable.prefix)]:
+        completeness = self.completeness(stable.prefix)
+        if quiet < PAUSE_QUIET_CELLS and completeness not in BACKGROUND_PAUSE_CLASSES:
+            return None
+        if frontier - self._command_ends[-1] < ROUTE_A_PAUSE[completeness]:
             return None
         return Pending(self._command_ends[-1], frontier, Route.A, stable.prefix)
 

@@ -267,7 +267,7 @@ the levers are physical: move it away from walls and the TV and closer to
 where people talk.
 
 When your request has ended is decided by a fixed policy on the controller
-(`post_afe_1`, described in [voice-pipeline.md](voice-pipeline.md)). It has no
+(`post_afe_2`, described in [voice-pipeline.md](voice-pipeline.md)). It has no
 dashboard tuning.
 
 ### Noise suppression

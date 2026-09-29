@@ -567,7 +567,7 @@ A **command-speech run** opens on a cell with VAD ≥ 0.65 whose level is within
 | Class | Updates `last_cmd_end` | Qualifies for route A's 15-of-19 vote | Route B (complete command, then background) |
 |---|---|---|---|
 | `command_speech` | yes | no | blocks it |
-| `background_speech` | no | no | counts toward the 80% requirement |
+| `background_speech` | no | only after `needs_more` or `unknown` text | counts toward the 80% requirement |
 | `self_output` | no | yes | ignored |
 | `non_speech` | no | yes | ignored |
 | `unknown` | no | no | ignored |
@@ -580,11 +580,12 @@ A **command-speech run** opens on a cell with VAD ≥ 0.65 whose level is within
 |---|---|---|
 | Fan or dishwasher running | `non_speech` after the command | Route A commits after the normal pause |
 | TV across the room during a grammar command (“set a timer for five minutes”) | TV speech arrives ≥ 10 dB below the commander: `background_speech` | Route B commits once the stable parse is complete and the TV's words don't extend it |
+| TV across the room during a free-form question (“what's the score of the Bears game”) | TV speech arrives ≥ 10 dB below the commander: `background_speech` | Route A counts it as pause and commits after the 1,792 ms `unknown` pause, as in a quiet room, once the recognizer has emitted no word for 400 ms |
 | TV at conversational level during a free-form question | TV cells within 10 dB of `F`: `command_speech` or `unknown` | No real pause: `too_long` at the 15 s bound, unless the user pauses while the TV is quiet |
 | Second person speaks right after the commander, at similar level | `command_speech` (indistinguishable by level) | Both people's words land in one utterance, ending at the next real pause or at `too_long`, and HA hears both: the physical limit below. Speaker takeover is backlog (section 19.1) |
 | Music ducked 18 dB with vocals | Native AEC plus the duck usually leave vocals ≥ 10 dB below the commander: `background_speech`; clean echo matches become `self_output` | Music does not keep the turn open |
 | Earcon at turn open | Reference non-silent; echo comparison `echo_only` | `self_output`, never mistaken for the start of a command |
-| Soft final syllables (“…lights”) | Can fall 10 dB below `F`: `background_speech` | Does not end the turn: route A needs non-speech, and route B needs text that no longer extends; a trailing word that extends the parse revokes a pending end |
+| Soft syllables (“…lights”) and quieter stretches of the command | Can fall 10 dB below `F`: `background_speech` | They never move the cut, which route A places 192 ms after the last `command_speech` cell. After `complete` or `extendable` text they hold the turn open, and route B still needs text that no longer extends. After `needs_more` or `unknown` text they count as pause: a soft stretch of about 1.9 s, with no louder cell and no word recognized in its last 400 ms, ends the turn before anything said after it |
 
 **No speaker model.** Attribution uses echo, VAD, and level only. Voiceprints were probed and rejected for the initial implementation: 1.2 s windows gave no usable separation, and the 2.0 s evidence is a two-clip sanity test [P1]. The deferred speaker-takeover route is in section 19.1.
 
@@ -602,7 +603,7 @@ The decision trace (section 11.3) records the class sequence as run-length segme
 
 Four decision paths exist, with numeric rules in section 16.6:
 
-1. **Normal pause:** VAD votes, decoder trailing blanks, and stable text agree; required pause length depends on grammar completeness.
+1. **Normal pause:** VAD votes, decoder trailing blanks, and stable text agree; required pause length depends on grammar completeness. After `needs_more` or `unknown` text, speech at least 10 dB below the command counts as pause, so a free-form request ends under a quieter TV.
 2. **Complete command under background speech:** a stable grammar-complete command is followed only by lower-level speech that does not extend the parse. This is the TV-room path for covered commands.
 3. **Reply on the ESPHome path:** for replies to HA-started conversations only, any 1,024 ms pause after command speech ends the reply (section 16.7).
 4. **Bounded failure:** no command, gap, too-long audio, or no stable progress closes as `no_input`, `interrupted`, `too_long`, or `retry` without dispatching guessed text.
@@ -897,7 +898,7 @@ These are acceptance thresholds for implementation, **not measured results**. Nu
 - Playback-profile false activations ≤0.2/h from non-self room audio (TV, conversation) during content playback and alert rings at 0.65, counted after verification.
 - Wake verification: genuine wakes spoken over TTS, content, and alerts pass ≥95%, with far-field and loud-playback strata reported. Self-output candidates, including answer openings that score on the wake model like the observed “Eight” and “I need to”, pass 0. Calibrate the 0.40 alias distance on these recordings, not on the 23 clips that chose it. Failing recall at every workable distance is the section 5.4 retraining trigger; failing rejection is an attribution defect.
 - No accepted self-wakes in at least 24 hours of owned-output replay; report exposure hours and a confidence bound, not “zero false-wake probability.”
-- Complete-command end-to-commit p95 ≤1.2 s in quiet/non-speech noise. For grammar-covered commands followed by background TV/radio speech at least 10 dB below the command, p95 ≤1.8 s through route B. For free-form requests under equal-level continuous TV, report commit-after-real-pause, `retry`, and `too_long` rates separately; merged action text is a failure. Retry rate is always reported beside latency so rejecting everything cannot pass.
+- Complete-command end-to-commit p95 ≤1.2 s in quiet/non-speech noise. For grammar-covered commands followed by background TV/radio speech at least 10 dB below the command, p95 ≤1.8 s through route B. For free-form requests followed by such background speech, report route A end-to-commit latency and the clipped-command rate of that stratum; it counts toward the clipped-command gate below. For free-form requests under equal-level continuous TV, report commit-after-real-pause, `retry`, and `too_long` rates separately; merged action text is a failure. Retry rate is always reported beside latency so rejecting everything cannot pass.
 - Clipped-command rate <1% on the section 13.3 endpoint set, with explicit long-pause/accessibility subsets.
 - Initial contaminated/false-action acceptance target <0.1% on negative-turn cases, with enough examples to bound it meaningfully. Safety-sensitive HA actions retain their own confirmation policy.
 - Device mute and physical stop work without HA/controller; local sound-stop target ≤100 ms from the physical event.
@@ -1343,7 +1344,9 @@ Audio admission requires nonzero alert gain; the UI can explicitly silence/delet
 
 ### 16.6 Speech bundle, evidence, and endpoint rules
 
-The values below define policy revision `post_afe_1`. They are implementable defaults, **not calibrated field probabilities**. Changing a value produces a new policy hash and reruns the section 13 acoustic gates; it does not require BCResNet retraining.
+The values below define policy revision `post_afe_2`. They are implementable defaults, **not calibrated field probabilities**. Changing a value produces a new policy hash and reruns the section 13 acoustic gates; it does not require BCResNet retraining.
+
+`post_afe_2` differs from `post_afe_1` in one rule: after `needs_more` or `unknown` text, route A's vote counts `background_speech` as quiet. Under `post_afe_1` a free-form question followed by a TV at least 10 dB down had no route: route A refused the TV as pause, route B and the fallback need `complete` text, and the no-progress limit closed it as `retry` (Office turn 460, 2026-09-28). The 1,792 ms pause bounds the added risk: only a soft stretch at least that long, containing no louder cell and ending in 400 ms without a recognized word, can end a request before speech that follows it.
 
 **Pinned speech bundle.** Selected by running candidates on real Dot recordings (section 14, [P2]); runtime behavior was probed in an isolated Python 3.12 environment on the controller host [P1]:
 
@@ -1482,7 +1485,7 @@ routes are tried in the order written; the first whose conditions hold sets pend
 route A, normal pause:
     command speech ≥ 192 ms
     stable prefix exists
-    ≥ 15 of the last 19 cells are non_speech or self_output
+    ≥ 15 of the last 19 cells are non_speech or self_output (or background_speech when the stable prefix is needs_more or unknown)
     trailing blanks ≥ 10 frames (400 ms)
     frontier − last_cmd_end ≥ 608 ms complete | 1,216 ms extendable | 1,792 ms needs_more/unknown
     → pending = {last_cmd_end, frontier, A}
@@ -1508,7 +1511,7 @@ if command speech exists and frontier − progress_sample ≥ 3.0 s:
 
 Every age and duration in this reducer is measured in acquired-audio sample time, never wall time. A delayed link therefore cannot shorten a no-input window or mistake late audio for silence; a missing range is a gap (`interrupted`), not quiet.
 
-This makes the TV case explicit. A grammar-covered command can finish while background speech continues. An uncovered free-form request finishes under equal-level TV only after a real pause; otherwise it reaches the 15 s bound and closes as `too_long`, asking for a shorter request. The design does not claim that one beam-selected microphone stream can separate arbitrary equal-level voices.
+This makes the TV case explicit. A grammar-covered command can finish while background speech continues. A free-form request followed by TV at least 10 dB below the command finishes after route A's long pause. An uncovered free-form request finishes under equal-level TV only after a real pause; otherwise it reaches the 15 s bound and closes as `too_long`, asking for a shorter request. The design does not claim that one beam-selected microphone stream can separate arbitrary equal-level voices.
 
 **Early answer.** While a prompt carrying a reply expectation plays, its `reply` lease gives each cell VAD, level, and a per-cell echo result. The prompt is interrupted for an early answer after 15 consecutive cells (480 ms) with VAD ≥0.85, `B` available and `E ≥ B+12 dB`, and a per-cell result of `near_end_present` or `no_reference`. The onset is the first of those cells. Otherwise the audio is retained and the prompt continues.
 
@@ -1752,7 +1755,7 @@ For each, `request_id` is exactly `"{{ context.id }}|<action>|{{ args | tojson }
 | VAD model and input? | Raw Silero v5 probabilities with carried state and context, on the evidence copy, on the controller within leases | v4 and raw-level input missed Dot speech; the sherpa wrapper is segment-only [P1][P2] |
 | New model fits required? | None to build or ship. Conditional: a BCResNet playback fine-tune only if the section 13 playback gates fail | Every model is either deployed (BCResNet) or pretrained, and measured on Dot audio where data exists [D2][D3][P2] |
 | Speaker gating? | None in the initial implementation; speaker takeover is backlog (section 19.1) | Only a two-clip sanity test exists [P1]; published approaches use trained per-frame models |
-| TV-room endpoint? | Grammar-complete background-speech route plus bounded retry | Equal-level voices are not separable from one stream |
+| TV-room endpoint? | Grammar-complete background-speech route; background speech ≥10 dB down counts as pause after `needs_more`/`unknown` text; bounded retry | Equal-level voices are not separable from one stream; speech ≥10 dB down is, and a 1,792 ms pause outlasts soft stretches inside a command |
 | Unsolicited follow-up? | Not implemented | No available directedness/NTT model |
 | Native AFE metadata? | Unused and unavailable in protocol v1 | No validated per-frame ERLE/DTD path |
 | Presentation timing? | Estimated callback/sample accounting plus 150 ms drain guard | No measured DAC timestamp API; guard is a release gate |

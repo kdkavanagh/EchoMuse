@@ -43,13 +43,14 @@ the device wire protocol is [docs/protocol-v1.md](../docs/protocol-v1.md).
 - **Endpointing and speech recognition on the controller.** A speech worker
   (sherpa-onnx 1.13.8 with Silero VAD and Kroko streaming ASR, hash-pinned
   and downloaded when the image is built) supplies evidence; a fixed policy
-  (`post_afe_1`) decides when you stopped talking. Home Assistant then runs a
+  (`post_afe_2`) decides when you stopped talking. Home Assistant then runs a
   speech-to-text-only pass on the committed audio and a separate intent/TTS
   pass. The wake word is removed from the transcript, never cut from the
   audio; when the streaming recognizer misses a quiet wake word, it is still
   removed from the start of HA's transcript, so local sentences keep matching.
   Utterances are capped at 15 s, or 30 s with the new **Extended
-  utterances** toggle.
+  utterances** toggle. A free-form question asked with a TV talking quietly
+  across the room ends after the normal pause.
 - **"Ophelia, stop" / "Ophelia, snooze"** stop or snooze a ringing alert. A
   bare wake word no longer stops a ring; a tap on the action button still
   does.

@@ -204,7 +204,7 @@ after you, counts as your command.
 
 ## Stage 7 — Deciding you've finished
 
-The **endpoint reducer** (`em_endpoint_policy`, fixed policy `post_afe_1`)
+The **endpoint reducer** (`em_endpoint_policy`, fixed policy `post_afe_2`)
 decides when your utterance ends, measured in audio time, never wall-clock
 time, so a slow network cannot shorten or lengthen a pause. It ends a turn in
 one of these ways:
@@ -214,7 +214,9 @@ one of these ways:
   your words already form a complete command: 608 ms for a complete one
   ("turn off the kitchen lights", "stop"), 1,216 ms when a longer name could
   follow ("turn off the kitchen…"), 1,792 ms otherwise, including every
-  free-form question.
+  free-form question. For those 1,792 ms waits, speech clearly quieter than
+  you (a TV across the room) counts as silence, so a question asked with the
+  TV on ends as it would in a quiet room.
 - **Complete command under background speech.** A recognised, complete
   command followed only by quieter speech that does not add to it ends
   without waiting for silence. This is the TV-room path, and it only covers
@@ -238,8 +240,10 @@ thinking pause, and failure modes are named rather than guessed. See
 [led-ring-states.md](led-ring-states.md) for what the ring shows at each
 point.
 
-**Caveat:** an uncovered free-form question asked over a loud TV only ends
-at a real pause, or at the length limit.
+**Caveat:** a free-form question asked over a TV about as loud as you only
+ends at a real pause, or at the length limit. And in a free-form question,
+dropping well below your own volume for about two seconds reads as the end:
+anything said after that is not part of the request.
 
 ## Stage 8 — Speech-to-text, in Home Assistant
 
