@@ -6,6 +6,7 @@ import (
 	"log"
 	"math"
 
+	"github.com/wilbowes/EchoMuse/internal/assets"
 	"github.com/wilbowes/EchoMuse/internal/audio/ema"
 	"github.com/wilbowes/EchoMuse/internal/audio/refdsp"
 	"github.com/wilbowes/EchoMuse/internal/audio/ring"
@@ -85,7 +86,7 @@ func (s *Supervisor) onRenderEpoch(epoch uint64) {
 			FinalSample: s.refRing.End(), Reason: reason})
 	}
 	s.refRing.Reset(0)
-	s.refEpoch, s.refReason = newEpoch(), reason
+	s.refEpoch, s.refReason = ema.NewEpoch(), reason
 	s.up.SetEpochs(s.micEpoch, s.refEpoch)
 	s.openReferenceStreamLocked()
 }
@@ -107,7 +108,7 @@ func (s *Supervisor) onProgress(p render.Progress) {
 		}
 	}
 	body := proto.RenderProgress{
-		PlaybackID: p.PlaybackID, Event: string(p.Event),
+		PlaybackID: p.PlaybackID, Event: p.Event,
 		SubmittedFrames: p.SubmittedFrames, CompletedFrames: p.CompletedFrames,
 		MonoNs: p.MonoNS, UncertaintyUs: p.UncertaintyUS,
 		TimingQuality: p.TimingQuality, ReferenceCoverage: p.ReferenceCoverage,
@@ -136,7 +137,7 @@ func (s *Supervisor) onFinished(f render.Finished) {
 	}
 	s.logSend(proto.TypeRenderFinished, f.Generation, proto.RenderFinished{
 		PlaybackID: f.PlaybackID, LastCompletedFrame: f.LastCompletedFrame,
-		Reason: string(f.Reason), TimingQuality: f.TimingQuality,
+		Reason: f.Reason, TimingQuality: f.TimingQuality,
 	})
 }
 
@@ -149,7 +150,7 @@ func (s *Supervisor) renderStart(env proto.Envelope) {
 		s.ack(env, proto.AckRejected, codeInvalid)
 		return
 	}
-	class := render.SourceClass(b.SourceClass)
+	class := b.SourceClass
 	v := render.Playback{ID: b.PlaybackID, Generation: env.Generation, Class: class, GainDB: b.GainDB}
 	asset := ""
 	if b.LocalAsset != nil {
@@ -175,7 +176,7 @@ func (s *Supervisor) renderStart(env proto.Envelope) {
 			return
 		}
 		pcm, installed := s.ex.PreviewPCM(asset)
-		if !installed && isSHA256(asset) {
+		if !installed && assets.IsSHA256(asset) {
 			s.wantSounds(asset)
 		}
 		v.PCM = pcm
@@ -252,7 +253,7 @@ func (s *Supervisor) focusAcquire(env proto.Envelope) {
 		s.ack(env, proto.AckRejected, codeInvalid)
 		return
 	}
-	kind := focus.Kind(b.Focus)
+	kind := b.Focus
 	if err := s.fm.Acquire(b.LeaseID, b.Owner, env.Generation, kind, ttl(b.TTLMs)); err != nil {
 		s.ack(env, proto.AckRejected, focusCode(err))
 		return

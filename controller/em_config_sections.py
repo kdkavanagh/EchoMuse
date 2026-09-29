@@ -11,48 +11,52 @@ rendering; tests/test_config_sections.py fails if the two drift or if any
 config key belongs to no section.
 """
 
-# Section id → (display label, config keys). Ids are stored in the DB, so they
-# are API surface: renaming one needs a migration. Labels are display only and
-# match the dashboard Stage titles.
-SECTIONS: dict[str, dict] = {
-    "playback": {
-        "label": "Playback",
-        "keys": ["eqBands", "eqLoudness", "duckDb"],
-    },
-    "wakeword": {
-        "label": "Wake word",
-        # wakeModel is the active registry graph's SHA-256 (§5.1); its
-        # thresholds belong to the registry entry, not to config.
-        "keys": ["wakeModel", "saveWakeClips", "wakeArbitrationMs", "wakeSound"],
-    },
-    "microphones": {
-        "label": "Speech",
-        # Everything the controller decides about the STT copy. Gain,
-        # beamforming, AEC and AGC belong to the native AFE (§4.1).
-        "keys": ["nsAsr", "saveUtterances", "extendedUtterances"],
-    },
-    "ring": {
-        "label": "Ring",
-        "keys": [
-            "ledScene", "ledListenColor", "ledThinkColor",
-            "meterAttack", "meterDecay", "meterFloor",
-            "meterGamma", "meterRef", "meterCurve",
-        ],
-    },
-    "advanced": {
-        "label": "Button",
-        "keys": ["buttonSingleTapEvent", "buttonMultiTapMs"],
-    },
-    "bluetooth": {
-        "label": "Bluetooth",
-        "keys": ["bleProxyEnabled"],
-    },
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import StrEnum
+from typing import Any, Iterable, Mapping
+
+# A config scope as stored (JSON object): values are whatever each key holds.
+DeviceConfig = dict[str, Any]
+
+
+class SectionId(StrEnum):
+    """Section ids. They are stored in the DB, so they are API surface:
+    renaming one needs a migration."""
+    PLAYBACK = "playback"
+    WAKEWORD = "wakeword"
+    MICROPHONES = "microphones"
+    RING = "ring"
+    ADVANCED = "advanced"
+    BLUETOOTH = "bluetooth"
+    TIMERS = "timers"
+
+
+@dataclass(frozen=True, slots=True)
+class Section:
+    label: str              # display only; matches the dashboard Stage title
+    keys: tuple[str, ...]   # the config keys this section scopes
+
+
+SECTIONS: dict[SectionId, Section] = {
+    SectionId.PLAYBACK: Section("Playback", ("eqBands", "eqLoudness", "duckDb")),
+    # wakeModel is the active registry graph's SHA-256 (§5.1); its
+    # thresholds belong to the registry entry, not to config.
+    SectionId.WAKEWORD: Section("Wake word", ("wakeModel", "saveWakeClips", "wakeArbitrationMs", "wakeSound")),
+    # Everything the controller decides about the STT copy. Gain,
+    # beamforming, AEC and AGC belong to the native AFE (§4.1).
+    SectionId.MICROPHONES: Section("Speech", ("nsAsr", "saveUtterances", "extendedUtterances")),
+    SectionId.RING: Section("Ring", (
+        "ledScene", "ledListenColor", "ledThinkColor",
+        "meterAttack", "meterDecay", "meterFloor",
+        "meterGamma", "meterRef", "meterCurve",
+    )),
+    SectionId.ADVANCED: Section("Button", ("buttonSingleTapEvent", "buttonMultiTapMs")),
+    SectionId.BLUETOOTH: Section("Bluetooth", ("bleProxyEnabled",)),
     # Separate from "ring" (the LED ring) so a device can take its own alert
     # sounds without forking its LED scene.
-    "timers": {
-        "label": "Timers",
-        "keys": ["timerSound", "timerRingSeconds", "timerRingGapSeconds", "alarmSound"],
-    },
+    SectionId.TIMERS: Section("Timers", ("timerSound", "timerRingSeconds", "timerRingGapSeconds", "alarmSound")),
 }
 
 # Keys that live in the config dict but are device STATE, not settings: they
@@ -64,20 +68,18 @@ SECTIONS: dict[str, dict] = {
 # never reported.
 STATE_KEYS: frozenset[str] = frozenset({"startupVolume"})
 
-SECTION_IDS: tuple[str, ...] = tuple(SECTIONS)
+SECTION_IDS: tuple[SectionId, ...] = tuple(SectionId)
 
 
-def keys_for(section_ids) -> set[str]:
+def keys_for(section_ids: Iterable[object] | None) -> set[str]:
     """Every config key belonging to the given sections. Unknown ids ignored."""
     out: set[str] = set()
-    for sid in section_ids or ():
-        section = SECTIONS.get(sid)
-        if section:
-            out.update(section["keys"])
+    for sid in normalise(section_ids):
+        out.update(SECTIONS[sid].keys)
     return out
 
 
-def normalise(section_ids) -> list[str]:
+def normalise(section_ids: Iterable[object] | None) -> list[SectionId]:
     """
     Filter to known section ids, in canonical SECTIONS order.
 
@@ -91,7 +93,8 @@ def normalise(section_ids) -> list[str]:
     return [sid for sid in SECTION_IDS if sid in given]
 
 
-def merge(global_cfg: dict, device_cfg: dict, section_ids) -> dict:
+def merge(global_cfg: Mapping[str, object], device_cfg: Mapping[str, object],
+          section_ids: Iterable[object] | None) -> DeviceConfig:
     """
     Effective config: fleet, with the device's values layered over it for the
     sections it overrides.
@@ -101,7 +104,7 @@ def merge(global_cfg: dict, device_cfg: dict, section_ids) -> dict:
     one from the fleet would mean a device coming back at another room's
     volume.
     """
-    effective = dict(global_cfg)
+    effective: DeviceConfig = dict(global_cfg)
     overridden = keys_for(section_ids)
     for key in overridden:
         if key in device_cfg:
@@ -112,7 +115,7 @@ def merge(global_cfg: dict, device_cfg: dict, section_ids) -> dict:
     return effective
 
 
-def summarise(section_ids) -> str:
+def summarise(section_ids: Iterable[object] | None) -> str:
     """Dashboard-facing one-liner for the Status panel's Config row."""
     n = len(normalise(section_ids))
     if n == 0:

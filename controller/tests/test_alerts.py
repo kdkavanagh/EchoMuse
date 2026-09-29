@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 import em_alerts
+import em_db
 from em_alert_scripts import render_scripts, config_sha256
 from em_alert_wire import (
     DEFAULT_LOOP_GAP_MS, DEFAULT_MAX_RING_MS, DEFAULT_RAMP_MS, DEFAULT_SNOOZE_MS,
@@ -18,6 +19,7 @@ from em_alert_wire import (
     snooze_due_utc_ms, snooze_schedule_id, ui_schedule_id,
 )
 from em_alerts import AlertEngine, Speaker
+from em_device_link import CommandAck
 from em_ha_client import HaUnavailable
 
 SOUND = "b" * 64
@@ -185,7 +187,7 @@ class Rig:
     def __init__(self, conn=None, ha=None, now=None, awaiting=("dev1",)):
         if conn is None:
             conn = sqlite3.connect(":memory:")
-            conn.executescript(em_alerts.ALERT_SCHEMA_SQL)   # the schema-22 migration's job
+            conn.executescript(em_db.ALERT_SCHEMA_SQL)   # the schema-22 migration's job
         self.conn = conn
         self.ha = ha or FakeHa()
         self.now = now or [int(NOW.timestamp() * 1000)]
@@ -767,7 +769,7 @@ def test_dismiss_and_snooze_complete_through_device_local_operation():
         assert rig.notes("alert_ringing")[-1] == {"ringing": True}
 
         async def device(dev, message_id, body):
-            rig.engine.on_command_ack(dev, {"message_id": message_id, "status": "durable", "error": None})
+            rig.engine.on_command_ack(dev, CommandAck.parse({"message_id": message_id, "status": "durable", "error": None}))
             child = snooze_child(occ, rig.now[0]) if body["action"] == "snooze" else None
             await rig.engine.on_local_operation(dev, device_op(occ, body["action"], child=child,
                                                                op_id=body["op_id"]))
@@ -783,7 +785,7 @@ def test_dismiss_and_snooze_complete_through_device_local_operation():
         assert (await rig.engine.snooze_alarm("dev1")) == {"ok": False, "error": "timers cannot be snoozed"}
 
         async def timer_device(dev, message_id, body):
-            rig.engine.on_command_ack(dev, {"message_id": message_id, "status": "applied", "error": None})
+            rig.engine.on_command_ack(dev, CommandAck.parse({"message_id": message_id, "status": "applied", "error": None}))
         rig.on_act = timer_device
         stopped = await rig.engine.dismiss_alert("dev1", source="entity")
         assert stopped["ok"] and stopped["kind"] == "timer" and stopped["name"] == "Pasta"

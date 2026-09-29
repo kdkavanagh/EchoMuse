@@ -17,7 +17,7 @@ Usage:
 
     device = db.get_device(device_id)
     db.upsert_device_seen(device_id, ip, version)
-    db.log_device(device_id, "info", "device", "Connected")
+    db.log_device(device_id, db.LogLevel.INFO, db.LogSource.DEVICE, "Connected")
 """
 
 import json
@@ -26,10 +26,12 @@ import os
 import sqlite3
 import threading
 import time
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from typing import Optional
+from dataclasses import dataclass, fields
+from enum import StrEnum
+from typing import Callable, Final, Optional, Self
 
-import em_alerts
 import em_ambient
 import em_config_sections
 import em_recordings
@@ -37,7 +39,141 @@ import em_samples
 import em_sounds
 import em_wakeclips
 
+from em_config_sections import DeviceConfig
+
 log = logging.getLogger("echomuse.db")
+
+
+class SystemConfigKey(StrEnum):
+    """`system_config` keys (get_config/set_config)."""
+    SCHEMA_VERSION = "schema_version"
+    GLOBAL_DEVICE_CONFIG = "global_device_config"
+    NEXT_ESPHOME_PORT = "next_esphome_port"
+    DEVICE_APPROVAL = "device_approval"
+    SESSION_EXPIRY_DAYS = "session_expiry_days"
+    UPDATE_CHECK_INTERVAL = "update_check_interval"
+    GITHUB_REPO = "github_repo"
+    LATEST_VERSION = "latest_version"
+    LATEST_BINARY_URL = "latest_binary_url"
+    LATEST_NOTES = "latest_notes"
+    LATEST_RELEASE_URL = "latest_release_url"
+    LATEST_PUBLISHED_AT = "latest_published_at"
+    LAST_UPDATE_CHECK = "last_update_check"
+    LATEST_CONTROLLER_VERSION = "latest_controller_version"
+    LATEST_CONTROLLER_NOTES = "latest_controller_notes"
+    LATEST_CONTROLLER_PUBLISHED_AT = "latest_controller_published_at"
+
+
+class LogLevel(StrEnum):
+    """`device_logs.level`."""
+    INFO = "info"
+    WARN = "warn"
+    ERROR = "error"
+
+
+class LogSource(StrEnum):
+    """`device_logs.source`: who wrote the entry."""
+    CONTROLLER = "controller"
+    DEVICE = "device"
+
+
+# ─── Row records ──────────────────────────────────────────────────────────────
+#
+# What the public getters return instead of sqlite3.Row. Fields follow the
+# table's `SELECT *` column order (CREATE, then each ALTER in migration order),
+# so asdict() keeps the key order the rows serialised with. from_row reads
+# every column by name: a column a later migration adds is ignored until a
+# field names it.
+
+@dataclass(frozen=True, slots=True)
+class DeviceRow:
+    """`devices`. INTEGER flags stay ints; config/config_sections are the
+    stored JSON text."""
+    device_id: str
+    label: Optional[str]
+    approved: int
+    ip: Optional[str]
+    firmware_ver: Optional[str]
+    firmware_previous: Optional[str]
+    first_seen: Optional[int]
+    last_seen: Optional[int]
+    config: str
+    esphome_api_port: Optional[int]
+    esphome_noise_psk: Optional[str]
+    use_global_config: int
+    ble_proxy_port: Optional[int]
+    token: Optional[str]
+    config_sections: str
+    collect_mode: int
+    ambient_mode: int
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> Self:
+        return cls(**{f.name: row[f.name] for f in fields(cls)})
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceLogRow:
+    """`device_logs`."""
+    id: int
+    device_id: str
+    ts: int
+    level: str
+    source: str
+    message: str
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> Self:
+        return cls(**{f.name: row[f.name] for f in fields(cls)})
+
+
+@dataclass(frozen=True, slots=True)
+class WakeCounterRow:
+    """`wake_counters`: one device-hour."""
+    device_id: str
+    hour_ts: int
+    near_misses: int
+    near_miss_max: float
+    underruns: int
+    dev_frames: int
+    dev_drops: int
+    dev_crossings: int
+    dev_max_score: float
+    dev_max_infer_ms: int
+    dev_max_gap_ms: int
+    dev_hops: int
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> Self:
+        return cls(**{f.name: row[f.name] for f in fields(cls)})
+
+
+@dataclass(frozen=True, slots=True)
+class UserRow:
+    """`users`."""
+    id: int
+    username: str
+    password_hash: str
+    role: str
+    created_at: int
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> Self:
+        return cls(**{f.name: row[f.name] for f in fields(cls)})
+
+
+@dataclass(frozen=True, slots=True)
+class SessionRow:
+    """`sessions`."""
+    token: str
+    user_id: int
+    created_at: int
+    expires_at: int
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> Self:
+        return cls(**{f.name: row[f.name] for f in fields(cls)})
+
 
 # ─── Default device config ────────────────────────────────────────────────────
 
@@ -48,7 +184,7 @@ DEPLOYED_WAKE_MODEL = "4eb745120ea56f5681eddbf788a0c69e1fd406d4694a04a4dba0c1e41
 # Every key a config scope may hold (SPEC §18.4). Keys ride the device
 # `config` message only where the device uses them; the rest are controller-
 # side. Sections: em_config_sections.SECTIONS.
-DEFAULT_DEVICE_CONFIG = {
+DEFAULT_DEVICE_CONFIG: DeviceConfig = {
     # Confirmation chime on an accepted wake, played by the device as an
     # `earcon` source (§11.2). Off by default: an audible change on every
     # device it reaches is a decision, not an upgrade side effect.
@@ -145,6 +281,49 @@ WAKE_COUNTER_RETENTION_DAYS = 180
 #   - Use CREATE TABLE IF NOT EXISTS / INSERT OR IGNORE for idempotency.
 #   - SQLite ALTER TABLE only supports ADD COLUMN. Renaming or dropping
 #     columns requires a create-copy-drop migration.
+#   - Nothing a migration executes may come from another module: a later
+#     edit there would silently change an applied migration.
+
+# §16.3 alert journal DDL verbatim, plus the script-installation record
+# (§16.7): em_alerts' tables, created by migration 22 and frozen with it.
+ALERT_SCHEMA_SQL: Final[str] = """\
+CREATE TABLE alert_ops (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    op_id TEXT NOT NULL UNIQUE,
+    endpoint_id TEXT NOT NULL,
+    calendar_entity TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (action IN
+      ('create','update','dismiss','snooze','expire','cancel')),
+    schedule_id TEXT NOT NULL,
+    occurrence_key TEXT,
+    source TEXT NOT NULL CHECK (source IN ('voice','llm','device','dashboard','engine')),
+    payload_json TEXT NOT NULL,
+    payload_sha256 TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending','applied','rejected')),
+    step INTEGER NOT NULL DEFAULT 0,
+    result_json TEXT,
+    created_ms INTEGER NOT NULL,
+    applied_ms INTEGER,
+    CHECK ((state = 'applied') = (applied_ms IS NOT NULL)),
+    CHECK (action NOT IN ('dismiss','snooze','expire') OR occurrence_key IS NOT NULL)
+);
+CREATE INDEX alert_ops_pending ON alert_ops(endpoint_id, state, seq);
+CREATE INDEX alert_ops_terminal ON alert_ops(schedule_id, occurrence_key);
+CREATE TABLE alert_delivery (
+    endpoint_id TEXT PRIMARY KEY,
+    calendar_entry_id TEXT NOT NULL,
+    calendar_entity TEXT NOT NULL,
+    delivery_epoch TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    acked_sequence INTEGER NOT NULL,
+    CHECK (acked_sequence <= sequence)
+);
+CREATE TABLE alert_scripts (
+    object_id TEXT PRIMARY KEY,
+    sha256 TEXT NOT NULL,
+    revision INTEGER NOT NULL
+);
+"""
 
 MIGRATIONS: list[str] = [
     # ── v1 — initial schema ──────────────────────────────────────────────────
@@ -701,7 +880,7 @@ MIGRATIONS: list[str] = [
 
     ALTER TABLE wake_counters ADD COLUMN dev_hops INTEGER NOT NULL DEFAULT 0;
     """
-    + em_alerts.ALERT_SCHEMA_SQL
+    + ALERT_SCHEMA_SQL
     + """
     UPDATE system_config SET value = '22' WHERE key = 'schema_version';
     """,
@@ -754,7 +933,7 @@ MIGRATIONS: list[str] = [
 
 # Post-migration fixups that need Python rather than SQL. Keyed by the schema
 # version they belong to; run once, immediately after that migration applies.
-def _fixup_v11(conn) -> None:
+def _fixup_v11(conn: sqlite3.Connection) -> None:
     rows = conn.execute("SELECT device_id, config, config_sections FROM devices").fetchall()
     for row in rows:
         try:
@@ -775,7 +954,7 @@ def _fixup_v11(conn) -> None:
             )
 
 
-def _fixup_v21(conn) -> None:
+def _fixup_v21(conn: sqlite3.Connection) -> None:
     removed = "ringBargeIn"
     changed = 0
 
@@ -822,7 +1001,7 @@ _V21_TIMER_RING_SECONDS = 60
 _EXTENDED_ABOVE_MS = 15_000
 
 
-def _json_dict(text) -> Optional[dict]:
+def _json_dict(text: Optional[str]) -> Optional[DeviceConfig]:
     """Parsed JSON object, {} for empty, None for anything unparseable."""
     try:
         value = json.loads(text or "{}") or {}
@@ -831,15 +1010,15 @@ def _json_dict(text) -> Optional[dict]:
     return value if isinstance(value, dict) else None
 
 
-def _extended_utterances(max_speech_ms) -> bool:
+def _extended_utterances(max_speech_ms: object) -> bool:
     try:
-        ms = int(max_speech_ms)
-    except (TypeError, ValueError):
+        ms = int(max_speech_ms) if isinstance(max_speech_ms, (int, float, str)) else _V21_MAX_SPEECH_MS
+    except ValueError:
         ms = _V21_MAX_SPEECH_MS
     return ms == 0 or ms > _EXTENDED_ABOVE_MS
 
 
-def _rewrite_scope_v22(cfg: dict) -> dict:
+def _rewrite_scope_v22(cfg: DeviceConfig) -> DeviceConfig:
     """One scope's stored config without the v22 removed keys, and with the old
     default ring limit moved to the new default (§18.4 steps 1–2)."""
     out = {k: v for k, v in cfg.items() if k not in _V22_REMOVED_KEYS}
@@ -848,7 +1027,7 @@ def _rewrite_scope_v22(cfg: dict) -> dict:
     return out
 
 
-def _fixup_v22(conn) -> None:
+def _fixup_v22(conn: sqlite3.Connection) -> None:
     """
     SPEC §18.4 config rewrite and alert-sound export.
 
@@ -920,7 +1099,7 @@ def _fixup_v22(conn) -> None:
                         f"{em_sounds.ALERT_MAX_SECONDS} s — its alert asset is cut")
 
 
-def _fixup_v23(conn) -> None:
+def _fixup_v23(conn: sqlite3.Connection) -> None:
     """Delete _V23_REMOVED_KEYS from the fleet config and every device config.
     Unreadable JSON is left as is: there is nothing to strip safely."""
     row = conn.execute(
@@ -942,7 +1121,7 @@ def _fixup_v23(conn) -> None:
             )
 
 
-_MIGRATION_FIXUPS = {11: _fixup_v11, 21: _fixup_v21, 22: _fixup_v22, 23: _fixup_v23}
+_MIGRATION_FIXUPS: dict[int, Callable[[sqlite3.Connection], None]] = {11: _fixup_v11, 21: _fixup_v21, 22: _fixup_v22, 23: _fixup_v23}
 
 # ─── Connection management ────────────────────────────────────────────────────
 
@@ -992,7 +1171,7 @@ def init(path: str = "echomuse.db") -> None:
 
 
 @contextmanager
-def _tx():
+def _tx() -> Iterator[sqlite3.Connection]:
     """
     Context manager for a write transaction.
 
@@ -1010,14 +1189,14 @@ def _tx():
             raise
 
 
-def _q(sql: str, params: tuple = ()) -> list[sqlite3.Row]:
+def _q(sql: str, params: Sequence[object] = ()) -> list[sqlite3.Row]:
     """Execute a read query and return all rows."""
     assert _conn is not None, "db.init() has not been called"
     with _db_lock:
         return _conn.execute(sql, params).fetchall()
 
 
-def _q1(sql: str, params: tuple = ()) -> Optional[sqlite3.Row]:
+def _q1(sql: str, params: Sequence[object] = ()) -> Optional[sqlite3.Row]:
     """Execute a read query and return at most one row."""
     assert _conn is not None, "db.init() has not been called"
     with _db_lock:
@@ -1078,7 +1257,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
     # system_config table doesn't exist yet, so we catch that case.
     try:
         row = conn.execute(
-            "SELECT value FROM system_config WHERE key = 'schema_version'"
+            "SELECT value FROM system_config WHERE key = ?", (SystemConfigKey.SCHEMA_VERSION,)
         ).fetchone()
         current = int(row[0]) if row else 0
     except sqlite3.OperationalError:
@@ -1136,29 +1315,22 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
 # ─── Device registry ──────────────────────────────────────────────────────────
 
-def get_device(device_id: str) -> Optional[sqlite3.Row]:
-    """
-    Return the device row for device_id, or None if not registered.
-
-    Row fields: device_id, label, approved, ip, firmware_ver,
-                firmware_previous, first_seen, last_seen, config (JSON str)
-    """
-    return _q1(
-        "SELECT * FROM devices WHERE device_id = ?",
-        (device_id,),
-    )
+def get_device(device_id: str) -> Optional[DeviceRow]:
+    """Return the device row for device_id, or None if not registered."""
+    row = _q1("SELECT * FROM devices WHERE device_id = ?", (device_id,))
+    return DeviceRow.from_row(row) if row is not None else None
 
 
-def get_all_devices() -> list[sqlite3.Row]:
+def get_all_devices() -> list[DeviceRow]:
     """Return all device rows ordered by first_seen."""
-    return _q("SELECT * FROM devices ORDER BY first_seen ASC")
+    return [DeviceRow.from_row(r) for r in _q("SELECT * FROM devices ORDER BY first_seen ASC")]
 
 
-def get_pending_devices() -> list[sqlite3.Row]:
+def get_pending_devices() -> list[DeviceRow]:
     """Return devices that have connected but not yet been approved."""
-    return _q(
+    return [DeviceRow.from_row(r) for r in _q(
         "SELECT * FROM devices WHERE approved = 0 ORDER BY first_seen ASC"
-    )
+    )]
 
 
 def register_new_device(device_id: str, ip: str, version: Optional[str]) -> None:
@@ -1188,7 +1360,7 @@ def register_new_device(device_id: str, ip: str, version: Optional[str]) -> None
     log.info(f"[db] New device registered (pending): {device_id}")
 
 
-def approve_device(device_id: str, label: str, config: Optional[dict] = None) -> None:
+def approve_device(device_id: str, label: str, config: Optional[Mapping[str, object]] = None) -> None:
     """
     Approve a pending device and optionally set label and config.
 
@@ -1199,7 +1371,7 @@ def approve_device(device_id: str, label: str, config: Optional[dict] = None) ->
     if device is None:
         raise ValueError(f"Device not found: {device_id}")
 
-    effective_config = json.dumps(config) if config is not None else device["config"]
+    effective_config = json.dumps(config) if config is not None else device.config
 
     with _tx() as conn:
         conn.execute(
@@ -1358,7 +1530,7 @@ def set_ambient_mode(device_id: str, enabled: bool) -> None:
         )
 
 
-def set_device_config(device_id: str, config: dict) -> None:
+def set_device_config(device_id: str, config: Mapping[str, object]) -> None:
     """
     Persist updated config for a device.
 
@@ -1372,7 +1544,7 @@ def set_device_config(device_id: str, config: dict) -> None:
         )
 
 
-def get_device_config(device_id: str) -> dict:
+def get_device_config(device_id: str) -> DeviceConfig:
     """
     Return the config dict for a device.
 
@@ -1389,14 +1561,14 @@ def get_device_config(device_id: str) -> dict:
         return dict(DEFAULT_DEVICE_CONFIG)
 
 
-def get_global_device_config() -> dict:
+def get_global_device_config() -> DeviceConfig:
     """
     Return the fleet-wide default device config.
 
     Falls back to DEFAULT_DEVICE_CONFIG if the key is missing or unparseable
     (should only occur on a fresh DB before migration v3 has run).
     """
-    row = _q1("SELECT value FROM system_config WHERE key = 'global_device_config'")
+    row = _q1("SELECT value FROM system_config WHERE key = ?", (SystemConfigKey.GLOBAL_DEVICE_CONFIG,))
     if row is None or not row["value"]:
         return dict(DEFAULT_DEVICE_CONFIG)
     try:
@@ -1413,7 +1585,7 @@ def get_global_device_config() -> dict:
     return {**DEFAULT_DEVICE_CONFIG, **stored}
 
 
-def get_global_device_config_raw() -> dict:
+def get_global_device_config_raw() -> DeviceConfig:
     """
     The stored fleet config with defaults NOT underlaid — i.e. exactly the
     keys an operator has persisted.
@@ -1425,7 +1597,7 @@ def get_global_device_config_raw() -> dict:
     look like it was deleting that key, and refuse a perfectly legitimate
     write. Returns {} when nothing has been saved yet.
     """
-    row = _q1("SELECT value FROM system_config WHERE key = 'global_device_config'")
+    row = _q1("SELECT value FROM system_config WHERE key = ?", (SystemConfigKey.GLOBAL_DEVICE_CONFIG,))
     if row is None or not row["value"]:
         return {}
     try:
@@ -1434,16 +1606,16 @@ def get_global_device_config_raw() -> dict:
         return {}
 
 
-def set_global_device_config(config: dict) -> None:
+def set_global_device_config(config: Mapping[str, object]) -> None:
     """Persist updated fleet-wide default device config."""
     with _tx() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO system_config (key, value) VALUES ('global_device_config', ?)",
-            (json.dumps(config),),
+            "INSERT OR REPLACE INTO system_config (key, value) VALUES (?, ?)",
+            (SystemConfigKey.GLOBAL_DEVICE_CONFIG, json.dumps(config)),
         )
 
 
-def get_device_config_sections(device_id: str) -> list:
+def get_device_config_sections(device_id: str) -> list[em_config_sections.SectionId]:
     """The section ids this device overrides. Empty list = follows the fleet."""
     row = _q1("SELECT config_sections FROM devices WHERE device_id = ?", (device_id,))
     if row is None:
@@ -1455,13 +1627,13 @@ def get_device_config_sections(device_id: str) -> list:
         return []
 
 
-def set_device_config_sections(device_id: str, section_ids) -> list:
+def set_device_config_sections(device_id: str, section_ids: Iterable[object]) -> list[em_config_sections.SectionId]:
     """
     Set which sections this device overrides, and drop the stored values for
     any section it no longer does.
 
-    Discarding on revert is deliberate and matches the pre-v8 behaviour of
-    set_device_use_global (which reset the whole config to a copy of global):
+    Discarding on revert is deliberate and matches the pre-v8 use-global
+    toggle (which reset the whole config to a copy of global):
     a section that follows the fleet should hold no stale shadow values that
     silently reappear if it is toggled back months later.
 
@@ -1469,9 +1641,12 @@ def set_device_config_sections(device_id: str, section_ids) -> list:
     """
     sections = em_config_sections.normalise(section_ids)
     kept = em_config_sections.keys_for(sections) | em_config_sections.STATE_KEYS
-    stored = get_device_config(device_id)
-    pruned = {k: v for k, v in stored.items() if k in kept}
     with _tx() as conn:
+        # Read inside the write transaction: a config write landing between
+        # a separate read and this UPDATE would otherwise be lost.
+        row = conn.execute("SELECT config FROM devices WHERE device_id = ?", (device_id,)).fetchone()
+        stored = _json_dict(row["config"] if row is not None else None) or dict(DEFAULT_DEVICE_CONFIG)
+        pruned = {k: v for k, v in stored.items() if k in kept}
         conn.execute(
             """
             UPDATE devices
@@ -1486,7 +1661,7 @@ def set_device_config_sections(device_id: str, section_ids) -> list:
     return sections
 
 
-def get_effective_device_config(device_id: str) -> dict:
+def get_effective_device_config(device_id: str) -> DeviceConfig:
     """
     Return the config that should be pushed to a device.
 
@@ -1527,33 +1702,6 @@ def get_effective_device_config(device_id: str) -> dict:
     return em_config_sections.merge(
         get_global_device_config(), per_device, sections
     )
-
-
-def set_device_use_global(device_id: str, enabled: bool) -> None:
-    """
-    Set the use_global_config flag for a device.
-
-    When enabling (reverting to global): also resets the device's own
-    config column to a copy of the current global config, so the stored
-    value stays coherent if the flag is toggled again later.
-
-    When disabling (enabling per-device override): the config column is
-    left as-is; the caller is expected to immediately follow with
-    set_device_config() to write the desired override values.
-    """
-    with _tx() as conn:
-        if enabled:
-            global_cfg = get_global_device_config()
-            conn.execute(
-                "UPDATE devices SET use_global_config = 1, config = ? WHERE device_id = ?",
-                (json.dumps(global_cfg), device_id),
-            )
-        else:
-            conn.execute(
-                "UPDATE devices SET use_global_config = 0 WHERE device_id = ?",
-                (device_id,),
-            )
-    log.info(f"[db] use_global_config={'1' if enabled else '0'}: {device_id}")
 
 
 def set_firmware_previous(device_id: str, version: Optional[str]) -> None:
@@ -1658,7 +1806,7 @@ def assign_esphome_port(device_id: str) -> int:
             )
 
         next_row = conn.execute(
-            "SELECT value FROM system_config WHERE key = 'next_esphome_port'"
+            "SELECT value FROM system_config WHERE key = ?", (SystemConfigKey.NEXT_ESPHOME_PORT,)
         ).fetchone()
         port = int(next_row["value"])
 
@@ -1667,8 +1815,8 @@ def assign_esphome_port(device_id: str) -> int:
             (port, device_id),
         )
         conn.execute(
-            "UPDATE system_config SET value = ? WHERE key = 'next_esphome_port'",
-            (str(port + 1),),
+            "UPDATE system_config SET value = ? WHERE key = ?",
+            (str(port + 1), SystemConfigKey.NEXT_ESPHOME_PORT),
         )
 
     log.info(f"[db] ESPHome port assigned: {device_id} → {port}")
@@ -1745,15 +1893,12 @@ def free_ble_proxy_port(device_id: str) -> None:
 
 def log_device(
     device_id: str,
-    level: str,
-    source: str,
+    level: LogLevel,
+    source: LogSource,
     message: str,
 ) -> None:
     """
     Append a log entry for a device and prune old entries.
-
-    level:  'info' | 'warn' | 'error'
-    source: 'device' | 'controller'
 
     Pruning keeps the most recent LOG_RETENTION rows per device.
     The extra DELETE is cheap on SQLite at this row count.
@@ -1787,7 +1932,7 @@ def get_device_logs(
     device_id: str,
     limit: int = 100,
     before_ts: Optional[int] = None,
-) -> list[sqlite3.Row]:
+) -> list[DeviceLogRow]:
     """
     Return log entries for a device in reverse-chronological order.
 
@@ -1798,7 +1943,7 @@ def get_device_logs(
     """
     limit = min(limit, 1000)
     if before_ts is not None:
-        return _q(
+        rows = _q(
             """
             SELECT * FROM device_logs
             WHERE device_id = ? AND ts < ?
@@ -1807,15 +1952,17 @@ def get_device_logs(
             """,
             (device_id, before_ts, limit),
         )
-    return _q(
-        """
-        SELECT * FROM device_logs
-        WHERE device_id = ?
-        ORDER BY ts DESC
-        LIMIT ?
-        """,
-        (device_id, limit),
-    )
+    else:
+        rows = _q(
+            """
+            SELECT * FROM device_logs
+            WHERE device_id = ?
+            ORDER BY ts DESC
+            LIMIT ?
+            """,
+            (device_id, limit),
+        )
+    return [DeviceLogRow.from_row(r) for r in rows]
 
 
 # ─── Activity stats ───────────────────────────────────────────────────────────
@@ -1877,13 +2024,13 @@ _TURN_READ_ONLY_COLUMNS = (
 )
 
 
-def _py(v):
+def _py(v: object) -> object:
     """Numpy scalars to Python natives: sqlite3 stores a numpy float32 as a
     BLOB, which breaks JSON serialisation and SQL MAX()."""
     return v.item() if hasattr(v, "item") else v
 
 
-def insert_turn(device_id: str, rec: dict) -> int:
+def insert_turn(device_id: str, rec: Mapping[str, object]) -> int:
     """
     Persist one completed voice turn. `rec` keys are those of _TURN_COLUMNS
     plus optional `ts` (epoch s); missing keys are NULL, other keys ignored.
@@ -1913,7 +2060,7 @@ def insert_turn(device_id: str, rec: dict) -> int:
             """,
             (device_id, device_id, TURN_RETENTION),
         )
-        return cur.lastrowid
+        return _rowid(cur)
 
 
 def set_turn_audio(turn_id: int, audio_file: Optional[str]) -> None:
@@ -1947,7 +2094,7 @@ def get_turns(
     device_id: str,
     limit: int = 50,
     since: Optional[float] = None,
-) -> list[dict]:
+) -> list[dict[str, object]]:
     """
     Recent turns for a device, oldest first: {turn_id, ts} plus every
     _TURN_COLUMNS key and every _TURN_READ_ONLY_COLUMNS column (NULL = not
@@ -1966,7 +2113,7 @@ def get_turns(
         )
     out = []
     for row in reversed(rows):
-        rec = {"turn_id": row["id"], "ts": row["ts"]}
+        rec: dict[str, object] = {"turn_id": row["id"], "ts": row["ts"]}
         for key, col in _TURN_COLUMNS.items():
             rec[key] = row[col]
         for col in _TURN_READ_ONLY_COLUMNS:
@@ -1994,7 +2141,7 @@ def bump_wake_counters(
     peak_smoothed, dev_max_infer_ms = infer_max_ms. Counts add; maxima take the
     max, and None (not measured this window) leaves the stored maximum alone.
     """
-    def _max(v):
+    def _max(v: object) -> object:
         return 0 if v is None else _py(v)
 
     hour_ts = int(time.time()) // 3600 * 3600
@@ -2017,7 +2164,7 @@ def bump_wake_counters(
             (device_id, hour_ts, _py(near_misses), _max(near_miss_max),
              _py(dev_hops), _py(dev_drops), _py(dev_crossings),
              _max(dev_max_score),
-             _max(None if dev_max_infer_ms is None else round(_py(dev_max_infer_ms)))),
+             _max(None if dev_max_infer_ms is None else round(float(dev_max_infer_ms)))),
         )
         conn.execute(
             "DELETE FROM wake_counters WHERE hour_ts < ?",
@@ -2025,16 +2172,16 @@ def bump_wake_counters(
         )
 
 
-def get_wake_counters(device_id: str, since: float) -> list[sqlite3.Row]:
+def get_wake_counters(device_id: str, since: float) -> list[WakeCounterRow]:
     """Hourly wake counters for a device from `since` (epoch s), oldest first."""
-    return _q(
+    return [WakeCounterRow.from_row(r) for r in _q(
         "SELECT * FROM wake_counters WHERE device_id = ? AND hour_ts >= ? "
         "ORDER BY hour_ts",
         (device_id, since),
-    )
+    )]
 
 
-def record_device_stats(device_id: str, stats: dict) -> None:
+def record_device_stats(device_id: str, stats: Mapping[str, object]) -> None:
     """
     Fold one ~30s hardware stats report into the current hour's
     device_metrics rollup. Missing/None fields are skipped. Averages are
@@ -2042,15 +2189,15 @@ def record_device_stats(device_id: str, stats: dict) -> None:
     the latest value. Prunes rows older than WAKE_COUNTER_RETENTION_DAYS.
     """
     hour_ts = int(time.time()) // 3600 * 3600
-    cpu     = stats.get("cpuPct")
-    mem     = stats.get("memUsedMb")
-    rssi    = stats.get("wifiRssi")
-    link_speed = stats.get("linkSpeedMbps")
-    cpu_temp   = stats.get("cpuTempC")
-    max_temp   = stats.get("maxTempC")
-    cores_on   = stats.get("coresOnline")
-    cores_tot  = stats.get("coresTotal")
-    therm_lim  = stats.get("thermalCoreLimit")
+    cpu     = _number(stats.get("cpuPct"))
+    mem     = _number(stats.get("memUsedMb"))
+    rssi    = _number(stats.get("wifiRssi"))
+    link_speed = _number(stats.get("linkSpeedMbps"))
+    cpu_temp   = _number(stats.get("cpuTempC"))
+    max_temp   = _number(stats.get("maxTempC"))
+    cores_on   = _number(stats.get("coresOnline"))
+    cores_tot  = _number(stats.get("coresTotal"))
+    therm_lim  = _number(stats.get("thermalCoreLimit"))
     with _tx() as conn:
         conn.execute(
             """
@@ -2144,8 +2291,8 @@ def record_device_stats(device_id: str, stats: dict) -> None:
             (
                 device_id, hour_ts,
                 float(cpu or 0.0), float(cpu or 0.0), float(mem or 0.0),
-                stats.get("memTotalMb"),
-                stats.get("storageUsedMb"), stats.get("storageTotalMb"),
+                _number(stats.get("memTotalMb")),
+                _number(stats.get("storageUsedMb")), _number(stats.get("storageTotalMb")),
                 float(rssi) if rssi is not None else 0.0,
                 1 if rssi is not None else 0,
                 float(rssi) if rssi is not None else None,
@@ -2153,19 +2300,19 @@ def record_device_stats(device_id: str, stats: dict) -> None:
                 # slower cadence, so 0/absent means "not sampled this tick"
                 # and must not poison the running minimum.
                 link_speed or None, link_speed or None,
-                stats.get("wifiFreqMhz") or None,
+                _number(stats.get("wifiFreqMhz")) or None,
                 stats.get("wifiBssid") or None,
-                int(stats.get("txBytes") or 0), int(stats.get("rxBytes") or 0),
-                int(stats.get("txErrors") or 0), int(stats.get("txDropped") or 0),
-                int(stats.get("rxCrcErrors") or 0),
+                int(_number(stats.get("txBytes")) or 0), int(_number(stats.get("rxBytes")) or 0),
+                int(_number(stats.get("txErrors")) or 0), int(_number(stats.get("txDropped")) or 0),
+                int(_number(stats.get("rxCrcErrors")) or 0),
                 # RTT is controller-measured and folded into the same report
                 # (see Device.drain_rtt). Absent when no probe completed in
                 # the window — NULL rather than 0 so the min stays honest.
-                int(stats.get("rttSumMs") or 0), int(stats.get("rttSamples") or 0),
-                stats.get("rttMinMs"), stats.get("rttMaxMs"),
-                int(stats.get("rttExcursions") or 0),
-                int(stats.get("rttExcursionsIdle") or 0),
-                int(stats.get("rttSamplesIdle") or 0),
+                int(_number(stats.get("rttSumMs")) or 0), int(_number(stats.get("rttSamples")) or 0),
+                _number(stats.get("rttMinMs")), _number(stats.get("rttMaxMs")),
+                int(_number(stats.get("rttExcursions")) or 0),
+                int(_number(stats.get("rttExcursionsIdle")) or 0),
+                int(_number(stats.get("rttSamplesIdle")) or 0),
                 # Thermals. NULL, never 0, when a sensor was unreadable — a
                 # zeroed temperature would drag a mean down and read as a cool
                 # device, which is the wrong direction for a safety metric.
@@ -2185,7 +2332,14 @@ def record_device_stats(device_id: str, stats: dict) -> None:
         )
 
 
-def get_device_metrics(device_id: str, since: float) -> list[dict]:
+def _number(value: object) -> int | float | None:
+    """A numeric stats field; None when absent or not a number."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value
+
+
+def get_device_metrics(device_id: str, since: float) -> list[dict[str, object]]:
     """
     Hourly hardware metrics for a device from `since` (epoch s), oldest
     first, with averages resolved from the stored sums.
@@ -2265,14 +2419,16 @@ def get_device_metrics(device_id: str, since: float) -> list[dict]:
 
 # ─── Users ────────────────────────────────────────────────────────────────────
 
-def get_user_by_username(username: str) -> Optional[sqlite3.Row]:
+def get_user_by_username(username: str) -> Optional[UserRow]:
     """Return a user row by username, or None."""
-    return _q1("SELECT * FROM users WHERE username = ?", (username,))
+    row = _q1("SELECT * FROM users WHERE username = ?", (username,))
+    return UserRow.from_row(row) if row is not None else None
 
 
-def get_user_by_id(user_id: int) -> Optional[sqlite3.Row]:
+def get_user_by_id(user_id: int) -> Optional[UserRow]:
     """Return a user row by id, or None."""
-    return _q1("SELECT * FROM users WHERE id = ?", (user_id,))
+    row = _q1("SELECT * FROM users WHERE id = ?", (user_id,))
+    return UserRow.from_row(row) if row is not None else None
 
 
 def create_user(username: str, password_hash: str, role: str = "readonly") -> int:
@@ -2292,7 +2448,7 @@ def create_user(username: str, password_hash: str, role: str = "readonly") -> in
             """,
             (username, password_hash, role, now),
         )
-        return cur.lastrowid
+        return _rowid(cur)
 
 
 def update_user_password(user_id: int, new_hash: str) -> None:
@@ -2312,9 +2468,9 @@ def update_user_password(user_id: int, new_hash: str) -> None:
     log.info(f"[db] Password updated for user id={user_id}")
 
 
-def get_all_users() -> list[sqlite3.Row]:
+def get_all_users() -> list[UserRow]:
     """Return all users (password_hash excluded in the API layer, not here)."""
-    return _q("SELECT * FROM users ORDER BY created_at ASC")
+    return [UserRow.from_row(r) for r in _q("SELECT * FROM users ORDER BY created_at ASC")]
 
 
 def user_count() -> int:
@@ -2339,18 +2495,18 @@ def create_session(token: str, user_id: int, expiry_days: int = 30) -> None:
         )
 
 
-def get_session(token: str) -> Optional[sqlite3.Row]:
+def get_session(token: str) -> Optional[SessionRow]:
     """
     Return a valid (non-expired) session row, or None.
 
     Expired sessions are not automatically deleted here — call
     prune_sessions() periodically from the controller.
     """
-    now = _now()
-    return _q1(
+    row = _q1(
         "SELECT * FROM sessions WHERE token = ? AND expires_at > ?",
-        (token, now),
+        (token, _now()),
     )
+    return SessionRow.from_row(row) if row is not None else None
 
 
 def delete_session(token: str) -> None:
@@ -2376,7 +2532,7 @@ def prune_sessions() -> int:
 
 # ─── System config ────────────────────────────────────────────────────────────
 
-def get_config(key: str, default: Optional[str] = None) -> Optional[str]:
+def get_config(key: SystemConfigKey, default: Optional[str] = None) -> Optional[str]:
     """Return a system_config value by key, or default if not set."""
     row = _q1("SELECT value FROM system_config WHERE key = ?", (key,))
     if row is None:
@@ -2384,7 +2540,7 @@ def get_config(key: str, default: Optional[str] = None) -> Optional[str]:
     return row["value"]
 
 
-def set_config(key: str, value: Optional[str]) -> None:
+def set_config(key: SystemConfigKey, value: Optional[str]) -> None:
     """Insert or update a system_config key."""
     with _tx() as conn:
         conn.execute(
@@ -2400,6 +2556,13 @@ def get_all_config() -> dict[str, Optional[str]]:
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def _rowid(cur: sqlite3.Cursor) -> int:
+    """The rowid an INSERT just assigned."""
+    if cur.lastrowid is None:
+        raise RuntimeError("INSERT assigned no rowid")
+    return cur.lastrowid
+
 
 def _now() -> int:
     """Current time as a Unix timestamp (integer seconds)."""

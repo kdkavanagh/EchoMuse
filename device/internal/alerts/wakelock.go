@@ -18,11 +18,13 @@ type WakeLockPaths struct {
 // DefaultWakeLockPaths are the nodes observed on the Dot (SPEC §14 [D1]).
 var DefaultWakeLockPaths = WakeLockPaths{Lock: "/sys/power/wake_lock", Unlock: "/sys/power/wake_unlock"}
 
-// Wakelock status values of WIRE alert.state.
+// WakeLockStatus is the WIRE alert.state wakelock value.
+type WakeLockStatus string
+
 const (
-	wakeLockHeld        = "held"
-	wakeLockReleased    = "released"
-	wakeLockUnavailable = "unavailable"
+	wakeLockHeld        WakeLockStatus = "held"
+	wakeLockReleased    WakeLockStatus = "released"
+	wakeLockUnavailable WakeLockStatus = "unavailable"
 )
 
 // wakeLock drives the kernel wakelock file protocol. The Executor serializes access.
@@ -74,7 +76,7 @@ func (w *wakeLock) release() error {
 	return nil
 }
 
-func (w *wakeLock) status() string {
+func (w *wakeLock) status() WakeLockStatus {
 	switch {
 	case w.unavailable:
 		return wakeLockUnavailable

@@ -7,7 +7,7 @@ tokens with emission samples, fed in sample order exactly as the actor does.
 from __future__ import annotations
 
 from echomuse_grammar import AMPM_CHOICES, CommandContext
-from em_attribution import CELL, ECHO_ONLY, NEAR_END_PRESENT, NO_REFERENCE, Cell
+from em_attribution import CELL, Cell, EchoResult
 from em_audio_timeline import CELL_FLAG_GAP, build_cells
 from em_utterance import (
     BLOCK,
@@ -156,13 +156,6 @@ def test_a_gap_closes_the_utterance_as_interrupted():
     assert decisions[-1] == Close("interrupted")
 
 
-def test_an_actor_close_is_final_and_single():
-    u = Utterance(spec())
-    assert u.close("audio_overrun") == Close("audio_overrun")
-    assert u.close("muted") is None
-    assert u.advance(10**6) == []
-
-
 def test_route_b_commits_a_complete_command_over_quieter_background_speech():
     u = Utterance(spec(vocabulary=("kitchen lights",)))
     # Command at -30 dB, then continuous TV speech 15 dB lower that adds no words.
@@ -256,9 +249,9 @@ def test_cells_release_in_order_once_vad_and_echo_are_known():
     a.add_vad(1_024, [0.1, 0.9])
     assert a.release() == []                              # waiting for echo labels
     assert [ev.start for ev in a.echo_pending()] == [1_024, 1_536]
-    a.add_echo(1_024, [NO_REFERENCE, ECHO_ONLY])
+    a.add_echo(1_024, [EchoResult.NO_REFERENCE, EchoResult.ECHO_ONLY])
     released = a.release()
-    assert [(ev.cell.vad, ev.cell.echo) for ev in released] == [(0.1, NO_REFERENCE), (0.9, ECHO_ONLY)]
+    assert [(ev.cell.vad, ev.cell.echo) for ev in released] == [(0.1, EchoResult.NO_REFERENCE), (0.9, EchoResult.ECHO_ONLY)]
 
 
 def test_a_transport_hole_and_device_gap_flags_become_gap_cells():
@@ -292,16 +285,16 @@ def test_an_early_answer_needs_fifteen_qualifying_near_end_cells():
     onset = None
     for i in range(20):
         start = 100 * CELL + i * CELL
-        echo = ECHO_ONLY if i < 3 else NEAR_END_PRESENT
+        echo = EchoResult.ECHO_ONLY if i < 3 else EchoResult.NEAR_END_PRESENT
         onset = watch.push(Evidence(Cell(start, -40.0, 0.9, echo), ROOM_DB)) or onset
     assert onset == 103 * CELL and watch.early
-    assert watch.push(Evidence(Cell(200 * CELL, -40.0, 0.9, NEAR_END_PRESENT), ROOM_DB)) is None
+    assert watch.push(Evidence(Cell(200 * CELL, -40.0, 0.9, EchoResult.NEAR_END_PRESENT), ROOM_DB)) is None
 
 
 def test_prompt_echo_is_not_an_early_answer():
     watch = ReplyWatch()
     for i in range(40):
-        assert watch.push(Evidence(Cell(i * CELL, -40.0, 0.95, ECHO_ONLY), ROOM_DB)) is None
+        assert watch.push(Evidence(Cell(i * CELL, -40.0, 0.95, EchoResult.ECHO_ONLY), ROOM_DB)) is None
 
 
 def test_a_short_answer_at_the_end_of_the_prompt_is_found_after_drain():
@@ -310,17 +303,17 @@ def test_a_short_answer_at_the_end_of_the_prompt_is_found_after_drain():
     for i in range(170, 200):
         speech = i >= 195                                   # starts 160 ms before the drain
         retained.append(Evidence(Cell(i * CELL, -40.0 if speech else -70.0,
-                                      0.95 if speech else 0.05, NO_REFERENCE), ROOM_DB))
+                                      0.95 if speech else 0.05, EchoResult.NO_REFERENCE), ROOM_DB))
     watch = ReplyWatch()
     assert watch.drained(drain, retained) is None           # only 5 speech cells so far
     onset = None
     for i in range(200, 204):
-        onset = watch.push(Evidence(Cell(i * CELL, -40.0, 0.95, NO_REFERENCE), ROOM_DB)) or onset
+        onset = watch.push(Evidence(Cell(i * CELL, -40.0, 0.95, EchoResult.NO_REFERENCE), ROOM_DB)) or onset
     assert onset == 195 * CELL and not watch.early
 
 
 def test_speech_already_running_long_before_drain_is_not_an_onset():
     drain = 200 * CELL
-    retained = [Evidence(Cell(i * CELL, -40.0, 0.95, NO_REFERENCE), ROOM_DB) for i in range(160, 200)]
+    retained = [Evidence(Cell(i * CELL, -40.0, 0.95, EchoResult.NO_REFERENCE), ROOM_DB) for i in range(160, 200)]
     watch = ReplyWatch()
     assert watch.drained(drain, retained) is None

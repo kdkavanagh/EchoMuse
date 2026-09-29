@@ -17,8 +17,10 @@ import (
 	"time"
 
 	"github.com/wilbowes/EchoMuse/internal/audio/ema"
+	"github.com/wilbowes/EchoMuse/internal/audio/refdsp"
 	"github.com/wilbowes/EchoMuse/internal/audio/ring"
 	"github.com/wilbowes/EchoMuse/internal/client"
+	"github.com/wilbowes/EchoMuse/internal/monoclock"
 	"github.com/wilbowes/EchoMuse/internal/proto"
 )
 
@@ -78,7 +80,7 @@ type Clock interface {
 }
 
 // SendFunc sends one control message (client.Session.Send).
-type SendFunc func(typ string, generation uint32, body any) (string, error)
+type SendFunc func(typ proto.MessageType, generation uint32, body any) (string, error)
 
 type streamID int
 
@@ -90,9 +92,9 @@ const (
 	numStreams
 )
 
-var streamKeys = [numStreams]string{proto.StreamMic, proto.StreamCells, proto.StreamReference}
+var streamKeys = [numStreams]proto.StreamID{proto.StreamMic, proto.StreamCells, proto.StreamReference}
 
-func streamOf(key string) (streamID, bool) {
+func streamOf(key proto.StreamID) (streamID, bool) {
 	for id, k := range streamKeys {
 		if k == key {
 			return streamID(id), true
@@ -108,10 +110,11 @@ type startReq struct {
 }
 
 type lease struct {
-	id, owner, reason string
-	gen               uint32
-	accepted          bool  // false only for a candidate awaiting its ack
-	deadline          int64 // ack deadline, then TTL expiry (now() clock)
+	id, owner string
+	reason    proto.LeaseReason
+	gen       uint32
+	accepted  bool  // false only for a candidate awaiting its ack
+	deadline  int64 // ack deadline, then TTL expiry (now() clock)
 
 	want    [numStreams]bool
 	req     [numStreams]startReq
@@ -184,10 +187,10 @@ type Executor struct {
 }
 
 // New returns an executor over the supervisor's rings; now is the
-// CLOCK_MONOTONIC source in ns (client.MonoNow when nil).
+// CLOCK_MONOTONIC source in ns (monoclock.Now when nil).
 func New(r Rings, c Clock, now func() int64) *Executor {
 	if now == nil {
-		now = client.MonoNow
+		now = monoclock.Now
 	}
 	e := &Executor{
 		rings:  r,
@@ -476,13 +479,13 @@ func emit(send SendFunc, out []ended) {
 }
 
 // endLocked removes l, drops its backfill and returns its uplink.ended.
-func (e *Executor) endLocked(l *lease, reason string) ended {
+func (e *Executor) endLocked(l *lease, reason proto.EndedReason) ended {
 	delete(e.leases, l.id)
 	body := proto.UplinkEnded{
 		LeaseID:      l.id,
 		Reason:       reason,
-		LastSample:   make(map[string]proto.NullU64, numStreams),
-		ClippedStart: make(map[string]proto.NullU64, numStreams),
+		LastSample:   make(map[proto.StreamID]proto.NullU64, numStreams),
+		ClippedStart: make(map[proto.StreamID]proto.NullU64, numStreams),
 	}
 	for id := range numStreams {
 		if !l.want[id] {
@@ -747,7 +750,7 @@ func (e *Executor) encodeLocked(id streamID, first, n uint64, m ring.Meta, unc u
 		if r.Copy(pcm, first) != nil {
 			return nil, false
 		}
-		if id == refStream && silent(pcm) {
+		if id == refStream && refdsp.AllZero(pcm) {
 			flags |= ema.FlagDigitalSilence
 		} else {
 			ema.PutPCM(payload, pcm)
@@ -842,15 +845,6 @@ func headerIndex(id streamID, idx uint64) uint64 {
 		return idx * ema.CellSamples
 	}
 	return idx
-}
-
-func silent(pcm []int16) bool {
-	for _, v := range pcm {
-		if v != 0 {
-			return false
-		}
-	}
-	return true
 }
 
 func ttl(ms int64) int64 {

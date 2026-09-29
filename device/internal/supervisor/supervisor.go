@@ -7,9 +7,6 @@ package supervisor
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -25,9 +22,11 @@ import (
 	"github.com/wilbowes/EchoMuse/internal/audio/ema"
 	"github.com/wilbowes/EchoMuse/internal/audio/refdsp"
 	"github.com/wilbowes/EchoMuse/internal/audio/ring"
+	"github.com/wilbowes/EchoMuse/internal/bindings/als"
 	"github.com/wilbowes/EchoMuse/internal/client"
 	"github.com/wilbowes/EchoMuse/internal/config"
 	"github.com/wilbowes/EchoMuse/internal/focus"
+	"github.com/wilbowes/EchoMuse/internal/monoclock"
 	"github.com/wilbowes/EchoMuse/internal/proto"
 	"github.com/wilbowes/EchoMuse/internal/render"
 	"github.com/wilbowes/EchoMuse/internal/server"
@@ -44,9 +43,6 @@ const (
 	// assetInterval paces background fetches of missing alert sounds. A
 	// sound is never fetched at its deadline (§16.5).
 	assetInterval = 2 * time.Second
-	// candidateAckWindow is how long a candidate lease (and its provisional
-	// duck) waits for the controller's command.ack (§4.4).
-	candidateAckWindow = time.Second
 )
 
 // Uplink is the lease executor (internal/uplink).
@@ -66,8 +62,8 @@ type Uplink interface {
 
 // Session is the part of a client.Session the supervisor uses.
 type Session interface {
-	Send(typ string, generation uint32, body any) (messageID string, err error)
-	Ack(messageID, status string, errCode *string) error
+	Send(typ proto.MessageType, generation uint32, body any) (messageID string, err error)
+	Ack(messageID string, status proto.AckStatus, errCode *proto.AckCode) error
 	Audio() client.AudioSink
 	Assets() assets.Transport
 }
@@ -90,9 +86,9 @@ type Config struct {
 	FirmwareVersion string
 	BootID          string
 	IP              func() string
-	// AmbientStatus is the retained als.Report() object; AmbientReadable
-	// gates the ambient_light capability.
-	AmbientStatus   func() json.RawMessage
+	// AmbientStatus is the retained als.Report() object (nil: null);
+	// AmbientReadable gates the ambient_light capability.
+	AmbientStatus   func() *als.Status
 	AmbientReadable func() bool
 
 	Mic          pkgmic.Microphone
@@ -100,7 +96,7 @@ type Config struct {
 	DeviceConfig *config.Device
 	SpeechStore  *assets.Store // /data/local/share/echomuse/speech
 	AlertStore   *assets.Store // <alerts root>/assets
-	NowMonoNS    func() int64  // CLOCK_MONOTONIC ns; nil selects client.MonoNow
+	NowMonoNS    func() int64  // CLOCK_MONOTONIC ns; nil selects monoclock.Now
 	Retained     RetainedHooks
 }
 
@@ -164,9 +160,9 @@ type Supervisor struct {
 	// Epoch announcements, guarded by announceMu.
 	announceMu sync.Mutex
 	micEpoch   uint64
-	micReason  string
+	micReason  proto.StreamReason
 	refEpoch   uint64
-	refReason  string
+	refReason  proto.StreamReason
 
 	// Session state, guarded by mu.
 	mu           sync.Mutex
@@ -200,13 +196,13 @@ func Assemble(cfg Config, d Deps) (*Supervisor, error) {
 		return nil, errors.New("supervisor: incomplete configuration")
 	}
 	if cfg.NowMonoNS == nil {
-		cfg.NowMonoNS = client.MonoNow
+		cfg.NowMonoNS = monoclock.Now
 	}
 	if cfg.IP == nil {
 		cfg.IP = func() string { return "" }
 	}
 	if cfg.AmbientStatus == nil {
-		cfg.AmbientStatus = func() json.RawMessage { return json.RawMessage("null") }
+		cfg.AmbientStatus = func() *als.Status { return nil }
 	}
 	if cfg.AmbientReadable == nil {
 		cfg.AmbientReadable = func() bool { return false }
@@ -375,7 +371,7 @@ func (s *Supervisor) CaptureToReference(sample uint64) (uint64, bool) {
 
 // SendRetained sends a retained device message (WIRE §4.8) on the current
 // session; it is dropped while disconnected.
-func (s *Supervisor) SendRetained(typ string, body any) { s.logSend(typ, 0, body) }
+func (s *Supervisor) SendRetained(typ proto.MessageType, body any) { s.logSend(typ, 0, body) }
 
 // Connected reports whether a session is established.
 func (s *Supervisor) Connected() bool { return s.connected() }
@@ -386,7 +382,7 @@ func (s *Supervisor) connected() bool {
 	return s.session != nil
 }
 
-func (s *Supervisor) send(typ string, gen uint32, body any) (string, error) {
+func (s *Supervisor) send(typ proto.MessageType, gen uint32, body any) (string, error) {
 	s.mu.Lock()
 	sess := s.session
 	s.mu.Unlock()
@@ -396,7 +392,7 @@ func (s *Supervisor) send(typ string, gen uint32, body any) (string, error) {
 	return sess.Send(typ, gen, body)
 }
 
-func (s *Supervisor) logSend(typ string, gen uint32, body any) {
+func (s *Supervisor) logSend(typ proto.MessageType, gen uint32, body any) {
 	if _, err := s.send(typ, gen, body); err != nil && !errors.Is(err, client.ErrClosed) {
 		log.Printf("[supervisor] send %s: %v", typ, err)
 	}
@@ -404,21 +400,21 @@ func (s *Supervisor) logSend(typ string, gen uint32, body any) {
 
 // sendUplink is the uplink executor's send: an ended candidate lease also
 // ends its provisional duck (§16.6).
-func (s *Supervisor) sendUplink(typ string, gen uint32, body any) (string, error) {
+func (s *Supervisor) sendUplink(typ proto.MessageType, gen uint32, body any) (string, error) {
 	if ended, ok := body.(proto.UplinkEnded); ok && typ == proto.TypeUplinkEnded {
 		s.releaseCandidateLease(ended.LeaseID)
 	}
 	return s.send(typ, gen, body)
 }
 
-func (s *Supervisor) ack(env proto.Envelope, status, code string) {
+func (s *Supervisor) ack(env proto.Envelope, status proto.AckStatus, code proto.AckCode) {
 	s.mu.Lock()
 	sess := s.session
 	s.mu.Unlock()
 	if sess == nil {
 		return
 	}
-	var c *string
+	var c *proto.AckCode
 	if code != "" {
 		c = &code
 	}
@@ -428,7 +424,7 @@ func (s *Supervisor) ack(env proto.Envelope, status, code string) {
 }
 
 // ackErr acks accepted, or rejected with code(err).
-func (s *Supervisor) ackErr(env proto.Envelope, err error, code func(error) string) {
+func (s *Supervisor) ackErr(env proto.Envelope, err error, code func(error) proto.AckCode) {
 	if err != nil {
 		s.ack(env, proto.AckRejected, code(err))
 		return
@@ -438,19 +434,6 @@ func (s *Supervisor) ackErr(env proto.Envelope, err error, code func(error) stri
 
 type volumeState struct {
 	Level int `json:"level"`
-}
-
-// newEpoch draws a random nonzero stream epoch (§16.1).
-func newEpoch() uint64 {
-	var b [8]byte
-	for {
-		if _, err := rand.Read(b[:]); err != nil {
-			panic("supervisor: crypto/rand: " + err.Error())
-		}
-		if v := binary.LittleEndian.Uint64(b[:]); v != 0 {
-			return v
-		}
-	}
 }
 
 func ttl(ms int64) time.Duration { return time.Duration(ms) * time.Millisecond }

@@ -29,7 +29,7 @@ def test_every_config_key_belongs_somewhere():
     """
     mapped = set()
     for sid, section in cs.SECTIONS.items():
-        for key in section["keys"]:
+        for key in section.keys:
             assert key not in mapped, f"{key} appears in more than one section"
             mapped.add(key)
 
@@ -46,7 +46,7 @@ def test_every_config_key_belongs_somewhere():
 
 
 def test_state_keys_are_not_in_any_section():
-    mapped = {k for s in cs.SECTIONS.values() for k in s["keys"]}
+    mapped = {k for s in cs.SECTIONS.values() for k in s.keys}
     assert not (cs.STATE_KEYS & mapped), (
         "a STATE_KEY must not also be section-scoped — it is never "
         "fleet-inherited, so offering it as an overridable setting is a lie"
@@ -69,7 +69,7 @@ def test_dashboard_section_map_matches_python():
         f"section ids differ: dashboard={sorted(js)} python={sorted(cs.SECTIONS)}"
     )
     for sid, keys in js.items():
-        assert sorted(keys) == sorted(cs.SECTIONS[sid]["keys"]), (
+        assert sorted(keys) == sorted(cs.SECTIONS[sid].keys), (
             f"section '{sid}' keys differ between dashboard and Python"
         )
 
@@ -110,7 +110,7 @@ def test_all_sections_reproduces_a_full_override():
 def test_removed_keys_are_neither_config_nor_scoped():
     """SPEC §18.4: a REMOVED/REPLACED key must not survive as a default or as
     a section member, or the dashboard would keep offering a dead control."""
-    mapped = {k for s in cs.SECTIONS.values() for k in s["keys"]}
+    mapped = {k for s in cs.SECTIONS.values() for k in s.keys}
     assert not (em_db.REMOVED_CONFIG_KEYS & set(em_db.DEFAULT_DEVICE_CONFIG))
     assert not (em_db.REMOVED_CONFIG_KEYS & mapped)
 

@@ -1,4 +1,4 @@
-const { useState, useEffect, useRef, useCallback, useMemo } = React;
+const { useState, useEffect, useRef, useCallback } = React;
 
 // ─── Ingress ──────────────────────────────────────────────────────────────────
 
@@ -23,61 +23,44 @@ function ingressWebSocketUrl(path) {
 
 const API = {
   token: null,
-  role: null,
 
-  headers() {
-    const h = { 'Content-Type': 'application/json' };
-    if (this.token) h['Authorization'] = `Bearer ${this.token}`;
-    return h;
-  },
-
-  async get(path) {
-    const r = await fetch(ingressPath(path), { headers: this.headers() });
-    if (r.status === 401) throw { code: 'not_authenticated', status: 401 };
-    const data = await r.json();
-    if (!r.ok) throw data;
-    return data;
-  },
-
-  async post(path, body) {
-    const r = await fetch(ingressPath(path), { method: 'POST', headers: this.headers(), body: JSON.stringify(body) });
-    if (r.status === 401) throw { code: 'not_authenticated', status: 401 };
-    const data = await r.json();
-    if (!r.ok) throw data;
-    return data;
-  },
-
-  async patch(path, body) {
-    const r = await fetch(ingressPath(path), { method: 'PATCH', headers: this.headers(), body: JSON.stringify(body) });
-    if (r.status === 401) throw { code: 'not_authenticated', status: 401 };
-    const data = await r.json();
-    if (!r.ok) throw data;
-    return data;
-  },
-
-  async del(path) {
-    const r = await fetch(ingressPath(path), { method: 'DELETE', headers: this.headers() });
-    if (r.status === 401) throw { code: 'not_authenticated', status: 401 };
-    const data = await r.json();
-    if (!r.ok) throw data;
-    return data;
-  },
-
-  // Binary GET. Sessions are Bearer-header-only (no cookie is ever set), so
-  // anything the browser fetches for itself — an <a download>, an <audio
-  // src> — would 401. Everything binary comes through here and is handed on
-  // as an object URL, which also keeps the token out of the URL bar.
-  async blob(path) {
-    const h = {};
-    if (this.token) h['Authorization'] = `Bearer ${this.token}`;
-    const r = await fetch(ingressPath(path), { headers: h });
+  // One request path for everything: ingress-relative URL, Bearer auth and
+  // one error shape. Sessions are Bearer-header-only (no cookie is ever set),
+  // so anything the browser would fetch for itself — an <a download>, an
+  // <audio src> — would 401; binary content comes through blob() and is
+  // handed on as an object URL, which also keeps the token out of the URL bar.
+  //
+  // Resolves to the Response when it is OK. Otherwise throws a plain object:
+  // {code:'not_authenticated', status:401} for a lapsed session, else the
+  // controller's JSON error body ({error, code, …}) with `status` added, or
+  // {code:'error', status} when the body was not JSON (a proxy's error page).
+  // A network failure rejects with fetch's own TypeError.
+  async request(path, { method = 'GET', body, json = false } = {}) {
+    const headers = {};
+    if (json) headers['Content-Type'] = 'application/json';
+    if (this.token) headers['Authorization'] = `Bearer ${this.token}`;
+    const r = await fetch(ingressPath(path), { method, headers, body });
     if (r.status === 401) throw { code: 'not_authenticated', status: 401 };
     if (!r.ok) {
-      let data = { code: 'error', status: r.status };
+      let data = { code: 'error' };
       try { data = await r.json(); } catch {}
-      throw data;
+      throw { ...data, status: r.status };
     }
-    return r.blob();
+    return r;
+  },
+
+  async _json(path, method, body) {
+    const init = body === undefined ? { method } : { method, json: true, body: JSON.stringify(body) };
+    return (await this.request(path, init)).json();
+  },
+
+  get(path)         { return this._json(path, 'GET'); },
+  post(path, body)  { return this._json(path, 'POST', body); },
+  patch(path, body) { return this._json(path, 'PATCH', body); },
+  del(path)         { return this._json(path, 'DELETE'); },
+
+  async blob(path) {
+    return (await this.request(path)).blob();
   },
 
   async upload(path, file, fieldName = 'binary') {
@@ -90,20 +73,175 @@ const API = {
   // sound upload sends an id alongside it). Content-Type is deliberately
   // left unset so the browser writes the multipart boundary.
   async postForm(path, form) {
-    const h = {};
-    if (this.token) h['Authorization'] = `Bearer ${this.token}`;
-    // ingressPath, like every other call in this object: under the HA
-    // Supervisor add-on the dashboard is served from an ingress prefix, and
-    // a bare path posts outside it.
-    const r = await fetch(ingressPath(path), { method: 'POST', headers: h, body: form });
-    if (r.status === 401) throw { code: 'not_authenticated', status: 401 };
-    const data = await r.json();
-    if (!r.ok) throw data;
-    return data;
+    return (await this.request(path, { method: 'POST', body: form })).json();
   },
 };
 
+// ─── Vocabularies ─────────────────────────────────────────────────────────────
+//
+// Closed sets of strings, one frozen object each; compare against these, never
+// against a bare literal. Most mirror a controller (or firmware) enum and are
+// wire values — each names its source, and must match it exactly. They carry
+// the members the dashboard reads, not necessarily the whole enum.
+
+// em_auth.Role
+const ROLE = Object.freeze({ ADMIN: 'admin' });
+
+// em_api.EventType — `type` of a message on the /api/events socket.
+const EVENT_TYPE = Object.freeze({
+  SNAPSHOT:                'snapshot',
+  DEVICE_UPDATE:           'device_update',
+  DEVICE_LOG:              'device_log',
+  DEVICE_CONNECTED:        'device_connected',
+  DEVICE_DISCONNECTED:     'device_disconnected',
+  DEVICE_PENDING:          'device_pending',
+  DEVICE_APPROVED:         'device_approved',
+  DEVICE_DELETED:          'device_deleted',
+  DEVICE_UPDATED:          'device_updated',
+  DEVICE_UPDATE_FAILED:    'device_update_failed',
+  DEVICE_AUTO_ROLLED_BACK: 'device_auto_rolled_back',
+  DEVICE_ROLLED_BACK:      'device_rolled_back',
+  RELEASE_UPDATE:          'release_update',
+  CONTROLLER_UPDATE:       'controller_update',
+  TURN_COMPLETE:           'turn_complete',
+  ALERTS:                  'alerts',
+  HA_STATUS:               'ha_status',
+});
+
+// em_device_link.Capability — the ones a dashboard control is gated on.
+const CAPABILITY = Object.freeze({
+  DEVICE_WAKE:     'device_wake_v1',
+  RENDER_PROGRESS: 'render_progress_v1',
+  FOCUS_LEASES:    'focus_leases_v1',
+  LED_ANIM:        'led_anim',
+  BUTTON_HOLD:     'button_hold',
+});
+
+// deviceState()'s key: what the dashboard shows a device doing. Derived here
+// from the device row's flags — the dashboard's own, not a controller enum.
+const DEVICE_STATE = Object.freeze({
+  PENDING: 'pending', OFFLINE: 'offline', UPGRADE: 'upgrade', MUTED: 'muted',
+  SPEAKING: 'speaking', THINKING: 'thinking', LISTENING: 'listening', IDLE: 'idle',
+});
+
+// em_utterance.UtteranceKind — turns.trigger.
+const TURN_TRIGGER = Object.freeze({
+  WAKE: 'wake', BUTTON: 'button', REPLY: 'reply', HA_REPLY: 'ha_reply',
+});
+
+// em_session.TerminalReason — turns.terminal_reason.
+const TERMINAL_REASON = Object.freeze({
+  COMPLETED:        'completed',
+  SUPERSEDED:       'superseded',
+  REPLY_TIMEOUT:    'reply_timeout',
+  INTERRUPTED:      'interrupted',
+  MUTED:            'muted',
+  SESSION_LOST:     'session_lost',
+  ARBITRATION_LOST: 'arbitration_lost',
+  VERIFIER_TIMEOUT: 'verifier_timeout',
+  UNVERIFIED_WAKE:  'unverified_wake',
+  SELF_OUTPUT:      'self_output',
+  ECHO_ONLY:        'echo_only',
+});
+
+// em_session.FollowUp — turns.continuation, when it is not a TerminalReason.
+const FOLLOW_UP = Object.freeze({
+  PENDING:          'pending',
+  ANSWERED:         'answered',
+  WAKE:             'wake',
+  PROMPT_CANCELLED: 'prompt_cancelled',
+  PROMPT_FAILED:    'prompt_failed',
+  NO_MIC:           'no_mic',
+  CHAIN_LIMIT:      'chain_limit',
+});
+
+// em_session.TurnOutcome — turns.outcome of a current row.
+const TURN_OUTCOME = Object.freeze({
+  HA: 'ha', LOCAL_COMMAND: 'local_command', ALARM: 'alarm',
+  ALARM_QUERY: 'alarm_query', TIMER: 'timer', CLARIFICATION: 'clarification',
+});
+
+// turns.outcome of a row from before the post-AFE cutover.
+const LEGACY_OUTCOME = Object.freeze({ OK: 'ok', CANCELLED: 'cancelled' });
+
+// em_session.WakeAttribution — turns.wake_attribution of an accepted wake.
+const WAKE_ATTRIBUTION = Object.freeze({ VERIFIED: 'verified', IDLE: 'idle' });
+
+// em_render.FinishReason | em_session.DialogEnd — turns.playback_reason.
+const PLAYBACK_END = Object.freeze({
+  DRAINED: 'drained', CANCELLED: 'cancelled', FAILED: 'failed', UNDERRUN: 'underrun',
+  RESPONSE_TIMEOUT: 'response_timeout', FENCED: 'fenced',
+});
+
+// em_alerts.AlertNotice — `kind` of an `alerts` event.
+const ALERT_NOTICE = Object.freeze({ TIMERS: 'timers' });
+
+// em_alerts.OpState — alert journal operation state.
+const ALERT_OP_STATE = Object.freeze({ PENDING: 'pending', APPLIED: 'applied', REJECTED: 'rejected' });
+
+// em_alert_wire.RingKind — what is ringing (alert.state `active.kind`).
+const RING_KIND = Object.freeze({ ALARM: 'alarm', TIMER: 'timer' });
+
+// em_alert_wire.Weekday — alarm schedule days, Monday first.
+const WEEKDAY = Object.freeze({
+  MON: 'mon', TUE: 'tue', WED: 'wed', THU: 'thu', FRI: 'fri', SAT: 'sat', SUN: 'sun',
+});
+
+// Firmware alerts.WakeLockStatus / alerts.StoreStatus — alert.state health.
+const WAKELOCK = Object.freeze({ HELD: 'held', RELEASED: 'released' });
+const ALERT_STORE = Object.freeze({ OK: 'ok' });
+
+// em_db.LogLevel / em_db.LogSource — a device log entry.
+const LOG_LEVEL = Object.freeze({ INFO: 'info', WARN: 'warn', ERROR: 'error' });
+const LOG_SOURCE = Object.freeze({ DEVICE: 'device' });
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+// The two typefaces. Inline styles cannot use a CSS variable for a font
+// family any more cleanly than this, and one constant beats 150 copies.
+const MONO = "'DM Mono',monospace";
+const SANS = "'DM Sans',sans-serif";
+
+// File-name-safe slug of a device, for downloads.
+function fileSlug(label, id) {
+  return (label || id).replace(/[^A-Za-z0-9]+/g, '-').toLowerCase();
+}
+
+// Save an object URL under `filename` via a transient <a download>. The URL
+// stays the caller's to revoke.
+function downloadUrl(url, filename) {
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+}
+
+// Save a blob that nothing else holds on to. Its URL is revoked on a timer,
+// not straight after the click: the click only starts the save, and revoking
+// the URL under a download in progress can cancel it.
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  downloadUrl(url, filename);
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+
+// Props that make a non-button element (a card, a list row, a selectable
+// tile) operable from the keyboard and named as a button to assistive tech:
+// focusable, and Enter/Space activate it like a click. `selected` reports a
+// toggle/selection state as aria-pressed.
+function pressable(onPress, { disabled = false, selected } = {}) {
+  return {
+    role: 'button',
+    tabIndex: disabled ? -1 : 0,
+    'aria-disabled': disabled || undefined,
+    'aria-pressed': selected,
+    onClick: disabled ? undefined : onPress,
+    onKeyDown: disabled ? undefined : e => {
+      if (e.target !== e.currentTarget) return;   // a nested control's own key
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onPress(e); }
+    },
+  };
+}
 
 // A graph SHA-256 is the registry key (§5.1); eight hex digits are enough to
 // tell entries apart on screen.
@@ -119,25 +257,24 @@ function wakeModelLabel(models, sha) {
   return m ? `${m.wake_phrase} · ${shortSha(sha)}` : shortSha(sha);
 }
 
-// The BCResNet registry (GET /api/wake_models → {active, models}). Fetched per
-// consumer; `reload` re-reads it after an upload or delete.
-function useWakeRegistry() {
-  const [registry, setRegistry] = useState({ active: null, models: [], loaded: false });
+// A controller catalog read once per consumer: `empty` until it arrives, then
+// the response plus `loaded: true`. `reload` re-reads it after an upload or
+// delete. A failed read (signed out, controller restarting) keeps the last
+// value.
+function useCatalog(path, empty) {
+  const [catalog, setCatalog] = useState({ ...empty, loaded: false });
   const reload = useCallback(async () => {
-    try { setRegistry({ ...(await API.get('/api/wake_models')), loaded: true }); }
-    catch (e) { /* signed-out or controller restarting: keep the last list */ }
-  }, []);
+    try { setCatalog({ ...(await API.get(path)), loaded: true }); } catch {}
+  }, [path]);
   useEffect(() => { reload(); }, [reload]);
-  return [registry, reload];
+  return [catalog, reload];
 }
 
-function uptime(s) {
-  if (!s) return '—';
-  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
-  if (d > 0) return `${d}d ${h}h`;
-  if (h > 0) return `${h}h ${m}m`;
-  return `${m}m`;
+// The BCResNet registry (GET /api/wake_models → {active, models}).
+function useWakeRegistry() {
+  return useCatalog('/api/wake_models', WAKE_REGISTRY_EMPTY);
 }
+const WAKE_REGISTRY_EMPTY = Object.freeze({ active: null, models: [] });
 
 function relTime(ts) {
   if (!ts) return '—';
@@ -160,14 +297,13 @@ function _emitEvent(msg) {
 // Why a control is unavailable on a connected device that lacks a capability
 // (§11.1). Features are gated on the capability set the device announced in
 // session.hello, never on its firmware version.
-const CAPABILITY_REASONS = {
-  device_wake_v1:      'this firmware has no on-device wake detector — update it',
-  render_progress_v1:  'this firmware cannot play device-local sounds — update it',
-  focus_leases_v1:     'this firmware cannot duck music under a response — update it',
-  alert_cache_v1:      'this Echo cannot hold a wakelock, so it cannot keep alarms armed while offline',
-  uplink_leases_v1:    'this firmware cannot open diagnostic audio leases — update it',
-  button_hold:         'this firmware has no action-button event for a tap to fire — update it',
-};
+const CAPABILITY_REASONS = Object.freeze({
+  [CAPABILITY.DEVICE_WAKE]:     'this firmware has no on-device wake detector — update it',
+  [CAPABILITY.RENDER_PROGRESS]: 'this firmware cannot play device-local sounds — update it',
+  [CAPABILITY.FOCUS_LEASES]:    'this firmware cannot duck music under a response — update it',
+  [CAPABILITY.LED_ANIM]:        'this firmware cannot animate the ring, so it shows the listening colour instead — update it',
+  [CAPABILITY.BUTTON_HOLD]:     'this firmware has no action-button event for a tap to fire — update it',
+});
 
 // The reason `cap` is missing, or null when the control is available.
 // `capabilities` null means "no live device to ask" (the fleet view, or an
@@ -188,20 +324,38 @@ function liveCapabilities(d) {
 const UNUSABLE_DOT = '#d4703a';
 
 function deviceState(d) {
-  if (!d.approved)  return { key: 'pending',   label: 'Pending',   color: 'var(--accent-hi)', dot: '#8ab0d0' };
-  if (!d.connected) return { key: 'offline',   label: 'Offline',   color: 'var(--warn)', dot: UNUSABLE_DOT };
+  const S = DEVICE_STATE;
+  if (!d.approved)  return { key: S.PENDING,   label: 'Pending',   color: 'var(--accent-hi)', dot: '#8ab0d0' };
+  if (!d.connected) return { key: S.OFFLINE,   label: 'Offline',   color: 'var(--warn)', dot: UNUSABLE_DOT };
   // Old firmware on the upgrade-only legacy handler (§12): it runs no turns,
   // alerts or audio until a firmware update replaces it.
-  if (d.upgrade_required) return { key: 'upgrade', label: 'Upgrade', color: 'var(--warn)', dot: UNUSABLE_DOT };
-  if (d.muted)      return { key: 'muted',     label: 'Muted',     color: 'var(--error)', dot: '#c04040' };
-  if (d.speaking)   return { key: 'speaking',  label: 'Speaking',  color: 'var(--accent)', dot: '#4080d0' };
-  if (d.thinking)   return { key: 'thinking',  label: 'Thinking',  color: 'var(--warn)', dot: '#a08020' };
-  if (d.listening)  return { key: 'listening', label: 'Listening', color: 'var(--ok)', dot: '#40906a' };
-  return               { key: 'idle',      label: 'Idle',      color: 'var(--muted)', dot: '#aaaaaa' };
+  if (d.upgrade_required) return { key: S.UPGRADE, label: 'Upgrade', color: 'var(--warn)', dot: UNUSABLE_DOT };
+  if (d.muted)      return { key: S.MUTED,     label: 'Muted',     color: 'var(--error)', dot: '#c04040' };
+  if (d.speaking)   return { key: S.SPEAKING,  label: 'Speaking',  color: 'var(--accent)', dot: '#4080d0' };
+  if (d.thinking)   return { key: S.THINKING,  label: 'Thinking',  color: 'var(--warn)', dot: '#a08020' };
+  if (d.listening)  return { key: S.LISTENING, label: 'Listening', color: 'var(--ok)', dot: '#40906a' };
+  return               { key: S.IDLE,      label: 'Idle',      color: 'var(--muted)', dot: '#aaaaaa' };
 }
 
+// The device's reported IP, or null when there is none worth showing (a
+// loopback address is not one anything can reach the device on).
+function deviceIp(d) {
+  return d.ip && d.ip !== '127.0.0.1' ? d.ip : null;
+}
+
+// deviceIp for display. An offline device shows its last known address
+// marked with `staleSuffix`.
+function deviceIpText(d, staleSuffix) {
+  const ip = deviceIp(d);
+  return d.connected ? (ip || '—') : (ip ? `${ip}${staleSuffix}` : '—');
+}
+
+const LOG_LEVEL_COLOR = Object.freeze({
+  [LOG_LEVEL.INFO]: 'var(--ok)', [LOG_LEVEL.WARN]: 'var(--warn)', [LOG_LEVEL.ERROR]: 'var(--error)',
+});
+
 function eventAccent(level) {
-  return { info: 'var(--ok)', warn: 'var(--warn)', error: 'var(--error)' }[level] || 'var(--muted)';
+  return LOG_LEVEL_COLOR[level] || 'var(--muted)';
 }
 
 // ─── Components ───────────────────────────────────────────────────────────────
@@ -215,7 +369,7 @@ function Lcd({ label, value, color, size = 16 }) {
           call sites became var(--lcd-green) it produced `var(--lcd-green)88`,
           invalid CSS that drops the whole declaration. The glow silently
           disappeared. color-mix takes a var(); 0x88 is 53%. */}
-      <div style={{ fontFamily: "'DM Mono',monospace", fontSize: size, color: color || 'var(--lcd-green)', lineHeight: 1,
+      <div style={{ fontFamily: MONO, fontSize: size, color: color || 'var(--lcd-green)', lineHeight: 1,
                     textShadow: `0 0 8px color-mix(in srgb, ${color || 'var(--lcd-green)'} 53%, transparent)` }}>{value}</div>
     </div>
   );
@@ -348,12 +502,63 @@ function Panel({ label, children, style }) {
 // everywhere instead of per-modal variants.
 function CircleButton({ onClick, title, color, children }) {
   return (
-    <button onClick={onClick} title={title} style={{
+    <button type="button" onClick={onClick} title={title} aria-label={title} style={{
       background: 'linear-gradient(180deg,var(--sunken),var(--border))', border: '1px solid var(--muted)',
       borderRadius: '50%', width: 28, height: 28, display: 'flex', alignItems: 'center',
       justifyContent: 'center', cursor: 'pointer', boxShadow: '0 1px 0 var(--sheen) inset',
       color: color || 'var(--text2)', fontSize: 15, fontWeight: 300, lineHeight: 1,
     }}>{children}</button>
+  );
+}
+
+// ModalFrame — the fixed window the device and settings modals share: a
+// blurred backdrop that closes the modal on a click outside it, and a fixed
+// height (not maxHeight), so every tab renders in an identical frame — content
+// scrolls inside, the window never resizes as you move between tabs.
+function ModalFrame({ onClose, zIndex, label, children }) {
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(180,176,168,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex, backdropFilter: 'blur(8px)' }}
+      onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="em-modal" role="dialog" aria-modal="true" aria-label={label}
+        style={{ width: 'min(900px,95vw)', height: 'min(700px,90vh)', background: 'linear-gradient(170deg,var(--raised),var(--surface))', border: '1px solid var(--border)', borderRadius: 16, boxShadow: '0 24px 80px rgba(0,0,0,0.3),0 2px 0 var(--sheen) inset', display: 'flex', flexDirection: 'column', overflow: 'hidden', animation: 'fadeIn 0.15s ease' }}>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+// TabBar — the raised folder tabs along the foot of a modal header, one style
+// across the dashboard. `labels` maps a tab to its text; without it the tab
+// value is shown (upper-cased by the style).
+function TabBar({ tabs, active, onSelect, labels }) {
+  return (
+    <div className="em-tabs" role="tablist" style={{ display: 'flex', gap: 2 }}>
+      {tabs.map(t => {
+        const on = active === t;
+        return (
+          <button key={t} type="button" role="tab" aria-selected={on} onClick={() => onSelect(t)} style={{ background: on ? 'linear-gradient(180deg,var(--raised),var(--surface))' : 'transparent', border: on ? '1px solid var(--border-hard)' : '1px solid transparent', borderBottom: on ? '1px solid var(--surface)' : '1px solid transparent', borderRadius: '6px 6px 0 0', fontFamily: MONO, fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.1em', padding: '7px 14px', cursor: 'pointer', color: on ? 'var(--text)' : 'var(--muted)', marginBottom: -1, transition: 'color 0.15s' }}>
+            {labels ? labels[t] : t}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+// DisclosureToggle — the ▸/▾ line that opens a collapsed section (release
+// notes, a stage's Advanced controls). A real button, so it is reachable from
+// the keyboard and announces whether it is open.
+function DisclosureToggle({ open, onToggle, style, children }) {
+  return (
+    <button type="button" aria-expanded={open} onClick={onToggle} style={{
+      background: 'none', border: 'none', padding: 0, width: '100%', textAlign: 'left',
+      fontFamily: MONO, fontSize: 9, color: 'var(--muted)', textTransform: 'uppercase',
+      letterSpacing: '0.15em', cursor: 'pointer', userSelect: 'none',
+      display: 'flex', alignItems: 'center', gap: 6, ...style,
+    }}>
+      <span aria-hidden="true">{open ? '▾' : '▸'}</span>
+      {children}
+    </button>
   );
 }
 
@@ -368,14 +573,14 @@ function Slider({ label, sub, value, min, max, step = 1, unit = '', formatValue,
     <div style={{ marginBottom: 20, minWidth: 0 }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 7, minWidth: 0, gap: 8 }}>
         <div style={{ minWidth: 0 }}>
-          <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, color: disabled ? 'var(--muted)' : 'var(--text2)' }}>{label}</span>
-          {sub && <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: 'var(--muted)', marginLeft: 8 }}>{sub}</span>}
+          <span style={{ fontFamily: MONO, fontSize: 11, color: disabled ? 'var(--muted)' : 'var(--text2)' }}>{label}</span>
+          {sub && <span style={{ fontFamily: MONO, fontSize: 10, color: 'var(--muted)', marginLeft: 8 }}>{sub}</span>}
         </div>
         <Lcd value={display} size={12} />
       </div>
       {/* A control whose feature the device lacks is shown disabled WITH the
           reason (in sub), never as one that silently does nothing. */}
-      <input type="range" min={min} max={max} step={step} value={value} disabled={disabled}
+      <input type="range" min={min} max={max} step={step} value={value} disabled={disabled} aria-label={label}
         style={{ width: '100%', opacity: disabled ? 0.45 : 1 }}
         onChange={e => onChange(Number(e.target.value))} />
     </div>
@@ -396,12 +601,15 @@ function Toggle({ label, sub, value, onChange, disabled = false }) {
   return (
     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20, minWidth: 0, gap: 10 }}>
       <div style={{ minWidth: 0, flex: 1 }}>
-        <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, color: disabled ? 'var(--muted)' : 'var(--text2)' }}>{label}</span>
-        {sub && <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: 'var(--muted)', marginLeft: 8 }}>{sub}</span>}
+        <span style={{ fontFamily: MONO, fontSize: 11, color: disabled ? 'var(--muted)' : 'var(--text2)' }}>{label}</span>
+        {sub && <span style={{ fontFamily: MONO, fontSize: 10, color: 'var(--muted)', marginLeft: 8 }}>{sub}</span>}
       </div>
-      <div onClick={() => { if (!disabled) onChange(!value); }} style={{
+      {/* A real switch: focusable, operable from the keyboard, and announced
+          with its label and state — it used to be a clickable <div>. */}
+      <button type="button" role="switch" aria-checked={!!value} aria-label={label}
+        disabled={disabled} onClick={() => onChange(!value)} style={{
         width: 36, height: 20, borderRadius: 10, cursor: disabled ? 'default' : 'pointer',
-        position: 'relative', flexShrink: 0, opacity: disabled ? 0.45 : 1,
+        position: 'relative', flexShrink: 0, opacity: disabled ? 0.45 : 1, padding: 0,
         background: value ? 'var(--accent)' : 'var(--muted)',
         border: value ? '1px solid var(--accent-deep)' : '1px solid var(--muted)',
         transition: 'background 0.15s',
@@ -412,7 +620,7 @@ function Toggle({ label, sub, value, onChange, disabled = false }) {
           background: value ? 'var(--accent-tint)' : 'var(--bg)',
           transition: 'left 0.15s',
         }}/>
-      </div>
+      </button>
     </div>
   );
 }
@@ -486,11 +694,11 @@ function EqCurve({ bands, fs = 22050 }) {
         style={{filter:'drop-shadow(0 0 4px rgba(64,88,120,0.4))'}}/>
       {dbTicks.filter(d=>d!==0).map(db => (
         <text key={db} x={PL+2} y={yOf(db)+4}
-          style={{fontFamily:"'DM Mono',monospace",fontSize:6,fill:'rgba(0,0,0,0.28)'}}>{db>0?'+':''}{db}</text>
+          style={{fontFamily:MONO,fontSize:6,fill:'rgba(0,0,0,0.28)'}}>{db>0?'+':''}{db}</text>
       ))}
       {fTicks.map(({f,label}) => (
         <text key={f} x={xOf(f)} y={H-4} textAnchor="middle"
-          style={{fontFamily:"'DM Mono',monospace",fontSize:6,fill:'rgba(0,0,0,0.28)'}}>{label}</text>
+          style={{fontFamily:MONO,fontSize:6,fill:'rgba(0,0,0,0.28)'}}>{label}</text>
       ))}
     </svg>
   );
@@ -516,7 +724,6 @@ function SignalBars({ rssi }) {
               : rssi > -80   ? 2
               : rssi > -90   ? 1
               :                0;
-  const on  = level > 0 ? 'var(--ok)' : 'var(--track)';
   const off = 'var(--track)';
   const bars = [{h:4,y:11},{h:7,y:8},{h:10,y:5},{h:14,y:1}];
   return (
@@ -533,7 +740,10 @@ function SignalBars({ rssi }) {
 // carried two: these desaturated tones and a brighter set (var(--error) and
 // friends) that had crept in on the latency row, which is why the scalar
 // metrics read as bolted on rather than designed.
-const SEV = { ok: 'var(--ok)', warn: 'var(--warn)', bad: 'var(--error)', none: 'transparent' };
+const SEVERITY = Object.freeze({ OK: 'ok', WARN: 'warn', BAD: 'bad' });
+const SEV = Object.freeze({
+  [SEVERITY.OK]: 'var(--ok)', [SEVERITY.WARN]: 'var(--warn)', [SEVERITY.BAD]: 'var(--error)',
+});
 
 // MicroMeter is a 2px severity bar. It exists so the scalar metrics
 // (link/latency/temp) share a visual grammar with the capacity bars above
@@ -542,7 +752,7 @@ function MicroMeter({ pct, sev }) {
   return (
     <div style={{ height:2, borderRadius:1, background:'var(--track)', overflow:'hidden', marginTop:5 }}>
       {pct != null && <div style={{ height:'100%', width:`${Math.max(2, Math.min(100, pct))}%`,
-        background:SEV[sev] ?? SEV.ok, borderRadius:1, transition:'width 0.6s' }}/>}
+        background:SEV[sev] ?? SEV[SEVERITY.OK], borderRadius:1, transition:'width 0.6s' }}/>}
     </div>
   );
 }
@@ -556,11 +766,11 @@ function MicroMeter({ pct, sev }) {
 // deliberately a separate prop rather than a second use of `note`, because
 // `note` is red — routing neutral information through it would make every
 // device look like it was in trouble.
-function StatTile({ label, value, unit, sev = 'ok', pct, glyph, note, sub }) {
+function StatTile({ label, value, unit, sev = SEVERITY.OK, pct, glyph, note, sub }) {
   const dim = value == null;
   return (
     <div style={{ flex:'1 1 0', minWidth:0 }}>
-      <div style={{ fontFamily:"'DM Mono',monospace", fontSize:9, color:'var(--muted)',
+      <div style={{ fontFamily:MONO, fontSize:9, color:'var(--muted)',
                     textTransform:'uppercase', letterSpacing:'0.08em', whiteSpace:'nowrap' }}>{label}</div>
       {/* FIXED height, and the glyph is centre-aligned rather than
           baseline-aligned.
@@ -573,17 +783,17 @@ function StatTile({ label, value, unit, sev = 'ok', pct, glyph, note, sub }) {
           vertical position from whatever a tile puts in this row, so the row
           of meters lines up by construction rather than by coincidence. */}
       <div style={{ display:'flex', alignItems:'baseline', gap:4, marginTop:3, height:18 }}>
-        <span style={{ fontFamily:"'DM Mono',monospace", fontSize:12,
+        <span style={{ fontFamily:MONO, fontSize:12,
                        color: dim ? 'var(--muted)' : SEV[sev] ?? 'var(--text2)' }}>
           {dim ? '—' : value}
         </span>
-        {!dim && unit && <span style={{ fontFamily:"'DM Mono',monospace", fontSize:9, color:'var(--muted)' }}>{unit}</span>}
+        {!dim && unit && <span style={{ fontFamily:MONO, fontSize:9, color:'var(--muted)' }}>{unit}</span>}
         {glyph && <span style={{ marginLeft:'auto', display:'flex', alignItems:'center',
                                  alignSelf:'center', flexShrink:0 }}>{glyph}</span>}
       </div>
       <MicroMeter pct={dim ? null : pct} sev={sev}/>
-      {note && <div style={{ fontFamily:"'DM Mono',monospace", fontSize:9, color:SEV.bad, marginTop:3 }}>{note}</div>}
-      {!note && sub && <div style={{ fontFamily:"'DM Mono',monospace", fontSize:9, color:'var(--muted)', marginTop:3 }}>{sub}</div>}
+      {note && <div style={{ fontFamily:MONO, fontSize:9, color:SEV[SEVERITY.BAD], marginTop:3 }}>{note}</div>}
+      {!note && sub && <div style={{ fontFamily:MONO, fontSize:9, color:'var(--muted)', marginTop:3 }}>{sub}</div>}
     </div>
   );
 }
@@ -596,8 +806,8 @@ function StatBar({ label, pct, text }) {
   return (
     <div style={{ marginBottom: 13 }}>
       <div style={{ display:'flex', justifyContent:'space-between', marginBottom:5 }}>
-        <span style={{ fontFamily:"'DM Mono',monospace", fontSize:10, color:'var(--muted)', textTransform:'uppercase', letterSpacing:'0.08em' }}>{label}</span>
-        <span style={{ fontFamily:"'DM Mono',monospace", fontSize:10, color:'var(--text2)' }}>{text ?? '—'}</span>
+        <span style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)', textTransform:'uppercase', letterSpacing:'0.08em' }}>{label}</span>
+        <span style={{ fontFamily:MONO, fontSize:10, color:'var(--text2)' }}>{text ?? '—'}</span>
       </div>
       <div style={{ height:3, borderRadius:2, background:'var(--track)', overflow:'hidden' }}>
         {pct != null && <div style={{ height:'100%', width:`${pct}%`, background:color, borderRadius:2, transition:'width 0.6s' }}/>}
@@ -610,17 +820,17 @@ function StatBar({ label, pct, text }) {
 
 function LedRing({ state, size = 120 }) {
   const cx = size / 2, cy = size / 2, r = size * 0.38;
-  const stateKey = state?.key || 'idle';
+  const stateKey = state?.key || DEVICE_STATE.IDLE;
   const stateColor = state?.dot || '#aaaaaa';
-  const isPending = stateKey === 'pending';
-  const isOffline = stateKey === 'offline' || stateKey === 'upgrade';
+  const isPending = stateKey === DEVICE_STATE.PENDING;
+  const isOffline = stateKey === DEVICE_STATE.OFFLINE || stateKey === DEVICE_STATE.UPGRADE;
 
   const ledColor = isPending ? '#c8c8c8'
                  : isOffline ? '#d4703a'
-                 : stateKey === 'muted' ? '#c04040'
-                 : stateKey === 'speaking' ? '#4080d0'
-                 : stateKey === 'listening' ? '#40906a'
-                 : stateKey === 'thinking' ? '#a08020'
+                 : stateKey === DEVICE_STATE.MUTED ? '#c04040'
+                 : stateKey === DEVICE_STATE.SPEAKING ? '#4080d0'
+                 : stateKey === DEVICE_STATE.LISTENING ? '#40906a'
+                 : stateKey === DEVICE_STATE.THINKING ? '#a08020'
                  : '#3a4a30';
 
   const shouldPulse = isPending || isOffline;
@@ -655,7 +865,7 @@ function LedRing({ state, size = 120 }) {
           stroke={ledColor} strokeWidth={size*0.045}
           strokeDasharray={`${segLen} ${gapLen}`}
           transform={`rotate(-90 ${cx} ${cy})`}
-          filter={stateKey !== 'idle' ? `url(#glow-${size})` : undefined}
+          filter={stateKey !== DEVICE_STATE.IDLE ? `url(#glow-${size})` : undefined}
           style={shouldPulse ? { animation: 'ledpulse 1.8s ease-in-out infinite' } : undefined}
         />
         <circle cx={cx} cy={cy} r={r} fill="none"
@@ -667,7 +877,7 @@ function LedRing({ state, size = 120 }) {
       <circle cx={cx} cy={cy} r={size*0.36} fill={`url(#inner-${size})`}/>
       <circle cx={cx} cy={cy} r={size*0.36} fill="none" stroke="rgba(255,255,255,0.04)" strokeWidth="0.8"/>
       <circle cx={cx} cy={cy} r={size*0.09} fill={stateColor} style={{ transition: 'fill 0.4s' }}
-        filter={stateKey !== 'idle' ? `url(#glow-${size})` : undefined}/>
+        filter={stateKey !== DEVICE_STATE.IDLE ? `url(#glow-${size})` : undefined}/>
       <ellipse cx={cx - size*0.07} cy={cy - size*0.08} rx={size*0.09} ry={size*0.055} fill="rgba(255,255,255,0.06)"/>
     </svg>
   );
@@ -691,7 +901,7 @@ function Shell({ deviceId, token, height = 320 }) {
   useEffect(() => {
     const term = new window.Terminal({
       fontSize: 12,
-      fontFamily: "'DM Mono', monospace",
+      fontFamily: MONO,
       cursorBlink: true,
       scrollback: 5000,
       theme: {
@@ -769,13 +979,88 @@ function Shell({ deviceId, token, height = 320 }) {
       sock.close();
       term.dispose();
     };
-  }, [deviceId]);
+  }, [deviceId, token]);
 
   return (
     <div style={{ background: '#1c1f18', border: '1px solid #1a1c16', borderRadius: 6, boxShadow: 'inset 0 2px 6px rgba(0,0,0,0.6)', padding: 10, height }}>
       <div ref={containerRef} style={{ height: '100%', width: '100%' }}/>
     </div>
   );
+}
+
+// ─── Recorded audio ───────────────────────────────────────────────────────────
+
+// Plays recordings one at a time, each fetched through API.blob and held as an
+// object URL (the browser cannot fetch them itself — see API.request).
+// Starting a clip stops whichever was sounding; `playing` is its key, and a
+// fetch overtaken by a later click never starts.
+//
+// With `cache` (the default) a clip's URL is kept for replay and download —
+// playing then downloading costs one transfer, not two — until `forget`, a
+// change of `scope`, or unmount; every object URL pins its blob in memory
+// until revoked. Without it a URL lives only while its clip is the current
+// one, for recordings too large to hold on to (ambient sessions run to tens of
+// megabytes), and `url()` hands the caller a fresh URL that is theirs to
+// revoke.
+function useClipPlayer(scope, { cache = true } = {}) {
+  const [playing, setPlaying] = useState(null);
+  const audioRef   = useRef(null);
+  const urlsRef    = useRef({});    // key -> cached object URL
+  const currentRef = useRef(null);  // uncached: the current clip's URL
+  const seqRef     = useRef(0);     // bumped on every stop
+
+  const stop = () => {
+    seqRef.current++;
+    if (audioRef.current) { audioRef.current.pause(); audioRef.current = null; }
+    if (currentRef.current) { URL.revokeObjectURL(currentRef.current); currentRef.current = null; }
+    setPlaying(null);
+  };
+
+  const url = async (key, path) => {
+    if (cache && urlsRef.current[key]) return urlsRef.current[key];
+    const u = URL.createObjectURL(await API.blob(path));
+    if (cache) urlsRef.current[key] = u;
+    return u;
+  };
+
+  // Resolves false when the recording could not be fetched.
+  const toggle = async (key, path) => {
+    const wasPlaying = playing === key;
+    stop();
+    if (wasPlaying) return true;
+    const seq = seqRef.current;
+    let u;
+    try { u = await url(key, path); } catch { return false; }
+    if (seq !== seqRef.current) {           // stopped or replaced meanwhile
+      if (!cache) URL.revokeObjectURL(u);
+      return true;
+    }
+    if (!cache) currentRef.current = u;
+    const el = new Audio(u);
+    const ended = () => setPlaying(p => (p === key ? null : p));
+    el.onended = el.onerror = ended;
+    audioRef.current = el;
+    setPlaying(key);
+    el.play().catch(ended);
+    return true;
+  };
+
+  const forget = key => {
+    if (!urlsRef.current[key]) return;
+    URL.revokeObjectURL(urlsRef.current[key]);
+    delete urlsRef.current[key];
+  };
+
+  const forgetAll = () => {
+    Object.values(urlsRef.current).forEach(URL.revokeObjectURL);
+    urlsRef.current = {};
+  };
+
+  // Only refs and the state setter are touched, so the first render's
+  // closures are safe to run at teardown.
+  useEffect(() => () => { stop(); forgetAll(); }, [scope]);
+
+  return { playing, toggle, stop, url, forget, forgetAll };
 }
 
 // ─── Turn observability (Activity tab) ───────────────────────────────────────
@@ -803,15 +1088,17 @@ function turnSegments(t) {
 
 // Terminal reasons (§7) that mean a wake candidate was refused rather than a
 // user's request failing: reported, but not counted against success.
-const REFUSED_WAKE = new Set(['self_output', 'echo_only', 'unverified_wake',
-                              'verifier_timeout', 'arbitration_lost']);
+const REFUSED_WAKE = new Set([
+  TERMINAL_REASON.SELF_OUTPUT, TERMINAL_REASON.ECHO_ONLY, TERMINAL_REASON.UNVERIFIED_WAKE,
+  TERMINAL_REASON.VERIFIER_TIMEOUT, TERMINAL_REASON.ARBITRATION_LOST,
+]);
 
 // Endings that are neither success nor failure: a silent reply window
 // expiring, or a newer wake/button press taking the turn over.
-const NEUTRAL_END = new Set(['reply_timeout', 'superseded']);
+const NEUTRAL_END = new Set([TERMINAL_REASON.REPLY_TIMEOUT, TERMINAL_REASON.SUPERSEDED]);
 
 function turnReasonColor(reason) {
-  if (reason === 'completed') return 'var(--ok)';
+  if (reason === TERMINAL_REASON.COMPLETED) return 'var(--ok)';
   if (REFUSED_WAKE.has(reason) || NEUTRAL_END.has(reason)) return 'var(--muted)';
   return 'var(--warn)';
 }
@@ -823,9 +1110,11 @@ const isLegacyTurn = t => t.terminal_reason == null;
 function turnEnd(t) {
   if (!isLegacyTurn(t)) return { label: t.terminal_reason, color: turnReasonColor(t.terminal_reason) };
   const label = t.outcome || 'unknown';
-  return { label, color: label === 'ok' ? 'var(--ok)' : label === 'cancelled' ? 'var(--muted)' : 'var(--warn)' };
+  return { label, color: label === LEGACY_OUTCOME.OK ? 'var(--ok)'
+                       : label === LEGACY_OUTCOME.CANCELLED ? 'var(--muted)' : 'var(--warn)' };
 }
-const turnSucceeded = t => (isLegacyTurn(t) ? t.outcome === 'ok' : t.terminal_reason === 'completed');
+const turnSucceeded = t => (isLegacyTurn(t) ? t.outcome === LEGACY_OUTCOME.OK
+                                            : t.terminal_reason === TERMINAL_REASON.COMPLETED);
 
 // Turn times always carry the date: the list spans days.
 const fmtTurnWhen = ts => new Date(ts * 1000).toLocaleString([], {
@@ -835,53 +1124,64 @@ const fmtTurnWhenFull = ts => new Date(ts * 1000).toLocaleString([], {
   hour: '2-digit', minute: '2-digit', second: '2-digit' });
 
 // How the endpoint reducer ended the utterance (§16.6 routes).
-const COMMIT_ROUTES = {
+// Keyed by em_endpoint_policy.Route values (turns.commit_route).
+const COMMIT_ROUTES = Object.freeze({
   A: 'pause after the command',
   B: 'complete command under background speech',
   R: 'pause in a reply to a Home Assistant prompt',
   fallback: 'stable complete prefix while speech continued',
-};
+});
 
 // Who took the request after transcription.
-const TURN_HANDLERS = {
-  ha: 'Home Assistant intent',
-  alarm: 'EchoMuse alarm engine',
-  timer: 'EchoMuse timer cancel → Home Assistant HassCancelTimer (no conversation agent)',
-  alarm_query: 'EchoMuse alarm question (alarm engine)',
-  clarification: 'EchoMuse (asked for AM or PM)',
-  local_command: 'Local command on the controller (Home Assistant not involved)',
-};
+const TURN_HANDLERS = Object.freeze({
+  [TURN_OUTCOME.HA]:            'Home Assistant intent',
+  [TURN_OUTCOME.ALARM]:         'EchoMuse alarm engine',
+  [TURN_OUTCOME.TIMER]:         'EchoMuse timer cancel → Home Assistant HassCancelTimer (no conversation agent)',
+  [TURN_OUTCOME.ALARM_QUERY]:   'EchoMuse alarm question (alarm engine)',
+  [TURN_OUTCOME.CLARIFICATION]: 'EchoMuse (asked for AM or PM)',
+  [TURN_OUTCOME.LOCAL_COMMAND]: 'Local command on the controller (Home Assistant not involved)',
+});
 
-const TRIGGERS = {
-  wake: 'Wake word', button: 'Action button', reply: 'Reply (no wake word)',
-  ha_reply: 'Reply to a Home Assistant prompt',
-};
+const TRIGGERS = Object.freeze({
+  [TURN_TRIGGER.WAKE]:     'Wake word',
+  [TURN_TRIGGER.BUTTON]:   'Action button',
+  [TURN_TRIGGER.REPLY]:    'Reply (no wake word)',
+  [TURN_TRIGGER.HA_REPLY]: 'Reply to a Home Assistant prompt',
+});
 
-// What became of a question a turn's answer asked (turns.continuation, the
-// controller's FOLLOWUP_* outcomes): [explanation, color].
-const FOLLOWUPS = {
-  pending:          ['reply window open', 'var(--muted)'],
-  answered:         ['answered without the wake word', 'var(--ok)'],
-  wake:             ['a wake word or button press took over, with the question as context', 'var(--ok)'],
-  reply_timeout:    ['no reply within the 7 s reply window', 'var(--muted)'],
-  prompt_cancelled: ['the question was cut off before it finished, so no reply window opened', 'var(--warn)'],
-  prompt_failed:    ['the question never finished playing (speech failed or timed out)', 'var(--warn)'],
-  no_mic:           ['no reply window: the microphone stream was unavailable', 'var(--warn)'],
-  chain_limit:      ['no reply window: already 5 replies or 60 s without the wake word', 'var(--muted)'],
-  interrupted:      ['the reply window’s microphone stream ended early', 'var(--warn)'],
-  superseded:       ['a newer wake or button press ended it', 'var(--muted)'],
-  muted:            ['the microphone was muted', 'var(--muted)'],
-  session_lost:     ['the device disconnected', 'var(--warn)'],
-};
+// What became of a question a turn's answer asked (turns.continuation: a
+// FollowUp, or the TerminalReason that ended the reply expectation):
+// [explanation, color].
+const FOLLOWUPS = Object.freeze({
+  [FOLLOW_UP.PENDING]:              ['reply window open', 'var(--muted)'],
+  [FOLLOW_UP.ANSWERED]:             ['answered without the wake word', 'var(--ok)'],
+  [FOLLOW_UP.WAKE]:                 ['a wake word or button press took over, with the question as context', 'var(--ok)'],
+  [TERMINAL_REASON.REPLY_TIMEOUT]:  ['no reply within the 7 s reply window', 'var(--muted)'],
+  [FOLLOW_UP.PROMPT_CANCELLED]:     ['the question was cut off before it finished, so no reply window opened', 'var(--warn)'],
+  [FOLLOW_UP.PROMPT_FAILED]:        ['the question never finished playing (speech failed or timed out)', 'var(--warn)'],
+  [FOLLOW_UP.NO_MIC]:               ['no reply window: the microphone stream was unavailable', 'var(--warn)'],
+  [FOLLOW_UP.CHAIN_LIMIT]:          ['no reply window: already 5 replies or 60 s without the wake word', 'var(--muted)'],
+  [TERMINAL_REASON.INTERRUPTED]:    ['the reply window’s microphone stream ended early', 'var(--warn)'],
+  [TERMINAL_REASON.SUPERSEDED]:     ['a newer wake or button press ended it', 'var(--muted)'],
+  [TERMINAL_REASON.MUTED]:          ['the microphone was muted', 'var(--muted)'],
+  [TERMINAL_REASON.SESSION_LOST]:   ['the device disconnected', 'var(--warn)'],
+});
 const followup = key => FOLLOWUPS[key] || [key.replace(/_/g, ' '), 'var(--muted)'];
 // Outcomes that mean the follow-up machinery failed rather than the user not answering.
-const FOLLOWUP_BROKEN = new Set(['prompt_cancelled', 'prompt_failed', 'no_mic', 'interrupted', 'session_lost']);
+const FOLLOWUP_BROKEN = new Set([
+  FOLLOW_UP.PROMPT_CANCELLED, FOLLOW_UP.PROMPT_FAILED, FOLLOW_UP.NO_MIC,
+  TERMINAL_REASON.INTERRUPTED, TERMINAL_REASON.SESSION_LOST,
+]);
 
 // How the spoken answer ended (render.finished reason, or a response limit).
-const PLAYBACK_ENDS = {
-  drained: 'played to the end', cancelled: 'cut off', failed: 'failed to play',
-  underrun: 'ran out of audio', response_timeout: 'stalled or timed out', fenced: 'superseded',
-};
+const PLAYBACK_ENDS = Object.freeze({
+  [PLAYBACK_END.DRAINED]:          'played to the end',
+  [PLAYBACK_END.CANCELLED]:        'cut off',
+  [PLAYBACK_END.FAILED]:           'failed to play',
+  [PLAYBACK_END.UNDERRUN]:         'ran out of audio',
+  [PLAYBACK_END.RESPONSE_TIMEOUT]: 'stalled or timed out',
+  [PLAYBACK_END.FENCED]:           'superseded',
+});
 
 // One turn, stage by stage: what woke it, what the controller's streaming
 // recognizer heard and why it stopped listening, what Home Assistant
@@ -889,7 +1189,6 @@ const PLAYBACK_ENDS = {
 // what became of any follow-up question. A stage that never ran (a refused
 // wake, no speech, a failed STT) is omitted rather than shown empty.
 function TurnDetail({ turn: t, turns, onSelect }) {
-  const mono = "'DM Mono',monospace";
   // Pre-cutover rows stored negative sentinels for unmeasured stages.
   const measured = v => typeof v === 'number' && v >= 0;
   const fmtS = ms => (measured(ms) ? (ms / 1000).toFixed(2) + ' s' : '—');
@@ -901,7 +1200,7 @@ function TurnDetail({ turn: t, turns, onSelect }) {
   const question = t.reply_to ? turns.find(x => x.turn_uuid === t.reply_to) : null;
   const answers = t.turn_uuid ? turns.filter(x => x.reply_to === t.turn_uuid) : [];
   const jump = (x, label) => (
-    <button key={x.turn_id} onClick={() => onSelect(x.turn_id)}
+    <button type="button" key={x.turn_id} onClick={() => onSelect(x.turn_id)}
       style={{ background: 'none', border: 'none', padding: 0, cursor: 'pointer', font: 'inherit', color: 'var(--accent)', textDecoration: 'underline' }}>
       {label}
     </button>
@@ -913,10 +1212,10 @@ function TurnDetail({ turn: t, turns, onSelect }) {
     </div>
   );
   // Turns that ran an HA intent: its conversation run, or EchoMuse's HassTimerStatus/HassCancelTimer.
-  const handledByHa = ['ha', 'timer'].includes(t.outcome);
+  const handledByHa = t.outcome === TURN_OUTCOME.HA || t.outcome === TURN_OUTCOME.TIMER;
   const agent = t.intent_local == null ? null : t.intent_local ? "HA's built-in agent" : 'the conversation agent';
   return (
-    <div style={{ marginTop: 10, background: 'var(--hairline)', border: '1px solid var(--track)', borderRadius: 6, padding: '8px 12px', fontFamily: mono, fontSize: 10, color: 'var(--text2)', lineHeight: 1.7 }}>
+    <div style={{ marginTop: 10, background: 'var(--hairline)', border: '1px solid var(--track)', borderRadius: 6, padding: '8px 12px', fontFamily: MONO, fontSize: 10, color: 'var(--text2)', lineHeight: 1.7 }}>
       <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', paddingBottom: 4 }}>
         <span style={{ color: 'var(--text)' }}>{fmtTurnWhenFull(t.ts)}</span>
         <span>{TRIGGERS[t.trigger] || t.trigger}</span>
@@ -925,12 +1224,12 @@ function TurnDetail({ turn: t, turns, onSelect }) {
         <span style={{ marginLeft: 'auto' }}>total {fmtS(t.total_ms)}</span>
       </div>
 
-      {t.trigger === 'wake' && stage('Wake', <>
+      {t.trigger === TURN_TRIGGER.WAKE && stage('Wake', <>
         {t.wake_model || '—'} ({shortSha(t.wake_model_sha256)}) · score {t.wake_score != null ? t.wake_score.toFixed(3) : '—'}
         {' '}/ threshold {t.wake_threshold != null ? t.wake_threshold.toFixed(2) : '—'}
         {' · '}{refused ? <span style={{ color: 'var(--warn)' }}>refused: {t.terminal_reason.replace(/_/g, ' ')}</span>
           : legacy ? null
-          : t.wake_attribution === 'verified' ? 'heard while the Echo was playing; verified' : 'heard while idle'}
+          : t.wake_attribution === WAKE_ATTRIBUTION.VERIFIED ? 'heard while the Echo was playing; verified' : 'heard while idle'}
       </>)}
 
       {!refused && !legacy && stage('Heard (EchoMuse)', <>
@@ -954,7 +1253,7 @@ function TurnDetail({ turn: t, turns, onSelect }) {
 
       {t.outcome && !legacy && stage('Handled by', <>
         {TURN_HANDLERS[t.outcome] || t.outcome.replace(/_/g, ' ')}
-        {t.outcome === 'local_command' && t.stt_text ? <> · {quote(t.stt_text)}</> : null}
+        {t.outcome === TURN_OUTCOME.LOCAL_COMMAND && t.stt_text ? <> · {quote(t.stt_text)}</> : null}
         {handledByHa && (agent || t.response_type || measured(t.intent_ms)) && (
           <div style={{ color: 'var(--muted)' }}>
             {[agent && `answered by ${agent}`, t.response_type && t.response_type.replace(/_/g, ' '),
@@ -971,7 +1270,7 @@ function TurnDetail({ turn: t, turns, onSelect }) {
               measured(t.playback_ms) && `audible ${fmtS(t.playback_ms)}`].filter(Boolean).join(' · ')}
             {t.playback_reason && <>
               {(measured(t.tts_url_ms) || measured(t.playback_ms)) && ' · '}
-              <span style={{ color: t.playback_reason === 'drained' ? undefined : 'var(--warn)' }}>
+              <span style={{ color: t.playback_reason === PLAYBACK_END.DRAINED ? undefined : 'var(--warn)' }}>
                 {PLAYBACK_ENDS[t.playback_reason] || t.playback_reason.replace(/_/g, ' ')}
               </span>
             </>}
@@ -990,7 +1289,7 @@ function TurnDetail({ turn: t, turns, onSelect }) {
         {t.continuation && (
           <div>
             <span style={{ color: 'var(--muted)' }}>
-              {t.outcome === 'ha' ? 'Home Assistant asked a follow-up' : 'EchoMuse asked a follow-up'}:{' '}
+              {t.outcome === TURN_OUTCOME.HA ? 'Home Assistant asked a follow-up' : 'EchoMuse asked a follow-up'}:{' '}
             </span>
             <span style={{ color: followup(t.continuation)[1] }}>{followup(t.continuation)[0]}</span>
             {answers.map(a => <React.Fragment key={a.turn_id}> · {jump(a, `reply at ${fmtTurnWhen(a.ts)}`)}</React.Fragment>)}
@@ -1016,11 +1315,9 @@ function TurnDetail({ turn: t, turns, onSelect }) {
 function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, stateLabel, stateColor }) {
   const [hover, setHover] = useState(null);       // index into `recent`
   const [selected, setSelected] = useState(null); // turn_id; null follows the newest
-  const mono = "'DM Mono',monospace";
 
-  // Saved audio — play in place or download the WAV. Both go through one
-  // fetched object URL per clip (API.blob; see the auth note there), so
-  // playing then downloading costs one transfer, not two.
+  // Saved audio — play in place or download the WAV, through one cached
+  // object URL per clip (useClipPlayer).
   //
   // A turn can carry two different recordings: the wake clip (the 1.4s that
   // crossed the threshold) and the utterance (the command that followed).
@@ -1029,20 +1326,15 @@ function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, stateLa
   // stops the other instead of leaving them talking over each other.
   const WAKE = 'wake', MIC = 'audio';   // also the last segment of the URL
   const clipKey = (t, kind) => `${t.turn_id}:${kind}`;
+  const clipPath = (t, kind) => `/api/devices/${deviceId}/turns/${t.turn_id}/${kind}`;
 
-  const [playing, setPlaying]   = useState(null);   // clip key currently sounding
+  const player = useClipPlayer(deviceId);
+  const playing = player.playing;             // clip key currently sounding
   const [gone, setGone]         = useState(() => new Set()); // 404 = pruned
   const [zipping, setZipping]   = useState(false);
   const [zipError, setZipError] = useState('');
-  const audioRef = useRef(null);
-  const urlsRef  = useRef({});    // clip key -> object URL
 
-  const slug = (deviceLabel || deviceId).replace(/[^A-Za-z0-9]+/g, '-').toLowerCase();
-
-  const stopAudio = () => {
-    if (audioRef.current) { audioRef.current.pause(); audioRef.current = null; }
-    setPlaying(null);
-  };
+  const slug = fileSlug(deviceLabel, deviceId);
 
   // Retention is a small per-device file count, far shorter than the turn
   // history, so a row naming a recording that no longer exists is ordinary.
@@ -1050,76 +1342,39 @@ function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, stateLa
   // clip rather than per turn: the two kinds are kept to their own counts,
   // so a turn routinely still has its wake clip long after its utterance
   // was pruned.
-  const clipUrl = async (t, kind) => {
-    const key = clipKey(t, kind);
-    if (urlsRef.current[key]) return urlsRef.current[key];
-    try {
-      const url = URL.createObjectURL(await API.blob(
-        `/api/devices/${deviceId}/turns/${t.turn_id}/${kind}`));
-      urlsRef.current[key] = url;
-      return url;
-    } catch {
-      setGone(g => new Set(g).add(key));
-      return null;
-    }
-  };
+  const markGone = key => setGone(g => new Set(g).add(key));
 
   const toggleAudio = async (t, kind) => {
     const key = clipKey(t, kind);
-    const wasPlaying = playing === key;
-    stopAudio();
-    if (wasPlaying) return;
-    const url = await clipUrl(t, kind);
-    if (!url) return;
-    const el = new Audio(url);
-    el.onended = el.onerror = () => setPlaying(p => (p === key ? null : p));
-    audioRef.current = el;
-    setPlaying(key);
-    el.play().catch(() => setPlaying(p => (p === key ? null : p)));
-  };
-
-  const download = (url, filename) => {
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    a.click();
+    if (!(await player.toggle(key, clipPath(t, kind)))) markGone(key);
   };
 
   const downloadAudio = async (t, kind) => {
-    const url = await clipUrl(t, kind);
-    if (!url) return;
+    const key = clipKey(t, kind);
+    let url;
+    try { url = await player.url(key, clipPath(t, kind)); } catch { markGone(key); return; }
     const when = new Date(t.ts * 1000).toISOString().slice(0, 19).replace(/[:T]/g, '');
     // The kind is in the filename because both clips of one turn land in the
     // same downloads folder seconds apart, and only one of them is the
     // training negative anyone went looking for.
-    download(url, `${slug}-${when}${kind === WAKE ? '-wake' : ''}.wav`);
+    downloadUrl(url, `${slug}-${when}${kind === WAKE ? '-wake' : ''}.wav`);
   };
 
   // Every wake clip the device still holds, in one archive — the hand-off to
   // a retraining run. Deliberately not "the clips for the turns on screen":
   // the store keeps hundreds and this list is the last 50, so most of the
   // false positives worth training on are already off the bottom of it.
-  // Its object URL is used once and revoked straight away; unlike the
-  // per-clip ones there is nothing to replay it for.
+  // Unlike the per-clip URLs there is nothing to replay it for, so it is not
+  // kept.
   async function doWakeZip() {
     setZipping(true); setZipError('');
     try {
-      const url = URL.createObjectURL(await API.blob(`/api/devices/${deviceId}/wakeclips.zip`));
-      download(url, `${slug}-wakeclips.zip`);
-      URL.revokeObjectURL(url);
+      downloadBlob(await API.blob(`/api/devices/${deviceId}/wakeclips.zip`), `${slug}-wakeclips.zip`);
     } catch (e) {
       setZipError(e.error || e.message || 'Could not build the archive');
     }
     setZipping(false);
   }
-
-  useEffect(() => () => {
-    stopAudio();
-    // Object URLs pin their blob in memory until revoked — a few minutes on
-    // the Activity tab would otherwise leak every recording played.
-    Object.values(urlsRef.current).forEach(URL.revokeObjectURL);
-    urlsRef.current = {};
-  }, []);
 
   const anyAudio = turns.some(t => t.audio_file);
   const anyWake  = turns.some(t => t.wake_file);
@@ -1127,7 +1382,8 @@ function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, stateLa
   // Success is over requests, so refused wake candidates and superseded turns
   // are left out of the denominator; refusals get their own tile.
   const refused = turns.filter(t => REFUSED_WAKE.has(t.terminal_reason));
-  const requests = turns.filter(t => !REFUSED_WAKE.has(t.terminal_reason) && t.terminal_reason !== 'superseded');
+  const requests = turns.filter(t => !REFUSED_WAKE.has(t.terminal_reason)
+                                   && t.terminal_reason !== TERMINAL_REASON.SUPERSEDED);
   const done = requests.filter(turnSucceeded);
   const successPct = requests.length ? Math.round(done.length / requests.length * 100) : null;
   // Commit → TTS URL (STT run plus intent), for completed turns that measured both.
@@ -1139,8 +1395,8 @@ function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, stateLa
   const fmtS = ms => (ms / 1000).toFixed(1) + 's';
   // Follow-up questions whose fate is known; a broken one (cut off, no mic,
   // disconnected) is a fault, not a user who stayed quiet.
-  const asked = turns.filter(t => t.continuation && t.continuation !== 'pending');
-  const answered = asked.filter(t => t.continuation === 'answered' || t.continuation === 'wake');
+  const asked = turns.filter(t => t.continuation && t.continuation !== FOLLOW_UP.PENDING);
+  const answered = asked.filter(t => t.continuation === FOLLOW_UP.ANSWERED || t.continuation === FOLLOW_UP.WAKE);
   const brokenFollowups = asked.filter(t => FOLLOWUP_BROKEN.has(t.continuation));
 
   // All buffered turns (up to 50), newest first — rendered inside their own
@@ -1172,7 +1428,7 @@ function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, stateLa
       </div>
 
       {recent.length === 0 ? (
-        <div style={{ fontFamily: mono, fontSize: 11, color: 'var(--muted)' }}>
+        <div style={{ fontFamily: MONO, fontSize: 11, color: 'var(--muted)' }}>
           No voice turns recorded yet — history starts when the device is next used.
         </div>
       ) : (
@@ -1180,24 +1436,24 @@ function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, stateLa
           {/* Legend */}
           <div style={{ display: 'flex', gap: 14, marginBottom: 10 }}>
             {TURN_STAGES.map(s => (
-              <span key={s.key} style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontFamily: mono, fontSize: 9, color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+              <span key={s.key} style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontFamily: MONO, fontSize: 9, color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
                 <span style={{ width: 8, height: 8, borderRadius: 2, background: s.color, display: 'inline-block' }}/>
                 {s.label}
               </span>
             ))}
             <span style={{ marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 12 }}>
               {(recordingsOn || anyAudio) && (
-                <span style={{ fontFamily: mono, fontSize: 9, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+                <span style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
                   ▶ hear the mic{anyAudio ? '' : ' — next turn'}
                 </span>
               )}
               {anyWake && (
-                <span style={{ fontFamily: mono, fontSize: 9, color: 'var(--lcd-amber)', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+                <span style={{ fontFamily: MONO, fontSize: 9, color: 'var(--lcd-amber)', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
                   ▷ what woke it
                 </span>
               )}
               {zipError && (
-                <span style={{ fontFamily: mono, fontSize: 9, color: 'var(--warn)' }}>{zipError}</span>
+                <span style={{ fontFamily: MONO, fontSize: 9, color: 'var(--warn)' }}>{zipError}</span>
               )}
               {/* Pill takes no title, so the explanation hangs off a wrapper
                   — this is the button someone presses before a retraining
@@ -1220,11 +1476,11 @@ function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, stateLa
             const isSel = shown && t.turn_id === shown.turn_id;
             return (
               <div key={t.turn_id}
-                onClick={() => setSelected(t.turn_id)}
+                {...pressable(() => setSelected(t.turn_id), { selected: !!isSel })}
                 onMouseEnter={() => setHover(i)} onMouseLeave={() => setHover(null)}
                 style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '3px 0', cursor: 'pointer', borderRadius: 4,
                   background: isSel ? 'var(--accent-tint)' : hover === i ? 'var(--hairline)' : 'transparent' }}>
-                <span style={{ fontFamily: mono, fontSize: 9, color: 'var(--muted)', width: 86, flexShrink: 0, textAlign: 'right', whiteSpace: 'nowrap' }}>{fmtTurnWhen(t.ts)}</span>
+                <span style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)', width: 86, flexShrink: 0, textAlign: 'right', whiteSpace: 'nowrap' }}>{fmtTurnWhen(t.ts)}</span>
                 <div style={{ flex: 1, display: 'flex', height: 14, alignItems: 'stretch' }}>
                   {TURN_STAGES.map(s => seg[s.key] > 0 && (
                     <div key={s.key} style={{
@@ -1233,15 +1489,15 @@ function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, stateLa
                     }}/>
                   ))}
                 </div>
-                <span style={{ fontFamily: mono, fontSize: 9, color: 'var(--text2)', width: 34, flexShrink: 0 }}>{fmtS(seg.shown)}</span>
+                <span style={{ fontFamily: MONO, fontSize: 9, color: 'var(--text2)', width: 34, flexShrink: 0 }}>{fmtS(seg.shown)}</span>
                 {/* ↩ answered a question; ? asked one, colored by what became of it. */}
-                <span style={{ fontFamily: mono, fontSize: 10, width: 10, flexShrink: 0, textAlign: 'center',
+                <span style={{ fontFamily: MONO, fontSize: 10, width: 10, flexShrink: 0, textAlign: 'center',
                   color: t.continuation ? followup(t.continuation)[1] : 'var(--text2)' }}
                   title={t.continuation ? `Asked a follow-up: ${followup(t.continuation)[0]}`
                     : t.reply_to ? 'Answered a follow-up question' : undefined}>
                   {t.continuation ? '?' : t.reply_to ? '↩' : ''}
                 </span>
-                <span style={{ fontFamily: mono, fontSize: 8, textTransform: 'uppercase', letterSpacing: '0.08em', width: 62, flexShrink: 0, color: end.color }}>
+                <span style={{ fontFamily: MONO, fontSize: 8, textTransform: 'uppercase', letterSpacing: '0.08em', width: 62, flexShrink: 0, color: end.color }}>
                   {end.label.replace(/_/g, ' ')}
                 </span>
                 {/* The turn's saved audio, in the order it happened: the wake
@@ -1252,23 +1508,27 @@ function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, stateLa
                     which is why each pair tests its own key. */}
                 <span style={{ width: 60, flexShrink: 0, display: 'flex', gap: 4, justifyContent: 'flex-end' }}>
                   {t.wake_file && !gone.has(clipKey(t, WAKE)) && (<>
-                    <button onClick={e => { e.stopPropagation(); toggleAudio(t, WAKE); }}
+                    <button type="button" onClick={e => { e.stopPropagation(); toggleAudio(t, WAKE); }}
+                      aria-label={playing === clipKey(t, WAKE) ? 'Stop the wake clip' : 'Play the wake clip'}
                       title={playing === clipKey(t, WAKE) ? 'Stop'
                         : 'Play the 1.4s that crossed the wake threshold — what triggered it, not the command'}
                       style={{ ...glyphBtn, color: playing === clipKey(t, WAKE) ? 'var(--warn)' : 'var(--lcd-amber)' }}>
                       {playing === clipKey(t, WAKE) ? '▮' : '▷'}
                     </button>
-                    <button onClick={e => { e.stopPropagation(); downloadAudio(t, WAKE); }}
+                    <button type="button" onClick={e => { e.stopPropagation(); downloadAudio(t, WAKE); }}
+                      aria-label="Download the wake clip"
                       title="Download the wake clip — a false trigger belongs in wake-word training"
                       style={{ ...glyphBtn, color: 'var(--muted)' }}>⤓</button>
                   </>)}
                   {t.audio_file && !gone.has(clipKey(t, MIC)) && (<>
-                    <button onClick={e => { e.stopPropagation(); toggleAudio(t, MIC); }}
+                    <button type="button" onClick={e => { e.stopPropagation(); toggleAudio(t, MIC); }}
+                      aria-label={playing === clipKey(t, MIC) ? 'Stop the mic audio' : 'Play the mic audio'}
                       title={playing === clipKey(t, MIC) ? 'Stop' : 'Play the mic audio for this turn'}
                       style={{ ...glyphBtn, color: playing === clipKey(t, MIC) ? 'var(--warn)' : 'var(--text2)' }}>
                       {playing === clipKey(t, MIC) ? '▮' : '▶'}
                     </button>
-                    <button onClick={e => { e.stopPropagation(); downloadAudio(t, MIC); }} title="Download the WAV"
+                    <button type="button" onClick={e => { e.stopPropagation(); downloadAudio(t, MIC); }}
+                      aria-label="Download the mic audio" title="Download the WAV"
                       style={{ ...glyphBtn, color: 'var(--muted)' }}>⤓</button>
                   </>)}
                 </span>
@@ -1329,7 +1589,6 @@ function ConnectivityTab({ device, row }) {
     }
   }
 
-  const mono  = "'DM Mono',monospace";
   const busy  = !!pending;
   const valid = ssid && (!psk || (psk.length >= 8 && psk.length <= 63)) &&
                 !/["\\]/.test(ssid) && !/["\\]/.test(psk);
@@ -1340,10 +1599,10 @@ function ConnectivityTab({ device, row }) {
       {/* Outcome banners — pending wins over last result */}
       {pending && (
         <div style={{ background:'rgba(64,88,120,0.10)', border:'1px solid rgba(64,88,120,0.25)', borderRadius:8, padding:'12px 16px' }}>
-          <div style={{ fontFamily:mono, fontSize:11, color:'var(--accent)' }}>
+          <div style={{ fontFamily:MONO, fontSize:11, color:'var(--accent)' }}>
             Switching to “{pending.ssid}” — the device will drop offline while it changes network.
           </div>
-          <div style={{ fontFamily:mono, fontSize:10, color:'var(--muted)', marginTop:4 }}>
+          <div style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)', marginTop:4 }}>
             If it can't associate, get an IP, or reach this controller, it rolls back to the previous
             network automatically and reports the failure here (allow ~2 minutes).
           </div>
@@ -1351,13 +1610,13 @@ function ConnectivityTab({ device, row }) {
       )}
       {!pending && result && (
         <div style={{ background: result.ok ? 'rgba(40,96,64,0.08)' : 'rgba(192,96,26,0.08)', border:`1px solid ${result.ok ? 'rgba(40,96,64,0.25)' : 'rgba(192,96,26,0.3)'}`, borderRadius:8, padding:'12px 16px' }}>
-          <div style={{ fontFamily:mono, fontSize:11, color: result.ok ? 'var(--ok)' : 'var(--warn)' }}>
+          <div style={{ fontFamily:MONO, fontSize:11, color: result.ok ? 'var(--ok)' : 'var(--warn)' }}>
             {result.ok
               ? `Switched to “${result.ssid}” successfully.`
               : `Change to “${result.ssid}” failed — previous network restored.`}
           </div>
           {!result.ok && result.error && (
-            <div style={{ fontFamily:mono, fontSize:10, color:'var(--muted)', marginTop:4 }}>{result.error}</div>
+            <div style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)', marginTop:4 }}>{result.error}</div>
           )}
         </div>
       )}
@@ -1365,15 +1624,15 @@ function ConnectivityTab({ device, row }) {
       <div className="em-grid2" style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:16, alignItems:'start' }}>
         <Panel label="Current connection">
           {row('Network', currentSsid || '—')}
-          {row('IP', device.ip && device.ip !== '127.0.0.1' ? device.ip : '—')}
+          {row('IP', deviceIp(device) || '—')}
           <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
-            <span style={{ fontFamily:mono, fontSize:10, color:'var(--muted)', textTransform:'uppercase', letterSpacing:'0.08em' }}>Signal</span>
+            <span style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)', textTransform:'uppercase', letterSpacing:'0.08em' }}>Signal</span>
             <div style={{ display:'flex', alignItems:'center', gap:8 }}>
-              <span style={{ fontFamily:mono, fontSize:10, color:'var(--text2)' }}>{s?.wifiRssi != null ? `${s.wifiRssi} dBm` : '—'}</span>
+              <span style={{ fontFamily:MONO, fontSize:10, color:'var(--text2)' }}>{s?.wifiRssi != null ? `${s.wifiRssi} dBm` : '—'}</span>
               <SignalBars rssi={s?.wifiRssi ?? null}/>
             </div>
           </div>
-          {!s && <div style={{ fontFamily:mono, fontSize:9, color:'var(--muted)', marginTop:8 }}>waiting for device stats…</div>}
+          {!s && <div style={{ fontFamily:MONO, fontSize:9, color:'var(--muted)', marginTop:8 }}>waiting for device stats…</div>}
         </Panel>
 
         <Panel label="Visible networks">
@@ -1381,20 +1640,20 @@ function ConnectivityTab({ device, row }) {
             <Pill small disabled={scanning || !device.connected || busy} onClick={doScan}>
               {scanning ? 'Scanning…' : networks ? 'Rescan' : 'Scan'}
             </Pill>
-            {scanError && <span style={{ fontFamily:mono, fontSize:10, color:'var(--warn)' }}>{scanError}</span>}
+            {scanError && <span style={{ fontFamily:MONO, fontSize:10, color:'var(--warn)' }}>{scanError}</span>}
           </div>
           {networks && networks.length === 0 && (
-            <div style={{ fontFamily:mono, fontSize:10, color:'var(--muted)' }}>No networks found.</div>
+            <div style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)' }}>No networks found.</div>
           )}
           {networks && networks.length > 0 && (
             <div style={{ maxHeight:170, overflowY:'auto' }}>
               {networks.map(n => (
-                <div key={n.ssid} onClick={() => !busy && setSsid(n.ssid)}
+                <div key={n.ssid} {...pressable(() => setSsid(n.ssid), { disabled: busy, selected: ssid === n.ssid })}
                   style={{ display:'flex', justifyContent:'space-between', alignItems:'center', padding:'5px 8px', borderRadius:6, cursor: busy ? 'default' : 'pointer', background: ssid === n.ssid ? 'rgba(64,88,120,0.12)' : 'transparent' }}>
-                  <span style={{ fontFamily:mono, fontSize:11, color: ssid === n.ssid ? 'var(--accent)' : 'var(--text)' }}>
+                  <span style={{ fontFamily:MONO, fontSize:11, color: ssid === n.ssid ? 'var(--accent)' : 'var(--text)' }}>
                     {n.ssid}{n.ssid === currentSsid ? '  ← current' : ''}
                   </span>
-                  <span style={{ fontFamily:mono, fontSize:10, color:'var(--muted)' }}>{n.signal} dBm</span>
+                  <span style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)' }}>{n.signal} dBm</span>
                 </div>
               ))}
             </div>
@@ -1403,21 +1662,21 @@ function ConnectivityTab({ device, row }) {
       </div>
 
       <Panel label="Change network">
-        <div style={{ fontFamily:mono, fontSize:10, color:'var(--muted)', marginBottom:12 }}>
+        <div style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)', marginBottom:12 }}>
           The device applies the change itself and rolls back automatically if the new network doesn't
           work out — including when it connects but can't reach this controller (wrong VLAN, isolated
           guest network). The previous network is only discarded once the device reports back here.
         </div>
         <div className="em-grid2" style={{ display:'grid', gridTemplateColumns:'1fr 1fr auto', gap:12, alignItems:'end' }}>
           <div>
-            <div style={{ fontFamily:mono, fontSize:9, color:'var(--text2)', letterSpacing:'0.08em', marginBottom:4 }}>SSID</div>
-            <input type="text" value={ssid} disabled={busy} onChange={e => setSsid(e.target.value)}
+            <div style={{ fontFamily:MONO, fontSize:9, color:'var(--text2)', letterSpacing:'0.08em', marginBottom:4 }}>SSID</div>
+            <input type="text" value={ssid} disabled={busy} onChange={e => setSsid(e.target.value)} aria-label="SSID"
               placeholder="Network name" style={{ width:'100%', boxSizing:'border-box' }}/>
           </div>
           <div>
-            <div style={{ fontFamily:mono, fontSize:9, color:'var(--text2)', letterSpacing:'0.08em', marginBottom:4 }}>Passphrase</div>
+            <div style={{ fontFamily:MONO, fontSize:9, color:'var(--text2)', letterSpacing:'0.08em', marginBottom:4 }}>Passphrase</div>
             <div style={{ display:'flex', gap:6 }}>
-              <input type={showPsk ? 'text' : 'password'} value={psk} disabled={busy} onChange={e => setPsk(e.target.value)}
+              <input type={showPsk ? 'text' : 'password'} value={psk} disabled={busy} onChange={e => setPsk(e.target.value)} aria-label="Passphrase"
                 placeholder="WPA passphrase (blank = open)" style={{ flex:1, boxSizing:'border-box' }}/>
               <Pill small onClick={() => setShowPsk(v => !v)}>{showPsk ? 'Hide' : 'Show'}</Pill>
             </div>
@@ -1432,17 +1691,17 @@ function ConnectivityTab({ device, row }) {
           )}
         </div>
         {ssid && !valid && (
-          <div style={{ fontFamily:mono, fontSize:10, color:'var(--warn)', marginTop:8 }}>
+          <div style={{ fontFamily:MONO, fontSize:10, color:'var(--warn)', marginTop:8 }}>
             {/["\\]/.test(ssid + psk)
               ? 'SSID/passphrase cannot contain " or \\ characters.'
               : 'WPA passphrase must be 8–63 characters (leave blank for an open network).'}
           </div>
         )}
         {submitError && (
-          <div style={{ fontFamily:mono, fontSize:10, color:'var(--warn)', marginTop:8 }}>{submitError}</div>
+          <div style={{ fontFamily:MONO, fontSize:10, color:'var(--warn)', marginTop:8 }}>{submitError}</div>
         )}
         {!device.connected && (
-          <div style={{ fontFamily:mono, fontSize:10, color:'var(--warn)', marginTop:8 }}>Device offline — connect it before changing networks.</div>
+          <div style={{ fontFamily:MONO, fontSize:10, color:'var(--warn)', marginTop:8 }}>Device offline — connect it before changing networks.</div>
         )}
       </Panel>
     </div>
@@ -1462,16 +1721,16 @@ function SamplesTab({ device, isAdmin }) {
   const [data, setData]       = useState(null);   // null = not fetched yet
   const [busy, setBusy]       = useState(false);
   const [error, setError]     = useState('');
-  const [playing, setPlaying] = useState(null);   // clip name currently sounding
   const [confirmWipe, setConfirmWipe] = useState(false);
   const [zipping, setZipping] = useState(false);
-  const audioRef = useRef(null);
-  const urlsRef  = useRef({});                    // name -> object URL
 
   const id   = device.device_id;
   const on   = !!device.collectMode;
-  const mono = "'DM Mono',monospace";
-  const slug = (device.label || id).replace(/[^A-Za-z0-9]+/g, '-').toLowerCase();
+  const slug = fileSlug(device.label, id);
+  // Clip URLs are cached for replay and download (useClipPlayer).
+  const player   = useClipPlayer(id);
+  const playing  = player.playing;                // clip name currently sounding
+  const clipPath = name => `/api/devices/${id}/samples/${name}`;
 
   const load = async () => {
     try {
@@ -1491,48 +1750,6 @@ function SamplesTab({ device, isAdmin }) {
     return () => clearInterval(iv);
   }, [id, on]);
 
-  const stopAudio = () => {
-    if (audioRef.current) { audioRef.current.pause(); audioRef.current = null; }
-    setPlaying(null);
-  };
-
-  // Object URLs pin their blob until revoked; a long session auditioning
-  // clips would otherwise hold every one of them in memory.
-  useEffect(() => () => {
-    stopAudio();
-    Object.values(urlsRef.current).forEach(URL.revokeObjectURL);
-    urlsRef.current = {};
-  }, [id]);
-
-  const clipUrl = async name => {
-    if (urlsRef.current[name]) return urlsRef.current[name];
-    // API.blob, not an <a href>: sessions are Bearer-header-only, so a
-    // browser-initiated request would 401.
-    const url = URL.createObjectURL(await API.blob(`/api/devices/${id}/samples/${name}`));
-    urlsRef.current[name] = url;
-    return url;
-  };
-
-  const toggleAudio = async name => {
-    const wasPlaying = playing === name;
-    stopAudio();
-    if (wasPlaying) return;
-    let url;
-    try { url = await clipUrl(name); } catch { return; }
-    const el = new Audio(url);
-    el.onended = el.onerror = () => setPlaying(p => (p === name ? null : p));
-    audioRef.current = el;
-    setPlaying(name);
-    el.play().catch(() => setPlaying(p => (p === name ? null : p)));
-  };
-
-  const download = (url, filename) => {
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    a.click();
-  };
-
   async function setMode(enabled) {
     setBusy(true); setError('');
     try {
@@ -1549,9 +1766,7 @@ function SamplesTab({ device, isAdmin }) {
   async function doZip() {
     setZipping(true); setError('');
     try {
-      const url = URL.createObjectURL(await API.blob(`/api/devices/${id}/samples.zip`));
-      download(url, `${slug}-samples.zip`);
-      URL.revokeObjectURL(url);
+      downloadBlob(await API.blob(`/api/devices/${id}/samples.zip`), `${slug}-samples.zip`);
     } catch (e) {
       setError(e.error || e.message || 'Could not build the archive');
     }
@@ -1559,13 +1774,10 @@ function SamplesTab({ device, isAdmin }) {
   }
 
   async function doDelete(name) {
-    stopAudio();
+    player.stop();
     try {
       await API.del(`/api/devices/${id}/samples/${name}`);
-      if (urlsRef.current[name]) {
-        URL.revokeObjectURL(urlsRef.current[name]);
-        delete urlsRef.current[name];
-      }
+      player.forget(name);
       setData(d => d && { ...d, clips: d.clips.filter(c => c.name !== name),
                           count: Math.max(0, d.count - 1) });
     } catch (e) {
@@ -1574,12 +1786,11 @@ function SamplesTab({ device, isAdmin }) {
   }
 
   async function doWipe() {
-    stopAudio();
+    player.stop();
     setConfirmWipe(false);
     try {
       await API.del(`/api/devices/${id}/samples`);
-      Object.values(urlsRef.current).forEach(URL.revokeObjectURL);
-      urlsRef.current = {};
+      player.forgetAll();
       await load();
     } catch (e) {
       setError(e.error || e.message || 'Could not delete the samples');
@@ -1594,14 +1805,14 @@ function SamplesTab({ device, isAdmin }) {
     <div style={{ minHeight:'100%', display:'flex', flexDirection:'column', gap:16 }}>
 
       <Panel label="Sample collection">
-        <div style={{ fontFamily:"'DM Sans',sans-serif", fontSize:12, color:'var(--text2)', lineHeight:1.55, marginBottom:14 }}>
+        <div style={{ fontFamily:SANS, fontSize:12, color:'var(--text2)', lineHeight:1.55, marginBottom:14 }}>
           Records this device&apos;s microphone continuously and cuts it into
           clips at the silences — say the wake word around the room and each
           one lands here as a WAV. The audio is exactly what the wake model
           scores, so the clips train against the array that will hear them.
         </div>
         <div style={{ background:'linear-gradient(160deg,var(--lcd-face),var(--lcd-deep))', border:'1px solid var(--lcd-line)', borderRadius:6, padding:'10px 12px', marginBottom:16 }}>
-          <span style={{ fontFamily:mono, fontSize:10, color:'var(--lcd-amber)', lineHeight:1.6 }}>
+          <span style={{ fontFamily:MONO, fontSize:10, color:'var(--lcd-amber)', lineHeight:1.6 }}>
             While collecting, this device answers nothing — no wake word, no
             button turn, and nothing reaches Home Assistant. Its ring throbs
             magenta so it is obvious from the room.
@@ -1626,18 +1837,18 @@ function SamplesTab({ device, isAdmin }) {
               running under an ambient session cuts the wake word out of the
               room noise it was recording. */}
           {!on && !!device.ambientMode && (
-            <span style={{ fontFamily:mono, fontSize:10, color:'var(--warn)' }}>
+            <span style={{ fontFamily:MONO, fontSize:10, color:'var(--warn)' }}>
               Stop ambient recording first — both modes want the same audio
             </span>
           )}
           {!device.connected && (
-            <span style={{ fontFamily:mono, fontSize:10, color:'var(--warn)' }}>
+            <span style={{ fontFamily:MONO, fontSize:10, color:'var(--warn)' }}>
               {on ? 'Armed — collection resumes when the device reconnects'
                   : 'Device offline — this will take effect on its next connect'}
             </span>
           )}
           {device.connected && on && (
-            <span style={{ fontFamily:mono, fontSize:10, color:'var(--muted)' }}>
+            <span style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)' }}>
               {device.collectClips || 0} clip(s) this session
               {device.collectLastMs ? ` · last ${device.collectLastMs}ms` : ''}
             </span>
@@ -1648,7 +1859,7 @@ function SamplesTab({ device, isAdmin }) {
             these three numbers are what tell them apart without a log tail. */}
         {data?.live && (
           <div style={{ marginTop:14, borderTop:'1px solid var(--hairline)', paddingTop:10,
-                        fontFamily:mono, fontSize:9, color:'var(--muted)', lineHeight:1.7 }}>
+                        fontFamily:MONO, fontSize:9, color:'var(--muted)', lineHeight:1.7 }}>
             Room floor {data.live.floor_db}dBFS · clips open above {data.live.open_db}dBFS
             {' · '}{data.live.frames} frame(s) heard
             {data.live.dropped_short ? ` · ${data.live.dropped_short} too short to keep` : ''}
@@ -1659,7 +1870,7 @@ function SamplesTab({ device, isAdmin }) {
           </div>
         )}
         {error && (
-          <div style={{ fontFamily:mono, fontSize:10, color:'var(--error)', marginTop:10 }}>{error}</div>
+          <div style={{ fontFamily:MONO, fontSize:10, color:'var(--error)', marginTop:10 }}>{error}</div>
         )}
       </Panel>
 
@@ -1675,7 +1886,7 @@ function SamplesTab({ device, isAdmin }) {
           )}
           {isAdmin && confirmWipe && (
             <>
-              <span style={{ fontFamily:mono, fontSize:9, color:'var(--error)' }}>Delete {clips.length} clip(s)?</span>
+              <span style={{ fontFamily:MONO, fontSize:9, color:'var(--error)' }}>Delete {clips.length} clip(s)?</span>
               <Pill small danger onClick={doWipe}>Confirm</Pill>
               <Pill small onClick={() => setConfirmWipe(false)}>Cancel</Pill>
             </>
@@ -1683,7 +1894,7 @@ function SamplesTab({ device, isAdmin }) {
         </div>
 
         {!clips.length && (
-          <div style={{ fontFamily:mono, fontSize:10, color:'var(--muted)' }}>
+          <div style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)' }}>
             {on ? 'Listening — say the wake word.' : 'Nothing collected yet.'}
           </div>
         )}
@@ -1694,16 +1905,16 @@ function SamplesTab({ device, isAdmin }) {
               display:'flex', alignItems:'center', gap:10, padding:'6px 0',
               borderTop:'1px solid var(--hairline)',
             }}>
-              <span style={{ fontFamily:mono, fontSize:10, color:'var(--text2)', minWidth:150 }}>
+              <span style={{ fontFamily:MONO, fontSize:10, color:'var(--text2)', minWidth:150 }}>
                 {new Date(c.ts * 1000).toLocaleString()}
               </span>
-              <span style={{ fontFamily:mono, fontSize:10, color:'var(--muted)', minWidth:60 }}>
+              <span style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)', minWidth:60 }}>
                 {(c.ms / 1000).toFixed(1)}s
               </span>
               <span style={{ flex:1 }}/>
-              <Pill small onClick={() => toggleAudio(c.name)}>{playing === c.name ? '■ Stop' : '▶ Play'}</Pill>
+              <Pill small onClick={() => player.toggle(c.name, clipPath(c.name))}>{playing === c.name ? '■ Stop' : '▶ Play'}</Pill>
               <Pill small onClick={async () => {
-                try { download(await clipUrl(c.name), `${slug}-${c.name}`); } catch {}
+                try { downloadUrl(await player.url(c.name, clipPath(c.name)), `${slug}-${c.name}`); } catch {}
               }}>Download</Pill>
               {isAdmin && <Pill small danger onClick={() => doDelete(c.name)}>Delete</Pill>}
             </div>
@@ -1730,16 +1941,19 @@ function AmbientPanel({ device, isAdmin }) {
   const [data, setData]   = useState(null);
   const [busy, setBusy]   = useState(false);
   const [error, setError] = useState('');
-  const [playing, setPlaying] = useState(null);
   const [confirmWipe, setConfirmWipe] = useState(false);
-  const audioRef = useRef(null);
-  const urlsRef  = useRef({});
 
   const id        = device.device_id;
   const on        = !!device.ambientMode;
   const collecting = !!device.collectMode;
-  const mono      = "'DM Mono',monospace";
-  const slug      = (device.label || id).replace(/[^A-Za-z0-9]+/g, '-').toLowerCase();
+  const slug      = fileSlug(device.label, id);
+  const filePath  = name => `/api/devices/${id}/ambient/${name}`;
+  // These are tens of megabytes each, so unlike a sample clip the blob is
+  // NOT cached: holding two of them pinned is a browser tab using 100MB to
+  // remember audio nobody is listening to any more. Each lives only while it
+  // is the one playing.
+  const player  = useClipPlayer(id, { cache: false });
+  const playing = player.playing;
 
   const load = async () => {
     try {
@@ -1759,37 +1973,6 @@ function AmbientPanel({ device, isAdmin }) {
     return () => clearInterval(iv);
   }, [id, on]);
 
-  const stopAudio = () => {
-    if (audioRef.current) { audioRef.current.pause(); audioRef.current = null; }
-    setPlaying(null);
-  };
-
-  useEffect(() => () => {
-    stopAudio();
-    Object.values(urlsRef.current).forEach(URL.revokeObjectURL);
-    urlsRef.current = {};
-  }, [id]);
-
-  // These are tens of megabytes each, so unlike a sample clip the blob is
-  // NOT cached: holding two of them pinned is a browser tab using 100MB to
-  // remember audio nobody is listening to any more.
-  const fileUrl = async name =>
-    URL.createObjectURL(await API.blob(`/api/devices/${id}/ambient/${name}`));
-
-  const toggleAudio = async name => {
-    const wasPlaying = playing === name;
-    stopAudio();
-    if (wasPlaying) return;
-    let url;
-    try { url = await fileUrl(name); } catch { return; }
-    urlsRef.current[name] = url;
-    const el = new Audio(url);
-    el.onended = el.onerror = () => setPlaying(p => (p === name ? null : p));
-    audioRef.current = el;
-    setPlaying(name);
-    el.play().catch(() => setPlaying(p => (p === name ? null : p)));
-  };
-
   async function setMode(enabled) {
     setBusy(true); setError('');
     try {
@@ -1805,13 +1988,9 @@ function AmbientPanel({ device, isAdmin }) {
   }
 
   async function doDelete(name) {
-    stopAudio();
+    player.stop();
     try {
       await API.del(`/api/devices/${id}/ambient/${name}`);
-      if (urlsRef.current[name]) {
-        URL.revokeObjectURL(urlsRef.current[name]);
-        delete urlsRef.current[name];
-      }
       await load();
     } catch (e) {
       setError(e.error || e.message || 'Could not delete that recording');
@@ -1819,12 +1998,10 @@ function AmbientPanel({ device, isAdmin }) {
   }
 
   async function doWipe() {
-    stopAudio();
+    player.stop();
     setConfirmWipe(false);
     try {
       await API.del(`/api/devices/${id}/ambient`);
-      Object.values(urlsRef.current).forEach(URL.revokeObjectURL);
-      urlsRef.current = {};
       await load();
     } catch (e) {
       setError(e.error || e.message || 'Could not delete the recordings');
@@ -1847,7 +2024,7 @@ function AmbientPanel({ device, isAdmin }) {
   return (
     <>
       <Panel label="Ambient recording">
-        <div style={{ fontFamily:"'DM Sans',sans-serif", fontSize:12, color:'var(--text2)', lineHeight:1.55, marginBottom:14 }}>
+        <div style={{ fontFamily:SANS, fontSize:12, color:'var(--text2)', lineHeight:1.55, marginBottom:14 }}>
           Holds this device&apos;s microphone open and keeps everything it
           hears. Stopping writes one WAV covering the whole session — the room
           as it actually sounds, which is the negative material a wake model is
@@ -1855,7 +2032,7 @@ function AmbientPanel({ device, isAdmin }) {
           clips: room noise has no pauses to cut at.
         </div>
         <div style={{ background:'linear-gradient(160deg,var(--lcd-face),var(--lcd-deep))', border:'1px solid var(--lcd-line)', borderRadius:6, padding:'10px 12px', marginBottom:16 }}>
-          <span style={{ fontFamily:mono, fontSize:10, color:'var(--lcd-amber)', lineHeight:1.6 }}>
+          <span style={{ fontFamily:MONO, fontSize:10, color:'var(--lcd-amber)', lineHeight:1.6 }}>
             While recording, this device answers nothing — no wake word, no
             button turn, and nothing reaches Home Assistant. Its ring throbs
             magenta so it is obvious from the room. Recordings roll into a new
@@ -1877,25 +2054,25 @@ function AmbientPanel({ device, isAdmin }) {
             {busy ? '…' : on ? 'Stop and save' : 'Start recording'}
           </Pill>
           {!on && collecting && (
-            <span style={{ fontFamily:mono, fontSize:10, color:'var(--warn)' }}>
+            <span style={{ fontFamily:MONO, fontSize:10, color:'var(--warn)' }}>
               Stop sample collection first — both modes want the same audio
             </span>
           )}
           {!device.connected && (
-            <span style={{ fontFamily:mono, fontSize:10, color:'var(--warn)' }}>
+            <span style={{ fontFamily:MONO, fontSize:10, color:'var(--warn)' }}>
               {on ? 'Armed — a new file starts when the device reconnects'
                   : 'Device offline — this will take effect on its next connect'}
             </span>
           )}
           {device.connected && on && (
-            <span style={{ fontFamily:mono, fontSize:10, color:'var(--muted)' }}>
+            <span style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)' }}>
               writing now — the file appears here when you stop
               {data?.session ? ` · ${data.session} already saved this session` : ''}
             </span>
           )}
         </div>
         {error && (
-          <div style={{ fontFamily:mono, fontSize:10, color:'var(--error)', marginTop:10 }}>{error}</div>
+          <div style={{ fontFamily:MONO, fontSize:10, color:'var(--error)', marginTop:10 }}>{error}</div>
         )}
       </Panel>
 
@@ -1908,7 +2085,7 @@ function AmbientPanel({ device, isAdmin }) {
           )}
           {isAdmin && confirmWipe && (
             <>
-              <span style={{ fontFamily:mono, fontSize:9, color:'var(--error)' }}>Delete {files.length} recording(s)?</span>
+              <span style={{ fontFamily:MONO, fontSize:9, color:'var(--error)' }}>Delete {files.length} recording(s)?</span>
               <Pill small danger onClick={doWipe}>Confirm</Pill>
               <Pill small onClick={() => setConfirmWipe(false)}>Cancel</Pill>
             </>
@@ -1916,7 +2093,7 @@ function AmbientPanel({ device, isAdmin }) {
         </div>
 
         {!files.length && (
-          <div style={{ fontFamily:mono, fontSize:10, color:'var(--muted)' }}>
+          <div style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)' }}>
             {on ? 'Recording — stop to save the file.' : 'Nothing recorded yet.'}
           </div>
         )}
@@ -1927,26 +2104,19 @@ function AmbientPanel({ device, isAdmin }) {
               display:'flex', alignItems:'center', gap:10, padding:'6px 0',
               borderTop:'1px solid var(--hairline)',
             }}>
-              <span style={{ fontFamily:mono, fontSize:10, color:'var(--text2)', minWidth:150 }}>
+              <span style={{ fontFamily:MONO, fontSize:10, color:'var(--text2)', minWidth:150 }}>
                 {new Date(f.ts * 1000).toLocaleString()}
               </span>
-              <span style={{ fontFamily:mono, fontSize:10, color:'var(--muted)', minWidth:60 }}>
+              <span style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)', minWidth:60 }}>
                 {clock(f.ms)}
               </span>
-              <span style={{ fontFamily:mono, fontSize:10, color:'var(--muted)', minWidth:70 }}>
+              <span style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)', minWidth:70 }}>
                 {(f.bytes / 1048576).toFixed(1)} MB
               </span>
               <span style={{ flex:1 }}/>
-              <Pill small onClick={() => toggleAudio(f.name)}>{playing === f.name ? '■ Stop' : '▶ Play'}</Pill>
+              <Pill small onClick={() => player.toggle(f.name, filePath(f.name))}>{playing === f.name ? '■ Stop' : '▶ Play'}</Pill>
               <Pill small onClick={async () => {
-                try {
-                  const url = await fileUrl(f.name);
-                  const a = document.createElement('a');
-                  a.href = url; a.download = `${slug}-ambient-${f.name}`; a.click();
-                  // Revoked on a timer, not immediately: the click starts the
-                  // save, and a revoked URL cancels a download in progress.
-                  setTimeout(() => URL.revokeObjectURL(url), 60000);
-                } catch {}
+                try { downloadBlob(await API.blob(filePath(f.name)), `${slug}-ambient-${f.name}`); } catch {}
               }}>Download</Pill>
               {isAdmin && <Pill small danger onClick={() => doDelete(f.name)}>Delete</Pill>}
             </div>
@@ -1961,9 +2131,8 @@ function AmbientPanel({ device, isAdmin }) {
 // measurement stays unavailable rather than looking like a healthy zero.
 function WakeHealth({ device, registry, expected }) {
   const w = device.wake_stats;
-  const gap = capabilityGap(liveCapabilities(device), 'device_wake_v1');
+  const gap = capabilityGap(liveCapabilities(device), CAPABILITY.DEVICE_WAKE);
   const unavailable = gap || w?.wake_unavailable;
-  const mono = "'DM Mono',monospace";
   const reason = gap || (w?.wake_unavailable
     ? `${w.wake_unavailable.replace(/_/g, ' ')}${w.detail ? ` — ${w.detail}` : ''}`
     : w ? 'ready' : 'waiting for the first wake report');
@@ -1974,18 +2143,18 @@ function WakeHealth({ device, registry, expected }) {
       <div className="em-grid2" style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:'0 24px' }}>
         <div>
           <div style={{ display:'flex', justifyContent:'space-between', padding:'8px 0', borderBottom:'1px solid var(--hairline)' }}>
-            <span style={{ fontFamily:mono, fontSize:11, color:'var(--muted)' }}>Availability</span>
-            <span style={{ fontFamily:mono, fontSize:11, color:unavailable ? 'var(--warn)' : 'var(--ok)' }}>{reason}</span>
+            <span style={{ fontFamily:MONO, fontSize:11, color:'var(--muted)' }}>Availability</span>
+            <span style={{ fontFamily:MONO, fontSize:11, color:unavailable ? 'var(--warn)' : 'var(--ok)' }}>{reason}</span>
           </div>
           <div style={{ display:'flex', justifyContent:'space-between', padding:'8px 0', borderBottom:'1px solid var(--hairline)' }}>
-            <span style={{ fontFamily:mono, fontSize:11, color:'var(--muted)' }}>Installed graph</span>
-            <span style={{ fontFamily:mono, fontSize:11, color:w?.graph_sha256 && expected && w.graph_sha256 !== expected ? 'var(--warn)' : 'var(--text2)' }}>
+            <span style={{ fontFamily:MONO, fontSize:11, color:'var(--muted)' }}>Installed graph</span>
+            <span style={{ fontFamily:MONO, fontSize:11, color:w?.graph_sha256 && expected && w.graph_sha256 !== expected ? 'var(--warn)' : 'var(--text2)' }}>
               {shortSha(w?.graph_sha256)}
             </span>
           </div>
           <div style={{ display:'flex', justifyContent:'space-between', padding:'8px 0' }}>
-            <span style={{ fontFamily:mono, fontSize:11, color:'var(--muted)' }}>Last report</span>
-            <span style={{ fontFamily:mono, fontSize:11, color:'var(--text2)' }}>
+            <span style={{ fontFamily:MONO, fontSize:11, color:'var(--muted)' }}>Last report</span>
+            <span style={{ fontFamily:MONO, fontSize:11, color:'var(--text2)' }}>
               {w?.received_ms ? relTime(w.received_ms / 1000) : '—'}
             </span>
           </div>
@@ -2023,7 +2192,6 @@ function AlertPanel({ device, isAdmin }) {
   const [days, setDays] = useState([]);
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState(null);
-  const mono = "'DM Mono',monospace";
 
   const load = useCallback(async () => {
     try {
@@ -2044,22 +2212,22 @@ function AlertPanel({ device, isAdmin }) {
   useEffect(() => {
     load();
     return subscribeEvents(msg => {
-      if (msg.type === 'alerts' && msg.device_id === device.device_id) {
-        if (msg.kind === 'timers' && Array.isArray(msg.data?.timers)) {
+      if (msg.type === EVENT_TYPE.ALERTS && msg.device_id === device.device_id) {
+        if (msg.kind === ALERT_NOTICE.TIMERS && Array.isArray(msg.data?.timers)) {
           setPayload(p => p?.status ? { ...p, status:{ ...p.status, timers:msg.data.timers } } : p);
         } else {
           load();
         }
       }
-      if (msg.type === 'ha_status') setPayload(p => p ? { ...p, ha:msg.features } : p);
+      if (msg.type === EVENT_TYPE.HA_STATUS) setPayload(p => p ? { ...p, ha:msg.features } : p);
     });
   }, [load, device.device_id]);
 
   const status = payload?.status;
   const timers = status?.timers || [];
   const occurrences = status?.occurrences || [];
-  const pending = (status?.operations || []).filter(x => x.state === 'pending');
-  const recent = (status?.operations || []).filter(x => x.state !== 'pending').slice(0, 8);
+  const pending = (status?.operations || []).filter(x => x.state === ALERT_OP_STATE.PENDING);
+  const recent = (status?.operations || []).filter(x => x.state !== ALERT_OP_STATE.PENDING).slice(0, 8);
   const alertState = status?.alert_state;
   const active = alertState?.active;
   const features = payload?.ha || {};
@@ -2104,24 +2272,24 @@ function AlertPanel({ device, isAdmin }) {
         <Panel label="Now">
           {active ? (
             <div>
-              <div style={{ fontFamily:mono, fontSize:13, color:'var(--warn)', marginBottom:6 }}>
-                {active.kind === 'timer' ? 'Timer' : 'Alarm'} ringing · {active.name || active.id}
+              <div style={{ fontFamily:MONO, fontSize:13, color:'var(--warn)', marginBottom:6 }}>
+                {active.kind === RING_KIND.TIMER ? 'Timer' : 'Alarm'} ringing · {active.name || active.id}
               </div>
-              <div style={{ fontFamily:mono, fontSize:10, color:'var(--muted)' }}>
+              <div style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)' }}>
                 {active.foreground ? 'foreground' : 'background while a turn is open'}
               </div>
             </div>
-          ) : <div style={{ fontFamily:mono, fontSize:11, color:'var(--muted)' }}>Nothing is ringing.</div>}
+          ) : <div style={{ fontFamily:MONO, fontSize:11, color:'var(--muted)' }}>Nothing is ringing.</div>}
           <div style={{ marginTop:14 }}>
             {timers.length === 0 ? (
-              <div style={{ fontFamily:mono, fontSize:10, color:'var(--muted)' }}>
+              <div style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)' }}>
                 No active Home Assistant timers in this controller&apos;s display copy.
               </div>
             ) : timers.map(t => {
               const left = Math.max(0, t.remaining_seconds || 0);
               return <div key={t.id} style={{ display:'flex', justifyContent:'space-between', padding:'7px 0', borderTop:'1px solid var(--hairline)' }}>
-                <span style={{ fontFamily:mono, fontSize:11, color:'var(--text2)' }}>{t.name || 'Timer'}</span>
-                <span style={{ fontFamily:mono, fontSize:11, color:'var(--lcd-green)' }}>
+                <span style={{ fontFamily:MONO, fontSize:11, color:'var(--text2)' }}>{t.name || 'Timer'}</span>
+                <span style={{ fontFamily:MONO, fontSize:11, color:'var(--lcd-green)' }}>
                   {Math.floor(left/60)}:{String(left%60).padStart(2,'0')}{t.active ? '' : ' · paused'}
                 </span>
               </div>;
@@ -2129,33 +2297,33 @@ function AlertPanel({ device, isAdmin }) {
           </div>
         </Panel>
         <Panel label="Delivery health">
-          <div style={{ fontFamily:mono, fontSize:10, lineHeight:1.8, color:'var(--text2)' }}>
+          <div style={{ fontFamily:MONO, fontSize:10, lineHeight:1.8, color:'var(--text2)' }}>
             <div>Calendar subscription {status ? <span style={{ color:status.calendar_live ? 'var(--ok)' : 'var(--warn)' }}>{status.calendar_live ? 'live' : 'unavailable'}</span> : '—'}</div>
             <div>Endpoint {status ? <span style={{ color:status.online ? 'var(--ok)' : 'var(--warn)' }}>{status.online ? 'online' : 'offline'}</span> : '—'}</div>
             <div>Delivery sequence {status ? `${status.acked_sequence} / ${status.sequence}` : '—'}</div>
             <div>Clock <span style={{ color:alertState?.clock_trusted ? 'var(--ok)' : 'var(--warn)' }}>{alertState ? (alertState.clock_trusted ? 'trusted' : 'untrusted') : '—'}</span></div>
-            <div>Wakelock <span style={{ color:alertState?.wakelock === 'held' || alertState?.wakelock === 'released' ? 'var(--ok)' : 'var(--warn)' }}>{alertState?.wakelock || '—'}</span></div>
-            <div>Alert store <span style={{ color:alertState?.store === 'ok' ? 'var(--ok)' : 'var(--warn)' }}>{alertState?.store || '—'}</span></div>
+            <div>Wakelock <span style={{ color:alertState?.wakelock === WAKELOCK.HELD || alertState?.wakelock === WAKELOCK.RELEASED ? 'var(--ok)' : 'var(--warn)' }}>{alertState?.wakelock || '—'}</span></div>
+            <div>Alert store <span style={{ color:alertState?.store === ALERT_STORE.OK ? 'var(--ok)' : 'var(--warn)' }}>{alertState?.store || '—'}</span></div>
           </div>
           {(status?.flags || []).map(flag => (
-            <div key={flag} style={{ marginTop:6, fontFamily:mono, fontSize:9, color:'var(--warn)' }}>{flag.replace(/_/g,' ')}</div>
+            <div key={flag} style={{ marginTop:6, fontFamily:MONO, fontSize:9, color:'var(--warn)' }}>{flag.replace(/_/g,' ')}</div>
           ))}
         </Panel>
       </div>
 
       <Panel label="Alarm schedules and occurrences">
-        {loading ? <div style={{ fontFamily:mono, fontSize:11, color:'var(--muted)' }}>Loading…</div>
-        : !status ? <div style={{ fontFamily:mono, fontSize:11, color:'var(--warn)' }}>This endpoint&apos;s alarm calendar is unavailable.</div>
-        : occurrences.length === 0 ? <div style={{ fontFamily:mono, fontSize:11, color:'var(--muted)' }}>No upcoming alarms.</div>
+        {loading ? <div style={{ fontFamily:MONO, fontSize:11, color:'var(--muted)' }}>Loading…</div>
+        : !status ? <div style={{ fontFamily:MONO, fontSize:11, color:'var(--warn)' }}>This endpoint&apos;s alarm calendar is unavailable.</div>
+        : occurrences.length === 0 ? <div style={{ fontFamily:MONO, fontSize:11, color:'var(--muted)' }}>No upcoming alarms.</div>
         : occurrences.map(o => (
           <div key={o.occurrence_id} style={{ display:'flex', alignItems:'center', gap:12, padding:'9px 0', borderBottom:'1px solid var(--hairline)' }}>
             <div style={{ flex:1, minWidth:0 }}>
-              <div style={{ fontFamily:"'DM Sans',sans-serif", fontSize:12, fontWeight:600, color:'var(--text2)' }}>{o.label}</div>
-              <div style={{ fontFamily:mono, fontSize:9, color:'var(--muted)', marginTop:2 }}>
+              <div style={{ fontFamily:SANS, fontSize:12, fontWeight:600, color:'var(--text2)' }}>{o.label}</div>
+              <div style={{ fontFamily:MONO, fontSize:9, color:'var(--muted)', marginTop:2 }}>
                 {formatAlertTime(o.due_local)} · schedule {shortSha(o.schedule_id)}
               </div>
             </div>
-            <span style={{ fontFamily:mono, fontSize:9, color:o.armed_on_endpoint ? 'var(--ok)' : 'var(--warn)' }}>
+            <span style={{ fontFamily:MONO, fontSize:9, color:o.armed_on_endpoint ? 'var(--ok)' : 'var(--warn)' }}>
               {o.armed_on_endpoint ? 'armed on endpoint' : o.delivery_pending ? 'delivery pending' : o.stored_in_ha ? 'stored in HA' : 'unconfirmed'}
             </span>
             {isAdmin && <Pill small danger disabled={busy} onClick={() => cancelAlarm(o)}>Cancel</Pill>}
@@ -2164,57 +2332,58 @@ function AlertPanel({ device, isAdmin }) {
         {isAdmin && (
           <div style={{ marginTop:18, paddingTop:14, borderTop:'1px solid var(--hairline)' }}>
             <div className="em-grid2" style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:12 }}>
-              <label style={{ fontFamily:mono, fontSize:10, color:'var(--text2)' }}>Time
+              <label style={{ fontFamily:MONO, fontSize:10, color:'var(--text2)' }}>Time
                 <input type="time" value={time} onChange={e => setTime(e.target.value)} style={{ display:'block', width:'100%', marginTop:5, boxSizing:'border-box' }}/>
               </label>
-              <label style={{ fontFamily:mono, fontSize:10, color:'var(--text2)' }}>Name
+              <label style={{ fontFamily:MONO, fontSize:10, color:'var(--text2)' }}>Name
                 <input type="text" value={name} maxLength={120} placeholder="Alarm" onChange={e => setName(e.target.value)} style={{ display:'block', width:'100%', marginTop:5, boxSizing:'border-box' }}/>
               </label>
             </div>
             <div style={{ display:'flex', alignItems:'center', gap:8, flexWrap:'wrap', marginTop:12 }}>
-              {['mon','tue','wed','thu','fri','sat','sun'].map(d => (
-                <button key={d} className={'em-pill em-pill--small' + (days.includes(d) ? ' em-pill--accent' : '')}
+              {Object.values(WEEKDAY).map(d => (
+                <button type="button" key={d} className={'em-pill em-pill--small' + (days.includes(d) ? ' em-pill--accent' : '')}
+                  aria-pressed={days.includes(d)}
                   onClick={() => { setDate(''); setDays(xs => xs.includes(d) ? xs.filter(x => x !== d) : [...xs,d]); }}>
                   {d}
                 </button>
               ))}
-              <label style={{ marginLeft:'auto', fontFamily:mono, fontSize:9, color:'var(--muted)' }}>
+              <label style={{ marginLeft:'auto', fontFamily:MONO, fontSize:9, color:'var(--muted)' }}>
                 one date <input type="date" value={date} disabled={days.length > 0} onChange={e => { setDays([]); setDate(e.target.value); }} style={{ marginLeft:6 }}/>
               </label>
             </div>
             <div style={{ display:'flex', alignItems:'center', gap:10, marginTop:14 }}>
               <Pill accent disabled={busy || !time} onClick={createAlarm}>{busy ? 'Working…' : 'Create alarm'}</Pill>
-              <span style={{ fontFamily:mono, fontSize:9, color:'var(--muted)' }}>
+              <span style={{ fontFamily:MONO, fontSize:9, color:'var(--muted)' }}>
                 {days.length ? `Repeats ${days.join(', ')}` : date ? `One time on ${date}` : 'One time at the next occurrence'}
               </span>
             </div>
           </div>
         )}
-        {result && <div style={{ marginTop:12, fontFamily:mono, fontSize:10, color:result.ok ? 'var(--ok)' : 'var(--error)' }}>{result.text}</div>}
+        {result && <div style={{ marginTop:12, fontFamily:MONO, fontSize:10, color:result.ok ? 'var(--ok)' : 'var(--error)' }}>{result.text}</div>}
       </Panel>
 
       <div className="em-grid2" style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:16 }}>
         <Panel label="Home Assistant provisioning">
-          {featureEntries.length === 0 ? <div style={{ fontFamily:mono, fontSize:10, color:'var(--muted)' }}>No provisioning report.</div>
+          {featureEntries.length === 0 ? <div style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)' }}>No provisioning report.</div>
           : featureEntries.map(([key, value]) => (
             <div key={key} style={{ display:'flex', justifyContent:'space-between', gap:12, padding:'6px 0', borderBottom:'1px solid var(--hairline)' }}>
-              <span style={{ fontFamily:mono, fontSize:10, color:'var(--text2)' }}>{key.replace(/_/g,' ')}</span>
-              <span style={{ fontFamily:mono, fontSize:9, color:value?.ok ? 'var(--ok)' : 'var(--warn)', textAlign:'right' }}>
+              <span style={{ fontFamily:MONO, fontSize:10, color:'var(--text2)' }}>{key.replace(/_/g,' ')}</span>
+              <span style={{ fontFamily:MONO, fontSize:9, color:value?.ok ? 'var(--ok)' : 'var(--warn)', textAlign:'right' }}>
                 {value?.ok ? 'ready' : value?.detail || 'unavailable'}
               </span>
             </div>
           ))}
-          {calendarUrl && <a href={calendarUrl} target="_blank" rel="noreferrer" style={{ display:'inline-block', marginTop:12, fontFamily:mono, fontSize:10, color:'var(--accent)' }}>Open Home Assistant calendar editor →</a>}
+          {calendarUrl && <a href={calendarUrl} target="_blank" rel="noreferrer" style={{ display:'inline-block', marginTop:12, fontFamily:MONO, fontSize:10, color:'var(--accent)' }}>Open Home Assistant calendar editor →</a>}
         </Panel>
         <Panel label={`Journal operations · ${pending.length} pending`}>
-          {[...pending, ...recent].length === 0 ? <div style={{ fontFamily:mono, fontSize:10, color:'var(--muted)' }}>No operations in the last 24 hours.</div>
+          {[...pending, ...recent].length === 0 ? <div style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)' }}>No operations in the last 24 hours.</div>
           : [...pending, ...recent].map(op => (
             <div key={op.op_id} style={{ padding:'6px 0', borderBottom:'1px solid var(--hairline)' }}>
               <div style={{ display:'flex', justifyContent:'space-between', gap:10 }}>
-                <span style={{ fontFamily:mono, fontSize:10, color:'var(--text2)' }}>{op.action.replace(/_/g,' ')}</span>
-                <span style={{ fontFamily:mono, fontSize:9, color:op.state === 'pending' ? 'var(--warn)' : op.state === 'applied' ? 'var(--ok)' : 'var(--error)' }}>{op.state} · step {op.step}</span>
+                <span style={{ fontFamily:MONO, fontSize:10, color:'var(--text2)' }}>{op.action.replace(/_/g,' ')}</span>
+                <span style={{ fontFamily:MONO, fontSize:9, color:op.state === ALERT_OP_STATE.PENDING ? 'var(--warn)' : op.state === ALERT_OP_STATE.APPLIED ? 'var(--ok)' : 'var(--error)' }}>{op.state} · step {op.step}</span>
               </div>
-              <div style={{ fontFamily:mono, fontSize:8, color:'var(--muted)', marginTop:2 }}>{shortSha(op.op_id)} · {op.source} · {new Date(op.created_ms).toLocaleTimeString()}</div>
+              <div style={{ fontFamily:MONO, fontSize:8, color:'var(--muted)', marginTop:2 }}>{shortSha(op.op_id)} · {op.source} · {new Date(op.created_ms).toLocaleTimeString()}</div>
             </div>
           ))}
         </Panel>
@@ -2227,8 +2396,14 @@ function AlertPanel({ device, isAdmin }) {
 
 // ─── Device detail modal ──────────────────────────────────────────────────────
 
+// The device modal's tabs; each value is also its (upper-cased) label.
+const DETAIL_TAB = Object.freeze({
+  APPROVE: 'approve', STATUS: 'status', ACTIVITY: 'activity', ALERTS: 'alerts',
+  SAMPLES: 'samples', CONFIG: 'config', CONSOLE: 'console', UPDATES: 'updates', LOGS: 'logs',
+});
+
 function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDeviceConfigChange }) {
-  const [tab, setTab] = useState('status');
+  const [tabChoice, setTab] = useState(DETAIL_TAB.STATUS);
   // Seed from the EFFECTIVE config, not the raw stored one — see
   // effectiveConfig(). A migrated row's stored dict is not the truth.
   const [config, setConfig] = useState(() => effectiveConfig(globalConfig, device));
@@ -2270,20 +2445,27 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
   // read-only viewer should be able to do to everyone else in the house.
   // A device awaiting its protocol-v1 firmware has nothing to configure or
   // observe yet: it gets status, the update, its console and logs.
-  const TABS = !device.approved ? ['approve']
+  const T = DETAIL_TAB;
+  const TABS = !device.approved ? [T.APPROVE]
     : device.upgrade_required
-      ? (isAdmin ? ['status', 'updates', 'console', 'logs'] : ['status', 'logs'])
-      : (isAdmin ? ['status', 'activity', 'alerts', 'samples', 'config', 'console', 'updates', 'logs']
-                 : ['status', 'activity', 'alerts', 'config', 'logs']);
+      ? (isAdmin ? [T.STATUS, T.UPDATES, T.CONSOLE, T.LOGS] : [T.STATUS, T.LOGS])
+      : (isAdmin ? [T.STATUS, T.ACTIVITY, T.ALERTS, T.SAMPLES, T.CONFIG, T.CONSOLE, T.UPDATES, T.LOGS]
+                 : [T.STATUS, T.ACTIVITY, T.ALERTS, T.CONFIG, T.LOGS]);
+  // The tab on screen is always one the bar offers. The chosen one can fall
+  // out of the set underneath the modal — a device opened while still pending
+  // (whose only tab is Approve), or one that drops to the upgrade-only
+  // handler while its Config tab is open — and rendering it anyway showed a
+  // panel with no tab selected above it.
+  const tab = TABS.includes(tabChoice) ? tabChoice : TABS[0];
 
   useEffect(() => {
-    if (tab === 'logs') {
+    if (tab === DETAIL_TAB.LOGS) {
       setLogsLoading(true);
       API.get(`/api/devices/${device.device_id}/logs?limit=50`)
         .then(setLogs).catch(console.error)
         .finally(() => setLogsLoading(false));
     }
-    if (tab === 'updates') {
+    if (tab === DETAIL_TAB.UPDATES) {
       API.get('/api/releases/latest').then(setRelease).catch(() => {});
     }
   }, [tab, device.device_id]);
@@ -2297,7 +2479,7 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
   // releases are hours apart, and the server side now returns fresh data
   // rather than a stale cache, so each poll is worth something.
   useEffect(() => {
-    if (tab !== 'updates') return;
+    if (tab !== DETAIL_TAB.UPDATES) return;
     let live = true;
     const iv = setInterval(() => {
       API.get('/api/releases/latest')
@@ -2310,7 +2492,7 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
   // Turn observability — fetch on Activity tab entry, refresh every 10s while
   // the tab is open (turn history is in-memory on the controller).
   useEffect(() => {
-    if (tab !== 'activity') return;
+    if (tab !== DETAIL_TAB.ACTIVITY) return;
     let live = true;
     const load = () => API.get(`/api/devices/${device.device_id}/turns`)
       .then(t => { if (live) setTurns(Array.isArray(t) ? t : []); })
@@ -2417,10 +2599,16 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
     }
   }
 
+  // One reconnect poll at a time, and none outliving the modal: closing it
+  // mid-update used to leave the poll running for its full two minutes.
+  const reconnectPoll = useRef(null);
+  useEffect(() => () => clearInterval(reconnectPoll.current), []);
+
   function _pollReconnect(targetVersion) {
     let attempts = 0;
     let wasDisconnected = false;
-    const poll = setInterval(async () => {
+    clearInterval(reconnectPoll.current);
+    const poll = reconnectPoll.current = setInterval(async () => {
       attempts++;
       try {
         const devices = await API.get('/api/devices');
@@ -2507,18 +2695,13 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
 
   const row = (k, v, c) => (
     <div style={{ display: 'flex', justifyContent: 'space-between', padding: '8px 0', borderBottom: '1px solid var(--hairline)' }}>
-      <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 12, color: 'var(--muted)' }}>{k}</span>
-      <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 12, color: c || 'var(--text)', fontWeight: 600 }}>{v}</span>
+      <span style={{ fontFamily: MONO, fontSize: 12, color: 'var(--muted)' }}>{k}</span>
+      <span style={{ fontFamily: MONO, fontSize: 12, color: c || 'var(--text)', fontWeight: 600 }}>{v}</span>
     </div>
   );
 
   return (
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(180,176,168,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100, backdropFilter: 'blur(8px)' }}
-      onClick={e => e.target === e.currentTarget && onClose()}>
-      {/* Fixed height (not maxHeight): every tab renders in an identical
-          frame — content scrolls inside, the window never resizes as you
-          move between tabs. */}
-      <div className="em-modal" style={{ width: 'min(900px,95vw)', height: 'min(700px,90vh)', background: 'linear-gradient(170deg,var(--raised),var(--surface))', border: '1px solid var(--border)', borderRadius: 16, boxShadow: '0 24px 80px rgba(0,0,0,0.3),0 2px 0 var(--sheen) inset', display: 'flex', flexDirection: 'column', overflow: 'hidden', animation: 'fadeIn 0.15s ease' }}>
+    <ModalFrame onClose={onClose} zIndex={100} label={device.label || device.device_id}>
         {/* Header */}
         <div className="em-modal-head" style={{ background: 'linear-gradient(180deg,var(--card),var(--bg))', borderBottom: '1px solid var(--border-hard)', padding: '20px 24px 0', boxShadow: '0 1px 0 var(--sheen) inset' }}>
           <div className="em-modal-headrow" style={{ display: 'flex', alignItems: 'center', gap: 20, marginBottom: 16 }}>
@@ -2527,41 +2710,37 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
               {renaming ? (
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                   <input
-                    type="text" value={renameValue} autoFocus
+                    type="text" value={renameValue} autoFocus aria-label="Device label"
                     onChange={e => setRenameValue(e.target.value)}
                     onKeyDown={e => {
                       if (e.key === 'Enter') doRename();
                       if (e.key === 'Escape') { setRenaming(false); setRenameValue(device.label || ''); }
                     }}
-                    style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 20, fontWeight: 600, padding: '4px 8px', maxWidth: 280 }}
+                    style={{ fontFamily: SANS, fontSize: 20, fontWeight: 600, padding: '4px 8px', maxWidth: 280 }}
                   />
                   <Pill small onClick={doRename} disabled={renameSaving}>{renameSaving ? 'Saving…' : 'Save'}</Pill>
                   <Pill small onClick={() => { setRenaming(false); setRenameValue(device.label || ''); }}>Cancel</Pill>
                 </div>
               ) : (
                 <div
-                  onClick={() => isAdmin && setRenaming(true)}
+                  {...(isAdmin ? pressable(() => setRenaming(true)) : {})}
                   title={isAdmin ? 'Click to rename' : undefined}
                   style={{
-                    fontFamily: "'DM Sans',sans-serif", fontSize: 26, color: 'var(--text)', fontWeight: 600,
+                    fontFamily: SANS, fontSize: 26, color: 'var(--text)', fontWeight: 600,
                     letterSpacing: '-0.02em', lineHeight: 1, cursor: isAdmin ? 'pointer' : 'default',
                     display: 'inline-block',
                   }}>
                   {device.label || <span style={{ color: 'var(--muted)', fontSize: 20 }}>{device.device_id.slice(0,8)}…</span>}
                 </div>
               )}
-              <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: 'var(--muted)', marginTop: 4, letterSpacing: '0.05em' }}>
-                {(() => {
-                  const ip = device.ip && device.ip !== '127.0.0.1' ? device.ip : null;
-                  const ipStr = device.connected ? (ip || '—') : (ip ? `${ip} (last seen)` : '—');
-                  return <>{ipStr} · {device.device_id} · {device.firmware_ver || 'unknown'}</>;
-                })()}
+              <div style={{ fontFamily: MONO, fontSize: 10, color: 'var(--muted)', marginTop: 4, letterSpacing: '0.05em' }}>
+                {deviceIpText(device, ' (last seen)')} · {device.device_id} · {device.firmware_ver || 'unknown'}
                 {needsUpdate && <span style={{ color: 'var(--warn)', marginLeft: 10 }}>{device.upgrade_required ? 'Upgrade required' : 'Update available'}</span>}
               </div>
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
               <div style={{ background: 'linear-gradient(160deg,var(--lcd-face),var(--lcd-deep))', border: '1px solid var(--lcd-line)', borderRadius: 6, padding: '5px 12px', boxShadow: 'inset 0 1px 3px rgba(0,0,0,0.5)' }}>
-                <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, color: state.dot, textShadow: `0 0 8px ${state.dot}88`, letterSpacing: '0.05em' }}>{state.label.toUpperCase()}</span>
+                <span style={{ fontFamily: MONO, fontSize: 11, color: state.dot, textShadow: `0 0 8px ${state.dot}88`, letterSpacing: '0.05em' }}>{state.label.toUpperCase()}</span>
               </div>
               {/* A collecting device is silent by design, which from every
                   other panel is indistinguishable from a broken one. Say so
@@ -2570,7 +2749,7 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                 <span className="em-pill em-pill--small em-pill--accent"
                       title="Collecting wake-word samples — voice turns suspended"
                       style={{ display: 'inline-block', pointerEvents: 'none',
-                               fontFamily: "'DM Mono',monospace", letterSpacing: '0.05em' }}>
+                               fontFamily: MONO, letterSpacing: '0.05em' }}>
                   COLLECTING
                 </span>
               )}
@@ -2582,7 +2761,7 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                 <span className="em-pill em-pill--small em-pill--accent"
                       title="Recording ambient audio — voice turns suspended"
                       style={{ display: 'inline-block', pointerEvents: 'none',
-                               fontFamily: "'DM Mono',monospace", letterSpacing: '0.05em' }}>
+                               fontFamily: MONO, letterSpacing: '0.05em' }}>
                   RECORDING
                 </span>
               )}
@@ -2595,7 +2774,7 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                 <span className="em-pill em-pill--small em-pill--accent"
                       title="Capturing to a webhook — voice turns suspended"
                       style={{ display: 'inline-block', pointerEvents: 'none',
-                               fontFamily: "'DM Mono',monospace", letterSpacing: '0.05em' }}>
+                               fontFamily: MONO, letterSpacing: '0.05em' }}>
                   CAPTURING
                 </span>
               )}
@@ -2606,7 +2785,7 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                 <span className="em-pill em-pill--small em-pill--danger"
                       title="A diagnostic lease is streaming live microphone audio; wakes are refused"
                       style={{ display: 'inline-block', pointerEvents: 'none',
-                               fontFamily: "'DM Mono',monospace", letterSpacing: '0.05em' }}>
+                               fontFamily: MONO, letterSpacing: '0.05em' }}>
                   MIC LIVE
                 </span>
               )}
@@ -2615,7 +2794,7 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
               )}
               {isAdmin && confirmDelete && (
                 <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: 'var(--error)' }}>Delete?</span>
+                  <span style={{ fontFamily: MONO, fontSize: 9, color: 'var(--error)' }}>Delete?</span>
                   <Pill small danger disabled={deleting} onClick={doDelete}>{deleting ? '…' : 'Confirm'}</Pill>
                   <Pill small onClick={() => setConfirmDelete(false)} disabled={deleting}>Cancel</Pill>
                 </div>
@@ -2623,27 +2802,23 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
               <CircleButton onClick={onClose} title="Close">×</CircleButton>
             </div>
           </div>
-          <div className="em-tabs" style={{ display: 'flex', gap: 2 }}>
-            {TABS.map(t => (
-              <button key={t} onClick={() => setTab(t)} style={{ background: tab === t ? 'linear-gradient(180deg,var(--raised),var(--surface))' : 'transparent', border: tab === t ? '1px solid var(--border-hard)' : '1px solid transparent', borderBottom: tab === t ? '1px solid var(--surface)' : '1px solid transparent', borderRadius: '6px 6px 0 0', fontFamily: "'DM Mono',monospace", fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.1em', padding: '7px 14px', cursor: 'pointer', color: tab === t ? 'var(--text)' : 'var(--muted)', marginBottom: -1, transition: 'color 0.15s' }}>{t}</button>
-            ))}
-          </div>
+          <TabBar tabs={TABS} active={tab} onSelect={setTab}/>
         </div>
 
         {/* Body */}
         <div className="em-modal-body" style={{ flex: 1, overflowY: 'auto', padding: 24 }}>
 
           {/* APPROVE */}
-          {tab === 'approve' && (
+          {tab === DETAIL_TAB.APPROVE && (
             <div style={{ maxWidth: 400 }}>
-              <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.15em', marginBottom: 16 }}>New Device — Pending Approval</div>
+              <div style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.15em', marginBottom: 16 }}>New Device — Pending Approval</div>
               {row('Serial', device.device_id)}
-              {row('IP', device.ip && device.ip !== '127.0.0.1' ? device.ip : '—')}
+              {row('IP', deviceIp(device) || '—')}
               {row('First seen', relTime(device.first_seen))}
               <div style={{ marginTop: 24, marginBottom: 8 }}>
-                <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, color: 'var(--text2)', marginBottom: 8 }}>Label</div>
-                <input type="text" value={approveLabel} onChange={e => setApproveLabel(e.target.value)} placeholder="e.g. Kitchen" onKeyDown={e => e.key === 'Enter' && doApprove()}/>
-                <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 11, color: 'var(--muted)', marginTop: 6 }}>
+                <div style={{ fontFamily: MONO, fontSize: 11, color: 'var(--text2)', marginBottom: 8 }}>Label</div>
+                <input type="text" value={approveLabel} onChange={e => setApproveLabel(e.target.value)} placeholder="e.g. Kitchen" aria-label="Label" onKeyDown={e => e.key === 'Enter' && doApprove()}/>
+                <div style={{ fontFamily: SANS, fontSize: 11, color: 'var(--muted)', marginTop: 6 }}>
                   Names the device everywhere — the dashboard, and “{approveLabel.trim() || '…'} Voice Assistant” in Home Assistant.
                 </div>
               </div>
@@ -2654,7 +2829,7 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                   Device", which read as an acknowledgement rather than a
                   decision — say what it does, then size it like it matters. */}
               <div style={{ marginTop: 24, background: 'linear-gradient(160deg,var(--text),var(--bg))', border: '1px solid var(--border)', borderRadius: 8, padding: '14px 16px' }}>
-                <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 12, color: 'var(--text2)', lineHeight: 1.5, marginBottom: 14 }}>
+                <div style={{ fontFamily: SANS, fontSize: 12, color: 'var(--text2)', lineHeight: 1.5, marginBottom: 14 }}>
                   Approving adds this device to your fleet: it receives the fleet
                   configuration, gets a voice satellite Home Assistant can drive,
                   and its microphone starts streaming to the controller when woken.
@@ -2663,7 +2838,7 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                   {approving ? 'Approving…' : 'Approve & Add to Fleet'}
                 </Pill>
                 {!approveLabel.trim() && (
-                  <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 11, color: 'var(--muted)', marginTop: 10 }}>
+                  <div style={{ fontFamily: SANS, fontSize: 11, color: 'var(--muted)', marginTop: 10 }}>
                     Enter a label above to continue.
                   </div>
                 )}
@@ -2672,7 +2847,7 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
           )}
 
           {/* STATUS */}
-          {tab === 'status' && (() => {
+          {tab === DETAIL_TAB.STATUS && (() => {
             const s = device.stats || null;
             // cpuPct comes from the aggregate /proc/stat line, so it is a
             // share of ONLINE capacity — and MTK parks 3 of this SoC's 4 cores
@@ -2702,13 +2877,13 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
               <div style={{ minHeight:'100%', display:'flex', flexDirection:'column', gap:16 }}>
                 {device.upgrade_required && (
                   <Panel label="Upgrade required">
-                    <div style={{ fontFamily:"'DM Mono',monospace", fontSize:11, color:'var(--text2)', lineHeight:1.6, marginBottom: isAdmin ? 12 : 0 }}>
+                    <div style={{ fontFamily:MONO, fontSize:11, color:'var(--text2)', lineHeight:1.6, marginBottom: isAdmin ? 12 : 0 }}>
                       This Echo runs firmware from before protocol v1. Until it is
                       updated it takes no voice turns, rings no timers or alarms and
                       plays nothing — the controller only offers it the update.
                     </div>
                     {isAdmin && (
-                      <Pill accent disabled={pushing} onClick={() => { setTab('updates'); doUpdate(); }}>
+                      <Pill accent disabled={pushing} onClick={() => { setTab(DETAIL_TAB.UPDATES); doUpdate(); }}>
                         {pushing ? 'Updating…' : 'Update firmware'}
                       </Pill>
                     )}
@@ -2716,10 +2891,7 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                 )}
                 <div className="em-grid2" style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:16 }}>
                   <Panel label="Device">
-                    {row('IP', (() => {
-                      const ip = device.ip && device.ip !== '127.0.0.1' ? device.ip : null;
-                      return device.connected ? (ip || '—') : (ip ? `${ip} (last seen)` : '—');
-                    })())}
+                    {row('IP', deviceIpText(device, ' (last seen)'))}
                     {row('Firmware', device.firmware_ver || '—')}
                     {row('WiFi network', s?.wifiSsid || '—')}
                     {row('ESPHome port', device.esphome_port != null ? String(device.esphome_port) : '—')}
@@ -2772,7 +2944,7 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                           a separate health metric. */}
                       <StatTile
                         label="Link" value={s?.wifiRssi != null ? s.wifiRssi : null} unit="dBm"
-                        sev={s?.wifiRssi == null ? 'ok' : s.wifiRssi > -70 ? 'ok' : s.wifiRssi > -80 ? 'warn' : 'bad'}
+                        sev={s?.wifiRssi == null ? SEVERITY.OK : s.wifiRssi > -70 ? SEVERITY.OK : s.wifiRssi > -80 ? SEVERITY.WARN : SEVERITY.BAD}
                         pct={s?.wifiRssi == null ? null : Math.max(0, Math.min(100, (s.wifiRssi + 95) / 35 * 100))}
                         glyph={<SignalBars rssi={s?.wifiRssi ?? null}/>}
                         sub={[wifiBand(s?.wifiFreqMhz),
@@ -2783,7 +2955,7 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                           RTT instrumentation counts excursions against. */}
                       <StatTile
                         label="Latency" value={device.rttMs != null ? device.rttMs : null} unit="ms"
-                        sev={device.rttMs == null ? 'ok' : device.rttMs >= 1000 ? 'bad' : device.rttMs >= 200 ? 'warn' : 'ok'}
+                        sev={device.rttMs == null ? SEVERITY.OK : device.rttMs >= 1000 ? SEVERITY.BAD : device.rttMs >= 200 ? SEVERITY.WARN : SEVERITY.OK}
                         pct={device.rttMs == null ? null : Math.min(100, device.rttMs / 500 * 100)}
                       />
                       {/* Scaled 20-90C so the meter shows real headroom; this
@@ -2793,15 +2965,15 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                           is the one thing in this row allowed to shout. */}
                       <StatTile
                         label="Temp" value={tempC != null ? tempC.toFixed(1) : null} unit="°C"
-                        sev={tempC == null ? 'ok' : tempC >= 85 ? 'bad' : tempC >= 70 ? 'warn' : 'ok'}
+                        sev={tempC == null ? SEVERITY.OK : tempC >= 85 ? SEVERITY.BAD : tempC >= 70 ? SEVERITY.WARN : SEVERITY.OK}
                         pct={tempC == null ? null : Math.max(0, Math.min(100, (tempC - 20) / 70 * 100))}
                         note={throttled ? `throttled ${s.thermalCoreLimit}/${s.coresTotal}` : null}
                         glyph={tempHot != null && tempC != null && tempHot > tempC + 1
-                          ? <span style={{ fontFamily:"'DM Mono',monospace", fontSize:9, color:'var(--muted)' }}>{tempHot.toFixed(1)} max</span>
+                          ? <span style={{ fontFamily:MONO, fontSize:9, color:'var(--muted)' }}>{tempHot.toFixed(1)} max</span>
                           : null}
                       />
                     </div>
-                    {!s && <div style={{ fontFamily:"'DM Mono',monospace", fontSize:9, color:'var(--muted)', marginTop:8 }}>waiting for device stats…</div>}
+                    {!s && <div style={{ fontFamily:MONO, fontSize:9, color:'var(--muted)', marginTop:8 }}>waiting for device stats…</div>}
                   </Panel>
                 </div>
                 {!device.upgrade_required && device.approved && (
@@ -2839,7 +3011,7 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
 
           {/* ACTIVITY — voice-turn observability; its own tab (genuinely
               useful, was cramped at the bottom of Status). */}
-          {tab === 'activity' && (() => {
+          {tab === DETAIL_TAB.ACTIVITY && (() => {
             const cfgEff = effectiveConfig(globalConfig, device);
             const model = registry.models.find(m => m.graph_sha256 === cfgEff.wakeModel);
             const thr = model
@@ -2862,13 +3034,13 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
           })()}
 
           {/* ALERTS — timers, this endpoint's alarms and their delivery */}
-          {tab === 'alerts' && <AlertPanel device={device} isAdmin={isAdmin}/>}
+          {tab === DETAIL_TAB.ALERTS && <AlertPanel device={device} isAdmin={isAdmin}/>}
 
           {/* SAMPLES — wake-word training capture */}
-          {tab === 'samples' && <SamplesTab device={device} isAdmin={isAdmin}/>}
+          {tab === DETAIL_TAB.SAMPLES && <SamplesTab device={device} isAdmin={isAdmin}/>}
 
           {/* CONFIG */}
-          {tab === 'config' && (
+          {tab === DETAIL_TAB.CONFIG && (
             <div>
               {/* Network (WiFi) — always per-device, kept above and visually
                   separate from the fleet-inheritable config below. */}
@@ -2887,12 +3059,12 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                   borderRadius: 8, padding: '12px 16px', marginBottom: 24, flexWrap: 'wrap',
                 }}>
                   <div>
-                    <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, color: 'var(--text2)' }}>
+                    <div style={{ fontFamily: MONO, fontSize: 11, color: 'var(--text2)' }}>
                       {sections.length
                         ? `Local override (${sections.length} of ${Object.keys(CONFIG_SECTIONS).length})`
                         : 'Following fleet config'}
                     </div>
-                    <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: 'var(--muted)', marginTop: 3 }}>
+                    <div style={{ fontFamily: MONO, fontSize: 10, color: 'var(--muted)', marginTop: 3 }}>
                       {sections.length
                         ? `Overriding: ${sections.map(s => SECTION_LABELS[s] || s).join(', ')} — everything else tracks the fleet`
                         : 'Switch any section below to Device to customise just that part'}
@@ -2939,14 +3111,14 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
           )}
 
           {/* CONSOLE — fills the whole tab frame */}
-          {tab === 'console' && (
+          {tab === DETAIL_TAB.CONSOLE && (
             device.connected
               ? <div style={{ height: '100%' }}><Shell deviceId={device.device_id} token={token} height="100%"/></div>
-              : <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 12, color: 'var(--warn)' }}>Device offline — console unavailable</div>
+              : <div style={{ fontFamily: MONO, fontSize: 12, color: 'var(--warn)' }}>Device offline — console unavailable</div>
           )}
 
           {/* UPDATES */}
-          {tab === 'updates' && (
+          {tab === DETAIL_TAB.UPDATES && (
             <div style={{ minHeight:'100%', display:'flex', flexDirection:'column', gap:16 }}>
 
               {/* Firmware state */}
@@ -2960,7 +3132,7 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                     )}
                   </div>
                   <div style={{ display:'flex', alignItems:'center', gap:12 }}>
-                    <span style={{ fontFamily:"'DM Mono',monospace", fontSize:11, color: needsUpdate ? 'var(--warn)' : 'var(--ok)' }}>
+                    <span style={{ fontFamily:MONO, fontSize:11, color: needsUpdate ? 'var(--warn)' : 'var(--ok)' }}>
                       {release?.version ? (needsUpdate ? `Update ${release.version} available` : 'Up to date') : 'No release info'}
                     </span>
                     <Pill small onClick={doCheckRelease} disabled={checkingRelease}>
@@ -2986,7 +3158,7 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                       Roll back to {device.firmware_previous}
                     </Pill>
                   )}
-                  <span style={{ fontFamily:"'DM Mono',monospace", fontSize:9, color:'var(--muted)', lineHeight:1.5, flex:'1 1 220px', minWidth:0 }}>
+                  <span style={{ fontFamily:MONO, fontSize:9, color:'var(--muted)', lineHeight:1.5, flex:'1 1 220px', minWidth:0 }}>
                     A/B slots — the previous binary stays available, and the device
                     rolls itself back if an update fails to start.
                   </span>
@@ -3003,29 +3175,24 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                     GitHub link covers the rest. */}
                 {needsUpdate && release?.notes && (
                   <div style={{ marginTop:14, borderTop:'1px solid var(--hairline)', paddingTop:10 }}>
-                    <div onClick={() => setNotesOpen(o => !o)} style={{
-                      fontFamily:"'DM Mono',monospace", fontSize:9, color:'var(--muted)',
-                      textTransform:'uppercase', letterSpacing:'0.15em', cursor:'pointer',
-                      userSelect:'none', display:'flex', alignItems:'center', gap:6,
-                    }}>
-                      <span>{notesOpen ? '▾' : '▸'}</span>
+                    <DisclosureToggle open={notesOpen} onToggle={() => setNotesOpen(o => !o)}>
                       What&apos;s in {release.version}
                       {release.published_at && (
                         <span style={{ marginLeft:'auto', letterSpacing:0, textTransform:'none' }}>
                           {new Date(release.published_at).toLocaleDateString()}
                         </span>
                       )}
-                    </div>
+                    </DisclosureToggle>
                     {notesOpen && (
                       <>
                         <pre style={{
-                          fontFamily:"'DM Mono',monospace", fontSize:10, lineHeight:1.65,
+                          fontFamily:MONO, fontSize:10, lineHeight:1.65,
                           color:'var(--text2)', whiteSpace:'pre-wrap', wordBreak:'break-word',
                           margin:'12px 0 0', maxHeight:320, overflowY:'auto',
                         }}>{release.notes}</pre>
                         {release.release_url && (
                           <a href={release.release_url} target="_blank" rel="noreferrer"
-                             style={{ fontFamily:"'DM Mono',monospace", fontSize:9, color:'var(--muted)',
+                             style={{ fontFamily:MONO, fontSize:9, color:'var(--muted)',
                                       display:'inline-block', marginTop:8 }}>
                             View release on GitHub →
                           </a>
@@ -3042,7 +3209,7 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                   secondary, and no longer competing for the top half. */}
               <div className="em-grid2" style={{ display:'grid', gridTemplateColumns:'1fr', gap:16 }}>
                 <Panel label="Local Build">
-                  <div style={{ fontFamily:"'DM Mono',monospace", fontSize:10, color:'var(--muted)', lineHeight:1.6, marginBottom:14 }}>
+                  <div style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)', lineHeight:1.6, marginBottom:14 }}>
                     Deploy a binary compiled on your machine (device/build/server from compile.sh).
                   </div>
                   <input ref={fileInputRef} type="file" accept="*/*" style={{ display:'none' }}
@@ -3053,7 +3220,7 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                     </Pill>
                     {localFile && (
                       <>
-                        <span style={{ fontFamily:"'DM Mono',monospace", fontSize:10, color:'var(--text2)', flex:1, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap', minWidth:0 }}>
+                        <span style={{ fontFamily:MONO, fontSize:10, color:'var(--text2)', flex:1, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap', minWidth:0 }}>
                           {localFile.name} · {(localFile.size/1024).toFixed(0)} KB
                         </span>
                         <Pill small danger onClick={() => setLocalFile(null)} disabled={pushing}>✕</Pill>
@@ -3073,7 +3240,7 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                   next to deploy and rollback. */}
               {isAdmin && (
                 <Panel label="Maintenance">
-                  <div style={{ fontFamily:"'DM Mono',monospace", fontSize:10, color:'var(--muted)', lineHeight:1.6, marginBottom:14 }}>
+                  <div style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)', lineHeight:1.6, marginBottom:14 }}>
                     Re-apply the debloat payloads: sync the boot script and hide any
                     Amazon package added to the list since this device was provisioned.
                     Runs automatically with every firmware update — this is for a device
@@ -3089,7 +3256,7 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
 
               {/* Activity console — always present so the layout never jumps
                   when a deploy starts */}
-              <div className="em-inset" style={{ '--em-inset-pad':'14px', fontFamily:"'DM Mono',monospace", fontSize:12, minHeight:96, flex:1 }}>
+              <div className="em-inset" style={{ '--em-inset-pad':'14px', fontFamily:MONO, fontSize:12, minHeight:96, flex:1 }}>
                 {pushLog.length === 0 && !pushing && (
                   <span style={{ color:'var(--lcd-faint)' }}>— no deploy activity this session —</span>
                 )}
@@ -3109,26 +3276,25 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
           )}
 
           {/* LOGS */}
-          {tab === 'logs' && (
+          {tab === DETAIL_TAB.LOGS && (
             <div>
-              <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.15em', marginBottom: 16 }}>Device logs</div>
+              <div style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.15em', marginBottom: 16 }}>Device logs</div>
               {logsLoading ? (
-                <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 12, color: 'var(--muted)' }}>Loading…</div>
+                <div style={{ fontFamily: MONO, fontSize: 12, color: 'var(--muted)' }}>Loading…</div>
               ) : logs.length === 0 ? (
-                <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 12, color: 'var(--muted)' }}>No logs</div>
+                <div style={{ fontFamily: MONO, fontSize: 12, color: 'var(--muted)' }}>No logs</div>
               ) : logs.map((entry, i) => (
                 <div key={i} style={{ display: 'flex', gap: 12, alignItems: 'baseline', padding: '8px 0', borderBottom: '1px solid var(--hairline)' }}>
-                  <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: 'var(--faint)', minWidth: 60, flexShrink: 0 }}>{new Date(entry.ts).toLocaleTimeString()}</span>
-                  <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: eventAccent(entry.level), textTransform: 'uppercase', letterSpacing: '0.1em', minWidth: 48, flexShrink: 0 }}>{entry.level}</span>
-                  <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: entry.source === 'device' ? 'var(--lcd-faint)' : 'var(--accent-deep)', textTransform: 'uppercase', letterSpacing: '0.08em', minWidth: 64, flexShrink: 0 }}>{entry.source}</span>
-                  <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, color: 'var(--text2)' }}>{entry.message}</span>
+                  <span style={{ fontFamily: MONO, fontSize: 10, color: 'var(--faint)', minWidth: 60, flexShrink: 0 }}>{new Date(entry.ts).toLocaleTimeString()}</span>
+                  <span style={{ fontFamily: MONO, fontSize: 9, color: eventAccent(entry.level), textTransform: 'uppercase', letterSpacing: '0.1em', minWidth: 48, flexShrink: 0 }}>{entry.level}</span>
+                  <span style={{ fontFamily: MONO, fontSize: 9, color: entry.source === LOG_SOURCE.DEVICE ? 'var(--lcd-faint)' : 'var(--accent-deep)', textTransform: 'uppercase', letterSpacing: '0.08em', minWidth: 64, flexShrink: 0 }}>{entry.source}</span>
+                  <span style={{ fontFamily: MONO, fontSize: 11, color: 'var(--text2)' }}>{entry.message}</span>
                 </div>
               ))}
             </div>
           )}
         </div>
-      </div>
-    </div>
+    </ModalFrame>
   );
 }
 
@@ -3139,11 +3305,12 @@ function Card({ device, onClick }) {
   const isPending = !device.approved;
 
   return (
-    <div onClick={onClick} style={{ background: 'linear-gradient(160deg,var(--card),var(--bg))', border: '1px solid var(--border)', borderRadius: 14, cursor: 'pointer', boxShadow: '0 4px 16px var(--track),0 1px 0 var(--sheen) inset', transition: 'box-shadow 0.15s,transform 0.1s', userSelect: 'none', opacity: isPending ? 0.85 : 1 }}
+    <div {...pressable(onClick)} aria-label={`${device.label || device.device_id} — ${state.label}`}
+      style={{ background: 'linear-gradient(160deg,var(--card),var(--bg))', border: '1px solid var(--border)', borderRadius: 14, cursor: 'pointer', boxShadow: '0 4px 16px var(--track),0 1px 0 var(--sheen) inset', transition: 'box-shadow 0.15s,transform 0.1s', userSelect: 'none', opacity: isPending ? 0.85 : 1 }}
       onMouseEnter={e => { e.currentTarget.style.boxShadow = '0 8px 28px rgba(0,0,0,0.18),0 1px 0 var(--sheen) inset'; e.currentTarget.style.transform = 'translateY(-1px)'; }}
       onMouseLeave={e => { e.currentTarget.style.boxShadow = '0 4px 16px var(--track),0 1px 0 var(--sheen) inset'; e.currentTarget.style.transform = 'translateY(0)'; }}>
       <div style={{ background: 'linear-gradient(180deg,var(--sunken),var(--sunken))', borderBottom: '1px solid var(--border-hard)', borderRadius: '13px 13px 0 0', padding: '10px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', boxShadow: '0 1px 0 var(--sheen) inset' }}>
-        <span style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 14, color: 'var(--text)', fontWeight: 600, letterSpacing: '-0.01em' }}>
+        <span style={{ fontFamily: SANS, fontSize: 14, color: 'var(--text)', fontWeight: 600, letterSpacing: '-0.01em' }}>
           {device.label || <span style={{ color: 'var(--muted)', fontSize: 12 }}>{device.device_id.slice(0, 8)}…</span>}
         </span>
         <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
@@ -3154,10 +3321,10 @@ function Card({ device, onClick }) {
             // height the text's own; the trimmed paddingRight cancels the
             // trailing letter-space Chrome leaves after the final N, which is
             // what made the word look shunted left inside its own badge.
-            <div style={{ display: 'inline-flex', alignItems: 'center', background: 'linear-gradient(160deg,var(--lcd-face),var(--lcd-deep))', border: '1px solid var(--lcd-line)', borderRadius: 3, padding: '3px 6px', paddingRight: 'calc(6px - 0.1em)', fontFamily: "'DM Mono',monospace", fontSize: 9, lineHeight: 1, color: 'var(--accent-lit)', letterSpacing: '0.1em' }}>PENDING</div>
+            <div style={{ display: 'inline-flex', alignItems: 'center', background: 'linear-gradient(160deg,var(--lcd-face),var(--lcd-deep))', border: '1px solid var(--lcd-line)', borderRadius: 3, padding: '3px 6px', paddingRight: 'calc(6px - 0.1em)', fontFamily: MONO, fontSize: 9, lineHeight: 1, color: 'var(--accent-lit)', letterSpacing: '0.1em' }}>PENDING</div>
           )}
           {!isPending && device.firmware_ver && (
-            <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: device.upgrade_required ? 'var(--warn)' : 'var(--muted)' }}
+            <div style={{ fontFamily: MONO, fontSize: 9, color: device.upgrade_required ? 'var(--warn)' : 'var(--muted)' }}
                  title={device.upgrade_required ? 'Pre-v1 firmware — open the device to update it' : undefined}>
               {device.upgrade_required ? `${device.firmware_ver} · upgrade required` : device.firmware_ver}
             </div>
@@ -3169,11 +3336,8 @@ function Card({ device, onClick }) {
       </div>
       <div style={{ padding: '0 16px 16px' }}>
         <div className="em-inset" style={{ '--em-inset-radius':'6px', '--em-inset-pad':'7px 12px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, color: state.dot, letterSpacing: '0.12em', textShadow: `0 0 8px ${state.dot}88` }}>{state.label.toUpperCase()}</span>
-          <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: 'var(--lcd-dim)', letterSpacing: '0.08em' }}>{(() => {
-            const ip = device.ip && device.ip !== '127.0.0.1' ? device.ip : null;
-            return device.connected ? (ip || '—') : (ip ? `${ip} ↑` : '—');
-          })()}</span>
+          <span style={{ fontFamily: MONO, fontSize: 11, color: state.dot, letterSpacing: '0.12em', textShadow: `0 0 8px ${state.dot}88` }}>{state.label.toUpperCase()}</span>
+          <span style={{ fontFamily: MONO, fontSize: 9, color: 'var(--lcd-dim)', letterSpacing: '0.08em' }}>{deviceIpText(device, ' ↑')}</span>
         </div>
       </div>
     </div>
@@ -3348,7 +3512,7 @@ function AddDeviceTile({ onClick }) {
   const [hover, setHover] = useState(false);
   return (
     <div
-      onClick={onClick}
+      {...pressable(onClick)}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
       style={{
@@ -3362,7 +3526,7 @@ function AddDeviceTile({ onClick }) {
       }}
     >
       <div style={{ fontSize: 28, color: hover ? 'var(--text2)' : 'var(--border-hard)', lineHeight: 1 }}>+</div>
-      <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: hover ? 'var(--text2)' : 'var(--border-hard)', letterSpacing: '0.12em', textTransform: 'uppercase' }}>Provision Device</div>
+      <div style={{ fontFamily: MONO, fontSize: 9, color: hover ? 'var(--text2)' : 'var(--border-hard)', letterSpacing: '0.12em', textTransform: 'uppercase' }}>Provision Device</div>
     </div>
   );
 }
@@ -3390,41 +3554,38 @@ const _ALEXA_PKGS = [
   'com.amazon.device.smarthome.adapters.wifi',
 ];
 
-// Steps that establish an ADB connection rather than needing one. They show
-// "Retry Connection" on error, and they are the only steps runStep will enter
-// without a live handle.
-const CONNECT_STEPS = new Set([0, 1, 6]);
+// The wizard's own vocabularies: a step's state, a transcript line's tone,
+// which OS the Dot is booted into (read off its ADB banner), and a package
+// manager reply.
+const STEP_STATE = Object.freeze({ PENDING: 'pending', RUNNING: 'running', DONE: 'done', ERROR: 'error' });
+const LOG_TONE = Object.freeze({ INFO: 'info', OK: 'ok', WARN: 'warn', ERROR: 'error', HEAD: 'head' });
+const BOOT_MODE = Object.freeze({ ANDROID: 'android', TWRP: 'twrp', UNKNOWN: 'unknown' });
+// What a `pm disable` / `pm hide` call said (see _pmVerdict).
+const PM_VERDICT = Object.freeze({ DISABLED: 'disabled', ABSENT: 'absent', REJECTED: 'rejected' });
 
-// Which mode each step has to run in.
-//
-// This matters because the Dot's only power source is the same micro-USB port
-// carrying data, so pulling the cable POWERS IT OFF, and `reboot recovery` is
-// a one-shot BCB flag. A replug is therefore a cold boot into Android, whatever
-// phase the wizard thinks it is in. Reconnecting during the TWRP phase hands
-// back an Android device that looks perfectly healthy.
-//
-// It is not a cosmetic mismatch. In Android `/dev/block/other-boot` resolves to
-// boot_b, which holds amonet's B-slot unlock payload rather than a kernel, so
-// retrying Patch Boot Image there would write over the unlock. The guard in
-// runPatchBoot refuses that, and this exists so the operator finds out before
-// they get as far as being refused.
-const _STEP_MODE = {
-  0: 'android',
-  1: 'twrp', 2: 'twrp', 3: 'twrp', 4: 'twrp', 5: 'twrp',
-  6: 'android', 7: 'android', 8: 'android', 9: 'android',
-  10: 'android', 11: 'android', 12: 'android',
-};
+// Dashboard-palette step states — same tones the rest of the UI uses
+// (accent slate for activity, deep green for done, rust for error).
+const STEP_STATE_STYLE = Object.freeze({
+  [STEP_STATE.PENDING]: { color: 'var(--muted)',  icon: '○' },
+  [STEP_STATE.RUNNING]: { color: 'var(--accent)', icon: '◌' },
+  [STEP_STATE.DONE]:    { color: 'var(--ok)',     icon: '●' },
+  [STEP_STATE.ERROR]:   { color: 'var(--warn)',   icon: '✕' },
+});
+
+const LOG_TONE_COLOR = Object.freeze({
+  [LOG_TONE.ERROR]: 'var(--error)', [LOG_TONE.OK]: 'var(--ok)', [LOG_TONE.WARN]: 'var(--warn)',
+});
 
 // TWRP is checked first: its banner is "omni_biscuit", which also contains
 // "biscuit", so an Android-first test would call every TWRP device Android.
 function _bannerMode(banner) {
   const b = (banner || '').toLowerCase();
-  if (b.includes('omni') || b.includes('twrp') || b.includes('recovery')) return 'twrp';
-  if (b.includes('csm') || b.includes('biscuit')) return 'android';
-  return 'unknown';
+  if (b.includes('omni') || b.includes('twrp') || b.includes('recovery')) return BOOT_MODE.TWRP;
+  if (b.includes('csm') || b.includes('biscuit')) return BOOT_MODE.ANDROID;
+  return BOOT_MODE.UNKNOWN;
 }
 
-const _MODE_NAME = { twrp: 'TWRP recovery', android: 'Android' };
+const _MODE_NAME = Object.freeze({ [BOOT_MODE.TWRP]: 'TWRP recovery', [BOOT_MODE.ANDROID]: 'Android' });
 
 const _INIT_RC_APPEND = `
 service mixer /system/bin/sh
@@ -3469,33 +3630,65 @@ async function _sha256Hex(buf) {
   return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-// Steps:
-//  0  connect_android  — connect in Android mode, verify FireOS 5, reboot to recovery
-//  1  connect_twrp     — reconnect once TWRP menu appears
-//  2  patch_boot       — SELinux cmdline + init.rc in one boot image pass  [auto]
-//  3  install_magisk   — flash Magisk 17.3 via twrp install                [file]
-//  4  preseed_db       — push pre-seeded magisk.db                         [auto]
-//  5  reboot           — reboot device to Android                          [button]
-//  6  reconnect        — reconnect ADB after Android boots                 [button]
-//  7  verify_root      — confirm su works                                  [auto]
-//  8  disable_alexa    — silence OOBE + pm disable BEFORE wifi            [auto]
-//  9  debloat          — pm hide bloat pkgs + service.d daemon-stop script [auto]
-// 10  wifi             — configure WiFi network                            [inputs]
-// 11  install_em       — push binary + startup script                      [file]
+// Steps, in order. `mode` is the OS each has to run in.
+//
+// The mode matters because the Dot's only power source is the same micro-USB
+// port carrying data, so pulling the cable POWERS IT OFF, and `reboot
+// recovery` is a one-shot BCB flag. A replug is therefore a cold boot into
+// Android, whatever phase the wizard thinks it is in. Reconnecting during the
+// TWRP phase hands back an Android device that looks perfectly healthy.
+//
+// It is not a cosmetic mismatch. In Android `/dev/block/other-boot` resolves to
+// boot_b, which holds amonet's B-slot unlock payload rather than a kernel, so
+// retrying Patch Boot Image there would write over the unlock. The guard in
+// runPatchBoot refuses that, and reconnectAdb checks the mode so the operator
+// finds out before they get as far as being refused.
+//
+//  connect_android  — connect in Android mode, verify FireOS 5, reboot to recovery
+//  connect_twrp     — reconnect once TWRP menu appears
+//  patch_boot       — SELinux cmdline + init.rc in one boot image pass  [auto]
+//  install_magisk   — flash Magisk 17.3 via twrp install                [file]
+//  preseed_db       — push pre-seeded magisk.db                         [auto]
+//  reboot           — reboot device to Android                          [button]
+//  reconnect        — reconnect ADB after Android boots                 [button]
+//  verify_root      — confirm su works                                  [auto]
+//  disable_alexa    — silence OOBE + pm disable BEFORE wifi             [auto]
+//  debloat          — pm hide bloat pkgs + service.d daemon-stop script [auto]
+//  wifi             — configure WiFi network                            [inputs]
+//  install_em       — push binary + startup script                      [file]
+//
+// `id` is also what a diagnostics upload names the failed step by.
 const _WIZARD_STEPS = [
-  { id: 'connect_android', label: 'Connect Device',     desc: 'Connect the Echo Dot via USB. Device should be on and booted into Android. Appears as "AEOBC" in the USB picker.' },
-  { id: 'connect_twrp',    label: 'Connect to TWRP',   desc: 'Wait for TWRP recovery to appear, then reconnect. Appears as "Echo" in the USB picker.' },
-  { id: 'patch_boot',      label: 'Patch Boot Image',  desc: 'Apply SELinux permissive patch and add init.rc service entries.' },
-  { id: 'install_magisk',  label: 'Install Magisk',    desc: 'Flash Magisk 17.3 for persistent root access.' },
-  { id: 'preseed_db',      label: 'Pre-seed Root DB',  desc: 'Grant root to ADB shell without a screen prompt.' },
-  { id: 'reboot',          label: 'Reboot to Android', desc: 'Reboot device to Android.' },
-  { id: 'reconnect',       label: 'Reconnect',         desc: 'Re-connect ADB as soon as the device appears as "AEOBC" in the USB picker — no need to wait for it to finish booting, the next step does that.' },
-  { id: 'verify_root',     label: 'Verify Root',       desc: 'Confirm Magisk root is working.' },
-  { id: 'disable_alexa',   label: 'Disable Alexa',     desc: 'Silence the Amazon setup assistant and disable the Alexa voice pipeline, before the device ever reaches WiFi.' },
-  { id: 'debloat',         label: 'Debloat',           desc: 'Hide non-essential Amazon packages and stop background daemons (~130MB RAM freed).' },
-  { id: 'wifi',            label: 'Configure WiFi',    desc: 'Connect the device to your local WiFi network.' },
-  { id: 'install_em',      label: 'Install EchoMuse',  desc: 'Push server binary and startup script to device.' },
+  { id: 'connect_android', mode: BOOT_MODE.ANDROID, label: 'Connect Device',     desc: 'Connect the Echo Dot via USB. Device should be on and booted into Android. Appears as "AEOBC" in the USB picker.' },
+  { id: 'connect_twrp',    mode: BOOT_MODE.TWRP,    label: 'Connect to TWRP',   desc: 'Wait for TWRP recovery to appear, then reconnect. Appears as "Echo" in the USB picker.' },
+  { id: 'patch_boot',      mode: BOOT_MODE.TWRP,    label: 'Patch Boot Image',  desc: 'Apply SELinux permissive patch and add init.rc service entries.' },
+  { id: 'install_magisk',  mode: BOOT_MODE.TWRP,    label: 'Install Magisk',    desc: 'Flash Magisk 17.3 for persistent root access.' },
+  { id: 'preseed_db',      mode: BOOT_MODE.TWRP,    label: 'Pre-seed Root DB',  desc: 'Grant root to ADB shell without a screen prompt.' },
+  { id: 'reboot',          mode: BOOT_MODE.TWRP,    label: 'Reboot to Android', desc: 'Reboot device to Android.' },
+  { id: 'reconnect',       mode: BOOT_MODE.ANDROID, label: 'Reconnect',         desc: 'Re-connect ADB as soon as the device appears as "AEOBC" in the USB picker — no need to wait for it to finish booting, the next step does that.' },
+  { id: 'verify_root',     mode: BOOT_MODE.ANDROID, label: 'Verify Root',       desc: 'Confirm Magisk root is working.' },
+  { id: 'disable_alexa',   mode: BOOT_MODE.ANDROID, label: 'Disable Alexa',     desc: 'Silence the Amazon setup assistant and disable the Alexa voice pipeline, before the device ever reaches WiFi.' },
+  { id: 'debloat',         mode: BOOT_MODE.ANDROID, label: 'Debloat',           desc: 'Hide non-essential Amazon packages and stop background daemons (~130MB RAM freed).' },
+  { id: 'wifi',            mode: BOOT_MODE.ANDROID, label: 'Configure WiFi',    desc: 'Connect the device to your local WiFi network.' },
+  { id: 'install_em',      mode: BOOT_MODE.ANDROID, label: 'Install EchoMuse',  desc: 'Push server binary and startup script to device.' },
 ];
+
+// Step index by id, e.g. STEP.INSTALL_MAGISK — the wizard addresses steps by
+// position, and a bare number there says nothing about which step it means.
+const STEP = Object.freeze(Object.fromEntries(_WIZARD_STEPS.map((s, i) => [s.id.toUpperCase(), i])));
+
+// Steps that establish an ADB connection rather than needing one. They show
+// "Retry Connection" on error, and they are the only steps runStep will enter
+// without a live handle.
+const CONNECT_STEPS = new Set([STEP.CONNECT_ANDROID, STEP.CONNECT_TWRP, STEP.RECONNECT]);
+
+// Steps that need no input: they start themselves once a handle is live.
+const AUTO_STEPS = new Set([STEP.PATCH_BOOT, STEP.PRESEED_DB, STEP.VERIFY_ROOT,
+                            STEP.DISABLE_ALEXA, STEP.DEBLOAT]);
+
+// Steps with their own input panel (file pickers, the WiFi form), which is
+// also their retry path; the generic Retry button is not offered for them.
+const INPUT_STEPS = new Set([STEP.INSTALL_MAGISK, STEP.WIFI, STEP.INSTALL_EM]);
 
 // ── WifiPanel ──
 
@@ -3518,7 +3711,7 @@ function WifiPanel({ adb, wifiSsid, setWifiSsid, wifiPsk, setWifiPsk, onScan, ne
           {scanning ? 'Scanning…' : 'Scan for networks'}
         </Pill>
         {networks.length > 0 && (
-          <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: 'var(--muted)' }}>
+          <span style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)' }}>
             {networks.length} network{networks.length !== 1 ? 's' : ''} found
           </span>
         )}
@@ -3538,7 +3731,7 @@ function WifiPanel({ adb, wifiSsid, setWifiSsid, wifiPsk, setWifiPsk, onScan, ne
             const blocked = n.blocker;
             return (
             <div key={n.ssid}
-              onClick={() => { if (!blocked) setWifiSsid(n.ssid); }}
+              {...pressable(() => setWifiSsid(n.ssid), { disabled: !!blocked, selected: wifiSsid === n.ssid })}
               title={blocked || ''}
               style={{
                 padding: '6px 10px', display: 'flex', justifyContent: 'space-between', alignItems: 'center',
@@ -3547,10 +3740,10 @@ function WifiPanel({ adb, wifiSsid, setWifiSsid, wifiPsk, setWifiPsk, onScan, ne
                 cursor: blocked ? 'not-allowed' : 'pointer',
                 opacity: blocked ? 0.5 : 1,
               }}>
-              <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, color: wifiSsid === n.ssid ? 'var(--accent)' : 'var(--text)' }}>
+              <span style={{ fontFamily: MONO, fontSize: 11, color: wifiSsid === n.ssid ? 'var(--accent)' : 'var(--text)' }}>
                 {n.ssid}
               </span>
-              <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: 'var(--muted)' }}>
+              <span style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)' }}>
                 {[n.securityLabel, (n.bands || []).join('+'), `${n.signal} dBm`]
                   .filter(Boolean).join(' · ')}
               </span>
@@ -3561,9 +3754,9 @@ function WifiPanel({ adb, wifiSsid, setWifiSsid, wifiPsk, setWifiPsk, onScan, ne
 
       {/* Manual SSID entry */}
       <div>
-        <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: 'var(--text2)', letterSpacing: '0.08em', marginBottom: 4 }}>SSID</div>
+        <div style={{ fontFamily: MONO, fontSize: 9, color: 'var(--text2)', letterSpacing: '0.08em', marginBottom: 4 }}>SSID</div>
         <input
-          type="text" value={wifiSsid} onChange={e => setWifiSsid(e.target.value)}
+          type="text" value={wifiSsid} onChange={e => setWifiSsid(e.target.value)} aria-label="SSID"
           placeholder="Select above or type network name"
           style={{ width: '100%', boxSizing: 'border-box' }}
         />
@@ -3571,16 +3764,16 @@ function WifiPanel({ adb, wifiSsid, setWifiSsid, wifiPsk, setWifiPsk, onScan, ne
 
       {/* Password */}
       <div>
-        <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: 'var(--text2)', letterSpacing: '0.08em', marginBottom: 4 }}>PASSWORD</div>
+        <div style={{ fontFamily: MONO, fontSize: 9, color: 'var(--text2)', letterSpacing: '0.08em', marginBottom: 4 }}>PASSWORD</div>
         <div style={{ display: 'flex', gap: 6 }}>
           <input
-            type={showPsk ? 'text' : 'password'} value={wifiPsk} onChange={e => setWifiPsk(e.target.value)}
+            type={showPsk ? 'text' : 'password'} value={wifiPsk} onChange={e => setWifiPsk(e.target.value)} aria-label="Password"
             placeholder="WPA passphrase" style={{ flex: 1, boxSizing: 'border-box' }}
             onKeyDown={e => e.key === 'Enter' && wifiSsid && onConnect()}
           />
-          <button onClick={() => setShowPsk(v => !v)} style={{
+          <button type="button" onClick={() => setShowPsk(v => !v)} style={{
             background: 'var(--hairline)', border: '1px solid var(--border-soft)', borderRadius: 6,
-            fontFamily: "'DM Mono',monospace", fontSize: 9, color: 'var(--muted)',
+            fontFamily: MONO, fontSize: 9, color: 'var(--muted)',
             padding: '0 8px', cursor: 'pointer', flexShrink: 0,
           }}>{showPsk ? 'hide' : 'show'}</button>
         </div>
@@ -3596,12 +3789,19 @@ function WifiPanel({ adb, wifiSsid, setWifiSsid, wifiPsk, setWifiPsk, onScan, ne
   );
 }
 
-function ProvisionWizard({ token, onClose, knownDevices }) {
+function ProvisionWizard({ onClose, knownDevices }) {
   const [step, setStep]         = useState(0);
-  const [stepState, setStepState] = useState(_WIZARD_STEPS.map(() => 'pending'));
+  const [stepState, setStepState] = useState(_WIZARD_STEPS.map(() => STEP_STATE.PENDING));
   const [log, setLog]           = useState([]);
+  const transcriptRef           = useRef([]);
   const [running, setRunning]   = useState(false);
-  const [adb, setAdb]           = useState(null);
+  // `adb` renders; adbRef is the live handle for code already in flight. A
+  // step is an async function from the render it started in, so its `adb`
+  // is whatever the handle was when the button was pressed — null for a
+  // connect step, however many handles it has opened since.
+  const [adb, setAdbState]      = useState(null);
+  const adbRef                  = useRef(null);
+  const setAdb = c => { adbRef.current = c; setAdbState(c); };
   const [magiskFile, setMagiskFile] = useState(null);
   const [binaryFile, setBinaryFile] = useState(null);
   const [wifiSsid, setWifiSsid] = useState('');
@@ -3633,16 +3833,35 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     /disconnect|transferOut|transferIn|NetworkError|device was lost/i.test(
       e?.message || '');
 
-  function addLog(msg, type = 'info') {
+  function addLog(msg, type = LOG_TONE.INFO) {
     // 200 lines truncated a normal successful run — the transcript above the
     // fold is exactly the part you need when a late step fails for an early
     // reason, and it was being thrown away. A whole provision is ~300 lines,
     // so this holds several runs' worth; it is text in memory, not a cost
     // worth optimising.
-    setLog(l => [...l, { msg, type }].slice(-5000));
+    //
+    // Mirrored in a ref for the same reason as adbRef: the diagnostics upload
+    // runs inside a step, where `log` is the transcript from before the step
+    // began — without its own output, which is the part that failed.
+    transcriptRef.current = [...transcriptRef.current, { msg, type }].slice(-5000);
+    setLog(transcriptRef.current);
     setTimeout(() => { if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight; }, 30);
   }
   function markStep(i, st) { setStepState(s => { const n = [...s]; n[i] = st; return n; }); }
+
+  // A provisioning payload from the controller, as a Response. The step
+  // runners report e.message, so a refusal becomes an Error naming the HTTP
+  // status (`status` kept on it); `what` completes the sentence.
+  async function fetchProvision(path, what = '', init) {
+    try {
+      return await API.request(path, init);
+    } catch (e) {
+      if (e instanceof Error) throw e;          // the network, not the controller
+      const err = new Error(`Controller returned ${e.status}${what ? ` ${what}` : ''}`);
+      err.status = e.status;
+      throw err;
+    }
+  }
 
   // Abandon whatever step is in flight.
   //
@@ -3662,8 +3881,8 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
   function abandonStep(reason, idx = step) {
     stepEpoch.current++;
     setRunning(false);
-    markStep(idx, 'error');
-    addLog(reason, 'error');
+    markStep(idx, STEP_STATE.ERROR);
+    addLog(reason, LOG_TONE.ERROR);
   }
 
   // The browser knows the cable was pulled; nothing was listening.
@@ -3688,7 +3907,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
       if (running) {
         abandonStep('Device disconnected. The step was abandoned — reconnect and retry.');
       } else {
-        addLog('Device disconnected.', 'warn');
+        addLog('Device disconnected.', LOG_TONE.WARN);
       }
     };
     navigator.usb.addEventListener('disconnect', onDisconnect);
@@ -3755,37 +3974,32 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
       step:  _WIZARD_STEPS[stepIdx]?.id || String(stepIdx),
       error: err?.message || '',
       probes,
-      transcript: log.map(l => l.msg),
+      transcript: transcriptRef.current.map(l => l.msg),
       selected_ssid: wifiSsid || null,
     });
   }
 
   async function captureDiagnostics(stepIdx, err) {
-    if (!adb) {
+    const c = adbRef.current;
+    if (!c) {
       // No connection means no probes, and a button that downloads a file
       // containing nothing but the error would be worse than no button.
-      addLog('No ADB connection, so device state could not be captured.', 'warn');
+      addLog('No ADB connection, so device state could not be captured.', LOG_TONE.WARN);
       return;
     }
     addLog('Capturing device state for diagnostics…');
     try {
-      setDiagnostics(await collectProvisionDiagnostics(adb, stepIdx, err));
-      addLog('Device state captured — "Download diagnostics" below.', 'ok');
+      setDiagnostics(await collectProvisionDiagnostics(c, stepIdx, err));
+      addLog('Device state captured — "Download diagnostics" below.', LOG_TONE.OK);
     } catch (e) {
       // Never let the diagnostic path bury the real failure.
-      addLog(`Could not capture device state: ${e.error || e.message}`, 'warn');
+      addLog(`Could not capture device state: ${e.error || e.message}`, LOG_TONE.WARN);
     }
   }
 
   function downloadDiagnostics() {
-    const blob = new Blob([JSON.stringify(diagnostics, null, 2)],
-                          { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `echomuse-provision-${new Date().toISOString().slice(0,19).replace(/[:T]/g,'')}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
+    downloadBlob(new Blob([JSON.stringify(diagnostics, null, 2)], { type: 'application/json' }),
+                 `echomuse-provision-${new Date().toISOString().slice(0,19).replace(/[:T]/g,'')}.json`);
   }
 
   async function doCheckRelease() {
@@ -3800,9 +4014,9 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
       // shows the available version before committing to the install.
       const rel = await API.post('/api/releases/check', {});
       setLatestRelease(rel);
-      addLog(`Latest GitHub release: ${rel.version}`, 'ok');
+      addLog(`Latest GitHub release: ${rel.version}`, LOG_TONE.OK);
     } catch (e) {
-      addLog(`Release check failed: ${e.error || e.message || 'unknown error'}`, 'error');
+      addLog(`Release check failed: ${e.error || e.message || 'unknown error'}`, LOG_TONE.ERROR);
     }
     setCheckingRelease(false);
   }
@@ -3828,10 +4042,10 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     if (fwBuild && fwBuild !== _TESTED_FIREOS_BUILD) {
       addLog(`Untested firmware — EchoMuse is developed against ${_TESTED_FIREOS_NAME} `
            + `(${_TESTED_FIREOS_BUILD}). Other FireOS 5 builds may behave differently, `
-           + `particularly around USB and ADB.`, 'warn');
+           + `particularly around USB and ADB.`, LOG_TONE.WARN);
     }
     if (model && !model.toLowerCase().includes('amazon') && !name.toLowerCase().includes('biscuit')) {
-      addLog('Warning: device may not be an Echo Dot 2nd gen — proceeding anyway.', 'warn');
+      addLog('Warning: device may not be an Echo Dot 2nd gen — proceeding anyway.', LOG_TONE.WARN);
     }
 
     // Refuse to re-provision a device already known to the controller —
@@ -3872,7 +4086,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     try { await c.shell('reboot recovery'); } catch {}
     await c.close();
     setAdb(null);
-    addLog('Device is rebooting. Wait for the TWRP menu to appear, then click "Connect to TWRP".', 'warn');
+    addLog('Device is rebooting. Wait for the TWRP menu to appear, then click "Connect to TWRP".', LOG_TONE.WARN);
     return null;
   }
 
@@ -3884,10 +4098,10 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     // ("omni_biscuit"), not via ro.bootmode or /sbin/recovery.
     // The banner is already logged by requestDevice; check it directly.
     const banner = c.banner ?? '';
-    if (!banner.toLowerCase().includes('omni') && !banner.toLowerCase().includes('twrp') && !banner.toLowerCase().includes('recovery')) {
+    if (_bannerMode(banner) !== BOOT_MODE.TWRP) {
       throw new Error(`Device banner is "${banner}" — expected TWRP (omni_biscuit). Is TWRP showing on screen?`);
     }
-    addLog('TWRP confirmed.', 'ok');
+    addLog('TWRP confirmed.', LOG_TONE.OK);
     return c;
   }
 
@@ -3993,7 +4207,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
       + '[ -e "$n" ] && echo "NAME ${n##*/} $(readlink -f "$n" 2>/dev/null)"; done');
     const boot = classifyBootTarget(probe);
     if (!boot.ok) throw new Error(boot.reason);
-    addLog(`  → ${boot.reason}`, boot.warn ? 'warn' : 'ok');
+    addLog(`  → ${boot.reason}`, boot.warn ? LOG_TONE.WARN : LOG_TONE.OK);
 
     addLog('Pulling boot image from device (10–20s)…');
     // stderr carried through rather than discarded: dd reports its record
@@ -4028,7 +4242,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
 
     let workImg = 'boot.img';
     if (cmdlineAlreadyPermissive) {
-      addLog('cmdline already has androidboot.selinux=permissive — skipping cmdline patch.', 'warn');
+      addLog('cmdline already has androidboot.selinux=permissive — skipping cmdline patch.', LOG_TONE.WARN);
     } else {
       addLog('Patching cmdline for SELinux permissive…');
       const patched = new Uint8Array(bootImg);
@@ -4055,14 +4269,14 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     const existing = new TextDecoder().decode(rcBytes);
     const rcAlreadyPatched = existing.includes('service echomuse');
     if (rcAlreadyPatched) {
-      addLog('Service entries already present — skipping.', 'warn');
+      addLog('Service entries already present — skipping.', LOG_TONE.WARN);
     } else {
       await c.push('/tmp/ramdisk/init.csm.project.rc', new TextEncoder().encode(existing + _INIT_RC_APPEND));
       await c.shell('chmod 750 /tmp/ramdisk/init.csm.project.rc');
     }
 
     if (cmdlineAlreadyPermissive && rcAlreadyPatched) {
-      addLog('Boot image already fully patched — nothing to flash.', 'ok');
+      addLog('Boot image already fully patched — nothing to flash.', LOG_TONE.OK);
       return;
     }
 
@@ -4086,7 +4300,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
         + `patched cmdline. The write did not take. Do not reboot the device: it is still in `
         + `TWRP and recoverable from here.`);
     }
-    addLog('Boot image flashed and verified.', 'ok');
+    addLog('Boot image flashed and verified.', LOG_TONE.OK);
   }
 
   async function runInstallMagisk(c, file) {
@@ -4101,7 +4315,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
         `not flashing. If you've intentionally updated the Magisk build, update _MAGISK_SHA256.`
       );
     }
-    addLog('Hash verified.', 'ok');
+    addLog('Hash verified.', LOG_TONE.OK);
     addLog(`Pushing ${file.name} to /sdcard/…`);
     await c.push(`/sdcard/${_MAGISK_FILENAME}`, new Uint8Array(buf),
       pct => setProgress({ label: 'Uploading Magisk', pct }));
@@ -4112,7 +4326,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     if (out.toLowerCase().includes('error') || out.toLowerCase().includes('failed')) {
       throw new Error('TWRP install reported an error — check the log.');
     }
-    addLog('Magisk installed.', 'ok');
+    addLog('Magisk installed.', LOG_TONE.OK);
   }
 
   async function runPreseedDb(c) {
@@ -4147,16 +4361,15 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     await c.shell('mkdir -p /data/adb');
     const rmOut = (await c.shell('rm -f /data/adb/magisk.db /data/adb/magisk.img 2>&1')).trim();
     if (rmOut) addLog(`  → ${rmOut}`);
-    addLog('Cleared.', 'ok');
+    addLog('Cleared.', LOG_TONE.OK);
 
     addLog('Downloading magisk.db from controller…');
-    const resp = await fetch(ingressPath('/api/provision/magisk_db'), { headers: { Authorization: `Bearer ${token}` } });
-    if (!resp.ok) throw new Error(`Controller returned ${resp.status}`);
+    const resp = await fetchProvision('/api/provision/magisk_db');
     const dbBytes = new Uint8Array(await resp.arrayBuffer());
     addLog(`magisk.db: ${dbBytes.length} bytes`);
     await c.push('/tmp/magisk_preseed.db', dbBytes);
     await c.shell('cp /tmp/magisk_preseed.db /data/adb/magisk.db && chmod 600 /data/adb/magisk.db');
-    addLog('magisk.db installed.', 'ok');
+    addLog('magisk.db installed.', LOG_TONE.OK);
   }
 
   async function runReboot(c) {
@@ -4170,7 +4383,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     // framework that wasn't. waitForFramework owns that question now, so the
     // only thing worth waiting for here is the device appearing over USB.
     addLog('Device rebooting to Android. Click Reconnect as soon as it appears in the USB picker — '
-         + 'the wizard waits for Android to finish booting by itself.', 'warn');
+         + 'the wizard waits for Android to finish booting by itself.', LOG_TONE.WARN);
     return null;
   }
 
@@ -4178,7 +4391,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     const c = await _ADB.Client.requestDevice(addLog);
     c._log = msg => addLog(`  adb: ${msg}`);
     setAdb(c);
-    addLog('ADB connected.', 'ok');
+    addLog('ADB connected.', LOG_TONE.OK);
     return c;
   }
 
@@ -4206,19 +4419,19 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
       // Say so when the device came back in the wrong mode. Without this the
       // reconnect looks like a success and the next Retry runs a TWRP step
       // against Android, or the reverse.
-      const want = _STEP_MODE[step];
+      const want = _WIZARD_STEPS[step].mode;
       const got  = _bannerMode(c.banner);
-      if (want && got !== 'unknown' && got !== want) {
+      if (got !== BOOT_MODE.UNKNOWN && got !== want) {
         addLog(`Reconnected in ${_MODE_NAME[got]}, but this step needs ${_MODE_NAME[want]} `
-             + `(banner "${c.banner}").`, 'error');
-        addLog('Pulling the cable powers the Dot off, and a cold boot comes up in Android.', 'warn');
-        if (want === 'twrp') {
+             + `(banner "${c.banner}").`, LOG_TONE.ERROR);
+        addLog('Pulling the cable powers the Dot off, and a cold boot comes up in Android.', LOG_TONE.WARN);
+        if (want === BOOT_MODE.TWRP) {
           addLog('To reach TWRP: unplug, plug back in, and hold the mute button for about '
-               + '5 seconds as soon as the blue LED appears.', 'warn');
+               + '5 seconds as soon as the blue LED appears.', LOG_TONE.WARN);
         }
       }
     } catch (e) {
-      addLog(`Reconnect failed: ${e.message}`, 'error');
+      addLog(`Reconnect failed: ${e.message}`, LOG_TONE.ERROR);
     }
     setRunning(false);
   }
@@ -4250,9 +4463,9 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
   // disable` prints "new state: disabled" and `pm hide` prints "new hidden
   // state: true". Guessing at "new state: hidden" matches neither.
   const _pmVerdict = (out) => {
-    if (out.includes('new state: disabled') || out.includes('hidden state: true')) return 'disabled';
-    if (/Unknown package/i.test(out)) return 'absent';
-    return 'rejected';
+    if (out.includes('new state: disabled') || out.includes('hidden state: true')) return PM_VERDICT.DISABLED;
+    if (/Unknown package/i.test(out)) return PM_VERDICT.ABSENT;
+    return PM_VERDICT.REJECTED;
   };
 
   // Wait for the Android framework to be genuinely usable, and REFUSE to
@@ -4307,7 +4520,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
           // the first re-gates (steps are individually retryable), and three
           // "Framework ready after 0s" banners per run is noise that trains
           // people to skim past the one time it matters.
-          if (announced) addLog(`Framework ready after ${Math.round((Date.now() - started) / 1000)}s.`, 'ok');
+          if (announced) addLog(`Framework ready after ${Math.round((Date.now() - started) / 1000)}s.`, LOG_TONE.OK);
           return;
         }
       }
@@ -4380,9 +4593,9 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
       // not touch, and which of those it is has not been established. Say what
       // was done, not what was achieved — claiming it is muted for the rest of
       // provisioning sends someone looking for a fault when they hear her.
-      addLog('  → volume turned down; the setup assistant may raise it again and talk anyway.', 'warn');
+      addLog('  → volume turned down; the setup assistant may raise it again and talk anyway.', LOG_TONE.WARN);
     } catch (e) {
-      addLog(`  → could not mute (${e.message}) — the setup prompt may talk over the wizard.`, 'warn');
+      addLog(`  → could not mute (${e.message}) — the setup prompt may talk over the wizard.`, LOG_TONE.WARN);
     }
 
     addLog('Testing su -c id… (magiskd can take a while to attach after boot — retrying if needed)');
@@ -4419,7 +4632,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     }
     addLog(`Total wait: ${((Date.now() - attemptStart) / 1000).toFixed(0)}s.`);
     if (!rooted) throw new Error('Root not working after waiting for boot + magiskd — check Magisk install and magisk.db.');
-    addLog('Root confirmed.', 'ok');
+    addLog('Root confirmed.', LOG_TONE.OK);
   }
 
   async function scanWifi(c) {
@@ -4543,22 +4756,22 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
       const match = seen.find(n => n.ssid === ssid);
 
       if (!match) {
-        addLog(`"${ssid}" was not seen in a fresh scan (${seen.length} other network(s) were).`, 'warn');
-        addLog('Either it is out of range, or it is hidden and the SSID is not spelled exactly right.', 'warn');
+        addLog(`"${ssid}" was not seen in a fresh scan (${seen.length} other network(s) were).`, LOG_TONE.WARN);
+        addLog('Either it is out of range, or it is hidden and the SSID is not spelled exactly right.', LOG_TONE.WARN);
         return;
       }
       addLog(`"${ssid}" IS on the air: ${_SECURITY_LABEL[match.security] || match.security}`
-           + `, ${match.bands.join(' + ') || match.freq + ' MHz'}, ${match.signal} dBm`, 'warn');
+           + `, ${match.bands.join(' + ') || match.freq + ' MHz'}, ${match.signal} dBm`, LOG_TONE.WARN);
       addLog(`  flags: ${match.flags}`);
       const blocker = securityBlocker(match.security);
       if (blocker) {
-        addLog(`  ${blocker}`, 'error');
+        addLog(`  ${blocker}`, LOG_TONE.ERROR);
       } else {
         addLog('  The Dot can join this kind of network, so the likely cause is the '
-             + 'password, or the AP refusing the client.', 'warn');
+             + 'password, or the AP refusing the client.', LOG_TONE.WARN);
       }
     } catch (e) {
-      addLog(`Could not scan to diagnose: ${e.message || e}`, 'warn');
+      addLog(`Could not scan to diagnose: ${e.message || e}`, LOG_TONE.WARN);
     }
   }
 
@@ -4586,7 +4799,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
            + `${known.bands.length ? ', ' + known.bands.join(' + ') : ''}`
            + `, ${known.signal} dBm`);
     } else {
-      addLog(`"${ssid}" was not in the last scan — configuring it as a hidden network.`, 'warn');
+      addLog(`"${ssid}" was not in the last scan — configuring it as a hidden network.`, LOG_TONE.WARN);
     }
 
     addLog('Enabling WiFi radio…');
@@ -4680,7 +4893,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     if (!onDevice.includes(`ssid="${ssid}"`)) {
       throw new Error(`Config at /data/misc/wifi/wpa_supplicant.conf does not contain ssid="${ssid}" after cp — the write did not take. On-device content:\n${onDevice}`);
     }
-    addLog('Config written and verified on device.', 'ok');
+    addLog('Config written and verified on device.', LOG_TONE.OK);
 
     addLog('Reloading WiFi via the Android framework…');
     // These two rewrite wpa_supplicant.conf out from under us. runDisableAlexa
@@ -4697,10 +4910,10 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
       .map(l => { const f = l.split(/\s+/); return { pid: f[1], name: (f[f.length - 1] || '').split('/').pop() }; })
       .filter(p => /^\d+$/.test(p.pid || ''));
     if (found.length === 0) {
-      addLog('No WiFi config interferers running — clean.', 'ok');
+      addLog('No WiFi config interferers running — clean.', LOG_TONE.OK);
     } else {
       addLog(`${found.map(p => `${p.name} (pid ${p.pid})`).join(', ')} running — `
-           + `rewrites wpa_supplicant.conf, stopping…`, 'warn');
+           + `rewrites wpa_supplicant.conf, stopping…`, LOG_TONE.WARN);
       // `kill -9` alone is not enough and was observed not holding: these are
       // init services, so init restarts them within moments and the re-check
       // finds a fresh pid. init has to be told to stop the SERVICE. The
@@ -4723,12 +4936,12 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
 
       const still = (await c.shell("su -c 'ps' | grep -iE 'wifiprofilemanager|SmartHomeWifid'")).trim();
       if (!still) {
-        addLog('Interferers stopped.', 'ok');
+        addLog('Interferers stopped.', LOG_TONE.OK);
       } else if (svcNames.length === 0) {
         addLog('Still running, and no matching init service was found to stop — '
-             + 'it will respawn. Association may be slow or the config may be overwritten.', 'warn');
+             + 'it will respawn. Association may be slow or the config may be overwritten.', LOG_TONE.WARN);
       } else {
-        addLog('Still running after stop+kill — association may be slow or the config overwritten.', 'warn');
+        addLog('Still running after stop+kill — association may be slow or the config overwritten.', LOG_TONE.WARN);
       }
     }
 
@@ -4764,7 +4977,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     const pidCount = psCheck.split('\n').map(s => s.trim()).filter(Boolean).length;
     if (pidCount === 0) throw new Error('wpa_supplicant did not start after svc wifi enable — check device logcat.');
     if (pidCount > 1) throw new Error(`Multiple wpa_supplicant processes running (${pidCount}) — the bare init service and the framework instance are both up and will conflict. Check for a stray "start wpa_supplicant" call.`);
-    addLog(`wpa_supplicant running (1 process, pid ${psCheck.trim()}).`, 'ok');
+    addLog(`wpa_supplicant running (1 process, pid ${psCheck.trim()}).`, LOG_TONE.OK);
 
     addLog('Waiting for association (up to 20s)…');
     let associated = false;
@@ -4784,14 +4997,14 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
       await reportWhyNoAssociation(c, ssid);
       throw new Error(`Did not associate to "${ssid}" within 20s. Last status:\n${lastStatus}`);
     }
-    addLog('Associated.', 'ok');
+    addLog('Associated.', LOG_TONE.OK);
 
     addLog('Waiting for IP address (up to 20s)…');
     for (let i = 0; i < 20; i++) {
       await new Promise(r => setTimeout(r, 1000));
       const ip = await c.shell("su -c 'ip addr show wlan0 | grep \"inet \" | while read proto addr rest; do echo ${addr%/*}; done'");
       if (ip && /\d+\.\d+\.\d+\.\d+/.test(ip)) {
-        addLog(`Connected! IP: ${ip}`, 'ok');
+        addLog(`Connected! IP: ${ip}`, LOG_TONE.OK);
         return;
       }
     }
@@ -4840,12 +5053,12 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     for (const pid of oobePids) await c.shell(`su -c "kill -9 ${pid}"`);
     const oobeLeft = (await c.shell(`su -c 'ps' | grep -F ${OOBE} | grep -v grep`)).trim();
     const oobeVerdict = _pmVerdict(oobeDisable);
-    addLog(`  → ${oobeVerdict === 'disabled' ? 'disabled'
-                : oobeVerdict === 'absent'   ? 'not installed on this build'
+    addLog(`  → ${oobeVerdict === PM_VERDICT.DISABLED ? 'disabled'
+                : oobeVerdict === PM_VERDICT.ABSENT   ? 'not installed on this build'
                 : (oobeDisable || 'no output')}`
          + `, ${oobePids.length} running process(es) killed`
          + (oobeLeft ? ', still running, it will stop at the reboot that ends provisioning' : ''),
-           oobeLeft || oobeVerdict === 'rejected' ? 'warn' : 'ok');
+           oobeLeft || oobeVerdict === PM_VERDICT.REJECTED ? LOG_TONE.WARN : LOG_TONE.OK);
 
     let disabled = 0, absent = 0, rejected = 0;
     for (const pkg of _ALEXA_PKGS) {
@@ -4853,16 +5066,16 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
       let out = await c.shell(`su -c 'pm disable ${pkg}' 2>&1`);
       if (_pmNotReady(out)) {
         // Still not ready despite the gate above — give it a moment and retry once.
-        addLog('  Package Manager not ready yet, waiting 3s and retrying…', 'warn');
+        addLog('  Package Manager not ready yet, waiting 3s and retrying…', LOG_TONE.WARN);
         await new Promise(r => setTimeout(r, 3000));
         out = await c.shell(`su -c 'pm disable ${pkg}' 2>&1`);
       }
       const verdict = _pmVerdict(out);
-      if (verdict === 'disabled') disabled++;
-      else if (verdict === 'absent') absent++;
+      if (verdict === PM_VERDICT.DISABLED) disabled++;
+      else if (verdict === PM_VERDICT.ABSENT) absent++;
       else rejected++;
-      addLog(`  → ${verdict === 'absent' ? 'not installed on this build' : (out.trim() || 'ok')}`,
-             verdict === 'disabled' ? undefined : 'warn');
+      addLog(`  → ${verdict === PM_VERDICT.ABSENT ? 'not installed on this build' : (out.trim() || 'ok')}`,
+             verdict === PM_VERDICT.DISABLED ? undefined : LOG_TONE.WARN);
     }
     // Three outcomes, not two.
     //
@@ -4887,10 +5100,10 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
       // the step green in silence — this is an image nobody here has seen.
       addLog(`None of the ${_ALEXA_PKGS.length} Alexa packages are installed on this build, `
            + `so there was nothing to disable. If the device is silent and its ring is off, `
-           + `that is the expected state and provisioning can continue.`, 'warn');
+           + `that is the expected state and provisioning can continue.`, LOG_TONE.WARN);
     } else {
       addLog(`${disabled} disabled, ${absent} not installed on this build.`,
-             disabled ? 'ok' : 'warn');
+             disabled ? LOG_TONE.OK : LOG_TONE.WARN);
     }
 
     // pm disable on com.amazon.device.smarthome.adapters.wifi does NOT stop
@@ -4915,7 +5128,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
       await c.shell(`su -c "kill -9 ${smartHomeWifidPid}"`);
     }
 
-    addLog('Alexa stack disabled.', 'ok');
+    addLog('Alexa stack disabled.', LOG_TONE.OK);
   }
 
   async function runDebloat(c) {
@@ -4931,8 +5144,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     //     so a fresh provision comes up fully debloated.
     // Both payloads come from the controller (device_payloads/) so the
     // package list and daemon set can be tuned without touching this code.
-    const pkgResp = await fetch(ingressPath('/api/provision/debloat_packages'), { headers: { Authorization: `Bearer ${token}` } });
-    if (!pkgResp.ok) throw new Error(`Controller returned ${pkgResp.status} fetching debloat package list.`);
+    const pkgResp = await fetchProvision('/api/provision/debloat_packages', 'fetching debloat package list.');
     const { packages } = await pkgResp.json();
 
     // Re-gate rather than trusting the previous step: steps are individually
@@ -4952,13 +5164,13 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
       // working, not pm refusing. The list spans SKU variants by design, so
       // absences are expected here even more than in the Alexa step.
       const verdict = _pmVerdict(out);
-      if (verdict === 'disabled') hidden++;
-      else if (verdict === 'absent') absentPkgs++;
+      if (verdict === PM_VERDICT.DISABLED) hidden++;
+      else if (verdict === PM_VERDICT.ABSENT) absentPkgs++;
       else rejectedPkgs++;
-      addLog(`  ${pkg} → ${verdict === 'disabled' ? 'hidden'
-                         : verdict === 'absent'   ? 'not installed on this build'
+      addLog(`  ${pkg} → ${verdict === PM_VERDICT.DISABLED ? 'hidden'
+                         : verdict === PM_VERDICT.ABSENT   ? 'not installed on this build'
                          : (out || 'no output')}`,
-             verdict === 'disabled' ? undefined : 'warn');
+             verdict === PM_VERDICT.DISABLED ? undefined : LOG_TONE.WARN);
     }
     // Same three outcomes as the Alexa step, and the same reason: counting
     // only successes made "this build does not carry these packages"
@@ -4971,11 +5183,10 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     }
     addLog(`${hidden}/${packages.length} packages hidden`
          + (absentPkgs ? `, ${absentPkgs} not installed on this build.` : '.'),
-           hidden ? 'ok' : 'warn');
+           hidden ? LOG_TONE.OK : LOG_TONE.WARN);
 
     addLog('Installing boot-time daemon-stop script (Magisk service.d)…');
-    const scrResp = await fetch(ingressPath('/api/provision/debloat_script'), { headers: { Authorization: `Bearer ${token}` } });
-    if (!scrResp.ok) throw new Error(`Controller returned ${scrResp.status} fetching debloat script.`);
+    const scrResp = await fetchProvision('/api/provision/debloat_script', 'fetching debloat script.');
     const script = await scrResp.text();
     // Same push-then-cp pattern as start_server.sh: nothing executes the
     // script this boot, so push() is safe (no "Text file busy" risk).
@@ -4986,7 +5197,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     if (!listing.includes('echomuse-debloat.sh')) {
       throw new Error(`Debloat script install verification failed — ${svcDir} contains: "${listing}". Is Magisk mounted (/sbin/.core present)?`);
     }
-    addLog('Debloat applied — daemon stops take effect on the post-install reboot.', 'ok');
+    addLog('Debloat applied — daemon stops take effect on the post-install reboot.', LOG_TONE.OK);
   }
 
   async function runInstallEchoMuse(c, file, useLatest) {
@@ -5000,8 +5211,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
       // pipeline uses — needed because a freshly-flashed device isn't in
       // _devices yet, so /api/devices/{id}/update (which requires a live
       // WebSocket session) isn't usable at this point in the wizard.
-      const resp = await fetch(ingressPath('/api/provision/latest_binary'), { headers: { Authorization: `Bearer ${token}` } });
-      if (!resp.ok) throw new Error(`Controller returned ${resp.status} fetching latest binary.`);
+      const resp = await fetchProvision('/api/provision/latest_binary', 'fetching latest binary.');
       buf = await resp.arrayBuffer();
       const ver = resp.headers.get('X-Release-Version');
       addLog(`Latest build${ver ? ` (${ver})` : ''}: ${(buf.byteLength/1024/1024).toFixed(1)} MB`);
@@ -5055,7 +5265,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     // locked/mounted-readonly server_a, the subsequent cp in the install
     // step would either overwrite it (fine) or fail loudly and get
     // caught by that verification anyway.
-    addLog('Cleared.', 'ok');
+    addLog('Cleared.', LOG_TONE.OK);
 
     addLog('Installing to /data/local/bin/ (A slot)…');
     // Each step checked individually instead of && chained — the original
@@ -5090,18 +5300,17 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     if (installedBytes.length !== buf.byteLength) {
       throw new Error(`Install verification failed: /data/local/bin/server_a is ${installedBytes.length.toLocaleString()} bytes on device, expected ${buf.byteLength.toLocaleString()}. The copy likely failed or was truncated — check free space on /data.`);
     }
-    addLog(`Verified: server → server_a (${installedBytes.length.toLocaleString()} bytes, matches pushed binary).`, 'ok');
+    addLog(`Verified: server → server_a (${installedBytes.length.toLocaleString()} bytes, matches pushed binary).`, LOG_TONE.OK);
 
     addLog('Fetching startup script from controller…');
-    const resp2 = await fetch(ingressPath('/api/provision/start_script'), { headers: { Authorization: `Bearer ${token}` } });
-    if (!resp2.ok) throw new Error(`Controller returned ${resp2.status}`);
+    const resp2 = await fetchProvision('/api/provision/start_script');
     const script = await resp2.text();
     // Same "Text file busy" risk as wificfg.sh — push + immediate chmod/exec
     // can race with the cat process. start_server.sh isn't executed
     // immediately here (only copied), so push() is safe for this one.
     await c.push('/sdcard/start_server.sh', new TextEncoder().encode(script));
     await c.shell("su -c 'cp /sdcard/start_server.sh /data/local/bin/start_server.sh && chmod 755 /data/local/bin/start_server.sh'");
-    addLog('EchoMuse installed.', 'ok');
+    addLog('EchoMuse installed.', LOG_TONE.OK);
 
     // Device-link TLS credentials — pushed pre-first-contact so the very
     // first connection this device ever makes to the controller is wss +
@@ -5113,19 +5322,14 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     addLog('Fetching device-link TLS credentials…');
     const serial = (await c.shell('getprop ro.serialno')).trim();
     if (!serial) {
-      addLog('Could not read device serial — skipping TLS credential install.', 'warn');
+      addLog('Could not read device serial — skipping TLS credential install.', LOG_TONE.WARN);
     } else {
-      const tlsResp = await fetch(ingressPath('/api/provision/tls_credentials'), {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ device_id: serial }),
-      });
-      if (tlsResp.status === 503) {
-        addLog('Controller has no TLS listener — device will connect over plain ws.', 'warn');
-      } else if (!tlsResp.ok) {
-        throw new Error(`Controller returned ${tlsResp.status} fetching TLS credentials.`);
+      const creds = await fetchProvision('/api/provision/tls_credentials', 'fetching TLS credentials.', {
+        method: 'POST', json: true, body: JSON.stringify({ device_id: serial }),
+      }).then(r => r.json(), e => { if (e.status === 503) return null; throw e; });
+      if (!creds) {
+        addLog('Controller has no TLS listener — device will connect over plain ws.', LOG_TONE.WARN);
       } else {
-        const creds = await tlsResp.json();
         await c.push('/sdcard/em-ca.pem', new TextEncoder().encode(creds.ca_pem));
         await c.push('/sdcard/em-token', new TextEncoder().encode(creds.token));
         await c.shell(`su -c 'mkdir -p ${creds.dir} && cp /sdcard/em-ca.pem ${creds.dir}/ca.pem && cp /sdcard/em-token ${creds.dir}/token && chmod 644 ${creds.dir}/ca.pem && chmod 600 ${creds.dir}/token && rm -f /sdcard/em-ca.pem /sdcard/em-token'`);
@@ -5133,7 +5337,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
         if (!tlsListing.includes('ca.pem') || !tlsListing.includes('token')) {
           throw new Error(`TLS credential install verification failed — ${creds.dir} contains: "${tlsListing}".`);
         }
-        addLog('TLS credentials installed — device will connect over wss.', 'ok');
+        addLog('TLS credentials installed — device will connect over wss.', LOG_TONE.OK);
       }
     }
     // Finish provisioning only after the binary, startup payload and TLS
@@ -5144,7 +5348,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     try { await c.shell('su -c reboot'); } catch {}
     await c.close();
     setAdb(null);
-    addLog('Device rebooting. It will appear in the controller dashboard within ~30s via mDNS.', 'ok');
+    addLog('Device rebooting. It will appear in the controller dashboard within ~30s via mDNS.', LOG_TONE.OK);
   }
 
   // ── Step executor ──
@@ -5158,12 +5362,12 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     const abandoned = () => epoch !== stepEpoch.current;
 
     setRunning(true);
-    markStep(stepIdx, 'running');
+    markStep(stepIdx, STEP_STATE.RUNNING);
     // One banner per step. The transcript is the only record of a provision
     // and people paste it when something goes wrong — without these it is a
     // single 200-line stream with no way to tell which step a message
     // belongs to, or which one a failure happened in.
-    addLog(`── ${stepIdx + 1}/${_WIZARD_STEPS.length}  ${_WIZARD_STEPS[stepIdx].label.toUpperCase()} ──`, 'head');
+    addLog(`── ${stepIdx + 1}/${_WIZARD_STEPS.length}  ${_WIZARD_STEPS[stepIdx].label.toUpperCase()} ──`, LOG_TONE.HEAD);
     let c = adb;
     try {
       // Every step but the three connection steps needs a live handle. Passing
@@ -5174,21 +5378,21 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
                       + 'device from the USB picker, then Retry this step.');
       }
       switch (stepIdx) {
-        case  0: c = await runConnectAndroid(); break;
-        case  1: c = await runConnectTwrp(); break;
-        case  2: await runPatchBoot(c); break;
-        case  3: await runInstallMagisk(c, magiskFile); break;
-        case  4: await runPreseedDb(c); break;
-        case  5: await runReboot(c); break;
-        case  6: c = await runReconnect(); break;
-        case  7: await runVerifyRoot(c); break;
-        case  8: await runDisableAlexa(c); break;
-        case  9: await runDebloat(c); break;
-        case 10: await runConfigWifi(c, wifiSsid, wifiPsk); break;
-        case 11: await runInstallEchoMuse(c, binaryFile, useLatest); break;
+        case STEP.CONNECT_ANDROID: c = await runConnectAndroid(); break;
+        case STEP.CONNECT_TWRP:    c = await runConnectTwrp(); break;
+        case STEP.PATCH_BOOT:      await runPatchBoot(c); break;
+        case STEP.INSTALL_MAGISK:  await runInstallMagisk(c, magiskFile); break;
+        case STEP.PRESEED_DB:      await runPreseedDb(c); break;
+        case STEP.REBOOT:          await runReboot(c); break;
+        case STEP.RECONNECT:       c = await runReconnect(); break;
+        case STEP.VERIFY_ROOT:     await runVerifyRoot(c); break;
+        case STEP.DISABLE_ALEXA:   await runDisableAlexa(c); break;
+        case STEP.DEBLOAT:         await runDebloat(c); break;
+        case STEP.WIFI:            await runConfigWifi(c, wifiSsid, wifiPsk); break;
+        case STEP.INSTALL_EM:      await runInstallEchoMuse(c, binaryFile, useLatest); break;
       }
       if (abandoned()) return;
-      markStep(stepIdx, 'done');
+      markStep(stepIdx, STEP_STATE.DONE);
       if (stepIdx < _WIZARD_STEPS.length - 1) setStep(stepIdx + 1);
     } catch (e) {
       // A step abandoned mid-flight may still throw on its way out, once the
@@ -5206,8 +5410,8 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
         setAdb(null);
         return;
       }
-      addLog(`Error: ${e.message}`, 'error');
-      markStep(stepIdx, 'error');
+      addLog(`Error: ${e.message}`, LOG_TONE.ERROR);
+      markStep(stepIdx, STEP_STATE.ERROR);
       if (e.matchedDeviceId) setDuplicateDeviceId(e.matchedDeviceId);
       // Collect device state while it is still the state that failed. A
       // duplicate-device stop is our own bookkeeping and has nothing to ask
@@ -5216,33 +5420,28 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
       // Clear the file selection on failure — forces a deliberate reselect
       // before retry rather than silently re-flashing whatever was picked
       // last time (which, on a hash-mismatch failure, is the wrong file).
-      if (stepIdx === 3) setMagiskFile(null);
-      if (stepIdx === 11) setBinaryFile(null);
+      if (stepIdx === STEP.INSTALL_MAGISK) setMagiskFile(null);
+      if (stepIdx === STEP.INSTALL_EM) setBinaryFile(null);
     }
     if (!abandoned()) setRunning(false);
   }
 
   // Auto-advance steps that need no user input once adb is connected.
-  // Step 8 (disable_alexa) is now before WiFi so Alexa can't phone home.
-  // Step 9 (debloat) rides the same connected-and-rooted state.
+  // Disable Alexa runs before WiFi so Alexa can't phone home; Debloat rides
+  // the same connected-and-rooted state.
   useEffect(() => {
-    const autoSteps = new Set([2, 4, 7, 8, 9]);
-    if (!autoSteps.has(step) || running || stepState[step] !== 'pending') return;
+    if (!AUTO_STEPS.has(step) || running || stepState[step] !== STEP_STATE.PENDING) return;
     if (adb) { runStep(step); return; }
     addLog(`"${_WIZARD_STEPS[step].label}" needs an ADB connection and there isn't one — `
-         + `reconnect the device and click Retry.`, 'error');
-    markStep(step, 'error');
+         + `reconnect the device and click Retry.`, LOG_TONE.ERROR);
+    markStep(step, STEP_STATE.ERROR);
   }, [step, running, adb]);
 
   const cur    = _WIZARD_STEPS[step];
-  const isDone = step === _WIZARD_STEPS.length - 1 && stepState[step] === 'done';
+  const isDone = step === _WIZARD_STEPS.length - 1 && stepState[step] === STEP_STATE.DONE;
 
   // Buttons are shown for manual steps; auto steps start themselves.
 
-  // Dashboard-palette step states — same tones the rest of the UI uses
-  // (accent slate for activity, deep green for done, rust for error).
-  const statusColors = { pending: 'var(--muted)', running: 'var(--accent)', done: 'var(--ok)', error: 'var(--warn)' };
-  const statusIcons  = { pending: '○', running: '◌', done: '●', error: '✕' };
 
   return (
     /* Same overlay + frame treatment as the Detail and Settings modals —
@@ -5253,7 +5452,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
       background: 'rgba(180,176,168,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center',
       backdropFilter: 'blur(8px)',
     }}>
-      <div style={{
+      <div role="dialog" aria-modal="true" aria-label="Provision Echo Dot" style={{
         background: 'linear-gradient(170deg,var(--raised),var(--surface))', border: '1px solid var(--border)',
         borderRadius: 16, width: 'min(900px,95vw)', height: 'min(700px,90vh)',
         display: 'flex', flexDirection: 'column', overflow: 'hidden',
@@ -5264,8 +5463,8 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
         {/* Header */}
         <div style={{ background: 'linear-gradient(180deg,var(--card),var(--bg))', borderBottom: '1px solid var(--border-hard)', padding: '20px 24px 16px', boxShadow: '0 1px 0 var(--sheen) inset', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <div>
-            <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 22, fontWeight: 600, color: 'var(--text)', letterSpacing: '-0.02em' }}>Provision Echo Dot</div>
-            <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: 'var(--muted)', letterSpacing: '0.12em', textTransform: 'uppercase', marginTop: 4 }}>Chrome/Edge only · USB-A cable · amonet-biscuit prerequisite</div>
+            <div style={{ fontFamily: SANS, fontSize: 22, fontWeight: 600, color: 'var(--text)', letterSpacing: '-0.02em' }}>Provision Echo Dot</div>
+            <div style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)', letterSpacing: '0.12em', textTransform: 'uppercase', marginTop: 4 }}>Chrome/Edge only · USB-A cable · amonet-biscuit prerequisite</div>
           </div>
           <CircleButton onClick={onClose} title="Close">×</CircleButton>
         </div>
@@ -5284,8 +5483,8 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
                     cursor: 'default',
                     opacity: running && !active ? 0.5 : 1,
                   }}>
-                  <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, color: statusColors[st], flexShrink: 0 }}>{statusIcons[st]}</span>
-                  <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: active ? 'var(--text)' : 'var(--muted)', letterSpacing: '0.04em', lineHeight: 1.4 }}>{s.label}</span>
+                  <span style={{ fontFamily: MONO, fontSize: 11, color: STEP_STATE_STYLE[st].color, flexShrink: 0 }}>{STEP_STATE_STYLE[st].icon}</span>
+                  <span style={{ fontFamily: MONO, fontSize: 9, color: active ? 'var(--text)' : 'var(--muted)', letterSpacing: '0.04em', lineHeight: 1.4 }}>{s.label}</span>
                 </div>
               );
             })}
@@ -5296,84 +5495,84 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
 
             {/* Step title + desc */}
             <div style={{ marginBottom: 14 }}>
-              <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 14, fontWeight: 600, color: 'var(--text)', marginBottom: 4 }}>{cur.label}</div>
-              <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: 'var(--muted)' }}>{cur.desc}</div>
+              <div style={{ fontFamily: SANS, fontSize: 14, fontWeight: 600, color: 'var(--text)', marginBottom: 4 }}>{cur.label}</div>
+              <div style={{ fontFamily: MONO, fontSize: 10, color: 'var(--muted)' }}>{cur.desc}</div>
             </div>
 
             {/* ── Step-specific controls ── */}
 
-            {/* Steps 0, 1, 6: connect / reconnect buttons */}
-            {CONNECT_STEPS.has(step) && stepState[step] === 'pending' && !running && (
+            {/* Connect / reconnect buttons */}
+            {CONNECT_STEPS.has(step) && stepState[step] === STEP_STATE.PENDING && !running && (
               <div style={{ marginBottom: 10 }}>
                 <Pill onClick={() => runStep(step)}>
-                  {step === 0 ? 'Connect Device' : step === 1 ? 'Connect to TWRP' : 'Reconnect Device'}
+                  {step === STEP.CONNECT_ANDROID ? 'Connect Device' : step === STEP.CONNECT_TWRP ? 'Connect to TWRP' : 'Reconnect Device'}
                 </Pill>
               </div>
             )}
 
-            {/* Step 5: reboot button */}
-            {step === 5 && stepState[5] === 'pending' && !running && (
+            {/* Reboot button */}
+            {step === STEP.REBOOT && stepState[STEP.REBOOT] === STEP_STATE.PENDING && !running && (
               <div style={{ marginBottom: 10 }}>
-                <Pill onClick={() => runStep(5)}>Reboot to Android</Pill>
+                <Pill onClick={() => runStep(STEP.REBOOT)}>Reboot to Android</Pill>
               </div>
             )}
 
-            {/* Step 3: Magisk zip file picker — stays visible through error so a
+            {/* Magisk zip file picker — stays visible through error so a
                 different file can be picked, not just gone after one attempt */}
-            {step === 3 && stepState[3] !== 'done' && !running && (
+            {step === STEP.INSTALL_MAGISK && stepState[STEP.INSTALL_MAGISK] !== STEP_STATE.DONE && !running && (
               <div style={{ marginBottom: 12, display: 'flex', flexDirection: 'column', gap: 8 }}>
-                <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: 'var(--text2)', letterSpacing: '0.08em' }}>
-                  {stepState[3] === 'error' ? 'SELECT A DIFFERENT FILE' : 'MAGISK-V17.3.ZIP'}
+                <div style={{ fontFamily: MONO, fontSize: 9, color: 'var(--text2)', letterSpacing: '0.08em' }}>
+                  {stepState[STEP.INSTALL_MAGISK] === STEP_STATE.ERROR ? 'SELECT A DIFFERENT FILE' : 'MAGISK-V17.3.ZIP'}
                 </div>
                 <input
-                  type="file" accept=".zip"
+                  type="file" accept=".zip" aria-label="Magisk zip"
                   onChange={e => setMagiskFile(e.target.files[0])}
-                  style={{ fontFamily: "'DM Mono',monospace", fontSize: 11 }}
+                  style={{ fontFamily: MONO, fontSize: 11 }}
                 />
-                {!!magiskFile && <Pill onClick={() => runStep(3)}>Flash Magisk</Pill>}
+                {!!magiskFile && <Pill onClick={() => runStep(STEP.INSTALL_MAGISK)}>Flash Magisk</Pill>}
               </div>
             )}
 
-            {/* Step 11: EchoMuse binary — custom upload or latest from controller.
+            {/* EchoMuse binary — custom upload or latest from controller.
                 Stays visible through error so a different file/source can be
                 tried instead of being stuck retrying whatever failed. */}
-            {step === 11 && stepState[11] !== 'done' && !running && (
+            {step === STEP.INSTALL_EM && stepState[STEP.INSTALL_EM] !== STEP_STATE.DONE && !running && (
               <div style={{ marginBottom: 12, display: 'flex', flexDirection: 'column', gap: 10 }}>
                 <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-                  <Pill accent onClick={() => runStep(11, true)}>Install latest from GitHub</Pill>
+                  <Pill accent onClick={() => runStep(STEP.INSTALL_EM, true)}>Install latest from GitHub</Pill>
                   <Pill small onClick={doCheckRelease} disabled={checkingRelease}>
                     {checkingRelease ? 'Checking…' : 'Check for newer release'}
                   </Pill>
                   {latestRelease && (
-                    <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: 'var(--muted)' }}>
+                    <span style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)' }}>
                       Latest on GitHub: {latestRelease.version}
                     </span>
                   )}
                 </div>
-                <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: 'var(--muted)', letterSpacing: '0.04em' }}>— or —</div>
-                <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: 'var(--text2)', letterSpacing: '0.08em' }}>
-                  {stepState[11] === 'error' ? 'SELECT A DIFFERENT BUILD (ARMv7)' : 'CUSTOM ECHOMUSE SERVER BINARY (ARMv7)'}
+                <div style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)', letterSpacing: '0.04em' }}>— or —</div>
+                <div style={{ fontFamily: MONO, fontSize: 9, color: 'var(--text2)', letterSpacing: '0.08em' }}>
+                  {stepState[STEP.INSTALL_EM] === STEP_STATE.ERROR ? 'SELECT A DIFFERENT BUILD (ARMv7)' : 'CUSTOM ECHOMUSE SERVER BINARY (ARMv7)'}
                 </div>
                 <input
-                  type="file"
+                  type="file" aria-label="EchoMuse server binary"
                   onChange={e => setBinaryFile(e.target.files[0])}
-                  style={{ fontFamily: "'DM Mono',monospace", fontSize: 11 }}
+                  style={{ fontFamily: MONO, fontSize: 11 }}
                 />
-                {!!binaryFile && <Pill onClick={() => runStep(11, false)}>Install Custom Build</Pill>}
+                {!!binaryFile && <Pill onClick={() => runStep(STEP.INSTALL_EM, false)}>Install Custom Build</Pill>}
               </div>
             )}
 
-            {/* Step 10: WiFi configuration */}
-            {step === 10 && stepState[10] !== 'done' && !running && (
+            {/* WiFi configuration */}
+            {step === STEP.WIFI && stepState[STEP.WIFI] !== STEP_STATE.DONE && !running && (
               <WifiPanel
                 adb={adb}
                 wifiSsid={wifiSsid} setWifiSsid={setWifiSsid}
                 wifiPsk={wifiPsk}   setWifiPsk={setWifiPsk}
-                onScan={() => scanWifi(adb).then(nets => setWifiNetworks(nets)).catch(e => addLog(`Scan failed: ${e.message}`, 'error'))}
+                onScan={() => scanWifi(adb).then(nets => setWifiNetworks(nets)).catch(e => addLog(`Scan failed: ${e.message}`, LOG_TONE.ERROR))}
                 networks={wifiNetworks}
-                onConnect={() => { if (wifiSsid) runStep(10); }}
-                onSkip={() => { markStep(10, 'done'); setStep(11); }}
-                onAbort={() => { markStep(10, 'error'); addLog('WiFi skipped — provision incomplete.', 'warn'); }}
+                onConnect={() => { if (wifiSsid) runStep(STEP.WIFI); }}
+                onSkip={() => { markStep(STEP.WIFI, STEP_STATE.DONE); setStep(STEP.INSTALL_EM); }}
+                onAbort={() => { markStep(STEP.WIFI, STEP_STATE.ERROR); addLog('WiFi skipped — provision incomplete.', LOG_TONE.WARN); }}
               />
             )}
 
@@ -5396,7 +5595,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
                 complete retry path with fresh input, so a second generic
                 "Retry" here would just compete with it and, for the file
                 steps, retry with no file selected (since failure clears it). */}
-            {!running && stepState[step] === 'error' && ![3, 10, 11].includes(step) && (
+            {!running && stepState[step] === STEP_STATE.ERROR && !INPUT_STEPS.has(step) && (
               <div style={{ marginBottom: 10, display: 'flex', gap: 8 }}>
                 <Pill onClick={() => runStep(step)}>Retry</Pill>
                 {/* Reachable from every step, not just the connection ones.
@@ -5413,15 +5612,15 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
                 {diagnostics && (
                   <Pill onClick={downloadDiagnostics}>Download diagnostics</Pill>
                 )}
-                {step === 0 && duplicateDeviceId && (
+                {step === STEP.CONNECT_ANDROID && duplicateDeviceId && (
                   <Pill danger onClick={async () => {
                     try {
                       await API.del(`/api/devices/${duplicateDeviceId}`);
-                      addLog(`Deleted "${duplicateDeviceId}" from controller. You can retry now.`, 'ok');
+                      addLog(`Deleted "${duplicateDeviceId}" from controller. You can retry now.`, LOG_TONE.OK);
                       setDuplicateDeviceId(null);
-                      markStep(0, 'pending');
+                      markStep(STEP.CONNECT_ANDROID, STEP_STATE.PENDING);
                     } catch (e) {
-                      addLog(`Delete failed: ${e.error || e.message || 'unknown error'} — check /api/devices/{id} DELETE exists in em_api.py.`, 'error');
+                      addLog(`Delete failed: ${e.error || e.message || 'unknown error'} — check /api/devices/{id} DELETE exists in em_api.py.`, LOG_TONE.ERROR);
                     }
                   }}>Delete "{duplicateDeviceId}" from controller</Pill>
                 )}
@@ -5431,8 +5630,8 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
             {/* The file steps run their own buttons above and are excluded
                 from the Retry block, which left them with no way to reconnect
                 either. A dead handle is a dead handle whichever step is
-                showing, and step 11 pushes 10MB over that handle. */}
-            {!running && stepState[step] === 'error' && [3, 10, 11].includes(step) && (
+                showing, and Install EchoMuse pushes 10MB over that handle. */}
+            {!running && stepState[step] === STEP_STATE.ERROR && INPUT_STEPS.has(step) && (
               <div style={{ marginBottom: 10, display: 'flex', gap: 8 }}>
                 <Pill onClick={reconnectAdb}>{adb ? 'Reconnect' : 'Reconnect device'}</Pill>
                 {diagnostics && (
@@ -5444,7 +5643,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
             {/* Progress bar — accent slate, same as toggles/sliders */}
             {progress && (
               <div style={{ margin: '6px 0 10px' }}>
-                <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: 'var(--muted)', marginBottom: 4 }}>{progress.label}</div>
+                <div style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)', marginBottom: 4 }}>{progress.label}</div>
                 <div style={{ height: 4, background: 'var(--sunken)', borderRadius: 2 }}>
                   <div style={{ height: '100%', width: `${Math.min(100, (progress.pct || 0) * 100).toFixed(0)}%`, background: 'var(--accent)', borderRadius: 2, transition: 'width 0.2s' }}/>
                 </div>
@@ -5454,7 +5653,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
             {/* Done message */}
             {isDone && (
               <div style={{ margin: '6px 0 10px', display: 'flex', flexDirection: 'column', gap: 10 }}>
-                <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, color: 'var(--ok)', lineHeight: 1.7 }}>
+                <div style={{ fontFamily: MONO, fontSize: 11, color: 'var(--ok)', lineHeight: 1.7 }}>
                   Provisioning complete. The device has rebooted and will discover the controller via mDNS,
                   appearing in the dashboard as a pending device within ~30s.
                 </div>
@@ -5468,7 +5667,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
                 when something needs diagnosing. Selecting it by hand out of a
                 scrolling box loses the top of it. */}
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginTop: 10 }}>
-              <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.15em' }}>
+              <span style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.15em' }}>
                 Output{log.length > 0 ? ` — ${log.length} lines` : ''}
               </span>
               {log.length > 0 && (
@@ -5476,7 +5675,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
                   const text = log.map(e => e.msg).join('\n');
                   navigator.clipboard.writeText(text)
                     .then(() => addLog('(transcript copied to clipboard)'))
-                    .catch(() => addLog('Clipboard blocked by the browser — select the text manually.', 'warn'));
+                    .catch(() => addLog('Clipboard blocked by the browser — select the text manually.', LOG_TONE.WARN));
                 }}>Copy log</Pill>
               )}
             </div>
@@ -5488,19 +5687,19 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
                 border: '1px solid var(--lcd-line)', borderRadius: 8,
                 boxShadow: 'inset 0 2px 6px rgba(0,0,0,0.5)',
                 padding: '10px 14px',
-                fontFamily: "'DM Mono',monospace", fontSize: 10, lineHeight: 1.7,
+                fontFamily: MONO, fontSize: 10, lineHeight: 1.7,
                 marginTop: 10,
               }}
             >
               {log.length === 0
                 ? <span style={{ color: 'var(--lcd-faint)' }}>— no output yet —</span>
                 : log.map((e, i) => (
-                  // 'head' is a step banner, not output — it is what turns 200
+                  // HEAD is a step banner, not output — it is what turns 200
                   // undifferentiated lines into something you can scan for the
                   // step that went wrong.
-                  <div key={i} style={e.type === 'head'
+                  <div key={i} style={e.type === LOG_TONE.HEAD
                     ? { color: 'var(--accent-lit)', letterSpacing: '0.12em', marginTop: i === 0 ? 0 : 10, paddingTop: 6, borderTop: i === 0 ? 'none' : '1px solid var(--lcd-faint)' }
-                    : { color: e.type === 'error' ? 'var(--error)' : e.type === 'ok' ? 'var(--ok)' : e.type === 'warn' ? 'var(--warn)' : 'var(--lcd-green)' }}>
+                    : { color: LOG_TONE_COLOR[e.type] || 'var(--lcd-green)' }}>
                     {e.msg}
                   </div>
                 ))
@@ -5513,13 +5712,8 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
   );
 }
 
-// ─── App ──────────────────────────────────────────────────────────────────────
-
 // ─── DeviceConfigForm ─────────────────────────────────────────────────────────
-// Shared config form used by both the per-device config tab and the global
-// settings panel. disabled=true renders all controls read-only.
-
-// ─── DeviceConfigForm ─────────────────────────────────────────────────────────
+// Shared by the per-device Config tab and the fleet settings panel.
 // The config rendered as the actual signal path: numbered stages from the
 // microphones to the speaker, each labelled with WHERE it runs (device /
 // controller) and WHAT it affects (wake stream / button turns / playback).
@@ -5536,7 +5730,7 @@ function ScopeChip({ children, tone }) {
   }[tone || 'scope'];
   return (
     <span style={{
-      fontFamily: "'DM Mono',monospace", fontSize: 8, textTransform: 'uppercase',
+      fontFamily: MONO, fontSize: 8, textTransform: 'uppercase',
       letterSpacing: '0.1em', padding: '3px 8px', borderRadius: 4,
       background: colors.bg, border: `1px solid ${colors.border}`, color: colors.text,
       whiteSpace: 'nowrap',
@@ -5552,7 +5746,7 @@ function EqSliders({ bands, onChange, disabled }) {
     <div style={{ display: 'flex', justifyContent: 'space-between', gap: 2, ...(disabled ? { opacity: 0.45, pointerEvents: 'none' } : {}) }}>
       {bands.map((g, i) => (
         <div key={i} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', flex: 1, minWidth: 0 }}>
-          <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 8, color: g !== 0 ? 'var(--accent)' : 'var(--muted)', marginBottom: 2, fontWeight: g !== 0 ? 600 : 400 }}>
+          <div style={{ fontFamily: MONO, fontSize: 8, color: g !== 0 ? 'var(--accent)' : 'var(--muted)', marginBottom: 2, fontWeight: g !== 0 ? 600 : 400 }}>
             {(g > 0 ? '+' : '') + g}
           </div>
           {/* Native vertical slider via writing-mode — a rotate() transform
@@ -5560,9 +5754,10 @@ function EqSliders({ bands, onChange, disabled }) {
               stays in the untransformed axis, so only clicks land).
               orient="vertical" covers older Firefox. */}
           <input type="range" min={-12} max={12} step={1} value={g} orient="vertical"
+            aria-label={`${FREQ_LABELS[i]} Hz band`}
             onChange={e => { const nb = [...bands]; nb[i] = Number(e.target.value); onChange(nb); }}
             style={{ writingMode: 'vertical-lr', direction: 'rtl', WebkitAppearance: 'slider-vertical', width: 20, height: 76, cursor: 'pointer' }}/>
-          <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 8, color: 'var(--muted)', marginTop: 2 }}>{FREQ_LABELS[i]}</div>
+          <div style={{ fontFamily: MONO, fontSize: 8, color: 'var(--muted)', marginTop: 2 }}>{FREQ_LABELS[i]}</div>
         </div>
       ))}
     </div>
@@ -5572,7 +5767,6 @@ function EqSliders({ bands, onChange, disabled }) {
 // Stage / StageAdvanced — module-scope so React preserves component
 // identity across DeviceConfigForm renders (inner definitions would remount
 // the subtree every render, breaking slider drags mid-gesture).
-const STAGE_MONO = "'DM Mono',monospace";
 
 // Mirror of em_config_sections.SECTIONS — which config keys each stage owns,
 // so a stage can be scoped to the fleet or to this device independently.
@@ -5645,7 +5839,7 @@ function ScopeToggle({ local, onChange, disabled }) {
       disabled={disabled}
       onClick={() => !disabled && onChange(next)}
       style={{
-        fontFamily: STAGE_MONO, fontSize: 9, letterSpacing: '0.1em',
+        fontFamily: MONO, fontSize: 9, letterSpacing: '0.1em',
         textTransform: 'uppercase', padding: '4px 10px', border: 'none',
         cursor: disabled ? 'default' : 'pointer',
         background: active ? (next ? SCOPE_DEVICE : SCOPE_FLEET) : 'transparent',
@@ -5657,7 +5851,7 @@ function ScopeToggle({ local, onChange, disabled }) {
   return (
     <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7, opacity: disabled ? 0.5 : 1 }}>
       <span style={{
-        fontFamily: STAGE_MONO, fontSize: 8, letterSpacing: '0.12em',
+        fontFamily: MONO, fontSize: 8, letterSpacing: '0.12em',
         textTransform: 'uppercase', color: 'var(--muted)',
       }}>Scope</span>
       <span style={{
@@ -5677,12 +5871,12 @@ function Stage({ n, title, chips, desc, children, scope, dim }) {
     <Panel>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 6, flexWrap: 'wrap' }}>
         <div style={{ display: 'flex', alignItems: 'baseline', gap: 10 }}>
-          <span style={{ fontFamily: STAGE_MONO, fontSize: 10, color: 'var(--muted)' }}>{n}</span>
-          <span style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 14, fontWeight: 600, color: 'var(--text)' }}>{title}</span>
+          <span style={{ fontFamily: MONO, fontSize: 10, color: 'var(--muted)' }}>{n}</span>
+          <span style={{ fontFamily: SANS, fontSize: 14, fontWeight: 600, color: 'var(--text)' }}>{title}</span>
         </div>
         <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>{chips}{scope}</div>
       </div>
-      <div style={{ fontFamily: STAGE_MONO, fontSize: 10, color: 'var(--muted)', lineHeight: 1.6, marginBottom: 14 }}>{desc}</div>
+      <div style={{ fontFamily: MONO, fontSize: 10, color: 'var(--muted)', lineHeight: 1.6, marginBottom: 14 }}>{desc}</div>
       {/* dim: a section following the fleet is shown read-only rather than
           hidden, so you can still see what it is inheriting. */}
       <div style={dim}>{children}</div>
@@ -5693,13 +5887,7 @@ function Stage({ n, title, chips, desc, children, scope, dim }) {
 function StageAdvanced({ open, onToggle, disabledStyle, children }) {
   return (
     <div style={{ marginTop: 14, borderTop: '1px solid var(--hairline)', paddingTop: 10 }}>
-      <div onClick={onToggle} style={{
-        fontFamily: STAGE_MONO, fontSize: 9, color: 'var(--muted)', textTransform: 'uppercase',
-        letterSpacing: '0.15em', cursor: 'pointer', userSelect: 'none',
-        display: 'flex', alignItems: 'center', gap: 6,
-      }}>
-        <span>{open ? '▾' : '▸'}</span> Advanced
-      </div>
+      <DisclosureToggle open={open} onToggle={onToggle}>Advanced</DisclosureToggle>
       {open && <div style={{ marginTop: 14, ...disabledStyle }}>{children}</div>}
     </div>
   );
@@ -5717,7 +5905,6 @@ function WakeModelPicker({ value, onChange, disabled }) {
   });
   const [uploading, setUploading] = useState(false);
   const [validation, setValidation] = useState(null);
-  const mono = "'DM Mono',monospace";
 
   async function upload() {
     if (!graph || !sidecar) {
@@ -5759,23 +5946,24 @@ function WakeModelPicker({ value, onChange, disabled }) {
           const selected = value === m.graph_sha256;
           const probe = Math.max(...Object.values(m.probe || {}).map(Number).filter(Number.isFinite), 0);
           return (
-            <div key={m.graph_sha256} onClick={() => !disabled && onChange(m.graph_sha256)} style={{
+            <div key={m.graph_sha256} {...pressable(() => onChange(m.graph_sha256), { disabled, selected })} style={{
               background:selected ? 'linear-gradient(160deg,var(--accent-tint),var(--accent-line))' : 'linear-gradient(160deg,var(--raised),var(--surface))',
               border:`1px solid ${selected ? 'var(--accent)' : 'var(--border-soft)'}`,
               borderRadius:8, padding:'10px 12px', cursor:disabled ? 'default' : 'pointer', position:'relative',
             }}>
               <div style={{ display:'flex', justifyContent:'space-between', gap:8 }}>
-                <div style={{ fontFamily:"'DM Sans',sans-serif", fontSize:12, fontWeight:600, color:'var(--text2)' }}>{m.wake_phrase}</div>
-                {m.active && <span style={{ fontFamily:mono, fontSize:8, color:'var(--ok)', textTransform:'uppercase' }}>active</span>}
+                <div style={{ fontFamily:SANS, fontSize:12, fontWeight:600, color:'var(--text2)' }}>{m.wake_phrase}</div>
+                {m.active && <span style={{ fontFamily:MONO, fontSize:8, color:'var(--ok)', textTransform:'uppercase' }}>active</span>}
               </div>
-              <div style={{ fontFamily:mono, fontSize:9, color:'var(--muted)', marginTop:3 }}>graph {shortSha(m.graph_sha256)} · sidecar {shortSha(m.sidecar_sha256)}</div>
-              <div style={{ fontFamily:mono, fontSize:8, color:'var(--muted)', marginTop:6, lineHeight:1.5 }}>
+              <div style={{ fontFamily:MONO, fontSize:9, color:'var(--muted)', marginTop:3 }}>graph {shortSha(m.graph_sha256)} · sidecar {shortSha(m.sidecar_sha256)}</div>
+              <div style={{ fontFamily:MONO, fontSize:8, color:'var(--muted)', marginTop:6, lineHeight:1.5 }}>
                 idle {m.thresholds.idle.toFixed(2)} · playback {m.thresholds.playback.toFixed(2)}<br/>
                 reference {m.thresholds.reference.toFixed(2)} · near miss {m.thresholds.near_miss.toFixed(2)}<br/>
                 validation probe max {probe.toFixed(4)}
               </div>
               {!disabled && !selected && !(m.in_use_by || []).length && (
-                <button onClick={e => { e.stopPropagation(); remove(m); }} title="Delete model"
+                <button type="button" onClick={e => { e.stopPropagation(); remove(m); }} title="Delete model"
+                  aria-label={`Delete model ${m.wake_phrase}`}
                   style={{ position:'absolute', right:7, bottom:5, background:'none', border:'none', color:'var(--muted)', cursor:'pointer' }}>×</button>
               )}
             </div>
@@ -5783,37 +5971,37 @@ function WakeModelPicker({ value, onChange, disabled }) {
         })}
         {missing && (
           <div style={{ border:'1px solid var(--error)', borderRadius:8, padding:'10px 12px' }}>
-            <div style={{ fontFamily:mono, fontSize:10, color:'var(--error)' }}>Missing registry model</div>
-            <div style={{ fontFamily:mono, fontSize:9, color:'var(--muted)', marginTop:3 }}>{value}</div>
+            <div style={{ fontFamily:MONO, fontSize:10, color:'var(--error)' }}>Missing registry model</div>
+            <div style={{ fontFamily:MONO, fontSize:9, color:'var(--muted)', marginTop:3 }}>{value}</div>
           </div>
         )}
-        <div onClick={() => !disabled && setUploadOpen(x => !x)} style={{
+        <div {...pressable(() => setUploadOpen(x => !x), { disabled })} aria-expanded={uploadOpen} style={{
           border:'1px dashed var(--border-hard)', borderRadius:8, padding:'10px 12px',
           cursor:disabled ? 'default' : 'pointer', background:'var(--surface)',
         }}>
-          <div style={{ fontFamily:"'DM Sans',sans-serif", fontSize:12, fontWeight:600, color:'var(--text2)' }}>+ BCResNet model</div>
-          <div style={{ fontFamily:mono, fontSize:9, color:'var(--muted)', marginTop:3 }}>upload and validate graph + sidecar</div>
+          <div style={{ fontFamily:SANS, fontSize:12, fontWeight:600, color:'var(--text2)' }}>+ BCResNet model</div>
+          <div style={{ fontFamily:MONO, fontSize:9, color:'var(--muted)', marginTop:3 }}>upload and validate graph + sidecar</div>
         </div>
       </div>
       {uploadOpen && (
         <div style={{ marginTop:12, border:'1px solid var(--border-soft)', borderRadius:8, padding:12 }}>
           <div className="em-grid2" style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:12 }}>
-            <label style={{ fontFamily:mono, fontSize:9, color:'var(--text2)' }}>ONNX graph
+            <label style={{ fontFamily:MONO, fontSize:9, color:'var(--text2)' }}>ONNX graph
               <input type="file" accept=".onnx" onChange={e => setGraph(e.target.files[0] || null)} style={{ display:'block', marginTop:5, maxWidth:'100%' }}/>
             </label>
-            <label style={{ fontFamily:mono, fontSize:9, color:'var(--text2)' }}>JSON sidecar
+            <label style={{ fontFamily:MONO, fontSize:9, color:'var(--text2)' }}>JSON sidecar
               <input type="file" accept=".json" onChange={e => setSidecar(e.target.files[0] || null)} style={{ display:'block', marginTop:5, maxWidth:'100%' }}/>
             </label>
-            <label style={{ fontFamily:mono, fontSize:9, color:'var(--text2)' }}>Wake phrase
+            <label style={{ fontFamily:MONO, fontSize:9, color:'var(--text2)' }}>Wake phrase
               <input value={wakePhrase} onChange={e => setWakePhrase(e.target.value)} style={{ display:'block', width:'100%', marginTop:5, boxSizing:'border-box' }}/>
             </label>
-            <label style={{ fontFamily:mono, fontSize:9, color:'var(--text2)' }}>Verification core
+            <label style={{ fontFamily:MONO, fontSize:9, color:'var(--text2)' }}>Verification core
               <input value={verifyCore} onChange={e => setVerifyCore(e.target.value)} style={{ display:'block', width:'100%', marginTop:5, boxSizing:'border-box' }}/>
             </label>
           </div>
           <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:8, marginTop:12 }}>
             {Object.entries(thresholds).map(([key, v]) => (
-              <label key={key} style={{ fontFamily:mono, fontSize:8, color:'var(--muted)' }}>{key.replace('_',' ')}
+              <label key={key} style={{ fontFamily:MONO, fontSize:8, color:'var(--muted)' }}>{key.replace('_',' ')}
                 <input type="number" min="0.01" max="0.99" step="0.01" value={v}
                   onChange={e => setThresholds(t => ({ ...t, [key]:Number(e.target.value) }))}
                   style={{ display:'block', width:'100%', marginTop:4, boxSizing:'border-box' }}/>
@@ -5822,30 +6010,26 @@ function WakeModelPicker({ value, onChange, disabled }) {
           </div>
           <div style={{ display:'flex', alignItems:'center', gap:10, marginTop:12 }}>
             <Pill accent disabled={uploading || !graph || !sidecar} onClick={upload}>{uploading ? 'Validating…' : 'Validate & add'}</Pill>
-            <span style={{ fontFamily:mono, fontSize:9, color:'var(--muted)' }}>Validation checks graph IO, sidecar agreement and silence/noise/tone probes.</span>
+            <span style={{ fontFamily:MONO, fontSize:9, color:'var(--muted)' }}>Validation checks graph IO, sidecar agreement and silence/noise/tone probes.</span>
           </div>
-          {validation && <div style={{ marginTop:10, fontFamily:mono, fontSize:9, color:validation.ok ? 'var(--ok)' : 'var(--error)' }}>{validation.text}</div>}
+          {validation && <div style={{ marginTop:10, fontFamily:MONO, fontSize:9, color:validation.ok ? 'var(--ok)' : 'var(--error)' }}>{validation.text}</div>}
         </div>
       )}
     </div>
   );
 }
 
+// The sound catalog (GET /api/sounds).
 function useSounds() {
-  const [catalog, setCatalog] = useState({ sounds:[], default_id:'default', unresolved:[], loaded:false });
-  const reload = useCallback(async () => {
-    try { setCatalog({ ...(await API.get('/api/sounds')), loaded:true }); } catch {}
-  }, []);
-  useEffect(() => { reload(); }, [reload]);
-  return [catalog, reload];
+  return useCatalog('/api/sounds', SOUND_CATALOG_EMPTY);
 }
+const SOUND_CATALOG_EMPTY = Object.freeze({ sounds: [], default_id: 'default', unresolved: [] });
 
 function SoundPicker({ label, configKey, value, onChange, disabled, catalog, reload, deviceId, deviceConnected, capabilities }) {
   const fileRef = useRef(null);
   const [previewing, setPreviewing] = useState(null);
   const [message, setMessage] = useState(null);
-  const mono = "'DM Mono',monospace";
-  const previewGap = deviceId && !deviceConnected ? 'device offline' : capabilityGap(capabilities, 'render_progress_v1');
+  const previewGap = deviceId && !deviceConnected ? 'device offline' : capabilityGap(capabilities, CAPABILITY.RENDER_PROGRESS);
   const missing = catalog.loaded && value && !catalog.sounds.some(s => s.id === value);
   // §18.4: an unresolvable effective sound stays stored but rings the
   // device's built-in fallback; em_sounds reports it per config scope.
@@ -5887,50 +6071,51 @@ function SoundPicker({ label, configKey, value, onChange, disabled, catalog, rel
 
   return (
     <div style={{ marginBottom:16 }}>
-      <div style={{ fontFamily:mono, fontSize:10, color:'var(--text2)', marginBottom:7 }}>{label}</div>
+      <div style={{ fontFamily:MONO, fontSize:10, color:'var(--text2)', marginBottom:7 }}>{label}</div>
       <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fill,minmax(140px,1fr))', gap:8 }}>
-        <div onClick={() => !disabled && onChange('')} style={{
+        <div {...pressable(() => onChange(''), { disabled, selected: !value })} style={{
           background:!value ? 'linear-gradient(160deg,var(--accent-tint),var(--accent-line))' : 'var(--surface)',
           border:`1px solid ${!value ? 'var(--accent)' : 'var(--border-soft)'}`, borderRadius:8, padding:'8px 10px',
           cursor:disabled ? 'default' : 'pointer',
         }}>
-          <div style={{ fontFamily:"'DM Sans',sans-serif", fontSize:12, fontWeight:600, color:'var(--text2)' }}>Default</div>
-          <div style={{ fontFamily:mono, fontSize:8, color:'var(--muted)', marginTop:3 }}>catalog “{catalog.default_id || 'default'}”, then built-in fallback</div>
+          <div style={{ fontFamily:SANS, fontSize:12, fontWeight:600, color:'var(--text2)' }}>Default</div>
+          <div style={{ fontFamily:MONO, fontSize:8, color:'var(--muted)', marginTop:3 }}>catalog “{catalog.default_id || 'default'}”, then built-in fallback</div>
         </div>
         {[...catalog.sounds, ...(missing ? [{ id:value, missing:true }] : [])].map(s => (
-          <div key={s.id} onClick={() => !disabled && onChange(s.id)} style={{
+          <div key={s.id} {...pressable(() => onChange(s.id), { disabled, selected: value === s.id })} style={{
             background:value === s.id ? 'linear-gradient(160deg,var(--accent-tint),var(--accent-line))' : 'var(--surface)',
             border:`1px solid ${value === s.id ? 'var(--accent)' : s.missing ? 'var(--error)' : 'var(--border-soft)'}`,
             borderRadius:8, padding:'8px 10px', position:'relative', cursor:disabled ? 'default' : 'pointer',
           }}>
-            <div style={{ fontFamily:"'DM Sans',sans-serif", fontSize:12, fontWeight:600, color:'var(--text2)' }}>{s.id}</div>
-            <div style={{ fontFamily:mono, fontSize:8, color:s.missing ? 'var(--error)' : 'var(--muted)', marginTop:3 }}>
+            <div style={{ fontFamily:SANS, fontSize:12, fontWeight:600, color:'var(--text2)' }}>{s.id}</div>
+            <div style={{ fontFamily:MONO, fontSize:8, color:s.missing ? 'var(--error)' : 'var(--muted)', marginTop:3 }}>
               {s.missing ? 'missing — built-in fallback'
                 : `${s.seconds != null ? `${s.seconds}s` : 'duration unavailable'}${s.shortened ? ' · shortened to 10s' : ''}`}
             </div>
             {!disabled && !s.missing && value !== s.id && (
-              <button onClick={e => { e.stopPropagation(); remove(s); }} title="Delete sound"
+              <button type="button" onClick={e => { e.stopPropagation(); remove(s); }} title="Delete sound"
+                aria-label={`Delete sound ${s.id}`}
                 style={{ position:'absolute', top:3, right:5, background:'none', border:'none', color:'var(--muted)', cursor:'pointer' }}>×</button>
             )}
             {deviceId && !s.missing && (
-              <button onClick={e => { e.stopPropagation(); preview(s.id); }} disabled={!!previewGap}
+              <button type="button" onClick={e => { e.stopPropagation(); preview(s.id); }} disabled={!!previewGap}
                 title={previewGap || 'Play this sound once on the device'}
-                style={{ marginTop:7, background:'none', border:'none', padding:0, fontFamily:mono, fontSize:8, color:previewGap ? 'var(--muted)' : 'var(--accent)', cursor:previewGap ? 'default' : 'pointer' }}>
+                style={{ marginTop:7, background:'none', border:'none', padding:0, fontFamily:MONO, fontSize:8, color:previewGap ? 'var(--muted)' : 'var(--accent)', cursor:previewGap ? 'default' : 'pointer' }}>
                 {previewing === s.id ? '■ stop preview' : '▶ preview'}
               </button>
             )}
           </div>
         ))}
-        <div onClick={() => !disabled && fileRef.current?.click()} style={{ border:'1px dashed var(--border-hard)', borderRadius:8, padding:'8px 10px', cursor:disabled ? 'default' : 'pointer' }}>
-          <div style={{ fontFamily:"'DM Sans',sans-serif", fontSize:12, fontWeight:600, color:'var(--text2)' }}>+ Upload sound</div>
-          <div style={{ fontFamily:mono, fontSize:8, color:'var(--muted)', marginTop:3 }}>mp3, wav, flac, ogg, m4a</div>
+        <div {...pressable(() => fileRef.current?.click(), { disabled })} style={{ border:'1px dashed var(--border-hard)', borderRadius:8, padding:'8px 10px', cursor:disabled ? 'default' : 'pointer' }}>
+          <div style={{ fontFamily:SANS, fontSize:12, fontWeight:600, color:'var(--text2)' }}>+ Upload sound</div>
+          <div style={{ fontFamily:MONO, fontSize:8, color:'var(--muted)', marginTop:3 }}>mp3, wav, flac, ogg, m4a</div>
           <input ref={fileRef} type="file" accept=".mp3,.wav,.flac,.ogg,.m4a,audio/*" style={{ display:'none' }}
             onChange={e => { upload(e.target.files[0]); e.target.value=''; }}/>
         </div>
       </div>
-      {unresolved && <div style={{ marginTop:6, fontFamily:mono, fontSize:9, color:'var(--warn)' }}>This sound cannot be resolved; rings use the built-in fallback tone.</div>}
-      {deviceId && previewGap && <div style={{ marginTop:6, fontFamily:mono, fontSize:9, color:'var(--muted)' }}>Preview unavailable: {previewGap}</div>}
-      {message && <div style={{ marginTop:6, fontFamily:mono, fontSize:9, color:message.ok ? 'var(--ok)' : 'var(--error)' }}>{message.text}</div>}
+      {unresolved && <div style={{ marginTop:6, fontFamily:MONO, fontSize:9, color:'var(--warn)' }}>This sound cannot be resolved; rings use the built-in fallback tone.</div>}
+      {deviceId && previewGap && <div style={{ marginTop:6, fontFamily:MONO, fontSize:9, color:'var(--muted)' }}>Preview unavailable: {previewGap}</div>}
+      {message && <div style={{ marginTop:6, fontFamily:MONO, fontSize:9, color:message.ok ? 'var(--ok)' : 'var(--error)' }}>{message.text}</div>}
     </div>
   );
 }
@@ -5954,10 +6139,14 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
   const secStyle = id => (disabled || !isLocal(id))
     ? { opacity:0.45, pointerEvents:'none' }
     : {};
-  const wakeGap = capabilityGap(capabilities, 'device_wake_v1');
-  const renderGap = capabilityGap(capabilities, 'render_progress_v1');
-  const focusGap = capabilityGap(capabilities, 'focus_leases_v1');
-  const holdGap = capabilityGap(capabilities, 'button_hold');
+  const wakeGap = capabilityGap(capabilities, CAPABILITY.DEVICE_WAKE);
+  const renderGap = capabilityGap(capabilities, CAPABILITY.RENDER_PROGRESS);
+  const focusGap = capabilityGap(capabilities, CAPABILITY.FOCUS_LEASES);
+  const holdGap = capabilityGap(capabilities, CAPABILITY.BUTTON_HOLD);
+  // Without led_anim the controller can only send static LEDs: the thinking
+  // spinner and the speaking meter both fall back to the solid listening
+  // colour (em_device._send_led), so their settings would do nothing.
+  const animGap = capabilityGap(capabilities, CAPABILITY.LED_ANIM);
   const [catalog, reloadSounds] = useSounds();
 
   const bands = config.eqBands ?? [0,0,0,0,0,0,0,0];
@@ -5974,7 +6163,6 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
   const [advRing, setAdvRing] = useState(false);
 
   const inputStyle = disabled ? { opacity: 0.45, pointerEvents: 'none' } : {};
-  const mono = "'DM Mono',monospace";
 
 
   // Ordered by how often each section gets touched: playback and wake word
@@ -5997,7 +6185,7 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
                 <Pill key={label} small accent={activeEqPreset === label} onClick={() => set('eqBands', vals)}>{label}</Pill>
               ))}
               {!activeEqPreset && (
-                <span style={{ fontFamily: mono, fontSize: 9, color: 'var(--accent)', textTransform: 'uppercase', letterSpacing: '0.1em' }}>· Custom</span>
+                <span style={{ fontFamily: MONO, fontSize: 9, color: 'var(--accent)', textTransform: 'uppercase', letterSpacing: '0.1em' }}>· Custom</span>
               )}
             </div>
           </div>
@@ -6018,7 +6206,7 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
                 run — so moving this slider did nothing until the device
                 restarted, and any real volume change overwrote it. Current
                 volume is now shown read-only on the Status tab. */}
-            <div style={{ marginTop: 8, fontFamily: mono, fontSize: 10, color: 'var(--muted)', lineHeight: 1.6 }}>
+            <div style={{ marginTop: 8, fontFamily: MONO, fontSize: 10, color: 'var(--muted)', lineHeight: 1.6 }}>
               Volume is remembered per device and restored after a reboot.
               Change it from Home Assistant or the device buttons; the current
               level is shown on the Status tab.
@@ -6033,7 +6221,7 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
         desc="The Echo scores BCResNet every 160 ms. Thresholds and verification words belong to each validated registry model; choosing a model names its graph SHA-256 to every device."
         scope={scopeEl('wakeword')} dim={secStyle('wakeword')}>
         <WakeModelPicker value={config.wakeModel || ''} onChange={v => set('wakeModel', v)} disabled={disabled || !!wakeGap}/>
-        {wakeGap && <div style={{ marginTop:8, fontFamily:mono, fontSize:9, color:'var(--warn)' }}>Wake controls unavailable: {wakeGap}</div>}
+        {wakeGap && <div style={{ marginTop:8, fontFamily:MONO, fontSize:9, color:'var(--warn)' }}>Wake controls unavailable: {wakeGap}</div>}
         <div className="em-grid2" style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:'0 24px', marginTop:16, ...inputStyle }}>
           <Toggle label="Wake chime"
             sub={renderGap || 'plays the built-in confirmation earcon immediately after an accepted wake'}
@@ -6079,7 +6267,7 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
         <div className="em-grid2" style={{ display: 'grid', gridTemplateColumns: '1.4fr 1fr', gap: 24, alignItems: 'start' }}>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, ...inputStyle }}>
             {RING_SCENES.map(sc => (
-              <div key={sc.value} onClick={() => set('ledScene', sc.value)} style={{
+              <div key={sc.value} {...pressable(() => set('ledScene', sc.value), { disabled, selected: (config.ledScene ?? 'standard') === sc.value })} style={{
                 background: (config.ledScene ?? 'standard') === sc.value
                   ? 'linear-gradient(160deg,var(--accent-tint),var(--accent-line))'
                   : 'linear-gradient(160deg,var(--raised),var(--surface))',
@@ -6088,7 +6276,7 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
                 cursor: disabled ? 'default' : 'pointer',
                 transition: 'border-color 0.15s, background 0.15s',
               }}>
-                <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 12, fontWeight: 600, color: 'var(--lcd-line)' }}>{sc.label}</div>
+                <div style={{ fontFamily: SANS, fontSize: 12, fontWeight: 600, color: 'var(--lcd-line)' }}>{sc.label}</div>
                 <div style={{ display: 'flex', gap: 3, marginTop: 4 }}>
                   {(sc.value === 'custom'
                     ? [config.ledListenColor ?? '#00b400', config.ledThinkColor ?? '#00c800']
@@ -6102,53 +6290,56 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
           </div>
           {(config.ledScene ?? 'standard') === 'custom' && (
             <div style={inputStyle}>
-              <div style={{ fontFamily: mono, fontSize: 11, color: 'var(--text2)', marginBottom: 8 }}>Custom colours</div>
+              <div style={{ fontFamily: MONO, fontSize: 11, color: 'var(--text2)', marginBottom: 8 }}>Custom colours</div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
                 <input type="color" value={config.ledListenColor ?? '#00b400'} disabled={disabled}
+                  aria-label="Listening colour"
                   onChange={e => set('ledListenColor', e.target.value)}
                   style={{ width: 36, height: 28, padding: 0, border: '1px solid var(--border)', borderRadius: 6, background: 'none', cursor: 'pointer' }}/>
                 <div>
-                  <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 12, fontWeight: 600 }}>Listening</div>
-                  <div style={{ fontFamily: mono, fontSize: 9, color: 'var(--muted)' }}>solid ring while recording</div>
+                  <div style={{ fontFamily: SANS, fontSize: 12, fontWeight: 600 }}>Listening</div>
+                  <div style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)' }}>solid ring while recording</div>
                 </div>
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                <input type="color" value={config.ledThinkColor ?? '#00c800'} disabled={disabled}
+                <input type="color" value={config.ledThinkColor ?? '#00c800'} disabled={disabled || !!animGap}
+                  aria-label="Thinking colour"
                   onChange={e => set('ledThinkColor', e.target.value)}
-                  style={{ width: 36, height: 28, padding: 0, border: '1px solid var(--border)', borderRadius: 6, background: 'none', cursor: 'pointer' }}/>
+                  style={{ width: 36, height: 28, padding: 0, border: '1px solid var(--border)', borderRadius: 6, background: 'none', cursor: animGap ? 'default' : 'pointer', opacity: animGap ? 0.45 : 1 }}/>
                 <div>
-                  <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 12, fontWeight: 600 }}>Thinking</div>
-                  <div style={{ fontFamily: mono, fontSize: 9, color: 'var(--muted)' }}>spinner while processing</div>
+                  <div style={{ fontFamily: SANS, fontSize: 12, fontWeight: 600 }}>Thinking</div>
+                  <div style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)' }}>{animGap || 'spinner while processing'}</div>
                 </div>
               </div>
             </div>
           )}
         </div>
         <StageAdvanced open={advRing} onToggle={() => setAdvRing(o => !o)} disabledStyle={inputStyle}>
-          <div style={{ fontFamily: mono, fontSize: 10, color: 'var(--text2)', lineHeight: 1.6, marginBottom: 12 }}>
+          <div style={{ fontFamily: MONO, fontSize: 10, color: 'var(--text2)', lineHeight: 1.6, marginBottom: 12 }}>
             While a response plays, the ring throbs with the live speaker level. These shape how
             hard it throbs — the device renders it locally, so changes apply on the next response
             with no restart. Defaults are tuned for speech; raise Decay and Gamma for a punchier
             ring, lower them for a calmer one.
           </div>
+          {animGap && <div style={{ marginBottom:12, fontFamily:MONO, fontSize:9, color:'var(--warn)' }}>Meter controls unavailable: {animGap}</div>}
           <div className="em-grid2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px 24px' }}>
             <Slider label="Decay" sub="how fast it falls — higher tracks individual syllables"
-              value={config.meterDecay ?? 0.30} min={0.02} max={1} step={0.02}
+              value={config.meterDecay ?? 0.30} min={0.02} max={1} step={0.02} disabled={!!animGap}
               onChange={v => set('meterDecay', v)}/>
             <Slider label="Attack" sub="how fast it rises on a peak"
-              value={config.meterAttack ?? 0.6} min={0.05} max={1} step={0.05}
+              value={config.meterAttack ?? 0.6} min={0.05} max={1} step={0.05} disabled={!!animGap}
               onChange={v => set('meterAttack', v)}/>
             <Slider label="Gamma" sub="contrast — higher makes the swing more visible"
-              value={config.meterGamma ?? 2.2} min={1} max={3.5} step={0.1}
+              value={config.meterGamma ?? 2.2} min={1} max={3.5} step={0.1} disabled={!!animGap}
               onChange={v => set('meterGamma', v)}/>
             <Slider label="Floor" sub="brightness during silence; 0 = fully dark between words"
-              value={config.meterFloor ?? 0.06} min={0} max={0.6} step={0.02}
+              value={config.meterFloor ?? 0.06} min={0} max={0.6} step={0.02} disabled={!!animGap}
               onChange={v => set('meterFloor', v)}/>
             <Slider label="Reference" sub="speaker level mapped to full brightness — lower = more sensitive"
-              value={config.meterRef ?? 0.22} min={0.02} max={1} step={0.02}
+              value={config.meterRef ?? 0.22} min={0.02} max={1} step={0.02} disabled={!!animGap}
               onChange={v => set('meterRef', v)}/>
             <Slider label="Curve" sub="below 1 lifts quiet consonants into view"
-              value={config.meterCurve ?? 0.7} min={0.3} max={2} step={0.05}
+              value={config.meterCurve ?? 0.7} min={0.3} max={2} step={0.05} disabled={!!animGap}
               onChange={v => set('meterCurve', v)}/>
           </div>
         </StageAdvanced>
@@ -6219,7 +6410,6 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
 // drop for reboot and reconnect on the new version.
 
 function DeployAllModal({ release, devices, deployState, onStarted, onDismiss, onClose }) {
-  const mono = "'DM Mono',monospace";
   const [running, setRunning] = useState(false);
   const [error, setError]     = useState('');
   // Guard against setState after the modal is closed mid-request — the deploy
@@ -6280,23 +6470,23 @@ function DeployAllModal({ release, devices, deployState, onStarted, onDismiss, o
 
   return (
     <div onClick={onClose} style={{ position: 'fixed', inset: 0, background: 'rgba(30,28,24,0.45)', zIndex: 60, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-      <div onClick={e => e.stopPropagation()} style={{ background: 'linear-gradient(170deg,var(--raised),var(--surface))', border: '1px solid var(--border)', borderRadius: 14, padding: '28px 32px', width: 440, maxWidth: '92vw', boxShadow: '0 24px 80px rgba(0,0,0,0.3)' }}>
-        <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 16, fontWeight: 600, color: 'var(--text)', marginBottom: 4 }}>
+      <div onClick={e => e.stopPropagation()} role="dialog" aria-modal="true" aria-label="Deploy to fleet" style={{ background: 'linear-gradient(170deg,var(--raised),var(--surface))', border: '1px solid var(--border)', borderRadius: 14, padding: '28px 32px', width: 440, maxWidth: '92vw', boxShadow: '0 24px 80px rgba(0,0,0,0.3)' }}>
+        <div style={{ fontFamily: SANS, fontSize: 16, fontWeight: 600, color: 'var(--text)', marginBottom: 4 }}>
           Deploy to fleet
         </div>
-        <div style={{ fontFamily: mono, fontSize: 10, color: 'var(--muted)', marginBottom: 18 }}>
+        <div style={{ fontFamily: MONO, fontSize: 10, color: 'var(--muted)', marginBottom: 18 }}>
           Target: {release?.version || '—'} · devices update over WiFi and auto-roll-back on failure
         </div>
 
         {!view ? (
           <>
-            <div style={{ fontFamily: mono, fontSize: 11, color: 'var(--text2)', marginBottom: 16, lineHeight: 1.8 }}>
+            <div style={{ fontFamily: MONO, fontSize: 11, color: 'var(--text2)', marginBottom: 16, lineHeight: 1.8 }}>
               {eligible.length === 0
                 ? 'Every connected device is already on this version.'
                 : <>Will update <b>{eligible.length}</b> device{eligible.length === 1 ? '' : 's'}:{' '}
                     {eligible.map(d => `${label(d)} (${d.firmware_ver || '?'})`).join(', ')}</>}
             </div>
-            {error && <div style={{ fontFamily: mono, fontSize: 11, color: 'var(--error)', marginBottom: 12 }}>{error}</div>}
+            {error && <div style={{ fontFamily: MONO, fontSize: 11, color: 'var(--error)', marginBottom: 12 }}>{error}</div>}
             <div style={{ display: 'flex', gap: 10 }}>
               <Pill accent disabled={running || eligible.length === 0} onClick={deploy}>
                 {running ? 'Starting…' : `Deploy ${release?.version || ''}`}
@@ -6309,22 +6499,22 @@ function DeployAllModal({ release, devices, deployState, onStarted, onDismiss, o
             {(view.started || []).map(id => {
               const s = statusFor(id);
               return (
-                <div key={id} style={{ display: 'flex', justifyContent: 'space-between', fontFamily: mono, fontSize: 11, padding: '5px 0', borderBottom: '1px solid var(--hairline)' }}>
+                <div key={id} style={{ display: 'flex', justifyContent: 'space-between', fontFamily: MONO, fontSize: 11, padding: '5px 0', borderBottom: '1px solid var(--hairline)' }}>
                   <span style={{ color: 'var(--text2)' }}>{label(byId[id])}</span>
                   <span style={{ color: s.color }}>{s.text} {byId[id]?.firmware_ver ? `· ${byId[id].firmware_ver}` : ''}</span>
                 </div>
               );
             })}
             {(view.skipped || []).map(s => (
-              <div key={s.device_id} style={{ display: 'flex', justifyContent: 'space-between', fontFamily: mono, fontSize: 11, padding: '5px 0', borderBottom: '1px solid var(--hairline)' }}>
+              <div key={s.device_id} style={{ display: 'flex', justifyContent: 'space-between', fontFamily: MONO, fontSize: 11, padding: '5px 0', borderBottom: '1px solid var(--hairline)' }}>
                 <span style={{ color: 'var(--muted)' }}>{label(byId[s.device_id])}</span>
                 <span style={{ color: 'var(--muted)' }}>skipped — {SKIP_REASONS[s.reason] || s.reason}</span>
               </div>
             ))}
             {(view.started || []).length === 0 && (view.skipped || []).length === 0 && (
-              <div style={{ fontFamily: mono, fontSize: 11, color: 'var(--muted)' }}>Nothing to do.</div>
+              <div style={{ fontFamily: MONO, fontSize: 11, color: 'var(--muted)' }}>Nothing to do.</div>
             )}
-            <div style={{ fontFamily: mono, fontSize: 10, color: 'var(--muted)', marginTop: 14 }}>
+            <div style={{ fontFamily: MONO, fontSize: 10, color: 'var(--muted)', marginTop: 14 }}>
               {allDone
                 ? (failedCount > 0
                     ? `Finished — ${failedCount} device${failedCount === 1 ? '' : 's'} failed (see device logs).`
@@ -6344,10 +6534,15 @@ function DeployAllModal({ release, devices, deployState, onStarted, onDismiss, o
 }
 
 // ─── SettingsPanel ─────────────────────────────────────────────────────────────
-// Gear icon → modal with two tabs: Fleet Config and Account.
+// Gear icon → modal with tabs: fleet config, account, and (admins) support.
+
+const SETTINGS_TAB = Object.freeze({ FLEET: 'fleet', ACCOUNT: 'account', SUPPORT: 'support' });
+const SETTINGS_TAB_LABELS = Object.freeze({
+  [SETTINGS_TAB.FLEET]: 'Config', [SETTINGS_TAB.ACCOUNT]: 'Account', [SETTINGS_TAB.SUPPORT]: 'Support',
+});
 
 function SettingsPanel({ globalConfig, onGlobalConfigChange, onClose, username, isAdmin }) {
-  const [tab, setTab]             = useState('fleet');
+  const [tab, setTab]             = useState(SETTINGS_TAB.FLEET);
   const [config, setConfig]       = useState({ ...globalConfig });
   const [dirty, setDirty]         = useState(false);
   const [saving, setSaving]       = useState(false);
@@ -6424,37 +6619,29 @@ function SettingsPanel({ globalConfig, onGlobalConfigChange, onClose, username, 
 
   // Support is admin-only because the endpoint is: the bundle spans the whole
   // fleet, so a tab a non-admin can only be refused by is worse than no tab.
-  const TABS = isAdmin ? ['fleet', 'account', 'support'] : ['fleet', 'account'];
-  const TAB_LABELS = { fleet: 'Config', account: 'Account', support: 'Support' };
+  const TABS = isAdmin ? [SETTINGS_TAB.FLEET, SETTINGS_TAB.ACCOUNT, SETTINGS_TAB.SUPPORT]
+                       : [SETTINGS_TAB.FLEET, SETTINGS_TAB.ACCOUNT];
 
   return (
-    <div style={{ position:'fixed', inset:0, background:'rgba(180,176,168,0.5)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:200, backdropFilter:'blur(8px)' }}
-      onClick={e => e.target === e.currentTarget && onClose()}>
-      {/* Same fixed frame as the device Detail modal — consistent window
-          size across the whole dashboard. */}
-      <div className="em-modal" style={{ width:'min(900px,95vw)', height:'min(700px,90vh)', background:'linear-gradient(170deg,var(--raised),var(--surface))', border:'1px solid var(--border)', borderRadius:16, boxShadow:'0 24px 80px rgba(0,0,0,0.3),0 2px 0 var(--sheen) inset', display:'flex', flexDirection:'column', overflow:'hidden', animation:'fadeIn 0.15s ease' }}>
+    <ModalFrame onClose={onClose} zIndex={200} label="Settings">
 
         {/* Header */}
         <div className="em-modal-head" style={{ background:'linear-gradient(180deg,var(--card),var(--bg))', borderBottom:'1px solid var(--border-hard)', padding:'20px 24px 0', boxShadow:'0 1px 0 var(--sheen) inset' }}>
           <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:16 }}>
-            <div style={{ fontFamily:"'DM Sans',sans-serif", fontSize:22, color:'var(--text)', fontWeight:600, letterSpacing:'-0.02em' }}>Settings</div>
+            <div style={{ fontFamily:SANS, fontSize:22, color:'var(--text)', fontWeight:600, letterSpacing:'-0.02em' }}>Settings</div>
             <CircleButton onClick={onClose} title="Close">×</CircleButton>
           </div>
           {/* Same raised folder-tab treatment as the device Detail modal —
               one tab style across the dashboard. */}
-          <div className="em-tabs" style={{ display:'flex', gap:2 }}>
-            {TABS.map(t => (
-              <button key={t} onClick={() => setTab(t)} style={{ background: tab === t ? 'linear-gradient(180deg,var(--raised),var(--surface))' : 'transparent', border: tab === t ? '1px solid var(--border-hard)' : '1px solid transparent', borderBottom: tab === t ? '1px solid var(--surface)' : '1px solid transparent', borderRadius: '6px 6px 0 0', fontFamily: "'DM Mono',monospace", fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.1em', padding: '7px 14px', cursor: 'pointer', color: tab === t ? 'var(--text)' : 'var(--muted)', marginBottom: -1, transition: 'color 0.15s' }}>{TAB_LABELS[t]}</button>
-            ))}
-          </div>
+          <TabBar tabs={TABS} active={tab} onSelect={setTab} labels={SETTINGS_TAB_LABELS}/>
         </div>
 
         {/* Body */}
         <div className="em-modal-body" style={{ overflowY:'auto', padding:'24px 28px 32px', flex:1 }}>
 
-          {tab === 'fleet' && (
+          {tab === SETTINGS_TAB.FLEET && (
             <>
-              <div style={{ fontFamily:"'DM Mono',monospace", fontSize:10, color:'var(--muted)', marginBottom:20, lineHeight:1.6 }}>
+              <div style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)', marginBottom:20, lineHeight:1.6 }}>
                 Default config applied to all devices unless overridden per-device.
               </div>
               <DeviceConfigForm config={config} onChange={setConf} disabled={!isAdmin}/>
@@ -6465,7 +6652,7 @@ function SettingsPanel({ globalConfig, onGlobalConfigChange, onClose, username, 
                 </div>
               )}
               {saveMsg && (
-                <div style={{ marginTop: 14, fontFamily: "'DM Mono',monospace", fontSize: 11,
+                <div style={{ marginTop: 14, fontFamily: MONO, fontSize: 11,
                   color: saveMsg.ok ? 'var(--ok)' : 'var(--error)' }}>
                   {saveMsg.ok ? '✓ ' : ''}{saveMsg.text}
                 </div>
@@ -6473,22 +6660,22 @@ function SettingsPanel({ globalConfig, onGlobalConfigChange, onClose, username, 
             </>
           )}
 
-          {tab === 'account' && (
+          {tab === SETTINGS_TAB.ACCOUNT && (
             <div style={{ maxWidth: 360 }}>
-              <div style={{ fontFamily:"'DM Mono',monospace", fontSize:9, color:'var(--muted)', textTransform:'uppercase', letterSpacing:'0.15em', marginBottom:20 }}>Change Password · {username}</div>
+              <div style={{ fontFamily:MONO, fontSize:9, color:'var(--muted)', textTransform:'uppercase', letterSpacing:'0.15em', marginBottom:20 }}>Change Password · {username}</div>
               {[
                 ['Current password', curPw, setCurPw],
                 ['New password',     newPw, setNewPw],
                 ['Confirm new',      confirmPw, setConfirmPw],
               ].map(([label, val, setter]) => (
                 <div key={label} style={{ marginBottom:16 }}>
-                  <div style={{ fontFamily:"'DM Mono',monospace", fontSize:11, color:'var(--text2)', marginBottom:6 }}>{label}</div>
-                  <input type="password" value={val} onChange={e => setter(e.target.value)}
+                  <div style={{ fontFamily:MONO, fontSize:11, color:'var(--text2)', marginBottom:6 }}>{label}</div>
+                  <input type="password" value={val} onChange={e => setter(e.target.value)} aria-label={label}
                     style={{ width:'100%', boxSizing:'border-box' }}/>
                 </div>
               ))}
               {pwMsg && (
-                <div style={{ fontFamily:"'DM Mono',monospace", fontSize:11, color: pwMsg.ok ? 'var(--ok)' : 'var(--error)', marginBottom:12 }}>
+                <div style={{ fontFamily:MONO, fontSize:11, color: pwMsg.ok ? 'var(--ok)' : 'var(--error)', marginBottom:12 }}>
                   {pwMsg.text}
                 </div>
               )}
@@ -6498,20 +6685,20 @@ function SettingsPanel({ globalConfig, onGlobalConfigChange, onClose, username, 
             </div>
           )}
 
-          {tab === 'support' && (
+          {tab === SETTINGS_TAB.SUPPORT && (
             <div style={{ maxWidth: 520 }}>
-              <div style={{ fontFamily:"'DM Mono',monospace", fontSize:10, color:'var(--muted)', marginBottom:20, lineHeight:1.6 }}>
+              <div style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)', marginBottom:20, lineHeight:1.6 }}>
                 A single file describing the fleet's state, to attach to a GitHub issue.
               </div>
 
               <div className="em-panel" style={{ padding:'16px 18px', marginBottom:18 }}>
                 <div className="em-label" style={{ marginBottom:10 }}>What it contains</div>
-                <div style={{ fontFamily:"'DM Mono',monospace", fontSize:11, color:'var(--text2)', lineHeight:1.7 }}>
+                <div style={{ fontFamily:MONO, fontSize:11, color:'var(--text2)', lineHeight:1.7 }}>
                   Controller and firmware versions, device capabilities, config,
                   and the last 24 hours of turns, metrics and logs.
                 </div>
                 <div className="em-label" style={{ margin:'16px 0 10px' }}>What it never contains</div>
-                <div style={{ fontFamily:"'DM Mono',monospace", fontSize:11, color:'var(--text2)', lineHeight:1.7 }}>
+                <div style={{ fontFamily:MONO, fontSize:11, color:'var(--text2)', lineHeight:1.7 }}>
                   Transcripts or recordings, device names, Wi-Fi networks,
                   addresses, tokens or passwords. Fields are allowlisted, so
                   anything new is left out until it is added deliberately.
@@ -6531,12 +6718,12 @@ function SettingsPanel({ globalConfig, onGlobalConfigChange, onClose, username, 
               </div>
 
               {bundleErr && (
-                <div style={{ marginTop:14, fontFamily:"'DM Mono',monospace", fontSize:11, color:'var(--error)' }}>
+                <div style={{ marginTop:14, fontFamily:MONO, fontSize:11, color:'var(--error)' }}>
                   {bundleErr}
                 </div>
               )}
               {bundle && (
-                <div style={{ marginTop:14, fontFamily:"'DM Mono',monospace", fontSize:11, color:'var(--muted)', lineHeight:1.6 }}>
+                <div style={{ marginTop:14, fontFamily:MONO, fontSize:11, color:'var(--muted)', lineHeight:1.6 }}>
                   Worth opening before you post it — it is plain JSON.
                 </div>
               )}
@@ -6544,15 +6731,23 @@ function SettingsPanel({ globalConfig, onGlobalConfigChange, onClose, username, 
           )}
 
         </div>
-      </div>
-    </div>
+    </ModalFrame>
   );
 }
 
+// ─── App ──────────────────────────────────────────────────────────────────────
 
 function App() {
-  const [token, setToken] = useState(() => localStorage.getItem('em_token'));
-  const [role, setRole] = useState(() => localStorage.getItem('em_role'));
+  // The session is read once: signing in and out both happen on the landing
+  // page, which this one navigates to. API.token is set here, synchronously,
+  // rather than in an effect — child effects run before a parent's, so an
+  // effect would leave any request a child makes on mount unauthenticated.
+  const [token] = useState(() => {
+    const t = localStorage.getItem('em_token');
+    API.token = t;
+    return t;
+  });
+  const [role] = useState(() => localStorage.getItem('em_role'));
   const [devices, setDevices] = useState([]);
   const [selected, setSelected] = useState(null);
   const [release, setRelease] = useState(null);
@@ -6571,9 +6766,10 @@ function App() {
   const [deployState, setDeployState] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
   const [globalConfig, setGlobalConfig] = useState(null);
-  const wsRef = useRef(null);
+  // Bumped to open a fresh events socket after the last one closed.
+  const [socketEpoch, setSocketEpoch] = useState(0);
 
-  const isAdmin = role === 'admin';
+  const isAdmin = role === ROLE.ADMIN;
 
   function handleLogout() {
     API.post('/api/auth/logout', {}).catch(() => {});
@@ -6584,8 +6780,8 @@ function App() {
     location.replace('.');
   }
 
-  // Restore token on mount
-  useEffect(() => { if (token) API.token = token; }, []);
+  // Re-read the fleet. Failures are left to the next poll or event.
+  const refreshDevices = () => API.get('/api/devices').then(setDevices).catch(() => {});
 
   // Load initial data
   useEffect(() => {
@@ -6612,16 +6808,17 @@ function App() {
   useEffect(() => {
     if (!token) return;
     const ws = new WebSocket(ingressWebSocketUrl(`/api/events?token=${token}`));
-    wsRef.current = ws;
+    let closedByUs = false;
+    let reconnect = null;
 
     ws.onmessage = e => {
       const msg = JSON.parse(e.data);
       _emitEvent(msg);
       switch(msg.type) {
-        case 'snapshot':
+        case EVENT_TYPE.SNAPSHOT:
           setDevices(msg.devices);
           break;
-        case 'device_update':
+        case EVENT_TYPE.DEVICE_UPDATE:
           // Merge partial state directly — no API round trip needed
           if (msg.state) {
             setDevices(prev => prev.map(d =>
@@ -6629,17 +6826,20 @@ function App() {
             ));
           }
           break;
-        case 'device_log':
-        case 'alerts':
-        case 'ha_status':
+        case EVENT_TYPE.DEVICE_LOG:
+        case EVENT_TYPE.ALERTS:
+        case EVENT_TYPE.HA_STATUS:
           // Detail panels consume these through subscribeEvents.
           break;
-        case 'device_connected':
+        case EVENT_TYPE.TURN_COMPLETE:
+          // The Activity tab polls its own turn list.
+          break;
+        case EVENT_TYPE.DEVICE_CONNECTED:
           setDevices(prev => prev.map(d =>
             d.device_id === msg.device_id ? { ...d, connected: true } : d
           ));
           break;
-        case 'device_disconnected':
+        case EVENT_TYPE.DEVICE_DISCONNECTED:
           console.log('[ws] device_disconnected:', msg.device_id);
           setDevices(prev => prev.map(d =>
             d.device_id === msg.device_id
@@ -6647,45 +6847,52 @@ function App() {
               : d
           ));
           break;
-        case 'device_updated':
-        case 'device_rolled_back':
-        case 'device_update_failed':
-        case 'device_approved':
+        case EVENT_TYPE.DEVICE_UPDATED:
+        case EVENT_TYPE.DEVICE_ROLLED_BACK:
+        case EVENT_TYPE.DEVICE_AUTO_ROLLED_BACK:
+        case EVENT_TYPE.DEVICE_UPDATE_FAILED:
+        case EVENT_TYPE.DEVICE_APPROVED:
+        case EVENT_TYPE.DEVICE_PENDING:
           // Full refresh for structural changes
-          API.get('/api/devices').then(setDevices).catch(() => {});
+          refreshDevices();
           break;
-        case 'controller_update':
+        case EVENT_TYPE.RELEASE_UPDATE:
+          // A new firmware release was published. Re-read it rather than
+          // merge the event: the event carries no download URL.
+          API.get('/api/releases/latest').then(setRelease).catch(() => {});
+          break;
+        case EVENT_TYPE.CONTROLLER_UPDATE:
           // The controller polls GitHub hourly; a dashboard left open should
           // learn about a new controller without a reload.
           setCtrlRelease(msg);
           break;
-        case 'device_pending':
-          API.get('/api/devices').then(setDevices).catch(() => {});
-          break;
-        case 'device_deleted':
+        case EVENT_TYPE.DEVICE_DELETED:
           setDevices(prev => prev.filter(d => d.device_id !== msg.device_id));
           break;
       }
     };
 
+    // Reconnect 5s after the socket drops (controller restart, network
+    // blip) by bumping the epoch this effect depends on. This used to call
+    // setToken(t => t), which React treats as no change: nothing re-ran, so
+    // one dropped socket ended live alert/timer events until a reload — the
+    // device poll below hid it for the fleet view, nothing did for the rest.
     ws.onclose = () => {
-      // Reconnect after 5s
-      setTimeout(() => {
-        if (token) setToken(t => t); // trigger re-run
-      }, 5000);
+      if (closedByUs) return;
+      reconnect = setTimeout(() => setSocketEpoch(n => n + 1), 5000);
     };
 
     // Polling fallback — catches anything the WebSocket misses
-    const poll = setInterval(() => {
-      API.get('/api/devices').then(setDevices).catch(() => {});
-    }, 5000);
+    const poll = setInterval(refreshDevices, 5000);
 
     return () => {
+      closedByUs = true;
+      clearTimeout(reconnect);
       ws.close();
       clearInterval(poll);
     };
 
-  }, [token]);
+  }, [token, socketEpoch]);
 
   // No session (direct visit, expired token, logged out) — the landing
   // page owns auth: it validates any stored token and shows the right
@@ -6707,14 +6914,14 @@ function App() {
       {/* Header */}
       <div className="em-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', marginBottom: 36 }}>
         <div style={{ display: 'flex', alignItems: 'baseline', gap: 14 }}>
-          <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 28, color: 'var(--text)', fontWeight: 600, letterSpacing: '-0.02em' }}>EchoMuse</div>
-          <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: 'var(--muted)', letterSpacing: '0.12em', textTransform: 'uppercase' }}>Device Management</div>
+          <div style={{ fontFamily: SANS, fontSize: 28, color: 'var(--text)', fontWeight: 600, letterSpacing: '-0.02em' }}>EchoMuse</div>
+          <div style={{ fontFamily: MONO, fontSize: 10, color: 'var(--muted)', letterSpacing: '0.12em', textTransform: 'uppercase' }}>Device Management</div>
           {status?.controller_version && (
-            <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: 'var(--muted)' }}>{status.controller_version}</div>
+            <div style={{ fontFamily: MONO, fontSize: 10, color: 'var(--muted)' }}>{status.controller_version}</div>
           )}
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-          <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: 'var(--muted)' }}>{role}</div>
+          <div style={{ fontFamily: MONO, fontSize: 10, color: 'var(--muted)' }}>{role}</div>
           <ThemeToggle/>
           <IconButton onClick={() => setShowSettings(true)} label="Settings">⚙</IconButton>
           <IconButton onClick={handleLogout} label="Sign out" danger><SignOutIcon/></IconButton>
@@ -6740,45 +6947,42 @@ function App() {
           padding: '14px 18px', marginBottom: 24,
         }}>
           <div style={{ display:'flex', alignItems:'center', gap:12, flexWrap:'wrap' }}>
-            <span style={{ fontFamily:"'DM Mono',monospace", fontSize:8, color:'var(--warn)',
+            <span style={{ fontFamily:MONO, fontSize:8, color:'var(--warn)',
                            textTransform:'uppercase', letterSpacing:'0.15em' }}>
               Controller update
             </span>
-            <span style={{ fontFamily:"'DM Mono',monospace", fontSize:14, color:'var(--warn)' }}>
+            <span style={{ fontFamily:MONO, fontSize:14, color:'var(--warn)' }}>
               {ctrlRelease.version}
             </span>
-            <span style={{ fontFamily:"'DM Mono',monospace", fontSize:10, color:'var(--muted)' }}>
+            <span style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)' }}>
               running {ctrlRelease.current || status?.controller_version || '—'}
             </span>
             {ctrlRelease.notes && (
-              <span onClick={() => setCtrlNotesOpen(o => !o)} style={{
-                fontFamily:"'DM Mono',monospace", fontSize:9, color:'var(--muted)',
-                cursor:'pointer', userSelect:'none', marginLeft:'auto',
-                textTransform:'uppercase', letterSpacing:'0.15em',
-              }}>
-                {ctrlNotesOpen ? '▾' : '▸'} What&apos;s in it
-              </span>
+              <DisclosureToggle open={ctrlNotesOpen} onToggle={() => setCtrlNotesOpen(o => !o)}
+                                style={{ width:'auto', marginLeft:'auto' }}>
+                What&apos;s in it
+              </DisclosureToggle>
             )}
           </div>
           {ctrlNotesOpen && (
             <div style={{ marginTop:12, borderTop:'1px solid rgba(255,255,255,0.06)', paddingTop:12 }}>
               <pre style={{
-                fontFamily:"'DM Mono',monospace", fontSize:10, lineHeight:1.65,
+                fontFamily:MONO, fontSize:10, lineHeight:1.65,
                 color:'var(--text2)', whiteSpace:'pre-wrap', wordBreak:'break-word',
                 margin:0, maxHeight:320, overflowY:'auto',
               }}>{ctrlRelease.notes}</pre>
-              <div style={{ fontFamily:"'DM Mono',monospace", fontSize:9, color:'var(--muted)',
+              <div style={{ fontFamily:MONO, fontSize:9, color:'var(--muted)',
                             marginTop:14, lineHeight:1.6 }}>
                 Update it yourself, from wherever your compose file lives:
               </div>
               <pre style={{
-                fontFamily:"'DM Mono',monospace", fontSize:10, color:'var(--lcd-green)',
+                fontFamily:MONO, fontSize:10, color:'var(--lcd-green)',
                 background:'rgba(0,0,0,0.35)', border:'1px solid rgba(0,0,0,0.5)',
                 borderRadius:6, padding:'10px 12px', margin:'8px 0 0', overflowX:'auto',
               }}>docker compose pull &amp;&amp; docker compose up -d</pre>
               {ctrlRelease.release_url && (
                 <a href={ctrlRelease.release_url} target="_blank" rel="noreferrer"
-                   style={{ fontFamily:"'DM Mono',monospace", fontSize:9, color:'var(--muted)',
+                   style={{ fontFamily:MONO, fontSize:9, color:'var(--muted)',
                             display:'inline-block', marginTop:10 }}>
                   View tag on GitHub →
                 </a>
@@ -6797,15 +7001,15 @@ function App() {
           ['Pending', pending.length, pending.length > 0 ? 'var(--accent-hi)' : 'var(--muted)'],
         ].map(([label, val, c]) => (
           <div key={label} className="em-inset" style={{ flex: 1 }}>
-            <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 8, color: 'var(--lcd-dim)', textTransform: 'uppercase', letterSpacing: '0.15em', marginBottom: 6 }}>{label}</div>
-            <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 24, color: c, lineHeight: 1, textShadow: `0 0 12px ${c}66` }}>{val}</div>
+            <div style={{ fontFamily: MONO, fontSize: 8, color: 'var(--lcd-dim)', textTransform: 'uppercase', letterSpacing: '0.15em', marginBottom: 6 }}>{label}</div>
+            <div style={{ fontFamily: MONO, fontSize: 24, color: c, lineHeight: 1, textShadow: `0 0 12px ${c}66` }}>{val}</div>
           </div>
         ))}
         {release && (
           <div className="em-summary-release em-inset" style={{ flex: 2, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <div>
-              <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 8, color: 'var(--lcd-dim)', textTransform: 'uppercase', letterSpacing: '0.15em', marginBottom: 6 }}>Latest Release</div>
-              <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 18, color: 'var(--lcd-green)', lineHeight: 1 }}>{release.version}</div>
+              <div style={{ fontFamily: MONO, fontSize: 8, color: 'var(--lcd-dim)', textTransform: 'uppercase', letterSpacing: '0.15em', marginBottom: 6 }}>Latest Release</div>
+              <div style={{ fontFamily: MONO, fontSize: 18, color: 'var(--lcd-green)', lineHeight: 1 }}>{release.version}</div>
             </div>
             {/* Actions as ONE flex child, not three.
                 space-between distributes across every child it has, so with
@@ -6876,7 +7080,7 @@ function App() {
       {/* Pending devices */}
       {pending.length > 0 && (
         <>
-          <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: 'var(--accent-hi)', textTransform: 'uppercase', letterSpacing: '0.15em', marginBottom: 14 }}>
+          <div style={{ fontFamily: MONO, fontSize: 9, color: 'var(--accent-hi)', textTransform: 'uppercase', letterSpacing: '0.15em', marginBottom: 14 }}>
             Pending Approval · {pending.length}
           </div>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(190px,1fr))', gap: 12, marginBottom: 36 }}>
@@ -6889,7 +7093,7 @@ function App() {
       {(approved.length > 0 || isAdmin) && (
         <>
           {approved.length > 0 && (
-            <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.15em', marginBottom: 14 }}>
+            <div style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.15em', marginBottom: 14 }}>
               Devices · {approved.length}
             </div>
           )}
@@ -6906,18 +7110,18 @@ function App() {
       )}
 
       {devices.length === 0 && !loadError && !isAdmin && (
-        <div style={{ textAlign: 'center', padding: '60px 0', fontFamily: "'DM Mono',monospace", fontSize: 12, color: 'var(--muted)' }}>
+        <div style={{ textAlign: 'center', padding: '60px 0', fontFamily: MONO, fontSize: 12, color: 'var(--muted)' }}>
           No devices yet — power on an EchoMuse device to see it appear here
         </div>
       )}
 
       {loadError && (
-        <div style={{ textAlign: 'center', padding: '60px 0', fontFamily: "'DM Mono',monospace", fontSize: 12, color: 'var(--error)' }}>{loadError}</div>
+        <div style={{ textAlign: 'center', padding: '60px 0', fontFamily: MONO, fontSize: 12, color: 'var(--error)' }}>{loadError}</div>
       )}
 
       {/* Provisioning wizard */}
       {showWizard && (
-        <ProvisionWizard token={token} onClose={() => setShowWizard(false)} knownDevices={devices}/>
+        <ProvisionWizard onClose={() => setShowWizard(false)} knownDevices={devices}/>
       )}
 
       {/* Fleet-wide OTA — the deploy itself is server-side; this modal is
@@ -6950,7 +7154,7 @@ function App() {
           device={selectedDevice}
           token={token}
           onClose={() => setSelected(null)}
-          onApprove={() => API.get('/api/devices').then(setDevices).catch(() => {})}
+          onApprove={refreshDevices}
           isAdmin={isAdmin}
           globalConfig={globalConfig}
           onDeviceConfigChange={(device_id, patch) =>

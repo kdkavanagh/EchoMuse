@@ -42,13 +42,16 @@ import logging
 import os
 import re
 from pathlib import Path
+from typing import TypedDict
 
 from em_samples import (          # one definition of the wire format
     CHANNELS,
     SAMPLE_RATE,
     SAMPLE_WIDTH,
+    StoreUsage,
     duration_ms,
     encode_wav,
+    safe_device_id,
 )
 
 log = logging.getLogger("echomuse.wakeclips")
@@ -74,8 +77,16 @@ KEEP_PER_DEVICE = 500
 # `<turn_id>.wav`, inside a per-device directory. turn_id is a rowid and
 # device_id is ro.serialno, but both come back off disk or out of a URL, so
 # they are validated as path components rather than trusted.
-_NAME_RE   = re.compile(r"^(?P<turn>\d{1,19})\.wav$")
-_DEVICE_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+_NAME_RE = re.compile(r"^(?P<turn>\d{1,19})\.wav$")
+
+
+class WakeClipEntry(TypedDict):
+    """One stored wake clip as the API lists it."""
+
+    name:    str
+    turn_id: int
+    bytes:   int
+    ms:      int
 
 
 def wakes_dir(db_path: str | None = None) -> Path:
@@ -83,14 +94,6 @@ def wakes_dir(db_path: str | None = None) -> Path:
     if db_path is None:
         db_path = os.environ.get("DB_PATH", "echomuse.db")
     return Path(db_path).resolve().parent / WAKES_SUBDIR
-
-
-def safe_device_id(device_id: str) -> str | None:
-    """The device id as a path component, or None if it isn't one."""
-    if device_id and _DEVICE_RE.fullmatch(device_id):
-        return device_id
-    return None
-
 
 def device_dir(device_id: str, db_path: str | None = None) -> Path | None:
     safe = safe_device_id(device_id)
@@ -133,7 +136,7 @@ def save(device_id: str, turn_id: int, pcm: bytes,
     return name
 
 
-def list_for(device_id: str, db_path: str | None = None) -> list[dict]:
+def list_for(device_id: str, db_path: str | None = None) -> list[WakeClipEntry]:
     """
     This device's clips, newest turn first: name, turn id, bytes, duration.
 
@@ -145,7 +148,7 @@ def list_for(device_id: str, db_path: str | None = None) -> list[dict]:
     directory = device_dir(device_id, db_path)
     if directory is None or not directory.is_dir():
         return []
-    out: list[dict] = []
+    out: list[WakeClipEntry] = []
     for child in directory.iterdir():
         turn = parse_filename(child.name)
         if turn is None:
@@ -166,7 +169,7 @@ def list_for(device_id: str, db_path: str | None = None) -> list[dict]:
     return out
 
 
-def usage(device_id: str, db_path: str | None = None) -> dict:
+def usage(device_id: str, db_path: str | None = None) -> StoreUsage:
     """Clip count, total bytes and total duration for a device."""
     clips = list_for(device_id, db_path)
     return {

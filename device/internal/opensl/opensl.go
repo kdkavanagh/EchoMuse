@@ -34,6 +34,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"unsafe"
+
+	"github.com/wilbowes/EchoMuse/internal/monoclock"
 )
 
 // ErrClosed is returned by Read/Write after the Recorder/Player (or the
@@ -303,7 +305,7 @@ func (r *Recorder) Close() {
 // it, counted, if the reader is behind), and re-enqueue the same slot
 // immediately so the recorder is never starved of somewhere to write.
 func (r *Recorder) onComplete() {
-	now := MonoNow()
+	now := monoclock.Now()
 	var idx int
 	select {
 	case idx = <-r.inflight:
@@ -453,7 +455,7 @@ func (p *Player) Close() {
 func (p *Player) onComplete() {
 	select {
 	case idx := <-p.inflight:
-		now := MonoNow()
+		now := monoclock.Now()
 		select {
 		case p.free <- idx:
 		default:

@@ -126,7 +126,7 @@ func TestPagedSnapshotDigestAndProtectedTombstones(t *testing.T) {
 
 	// The device dismisses the first occurrence before the controller hears.
 	first := specs[0].occID()
-	res := h.e.Act("", first, actionDismiss, "dashboard")
+	res := h.e.Act("", first, ActionDismiss, "dashboard")
 	if res.Status != StatusDurable {
 		t.Fatalf("dismiss %+v", res)
 	}

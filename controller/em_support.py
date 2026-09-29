@@ -47,12 +47,17 @@ without them nothing correlates — but nothing else is.
 
 from __future__ import annotations
 
+import enum
 import json
 import logging
 import re
 import time
 from collections import deque
-from typing import Any
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from typing import NotRequired, TypedDict, TypeVar
+
+T = TypeVar("T")
+
 
 # Device columns safe to publish. Names are listed rather than filtered so a
 # future column is excluded by default.
@@ -168,18 +173,22 @@ def is_noise(line: str) -> bool:
     return any(marker in line for marker in _LOG_NOISE)
 
 
-def thin_noise(items: list, keep: int = 3, key=lambda x: x) -> list:
+def thin_noise(items: Sequence[T], keep: int = 3,
+               key: Callable[[T], str] | None = None) -> list[T]:
     """
     Keep the first `keep` noise items and drop the rest, order preserved.
 
     `items` must be NEWEST FIRST, which is how `db.get_device_logs` returns
     them — "first" is then "most recent", and the caller sorts for display.
     `key` extracts the text, so callers can carry a timestamp alongside it
-    rather than parsing one back out of the formatted line.
+    rather than parsing one back out of the formatted line; without one the
+    items are the text.
     """
-    out, seen = [], 0
+    out: list[T] = []
+    seen = 0
     for item in items:
-        if is_noise(key(item)):
+        text = key(item) if key is not None else item
+        if isinstance(text, str) and is_noise(text):
             seen += 1
             if seen > keep:
                 continue
@@ -291,18 +300,18 @@ class CpuHistory:
 _ROLE_RE = re.compile(r"^[a-z_]{1,16}$")
 
 
-def _account_pattern(accounts: dict[str, str]) -> tuple[re.Pattern | None, dict[str, str]]:
+def _account_pattern(accounts: Mapping[str, str]) -> tuple[re.Pattern[str] | None, dict[str, str]]:
     """
     Match this install's account names, longest first, mapped to their role.
 
     Longest first matters: with users `wil` and `wilbowes`, alternation in the
     wrong order rewrites the prefix and leaves `<admin>bowes` behind.
     """
-    names = sorted((n for n in (accounts or {}) if n and len(n) >= 2),
+    names = sorted((n for n in accounts if n and len(n) >= 2),
                    key=len, reverse=True)
     if not names:
         return None, {}
-    roles = {}
+    roles: dict[str, str] = {}
     for n in names:
         role = (accounts.get(n) or "user").strip().lower()
         # The role is written into published text, so it is checked rather
@@ -312,7 +321,7 @@ def _account_pattern(accounts: dict[str, str]) -> tuple[re.Pattern | None, dict[
                        re.IGNORECASE), roles)
 
 
-def sanitise_log(lines: list[str], accounts: dict[str, str] | None = None) -> list[str]:
+def sanitise_log(lines: Iterable[str], accounts: Mapping[str, str] | None = None) -> list[str]:
     """
     Make controller log lines safe to publish.
 
@@ -336,7 +345,7 @@ def sanitise_log(lines: list[str], accounts: dict[str, str] | None = None) -> li
     account.
     """
     users, roles = _account_pattern(accounts or {})
-    out = []
+    out: list[str] = []
     for ln in lines:
         if any(marker in ln for marker in _LOG_DROP):
             continue
@@ -353,20 +362,19 @@ def sanitise_log(lines: list[str], accounts: dict[str, str] | None = None) -> li
     return out
 
 
-def _pick(row: Any, fields: tuple[str, ...]) -> dict:
-    """Project a sqlite3.Row onto an allowlist, skipping absent columns."""
-    keys = set(row.keys())
-    return {f: row[f] for f in fields if f in keys}
+def _pick(row: Mapping[str, object], fields: tuple[str, ...]) -> dict[str, object]:
+    """Project one record's columns onto an allowlist, skipping absent ones."""
+    return {f: row[f] for f in fields if f in row}
 
 
-def redact_stats(stats: Any) -> dict | None:
+def redact_stats(stats: object) -> dict[str, object] | None:
     """Project a device's live stats onto the allowlist, dropping the rest."""
     if not isinstance(stats, dict):
         return None
     return {k: stats[k] for k in _STATS_FIELDS if k in stats}
 
 
-def redact_config(config: dict) -> dict:
+def redact_config(config: Mapping[str, object] | None) -> dict[str, object]:
     """
     Drop anything credential-shaped from a device/fleet config.
 
@@ -375,7 +383,7 @@ def redact_config(config: dict) -> dict:
     secret is dropped without needing to know what it is. Belt and braces
     against a future config key nobody thought about.
     """
-    out = {}
+    out: dict[str, object] = {}
     for k, v in (config or {}).items():
         if any(bad in k.lower() for bad in _CONFIG_DENY):
             out[k] = "<redacted>"
@@ -384,27 +392,50 @@ def redact_config(config: dict) -> dict:
     return out
 
 
+class ControllerInfo(TypedDict):
+    version: str
+    schema_version: int
+    stats: dict[str, object]
+
+
+class SupportBundle(TypedDict):
+    """The support bundle file, as `build` assembles it."""
+
+    generated_at: int
+    format: int
+    redaction: str
+    controller: ControllerInfo
+    fleet_config: dict[str, object]
+    devices: list[dict[str, object]]
+    turns: list[dict[str, object]]
+    metrics: list[dict[str, object]]
+    wake_counters: list[dict[str, object]]
+    controller_log_tail: list[str]
+    device_log_tail: list[str]
+
+
 def build(
     *,
     controller_version: str,
-    devices: list,
-    fleet_config: dict,
+    devices: Sequence[Mapping[str, object]],
+    fleet_config: Mapping[str, object],
     schema_version: int,
-    turns: list,
-    metrics: list,
-    counters: list,
-    device_configs: dict[str, dict],
-    live_state: dict[str, dict],
-    controller_log: list[str],
-    device_log: list[str],
-    accounts: dict[str, str] | None = None,
-    controller_stats: dict | None = None,
-) -> dict:
+    turns: Sequence[Mapping[str, object]],
+    metrics: Sequence[Mapping[str, object]],
+    counters: Sequence[Mapping[str, object]],
+    device_configs: Mapping[str, Mapping[str, object]],
+    live_state: Mapping[str, Mapping[str, object]],
+    controller_log: Sequence[str],
+    device_log: Sequence[str],
+    accounts: Mapping[str, str] | None = None,
+    controller_stats: Mapping[str, object] | None = None,
+) -> SupportBundle:
     """
     Assemble the bundle. Pure — callers do the I/O, so this is testable
     without a database, and the redaction can be asserted directly.
     """
-    bundle: dict = {
+    stats = controller_stats or {}
+    bundle: SupportBundle = {
         "generated_at": int(time.time()),
         # 2: controller_log_tail became the CONTROLLER's log; the relayed
         # per-device lines moved to device_log_tail.
@@ -423,8 +454,7 @@ def build(
             # The controller's own resources. Without them a bundle can show
             # a device starving for audio and give no way to tell whether the
             # host it streams from was out of CPU, memory or disk at the time.
-            "stats": {k: controller_stats[k] for k in _CONTROLLER_STAT_FIELDS
-                      if k in (controller_stats or {})},
+            "stats": {k: stats[k] for k in _CONTROLLER_STAT_FIELDS if k in stats},
         },
         "fleet_config": redact_config(fleet_config),
         "devices": [],
@@ -441,17 +471,17 @@ def build(
         # names. The user can say which is which if it ever matters.
         entry["name"] = f"device-{n}"
         did = entry.get("device_id")
-        entry["config"] = redact_config(device_configs.get(did, {}))
+        entry["config"] = redact_config(device_configs.get(did, {}) if isinstance(did, str) else {})
         # Live state matters more than stored state for "it is behaving
         # oddly right now": capabilities decide which HA entities exist,
         # and connected/link tell you whether to trust anything else.
-        entry["live"] = live_state.get(did, {})
+        entry["live"] = live_state.get(did, {}) if isinstance(did, str) else {}
         bundle["devices"].append(entry)
 
     return bundle
 
 
-def to_json(bundle: dict) -> str:
+def to_json(bundle: Mapping[str, object]) -> str:
     return json.dumps(bundle, indent=2, default=str)
 
 
@@ -504,22 +534,48 @@ _WPA_STATUS_KEYS = (
     "suppPortStatus",
 )
 
-# Probe names the wizard may post. Anything else is dropped.
-_PROVISION_PROBES = (
-    "props",          # getprop, filtered to _PROVISION_PROPS
-    "root",           # su -c id
-    "selinux",        # getenforce
-    "pm_ready",       # pm path android
-    "storage",        # df /data
-    "wpa_status",     # wpa_cli status
-    "wpa_scan",       # wpa_cli scan_results
-    "wpa_caps",       # wpa_cli get_capability key_mgmt
-    "services",       # getprop | grep init.svc
-    "processes",      # wpa_supplicant / SmartHomeWifid counts
-    "packages",       # how many of the disable/hide lists are still visible
-    "data_property",  # filenames only
-    "boot_target",    # what /dev/block/other-boot resolves to (TWRP steps)
-)
+class ProvisionProbe(enum.StrEnum):
+    """Probe names the wizard may post. Anything else is dropped."""
+
+    PROPS = "props"                  # getprop, filtered to _PROVISION_PROPS
+    ROOT = "root"                    # su -c id
+    SELINUX = "selinux"              # getenforce
+    PM_READY = "pm_ready"            # pm path android
+    STORAGE = "storage"              # df /data
+    WPA_STATUS = "wpa_status"        # wpa_cli status
+    WPA_SCAN = "wpa_scan"            # wpa_cli scan_results
+    WPA_CAPS = "wpa_caps"            # wpa_cli get_capability key_mgmt
+    SERVICES = "services"            # getprop | grep init.svc
+    PROCESSES = "processes"          # wpa_supplicant / SmartHomeWifid counts
+    PACKAGES = "packages"            # how many of the disable/hide lists are still visible
+    DATA_PROPERTY = "data_property"  # filenames only
+    BOOT_TARGET = "boot_target"      # what /dev/block/other-boot resolves to (TWRP steps)
+
+
+class WpaScanRow(TypedDict):
+    network: str
+    freq: str
+    signal: str
+    flags: str
+    selected: bool
+
+
+ProbeResult = dict[str, str] | list[WpaScanRow] | list[str]
+
+
+class ProvisionDiagnostics(TypedDict):
+    """The provisioning diagnostics file, as `build_provision_diagnostics` makes it."""
+
+    format: int
+    kind: str
+    generated: float
+    controller_version: str
+    step: str
+    error: list[str]
+    probes: dict[str, ProbeResult]
+    probes_missing: list[str]
+    transcript: NotRequired[list[str]]
+
 
 _INIT_SVC = re.compile(r"^\[init\.svc\.[a-z0-9_.-]+\]:\s*\[[a-z]+\]$", re.I)
 
@@ -534,7 +590,7 @@ def _scrub(text: str) -> list[str]:
     an output shape nobody has seen: these devices are the ones behaving
     unusually, by definition.
     """
-    out = []
+    out: list[str] = []
     for ln in (text or "").splitlines():
         ln = _QUOTED.sub("<redacted>", ln)
         ln = _URL.sub("<url>", ln)
@@ -545,9 +601,9 @@ def _scrub(text: str) -> list[str]:
     return out
 
 
-def _probe_props(text: str) -> dict:
+def _probe_props(text: str) -> dict[str, str]:
     """`getprop` output projected onto the property allowlist."""
-    found = {}
+    found: dict[str, str] = {}
     for ln in (text or "").splitlines():
         m = re.match(r"^\[([^\]]+)\]:\s*\[(.*)\]$", ln.strip())
         if m and m.group(1) in _PROVISION_PROPS:
@@ -555,9 +611,9 @@ def _probe_props(text: str) -> dict:
     return found
 
 
-def _probe_wpa_status(text: str) -> dict:
+def _probe_wpa_status(text: str) -> dict[str, str]:
     """`wpa_cli status` projected onto the key allowlist."""
-    found = {}
+    found: dict[str, str] = {}
     for ln in (text or "").splitlines():
         k, _, v = ln.strip().partition("=")
         if k in _WPA_STATUS_KEYS:
@@ -565,7 +621,7 @@ def _probe_wpa_status(text: str) -> dict:
     return found
 
 
-def _probe_wpa_scan(text: str, selected: str | None = None) -> list[dict]:
+def _probe_wpa_scan(text: str, selected: object = None) -> list[WpaScanRow]:
     """
     Scan results with the names taken out and the radio left in.
 
@@ -579,7 +635,7 @@ def _probe_wpa_scan(text: str, selected: str | None = None) -> list[dict]:
     you wanted is WPA3" is the whole answer and is otherwise unrecoverable
     once the names are gone.
     """
-    rows = []
+    rows: list[WpaScanRow] = []
     for ln in (text or "").splitlines():
         parts = ln.rstrip("\n").split("\t")
         if len(parts) < 4 or parts[0].strip().lower().startswith("bssid"):
@@ -604,15 +660,30 @@ def _probe_services(text: str) -> list[str]:
             if _INIT_SVC.match(ln.strip())]
 
 
+def _probe(probe: ProvisionProbe, text: str, selected_ssid: object) -> ProbeResult:
+    """One posted probe's output, projected by its own parser, else scrubbed."""
+    match probe:
+        case ProvisionProbe.PROPS:
+            return _probe_props(text)
+        case ProvisionProbe.WPA_STATUS:
+            return _probe_wpa_status(text)
+        case ProvisionProbe.WPA_SCAN:
+            return _probe_wpa_scan(text, selected_ssid)
+        case ProvisionProbe.SERVICES:
+            return _probe_services(text)
+        case _:
+            return _scrub(text)
+
+
 def build_provision_diagnostics(
     *,
-    step: str,
-    error: str,
-    probes: dict,
-    transcript: list[str] | None = None,
-    selected_ssid: str | None = None,
+    step: object,
+    error: object,
+    probes: object,
+    transcript: object = None,
+    selected_ssid: object = None,
     controller_version: str = "unknown",
-) -> dict:
+) -> ProvisionDiagnostics:
     """
     One file the reporter can attach to a public issue after a failed step.
 
@@ -622,6 +693,9 @@ def build_provision_diagnostics(
     the moment of failure was gone. Collection is automatic; the download is
     deliberate.
 
+    Every argument but the version is the wizard's POSTed JSON, taken as
+    untrusted input of any shape — this function is where it is validated.
+
     `step` and `error` are OURS — the step id comes from a fixed list and the
     error is our own message — but they are scrubbed anyway rather than
     trusted, because an error string interpolates device output often enough
@@ -630,39 +704,25 @@ def build_provision_diagnostics(
     The transcript is scrubbed line by line and is where a device's own words
     reach the file, so it gets the same treatment as everything else.
     """
-    out = {
+    raw = probes if isinstance(probes, dict) else {}
+    found: dict[str, ProbeResult] = {}
+    for probe in ProvisionProbe:
+        text = raw.get(probe)
+        if isinstance(text, str):
+            found[probe] = _probe(probe, text, selected_ssid)
+
+    out: ProvisionDiagnostics = {
         "format": 1,
         "kind": "provision_diagnostics",
         "generated": time.time(),
         "controller_version": controller_version,
         "step": " ".join(_scrub(str(step))) or "unknown",
         "error": _scrub(str(error)),
-        "probes": {},
+        "probes": found,
+        # Named so a reader can tell "the wizard did not ask" from "the device
+        # had nothing to say", which need opposite next questions.
+        "probes_missing": [p for p in ProvisionProbe if p not in found],
     }
-
-    raw = probes if isinstance(probes, dict) else {}
-    for name in _PROVISION_PROBES:
-        if name not in raw:
-            continue
-        text = raw.get(name)
-        if not isinstance(text, str):
-            continue
-        if name == "props":
-            value = _probe_props(text)
-        elif name == "wpa_status":
-            value = _probe_wpa_status(text)
-        elif name == "wpa_scan":
-            value = _probe_wpa_scan(text, selected_ssid)
-        elif name == "services":
-            value = _probe_services(text)
-        else:
-            value = _scrub(text)
-        out["probes"][name] = value
-
-    # Named so a reader can tell "the wizard did not ask" from "the device had
-    # nothing to say", which need opposite next questions.
-    out["probes_missing"] = [n for n in _PROVISION_PROBES if n not in out["probes"]]
-
-    if transcript:
+    if transcript and isinstance(transcript, list):
         out["transcript"] = [ln for t in transcript for ln in _scrub(str(t))]
     return out

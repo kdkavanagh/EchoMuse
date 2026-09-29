@@ -11,9 +11,6 @@ import (
 	"github.com/wilbowes/EchoMuse/internal/proto"
 )
 
-// alertAssetExt is the alert sound extension in the alert asset store (§16.5).
-const alertAssetExt = "wav"
-
 // AlertState implements alerts.EventSink: alert.state on every change.
 func (s *Supervisor) AlertState(st alerts.AlertState) {
 	s.mu.Lock()
@@ -70,7 +67,8 @@ func (s *Supervisor) alertAct(env proto.Envelope) {
 		return
 	}
 	res := s.ex.Act(b.OpID, b.TargetID, b.Action, b.Source)
-	s.ack(env, res.Status, res.Error)
+	status, code := actAck(res)
+	s.ack(env, status, code)
 	s.sendActResult(res)
 }
 
@@ -97,7 +95,7 @@ func (s *Supervisor) alertRing(env proto.Envelope) {
 	s.ack(env, proto.AckAccepted, "")
 	// A sound that was not installed rings as the fallback (§16.5); install it
 	// in the background so the next ring uses it.
-	if _, installed := s.ex.PreviewPCM(r.Sound); !installed && isSHA256(r.Sound) {
+	if _, installed := s.ex.PreviewPCM(r.Sound); !installed && assets.IsSHA256(r.Sound) {
 		s.wantSounds(r.Sound)
 		s.fetchAlertAssets()
 	}
@@ -113,7 +111,7 @@ func (s *Supervisor) alertPrefetch(env proto.Envelope) {
 		return
 	}
 	for _, sha := range b.Sounds {
-		if !isSHA256(sha) {
+		if !assets.IsSHA256(sha) {
 			s.ack(env, proto.AckRejected, codeInvalid)
 			return
 		}
@@ -188,7 +186,7 @@ func (s *Supervisor) fetchAlertAssetsFrom(ctx context.Context, tr assets.Transpo
 			s.fetched(sha)
 			continue
 		}
-		if _, err := s.cfg.AlertStore.Ensure(ctx, tr, sha, alertAssetExt); err != nil {
+		if _, err := s.cfg.AlertStore.Ensure(ctx, tr, sha, alerts.AssetExt); err != nil {
 			if errors.Is(err, assets.ErrNotFound) || errors.Is(err, assets.ErrHashMismatch) {
 				s.mu.Lock()
 				s.unfetchable[sha] = true

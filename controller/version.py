@@ -22,8 +22,22 @@ from __future__ import annotations
 
 import os
 import subprocess
+from enum import StrEnum
+from typing import TypedDict
 
 _PREFIX = "controller-"
+
+
+class UpdateStatus(StrEnum):
+    UPDATE = "update"
+    CURRENT = "current"
+    UNKNOWN = "unknown"
+
+
+class UpdateCheck(TypedDict):
+    """The `status`/`available` pair merged into the controller-update API body."""
+    status: UpdateStatus
+    available: bool
 
 
 def _resolve() -> str:
@@ -42,8 +56,8 @@ def _resolve() -> str:
         described = out.stdout.strip()
         if out.returncode == 0 and described:
             return described.removeprefix(_PREFIX)
-    except Exception:
-        pass
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+        pass    # no git binary, not a checkout, or a hung/garbled describe: "dev"
 
     return "dev"
 
@@ -51,7 +65,7 @@ def _resolve() -> str:
 VERSION = _resolve()
 
 
-def parse(text: str) -> tuple | None:
+def parse(text: str) -> tuple[int, ...] | None:
     """
     ("v2.10.0", "controller-v2.10.0", "v2.10.0-3-gabc1234-dirty") -> (2, 10, 0).
 
@@ -69,7 +83,7 @@ def parse(text: str) -> tuple | None:
     return tuple(int(p) for p in parts[:3])
 
 
-def compare(current: str, latest: str) -> dict:
+def compare(current: str, latest: str) -> UpdateCheck:
     """
     Is `latest` newer than the running `current`?
 
@@ -87,7 +101,7 @@ def compare(current: str, latest: str) -> dict:
     """
     c, l = parse(current), parse(latest)
     if c is None or l is None:
-        return {"status": "unknown", "available": False}
+        return {"status": UpdateStatus.UNKNOWN, "available": False}
     if l > c:
-        return {"status": "update", "available": True}
-    return {"status": "current", "available": False}
+        return {"status": UpdateStatus.UPDATE, "available": True}
+    return {"status": UpdateStatus.CURRENT, "available": False}

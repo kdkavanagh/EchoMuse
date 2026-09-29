@@ -112,13 +112,8 @@ func readAsset(path, sha string) ([]int16, error) {
 // plays the built-in fallback immediately (§16.5). The slice is shared and
 // must not be modified.
 func (e *Executor) PreviewPCM(sound string) (pcm []int16, installed bool) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if sound != SoundFallback && validSHA256(sound) {
-		e.cacheSoundLocked(sound)
-		if pcm := e.sounds[sound]; pcm != nil {
-			return pcm, true
-		}
+	if pcm := e.cachedSound(sound); pcm != nil {
+		return pcm, true
 	}
 	return FallbackPCM(), false
 }

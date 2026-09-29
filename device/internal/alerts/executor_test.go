@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/wilbowes/EchoMuse/internal/uuid"
 )
 
 func minute(n int) int64 { return int64(n) * 60000 }
@@ -23,7 +25,7 @@ func TestDismissIsDurableBeforeAckAndNeverReringsAfterReboot(t *testing.T) {
 		t.Fatal("ringing alarm produced no audio")
 	}
 
-	res := h.e.Act("", a.occID(), actionDismiss, "button")
+	res := h.e.Act("", a.occID(), ActionDismiss, "button")
 	if res.Status != StatusDurable || res.Operation == nil || res.Ended == nil || res.Ended.Reason != "button" {
 		t.Fatalf("dismiss %+v", res)
 	}
@@ -32,7 +34,7 @@ func TestDismissIsDurableBeforeAckAndNeverReringsAfterReboot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if op := other.st.ops[res.OpID]; op == nil || op.Action != actionDismiss || op.OccurrenceID != a.occID() {
+	if op := other.st.ops[res.OpID]; op == nil || op.Action != ActionDismiss || op.OccurrenceID != a.occID() {
 		t.Fatalf("dismiss not journaled before ack: %+v", other.st.ops)
 	}
 	other.close()
@@ -53,7 +55,7 @@ func TestDismissIsDurableBeforeAckAndNeverReringsAfterReboot(t *testing.T) {
 	if ops := h.e.PendingOperations(); len(ops) != 1 || ops[0].OpID != res.OpID {
 		t.Fatalf("operation not re-sent after reboot: %+v", ops)
 	}
-	if again := h.e.Act(res.OpID, a.occID(), actionDismiss, "button"); again.Status != StatusDurable {
+	if again := h.e.Act(res.OpID, a.occID(), ActionDismiss, "button"); again.Status != StatusDurable {
 		t.Fatalf("retried op id: %+v", again)
 	}
 }
@@ -66,7 +68,7 @@ func TestDismissPersistenceFailureStopsInMemoryOnly(t *testing.T) {
 	h.advanceTo(a.dueUTC)
 	h.e.st.log.Close() // every later write fails
 
-	res := h.e.Act("", a.occID(), actionDismiss, "voice")
+	res := h.e.Act("", a.occID(), ActionDismiss, "voice")
 	if res.Status != StatusApplied || res.Error != "persistence_failed" || res.Operation == nil {
 		t.Fatalf("dismiss with failing store %+v", res)
 	}
@@ -90,7 +92,7 @@ func TestSnoozeChildIdentityAndSupersession(t *testing.T) {
 	h.install("E1", 1, p)
 	h.advanceTo(parentDue + 500) // the press is 06:30:00.5 local
 
-	res := h.e.Act("", p.id, actionSnooze, "voice")
+	res := h.e.Act("", p.id, ActionSnooze, "voice")
 	if res.Status != StatusDurable || res.Operation == nil || res.Operation.Child == nil {
 		t.Fatalf("snooze %+v", res)
 	}
@@ -105,7 +107,7 @@ func TestSnoozeChildIdentityAndSupersession(t *testing.T) {
 	if child != want {
 		t.Fatalf("child\n got %+v\nwant %+v", child, want)
 	}
-	if res.Operation.Action != actionSnooze || res.Operation.OccurrenceID != p.id {
+	if res.Operation.Action != ActionSnooze || res.Operation.OccurrenceID != p.id {
 		t.Fatalf("operation %+v", res.Operation)
 	}
 	// Parent and child are one journal transaction.
@@ -153,7 +155,7 @@ func TestRingingChildAdoptsDeliveredCopy(t *testing.T) {
 	p := alarm("wake", t0+minute(1))
 	h.install("E1", 1, p)
 	h.advanceTo(p.dueUTC)
-	res := h.e.Act("", p.occID(), actionSnooze, "voice")
+	res := h.e.Act("", p.occID(), ActionSnooze, "voice")
 	child := res.Operation.Child
 	h.advanceTo(child.DueUTCMs)
 	if h.activeID() != child.OccurrenceID {
@@ -202,7 +204,7 @@ func TestQueueOrdersAlarmsAndTimerRings(t *testing.T) {
 	if q := h.e.State().Queue; len(q) != 3 || q[0] != first.occID() || q[1] != second.occID() || q[2] != "t-late" {
 		t.Fatalf("queue %v", q)
 	}
-	if r := h.e.Act("", "t-early", actionSnooze, "voice"); r.Status != StatusRejected || r.Error != "not_snoozable" {
+	if r := h.e.Act("", "t-early", ActionSnooze, "voice"); r.Status != StatusRejected || r.Error != "not_snoozable" {
 		t.Fatalf("timer snooze %+v", r)
 	}
 	for _, want := range []string{"t-early", first.occID(), second.occID(), "t-late"} {
@@ -210,7 +212,7 @@ func TestQueueOrdersAlarmsAndTimerRings(t *testing.T) {
 		if h.activeID() != want {
 			t.Fatalf("active %q, want %q", h.activeID(), want)
 		}
-		r := h.e.Act("", want, actionDismiss, "entity")
+		r := h.e.Act("", want, ActionDismiss, "entity")
 		if r.Ended == nil || r.Ended.ID != want || r.Ended.Reason != "entity" {
 			t.Fatalf("stop %s: %+v", want, r)
 		}
@@ -237,13 +239,13 @@ func TestActAcceptsTheControllersUUIDv5OpIDs(t *testing.T) {
 	if h.activeID() != "t" {
 		t.Fatalf("timer not ringing: %+v", h.active())
 	}
-	for _, bad := range []string{"not-a-uuid", strings.ToUpper(NewUUID4().String()), "6ba7b811-9dad-11d1-00b4-00c04fd430c8"} {
-		if r := h.e.Act(bad, "t", actionDismiss, "voice"); r.Status != StatusRejected || r.Error != "invalid_op_id" {
+	for _, bad := range []string{"not-a-uuid", strings.ToUpper(uuid.NewV4().String()), "6ba7b811-9dad-11d1-00b4-00c04fd430c8"} {
+		if r := h.e.Act(bad, "t", ActionDismiss, "voice"); r.Status != StatusRejected || r.Error != "invalid_op_id" {
 			t.Fatalf("op_id %q: %+v", bad, r)
 		}
 	}
-	voice := UUID5(NamespaceURL, "turn-1|dismiss").String()
-	r := h.e.Act(voice, "t", actionDismiss, "voice")
+	voice := uuid.V5(uuid.NamespaceURL, "turn-1|dismiss").String()
+	r := h.e.Act(voice, "t", ActionDismiss, "voice")
 	if r.Status != StatusApplied || r.Ended == nil || r.Ended.ID != "t" || r.OpID != voice {
 		t.Fatalf("voice stop with a UUIDv5 op_id: %+v", r)
 	}
@@ -255,8 +257,8 @@ func TestActAcceptsTheControllersUUIDv5OpIDs(t *testing.T) {
 	a := alarm("wake", h.utcNow()+minute(1))
 	h.install("E1", 1, a)
 	h.advanceTo(a.dueUTC)
-	llm := UUID5(NamespaceURL, "request-1").String()
-	if r := h.e.Act(llm, a.occID(), actionDismiss, "llm"); r.Status != StatusDurable || r.Operation == nil || r.Operation.OpID != llm {
+	llm := uuid.V5(uuid.NamespaceURL, "request-1").String()
+	if r := h.e.Act(llm, a.occID(), ActionDismiss, "llm"); r.Status != StatusDurable || r.Operation == nil || r.Operation.OpID != llm {
 		t.Fatalf("llm dismiss with a UUIDv5 op_id: %+v", r)
 	}
 }
@@ -271,8 +273,8 @@ func TestCatchUpWindowAndMissedExpiry(t *testing.T) {
 	if h.activeID() != late.occID() {
 		t.Fatalf("catch-up occurrence not ringing: %+v", h.active())
 	}
-	if len(h.rec.ops) != 1 || h.rec.ops[0].Action != actionExpire || *h.rec.ops[0].Reason != reasonMissed ||
-		h.rec.ops[0].OccurrenceID != missed.occID() || h.rec.ops[0].Source != sourceExecutor {
+	if len(h.rec.ops) != 1 || h.rec.ops[0].Action != ActionExpire || *h.rec.ops[0].Reason != reasonMissed ||
+		h.rec.ops[0].OccurrenceID != missed.occID() || h.rec.ops[0].Source != SourceExecutor {
 		t.Fatalf("missed expiry %+v", h.rec.ops)
 	}
 
@@ -285,7 +287,7 @@ func TestCatchUpWindowAndMissedExpiry(t *testing.T) {
 	h2.install("E1", 1, ringing, queued)
 	h2.advanceTo(ringing.dueUTC)
 	h2.advanceTo(queued.dueUTC + minute(31))
-	h2.e.Act("", ringing.occID(), actionDismiss, "button")
+	h2.e.Act("", ringing.occID(), ActionDismiss, "button")
 	h2.e.Poll()
 	if h2.active() != nil || len(h2.rec.ops) != 1 || *h2.rec.ops[0].Reason != reasonMissed {
 		t.Fatalf("stale queued occurrence rang: active=%+v ops=%+v", h2.active(), h2.rec.ops)
@@ -382,7 +384,7 @@ func TestRampAndLoopGapSampleMath(t *testing.T) {
 	}
 
 	// A timer ring has no ramp.
-	h.e.Act("", a.occID(), actionDismiss, "button")
+	h.e.Act("", a.occID(), ActionDismiss, "button")
 	h.fill(480)
 	if err := h.e.HandleTimerRing(TimerRing{RingID: "t", Name: "x", Sound: sha, LoopGapMs: 10, MaxRingMs: 60000}); err != nil {
 		t.Fatal(err)
@@ -445,7 +447,7 @@ func TestFallbackToneCadence(t *testing.T) {
 		t.Fatal("missing asset did not select the fallback")
 	}
 	// A corrupt asset (hash mismatch) is refused the same way.
-	if err := os.MkdirAll(h.e.AssetDir(), 0o750); err != nil {
+	if err := os.MkdirAll(AssetDir(h.root), 0o750); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(h.e.assetPath(a.sound), []byte("RIFF"), 0o640); err != nil {
@@ -624,7 +626,7 @@ func TestWakeLockFileProtocol(t *testing.T) {
 		t.Fatalf("armed occurrence did not hold the lock: %q %s", read(h.paths.Lock), h.e.State().WakeLock)
 	}
 	reset()
-	h.e.Act("", a.occID(), actionDismiss, "dashboard")
+	h.e.Act("", a.occID(), ActionDismiss, "dashboard")
 	h.e.Poll()
 	if read(h.paths.Unlock) != wakeLockName || h.e.State().WakeLock != "released" {
 		t.Fatal("empty cache did not release the lock")

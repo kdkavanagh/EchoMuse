@@ -18,10 +18,13 @@ import sys
 import tarfile
 import tempfile
 import urllib.request
+from collections.abc import Mapping
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from em_speech_bundle import ATTRIBUTION_TEXT, MANIFEST_PATH, qualify_bundle, verify_bundle  # noqa: E402
+from em_speech_bundle import (  # noqa: E402
+    ATTRIBUTION_TEXT, MANIFEST_PATH, FileEntry, Manifest, qualify_bundle, verify_bundle,
+)
 
 
 def _sha256(path: Path) -> str:
@@ -32,19 +35,31 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def _verify(path: Path, entry: dict, label: str) -> None:
-    if path.stat().st_size != entry["size"] or _sha256(path) != entry["sha256"]:
+def _verify(path: Path, entry: FileEntry, label: str) -> None:
+    if path.stat().st_size != entry.size or _sha256(path) != entry.sha256:
         raise SystemExit(f"{label} failed size/SHA-256 verification: {path}")
 
 
-def _install(source: Path | None, destination: Path, entry: dict, label: str) -> None:
+def _manifest_str(raw: object, *keys: str) -> str:
+    """A string the typed Manifest does not carry (download URLs, the archive's
+    top directory), read from the raw manifest JSON."""
+    node = raw
+    for key in keys:
+        node = node.get(key) if isinstance(node, Mapping) else None
+    if not isinstance(node, str):
+        raise SystemExit(f"speech bundle manifest has no {'.'.join(keys)}")
+    return node
+
+
+def _install(source: Path | None, destination: Path, entry: FileEntry, label: str,
+             url: str) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".part", dir=destination.parent)
     os.close(fd)
     tmp = Path(tmp_name)
     try:
         if source is None:
-            request = urllib.request.Request(entry["url"], headers={"User-Agent": "EchoMuse-speech-bundle/1"})
+            request = urllib.request.Request(url, headers={"User-Agent": "EchoMuse-speech-bundle/1"})
             with urllib.request.urlopen(request, timeout=120) as response, open(tmp, "wb") as out:
                 shutil.copyfileobj(response, out, length=1024 * 1024)
         else:
@@ -56,21 +71,20 @@ def _install(source: Path | None, destination: Path, entry: dict, label: str) ->
         tmp.unlink(missing_ok=True)
 
 
-def _source(explicit: str | None, local_dir: Path | None, entry: dict) -> Path | None:
+def _source(explicit: str | None, local_dir: Path | None, entry: FileEntry) -> Path | None:
     if explicit:
         return Path(explicit)
     if local_dir is not None:
-        path = local_dir / Path(entry["path"]).name
+        path = local_dir / Path(entry.path).name
         if not path.is_file():
             raise SystemExit(f"local artifact is missing: {path}")
         return path
     return None
 
 
-def _extract(archive_path: Path, root: Path, manifest: dict) -> None:
-    prefix = manifest["asr"]["name"] + "/"
-    wanted = {prefix + Path(entry["path"]).name: (name, entry)
-              for name, entry in manifest["asr"]["files"].items()}
+def _extract(archive_path: Path, root: Path, top: str, files: Mapping[str, FileEntry]) -> None:
+    prefix = top + "/"
+    wanted = {prefix + Path(entry.path).name: (name, entry) for name, entry in files.items()}
     found = set()
     with tarfile.open(archive_path, "r:bz2") as archive:
         for member in archive:
@@ -83,7 +97,7 @@ def _extract(archive_path: Path, root: Path, manifest: dict) -> None:
             source = archive.extractfile(member)
             if source is None:
                 raise SystemExit(f"cannot read Kroko member: {member.name}")
-            destination = root / entry["path"]
+            destination = root / entry.path
             destination.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp_name = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".part", dir=destination.parent)
             try:
@@ -106,16 +120,20 @@ def _extract(archive_path: Path, root: Path, manifest: dict) -> None:
 def fetch(destination: Path, *, wheel: str | None = None, archive: str | None = None,
           vad: str | None = None, local_dir: Path | None = None,
           qualify: bool = False) -> None:
-    manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    raw = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    manifest = Manifest.parse(raw)
     destination.mkdir(parents=True, exist_ok=True)
-    wheel_entry = manifest["runtime"]["wheel"]
-    archive_entry = manifest["asr"]["archive"]
-    vad_entry = manifest["vad"]
-    _install(_source(wheel, local_dir, wheel_entry), destination / wheel_entry["path"], wheel_entry, "wheel")
-    _install(_source(archive, local_dir, archive_entry), destination / archive_entry["path"], archive_entry, "archive")
-    _install(_source(vad, local_dir, vad_entry), destination / vad_entry["path"], vad_entry, "Silero v5")
-    _extract(destination / archive_entry["path"], destination, manifest)
-    attribution = destination / manifest["attribution"]["path"]
+    for explicit, entry, label, url_keys in (
+        (wheel, manifest.wheel, "wheel", ("runtime", "wheel", "url")),
+        (archive, manifest.archive, "archive", ("asr", "archive", "url")),
+        (vad, manifest.vad, "Silero v5", ("vad", "url")),
+    ):
+        source = _source(explicit, local_dir, entry)
+        url = _manifest_str(raw, *url_keys) if source is None else ""
+        _install(source, destination / entry.path, entry, label, url)
+    _extract(destination / manifest.archive.path, destination,
+             _manifest_str(raw, "asr", "name"), manifest.asr_files)
+    attribution = destination / manifest.attribution_path
     attribution.write_text(ATTRIBUTION_TEXT, encoding="utf-8")
     bundle = verify_bundle(destination, check_installed_package=False)
     if qualify:

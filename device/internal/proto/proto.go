@@ -5,13 +5,24 @@
 // Bodies already defined by the package that produces them are not repeated
 // here: detector.Candidate/CandidateEnd/Stats (wake.*), alerts.AlertState,
 // RingEnded, LocalOperation, OpResult, TimerRing, ClockRequest/ClockReply,
-// AlertAck and the snapshot/delta pages.
+// AlertAck and the snapshot/delta pages. Fields drawn from a closed
+// vocabulary use the owning package's type (render.SourceClass,
+// focus.Kind, alerts.Action, ...) or one of the named string types below;
+// they encode exactly as the strings they name.
 package proto
 
 import (
 	"encoding/json"
 	"errors"
 	"strconv"
+
+	"github.com/wilbowes/EchoMuse/internal/alerts"
+	"github.com/wilbowes/EchoMuse/internal/bindings/als"
+	"github.com/wilbowes/EchoMuse/internal/bluetooth"
+	"github.com/wilbowes/EchoMuse/internal/focus"
+	"github.com/wilbowes/EchoMuse/internal/render"
+	"github.com/wilbowes/EchoMuse/internal/wifi"
+	pkgbuttons "github.com/wilbowes/EchoMuse/pkg/buttons"
 )
 
 // Version is the only protocol revision this firmware speaks.
@@ -30,100 +41,106 @@ const (
 	MaxControlBytes = 256 * 1024
 )
 
+// Capability is a session.hello capability name.
+type Capability string
+
 // Capabilities (SPEC §11.1) plus the retained hardware capabilities.
 const (
-	CapAudioTimeline   = "audio_timeline_v1"
-	CapUplinkLeases    = "uplink_leases_v1"
-	CapDeviceWake      = "device_wake_v1"
-	CapRenderReference = "render_reference_v1"
-	CapRenderProgress  = "render_progress_v1"
-	CapFocusLeases     = "focus_leases_v1"
-	CapAlertCache      = "alert_cache_v1"
-	CapTurnProtocol    = "turn_protocol_v1"
+	CapAudioTimeline   Capability = "audio_timeline_v1"
+	CapUplinkLeases    Capability = "uplink_leases_v1"
+	CapDeviceWake      Capability = "device_wake_v1"
+	CapRenderReference Capability = "render_reference_v1"
+	CapRenderProgress  Capability = "render_progress_v1"
+	CapFocusLeases     Capability = "focus_leases_v1"
+	CapAlertCache      Capability = "alert_cache_v1"
+	CapTurnProtocol    Capability = "turn_protocol_v1"
 
-	CapLEDs         = "leds"
-	CapLEDAnim      = "led_anim"
-	CapButtons      = "buttons"
-	CapButtonHold   = "button_hold"
-	CapAmbientLight = "ambient_light"
+	CapLEDs         Capability = "leds"
+	CapLEDAnim      Capability = "led_anim"
+	CapButtons      Capability = "buttons"
+	CapButtonHold   Capability = "button_hold"
+	CapAmbientLight Capability = "ambient_light"
 
 	// CapAlertPrefetch: the device installs the sounds alert.prefetch names.
-	CapAlertPrefetch = "alert_prefetch"
+	CapAlertPrefetch Capability = "alert_prefetch"
 )
+
+// MessageType is an envelope type.
+type MessageType string
 
 // Message types (WIRE §4).
 const (
-	TypeSessionHello    = "session.hello"
-	TypeSessionReady    = "session.ready"
-	TypeSessionRejected = "session.rejected"
-	TypeHeartbeat       = "heartbeat"
-	TypeClockRequest    = "clock.request"
-	TypeClockReply      = "clock.reply"
-	TypeCommandAck      = "command.ack"
-	TypeProtocolError   = "protocol.error"
+	TypeSessionHello    MessageType = "session.hello"
+	TypeSessionReady    MessageType = "session.ready"
+	TypeSessionRejected MessageType = "session.rejected"
+	TypeHeartbeat       MessageType = "heartbeat"
+	TypeClockRequest    MessageType = "clock.request"
+	TypeClockReply      MessageType = "clock.reply"
+	TypeCommandAck      MessageType = "command.ack"
+	TypeProtocolError   MessageType = "protocol.error"
 
-	TypeStreamOpen = "stream.open"
-	TypeStreamEnd  = "stream.end"
+	TypeStreamOpen MessageType = "stream.open"
+	TypeStreamEnd  MessageType = "stream.end"
 
-	TypeRenderStart    = "render.start"
-	TypeRenderEnd      = "render.end"
-	TypeRenderCancel   = "render.cancel"
-	TypeRenderProgress = "render.progress"
-	TypeRenderFinished = "render.finished"
+	TypeRenderStart    MessageType = "render.start"
+	TypeRenderEnd      MessageType = "render.end"
+	TypeRenderCancel   MessageType = "render.cancel"
+	TypeRenderProgress MessageType = "render.progress"
+	TypeRenderFinished MessageType = "render.finished"
 
-	TypeFocusAcquire = "focus.acquire"
-	TypeFocusRenew   = "focus.renew"
-	TypeFocusRelease = "focus.release"
+	TypeFocusAcquire MessageType = "focus.acquire"
+	TypeFocusRenew   MessageType = "focus.renew"
+	TypeFocusRelease MessageType = "focus.release"
 
-	TypeWakeCandidate    = "wake.candidate"
-	TypeWakeCandidateEnd = "wake.candidate_end"
-	TypeWakeStats        = "wake.stats"
+	TypeWakeCandidate    MessageType = "wake.candidate"
+	TypeWakeCandidateEnd MessageType = "wake.candidate_end"
+	TypeWakeStats        MessageType = "wake.stats"
 
-	TypeUplinkOpen  = "uplink.open"
-	TypeUplinkRenew = "uplink.renew"
-	TypeUplinkClose = "uplink.close"
-	TypeUplinkEnded = "uplink.ended"
+	TypeUplinkOpen  MessageType = "uplink.open"
+	TypeUplinkRenew MessageType = "uplink.renew"
+	TypeUplinkClose MessageType = "uplink.close"
+	TypeUplinkEnded MessageType = "uplink.ended"
 
-	TypePrivacyChanged = "privacy.changed"
-	TypeButtonAction   = "button.action"
+	TypePrivacyChanged MessageType = "privacy.changed"
+	TypeButtonAction   MessageType = "button.action"
 
-	TypeAlertSnapshot  = "alert.snapshot"
-	TypeAlertDelta     = "alert.delta"
-	TypeAlertAck       = "alert.ack"
-	TypeAlertLocalOp   = "alert.local_operation"
-	TypeAlertOpResult  = "alert.op_result"
-	TypeAlertAct       = "alert.act"
-	TypeAlertRing      = "alert.ring"
-	TypeAlertPrefetch  = "alert.prefetch"
-	TypeAlertRingEnded = "alert.ring_ended"
-	TypeAlertState     = "alert.state"
+	TypeAlertSnapshot  MessageType = "alert.snapshot"
+	TypeAlertDelta     MessageType = "alert.delta"
+	TypeAlertAck       MessageType = "alert.ack"
+	TypeAlertLocalOp   MessageType = "alert.local_operation"
+	TypeAlertOpResult  MessageType = "alert.op_result"
+	TypeAlertAct       MessageType = "alert.act"
+	TypeAlertRing      MessageType = "alert.ring"
+	TypeAlertPrefetch  MessageType = "alert.prefetch"
+	TypeAlertRingEnded MessageType = "alert.ring_ended"
+	TypeAlertState     MessageType = "alert.state"
 
 	// Retained messages (WIRE §4.8): legacy bodies inside the envelope.
-	TypeLEDs         = "leds"
-	TypeLEDAnim      = "led_anim"
-	TypeVolumeSet    = "volume_set"
-	TypeConfig       = "config"
-	TypeShellOpen    = "shell_open"
-	TypeShellClose   = "shell_close"
-	TypeWifiChange   = "wifi_change"
-	TypeWifiCommit   = "wifi_commit"
-	TypeWifiScan     = "wifi_scan"
-	TypePing         = "ping"
-	TypeVolumeState  = "volume_state"
-	TypeAmbientLight = "ambient_light"
-	TypeLog          = "log"
-	TypeWifiResult   = "wifi_result"
-	TypeWifiScanRes  = "wifi_scan_result"
-	TypeBLEAdverts   = "ble_adverts"
-	TypeStats        = "stats"
-	TypePong         = "pong"
+	TypeLEDs         MessageType = "leds"
+	TypeLEDAnim      MessageType = "led_anim"
+	TypeVolumeSet    MessageType = "volume_set"
+	TypeConfig       MessageType = "config"
+	TypeShellOpen    MessageType = "shell_open"
+	TypeShellClose   MessageType = "shell_close"
+	TypeWifiChange   MessageType = "wifi_change"
+	TypeWifiCommit   MessageType = "wifi_commit"
+	TypeWifiScan     MessageType = "wifi_scan"
+	TypePing         MessageType = "ping"
+	TypeVolumeState  MessageType = "volume_state"
+	TypeAmbientLight MessageType = "ambient_light"
+	TypeLog          MessageType = "log"
+	TypeWifiResult   MessageType = "wifi_result"
+	TypeWifiScanRes  MessageType = "wifi_scan_result"
+	TypeBLEAdverts   MessageType = "ble_adverts"
+	TypeStats        MessageType = "stats"
+	TypePong         MessageType = "pong"
 )
 
 // Envelope wraps every control message (WIRE §2). SessionID is nil only on
 // session.hello.
 type Envelope struct {
 	Protocol   int             `json:"protocol"`
-	Type       string          `json:"type"`
+	Type       MessageType     `json:"type"`
 	SessionID  *string         `json:"session_id"`
 	MessageID  string          `json:"message_id"`
 	DeviceID   string          `json:"device_id"`
@@ -179,17 +196,17 @@ type Volume struct {
 // SessionHello's Clock and Alerts come from alerts.Executor (ClockInfo,
 // Hello); AmbientLightStatus is the retained als.Report() object.
 type SessionHello struct {
-	Capabilities       []string        `json:"capabilities"`
-	FirmwareVersion    string          `json:"firmware_version"`
-	BootID             string          `json:"boot_id"`
-	Protocols          []int           `json:"protocols"`
-	IP                 string          `json:"ip"`
-	AmbientLightStatus json.RawMessage `json:"ambient_light_status"`
-	Privacy            Privacy         `json:"privacy"`
-	Clock              any             `json:"clock"`
-	Alerts             any             `json:"alerts"`
-	Assets             []string        `json:"assets"`
-	Volume             Volume          `json:"volume"`
+	Capabilities       []Capability       `json:"capabilities"`
+	FirmwareVersion    string             `json:"firmware_version"`
+	BootID             string             `json:"boot_id"`
+	Protocols          []int              `json:"protocols"`
+	IP                 string             `json:"ip"`
+	AmbientLightStatus *als.Status        `json:"ambient_light_status"`
+	Privacy            Privacy            `json:"privacy"`
+	Clock              alerts.ClockInfo   `json:"clock"`
+	Alerts             alerts.HelloAlerts `json:"alerts"`
+	Assets             []string           `json:"assets"`
+	Volume             Volume             `json:"volume"`
 }
 
 type SpeechAssets struct {
@@ -228,84 +245,109 @@ type SessionReady struct {
 	UTCMs            uint64         `json:"utc_ms,string"`
 }
 
+// RejectReason is a session.rejected reason.
+type RejectReason string
+
 // Session rejection reasons.
 const (
-	RejectPendingApproval = "pending_approval"
-	RejectUnauthorized    = "unauthorized"
-	RejectProtocol        = "protocol"
+	RejectPendingApproval RejectReason = "pending_approval"
+	RejectUnauthorized    RejectReason = "unauthorized"
+	RejectProtocol        RejectReason = "protocol"
 )
 
 type SessionRejected struct {
-	Reason string `json:"reason"`
+	Reason RejectReason `json:"reason"`
 }
 
 type Heartbeat struct {
 	MonoNs int64 `json:"mono_ns,string"`
 }
 
+// AckStatus is a command.ack status.
+type AckStatus string
+
 // Command acknowledgement statuses.
 const (
-	AckAccepted = "accepted"
-	AckApplied  = "applied"
-	AckDurable  = "durable"
-	AckRejected = "rejected"
+	AckAccepted AckStatus = "accepted"
+	AckApplied  AckStatus = "applied"
+	AckDurable  AckStatus = "durable"
+	AckRejected AckStatus = "rejected"
 )
 
+// AckCode is a command.ack rejection code; alert.act uses the alert
+// executor's codes (alerts.ActError).
+type AckCode string
+
 type CommandAck struct {
-	MessageID string  `json:"message_id"`
-	Status    string  `json:"status"`
-	Error     *string `json:"error"`
+	MessageID string    `json:"message_id"`
+	Status    AckStatus `json:"status"`
+	Error     *AckCode  `json:"error"`
 }
 
+// ErrorCode is a protocol.error code.
+type ErrorCode string
+
+// Protocol error codes the device sends.
+const (
+	ErrMalformedMessage ErrorCode = "malformed_message"
+	ErrMalformedFrame   ErrorCode = "malformed_frame"
+)
+
 type ProtocolError struct {
-	Code   string `json:"code"`
-	Detail string `json:"detail"`
+	Code   ErrorCode `json:"code"`
+	Detail string    `json:"detail"`
 }
 
 // ── Streams and render (WIRE §4.2) ──────────────────────────────────────────
 
-// Uplink stream IDs; also the uplink lease stream keys.
+// StreamID names an uplink stream; also the uplink lease stream keys.
+type StreamID string
+
+// Uplink stream IDs.
 const (
-	StreamMic       = "mic"
-	StreamReference = "reference"
-	StreamCells     = "cells"
+	StreamMic       StreamID = "mic"
+	StreamReference StreamID = "reference"
+	StreamCells     StreamID = "cells"
 )
+
+// StreamReason says why a stream epoch opened or ended.
+type StreamReason string
 
 // Stream open/end reasons.
 const (
-	StreamStart         = "start"
-	StreamDiscontinuity = "discontinuity"
-	StreamPrivacy       = "privacy"
-	StreamClockReset    = "clock_reset"
-	StreamRenderEpoch   = "render_epoch"
+	StreamStart         StreamReason = "start"
+	StreamDiscontinuity StreamReason = "discontinuity"
+	StreamPrivacy       StreamReason = "privacy"
+	StreamClockReset    StreamReason = "clock_reset"
+	StreamRenderEpoch   StreamReason = "render_epoch"
 )
 
 type StreamOpen struct {
-	StreamID   string `json:"stream_id"`
-	Epoch      uint64 `json:"epoch,string"`
-	Kind       uint8  `json:"kind"`
-	SampleRate uint32 `json:"sample_rate"`
-	Format     uint8  `json:"format"`
-	Reason     string `json:"reason"`
+	StreamID   StreamID     `json:"stream_id"`
+	Epoch      uint64       `json:"epoch,string"`
+	Kind       uint8        `json:"kind"`
+	SampleRate uint32       `json:"sample_rate"`
+	Format     uint8        `json:"format"`
+	Reason     StreamReason `json:"reason"`
 }
 
 type StreamEnd struct {
-	StreamID    string `json:"stream_id"`
-	Epoch       uint64 `json:"epoch,string"`
-	FinalSample uint64 `json:"final_sample,string"`
-	Reason      string `json:"reason"`
+	StreamID    StreamID     `json:"stream_id"`
+	Epoch       uint64       `json:"epoch,string"`
+	FinalSample uint64       `json:"final_sample,string"`
+	Reason      StreamReason `json:"reason"`
 }
 
 // RenderStart's Epoch is set only for network sources; LocalAsset only for
 // local ones ("builtin:wake_chime", "builtin:fallback" or an alert sha256).
 type RenderStart struct {
-	PlaybackID   string  `json:"playback_id"`
-	SourceClass  string  `json:"source_class"`
-	Epoch        NullU64 `json:"epoch"`
-	GainDB       float64 `json:"gain_db"`
-	Format       uint8   `json:"format"`
-	LocalAsset   *string `json:"local_asset"`
-	Announcement bool    `json:"announcement"`
+	PlaybackID   string             `json:"playback_id"`
+	SourceClass  render.SourceClass `json:"source_class"`
+	Epoch        NullU64            `json:"epoch"`
+	GainDB       float64            `json:"gain_db"`
+	Format       uint8              `json:"format"`
+	LocalAsset   *string            `json:"local_asset"`
+	Announcement bool               `json:"announcement"`
 }
 
 // RenderEnd ends a network playback. EndFrame is the source frame after the
@@ -323,34 +365,34 @@ type RenderCancel struct {
 // RenderProgress: SeekFrame/MissingFrom/MissingTo/GainDB are present only for
 // their event.
 type RenderProgress struct {
-	PlaybackID        string   `json:"playback_id"`
-	Event             string   `json:"event"`
-	SubmittedFrames   uint64   `json:"submitted_frames,string"`
-	CompletedFrames   uint64   `json:"completed_frames,string"`
-	MonoNs            int64    `json:"mono_ns,string"`
-	UncertaintyUs     uint32   `json:"uncertainty_us"`
-	TimingQuality     string   `json:"timing_quality"`
-	ReferenceCoverage string   `json:"reference_coverage"`
-	SeekFrame         *NullU64 `json:"seek_frame,omitempty"`
-	MissingFrom       *NullU64 `json:"missing_from,omitempty"`
-	MissingTo         *NullU64 `json:"missing_to,omitempty"`
-	GainDB            *float64 `json:"gain_db,omitempty"`
+	PlaybackID        string                   `json:"playback_id"`
+	Event             render.ProgressEvent     `json:"event"`
+	SubmittedFrames   uint64                   `json:"submitted_frames,string"`
+	CompletedFrames   uint64                   `json:"completed_frames,string"`
+	MonoNs            int64                    `json:"mono_ns,string"`
+	UncertaintyUs     uint32                   `json:"uncertainty_us"`
+	TimingQuality     render.TimingQuality     `json:"timing_quality"`
+	ReferenceCoverage render.ReferenceCoverage `json:"reference_coverage"`
+	SeekFrame         *NullU64                 `json:"seek_frame,omitempty"`
+	MissingFrom       *NullU64                 `json:"missing_from,omitempty"`
+	MissingTo         *NullU64                 `json:"missing_to,omitempty"`
+	GainDB            *float64                 `json:"gain_db,omitempty"`
 }
 
 type RenderFinished struct {
-	PlaybackID         string `json:"playback_id"`
-	LastCompletedFrame uint64 `json:"last_completed_frame,string"`
-	Reason             string `json:"reason"`
-	TimingQuality      string `json:"timing_quality"`
+	PlaybackID         string               `json:"playback_id"`
+	LastCompletedFrame uint64               `json:"last_completed_frame,string"`
+	Reason             render.FinishReason  `json:"reason"`
+	TimingQuality      render.TimingQuality `json:"timing_quality"`
 }
 
 // ── Focus (WIRE §4.3) ───────────────────────────────────────────────────────
 
 type FocusAcquire struct {
-	LeaseID string `json:"lease_id"`
-	Owner   string `json:"owner"`
-	Focus   string `json:"focus"` // dialog_input | dialog_output
-	TTLMs   int64  `json:"ttl_ms"`
+	LeaseID string     `json:"lease_id"`
+	Owner   string     `json:"owner"`
+	Focus   focus.Kind `json:"focus"`
+	TTLMs   int64      `json:"ttl_ms"`
 }
 
 type FocusRenew struct {
@@ -367,10 +409,10 @@ type FocusRelease struct {
 // ActiveAlert is wake.candidate's active_alert (null when nothing is ringing
 // or backgrounded). The supervisor adds it beside detector.Candidate's fields.
 type ActiveAlert struct {
-	ID         string `json:"id"`
-	Kind       string `json:"kind"`
-	Name       string `json:"name"`
-	Foreground bool   `json:"foreground"`
+	ID         string      `json:"id"`
+	Kind       alerts.Kind `json:"kind"`
+	Name       string      `json:"name"`
+	Foreground bool        `json:"foreground"`
 }
 
 // ── Uplink leases (WIRE §4.5) ───────────────────────────────────────────────
@@ -378,55 +420,70 @@ type ActiveAlert struct {
 // StartLive is the uplink stream start meaning "from now".
 const StartLive = "live"
 
-// Uplink reasons and end reasons.
+// LeaseReason is an uplink lease's purpose.
+type LeaseReason string
+
+// Uplink lease reasons.
 const (
-	LeaseCandidate  = "candidate"
-	LeaseTurn       = "turn"
-	LeaseReply      = "reply"
-	LeaseDiagnostic = "diagnostic"
+	LeaseCandidate  LeaseReason = "candidate"
+	LeaseTurn       LeaseReason = "turn"
+	LeaseReply      LeaseReason = "reply"
+	LeaseDiagnostic LeaseReason = "diagnostic"
+)
 
-	CloseRejected        = "rejected"
-	CloseArbitrationLost = "arbitration_lost"
-	CloseCommitted       = "committed"
-	CloseClosed          = "closed"
+// CloseReason is an uplink.close reason.
+type CloseReason string
 
-	EndedClosed  = "closed"
-	EndedTTL     = "ttl"
-	EndedMute    = "mute"
-	EndedEpoch   = "epoch"
-	EndedOverrun = "overrun"
-	EndedSession = "session"
+// Uplink close reasons.
+const (
+	CloseRejected        CloseReason = "rejected"
+	CloseArbitrationLost CloseReason = "arbitration_lost"
+	CloseCommitted       CloseReason = "committed"
+	CloseClosed          CloseReason = "closed"
+)
+
+// EndedReason is an uplink.ended reason.
+type EndedReason string
+
+// Uplink end reasons.
+const (
+	EndedClosed  EndedReason = "closed"
+	EndedTTL     EndedReason = "ttl"
+	EndedMute    EndedReason = "mute"
+	EndedEpoch   EndedReason = "epoch"
+	EndedOverrun EndedReason = "overrun"
+	EndedSession EndedReason = "session"
 )
 
 // UplinkOpen.Streams maps a stream key to a decimal capture-epoch sample
 // index or "live"; an absent key is not wanted.
 type UplinkOpen struct {
-	LeaseID string            `json:"lease_id"`
-	Owner   string            `json:"owner"`
-	Reason  string            `json:"reason"`
-	Streams map[string]string `json:"streams"`
-	TTLMs   int64             `json:"ttl_ms"`
+	LeaseID string              `json:"lease_id"`
+	Owner   string              `json:"owner"`
+	Reason  LeaseReason         `json:"reason"`
+	Streams map[StreamID]string `json:"streams"`
+	TTLMs   int64               `json:"ttl_ms"`
 }
 
 // UplinkRenew converts a candidate lease when Reason == "turn" and the
 // envelope generation is the lease's + 1.
 type UplinkRenew struct {
-	LeaseID string `json:"lease_id"`
-	TTLMs   int64  `json:"ttl_ms"`
-	Reason  string `json:"reason,omitempty"`
-	Owner   string `json:"owner,omitempty"`
+	LeaseID string      `json:"lease_id"`
+	TTLMs   int64       `json:"ttl_ms"`
+	Reason  LeaseReason `json:"reason,omitempty"`
+	Owner   string      `json:"owner,omitempty"`
 }
 
 type UplinkClose struct {
-	LeaseID string `json:"lease_id"`
-	Reason  string `json:"reason"`
+	LeaseID string      `json:"lease_id"`
+	Reason  CloseReason `json:"reason"`
 }
 
 type UplinkEnded struct {
-	LeaseID      string             `json:"lease_id"`
-	Reason       string             `json:"reason"`
-	LastSample   map[string]NullU64 `json:"last_sample"`
-	ClippedStart map[string]NullU64 `json:"clipped_start"`
+	LeaseID      string               `json:"lease_id"`
+	Reason       EndedReason          `json:"reason"`
+	LastSample   map[StreamID]NullU64 `json:"last_sample"`
+	ClippedStart map[StreamID]NullU64 `json:"clipped_start"`
 }
 
 // ── Physical events (WIRE §4.6) ─────────────────────────────────────────────
@@ -437,35 +494,103 @@ type PrivacyChanged struct {
 	PhysicalSeq  uint64  `json:"physical_seq"`
 }
 
-// HandledAlertStopped is button.action's handled value when the device
-// stopped a ringing or backgrounded alert itself.
-const HandledAlertStopped = "alert_stopped"
+// Handled is button.action's handled value: what the device did with the
+// press itself.
+type Handled string
+
+// HandledAlertStopped: the device stopped a ringing or backgrounded alert.
+const HandledAlertStopped Handled = "alert_stopped"
 
 type ButtonAction struct {
-	ClickType     int     `json:"click_type"`
-	Button        string  `json:"button"`
-	Down          bool    `json:"down"`
-	HeldMs        int64   `json:"held_ms"`
-	Muted         bool    `json:"muted"`
-	MonoNs        int64   `json:"mono_ns,string"`
-	CaptureEpoch  NullU64 `json:"capture_epoch"`
-	CaptureSample NullU64 `json:"capture_sample"`
-	PhysicalSeq   uint64  `json:"physical_seq"`
-	OccurrenceID  *string `json:"occurrence_id"`
-	Handled       *string `json:"handled"`
+	ClickType     pkgbuttons.ClickType  `json:"click_type"`
+	Button        pkgbuttons.ButtonType `json:"button"`
+	Down          bool                  `json:"down"`
+	HeldMs        int64                 `json:"held_ms"`
+	Muted         bool                  `json:"muted"`
+	MonoNs        int64                 `json:"mono_ns,string"`
+	CaptureEpoch  NullU64               `json:"capture_epoch"`
+	CaptureSample NullU64               `json:"capture_sample"`
+	PhysicalSeq   uint64                `json:"physical_seq"`
+	OccurrenceID  *string               `json:"occurrence_id"`
+	Handled       *Handled              `json:"handled"`
 }
 
 // ── Alerts (WIRE §4.7) ──────────────────────────────────────────────────────
 
 type AlertAct struct {
-	OpID     string `json:"op_id"`
-	TargetID string `json:"target_id"`
-	Action   string `json:"action"` // dismiss | snooze
-	Source   string `json:"source"`
+	OpID     string        `json:"op_id"`
+	TargetID string        `json:"target_id"`
+	Action   alerts.Action `json:"action"` // dismiss | snooze
+	Source   alerts.Source `json:"source"`
 }
 
 // AlertPrefetch names alert sounds (SHA-256) to install before anything
 // rings them: alert.ring names the timer sound only when the timer finishes.
 type AlertPrefetch struct {
 	Sounds []string `json:"sounds"`
+}
+
+// ── Retained device reports (WIRE §4.8) ─────────────────────────────────────
+
+// Stats is the retained stats body. Unavailable measurements use nil rather
+// than a numeric sentinel (SPEC §8.1).
+type Stats struct {
+	CPUPct           float64          `json:"cpuPct"`
+	MemUsedMb        int              `json:"memUsedMb"`
+	MemTotalMb       int              `json:"memTotalMb"`
+	StorageUsedMb    int              `json:"storageUsedMb"`
+	StorageTotalMb   int              `json:"storageTotalMb"`
+	WifiRssi         *int             `json:"wifiRssi"`
+	WifiSsid         string           `json:"wifiSsid"`
+	LinkSpeedMbps    int              `json:"linkSpeedMbps,omitempty"`
+	WifiFreqMhz      int              `json:"wifiFreqMhz,omitempty"`
+	WifiBssid        string           `json:"wifiBssid,omitempty"`
+	TxBytes          uint64           `json:"txBytes"`
+	RxBytes          uint64           `json:"rxBytes"`
+	TxErrors         uint64           `json:"txErrors"`
+	TxDropped        uint64           `json:"txDropped"`
+	RxCrcErrors      uint64           `json:"rxCrcErrors"`
+	Ble              *bluetooth.Stats `json:"ble,omitempty"`
+	AmbientLux       *int             `json:"ambientLux"`
+	CPUTempC         *float64         `json:"cpuTempC"`
+	MaxTempC         *float64         `json:"maxTempC"`
+	CoresOnline      int              `json:"coresOnline,omitempty"`
+	CoresTotal       int              `json:"coresTotal,omitempty"`
+	ThermalCoreLimit int              `json:"thermalCoreLimit,omitempty"`
+}
+
+// WifiResult is the retained wifi_result body; error is always present, ""
+// on success.
+type WifiResult struct {
+	Error string `json:"error"`
+	OK    bool   `json:"ok"`
+	SSID  string `json:"ssid"`
+}
+
+// WifiScanResult is the retained wifi_scan_result body; networks is null
+// when the scan failed.
+type WifiScanResult struct {
+	Error    string         `json:"error"`
+	Networks []wifi.Network `json:"networks"`
+}
+
+// BLEAdverts is the retained ble_adverts body.
+type BLEAdverts struct {
+	Adverts []bluetooth.Advert `json:"adverts"`
+}
+
+// AmbientLight is the retained ambient_light body.
+type AmbientLight struct {
+	Lux int `json:"lux"`
+}
+
+// LogLevel is a retained log message's level.
+type LogLevel string
+
+const LogInfo LogLevel = "info"
+
+// Log is the retained log body: a device log line for the controller.
+type Log struct {
+	Level   LogLevel `json:"level"`
+	Message string   `json:"message"`
 }

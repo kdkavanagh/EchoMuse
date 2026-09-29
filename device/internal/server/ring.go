@@ -186,12 +186,6 @@ func (r *ring) cancelVolume() {
 	r.mu.Unlock()
 }
 
-func (r *ring) displayActive() bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.arc
-}
-
 func (r *ring) paintLocked() {
 	if r.leds == nil {
 		return

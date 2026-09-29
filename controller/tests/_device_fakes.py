@@ -6,12 +6,15 @@ import asyncio
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
+import em_db
 import em_device
+from em_device_link import Envelope, MessageType, SessionHello
 
 ALL_V1 = sorted(em_device.REQUIRED_CAPABILITIES)
 
 
-def hello(capabilities=None, **extra) -> dict:
+def hello_body(capabilities=None, **extra) -> dict:
+    """A `session.hello` body as the device sends it."""
     body = {
         "capabilities": list(ALL_V1 if capabilities is None else capabilities),
         "firmware_version": "v3.0.0",
@@ -24,6 +27,14 @@ def hello(capabilities=None, **extra) -> dict:
     }
     body.update(extra)
     return body
+
+
+def hello(capabilities=None, **extra) -> SessionHello:
+    return SessionHello.parse(hello_body(capabilities, **extra))
+
+
+def envelope(msg_type: str, body: dict) -> Envelope:
+    return Envelope(MessageType(msg_type), "s-1", "m", "DEV1", 0, body)
 
 
 class FakeActor:
@@ -48,8 +59,8 @@ class FakeActor:
     def detach(self, reason: str) -> None:
         self.detached.append(reason)
 
-    def on_message(self, msg_type: str, envelope: dict) -> None:
-        self.messages.append((msg_type, envelope))
+    def on_message(self, envelope: Envelope) -> None:
+        self.messages.append((envelope.type, envelope))
 
     def on_audio(self, frame: bytes) -> None:
         self.audio.append(frame)
@@ -74,20 +85,20 @@ class FakeRender:
         self.seen: list[str] = []
         self.failed: list[str] = []
 
-    def on_message(self, msg_type: str, envelope: dict) -> bool:
-        self.seen.append(msg_type)
-        return msg_type in self.consumes
+    def on_message(self, envelope: Envelope) -> bool:
+        self.seen.append(envelope.type)
+        return envelope.type in self.consumes
 
     def fail_all(self, reason: str) -> None:
         self.failed.append(reason)
 
 
 class FakeLink:
-    def __init__(self, hello_body: dict, device_id: str = "DEV1") -> None:
+    def __init__(self, session_hello: SessionHello, device_id: str = "DEV1") -> None:
         self.device_id = device_id
         self.session_id = "s-1"
-        self.hello = hello_body
-        self.capabilities = frozenset(hello_body["capabilities"])
+        self.hello = session_hello
+        self.capabilities = session_hello.capabilities
         self.peer_ip = "10.0.0.5"
         self.secure = True
         self.closed = False
@@ -183,11 +194,20 @@ class FakeHost:
         return {"ok": ok}
 
 
+def device_row(device_id: str, *, approved: bool, label: str | None) -> em_db.DeviceRow:
+    """A `devices` row as a freshly registered device has it."""
+    return em_db.DeviceRow(
+        device_id=device_id, label=label, approved=int(approved), ip=None,
+        firmware_ver=None, firmware_previous=None, first_seen=None, last_seen=None,
+        config="{}", esphome_api_port=None, esphome_noise_psk=None, use_global_config=1,
+        ble_proxy_port=None, token=None, config_sections="[]", collect_mode=0, ambient_mode=0)
+
+
 class FakeStore:
     """In-memory device table with the em_db registration semantics."""
 
     def __init__(self, *, approval: str = "strict", token: str | None = None) -> None:
-        self.rows: dict[str, dict] = {}
+        self.rows: dict[str, em_db.DeviceRow] = {}
         self.approval = approval
         self.stored_token = token
         self.configs: dict[str, dict] = {}
@@ -195,7 +215,7 @@ class FakeStore:
         self.registered: list[str] = []
 
     def add(self, device_id: str, *, approved: bool, label: str = "Office") -> None:
-        self.rows[device_id] = {"approved": approved, "label": label}
+        self.rows[device_id] = device_row(device_id, approved=approved, label=label)
 
     def device(self, device_id):
         return self.rows.get(device_id)
@@ -204,14 +224,14 @@ class FakeStore:
         return self.stored_token
 
     def approval_mode(self, default):
-        return self.approval
+        return em_device.ApprovalMode(self.approval)
 
     def register(self, device_id, ip, version):
         self.registered.append(device_id)
-        self.rows.setdefault(device_id, {"approved": False, "label": None})
+        self.rows.setdefault(device_id, device_row(device_id, approved=False, label=None))
 
     def approve(self, device_id, label):
-        self.rows[device_id] = {"approved": True, "label": label}
+        self.rows[device_id] = device_row(device_id, approved=True, label=label)
 
     def seen(self, device_id, ip, version): ...
 
@@ -237,8 +257,7 @@ class FakeRegistry:
 
 class FakeAssets:
     def speech_assets(self, model):
-        return SimpleNamespace(wire=lambda: {"runtime_sha256": "r", "graph_sha256": "g",
-                                             "sidecar_sha256": "s"})
+        return em_device.em_device_assets.SpeechAssets("r", "g", "s")
 
 
 def make_hub(store: FakeStore | None = None, host: FakeHost | None = None,

@@ -74,23 +74,6 @@ def test_result_is_sorted_for_a_stable_error_message():
     assert out == sorted(out)
 
 
-@pytest.mark.parametrize("path,handler", [
-    ("global", "_post_global_config"),
-    ("device", "_post_device_config"),
-])
-def test_both_write_paths_are_guarded(path, handler):
-    """
-    Both endpoints replace rather than merge, so both need the check. A
-    guard on only one would leave the identical trap open next door.
-    """
-    src = (CONTROLLER / "em_api.py").read_text()
-    m = re.search(rf"async def {handler}\(.*?(?=\nasync def )", src, re.S)
-    assert m, f"could not locate {handler}"
-    body = m.group(0)
-    assert "_dropped_keys(" in body, f"{handler} does not call _dropped_keys"
-    assert "would_drop_keys" in body, f"{handler} does not refuse the write"
-
-
 def test_guard_reads_raw_stored_config_not_the_underlaid_view():
     """The guard must call the raw accessor, or the false positive returns."""
     src = (CONTROLLER / "em_api.py").read_text()

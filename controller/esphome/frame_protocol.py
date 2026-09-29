@@ -37,7 +37,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import socket
-from typing import Callable, Optional
+from typing import Optional
 
 log = logging.getLogger("echomuse.esphome.frame")
 
@@ -207,47 +207,44 @@ class PlaintextFrameProtocol(asyncio.Protocol):
     """
     Server-side asyncio.Protocol for one ESPHome native API connection.
 
-    Usage: subclass or pass callbacks via the constructor. on_packet is
-    called as on_packet(msg_type: int, payload: bytes) for every fully
-    decoded frame. on_connected/on_disconnected are lifecycle hooks.
+    Subclasses override packet_received(msg_type, payload), called for
+    every fully decoded frame, and optionally connection_closed().
 
     One instance is created per accepted TCP connection (see
     asyncio.start_server's protocol_factory).
     """
 
-    def __init__(
-        self,
-        on_packet: Callable[["PlaintextFrameProtocol", int, bytes], None],
-        on_connected: Optional[Callable[["PlaintextFrameProtocol"], None]] = None,
-        on_disconnected: Optional[Callable[["PlaintextFrameProtocol"], None]] = None,
-        log_name: str = "esphome",
-    ) -> None:
-        self._on_packet = on_packet
-        self._on_connected = on_connected
-        self._on_disconnected = on_disconnected
+    def __init__(self, log_name: str = "esphome") -> None:
         self._log_name = log_name
         self._reader = _VaruintReader()
         self._transport: Optional[asyncio.Transport] = None
         self.peer: str = "unknown"
 
+    # ── Subclass hooks ────────────────────────────────────────────────────
+
+    def packet_received(self, msg_type: int, payload: bytes) -> None:
+        raise NotImplementedError
+
+    def connection_closed(self) -> None:
+        """Called once the peer's connection is gone, however it ended."""
+
     # ── asyncio.Protocol interface ──────────────────────────────────────
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
-        self._transport = transport  # type: ignore[assignment]
+        if not isinstance(transport, asyncio.Transport):
+            raise TypeError(f"stream transport required, got {type(transport).__name__}")
+        self._transport = transport
         peer = transport.get_extra_info("peername")
         self.peer = f"{peer[0]}:{peer[1]}" if peer else "unknown"
         log.info(f"[{self._log_name}] Connection from {self.peer}")
         _enable_tcp_keepalive(transport, self._log_name)
-        if self._on_connected:
-            self._on_connected(self)
 
     def connection_lost(self, exc: Optional[Exception]) -> None:
         log.info(
             f"[{self._log_name}] Connection closed: {self.peer}"
             + (f" ({exc})" if exc else "")
         )
-        if self._on_disconnected:
-            self._on_disconnected(self)
+        self.connection_closed()
 
     def data_received(self, data: bytes) -> None:
         self._reader.feed(data)
@@ -265,7 +262,7 @@ class PlaintextFrameProtocol(asyncio.Protocol):
         """
         Attempt to decode one complete frame from the buffer.
 
-        Returns True if a frame was decoded (and dispatched to on_packet) —
+        Returns True if a frame was decoded (and dispatched to packet_received) —
         caller should loop again in case more frames are already buffered.
         Returns False if more data is needed — caller should wait for the
         next data_received call.
@@ -312,15 +309,12 @@ class PlaintextFrameProtocol(asyncio.Protocol):
         if msg_type == _VARUINT_TOO_LONG:
             raise FrameProtocolError("msg_type varuint exceeds byte limit")
 
-        if length == 0:
-            payload = b""
-        else:
-            payload = r.read_exact(length)
-            if payload is None:
-                r.pos = start_pos
-                return False
+        payload = r.read_exact(length)
+        if payload is None:
+            r.pos = start_pos
+            return False
 
-        self._on_packet(self, msg_type, payload)
+        self.packet_received(msg_type, payload)
         return True
 
     # ── Writing ───────────────────────────────────────────────────────────

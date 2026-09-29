@@ -3,8 +3,7 @@ package buttons
 type ButtonType string
 
 type Button struct {
-	internalName string
-	Type         ButtonType `json:"type"`
+	Type ButtonType `json:"type"`
 }
 
 type ClickType uint16
@@ -18,8 +17,8 @@ const (
 	VolumeButton    ButtonType = "Volume"
 )
 
-func (c *ClickType) String() string {
-	switch *c {
+func (c ClickType) String() string {
+	switch c {
 	case DotClick:
 		return "dot"
 	case VolumeUpClick:

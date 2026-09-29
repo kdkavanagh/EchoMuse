@@ -1,4 +1,4 @@
-"""Audio decode for render: URLs and files to 48 kHz mono int16 via ffmpeg.
+"""Audio decode for render: URLs to 48 kHz mono int16 via ffmpeg.
 
 `stream_url` serves HA TTS URLs (unauthenticated capability URLs that expire
 after ~300 s: fetched immediately, never cached, §16.7) and music. The HTTP
@@ -9,9 +9,9 @@ decoded; neither the encoded response nor the decoded audio is accumulated.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
-import os
-from typing import AsyncIterator
+from collections.abc import AsyncGenerator
 
 import numpy as np
 
@@ -24,7 +24,6 @@ CONNECT_TIMEOUT_S = 10
 # synthesis, not just the network.
 READ_TIMEOUT_S = 60
 FFMPEG_EXIT_TIMEOUT_S = 15
-DECODE_TIMEOUT_S = 30
 RETRY_DELAY_S = 0.5
 
 
@@ -41,20 +40,21 @@ def _ffmpeg_error(stderr: bytes, returncode: int | None) -> RuntimeError:
     return RuntimeError(f"ffmpeg: {tail[-1] if tail else f'exit {returncode}'}")
 
 
-async def stream_url(url: str, *, rate: int = RATE, start_s: float = 0.0) -> AsyncIterator[np.ndarray]:
+async def stream_url(url: str, *, rate: int = RATE, start_s: float = 0.0) -> AsyncGenerator[np.ndarray, None]:
     """Fetch `url` and yield decoded mono int16 chunks at `rate`.
 
     One retry, only before any PCM was yielded (a later retry would repeat
     audio already played). `start_s` skips into the source (ffmpeg input
     seek). Raises on HTTP or decode failure; closing the generator kills
-    ffmpeg and the request.
+    ffmpeg and the request before `aclose()` returns.
     """
     emitted = False
     for attempt in range(2):
         try:
-            async for pcm in _stream_once(url, rate, start_s):
-                emitted = True
-                yield pcm
+            async with contextlib.aclosing(_stream_once(url, rate, start_s)) as chunks:
+                async for pcm in chunks:
+                    emitted = True
+                    yield pcm
             return
         except Exception as err:
             if attempt or emitted:
@@ -63,11 +63,11 @@ async def stream_url(url: str, *, rate: int = RATE, start_s: float = 0.0) -> Asy
             await asyncio.sleep(RETRY_DELAY_S)
 
 
-async def _stream_once(url: str, rate: int, start_s: float) -> AsyncIterator[np.ndarray]:
+async def _stream_once(url: str, rate: int, start_s: float) -> AsyncGenerator[np.ndarray, None]:
     import aiohttp
 
     proc: asyncio.subprocess.Process | None = None
-    tasks: list[asyncio.Task] = []
+    tasks: list[asyncio.Task[object]] = []
     timeout = aiohttp.ClientTimeout(total=None, connect=CONNECT_TIMEOUT_S,
                                     sock_connect=CONNECT_TIMEOUT_S, sock_read=READ_TIMEOUT_S)
     try:
@@ -80,22 +80,24 @@ async def _stream_once(url: str, rate: int, start_s: float) -> AsyncIterator[np.
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
+                if proc.stdin is None or proc.stdout is None or proc.stderr is None:
+                    raise RuntimeError("ffmpeg: subprocess pipes were not opened")
 
-                async def feed() -> None:
+                async def feed(sink: asyncio.StreamWriter) -> None:
                     try:
                         async for chunk in resp.content.iter_chunked(READ_BYTES):
-                            proc.stdin.write(chunk)
-                            await proc.stdin.drain()
+                            sink.write(chunk)
+                            await sink.drain()
                     except (BrokenPipeError, ConnectionResetError):
                         pass    # ffmpeg exited; its exit status reports why
                     finally:
-                        if not proc.stdin.is_closing():
-                            proc.stdin.close()
+                        if not sink.is_closing():
+                            sink.close()
 
-                feeder = asyncio.create_task(feed())
+                feeder: asyncio.Task[None] = asyncio.create_task(feed(proc.stdin))
                 # stderr drains concurrently: a full stderr pipe would stall
                 # ffmpeg's stdout, and malformed input is what fills it.
-                stderr = asyncio.create_task(proc.stderr.read())
+                stderr: asyncio.Task[bytes] = asyncio.create_task(proc.stderr.read())
                 tasks += [feeder, stderr]
                 async for pcm in _pcm_chunks(proc.stdout):
                     yield pcm
@@ -114,7 +116,7 @@ async def _stream_once(url: str, rate: int, start_s: float) -> AsyncIterator[np.
             await proc.wait()
 
 
-async def _pcm_chunks(stdout: asyncio.StreamReader) -> AsyncIterator[np.ndarray]:
+async def _pcm_chunks(stdout: asyncio.StreamReader) -> AsyncGenerator[np.ndarray, None]:
     """Whole int16 samples from a byte stream; an odd byte waits for its pair."""
     carry = b""
     while data := await stdout.read(READ_BYTES):
@@ -123,31 +125,3 @@ async def _pcm_chunks(stdout: asyncio.StreamReader) -> AsyncIterator[np.ndarray]
         carry = data[whole:]
         if whole:
             yield np.frombuffer(data[:whole], dtype="<i2").astype(np.int16)
-
-
-async def decode_file(source: str | os.PathLike | bytes, *, rate: int = RATE) -> np.ndarray:
-    """Decode a whole file (path or encoded bytes) to mono int16 at `rate`.
-    Raises RuntimeError with ffmpeg's reason on failure."""
-    data = source if isinstance(source, bytes) else None
-    proc = await asyncio.create_subprocess_exec(
-        *_ffmpeg_args("pipe:0" if data is not None else os.fspath(source), rate, 0.0),
-        stdin=asyncio.subprocess.PIPE if data is not None else asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        async with asyncio.timeout(DECODE_TIMEOUT_S):
-            pcm, err = await proc.communicate(input=data)
-    except TimeoutError:
-        raise RuntimeError(f"ffmpeg: decode exceeded {DECODE_TIMEOUT_S} s") from None
-    finally:
-        if proc.returncode is None:
-            proc.kill()
-            await proc.wait()
-    if proc.returncode != 0:
-        raise _ffmpeg_error(err, proc.returncode)
-    if not pcm:
-        raise RuntimeError("ffmpeg: decoded to zero samples")
-    if len(pcm) % 2:
-        raise RuntimeError("ffmpeg: decoded an incomplete int16 sample")
-    return np.frombuffer(pcm, dtype="<i2").astype(np.int16)

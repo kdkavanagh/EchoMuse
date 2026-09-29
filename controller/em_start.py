@@ -11,6 +11,7 @@ em_ha_client uses with `ws://supervisor/core/websocket` (SPEC §16.7).
 
 import json
 import os
+import sys
 from pathlib import Path
 
 OPTIONS_PATH = Path("/data/options.json")
@@ -39,4 +40,4 @@ if OPTIONS_PATH.is_file():
         env_value = "1" if value is True else "0" if value is False else str(value)
         os.environ.setdefault(env_key, env_value)
 
-os.execvp("python3", ["python3", "-u", "em_controller.py"])
+os.execv(sys.executable, [sys.executable, "-u", "em_controller.py"])

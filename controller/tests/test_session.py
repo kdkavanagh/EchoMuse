@@ -23,6 +23,7 @@ from em_audio_timeline import (
     build_cells,
     build_packet,
 )
+from em_device_link import AckStatus, CommandAck, Envelope, MessageType
 from em_ha_client import HaUnavailable, IntentEnded, RunEnded, TtsReady
 from em_session import ActorDeps, SessionActor
 from em_speech_worker import (
@@ -54,6 +55,10 @@ def run(coro):
     return asyncio.run(asyncio.wait_for(coro, 30))
 
 
+def envelope(msg_type, body, message_id="m"):
+    return Envelope(MessageType(msg_type), "s", message_id, "dev1", 0, body)
+
+
 # --- fakes --------------------------------------------------------------------------------
 
 
@@ -76,7 +81,7 @@ class FakeLink:
 
     async def request(self, msg_type, body, *, generation=0, timeout=2.0):
         self.requests.append((msg_type, body))
-        return {"message_id": "x", "status": "durable", "error": None}
+        return CommandAck("x", AckStatus.DURABLE, None)
 
     async def ack(self, message_id, status, error=None):
         self.acks.append((message_id, status, error))
@@ -327,9 +332,9 @@ class Device:
     def open_streams(self):
         for stream_id, kind, epoch, fmt in (("mic", 1, MIC_EPOCH, 1), ("cells", 4, MIC_EPOCH, 2),
                                             ("reference", 2, REF_EPOCH, 1)):
-            self.actor.on_message("stream.open", {"type": "stream.open", "body": {
+            self.actor.on_message(envelope("stream.open", {
                 "stream_id": stream_id, "epoch": str(epoch), "kind": kind, "sample_rate": 16000,
-                "format": fmt, "reason": "start"}})
+                "format": fmt, "reason": "start"}))
 
     def _packet(self, kind, first, **kw):
         self.seq[kind] += 1
@@ -451,11 +456,11 @@ def candidate(*, producing_sound=False, active_alert=None, lease="L1", cid="C1")
     hops = [{"end_sample": str(S + 2_560 * k), "raw": 0.95 if k == 5 else 0.3,
              "smoothed": 0.92 if k == 5 else 0.3, "profile": "playback" if producing_sound else "idle"}
             for k in range(1, 6)]
-    return {"type": "wake.candidate", "message_id": f"msg-{cid}", "body": {
+    return envelope("wake.candidate", {
         "candidate_id": cid, "lease_id": lease, "capture_epoch": str(MIC_EPOCH), "graph_sha256": "g" * 64,
         "scorer_revision": 3, "profile": hops[0]["profile"], "threshold": 0.9 if not producing_sound else 0.65,
         "producing_sound": producing_sound, "first_crossing_end": str(OPEN), "support_start": str(S),
-        "mono_ns": "1", "active_alert": active_alert, "hops": hops}}
+        "mono_ns": "1", "active_alert": active_alert, "hops": hops}, message_id=f"msg-{cid}")
 
 
 def speech(*spans):
@@ -473,7 +478,7 @@ def test_idle_wake_is_accepted_and_its_candidate_lease_becomes_the_turn_lease():
     async def main():
         h = Harness()
         await h.start()
-        h.actor.on_message("wake.candidate", candidate())
+        h.actor.on_message(candidate())
         await h.settle()
         assert h.link.acks == [("msg-C1", "accepted", None)]
         renew = h.link.of("uplink.renew")
@@ -492,7 +497,7 @@ def test_a_wake_while_speech_is_unavailable_is_refused_with_the_error_cue():
         h = Harness()
         await h.start()
         h.worker.available = False
-        h.actor.on_message("wake.candidate", candidate())
+        h.actor.on_message(candidate())
         await h.settle()
         assert h.link.acks == [("msg-C1", "rejected", "speech_unavailable")]
         assert h.cues() == ["error_anim"] and h.actor.state == "IDLE"
@@ -506,7 +511,7 @@ def test_a_wake_lost_to_another_speaker_closes_as_arbitration_lost():
         h = Harness()
         await h.start()
         h.arbiter.claim("kitchen", 0.7)
-        h.actor.on_message("wake.candidate", candidate())
+        h.actor.on_message(candidate())
         await h.settle()
         assert h.link.of("uplink.close")[0][0] == {"lease_id": "L1", "reason": "arbitration_lost"}
         assert h.terminals() == ["arbitration_lost"]
@@ -519,7 +524,7 @@ def test_a_wake_lost_to_another_speaker_closes_as_arbitration_lost():
 
 async def producing_sound_case(h: Harness):
     await h.start()
-    h.actor.on_message("wake.candidate", candidate(producing_sound=True))
+    h.actor.on_message(candidate(producing_sound=True))
     await h.settle()
     await h.feed(S - 4_800 - 20_000, OPEN + 9_000)
     await h.wait_for(lambda: h.terminals())
@@ -588,7 +593,7 @@ def test_wake_then_stop_with_a_ringing_alarm_dismisses_it_locally_without_home_a
         h.worker.tokens = [("▁OPHELIA", OPEN - 1_800), ("▁STOP", OPEN + 5_200)]
         await h.start()
         alert = {"id": "occ-1", "kind": "alarm", "name": "Wake up", "foreground": False}
-        h.actor.on_message("wake.candidate", candidate(active_alert=alert))
+        h.actor.on_message(candidate(active_alert=alert))
         await h.settle()
         assert h.render.local == []                        # the ring stopping is the acknowledgement
         await h.feed(S - 4_800 - 20_000, OPEN + 40_000)
@@ -616,7 +621,7 @@ def test_a_wake_turn_records_each_stage_what_asr_heard_what_ha_transcribed_and_w
         h.ha.next_run = FakeRun([IntentEnded("It is noon.", "conv-1", False, "query_answer", True),
                                  TtsReady("http://ha/tts/1", False), RunEnded()])
         await h.start()
-        h.actor.on_message("wake.candidate", candidate())
+        h.actor.on_message(candidate())
         await h.settle()
         await h.feed(S - 4_800 - 20_000, OPEN + 60_000)
         await h.wait_for(lambda: h.render.streams)
@@ -963,8 +968,7 @@ def test_privacy_mute_mid_turn_closes_it_as_muted_without_dispatch():
         h = Harness()
         await button_turn(h, PRESS + 6_000)
         assert h.actor.state in ("ARMED", "LISTENING")
-        h.actor.on_message("privacy.changed", {"type": "privacy.changed",
-                                               "body": {"muted": True, "capture_epoch": None, "physical_seq": 2}})
+        h.actor.on_message(envelope("privacy.changed", {"muted": True, "capture_epoch": None, "physical_seq": 2}))
         await h.settle()
         assert h.terminals() == ["muted"]
         assert h.cues() == [] and h.ha.stt_calls == [] and h.ha.tts == []

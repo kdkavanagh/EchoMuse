@@ -36,8 +36,8 @@ var uuidV4 = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-
 type recorder struct {
 	hellos   chan time.Time
 	ready    chan *Session
-	rejected chan string
-	lost     chan string
+	rejected chan proto.RejectReason
+	lost     chan LostReason
 	control  chan proto.Envelope
 	audio    chan ema.Header
 }
@@ -46,8 +46,8 @@ func newRecorder() *recorder {
 	return &recorder{
 		hellos:   make(chan time.Time, 16),
 		ready:    make(chan *Session, 4),
-		rejected: make(chan string, 4),
-		lost:     make(chan string, 4),
+		rejected: make(chan proto.RejectReason, 4),
+		lost:     make(chan LostReason, 4),
 		control:  make(chan proto.Envelope, 16),
 		audio:    make(chan ema.Header, 16),
 	}
@@ -55,11 +55,11 @@ func newRecorder() *recorder {
 
 func (r *recorder) Hello() proto.SessionHello {
 	r.hellos <- time.Now()
-	return proto.SessionHello{Capabilities: []string{proto.CapAudioTimeline}, Protocols: []int{proto.Version}}
+	return proto.SessionHello{Capabilities: []proto.Capability{proto.CapAudioTimeline}, Protocols: []int{proto.Version}}
 }
 func (r *recorder) Ready(s *Session, _ proto.SessionReady) { r.ready <- s }
-func (r *recorder) Rejected(reason string)                 { r.rejected <- reason }
-func (r *recorder) Lost(reason string)                     { r.lost <- reason }
+func (r *recorder) Rejected(reason proto.RejectReason)     { r.rejected <- reason }
+func (r *recorder) Lost(reason LostReason)                 { r.lost <- reason }
 func (r *recorder) Control(env proto.Envelope)             { r.control <- env }
 func (r *recorder) RenderAudio(h ema.Header, _ []byte)     { r.audio <- h }
 
@@ -127,7 +127,7 @@ func (c *controller) header(path string) http.Header {
 	return c.headers[path]
 }
 
-func sendEnv(t *testing.T, c *websocket.Conn, typ string, body any) {
+func sendEnv(t *testing.T, c *websocket.Conn, typ proto.MessageType, body any) {
 	b, _ := json.Marshal(body)
 	sid := testSession
 	env := proto.Envelope{Protocol: 1, Type: typ, SessionID: &sid, MessageID: "c2d-1", DeviceID: testDevice, Body: b}
@@ -137,7 +137,7 @@ func sendEnv(t *testing.T, c *websocket.Conn, typ string, body any) {
 }
 
 // readEnv reads control envelopes until one of type typ arrives.
-func readEnv(t *testing.T, c *websocket.Conn, typ string) proto.Envelope {
+func readEnv(t *testing.T, c *websocket.Conn, typ proto.MessageType) proto.Envelope {
 	t.Helper()
 	c.SetReadDeadline(time.Now().Add(3 * time.Second))
 	for {
@@ -248,6 +248,10 @@ func TestHandshakeOpensSessionSockets(t *testing.T) {
 	sendEnv(t, ctrl, proto.TypePing, map[string]int{"id": 7})
 	if pong := readEnv(t, ctrl, proto.TypePong); string(pong.Body) != `{"id":7}` {
 		t.Fatalf("pong %s", pong.Body)
+	}
+	sendEnv(t, ctrl, proto.TypePing, struct{}{})
+	if pong := readEnv(t, ctrl, proto.TypePong); string(pong.Body) != `{}` {
+		t.Fatalf("pong without id %s", pong.Body)
 	}
 
 	ctrl.Close()

@@ -6,9 +6,6 @@
 package capture
 
 import (
-	"crypto/rand"
-	"encoding/binary"
-
 	"github.com/wilbowes/EchoMuse/internal/audio/clockfit"
 	"github.com/wilbowes/EchoMuse/internal/audio/ema"
 )
@@ -73,7 +70,7 @@ type Timeline struct {
 func NewTimeline() *Timeline {
 	return &Timeline{
 		fit:      clockfit.New(RateHz, PeriodNs),
-		newEpoch: randomEpoch,
+		newEpoch: ema.NewEpoch,
 		pending:  ReasonStart,
 	}
 }
@@ -141,17 +138,4 @@ func (t *Timeline) Add(pcm []int16, doneNs int64) Block {
 	t.next = b.First + uint64(len(pcm))
 	t.lastDone = doneNs
 	return b
-}
-
-// randomEpoch draws a random nonzero epoch (§16.1).
-func randomEpoch() uint64 {
-	var b [8]byte
-	for {
-		if _, err := rand.Read(b[:]); err != nil {
-			panic("capture: crypto/rand: " + err.Error())
-		}
-		if v := binary.LittleEndian.Uint64(b[:]); v != 0 {
-			return v
-		}
-	}
 }

@@ -8,9 +8,11 @@ family dispatch path.
 from __future__ import annotations
 
 import collections
+import enum
 import json
 import math
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -28,6 +30,8 @@ SILENCE_RMS = 1e-4
 REFERENCE_THRESHOLD = 0.30
 CANDIDATE_KEEP_RATIO = 0.50
 
+Infer = Callable[[np.ndarray], np.ndarray]   # float32 [batch, window] audio → logits [batch, labels]
+
 
 @dataclass(frozen=True, slots=True)
 class BcresnetSpec:
@@ -44,9 +48,9 @@ class BcresnetSpec:
         return self.labels[self.wake_index]
 
 
-def parse_spec(raw: dict) -> BcresnetSpec:
+def parse_spec(raw: object) -> BcresnetSpec:
     """Parse a §5.1 sidecar, rejecting values the consumer cannot honor."""
-    if not isinstance(raw, dict):
+    if not isinstance(raw, Mapping):
         raise ValueError(f"sidecar must be a JSON object, got {type(raw).__name__}")
     if raw.get("type") != TYPE_BCRESNET:
         raise ValueError(f"sidecar type must be {TYPE_BCRESNET!r}, got {raw.get('type')!r}")
@@ -76,11 +80,11 @@ def parse_spec(raw: dict) -> BcresnetSpec:
                         float(norm_peak), n_mels, float(clip_seconds))
 
 
-def sidecar_path(model_path: str | os.PathLike) -> Path:
+def sidecar_path(model_path: str | os.PathLike[str]) -> Path:
     return Path(model_path).with_suffix(".json")
 
 
-def load_spec(model_path: str | os.PathLike, sidecar: str | os.PathLike | None = None) -> BcresnetSpec:
+def load_spec(model_path: str | os.PathLike[str], sidecar: str | os.PathLike[str] | None = None) -> BcresnetSpec:
     path = sidecar_path(model_path) if sidecar is None else Path(sidecar)
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -116,7 +120,7 @@ def prepare_window(pcm: np.ndarray, spec: BcresnetSpec, *, allow_silence: bool =
     return np.ascontiguousarray(x)
 
 
-def wake_probability(infer: Callable[[np.ndarray], np.ndarray], spec: BcresnetSpec,
+def wake_probability(infer: Infer, spec: BcresnetSpec,
                      pcm: np.ndarray, *, allow_silence: bool = False) -> float | None:
     x = prepare_window(pcm, spec, allow_silence=allow_silence)
     if x is None:
@@ -139,19 +143,35 @@ class HopScore:
     smoothed: float | None
 
 
+class CandidateClose(enum.StrEnum):
+    """Why a reference candidate closed (§5.2)."""
+
+    BELOW = "below"
+    GAP = "gap"
+    RESET = "reset"
+
+
 @dataclass(frozen=True, slots=True)
 class ReferenceCandidate:
     """A reference-scorer candidate event in reference-epoch samples.
 
-    Emitted once when it opens (`close_reason` None) and once when it closes
-    (`close_reason` `below`, `gap`, or `reset`). `support_end` is the end of
-    the last window whose raw probability reached the threshold so far."""
+    Emitted once when it opens (`close_reason` None) and once when it closes.
+    `support_end` is the end of the last window whose raw probability reached
+    the threshold so far."""
 
     first_crossing_end: int
     support_start: int
     support_end: int | None
     peak_smoothed: float
-    close_reason: str | None = None
+    close_reason: CandidateClose | None = None
+
+
+@dataclass(slots=True)
+class _OpenCandidate:
+    first: int
+    start: int
+    support_end: int | None
+    peak: float
 
 
 class BcresnetScorer:
@@ -162,7 +182,7 @@ class BcresnetScorer:
     PCM ring. `score_window` returns both raw and smoothed values.
     """
 
-    def __init__(self, infer: Callable[[np.ndarray], np.ndarray], spec: BcresnetSpec,
+    def __init__(self, infer: Infer, spec: BcresnetSpec,
                  smoothing: int = SMOOTHING_WINDOWS, clear_after_unscored: int = CLEAR_AFTER_UNSCORED):
         if smoothing < 1 or clear_after_unscored < 1:
             raise ValueError("smoothing and clear_after_unscored must be positive")
@@ -213,20 +233,20 @@ class ReferenceDetector:
             raise ValueError("threshold must be in (0, 1)")
         self.scorer = scorer
         self.threshold = threshold
-        self._open: dict | None = None
+        self._open: _OpenCandidate | None = None
         self._below = 0
 
-    def reset(self, reason: str = "reset") -> ReferenceCandidate | None:
+    def reset(self, reason: CandidateClose = CandidateClose.RESET) -> ReferenceCandidate | None:
         closed = self._close(reason)
         self.scorer.reset()
         return closed
 
-    def _close(self, reason: str) -> ReferenceCandidate | None:
+    def _close(self, reason: CandidateClose) -> ReferenceCandidate | None:
         if self._open is None:
             self._below = 0
             return None
-        c = ReferenceCandidate(self._open["first"], self._open["start"],
-                               self._open["support_end"], self._open["peak"], reason)
+        o = self._open
+        c = ReferenceCandidate(o.first, o.start, o.support_end, o.peak, reason)
         self._open = None
         self._below = 0
         return c
@@ -234,43 +254,43 @@ class ReferenceDetector:
     def push(self, score: HopScore, *, invalid: bool = False) -> tuple[ReferenceCandidate, ...]:
         events = []
         if invalid:
-            closed = self._close("gap")
+            closed = self._close(CandidateClose.GAP)
             if closed is not None:
                 events.append(closed)
             return tuple(events)
         if score.smoothed is None:
             if self._open is not None and not self.scorer.history:
-                closed = self._close("reset")
+                closed = self._close(CandidateClose.RESET)
                 if closed is not None:
                     events.append(closed)
             return tuple(events)
+        reached = score.raw is not None and score.raw >= self.threshold
         if self._open is None and score.smoothed >= self.threshold:
             history = self.scorer.history
             start = history[0][0] - self.scorer.spec.window
-            self._open = {"first": score.end_sample, "start": start,
-                          "support_end": score.end_sample if score.raw >= self.threshold else None,
-                          "peak": score.smoothed}
+            self._open = _OpenCandidate(score.end_sample, start,
+                                        score.end_sample if reached else None, score.smoothed)
             events.append(ReferenceCandidate(score.end_sample, start,
-                                             self._open["support_end"], score.smoothed))
+                                             self._open.support_end, score.smoothed))
             return tuple(events)
         if self._open is None:
             return ()
-        self._open["peak"] = max(self._open["peak"], score.smoothed)
-        if score.raw is not None and score.raw >= self.threshold:
-            self._open["support_end"] = score.end_sample
+        self._open.peak = max(self._open.peak, score.smoothed)
+        if reached:
+            self._open.support_end = score.end_sample
         if score.smoothed >= self.threshold * CANDIDATE_KEEP_RATIO:
             self._below = 0
         else:
             self._below += 1
             if self._below >= 2:
-                closed = self._close("below")
+                closed = self._close(CandidateClose.BELOW)
                 if closed is not None:
                     events.append(closed)
         return tuple(events)
 
 
-def onnx_infer(model_path: str | os.PathLike, threads: int = 1,
-               *, spec: BcresnetSpec | None = None):
+def onnx_infer(model_path: str | os.PathLike[str], threads: int = 1,
+               *, spec: BcresnetSpec | None = None) -> tuple[Infer, str]:
     """Load one CPU ORT session (one intra-op thread, sequential execution).
 
     Static and dynamic graph IO is checked against the sidecar before the
@@ -298,7 +318,8 @@ def onnx_infer(model_path: str | os.PathLike, threads: int = 1,
         raise ValueError(f"BCResNet output shape disagrees with {len(spec.labels)} labels: {out.shape}")
 
     def infer(x: np.ndarray) -> np.ndarray:
-        return sess.run([out.name], {inp.name: np.ascontiguousarray(x, dtype=np.float32)})[0]
+        logits: np.ndarray = sess.run([out.name], {inp.name: np.ascontiguousarray(x, dtype=np.float32)})[0]
+        return logits
 
     # A real run proves dynamic output count and catches a graph that opens but
     # cannot execute on this runtime.
@@ -308,7 +329,7 @@ def onnx_infer(model_path: str | os.PathLike, threads: int = 1,
     return infer, f"onnxruntime {ort.__version__}, {path.name}"
 
 
-def probe_model(infer: Callable[[np.ndarray], np.ndarray], spec: BcresnetSpec) -> dict[str, float]:
+def probe_model(infer: Infer, spec: BcresnetSpec) -> dict[str, float]:
     """Deterministic silence/noise/tone load probe used by registry upload.
 
     Signals are int16 because deployed input is canonical PCM. Silence bypasses
@@ -321,13 +342,13 @@ def probe_model(infer: Callable[[np.ndarray], np.ndarray], spec: BcresnetSpec) -
     noise = np.clip(np.rint(rng.normal(0.0, 0.10, n) * 32767.0), -32768, 32767).astype(np.int16)
     t = np.arange(n, dtype=np.float64) / spec.sample_rate
     tone = np.rint(0.5 * np.sin(2 * np.pi * 1000.0 * t) * 32767.0).astype(np.int16)
-    scores = {
-        "silence": wake_probability(infer, spec, silence, allow_silence=True),
-        "noise": wake_probability(infer, spec, noise, allow_silence=True),
-        "tone": wake_probability(infer, spec, tone, allow_silence=True),
-    }
-    assert all(v is not None for v in scores.values())
-    return {k: float(v) for k, v in scores.items()}
+    scores: dict[str, float] = {}
+    for name, signal in (("silence", silence), ("noise", noise), ("tone", tone)):
+        p = wake_probability(infer, spec, signal, allow_silence=True)
+        if p is None:     # allow_silence scores every window
+            raise ValueError(f"{name} probe window was not scored")
+        scores[name] = p
+    return scores
 
 
 def validate_probe(scores: dict[str, float], near_miss: float) -> None:

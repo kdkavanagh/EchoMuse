@@ -3,29 +3,23 @@ package buttons
 import (
 	"context"
 	"errors"
-	"time"
-	"github.com/wilbowes/EchoMuse/pkg/buttons"
 	evdev "github.com/gvalkov/golang-evdev"
+	"github.com/wilbowes/EchoMuse/pkg/buttons"
 	"os/exec"
+	"time"
 )
 
 const dotButton = "/dev/input/event1"
 const volumeButton = "/dev/input/event2"
 
-// VolumeCallback is called on volume button release with direction "up" or "down".
-type VolumeCallback func(direction string)
-
-// MuteCallback is called on mute button release.
-type MuteCallback func()
-
 type EvDevController struct {
-	volumeCallback func(direction string)
+	volumeCallback func(up bool)
 	muteCallback   func()
 }
 
-// SetVolumeCallback registers a function to be called on volume button events.
-// Must be called before SubscribeToButton.
-func (e *EvDevController) SetVolumeCallback(cb func(direction string)) {
+// SetVolumeCallback registers a function called on each volume button
+// release with the direction pressed. Must be called before SubscribeToButton.
+func (e *EvDevController) SetVolumeCallback(cb func(up bool)) {
 	e.volumeCallback = cb
 }
 
@@ -55,6 +49,8 @@ func (e *EvDevController) SubscribeToButton(callback buttons.ButtonClickCallback
 	}
 	volDevice, err := evdev.Open(volumeButton)
 	if err != nil {
+		// Release() only ends an EVIOCGRAB; closing the file frees the fd.
+		dotDevice.File.Close()
 		return nil, err
 	}
 
@@ -62,7 +58,7 @@ func (e *EvDevController) SubscribeToButton(callback buttons.ButtonClickCallback
 	eventSub := buttons.NewEventSubscription(cancel)
 
 	readBtn := func(btn buttons.Button, btnDevice *evdev.InputDevice) {
-		defer btnDevice.Release()
+		defer btnDevice.File.Close()
 
 		beforeClickType := buttons.ClickType(0)
 		beforeDown := false
@@ -115,11 +111,11 @@ func (e *EvDevController) SubscribeToButton(callback buttons.ButtonClickCallback
 				switch clickType {
 				case buttons.VolumeUpClick:
 					if e.volumeCallback != nil {
-						e.volumeCallback("up")
+						e.volumeCallback(true)
 					}
 				case buttons.VolumeDownClick:
 					if e.volumeCallback != nil {
-						e.volumeCallback("down")
+						e.volumeCallback(false)
 					}
 				}
 				continue

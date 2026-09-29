@@ -27,16 +27,45 @@ Usage:
 """
 
 import asyncio
+import json
 import logging
-import os
 import secrets
+from collections.abc import Awaitable, Callable
+from enum import StrEnum
 from functools import wraps
-from typing import Optional
+from typing import Optional, TypedDict, TypeVar
 
 import bcrypt
 from aiohttp import web
 
 import em_db as db
+
+
+class Role(StrEnum):
+    """`users.role` values."""
+    ADMIN = "admin"
+    READONLY = "readonly"
+
+    @classmethod
+    def stored(cls, value: str) -> "Role":
+        """A `users.role` column value. The column is unconstrained TEXT, so
+        anything but 'admin' fails closed to read-only rather than raising."""
+        if value == cls.ADMIN:
+            return cls.ADMIN
+        if value != cls.READONLY:
+            log.warning("unknown stored role %r treated as readonly", value)
+        return cls.READONLY
+
+
+class SessionUser(TypedDict):
+    """A resolved session, cached on request["user"]."""
+    id: int
+    username: str
+    role: Role
+    token: str
+
+
+_R = TypeVar("_R", bound=web.StreamResponse)
 
 log = logging.getLogger("echomuse.auth")
 
@@ -80,20 +109,21 @@ def verify_password(password: str, hashed: str) -> bool:
             password.encode("utf-8"),
             hashed.encode("utf-8"),
         )
-    except Exception:
+    except ValueError as err:
+        # A malformed stored hash ("Invalid salt") fails the login rather
+        # than the request, but must not disappear without a trace.
+        log.warning(f"[auth] Unusable password hash: {err}")
         return False
 
 
 async def hash_password_async(password: str) -> str:
     """Non-blocking wrapper — runs bcrypt in the default thread pool."""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, hash_password, password)
+    return await asyncio.to_thread(hash_password, password)
 
 
 async def verify_password_async(password: str, hashed: str) -> bool:
     """Non-blocking wrapper — runs bcrypt in the default thread pool."""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, verify_password, password, hashed)
+    return await asyncio.to_thread(verify_password, password, hashed)
 
 
 # ─── Token generation ─────────────────────────────────────────────────────────
@@ -105,7 +135,7 @@ def generate_token() -> str:
 
 # ─── Login / logout ───────────────────────────────────────────────────────────
 
-async def login(username: str, password: str) -> tuple[str, str]:
+async def login(username: str, password: str) -> tuple[str, Role]:
     """
     Validate credentials and create a session.
 
@@ -113,31 +143,27 @@ async def login(username: str, password: str) -> tuple[str, str]:
     Raises AuthError on failure — do not distinguish between "user not
     found" and "wrong password" to avoid user enumeration.
     """
-    loop = asyncio.get_event_loop()
-
-    user = await loop.run_in_executor(None, db.get_user_by_username, username)
+    user = await asyncio.to_thread(db.get_user_by_username, username)
     if user is None:
         # Run a dummy bcrypt check to prevent timing-based user enumeration.
         await verify_password_async(password, _DUMMY_HASH)
         raise AuthError("invalid_credentials", "Invalid username or password", 401)
 
-    if not await verify_password_async(password, user["password_hash"]):
+    if not await verify_password_async(password, user.password_hash):
         raise AuthError("invalid_credentials", "Invalid username or password", 401)
 
+    role = Role.stored(user.role)
     token = generate_token()
-    expiry_days = int(db.get_config("session_expiry_days", "30") or 30)
+    expiry_days = int(await asyncio.to_thread(db.get_config, db.SystemConfigKey.SESSION_EXPIRY_DAYS, "30") or 30)
 
-    await loop.run_in_executor(
-        None, db.create_session, token, user["id"], expiry_days
-    )
-    log.info(f"[auth] Login: {username} ({user['role']})")
-    return token, user["role"]
+    await asyncio.to_thread(db.create_session, token, user.id, expiry_days)
+    log.info(f"[auth] Login: {username} ({role})")
+    return token, role
 
 
 async def logout(token: str) -> None:
     """Invalidate a session token."""
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, db.delete_session, token)
+    await asyncio.to_thread(db.delete_session, token)
     log.debug("[auth] Session invalidated")
 
 
@@ -165,45 +191,54 @@ def _extract_token(request: web.Request) -> Optional[str]:
 
 # ─── Session resolution ───────────────────────────────────────────────────────
 
-async def resolve_session(request: web.Request) -> Optional[dict]:
-    """
-    Resolve the session token from a request to a user dict.
+async def _session_user(token: str) -> Optional[SessionUser]:
+    """The user a session token belongs to, or None if the session is
+    unknown/expired or its user is gone."""
+    session = await asyncio.to_thread(db.get_session, token)
+    if session is None:
+        return None
 
-    Returns a dict with keys {id, username, role} if the session is
-    valid and not expired, otherwise None.
+    user = await asyncio.to_thread(db.get_user_by_id, session.user_id)
+    if user is None:
+        return None
+
+    return {
+        "id":       user.id,
+        "username": user.username,
+        "role":     Role.stored(user.role),
+        "token":    token,
+    }
+
+
+async def resolve_session(request: web.Request) -> Optional[SessionUser]:
+    """
+    Resolve the session token from a request to its user.
+
+    Returns {id, username, role, token} if the session is valid and not
+    expired, otherwise None.
 
     Result is cached on request["user"] to avoid repeated DB hits
     within the same request lifecycle.
     """
     if "user" in request:
-        return request["user"]
+        cached: SessionUser = request["user"]
+        return cached
 
     token = _extract_token(request)
     if not token:
         return None
 
-    loop = asyncio.get_event_loop()
-    session = await loop.run_in_executor(None, db.get_session, token)
-    if session is None:
-        return None
-
-    user = await loop.run_in_executor(None, db.get_user_by_id, session["user_id"])
-    if user is None:
-        return None
-
-    result = {
-        "id":       user["id"],
-        "username": user["username"],
-        "role":     user["role"],
-        "token":    token,
-    }
-    request["user"] = result
+    result = await _session_user(token)
+    if result is not None:
+        request["user"] = result
     return result
 
 
 # ─── Access control decorators ───────────────────────────────────────────────
 
-def require_auth(handler):
+def require_auth(
+    handler: Callable[[web.Request], Awaitable[_R]],
+) -> Callable[[web.Request], Awaitable[_R | web.Response]]:
     """
     Decorator: require any authenticated session (admin or readonly).
 
@@ -212,7 +247,7 @@ def require_auth(handler):
     record is missing (should not happen in practice).
     """
     @wraps(handler)
-    async def wrapper(request: web.Request) -> web.Response:
+    async def wrapper(request: web.Request) -> _R | web.Response:
         user = await resolve_session(request)
         if user is None:
             return _error("not_authenticated", "Authentication required", 401)
@@ -221,18 +256,20 @@ def require_auth(handler):
     return wrapper
 
 
-def require_admin(handler):
+def require_admin(
+    handler: Callable[[web.Request], Awaitable[_R]],
+) -> Callable[[web.Request], Awaitable[_R | web.Response]]:
     """
     Decorator: require an authenticated session with role 'admin'.
 
     Returns 401 if not authenticated, 403 if authenticated but not admin.
     """
     @wraps(handler)
-    async def wrapper(request: web.Request) -> web.Response:
+    async def wrapper(request: web.Request) -> _R | web.Response:
         user = await resolve_session(request)
         if user is None:
             return _error("not_authenticated", "Authentication required", 401)
-        if user["role"] != "admin":
+        if user["role"] != Role.ADMIN:
             return _error("forbidden", "Admin access required", 403)
         request["user"] = user
         return await handler(request)
@@ -241,7 +278,7 @@ def require_admin(handler):
 
 # ─── WebSocket auth ───────────────────────────────────────────────────────────
 
-async def ws_resolve_session(request: web.Request) -> Optional[dict]:
+async def ws_resolve_session(request: web.Request) -> Optional[SessionUser]:
     """
     Resolve auth for a WebSocket upgrade request.
 
@@ -249,7 +286,7 @@ async def ws_resolve_session(request: web.Request) -> Optional[dict]:
     so this checks only the session cookie. API clients using a token
     can pass it as a query parameter: ?token=<token>.
 
-    Returns user dict or None.
+    Returns the session's user or None.
     """
     # Check cookie first
     token = request.cookies.get(AUTH_COOKIE, "").strip()
@@ -261,21 +298,7 @@ async def ws_resolve_session(request: web.Request) -> Optional[dict]:
     if not token:
         return None
 
-    loop = asyncio.get_event_loop()
-    session = await loop.run_in_executor(None, db.get_session, token)
-    if session is None:
-        return None
-
-    user = await loop.run_in_executor(None, db.get_user_by_id, session["user_id"])
-    if user is None:
-        return None
-
-    return {
-        "id":       user["id"],
-        "username": user["username"],
-        "role":     user["role"],
-        "token":    token,
-    }
+    return await _session_user(token)
 
 
 # ─── First-run bootstrap ──────────────────────────────────────────────────────
@@ -348,16 +371,13 @@ async def create_first_admin(
     if not secrets.compare_digest(bootstrap_token, _bootstrap_token):
         raise AuthError("invalid_token", "Invalid setup token", 401)
 
-    if db.user_count() > 0:
+    if await asyncio.to_thread(db.user_count) > 0:
         raise AuthError("setup_complete", "A user already exists", 403)
 
     _validate_credentials(username, password)
 
     hashed = await hash_password_async(password)
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(
-        None, db.create_user, username, hashed, "admin"
-    )
+    await asyncio.to_thread(db.create_user, username, hashed, Role.ADMIN)
 
     _bootstrap_token = None  # Consume the token — setup is done
     log.info(f"[auth] First admin created: {username}")
@@ -406,7 +426,6 @@ class AuthError(Exception):
 
 def _error(code: str, message: str, status: int) -> web.Response:
     """Consistent error response shape per spec."""
-    import json
     return web.Response(
         status=status,
         content_type="application/json",

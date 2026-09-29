@@ -3,23 +3,38 @@ package supervisor
 import (
 	"errors"
 
+	"github.com/wilbowes/EchoMuse/internal/alerts"
 	"github.com/wilbowes/EchoMuse/internal/focus"
+	"github.com/wilbowes/EchoMuse/internal/proto"
 	"github.com/wilbowes/EchoMuse/internal/render"
 	"github.com/wilbowes/EchoMuse/internal/uplink"
 )
 
 // command.ack rejection codes (WIRE §4.1).
 const (
-	codeInvalid         = "invalid"
-	codeInvalidClass    = "invalid_class"
-	codeUnknownAsset    = "unknown_asset"
-	codeUnknownLease    = "unknown_lease"
-	codeUnknownPlayback = "unknown_playback"
-	codeStaleGeneration = "stale_generation"
-	codeMuted           = "muted"
+	codeInvalid         proto.AckCode = "invalid"
+	codeInvalidClass    proto.AckCode = "invalid_class"
+	codeUnknownAsset    proto.AckCode = "unknown_asset"
+	codeUnknownLease    proto.AckCode = "unknown_lease"
+	codeUnknownPlayback proto.AckCode = "unknown_playback"
+	codeStaleGeneration proto.AckCode = "stale_generation"
+	codeMuted           proto.AckCode = "muted"
 )
 
-func renderCode(err error) string {
+// actAck maps an alert executor Act result onto its command.ack; the
+// executor's error codes are alert.act's command.ack codes.
+func actAck(res alerts.ActResult) (proto.AckStatus, proto.AckCode) {
+	switch res.Status {
+	case alerts.StatusApplied:
+		return proto.AckApplied, proto.AckCode(res.Error)
+	case alerts.StatusDurable:
+		return proto.AckDurable, proto.AckCode(res.Error)
+	default:
+		return proto.AckRejected, proto.AckCode(res.Error)
+	}
+}
+
+func renderCode(err error) proto.AckCode {
 	switch {
 	case errors.Is(err, render.ErrStale):
 		return codeStaleGeneration
@@ -32,14 +47,14 @@ func renderCode(err error) string {
 
 // endCode maps render.end errors: the mixer reports an unknown or superseded
 // playback as ErrStale.
-func endCode(err error) string {
+func endCode(err error) proto.AckCode {
 	if errors.Is(err, render.ErrStale) {
 		return codeUnknownPlayback
 	}
 	return codeInvalid
 }
 
-func focusCode(err error) string {
+func focusCode(err error) proto.AckCode {
 	switch {
 	case errors.Is(err, focus.ErrStale):
 		return codeStaleGeneration
@@ -50,7 +65,7 @@ func focusCode(err error) string {
 	}
 }
 
-func uplinkCode(err error) string {
+func uplinkCode(err error) proto.AckCode {
 	switch {
 	case errors.Is(err, uplink.ErrUnknownLease):
 		return codeUnknownLease
@@ -59,17 +74,4 @@ func uplinkCode(err error) string {
 	default:
 		return codeInvalid
 	}
-}
-
-// isSHA256 reports whether s is a lowercase hex SHA-256.
-func isSHA256(s string) bool {
-	if len(s) != 64 {
-		return false
-	}
-	for _, c := range s {
-		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
-			return false
-		}
-	}
-	return true
 }

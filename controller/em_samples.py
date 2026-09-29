@@ -56,6 +56,7 @@ import time
 import wave
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypedDict
 
 log = logging.getLogger("echomuse.samples")
 
@@ -81,6 +82,23 @@ DB_FLOOR = -100.0
 # Measured room floors on this fleet sit around -66dBFS at the level the
 # device delivers, so this is well below anything real.
 ABS_FLOOR_DB = -75.0
+
+
+class ClipEntry(TypedDict):
+    """One stored clip as the API lists it (shared by `em_ambient`)."""
+
+    name:  str
+    ts:    float     # epoch seconds, from the filename
+    bytes: int
+    ms:    int
+
+
+class StoreUsage(TypedDict):
+    """A device's footprint in one of the per-device audio stores."""
+
+    count: int
+    bytes: int
+    ms:    int
 
 
 @dataclass
@@ -461,7 +479,7 @@ def save_clip(device_id: str, clip: Clip, when_ms: int | None = None,
     return name
 
 
-def list_for(device_id: str, db_path: str | None = None) -> list[dict]:
+def list_for(device_id: str, db_path: str | None = None) -> list[ClipEntry]:
     """
     This device's clips, newest first: name, epoch ms, bytes and duration.
 
@@ -473,7 +491,7 @@ def list_for(device_id: str, db_path: str | None = None) -> list[dict]:
     directory = device_dir(device_id, db_path)
     if directory is None or not directory.is_dir():
         return []
-    out: list[dict] = []
+    out: list[ClipEntry] = []
     for child in directory.iterdir():
         ts = parse_filename(child.name)
         if ts is None:
@@ -494,7 +512,7 @@ def list_for(device_id: str, db_path: str | None = None) -> list[dict]:
     return out
 
 
-def usage(device_id: str, db_path: str | None = None) -> dict:
+def usage(device_id: str, db_path: str | None = None) -> StoreUsage:
     """Clip count and total bytes for a device."""
     clips = list_for(device_id, db_path)
     return {

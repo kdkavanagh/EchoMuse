@@ -10,7 +10,8 @@ configuration:
     description: >-
       The LAN IP address of this Home Assistant host. Echo devices use this
       address to connect to the controller, so it must be reachable from
-      them. Required — the controller cannot advertise itself without it.
+      them. Leave empty to advertise the address of the host's default-route
+      interface; set it if the Echo devices reach the host on another one.
   mdns_name:
     name: mDNS service name
     description: >-

@@ -25,14 +25,14 @@ const audioQueueDepth = 5
 type socketAudioSink struct {
 	conn  *websocket.Conn
 	write time.Duration
-	fail  func(reason string)
+	fail  func(LostReason)
 
 	mu     sync.Mutex
 	closed bool
 	q      chan []byte
 }
 
-func newSocketAudioSink(conn *websocket.Conn, write time.Duration, fail func(string)) *socketAudioSink {
+func newSocketAudioSink(conn *websocket.Conn, write time.Duration, fail func(LostReason)) *socketAudioSink {
 	return &socketAudioSink{conn: conn, write: write, fail: fail, q: make(chan []byte, audioQueueDepth)}
 }
 

@@ -174,6 +174,48 @@ the device wire protocol is [docs/protocol-v1.md](../docs/protocol-v1.md).
   reconnect check and leaving the device's shell lock held, so the next
   update could not open a shell until the controller restarted.
 
+### Code review fixes
+
+- **`SERVER_IP` unset no longer advertises a hard-coded address.** The
+  controller and its ESPHome/BT-proxy records fell back to `10.10.1.236`
+  (the add-on's default `server_ip` is empty, so add-on installs hit this).
+  Unset, it now advertises the address of the interface holding the default
+  route and logs a warning; with no default route it refuses to start.
+- **Firmware updates:** two update requests for one device could both start;
+  a refused update request (device offline, update running) discarded the
+  uploaded binary; a job that timed out waiting for the device shell could
+  close the shell an update in progress was using; and closing an open
+  Console could drop an update's pending shell request.
+- **WiFi change:** when the command could not be sent, the device stayed
+  marked "change pending" for four minutes and the request failed with a 500;
+  it now fails with `device_offline` and nothing is left pending. A failed
+  change is logged at `warn` (it was `warning`, which the dashboard did not
+  colour).
+- **Settings:** `PATCH /api/system/config` with one unknown key no longer
+  saves the others before refusing; a non-numeric or zero
+  `update_check_interval` no longer stops release checks for good (or polls
+  GitHub in a loop). Concurrent config-section writes no longer lose one of
+  the updates. `GET /api/releases/controller` now requires a session like
+  every other read.
+- **Home Assistant scripts** were reported as installed after a failed
+  install when an earlier connect had left warnings.
+- **Dashboard:** the live event stream now reconnects after the controller
+  restarts (alerts, timers and HA status stopped updating until a reload); a
+  pending device opens on its approval form; new releases and automatic
+  rollbacks show without waiting for a poll; ring animation controls are
+  disabled, with the reason, on a Dot without animated LEDs; played and
+  downloaded recordings no longer leak memory; controls are reachable and
+  named for keyboard and screen-reader use.
+- **Memory:** the speech worker queued every observation for a consumer that
+  never read them, growing for the life of the process.
+- Malformed BLE adverts are dropped instead of being forwarded to Home
+  Assistant as blank entries; stopping a media stream stops ffmpeg at once;
+  a malformed `timerRingSeconds` no longer ends the ring.
+- **Firmware:** a data race in stats collection on reconnect; a timer ring
+  or sound preview read its WAV while holding the lock that times due
+  alerts; an input-device handle leaked when the second button device failed
+  to open.
+
 ### Earlier in this release
 
 - ASR gain: the STT copy sent to Home Assistant is amplified by

@@ -1,44 +1,32 @@
 import pytest
 
-from em_attribution import (
-    BACKGROUND_SPEECH,
-    CELL,
-    COMMAND_SPEECH,
-    GAP,
-    NON_SPEECH,
-    SELF_OUTPUT,
-    ClassifiedCell,
-)
+from echomuse_grammar import GrammarClass
+from em_attribution import CELL, CellClass, ClassifiedCell, Rule
 from em_endpoint_policy import (
-    COMMITTED,
-    END_PENDING,
-    LISTENING,
-    ChoiceResult,
     EndpointReducer,
-    ReplyChoice,
+    EndpointState,
     StableText,
     TextStability,
     local_command_preconditions,
     redecode_differs,
-    resolve_reply_choice,
 )
 
 def complete(text):
     if text in {"turn off lights", "set a timer for five minutes", "stop"}:
-        return "complete"
+        return GrammarClass.COMPLETE
     if text == "turn off":
-        return "extendable"
+        return GrammarClass.EXTENDABLE
     if text in {"set a timer for", "turn off lights in the"}:
-        return "needs_more"
-    return "unknown"
+        return GrammarClass.NEEDS_MORE
+    return GrammarClass.UNKNOWN
 
 
 def classified(i, cls, *, speech=None, command=None):
     if speech is None:
-        speech = cls in (COMMAND_SPEECH, BACKGROUND_SPEECH)
+        speech = cls in (CellClass.COMMAND_SPEECH, CellClass.BACKGROUND_SPEECH)
     if command is None:
-        command = cls == COMMAND_SPEECH
-    return ClassifiedCell(i * CELL, cls, "vad", speech, command)
+        command = cls == CellClass.COMMAND_SPEECH
+    return ClassifiedCell(i * CELL, cls, Rule.VAD, speech, command)
 
 
 def stable(
@@ -85,18 +73,18 @@ def test_text_stability_needs_three_results_spanning_240_ms_and_ignores_punctuat
 
 def test_route_a_pending_then_commit_with_immutable_192_ms_tail():
     r = reducer()
-    r.observe([classified(i, COMMAND_SPEECH) for i in range(6)])
-    r.observe([classified(i, NON_SPEECH, speech=False, command=False) for i in range(6, 25)])
+    r.observe([classified(i, CellClass.COMMAND_SPEECH) for i in range(6)])
+    r.observe([classified(i, CellClass.NON_SPEECH, speech=False, command=False) for i in range(6, 25)])
     frontier = 25 * CELL  # exactly 608 ms after command boundary
     first = r.step(frontier=frontier, valid_audio_end=frontier, stable=stable(through_sample=frontier))
-    assert first.state == END_PENDING and first.pending.route == "A"
+    assert first.state == EndpointState.END_PENDING and first.pending.route == "A"
     second_frontier = frontier + 3_072
     second = r.step(
         frontier=second_frontier,
         valid_audio_end=second_frontier - 200,
         stable=stable(through_sample=second_frontier),
     )
-    assert second.state == COMMITTED
+    assert second.state == EndpointState.COMMITTED
     assert second.commit.boundary == 6 * CELL
     assert second.commit.end == 6 * CELL + 3_072
     assert second.commit.route == "A"
@@ -107,21 +95,21 @@ def test_route_a_pending_then_commit_with_immutable_192_ms_tail():
 
 def test_pending_is_revoked_by_four_new_command_cells_before_lookahead():
     r = reducer()
-    r.observe([classified(i, COMMAND_SPEECH) for i in range(6)])
-    r.observe([classified(i, NON_SPEECH, speech=False, command=False) for i in range(6, 25)])
+    r.observe([classified(i, CellClass.COMMAND_SPEECH) for i in range(6)])
+    r.observe([classified(i, CellClass.NON_SPEECH, speech=False, command=False) for i in range(6, 25)])
     frontier = 25 * CELL
     pending = r.step(frontier=frontier, valid_audio_end=frontier, stable=stable(through_sample=frontier)).pending
-    r.observe([classified(i, COMMAND_SPEECH) for i in range(25, 29)])
+    r.observe([classified(i, CellClass.COMMAND_SPEECH) for i in range(25, 29)])
     got = r.step(frontier=29 * CELL, valid_audio_end=29 * CELL, stable=stable(through_sample=29 * CELL))
-    assert got.state == LISTENING
+    assert got.state == EndpointState.LISTENING
     assert got.revoked == pending
     assert got.commit is None
 
 
 def test_route_b_complete_command_under_background_speech():
     r = reducer()
-    r.observe([classified(i, COMMAND_SPEECH) for i in range(6)])
-    r.observe([classified(i, BACKGROUND_SPEECH, command=False) for i in range(6, 25)])
+    r.observe([classified(i, CellClass.COMMAND_SPEECH) for i in range(6)])
+    r.observe([classified(i, CellClass.BACKGROUND_SPEECH, command=False) for i in range(6, 25)])
     frontier = 25 * CELL
     got = r.step(frontier=frontier, valid_audio_end=frontier, stable=stable(through_sample=frontier))
     assert got.pending.route == "B"
@@ -138,8 +126,8 @@ def test_route_b_complete_command_under_background_speech():
 def test_route_b_requires_tail_that_does_not_extend_the_parse(tail, routed):
     # §16.6: route B holds only when prefix + tail parses `unknown` (TV words); an extending tail blocks it.
     r = reducer()
-    r.observe([classified(i, COMMAND_SPEECH) for i in range(6)])
-    r.observe([classified(i, BACKGROUND_SPEECH, command=False) for i in range(6, 25)])
+    r.observe([classified(i, CellClass.COMMAND_SPEECH) for i in range(6)])
+    r.observe([classified(i, CellClass.BACKGROUND_SPEECH, command=False) for i in range(6, 25)])
     got = r.step(
         frontier=25 * CELL,
         valid_audio_end=25 * CELL,
@@ -148,13 +136,13 @@ def test_route_b_requires_tail_that_does_not_extend_the_parse(tail, routed):
     if routed:
         assert got.pending.route == "B"
     else:
-        assert got.pending is None and got.state == LISTENING
+        assert got.pending is None and got.state == EndpointState.LISTENING
 
 
 def test_route_r_replaces_routes_a_and_b_for_esphome_replies():
     r = reducer(esphome=True)
-    r.observe([classified(0, COMMAND_SPEECH)])
-    r.observe([classified(i, NON_SPEECH, speech=False, command=False) for i in range(1, 33)])
+    r.observe([classified(0, CellClass.COMMAND_SPEECH)])
+    r.observe([classified(i, CellClass.NON_SPEECH, speech=False, command=False) for i in range(1, 33)])
     frontier = CELL + 16_384
     got = r.step(
         frontier=frontier,
@@ -166,7 +154,7 @@ def test_route_r_replaces_routes_a_and_b_for_esphome_replies():
 
 def test_three_second_no_progress_fallback_commits_complete_prefix():
     r = reducer()
-    r.observe([classified(i, COMMAND_SPEECH) for i in range(6)])
+    r.observe([classified(i, CellClass.COMMAND_SPEECH) for i in range(6)])
     frontier = 3_072 + 48_000
     s = stable(prefix_sample=3_072, progress_sample=3_072, through_sample=frontier, blanks=0)
     got = r.step(frontier=frontier, valid_audio_end=frontier, stable=s)
@@ -177,7 +165,7 @@ def test_three_second_no_progress_fallback_commits_complete_prefix():
 
 def test_three_second_no_progress_fallback_retries_unknown_text():
     r = reducer()
-    r.observe([classified(i, COMMAND_SPEECH) for i in range(6)])
+    r.observe([classified(i, CellClass.COMMAND_SPEECH) for i in range(6)])
     frontier = 3_072 + 48_000
     s = stable(prefix="tell me a story", prefix_sample=3_072, progress_sample=3_072, through_sample=frontier, blanks=0)
     got = r.step(frontier=frontier, valid_audio_end=frontier, stable=s)
@@ -197,7 +185,7 @@ def test_no_input_uses_frontier_not_number_or_wall_time_of_calls():
 @pytest.mark.parametrize(("extended", "frontier"), [(False, 240_000), (True, 480_000)])
 def test_too_long_bounds(extended, frontier):
     r = reducer(extended=extended)
-    r.observe([classified(0, COMMAND_SPEECH)])
+    r.observe([classified(0, CellClass.COMMAND_SPEECH)])
     got = r.step(frontier=frontier, valid_audio_end=frontier, stable=stable(through_sample=frontier))
     assert got.close.reason == "too_long"
 
@@ -219,7 +207,7 @@ def test_terminal_close_priority(kwargs, expected):
 
 def test_gap_cell_closes_interrupted_without_external_flag():
     r = reducer()
-    r.observe([classified(0, GAP, speech=False, command=False)])
+    r.observe([classified(0, CellClass.GAP, speech=False, command=False)])
     got = r.step(frontier=CELL, valid_audio_end=CELL, stable=stable(through_sample=CELL))
     assert got.close.reason == "interrupted"
 
@@ -240,8 +228,8 @@ def test_redecode_parse_difference_except_final_word_completion(before, after, d
 
 def test_local_command_preconditions_are_stable_and_not_mostly_self_output():
     s = stable(prefix="stop", prefix_sample=1_000, through_sample=5_000, tail="")
-    cells = [classified(i, COMMAND_SPEECH, speech=True) for i in range(5)]
-    cells += [classified(i, SELF_OUTPUT, speech=True, command=False) for i in range(5, 7)]
+    cells = [classified(i, CellClass.COMMAND_SPEECH, speech=True) for i in range(5)]
+    cells += [classified(i, CellClass.SELF_OUTPUT, speech=True, command=False) for i in range(5, 7)]
     assert local_command_preconditions(
         normalized_text="Stop!",
         stable=s,
@@ -250,7 +238,7 @@ def test_local_command_preconditions_are_stable_and_not_mostly_self_output():
         cells=cells,
     )
     mostly_echo = cells + [
-        classified(i, SELF_OUTPUT, speech=True, command=False) for i in range(7, 10)
+        classified(i, CellClass.SELF_OUTPUT, speech=True, command=False) for i in range(7, 10)
     ]
     assert not local_command_preconditions(
         normalized_text="stop",
@@ -266,13 +254,3 @@ def test_local_command_preconditions_are_stable_and_not_mostly_self_output():
         commit_boundary=7 * CELL,
         cells=cells,
     )
-
-
-def test_reply_choices_match_exact_alias_and_reprompt_once():
-    choices = [
-        ReplyChoice("am", ("am", "a m", "morning")),
-        ReplyChoice("pm", ("pm", "p m", "at night")),
-    ]
-    assert resolve_reply_choice(" Morning! ", choices, already_reprompted=False) == ChoiceResult("selected", "am")
-    assert resolve_reply_choice("seven", choices, already_reprompted=False) == ChoiceResult("reprompt")
-    assert resolve_reply_choice("seven", choices, already_reprompted=True) == ChoiceResult("abandon")

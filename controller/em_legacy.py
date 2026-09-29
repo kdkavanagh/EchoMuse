@@ -13,26 +13,20 @@ import asyncio
 import contextlib
 import json
 import logging
-from typing import Any
 
 import websockets.exceptions
+from websockets.asyncio.server import ServerConnection
 
 import em_device
+import em_device_link
+from em_device_link import RejectReason
 
 log = logging.getLogger("em_legacy")
 REGISTER_TIMEOUT_SECONDS = 10.0
 
 
-def _header(ws: Any, name: str) -> str | None:
-    try:
-        return ws.request.headers.get(name)
-    except AttributeError:
-        return None
-
-
-async def serve_control(ws: Any, *, secure: bool, hub: em_device.LinkHub) -> None:
-    remote = ws.remote_address
-    peer_ip = str(remote[0]) if remote else ""
+async def serve_control(ws: ServerConnection, *, secure: bool, hub: em_device.LinkHub) -> None:
+    peer_ip = em_device_link.peer_ip(ws)
     try:
         raw = await asyncio.wait_for(ws.recv(), timeout=REGISTER_TIMEOUT_SECONDS)
         if not isinstance(raw, str):
@@ -49,18 +43,19 @@ async def serve_control(ws: Any, *, secure: bool, hub: em_device.LinkHub) -> Non
                 or any(not isinstance(cap, str) for cap in capabilities)):
             await ws.close()
             return
-        ip = message.get("ip") if isinstance(message.get("ip"), str) else peer_ip
-        version = message.get("version") if isinstance(message.get("version"), str) else None
+        reported_ip = message.get("ip")
+        ip = reported_ip if isinstance(reported_ip, str) else peer_ip
+        reported_version = message.get("version")
+        version = reported_version if isinstance(reported_version, str) else None
         result = await hub.admit_legacy(
-            device_id=device_id, ip=ip, version=version,
-            capabilities=capabilities, secure=secure,
-            token=_header(ws, "X-EM-Token"),
+            device_id=device_id, ip=ip, version=version, secure=secure,
+            token=em_device_link.request_header(ws, em_device_link.TOKEN_HEADER),
         )
-        if result.result == "pending_approval":
+        if result.rejected is RejectReason.PENDING_APPROVAL:
             await ws.send(json.dumps({"type": "pending"}))
             await ws.close()
             return
-        if result.result != "ok":
+        if result.rejected is not None:
             await ws.close()
             return
         device = await hub.ensure(device_id, result.label or device_id)

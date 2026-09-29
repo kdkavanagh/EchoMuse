@@ -34,8 +34,10 @@ import re
 import subprocess
 import tempfile
 import wave
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypedDict
 
 import numpy as np
 
@@ -64,6 +66,9 @@ MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 # Accepted upload extensions: the formats listened to on this hardware.
 ALLOWED_SUFFIXES = (".mp3", ".wav", ".flac", ".ogg", ".m4a")
 
+# The config keys whose values are catalog IDs (§16.7).
+SOUND_CONFIG_KEYS = ("timerSound", "alarmSound")
+
 # Sound IDs are filename stems and URL segments.
 _STEM_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -81,6 +86,52 @@ class AlertExport:
     sha256: str       # of the WAV file bytes; the asset's name
     seconds: float    # exported length, ≤ ALERT_MAX_SECONDS
     shortened: bool   # the upload was longer and was cut (dashboard warning)
+
+
+class CatalogEntry(TypedDict):
+    """One catalog sound as `scan` (and so `GET /api/sounds`) lists it."""
+
+    id: str
+    file: str
+    size: int
+    mtime: int
+    seconds: float | None
+    sha256: str | None
+    shortened: bool | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ExportRecord:
+    """`<id>.alert.json`: the outcome of exporting one exact upload."""
+
+    stamp: str
+    error: str | None = None
+    sha256: str | None = None
+    seconds: float | None = None
+    shortened: bool | None = None
+
+    @classmethod
+    def parse(cls, raw: object) -> _ExportRecord | None:
+        """The record from decoded sidecar JSON, or None if it is not one."""
+        if not isinstance(raw, dict) or not isinstance(raw.get("stamp"), str):
+            return None
+        error, sha, seconds, shortened = (
+            raw.get("error"), raw.get("sha256"), raw.get("seconds"), raw.get("shortened"))
+        return cls(
+            stamp=raw["stamp"],
+            error=str(error) if error else None,
+            sha256=sha if isinstance(sha, str) and sha else None,
+            seconds=(float(seconds) if isinstance(seconds, (int, float))
+                     and not isinstance(seconds, bool) else None),
+            shortened=shortened if isinstance(shortened, bool) else None,
+        )
+
+    @property
+    def export(self) -> AlertExport | None:
+        """The successful export this records, or None."""
+        if self.sha256 is None or self.seconds is None or self.shortened is None:
+            return None
+        return AlertExport(self.sha256, self.seconds, self.shortened)
 
 
 def sounds_dir(db_path: str | None = None) -> Path:
@@ -144,12 +195,12 @@ def _atomic_write(path: Path, data: bytes) -> None:
         raise
 
 
-def _fresh_record(source: Path, directory: Path, sound_id: str) -> dict | None:
+def _fresh_record(source: Path, directory: Path, sound_id: str) -> _ExportRecord | None:
     """The sidecar record if it describes this exact upload, else None."""
     try:
-        record = json.loads(_sidecar_path(directory, sound_id).read_text())
-        return record if record.get("stamp") == _stamp(source) else None
-    except (OSError, ValueError, AttributeError):
+        record = _ExportRecord.parse(json.loads(_sidecar_path(directory, sound_id).read_text()))
+        return record if record is not None and record.stamp == _stamp(source) else None
+    except (OSError, ValueError):
         return None
 
 
@@ -211,10 +262,11 @@ def export(sound_id: str, directory: Path | None = None) -> AlertExport:
         raise ExportError(f"no sound {sound_id!r}")
     record = _fresh_record(source, directory, sound_id)
     if record is not None:
-        if record.get("error"):
-            raise ExportError(record["error"])
-        if (assets_dir(directory) / f"{record['sha256']}.wav").is_file():
-            return AlertExport(record["sha256"], record["seconds"], record["shortened"])
+        if record.error:
+            raise ExportError(record.error)
+        done = record.export
+        if done is not None and (assets_dir(directory) / f"{done.sha256}.wav").is_file():
+            return done
 
     stamp = _stamp(source)
     try:
@@ -269,7 +321,7 @@ def asset_path(sha256: str, directory: Path | None = None) -> Path | None:
     return p if p.is_file() else None
 
 
-def scan(directory: Path | None = None) -> list[dict]:
+def scan(directory: Path | None = None) -> list[CatalogEntry]:
     """
     The catalog: [{id, file, size, mtime, seconds, sha256, shortened}], id-
     sorted. The last three describe the current upload's alert asset and are
@@ -278,7 +330,7 @@ def scan(directory: Path | None = None) -> list[dict]:
     directory = directory if directory is not None else sounds_dir()
     if not directory.is_dir():
         return []
-    out = []
+    out: list[CatalogEntry] = []
     for f in sorted(directory.iterdir()):
         if f.suffix.lower() not in ALLOWED_SUFFIXES or not f.is_file():
             continue
@@ -286,16 +338,15 @@ def scan(directory: Path | None = None) -> list[dict]:
             st = f.stat()
         except OSError:
             continue
-        record = _fresh_record(f, directory, f.stem) or {}
-        ok = bool(record.get("sha256"))
+        done = record.export if (record := _fresh_record(f, directory, f.stem)) else None
         out.append({
             "id": f.stem,
             "file": f.name,
             "size": st.st_size,
             "mtime": int(st.st_mtime),
-            "seconds": record.get("seconds") if ok else None,
-            "sha256": record.get("sha256") if ok else None,
-            "shortened": record.get("shortened") if ok else None,
+            "seconds": done.seconds if done else None,
+            "sha256": done.sha256 if done else None,
+            "shortened": done.shortened if done else None,
         })
     return out
 
@@ -328,10 +379,10 @@ def delete(sound_id: str, directory: Path | None = None) -> bool:
     return True
 
 
-def in_use_by(sound_id: str, configs: dict[str, dict]) -> list[str]:
+def in_use_by(sound_id: str, configs: Mapping[str, Mapping[str, object]]) -> list[str]:
     """Config scopes (label → config) naming this sound as timerSound or
     alarmSound, so the dashboard can warn before a delete."""
     return [
         scope for scope, cfg in configs.items()
-        if sound_id in ((cfg or {}).get("timerSound"), (cfg or {}).get("alarmSound"))
+        if any(cfg.get(key) == sound_id for key in SOUND_CONFIG_KEYS)
     ]

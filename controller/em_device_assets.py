@@ -7,7 +7,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 
 from em_wake_registry import WakeModel, WakeRegistry
 
@@ -51,22 +51,22 @@ class AssetInfo:
     size: int
 
 
-def installed_speech_assets(hello_assets: list[str], named: dict[str, str] | None,
-                            wake_stats: dict | None) -> list[str]:
+def installed_speech_assets(hello_assets: Iterable[str], named: Mapping[str, str] | None,
+                            wake_stats: Mapping[str, object] | None) -> list[str]:
     """Speech assets the device holds: its `session.hello` list, plus the
     named set once `wake.stats` shows that graph loaded (the device fetches
     missing assets after hello, and loads runtime, graph and sidecar together).
     """
     installed = list(hello_assets)
-    loaded = (named is not None and wake_stats is not None
-              and wake_stats.get("graph_sha256") == named["graph_sha256"]
-              and wake_stats.get("wake_unavailable") is None)
-    if loaded:
+    if named is None or wake_stats is None:
+        return installed
+    if (wake_stats.get("graph_sha256") == named["graph_sha256"]
+            and wake_stats.get("wake_unavailable") is None):
         installed += [digest for digest in named.values() if digest not in installed]
     return installed
 
 
-def sha256_file(path: str | os.PathLike) -> str:
+def sha256_file(path: str | os.PathLike[str]) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as source:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
@@ -83,8 +83,8 @@ class DeviceAssets:
     """
 
     def __init__(self, registry: WakeRegistry,
-                 alert_lookup: Callable[[str], str | os.PathLike | None],
-                 runtime_path: str | os.PathLike | None = None):
+                 alert_lookup: Callable[[str], str | os.PathLike[str] | None],
+                 runtime_path: str | os.PathLike[str] | None = None):
         self.registry = registry
         self.alert_lookup = alert_lookup
         self.runtime_path = Path(runtime_path or os.environ.get(RUNTIME_ENV, RUNTIME_DEFAULT))
@@ -111,6 +111,7 @@ class DeviceAssets:
     def resolve(self, sha256: str) -> AssetInfo:
         if not isinstance(sha256, str) or not _SHA_RE.fullmatch(sha256):
             raise AssetNotFound("not_found")
+        path: Path | None
         if sha256 == RUNTIME_SHA256:
             path = self.runtime_path
         else:

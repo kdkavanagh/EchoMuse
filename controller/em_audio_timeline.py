@@ -16,8 +16,9 @@ import collections
 import enum
 import struct
 import time
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
-from typing import Callable, Iterable
+from typing import Callable, Iterable, TypedDict
 
 import numpy as np
 
@@ -363,7 +364,7 @@ class IntervalSet:
         self._starts: list[int] = []
         self._ends: list[int] = []
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[tuple[int, int]]:
         return iter(zip(self._starts, self._ends))
 
     def __bool__(self) -> bool:
@@ -379,7 +380,7 @@ class IntervalSet:
 
     def overlapping(self, a: int, b: int) -> list[tuple[int, int]]:
         """The parts of this set inside `[a, b)`."""
-        out = []
+        out: list[tuple[int, int]] = []
         i = max(bisect.bisect_right(self._ends, a), 0)
         while i < len(self._starts) and self._starts[i] < b:
             lo, hi = max(self._starts[i], a), min(self._ends[i], b)
@@ -390,7 +391,7 @@ class IntervalSet:
 
     def missing(self, a: int, b: int) -> list[tuple[int, int]]:
         """The parts of `[a, b)` not in this set."""
-        out = []
+        out: list[tuple[int, int]] = []
         cur = a
         for lo, hi in self.overlapping(a, b):
             if lo > cur:
@@ -618,19 +619,15 @@ class ReferenceView:
         self._owner = owner
         self.epoch = epoch
 
-    def _bounds(self) -> tuple[int, int, int] | None:
-        seg = self._owner._segments.get(self.epoch)
-        if seg is None:
-            return None
-        return seg
+    def _bounds(self) -> _Segment | None:
+        return self._owner._segments.get(self.epoch)
 
     def _span(self, a: int, b: int) -> tuple[int, int] | None:
         seg = self._bounds()
         if seg is None:
             return None
-        delta, lo, hi = seg
-        ga, gb = a + delta, b + delta
-        if ga < lo or gb > hi:
+        ga, gb = a + seg.delta, b + seg.delta
+        if ga < seg.lo or gb > seg.hi:
             return None
         return ga, gb
 
@@ -639,18 +636,16 @@ class ReferenceView:
         seg = self._bounds()
         if seg is None:
             return None
-        delta, lo, hi = seg
-        parts = self._owner.store.known.overlapping(max(lo, self._owner.store.floor), hi)
-        return None if not parts else parts[0][0] - delta
+        parts = self._owner.store.known.overlapping(max(seg.lo, self._owner.store.floor), seg.hi)
+        return None if not parts else parts[0][0] - seg.delta
 
     @property
     def frontier(self) -> int | None:
         seg = self._bounds()
         if seg is None:
             return None
-        delta, lo, hi = seg
-        parts = self._owner.store.known.overlapping(max(lo, self._owner.store.floor), hi)
-        return None if not parts else parts[-1][1] - delta
+        parts = self._owner.store.known.overlapping(max(seg.lo, self._owner.store.floor), seg.hi)
+        return None if not parts else parts[-1][1] - seg.delta
 
     def covers(self, a: int, b: int) -> bool:
         g = self._span(a, b)
@@ -670,7 +665,7 @@ class ReferenceView:
         seg = self._bounds()
         if seg is None:
             return [(a, b)] if a < b else []
-        delta, lo, hi = seg
+        delta = seg.delta
         out = []
         for x, y in self._owner.store.missing(a + delta, b + delta):
             out.append((x - delta, y - delta))
@@ -680,8 +675,17 @@ class ReferenceView:
         seg = self._bounds()
         if seg is None:
             return []
-        delta = seg[0]
+        delta = seg.delta
         return [x - delta for x in self._owner.store.discontinuities_in(a + delta, b + delta)]
+
+
+@dataclass(slots=True)
+class _Segment:
+    """One reference epoch's place in the ring: global = epoch sample + `delta`, valid in `[lo, hi)`."""
+
+    delta: int
+    lo: int
+    hi: int
 
 
 class ReferenceTimeline:
@@ -695,8 +699,7 @@ class ReferenceTimeline:
     def __init__(self, capacity: int = PCM_CAPACITY):
         self.capacity = capacity
         self.store = SampleTimeline(capacity)
-        # epoch → (delta, global_lo, global_hi); global = epoch sample + delta
-        self._segments: collections.OrderedDict[int, list[int]] = collections.OrderedDict()
+        self._segments: collections.OrderedDict[int, _Segment] = collections.OrderedDict()
 
     @property
     def nbytes(self) -> int:
@@ -721,11 +724,11 @@ class ReferenceTimeline:
         if seg is None:
             base = 0 if self.store.frontier is None else self.store.frontier
             for other in self._segments.values():
-                other[2] = min(other[2], base)
-            seg = self._segments[epoch] = [base - first, base, U64_MAX]
-        delta, lo, hi = seg
+                other.hi = min(other.hi, base)
+            seg = self._segments[epoch] = _Segment(base - first, base, U64_MAX)
+        delta = seg.delta
         g0, g1 = first + delta, first + delta + n
-        a, b = max(g0, lo), min(g1, hi)
+        a, b = max(g0, seg.lo), min(g1, seg.hi)
         if a >= b:
             return []
         if discontinuity:
@@ -739,8 +742,8 @@ class ReferenceTimeline:
 
     def _drop_forgotten(self) -> None:
         while len(self._segments) > 1:
-            epoch, (_, _, hi) = next(iter(self._segments.items()))
-            if hi > self.store.floor:
+            epoch, seg = next(iter(self._segments.items()))
+            if seg.hi > self.store.floor:
                 break
             del self._segments[epoch]
 
@@ -755,13 +758,27 @@ class ReferenceTimeline:
 # Stream registry (stream.open / stream.end, WIRE §4.2)
 # ---------------------------------------------------------------------------
 
-_STREAM_KIND = {"mic": Kind.MIC, "reference": Kind.REFERENCE, "cells": Kind.CELLS}
+class StreamId(enum.StrEnum):
+    """Uplink stream ids (WIRE §4.2, §4.5)."""
+
+    MIC = "mic"
+    REFERENCE = "reference"
+    CELLS = "cells"
+
+
+_STREAM_KIND = {StreamId.MIC: Kind.MIC, StreamId.REFERENCE: Kind.REFERENCE, StreamId.CELLS: Kind.CELLS}
 _KIND_STREAM = {v: k for k, v in _STREAM_KIND.items()}
+
+
+def _stream_id(value: object) -> StreamId:
+    if not isinstance(value, str) or value not in StreamId:
+        raise ProtocolError("bad_stream", f"unknown stream_id {value!r}")
+    return StreamId(value)
 
 
 @dataclass
 class _EpochState:
-    stream_id: str
+    stream_id: StreamId
     epoch: int
     ended: bool = False
     final_sample: int | None = None
@@ -782,13 +799,11 @@ class StreamRegistry:
     dropped by the timelines."""
 
     def __init__(self) -> None:
-        self._epochs: dict[tuple[str, int], _EpochState] = {}
-        self._current: dict[str, int] = {}
+        self._epochs: dict[tuple[StreamId, int], _EpochState] = {}
+        self._current: dict[StreamId, int] = {}
 
-    def open(self, body: dict) -> tuple[str, int]:
-        stream_id = body.get("stream_id")
-        if stream_id not in _STREAM_KIND:
-            raise ProtocolError("bad_stream", f"unknown stream_id {stream_id!r}")
+    def open(self, body: Mapping[str, object]) -> tuple[StreamId, int]:
+        stream_id = _stream_id(body.get("stream_id"))
         kind = _STREAM_KIND[stream_id]
         epoch = parse_u64(body.get("epoch"), "epoch")
         if epoch == 0:
@@ -805,27 +820,29 @@ class StreamRegistry:
         self._current[stream_id] = epoch
         return stream_id, epoch
 
-    def end(self, body: dict) -> tuple[str, int, int]:
-        stream_id = body.get("stream_id")
+    def end(self, body: Mapping[str, object]) -> tuple[StreamId, int, int]:
+        raw_id = body.get("stream_id")
         epoch = parse_u64(body.get("epoch"), "epoch")
         final = parse_u64(body.get("final_sample"), "final_sample")
-        state = self._epochs.get((stream_id, epoch))
+        state = (self._epochs.get((StreamId(raw_id), epoch))
+                 if isinstance(raw_id, str) and raw_id in StreamId else None)
         if state is None:
-            raise ProtocolError("unknown_epoch", f"stream.end for unknown {stream_id} epoch {epoch}")
+            raise ProtocolError("unknown_epoch", f"stream.end for unknown {raw_id} epoch {epoch}")
+        stream_id = state.stream_id
         state.ended = True
         state.final_sample = final
         if self._current.get(stream_id) == epoch:
             del self._current[stream_id]
         return stream_id, epoch, final
 
-    def current(self, stream_id: str) -> int | None:
+    def current(self, stream_id: StreamId) -> int | None:
         return self._current.get(stream_id)
 
-    def is_open(self, stream_id: str, epoch: int) -> bool:
+    def is_open(self, stream_id: StreamId, epoch: int) -> bool:
         state = self._epochs.get((stream_id, epoch))
         return state is not None and not state.ended
 
-    def grant_backfill(self, stream_id: str, epoch: int | None = None) -> None:
+    def grant_backfill(self, stream_id: StreamId, epoch: int | None = None) -> None:
         """A lease starts wanting `stream_id`: allow one backfill run on the
         named epoch (or every open epoch of it, for the reference)."""
         for (sid, ep), state in self._epochs.items():
@@ -834,7 +851,7 @@ class StreamRegistry:
                     and (epoch is None or ep == epoch):
                 state.backfills += 1
 
-    def check(self, packet: Packet) -> str:
+    def check(self, packet: Packet) -> StreamId:
         """Validate a packet against its epoch; returns its stream id."""
         stream_id = _KIND_STREAM.get(packet.kind)
         if stream_id is None:
@@ -965,23 +982,37 @@ class ClockMap:
 # Leases (§4.4, WIRE §4.5)
 # ---------------------------------------------------------------------------
 
-class LeaseReason(str, enum.Enum):
+class LeaseReason(enum.StrEnum):
     CANDIDATE = "candidate"
     TURN = "turn"
     REPLY = "reply"
     DIAGNOSTIC = "diagnostic"
 
 
-class AckState(str, enum.Enum):
+class AckState(enum.StrEnum):
     PENDING = "pending"
     ACCEPTED = "accepted"
     REJECTED = "rejected"
 
 
+class LeaseEnd(enum.StrEnum):
+    """Why a lease is over: an `uplink.close` reason (controller) or an `uplink.ended` reason (device)."""
+
+    REJECTED = "rejected"
+    ARBITRATION_LOST = "arbitration_lost"
+    COMMITTED = "committed"
+    CLOSED = "closed"
+    TTL = "ttl"
+    MUTE = "mute"
+    EPOCH = "epoch"
+    OVERRUN = "overrun"
+    SESSION = "session"
+
+
 LIVE = "live"
-STREAM_IDS = ("mic", "reference", "cells")
-CLOSE_REASONS = ("rejected", "arbitration_lost", "committed", "closed")
-ENDED_REASONS = ("closed", "ttl", "mute", "epoch", "overrun", "session")
+CLOSE_REASONS = frozenset({LeaseEnd.REJECTED, LeaseEnd.ARBITRATION_LOST, LeaseEnd.COMMITTED, LeaseEnd.CLOSED})
+ENDED_REASONS = frozenset({LeaseEnd.CLOSED, LeaseEnd.TTL, LeaseEnd.MUTE, LeaseEnd.EPOCH, LeaseEnd.OVERRUN,
+                           LeaseEnd.SESSION})
 
 
 @dataclass
@@ -991,22 +1022,22 @@ class Lease:
     owner: str
     generation: int
     capture_epoch: int
-    streams: dict[str, int | None]      # stream id → start (capture samples), None = live
+    streams: dict[StreamId, int | None]   # stream → start (capture samples), None = live
     ttl_ms: int
     opened_at: float
     renewed_at: float
     ack: AckState | None = None         # candidate leases only
     candidate_id: str | None = None
-    ended: str | None = None            # close/ended reason once over
-    last_sample: dict[str, int | None] = field(default_factory=dict)   # None: nothing sent
-    clipped_start: dict[str, int | None] = field(default_factory=dict)
+    ended: LeaseEnd | None = None       # close/ended reason once over
+    last_sample: dict[StreamId, int | None] = field(default_factory=dict)   # None: nothing sent
+    clipped_start: dict[StreamId, int | None] = field(default_factory=dict)
 
     @property
     def active(self) -> bool:
         """Receiving audio: open, and acknowledged if it is a candidate lease."""
         return self.ended is None and self.ack in (None, AckState.ACCEPTED)
 
-    def wants(self, stream_id: str) -> bool:
+    def wants(self, stream_id: StreamId) -> bool:
         return self.active and stream_id in self.streams
 
     @property
@@ -1014,13 +1045,46 @@ class Lease:
         return self.renewed_at + self.ttl_ms / 1000.0
 
 
+class LeaseCommand(enum.StrEnum):
+    """The control message types of controller lease commands (WIRE §4.5)."""
+
+    OPEN = "uplink.open"
+    RENEW = "uplink.renew"
+    CLOSE = "uplink.close"
+
+
+class UplinkOpenBody(TypedDict):
+    lease_id: str
+    owner: str
+    reason: LeaseReason
+    streams: dict[StreamId, str]          # start as a u64 decimal string, or LIVE
+    ttl_ms: int
+
+
+class UplinkRenewBody(TypedDict):
+    lease_id: str
+    ttl_ms: int
+
+
+class UplinkConvertBody(UplinkRenewBody):
+    """The renewal that converts a candidate lease into the turn's lease."""
+
+    reason: LeaseReason
+    owner: str
+
+
+class UplinkCloseBody(TypedDict):
+    lease_id: str
+    reason: LeaseEnd
+
+
 @dataclass(frozen=True, slots=True)
 class LeaseMessage:
     """A control message to send: envelope `type`, `generation`, `body`."""
 
-    type: str
+    type: LeaseCommand
     generation: int
-    body: dict
+    body: UplinkOpenBody | UplinkRenewBody | UplinkConvertBody | UplinkCloseBody
 
 
 def _round_down(x: int, grid: int) -> int:
@@ -1034,7 +1098,7 @@ class LeaseTable:
         self._now = now
         self._leases: dict[str, Lease] = {}
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[Lease]:
         return iter(list(self._leases.values()))
 
     def get(self, lease_id: str) -> Lease | None:
@@ -1057,9 +1121,9 @@ class LeaseTable:
         now = self._now()
         lease = Lease(
             lease_id, LeaseReason.CANDIDATE, candidate_id, 1, capture_epoch,
-            {"mic": mic,
-             "cells": _round_down(mic - CANDIDATE_CELLS_LEAD, CELL_SAMPLES),
-             "reference": max(0, mic - CANDIDATE_REFERENCE_LEAD)},
+            {StreamId.MIC: mic,
+             StreamId.CELLS: _round_down(mic - CANDIDATE_CELLS_LEAD, CELL_SAMPLES),
+             StreamId.REFERENCE: max(0, mic - CANDIDATE_REFERENCE_LEAD)},
             LEASE_TTL_MS, now, now, ack=AckState.PENDING, candidate_id=candidate_id,
         )
         self._leases[lease_id] = lease
@@ -1073,36 +1137,37 @@ class LeaseTable:
         lease.ack = AckState.ACCEPTED if accepted else AckState.REJECTED
         lease.renewed_at = self._now()
         if not accepted:
-            lease.ended = "rejected"
+            lease.ended = LeaseEnd.REJECTED
         return lease
 
     def open(self, lease_id: str, reason: LeaseReason, owner: str, capture_epoch: int,
-             streams: dict[str, int | None], ttl_ms: int = LEASE_TTL_MS) -> tuple[Lease, LeaseMessage]:
+             streams: Mapping[StreamId, int | None], ttl_ms: int = LEASE_TTL_MS) -> tuple[Lease, LeaseMessage]:
         """A controller-opened lease (`turn`, `reply`, `diagnostic`)."""
         reason = LeaseReason(reason)
         if reason is LeaseReason.CANDIDATE:
             raise LeaseError("candidate leases are opened by the device")
         if lease_id in self._leases:
             raise LeaseError(f"lease {lease_id} already exists")
-        if not streams or set(streams) - set(STREAM_IDS):
+        if not streams or any(sid not in StreamId for sid in streams):
             raise LeaseError(f"invalid streams {sorted(streams)}")
-        starts = {}
+        starts: dict[StreamId, int | None] = {}
         for sid, start in streams.items():
+            sid = StreamId(sid)
             if start is None:
                 starts[sid] = None
-            elif sid == "reference":
+            elif sid == StreamId.REFERENCE:
                 starts[sid] = max(0, start)
             else:
                 starts[sid] = _round_down(start, CELL_SAMPLES)
         now = self._now()
         lease = Lease(lease_id, reason, owner, 1, capture_epoch, starts, ttl_ms, now, now)
         self._leases[lease_id] = lease
-        body = {
-            "lease_id": lease_id, "owner": owner, "reason": reason.value,
-            "streams": {sid: LIVE if s is None else format_u64(s) for sid, s in starts.items()},
-            "ttl_ms": ttl_ms,
-        }
-        return lease, LeaseMessage("uplink.open", lease.generation, body)
+        body = UplinkOpenBody(
+            lease_id=lease_id, owner=owner, reason=reason,
+            streams={sid: LIVE if s is None else format_u64(s) for sid, s in starts.items()},
+            ttl_ms=ttl_ms,
+        )
+        return lease, LeaseMessage(LeaseCommand.OPEN, lease.generation, body)
 
     def convert_to_turn(self, lease_id: str, owner: str) -> LeaseMessage:
         """Convert an accepted candidate lease into the turn's lease in place."""
@@ -1113,8 +1178,8 @@ class LeaseTable:
         lease.owner = owner
         lease.generation += 1
         lease.renewed_at = self._now()
-        return LeaseMessage("uplink.renew", lease.generation,
-                            {"lease_id": lease_id, "ttl_ms": lease.ttl_ms, "reason": "turn", "owner": owner})
+        return LeaseMessage(LeaseCommand.RENEW, lease.generation, UplinkConvertBody(
+            lease_id=lease_id, ttl_ms=lease.ttl_ms, reason=LeaseReason.TURN, owner=owner))
 
     def renew(self, lease_id: str) -> LeaseMessage:
         lease = self._live(lease_id)
@@ -1124,7 +1189,7 @@ class LeaseTable:
         if lease.ack is AckState.PENDING:
             raise LeaseError(f"candidate lease {lease_id} is not acknowledged")
         lease.renewed_at = now
-        return LeaseMessage("uplink.renew", lease.generation, {"lease_id": lease_id, "ttl_ms": lease.ttl_ms})
+        return LeaseMessage(LeaseCommand.RENEW, lease.generation, UplinkRenewBody(lease_id=lease_id, ttl_ms=lease.ttl_ms))
 
     def due_renewals(self) -> list[Lease]:
         """Leases whose once-a-second renewal is due."""
@@ -1133,27 +1198,31 @@ class LeaseTable:
                 if l.active and now - l.renewed_at >= LEASE_RENEW_S
                 and not (l.reason is LeaseReason.DIAGNOSTIC and now - l.opened_at >= DIAGNOSTIC_MAX_S)]
 
-    def close(self, lease_id: str, reason: str) -> LeaseMessage:
+    def close(self, lease_id: str, reason: LeaseEnd) -> LeaseMessage:
         if reason not in CLOSE_REASONS:
             raise LeaseError(f"invalid close reason {reason!r}")
         lease = self._live(lease_id)
         lease.ended = reason
-        return LeaseMessage("uplink.close", lease.generation, {"lease_id": lease_id, "reason": reason})
+        return LeaseMessage(LeaseCommand.CLOSE, lease.generation, UplinkCloseBody(lease_id=lease_id, reason=reason))
 
-    def device_ended(self, body: dict) -> Lease | None:
+    def device_ended(self, body: Mapping[str, object]) -> Lease | None:
         """Apply `uplink.ended`; returns the lease, or None if unknown."""
-        lease = self._leases.get(body.get("lease_id"))
+        lease_id = body.get("lease_id")
+        lease = self._leases.get(lease_id) if isinstance(lease_id, str) else None
         if lease is None:
             return None
         reason = body.get("reason")
-        if reason not in ENDED_REASONS:
+        if not isinstance(reason, str) or reason not in ENDED_REASONS:
             raise ProtocolError("malformed_message", f"uplink.ended reason {reason!r}")
         if lease.ended is None:
-            lease.ended = reason
+            lease.ended = LeaseEnd(reason)
         for key, target in (("last_sample", lease.last_sample), ("clipped_start", lease.clipped_start)):
-            for sid, value in (body.get(key) or {}).items():
-                if sid in STREAM_IDS:
-                    target[sid] = None if value is None else parse_u64(value, f"{key}.{sid}")
+            values = body.get(key) or {}
+            if not isinstance(values, Mapping):
+                raise ProtocolError("malformed_message", f"uplink.ended {key} must be an object")
+            for sid, value in values.items():
+                if isinstance(sid, str) and sid in StreamId:
+                    target[StreamId(sid)] = None if value is None else parse_u64(value, f"{key}.{sid}")
         return lease
 
     def expire(self) -> list[Lease]:
@@ -1165,15 +1234,15 @@ class LeaseTable:
             if lease.ended is not None:
                 continue
             if lease.ack is AckState.PENDING and now - lease.opened_at >= CANDIDATE_ACK_S:
-                lease.ended = "ttl"
+                lease.ended = LeaseEnd.TTL
             elif now >= lease.expires_at:
-                lease.ended = "ttl"
+                lease.ended = LeaseEnd.TTL
             else:
                 continue
             out.append(lease)
         return out
 
-    def end_all(self, reason: str) -> list[Lease]:
+    def end_all(self, reason: LeaseEnd) -> list[Lease]:
         """Mute, epoch change, or session loss: every open lease ends."""
         if reason not in ENDED_REASONS:
             raise LeaseError(f"invalid end reason {reason!r}")
@@ -1187,11 +1256,11 @@ class LeaseTable:
     def forget(self, lease_id: str) -> None:
         self._leases.pop(lease_id, None)
 
-    def wanting(self, stream_id: str, epoch: int) -> list[Lease]:
+    def wanting(self, stream_id: StreamId, epoch: int) -> list[Lease]:
         """Active leases that take this packet's stream/epoch. Mic and cells
         belong to the lease's capture epoch; the reference has its own epochs."""
         return [l for l in self._leases.values()
-                if l.wants(stream_id) and (stream_id == "reference" or l.capture_epoch == epoch)]
+                if l.wants(stream_id) and (stream_id == StreamId.REFERENCE or l.capture_epoch == epoch)]
 
 
 # ---------------------------------------------------------------------------
@@ -1233,10 +1302,10 @@ class LeaseTimeline:
         anchor = self.mic.frontier if self.utterance_start is None else self.utterance_start
         self.trim_before(max(0, anchor - ROLLING_SAMPLES))
 
-    def store(self, stream_id: str, packet: Packet) -> list[tuple[int, int]]:
+    def store(self, stream_id: StreamId, packet: Packet) -> list[tuple[int, int]]:
         """Place a validated packet; returns newly known ranges."""
         start = self.lease.streams.get(stream_id)
-        if stream_id == "mic":
+        if stream_id == StreamId.MIC:
             first = packet.first_sample
             if packet.discontinuity:
                 self.mic.mark_discontinuity(first)
@@ -1251,7 +1320,7 @@ class LeaseTimeline:
                 pcm = pcm[start - first:]
                 first = start
             new = self.mic.write(first, pcm)
-        elif stream_id == "cells":
+        elif stream_id == StreamId.CELLS:
             records = packet.cells()
             first = packet.first_sample
             if start is not None and first < start:
@@ -1262,8 +1331,8 @@ class LeaseTimeline:
                 first += skip * CELL_SAMPLES
             new = self.cells.write(first, records)
         else:
-            pcm = None if packet.digital_silence else packet.pcm()
-            new = self.reference.write(packet.epoch, packet.first_sample, pcm, packet.frame_count,
+            reference = None if packet.digital_silence else packet.pcm()
+            new = self.reference.write(packet.epoch, packet.first_sample, reference, packet.frame_count,
                                        discontinuity=packet.discontinuity)
         self._retain()
         return new
@@ -1278,7 +1347,7 @@ class Delivery:
     """New samples a packet contributed to one lease's timeline."""
 
     lease_id: str
-    stream_id: str
+    stream_id: StreamId
     epoch: int
     ranges: tuple[tuple[int, int], ...]
     packet: Packet
@@ -1295,10 +1364,10 @@ class UplinkSession:
 
     # -- stream messages -------------------------------------------------
 
-    def stream_open(self, body: dict) -> tuple[str, int]:
+    def stream_open(self, body: Mapping[str, object]) -> tuple[StreamId, int]:
         return self.streams.open(body)
 
-    def stream_end(self, body: dict) -> tuple[str, int, int]:
+    def stream_end(self, body: Mapping[str, object]) -> tuple[StreamId, int, int]:
         stream_id, epoch, final = self.streams.end(body)
         self._clocks.pop((_STREAM_KIND[stream_id], epoch), None)
         return stream_id, epoch, final
@@ -1308,7 +1377,7 @@ class UplinkSession:
     def _attach(self, lease: Lease) -> None:
         self.timelines[lease.lease_id] = LeaseTimeline(lease)
         for sid in lease.streams:
-            self.streams.grant_backfill(sid, None if sid == "reference" else lease.capture_epoch)
+            self.streams.grant_backfill(sid, None if sid == StreamId.REFERENCE else lease.capture_epoch)
 
     def candidate(self, lease_id: str, candidate_id: str, capture_epoch: int, support_start: int) -> Lease:
         return self.leases.open_candidate(lease_id, candidate_id, capture_epoch, support_start)
@@ -1320,7 +1389,7 @@ class UplinkSession:
         return lease
 
     def open(self, lease_id: str, reason: LeaseReason, owner: str, capture_epoch: int,
-             streams: dict[str, int | None], ttl_ms: int = LEASE_TTL_MS) -> LeaseMessage:
+             streams: Mapping[StreamId, int | None], ttl_ms: int = LEASE_TTL_MS) -> LeaseMessage:
         lease, msg = self.leases.open(lease_id, reason, owner, capture_epoch, streams, ttl_ms)
         self._attach(lease)
         return msg
@@ -1330,11 +1399,11 @@ class UplinkSession:
         self.timelines.pop(lease_id, None)
         self.leases.forget(lease_id)
 
-    def clear(self, reason: str) -> list[Lease]:
+    def clear(self, reason: LeaseEnd) -> list[Lease]:
         """Mute or session loss: end every lease and erase buffered audio."""
         ended = self.leases.end_all(reason)
         self.timelines.clear()
-        if reason == "session":
+        if reason == LeaseEnd.SESSION:
             self.streams.clear()
             self._clocks.clear()
         return ended
@@ -1350,7 +1419,7 @@ class UplinkSession:
         stream_id = self.streams.check(packet)
         clock = self._clocks.setdefault((packet.kind, packet.epoch), StreamClock())
         clock.add(packet)
-        out = []
+        out: list[Delivery] = []
         for lease in self.leases.wanting(stream_id, packet.epoch):
             timeline = self.timelines.get(lease.lease_id)
             if timeline is None:
@@ -1360,14 +1429,14 @@ class UplinkSession:
                 out.append(Delivery(lease.lease_id, stream_id, packet.epoch, tuple(ranges), packet))
         return out
 
-    def clock_fit(self, stream_id: str, epoch: int) -> ClockFit | None:
+    def clock_fit(self, stream_id: StreamId, epoch: int) -> ClockFit | None:
         clock = self._clocks.get((_STREAM_KIND[stream_id], epoch))
         return None if clock is None else clock.fit()
 
     def clock_map(self, capture_epoch: int, reference_epoch: int) -> ClockMap | None:
         """Affine capture↔reference mapping, or None while either fit is unknown."""
-        cap = self.clock_fit("mic", capture_epoch)
-        ref = self.clock_fit("reference", reference_epoch)
+        cap = self.clock_fit(StreamId.MIC, capture_epoch)
+        ref = self.clock_fit(StreamId.REFERENCE, reference_epoch)
         if cap is None or ref is None:
             return None
         return ClockMap(cap, ref)

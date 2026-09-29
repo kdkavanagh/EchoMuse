@@ -11,6 +11,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/wilbowes/EchoMuse/internal/uuid"
 )
 
 type fakeClock struct{ ns int64 }
@@ -174,7 +176,7 @@ type occSpec struct {
 }
 
 func alarm(name string, dueUTC int64) occSpec {
-	return occSpec{sched: UUID5(NamespaceURL, name).String(), dueUTC: dueUTC, label: name,
+	return occSpec{sched: uuid.V5(uuid.NamespaceURL, name).String(), dueUTC: dueUTC, label: name,
 		maxRingMs: 600000, rampMs: 20000, loopGapMs: 2000, snoozeMs: 540000,
 		sound: SoundFallback, volume: "null", revision: 1}
 }

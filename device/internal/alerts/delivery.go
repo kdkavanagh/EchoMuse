@@ -4,6 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+
+	"github.com/wilbowes/EchoMuse/internal/assets"
 )
 
 // maxSnapshotPageObjects is the alert.snapshot page limit (SPEC §16.4).
@@ -110,7 +112,7 @@ func (e *Executor) ApplySnapshotPage(body []byte) (ack AlertAck, done bool) {
 	defer e.mu.Unlock()
 	var p snapshotPage
 	if err := json.Unmarshal(body, &p); err != nil || p.PageCount <= 0 || p.PageIndex < 0 ||
-		p.PageIndex >= p.PageCount || len(p.Objects) > maxSnapshotPageObjects || !validSHA256(p.SHA256) {
+		p.PageIndex >= p.PageCount || len(p.Objects) > maxSnapshotPageObjects || !assets.IsSHA256(p.SHA256) {
 		return e.rejectSnapshotLocked(), true
 	}
 	if p.PageIndex == 0 {

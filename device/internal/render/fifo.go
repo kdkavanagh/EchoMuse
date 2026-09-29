@@ -38,14 +38,6 @@ func (q *sampleFIFO) pop() int16 {
 	return v
 }
 
-// peek copies up to len(dst) queued samples without consuming them.
-func (q *sampleFIFO) peek(dst []int16) int {
-	n := min(len(dst), q.n)
-	c := copy(dst[:n], q.buf[q.head:])
-	copy(dst[c:n], q.buf)
-	return n
-}
-
 // gainRamp moves linearly to its target over a fixed number of samples,
 // whatever the distance, so ramp duration is exact and independent of block
 // and write size (SPEC §4.1).

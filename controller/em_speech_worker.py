@@ -16,21 +16,24 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import enum
 import inspect
 import json
 import math
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Callable, Literal
+from typing import Callable
 
 import numpy as np
 
+from echomuse_grammar import Result as GrammarResult
+from em_attribution import EchoResult, WakeHop
 from em_audio_timeline import (
-    FLAG_DISCONTINUITY, FLAG_MUTED, REFERENCE_HOP, ReferenceView, SampleTimeline, ceil_to,
+    FLAG_DISCONTINUITY, FLAG_MUTED, REFERENCE_HOP, ReferenceView, SampleTimeline, StreamId, ceil_to,
 )
 from em_endpoint_policy import TextStability
-from em_speech_bundle import SpeechBundle, create_recognizer, verify_bundle
+from em_speech_bundle import Recognizer, RecognizerStream, SpeechBundle, create_recognizer, verify_bundle
 from em_wake_phrase import StreamingTranscript, verify_wake
 from em_wake_registry import WakeRegistry
 from em_wake_scorer import (
@@ -55,13 +58,30 @@ PROBE_INTERVAL_S = 10.0
 PROBE_DEADLINE_S = 1.0
 PROBES_TO_RECOVER = 2
 POLICY_REVISION = "post_afe_1"
-ECHO_RESULTS = frozenset({"echo_only", "near_end_present", "unknown", "no_reference"})
 
-StreamName = Literal["mic", "reference"]
-SourceName = Literal["device", "controller"]
-ObservationKind = Literal[
-    "candidate", "level", "vad", "reference_score", "echo", "asr", "verification", "error",
-]
+
+class ObservationSource(enum.StrEnum):
+    DEVICE = "device"
+    CONTROLLER = "controller"
+
+
+class ObservationKind(enum.StrEnum):
+    """§8.1 observation kinds; the controller-side ones also name the worker component that failed."""
+
+    CANDIDATE = "candidate"
+    LEVEL = "level"
+    VAD = "vad"
+    REFERENCE_SCORE = "reference_score"
+    ECHO = "echo"
+    ASR = "asr"
+    VERIFICATION = "verification"
+    ERROR = "error"
+
+
+class VerificationResult(enum.StrEnum):
+    PASS = "pass"
+    FAIL = "fail"
+    TIMEOUT = "timeout"
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +98,7 @@ class CandidatePayload:
     first_crossing_sample: int
     support_start: int
     support_end: int | None           # None while the candidate is open
-    hops: tuple[dict, ...]
+    hops: tuple[WakeHop, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,7 +129,7 @@ class ReferenceScorePayload:
 @dataclass(frozen=True, slots=True)
 class EchoPayload:
     first_cell_sample: int
-    results: tuple[str, ...]
+    results: tuple[EchoResult, ...]
     lag_samples: int | None
 
 
@@ -123,7 +143,7 @@ class AsrPayload:
     text: str
     stable_prefix: str | None
     trailing_blank_frames: int
-    grammar_result: Any | None
+    grammar_result: GrammarResult | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,12 +151,12 @@ class VerificationPayload:
     candidate_id: str
     text: str | None
     alias_distance: float | None
-    result: Literal["pass", "fail", "timeout"]
+    result: VerificationResult
 
 
 @dataclass(frozen=True, slots=True)
 class ErrorPayload:
-    component: str
+    component: ObservationKind        # the job kind that failed
     reason: str
 
 
@@ -148,8 +168,8 @@ Payload = (CandidatePayload | LevelPayload | VadPayload | ReferenceScorePayload 
 class Observation:
     device_id: str
     capture_epoch: int
-    stream: StreamName
-    source: SourceName
+    stream: StreamId                  # mic or reference
+    source: ObservationSource
     kind: ObservationKind
     through_sample: int               # evidence covers samples before this index
     utterance_id: str | None
@@ -162,6 +182,36 @@ class Observation:
 
 class SpeechWorkerError(Exception):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class AsrResult:
+    """One Kroko result: tokens with emission times (s from stream start) and trailing blank frames."""
+
+    text: str
+    tokens: tuple[str, ...]
+    timestamps: tuple[float, ...]
+    trailing_blanks: int
+
+    @classmethod
+    def parse(cls, raw: str) -> AsrResult:
+        try:
+            result = json.loads(raw)
+        except (TypeError, ValueError) as exc:
+            raise SpeechWorkerError(f"invalid Kroko result JSON: {exc}") from None
+        if not isinstance(result, dict):
+            raise SpeechWorkerError("Kroko result JSON is not an object")
+        tokens = result.get("tokens", [])
+        stamps = result.get("timestamps", [])
+        blanks = result.get("num_trailing_blanks")
+        if not isinstance(tokens, list) or not isinstance(stamps, list) or len(tokens) != len(stamps):
+            raise SpeechWorkerError("Kroko tokens and timestamps disagree")
+        if not all(isinstance(t, (int, float)) and math.isfinite(t) for t in stamps):
+            raise SpeechWorkerError("Kroko timestamps are not finite")
+        if isinstance(blanks, bool) or not isinstance(blanks, int) or blanks < 0:
+            raise SpeechWorkerError("Kroko result lacks a valid num_trailing_blanks")
+        return cls(str(result.get("text", "")), tuple(str(t) for t in tokens),
+                   tuple(float(t) for t in stamps), blanks)
 
 
 # ---------------------------------------------------------------------------
@@ -193,10 +243,10 @@ class SpeechModels:
         if inputs != {"input": "tensor(float)", "state": "tensor(float)", "sr": "tensor(int64)"} \
                 or outputs != {"output", "stateN"}:
             raise SpeechWorkerError(f"Silero v5 graph has unexpected IO {inputs} → {outputs}")
-        self.recognizer = create_recognizer(bundle)
+        self.recognizer: Recognizer = create_recognizer(bundle)
         m = bundle.manifest
-        self.revision = (f"sherpa-onnx {bundle.package_version}; kroko {m['asr']['archive']['sha256'][:12]}; "
-                         f"silero {m['vad']['sha256'][:12]}")
+        self.revision = (f"sherpa-onnx {bundle.package_version}; kroko {m.archive.sha256[:12]}; "
+                         f"silero {m.vad.sha256[:12]}")
         self._sr = np.array(SAMPLE_RATE, dtype=np.int64)
 
     def vad(self, state: "_VadState", cell: np.ndarray) -> float:
@@ -212,29 +262,14 @@ class SpeechModels:
         state.window[:VAD_CONTEXT_SAMPLES] = cell[-VAD_CONTEXT_SAMPLES:]
         return p
 
-    def decode(self, stream, evidence: np.ndarray) -> None:
+    def decode(self, stream: RecognizerStream, evidence: np.ndarray) -> None:
         """Feed int16 evidence as float32 in [-1, 1] and decode while ready."""
         stream.accept_waveform(SAMPLE_RATE, evidence.astype(np.float32) / np.float32(32768.0))
         while self.recognizer.is_ready(stream):
             self.recognizer.decode_stream(stream)
 
-    def result(self, stream) -> dict:
-        try:
-            result = json.loads(self.recognizer.get_result_as_json_string(stream))
-        except (TypeError, ValueError) as exc:
-            raise SpeechWorkerError(f"invalid Kroko result JSON: {exc}") from None
-        if not isinstance(result, dict):
-            raise SpeechWorkerError("Kroko result JSON is not an object")
-        tokens = result.get("tokens", [])
-        stamps = result.get("timestamps", [])
-        blanks = result.get("num_trailing_blanks")
-        if not isinstance(tokens, list) or not isinstance(stamps, list) or len(tokens) != len(stamps):
-            raise SpeechWorkerError("Kroko tokens and timestamps disagree")
-        if not all(isinstance(t, (int, float)) and math.isfinite(t) for t in stamps):
-            raise SpeechWorkerError("Kroko timestamps are not finite")
-        if isinstance(blanks, bool) or not isinstance(blanks, int) or blanks < 0:
-            raise SpeechWorkerError("Kroko result lacks a valid num_trailing_blanks")
-        return result
+    def result(self, stream: RecognizerStream) -> AsrResult:
+        return AsrResult.parse(self.recognizer.get_result_as_json_string(stream))
 
     def probe(self) -> None:
         """1 s of zeros through fresh VAD state and a fresh ASR stream."""
@@ -293,10 +328,10 @@ class _VadState:
 class _Utterance:
     utterance_id: str
     start_sample: int
-    stream: Any
+    stream: RecognizerStream
     stability: TextStability
     text_transform: Callable[[StreamingTranscript], str] | None
-    grammar: Callable[[str], Any] | None
+    grammar: Callable[[str], GrammarResult] | None
     fed_through: int
 
 
@@ -319,18 +354,18 @@ class _Lease:
 @dataclass(frozen=True, slots=True)
 class _Job:
     lane: str
-    component: str
+    component: ObservationKind
     created: float
     run: Callable[[], tuple[Observation, ...]]
     lease: _Lease | None
-    stream: StreamName
+    stream: StreamId
     through: int
     utterance_id: str | None
     control: bool = False              # state changes: never dropped for age
     candidate_id: str | None = None
 
 
-_STOP = object()
+_Lane = asyncio.Queue[_Job | None]      # None stops the lane
 
 
 # ---------------------------------------------------------------------------
@@ -341,9 +376,9 @@ class SpeechWorker:
     """The actor's handle on controller speech inference.
 
     Lifecycle: `await start()`; per lease `open_lease()` … `close_lease()`;
-    submissions return immediately; results arrive in `observations` (an
-    asyncio queue) and, if given, `on_observation(obs)`. Availability changes
-    arrive in `availability` and `on_availability(bool)`.
+    submissions return immediately; results go to `on_observation(obs)` or,
+    without that callback, to the `observations` asyncio queue. Availability
+    changes arrive in `availability` and `on_availability(bool)`.
     """
 
     def __init__(
@@ -352,8 +387,8 @@ class SpeechWorker:
         *,
         bundle_dir: str | None = None,
         policy_hash: str = POLICY_REVISION,
-        on_observation: Callable[[Observation], Any] | None = None,
-        on_availability: Callable[[bool], Any] | None = None,
+        on_observation: Callable[[Observation], object] | None = None,
+        on_availability: Callable[[bool], object] | None = None,
         now: Callable[[], float] = time.monotonic,
         job_deadline_s: float = JOB_DEADLINE_S,
         probe_interval_s: float = PROBE_INTERVAL_S,
@@ -373,10 +408,11 @@ class SpeechWorker:
         self._executor: ThreadPoolExecutor | None = None
         self._wake: dict[str, WakeGraph] = {}
         self._leases: dict[str, _Lease] = {}
-        self._lanes: dict[str, asyncio.Queue] = {}
-        self._lane_tasks: dict[str, asyncio.Task] = {}
+        self._lanes: dict[str, _Lane] = {}
+        self._lane_tasks: dict[str, asyncio.Task[None]] = {}
         self._errors: collections.deque[float] = collections.deque()
-        self._probe_task: asyncio.Task | None = None
+        self._probe_task: asyncio.Task[None] | None = None
+        self._callbacks: set[asyncio.Future[object]] = set()   # awaitables on_availability returned
         self._closed = False
 
     # -- startup / shutdown ------------------------------------------------
@@ -390,8 +426,9 @@ class SpeechWorker:
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="speech")
         loop = asyncio.get_running_loop()
         try:
-            self.models = await loop.run_in_executor(self._executor, SpeechModels, bundle)
-            await loop.run_in_executor(self._executor, self.models.probe)
+            models = await loop.run_in_executor(self._executor, SpeechModels, bundle)
+            self.models = models
+            await loop.run_in_executor(self._executor, models.probe)
             await self.load_wake_graph(self.registry.active().graph_sha256)
         except BaseException:
             self._executor.shutdown(wait=True, cancel_futures=True)
@@ -416,7 +453,7 @@ class SpeechWorker:
             self._probe_task.cancel()
             await asyncio.gather(self._probe_task, return_exceptions=True)
         for queue in self._lanes.values():
-            queue.put_nowait(_STOP)
+            queue.put_nowait(None)
         await asyncio.gather(*list(self._lane_tasks.values()), return_exceptions=True)
         self._lanes.clear()
         self._lane_tasks.clear()
@@ -446,7 +483,7 @@ class SpeechWorker:
         for lane in (f"mic:{lease_id}", f"reference:{lease_id}"):
             queue = self._lanes.pop(lane, None)
             if queue is not None:
-                queue.put_nowait(_STOP)
+                queue.put_nowait(None)
 
     def reset_mic(self, lease_id: str) -> None:
         """Epoch change, discontinuity, or mute: reset VAD state and context
@@ -458,7 +495,8 @@ class SpeechWorker:
             lease.vad.reset()
             lease.utterance = None
             return ()
-        self._submit(_Job(f"mic:{lease_id}", "vad", self._now(), run, lease, "mic", 0, None, control=True))
+        self._submit(_Job(f"mic:{lease_id}", ObservationKind.VAD, self._now(), run, lease, StreamId.MIC, 0, None,
+                          control=True))
 
     # -- utterance ASR ------------------------------------------------------
 
@@ -471,7 +509,7 @@ class SpeechWorker:
         mic: SampleTimeline,
         *,
         text_transform: Callable[[StreamingTranscript], str] | None = None,
-        grammar: Callable[[str], Any] | None = None,
+        grammar: Callable[[str], GrammarResult] | None = None,
     ) -> None:
         """Open the utterance's ASR stream at `start_sample` (the pre-roll
         start) and catch it up on the canonical mic already submitted.
@@ -480,15 +518,14 @@ class SpeechWorker:
         and grammar judge (the §16.6 wake-phrase cut for wake turns);
         `grammar(text)` supplies `grammar_result`."""
         lease = self._lease(lease_id)
-        self._require_started()
+        models = self._require_started()
         through = lease.mic_through if lease.mic_through is not None else start_sample
         preroll = None
         if through > start_sample:
             if not mic.covers(start_sample, through):
                 raise SpeechWorkerError(f"pre-roll [{start_sample}, {through}) is not all known")
             preroll = evidence_copy(mic.read(start_sample, through))
-        assert self.models is not None
-        stream = self.models.recognizer.create_stream()
+        stream = models.recognizer.create_stream()
         utterance = _Utterance(utterance_id, start_sample, stream, TextStability(trigger_sample),
                                text_transform, grammar, start_sample)
 
@@ -497,10 +534,10 @@ class SpeechWorker:
             if preroll is None:
                 return ()
             for i in range(0, preroll.size, BLOCK_SAMPLES):
-                self.models.decode(stream, preroll[i:i + BLOCK_SAMPLES])
+                models.decode(stream, preroll[i:i + BLOCK_SAMPLES])
             utterance.fed_through = start_sample + preroll.size
-            return (self._asr_observation(lease, utterance),)
-        self._submit(_Job(f"mic:{lease_id}", "asr", self._now(), run, lease, "mic",
+            return (self._asr_observation(models, lease, utterance),)
+        self._submit(_Job(f"mic:{lease_id}", ObservationKind.ASR, self._now(), run, lease, StreamId.MIC,
                           max(through, start_sample), utterance_id, control=True))
 
     def close_utterance(self, lease_id: str) -> None:
@@ -510,7 +547,8 @@ class SpeechWorker:
         def run() -> tuple[Observation, ...]:
             lease.utterance = None
             return ()
-        self._submit(_Job(f"mic:{lease_id}", "asr", self._now(), run, lease, "mic", 0, None, control=True))
+        self._submit(_Job(f"mic:{lease_id}", ObservationKind.ASR, self._now(), run, lease, StreamId.MIC, 0, None,
+                          control=True))
 
     # -- mic blocks ---------------------------------------------------------
 
@@ -519,6 +557,7 @@ class SpeechWorker:
         """One uploaded mic block (canonical int16). The evidence copy is
         built once here and shared by VAD and the utterance's ASR."""
         lease = self._lease(lease_id)
+        models = self._require_started()
         pcm = np.asarray(canonical_pcm)
         if pcm.dtype != np.int16 or pcm.ndim != 1 or pcm.size == 0:
             raise ValueError("canonical PCM must be a non-empty 1-D int16 array")
@@ -530,17 +569,17 @@ class SpeechWorker:
         end = first_sample + pcm.size
         lease.mic_through = end
         utterance_id = lease.utterance.utterance_id if lease.utterance else None
-        self._submit(_Job(f"mic:{lease_id}", "vad", self._now(),
-                          lambda: self._run_mic(lease, first_sample, evidence),
-                          lease, "mic", end, utterance_id))
+        self._submit(_Job(f"mic:{lease_id}", ObservationKind.VAD, self._now(),
+                          lambda: self._run_mic(models, lease, first_sample, evidence),
+                          lease, StreamId.MIC, end, utterance_id))
 
-    def _run_mic(self, lease: _Lease, first: int, evidence: np.ndarray) -> tuple[Observation, ...]:
-        assert self.models is not None
+    def _run_mic(self, models: SpeechModels, lease: _Lease, first: int,
+                 evidence: np.ndarray) -> tuple[Observation, ...]:
         if lease.dirty:
             lease.vad.reset()
             lease.utterance = None
             lease.dirty = False
-        out = []
+        out: list[Observation] = []
         vad = lease.vad
         if vad.next_sample is not None and first != vad.next_sample + vad.pending.size:
             # Missing range: VAD context never crosses a gap (the actor closes
@@ -557,42 +596,41 @@ class SpeechWorker:
         if n_cells:
             first_cell = vad.next_sample
             cells = vad.pending[:n_cells * VAD_CELL_SAMPLES].astype(np.float32) / np.float32(32768.0)
-            probs = tuple(self.models.vad(vad, cells[i * VAD_CELL_SAMPLES:(i + 1) * VAD_CELL_SAMPLES])
+            probs = tuple(models.vad(vad, cells[i * VAD_CELL_SAMPLES:(i + 1) * VAD_CELL_SAMPLES])
                           for i in range(n_cells))
             vad.pending = vad.pending[n_cells * VAD_CELL_SAMPLES:]
-            vad.next_sample += n_cells * VAD_CELL_SAMPLES
+            vad.next_sample = first_cell + n_cells * VAD_CELL_SAMPLES
             u = lease.utterance
-            out.append(self._observe(lease, "mic", "vad", vad.next_sample, VadPayload(first_cell, probs),
-                                     u.utterance_id if u else None))
+            out.append(self._observe(lease, StreamId.MIC, ObservationKind.VAD, vad.next_sample,
+                                     VadPayload(first_cell, probs), u.utterance_id if u else None))
         u = lease.utterance
         if u is not None:
             end = first + evidence.size
             if first > u.fed_through:
                 lease.utterance = None   # gap inside the utterance: stream is dead
             elif end > u.fed_through:
-                self.models.decode(u.stream, evidence[u.fed_through - first:])
+                models.decode(u.stream, evidence[u.fed_through - first:])
                 u.fed_through = end
-                out.append(self._asr_observation(lease, u))
+                out.append(self._asr_observation(models, lease, u))
         return tuple(out)
 
-    def _asr_observation(self, lease: _Lease, u: _Utterance) -> Observation:
-        assert self.models is not None
-        result = self.models.result(u.stream)
-        tokens = tuple(str(t) for t in result["tokens"])
-        emissions = tuple(u.start_sample + round(float(t) * SAMPLE_RATE) for t in result["timestamps"])
-        blanks = int(result["num_trailing_blanks"])
-        raw_text = str(result.get("text", ""))
+    def _asr_observation(self, models: SpeechModels, lease: _Lease, u: _Utterance) -> Observation:
+        result = models.result(u.stream)
+        tokens = result.tokens
+        emissions = tuple(u.start_sample + round(t * SAMPLE_RATE) for t in result.timestamps)
+        blanks = result.trailing_blanks
+        raw_text = result.text
         text = raw_text if u.text_transform is None else u.text_transform(
             StreamingTranscript.from_tokens(tokens, emissions))
         stable = u.stability.push(text, u.fed_through, blanks)
         payload = AsrPayload(tokens, emissions, raw_text, stable.prefix if stable.prefix_sample is not None else None,
                              blanks, None if u.grammar is None else u.grammar(text))
-        return self._observe(lease, "mic", "asr", u.fed_through, payload, u.utterance_id)
+        return self._observe(lease, StreamId.MIC, ObservationKind.ASR, u.fed_through, payload, u.utterance_id)
 
     # -- echo ----------------------------------------------------------------
 
     def submit_echo(self, lease_id: str, first_cell_sample: int, through_sample: int,
-                    compare: Callable[[], tuple[tuple[str, ...], int | None]],
+                    compare: Callable[[], tuple[tuple[EchoResult, ...], int | None]],
                     utterance_id: str | None = None) -> None:
         """Run the pure per-cell reference comparison (`em_attribution`) on
         the executor, serialized with this lease's mic analysis."""
@@ -600,12 +638,11 @@ class SpeechWorker:
 
         def run() -> tuple[Observation, ...]:
             results, lag = compare()
-            results = tuple(results)
-            if not results or any(r not in ECHO_RESULTS for r in results):
+            if not results or any(not isinstance(r, EchoResult) for r in results):
                 raise SpeechWorkerError(f"echo comparison returned {results!r}")
-            return (self._observe(lease, "mic", "echo", through_sample,
+            return (self._observe(lease, StreamId.MIC, ObservationKind.ECHO, through_sample,
                                   EchoPayload(first_cell_sample, results, lag), utterance_id),)
-        self._submit(_Job(f"mic:{lease_id}", "echo", self._now(), run, lease, "mic",
+        self._submit(_Job(f"mic:{lease_id}", ObservationKind.ECHO, self._now(), run, lease, StreamId.MIC,
                           through_sample, utterance_id))
 
     # -- reference scoring --------------------------------------------------
@@ -622,7 +659,7 @@ class SpeechWorker:
         next_end = lease.ref_next.get(epoch)
         if next_end is None:
             next_end = ceil_to(first + WINDOW_SAMPLES, REFERENCE_HOP)
-        slots = []
+        slots: list[tuple[int, np.ndarray | None, bool]] = []
         while next_end <= frontier:
             start = next_end - WINDOW_SAMPLES
             if reference.covers(start, next_end):
@@ -633,29 +670,32 @@ class SpeechWorker:
             next_end += REFERENCE_HOP
         lease.ref_next[epoch] = next_end
         if slots:
-            self._submit(_Job(f"reference:{lease_id}", "reference_score", self._now(),
+            self._submit(_Job(f"reference:{lease_id}", ObservationKind.REFERENCE_SCORE, self._now(),
                               lambda: self._run_reference(lease, epoch, slots),
-                              lease, "reference", slots[-1][0], None))
+                              lease, StreamId.REFERENCE, slots[-1][0], None))
 
     def _run_reference(self, lease: _Lease, epoch: int,
                        slots: list[tuple[int, np.ndarray | None, bool]]) -> tuple[Observation, ...]:
-        if lease.detector is None or lease.reference_epoch != epoch:
-            lease.detector = ReferenceDetector(BcresnetScorer(lease.wake.infer, lease.wake.spec),
-                                               lease.wake.reference_threshold)
+        detector = lease.detector
+        if detector is None or lease.reference_epoch != epoch:
+            detector = lease.detector = ReferenceDetector(BcresnetScorer(lease.wake.infer, lease.wake.spec),
+                                                          lease.wake.reference_threshold)
             lease.reference_epoch = epoch
-        raw, smoothed, events = [], [], []
+        raw: list[float | None] = []
+        smoothed: list[float | None] = []
+        events: list[ReferenceCandidate] = []
         for end, pcm, silent in slots:
             if pcm is None and not silent:
-                score = lease.detector.scorer.invalid(end)
-                events.extend(lease.detector.push(score, invalid=True))
+                score = detector.scorer.invalid(end)
+                events.extend(detector.push(score, invalid=True))
             else:
-                score = lease.detector.scorer.score_window(
+                score = detector.scorer.score_window(
                     end, pcm if pcm is not None else np.zeros(WINDOW_SAMPLES, np.int16), digital_silence=silent)
-                events.extend(lease.detector.push(score))
+                events.extend(detector.push(score))
             raw.append(score.raw)
             smoothed.append(score.smoothed)
         payload = ReferenceScorePayload(slots[0][0], epoch, tuple(raw), tuple(smoothed), tuple(events))
-        return (self._observe(lease, "reference", "reference_score", slots[-1][0], payload),)
+        return (self._observe(lease, StreamId.REFERENCE, ObservationKind.REFERENCE_SCORE, slots[-1][0], payload),)
 
     # -- wake verification --------------------------------------------------
 
@@ -665,27 +705,28 @@ class SpeechWorker:
         [support_start − 300 ms, open + 480 ms), flushed with 0.5 s of zeros.
         Call once the mic timeline covers that range."""
         lease = self._lease(lease_id)
+        models = self._require_started()
         a = max(0, support_start - VERIFICATION_PREROLL)
         b = open_sample + VERIFICATION_LOOKAHEAD
         a = max(a, mic.floor)
         if not mic.covers(a, b):
             raise SpeechWorkerError(f"verification input [{a}, {b}) is not all known")
         evidence = evidence_copy(mic.read(a, b))
-        self._submit(_Job(f"verification:{candidate_id}", "verification", self._now(),
-                          lambda: self._run_verification(lease, candidate_id, evidence, verify_core, b),
-                          lease, "mic", b, None, candidate_id=candidate_id))
+        self._submit(_Job(f"verification:{candidate_id}", ObservationKind.VERIFICATION, self._now(),
+                          lambda: self._run_verification(models, lease, candidate_id, evidence, verify_core, b),
+                          lease, StreamId.MIC, b, None, candidate_id=candidate_id))
 
-    def _run_verification(self, lease: _Lease, candidate_id: str, evidence: np.ndarray,
+    def _run_verification(self, models: SpeechModels, lease: _Lease, candidate_id: str, evidence: np.ndarray,
                           core: str, through: int) -> tuple[Observation, ...]:
-        assert self.models is not None
-        stream = self.models.recognizer.create_stream()
+        stream = models.recognizer.create_stream()
         for i in range(0, evidence.size, BLOCK_SAMPLES):
-            self.models.decode(stream, evidence[i:i + BLOCK_SAMPLES])
-        self.models.decode(stream, np.zeros(VERIFICATION_FLUSH, dtype=np.int16))
-        text = str(self.models.result(stream).get("text", ""))
+            models.decode(stream, evidence[i:i + BLOCK_SAMPLES])
+        models.decode(stream, np.zeros(VERIFICATION_FLUSH, dtype=np.int16))
+        text = models.result(stream).text
         v = verify_wake(text, core)
-        payload = VerificationPayload(candidate_id, text, v.distance, "pass" if v.passed else "fail")
-        return (self._observe(lease, "mic", "verification", through, payload),)
+        payload = VerificationPayload(candidate_id, text, v.distance,
+                                      VerificationResult.PASS if v.passed else VerificationResult.FAIL)
+        return (self._observe(lease, StreamId.MIC, ObservationKind.VERIFICATION, through, payload),)
 
     # -- committed-span re-decode ---------------------------------------------
 
@@ -694,9 +735,8 @@ class SpeechWorker:
         0.5 s of internal zeros (§16.6 route B / fallback re-decode). Returns
         tokens and their emission times in seconds from the span start. A
         failure counts toward `speech_unavailable` and raises SpeechWorkerError."""
-        self._require_started()
+        models = self._require_started()
         evidence = evidence_copy(canonical_pcm)
-        models = self.models
 
         def run() -> tuple[tuple[str, ...], tuple[float, ...]]:
             stream = models.recognizer.create_stream()
@@ -704,8 +744,7 @@ class SpeechWorker:
                 models.decode(stream, evidence[i:i + BLOCK_SAMPLES])
             models.decode(stream, np.zeros(VERIFICATION_FLUSH, dtype=np.int16))
             result = models.result(stream)
-            return (tuple(str(t) for t in result["tokens"]),
-                    tuple(float(t) for t in result["timestamps"]))
+            return result.tokens, result.timestamps
         try:
             return await asyncio.get_running_loop().run_in_executor(self._executor, run)
         except Exception as exc:
@@ -719,24 +758,24 @@ class SpeechWorker:
             raise SpeechWorkerError("worker is not running")
         queue = self._lanes.get(job.lane)
         if queue is None:
-            queue = self._lanes[job.lane] = asyncio.Queue()
+            queue = self._lanes[job.lane] = _Lane()
             self._lane_tasks[job.lane] = asyncio.create_task(self._lane(job.lane, queue))
         queue.put_nowait(job)
 
-    async def _lane(self, name: str, queue: asyncio.Queue) -> None:
+    async def _lane(self, name: str, queue: _Lane) -> None:
         loop = asyncio.get_running_loop()
         one_shot = name.startswith("verification:")
         while True:
             job = await queue.get()
-            if job is _STOP:
+            if job is None:
                 break
             if not job.control and self._now() - job.created > self.job_deadline_s:
-                await self._fail(job, "job deadline exceeded before it ran")
+                await self._fail(job, "job deadline exceeded before it ran", deadline=True)
                 continue
             try:
                 observations = await loop.run_in_executor(self._executor, job.run)
                 if not job.control and self._now() - job.created > self.job_deadline_s:
-                    await self._fail(job, "job deadline exceeded")
+                    await self._fail(job, "job deadline exceeded", deadline=True)
                     continue
                 for obs in observations:
                     await self._emit(obs)
@@ -751,18 +790,18 @@ class SpeechWorker:
         if self._lane_tasks.get(name) is asyncio.current_task():
             del self._lane_tasks[name]
 
-    async def _fail(self, job: _Job, reason: str) -> None:
+    async def _fail(self, job: _Job, reason: str, *, deadline: bool = False) -> None:
+        """Report a failed job; a verification past its deadline is also a `timeout` verdict (§16.6)."""
         lease = job.lease
         if lease is not None:
-            if job.stream == "mic" and not job.candidate_id:
+            if job.stream == StreamId.MIC and not job.candidate_id:
                 lease.dirty = True   # the lane's recurrent state skipped audio
-            if job.candidate_id is not None and "deadline" in reason:
-                await self._emit(self._observe(lease, "mic", "verification", job.through,
-                                               VerificationPayload(job.candidate_id, None, None, "timeout")))
-            await self._emit(Observation(
-                lease.device_id, lease.capture_epoch, job.stream, "controller", "error", job.through,
-                job.utterance_id, self._revision(lease, job.stream), self.policy_hash,
-                ErrorPayload(job.component, reason), int(time.time() * 1000), lease.lease_id))
+            if job.candidate_id is not None and deadline:
+                await self._emit(self._observe(
+                    lease, StreamId.MIC, ObservationKind.VERIFICATION, job.through,
+                    VerificationPayload(job.candidate_id, None, None, VerificationResult.TIMEOUT)))
+            await self._emit(self._observe(lease, job.stream, ObservationKind.ERROR, job.through,
+                                           ErrorPayload(job.component, reason), job.utterance_id))
         self._record_error()
 
     def _record_error(self) -> None:
@@ -783,7 +822,8 @@ class SpeechWorker:
             await asyncio.sleep(self.probe_interval_s)
             started = time.monotonic()
             try:
-                await asyncio.wait_for(loop.run_in_executor(self._executor, self.models.probe),
+                models = self._require_started()
+                await asyncio.wait_for(loop.run_in_executor(self._executor, models.probe),
                                        PROBE_DEADLINE_S)
                 ok = time.monotonic() - started < PROBE_DEADLINE_S
             except asyncio.CancelledError:
@@ -803,24 +843,27 @@ class SpeechWorker:
         if self.on_availability is not None:
             value = self.on_availability(available)
             if inspect.isawaitable(value):
-                asyncio.ensure_future(value)
+                future = asyncio.ensure_future(value)
+                self._callbacks.add(future)
+                future.add_done_callback(self._callbacks.discard)
 
     async def _emit(self, obs: Observation) -> None:
-        self.observations.put_nowait(obs)
-        if self.on_observation is not None:
-            value = self.on_observation(obs)
-            if inspect.isawaitable(value):
-                await value
+        if self.on_observation is None:
+            self.observations.put_nowait(obs)
+            return
+        value = self.on_observation(obs)
+        if inspect.isawaitable(value):
+            await value
 
-    def _revision(self, lease: _Lease, stream: StreamName) -> str | None:
-        if stream == "reference":
+    def _revision(self, lease: _Lease, stream: StreamId) -> str | None:
+        if stream == StreamId.REFERENCE:
             return lease.wake.sha256
         return None if self.models is None else self.models.revision
 
-    def _observe(self, lease: _Lease, stream: StreamName, kind: ObservationKind, through: int,
+    def _observe(self, lease: _Lease, stream: StreamId, kind: ObservationKind, through: int,
                  payload: Payload, utterance_id: str | None = None) -> Observation:
-        return Observation(lease.device_id, lease.capture_epoch, stream, "controller", kind, through,
-                           utterance_id, self._revision(lease, stream), self.policy_hash, payload,
+        return Observation(lease.device_id, lease.capture_epoch, stream, ObservationSource.CONTROLLER, kind,
+                           through, utterance_id, self._revision(lease, stream), self.policy_hash, payload,
                            int(time.time() * 1000), lease.lease_id)
 
     def _lease(self, lease_id: str) -> _Lease:
@@ -829,6 +872,7 @@ class SpeechWorker:
             raise SpeechWorkerError(f"unknown lease {lease_id}")
         return lease
 
-    def _require_started(self) -> None:
+    def _require_started(self) -> SpeechModels:
         if self._executor is None or self.models is None:
             raise SpeechWorkerError("worker is not started")
+        return self.models

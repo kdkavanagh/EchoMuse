@@ -46,6 +46,7 @@ import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
+from typing import TypeGuard
 from urllib.parse import urlparse
 
 from em_samples import (          # one definition of the wire format
@@ -227,30 +228,34 @@ class Window:
 
 # ─── validation ───────────────────────────────────────────────────────────────
 
-def clamp_max_ms(value) -> int:
+def clamp_max_ms(value: object) -> int:
     """A caller's window length, made safe. Never raises."""
+    if not isinstance(value, (int, float, str)):
+        return DEFAULT_WINDOW_MS
     try:
         ms = int(value)
-    except (TypeError, ValueError):
+    except (ValueError, OverflowError):     # "abc", NaN / ±Infinity
         return DEFAULT_WINDOW_MS
     if ms <= 0:
         return DEFAULT_WINDOW_MS
     return min(ms, MAX_WINDOW_MS)
 
 
-def clamp_idle_s(value) -> float:
+def clamp_idle_s(value: object) -> float:
     """The dead-man's timeout, made safe. Never raises, never returns 0 —
     a zero here would disarm the one thing that un-strands the device."""
+    if not isinstance(value, (int, float, str)):
+        return DEFAULT_IDLE_S
     try:
         s = float(value)
-    except (TypeError, ValueError):
+    except ValueError:
         return DEFAULT_IDLE_S
     if s <= 0.0:
         return DEFAULT_IDLE_S
     return min(s, MAX_IDLE_S)
 
 
-def clean_tag(tag) -> str:
+def clean_tag(tag: object) -> str:
     """
     A caller's tag, made safe to put in a header.
 
@@ -265,7 +270,7 @@ def clean_tag(tag) -> str:
     return "".join(c for c in text if 0x20 <= ord(c) < 0x7F)
 
 
-def valid_webhook(url) -> bool:
+def valid_webhook(url: object) -> TypeGuard[str]:
     """
     True if `url` is something we are willing to POST to.
 
@@ -286,7 +291,7 @@ def valid_webhook(url) -> bool:
 
 # ─── delivery metadata ────────────────────────────────────────────────────────
 
-def headers(result: CaptureResult, device_id: str, dropped: int = 0) -> dict:
+def headers(result: CaptureResult, device_id: str, dropped: int = 0) -> dict[str, str]:
     """
     The metadata that rides the POST.
 

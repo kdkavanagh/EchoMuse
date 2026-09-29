@@ -1,6 +1,10 @@
 package alerts
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/wilbowes/EchoMuse/internal/uuid"
+)
 
 // Expected values were produced by CPython 3 json.dumps(obj, sort_keys=True,
 // separators=(",", ":"), ensure_ascii=False) and uuid.uuid5, the controller's
@@ -44,14 +48,14 @@ func TestUUID5MatchesPython(t *testing.T) {
 	if err != nil || occ != "164ed469-897e-5b59-b53b-23431a19381b" {
 		t.Fatalf("child occurrence %s %v", occ, err)
 	}
-	if got := UUID5(NamespaceURL, "calendar.echomuse_office/abc").String(); got != "09e72c24-77e1-5473-859a-025b5a1115df" {
+	if got := uuid.V5(uuid.NamespaceURL, "calendar.echomuse_office/abc").String(); got != "09e72c24-77e1-5473-859a-025b5a1115df" {
 		t.Fatalf("ui schedule %s", got)
 	}
-	u := NewUUID4()
+	u := uuid.NewV4()
 	if u[6]>>4 != 4 || u[8]>>6 != 2 {
 		t.Fatalf("not a v4 uuid: %s", u)
 	}
-	if p, err := ParseUUID(u.String()); err != nil || p != u {
+	if p, err := uuid.Parse(u.String()); err != nil || p != u {
 		t.Fatalf("round trip %s: %v", u, err)
 	}
 }

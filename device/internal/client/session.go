@@ -2,8 +2,6 @@ package client
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"log"
@@ -14,8 +12,9 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/wilbowes/EchoMuse/internal/assets"
 	"github.com/wilbowes/EchoMuse/internal/audio/ema"
+	"github.com/wilbowes/EchoMuse/internal/monoclock"
 	"github.com/wilbowes/EchoMuse/internal/proto"
-	"golang.org/x/sys/unix"
+	"github.com/wilbowes/EchoMuse/internal/uuid"
 )
 
 var (
@@ -51,7 +50,7 @@ type Session struct {
 	assets *assetTransport
 
 	controlQ chan controlWrite
-	lostWhy  chan string // first failure reason; buffered 1
+	lostWhy  chan LostReason // first failure reason; buffered 1
 	closed   atomic.Bool
 	degraded atomic.Bool
 	lastRx   atomic.Int64 // CLOCK_MONOTONIC ns of the last control message
@@ -69,10 +68,10 @@ func newSession(parent context.Context, l *Link, id string, ctrl, audio *websock
 		audio:    audio,
 		assets:   at,
 		controlQ: make(chan controlWrite, controlQueueDepth),
-		lostWhy:  make(chan string, 1),
+		lostWhy:  make(chan LostReason, 1),
 	}
 	s.sink = newSocketAudioSink(audio, l.t.write, s.fail)
-	s.lastRx.Store(MonoNow())
+	s.lastRx.Store(monoclock.Now())
 	return s
 }
 
@@ -90,11 +89,11 @@ func (s *Session) Degraded() bool { return s.degraded.Load() }
 
 // Send queues one control envelope without blocking and returns its fresh
 // UUIDv4 message ID (the command ID).
-func (s *Session) Send(typ string, generation uint32, body any) (string, error) {
+func (s *Session) Send(typ proto.MessageType, generation uint32, body any) (string, error) {
 	if s.closed.Load() {
 		return "", ErrClosed
 	}
-	id := newUUID()
+	id := uuid.NewV4().String()
 	data, err := marshalEnvelope(s.link.cfg.DeviceID, &s.id, typ, id, generation, body)
 	if err != nil {
 		return "", err
@@ -111,14 +110,14 @@ func (s *Session) Send(typ string, generation uint32, body any) (string, error) 
 }
 
 // Ack sends command.ack for a C→D message (WIRE §4.1).
-func (s *Session) Ack(messageID, status string, errCode *string) error {
+func (s *Session) Ack(messageID string, status proto.AckStatus, errCode *proto.AckCode) error {
 	_, err := s.Send(proto.TypeCommandAck, 0, proto.CommandAck{MessageID: messageID, Status: status, Error: errCode})
 	return err
 }
 
 // run starts the session's goroutines, calls ready, reads control until the
 // session ends (or the link's context does), and returns why it ended.
-func (s *Session) run(ready func()) string {
+func (s *Session) run(ready func()) LostReason {
 	stop := context.AfterFunc(s.ctx, func() { s.fail(LostClosed) })
 	defer stop()
 	s.wg.Add(5)
@@ -137,7 +136,7 @@ func (s *Session) run(ready func()) string {
 	return reason
 }
 
-func (s *Session) readControl() string {
+func (s *Session) readControl() LostReason {
 	for {
 		kind, raw, err := s.ctrl.ReadMessage()
 		if err != nil {
@@ -148,10 +147,10 @@ func (s *Session) readControl() string {
 				return LostClosed
 			}
 		}
-		s.lastRx.Store(MonoNow())
+		s.lastRx.Store(monoclock.Now())
 		s.degraded.Store(false)
 		if kind != websocket.TextMessage {
-			s.protocolError("malformed_message", "control frames are text")
+			s.protocolError(proto.ErrMalformedMessage, "control frames are text")
 			return LostProtocol
 		}
 		env, err := decodeEnvelope(raw, s.link.cfg.DeviceID)
@@ -159,7 +158,7 @@ func (s *Session) readControl() string {
 			err = errors.New("envelope for another session")
 		}
 		if err != nil {
-			s.protocolError("malformed_message", err.Error())
+			s.protocolError(proto.ErrMalformedMessage, err.Error())
 			return LostProtocol
 		}
 		switch env.Type {
@@ -186,18 +185,18 @@ func (s *Session) readControl() string {
 
 func (s *Session) h() Handler { return s.link.h }
 
+// pingPong is the retained ping body and its pong echo. ID is echoed
+// verbatim, whatever JSON the controller chose; an absent id stays absent.
+type pingPong struct {
+	ID json.RawMessage `json:"id,omitempty"`
+}
+
 // pong echoes a ping's id so the controller can pair it with its send; RTT is
 // measured on the controller's clock alone.
 func (s *Session) pong(body json.RawMessage) {
-	var ping struct {
-		ID json.RawMessage `json:"id"`
-	}
+	var ping pingPong
 	_ = json.Unmarshal(body, &ping)
-	pong := map[string]json.RawMessage{}
-	if len(ping.ID) > 0 {
-		pong["id"] = ping.ID
-	}
-	_, _ = s.Send(proto.TypePong, 0, pong)
+	_, _ = s.Send(proto.TypePong, 0, pingPong{ID: ping.ID})
 }
 
 func (s *Session) writeControl() {
@@ -229,7 +228,7 @@ func (s *Session) heartbeats() {
 		case <-s.ctx.Done():
 			return
 		case <-t.C:
-			if _, err := s.Send(proto.TypeHeartbeat, 0, proto.Heartbeat{MonoNs: MonoNow()}); err != nil {
+			if _, err := s.Send(proto.TypeHeartbeat, 0, proto.Heartbeat{MonoNs: monoclock.Now()}); err != nil {
 				s.fail(LostClosed)
 				return
 			}
@@ -248,7 +247,7 @@ func (s *Session) liveness() {
 		case <-s.ctx.Done():
 			return
 		case <-t.C:
-			silence := time.Duration(MonoNow() - s.lastRx.Load())
+			silence := time.Duration(monoclock.Now() - s.lastRx.Load())
 			s.degraded.Store(silence >= s.link.t.degraded)
 			if silence >= s.link.t.lost {
 				s.fail(LostTimeout)
@@ -269,7 +268,7 @@ func (s *Session) readAudio() {
 			return
 		}
 		if kind != websocket.BinaryMessage {
-			s.protocolError("malformed_frame", "audio frames are binary")
+			s.protocolError(proto.ErrMalformedFrame, "audio frames are binary")
 			s.fail(LostProtocol)
 			return
 		}
@@ -278,7 +277,7 @@ func (s *Session) readAudio() {
 			err = errors.New("downlink frames are kind 3")
 		}
 		if err != nil {
-			s.protocolError("malformed_frame", err.Error())
+			s.protocolError(proto.ErrMalformedFrame, err.Error())
 			s.fail(LostProtocol)
 			return
 		}
@@ -288,8 +287,8 @@ func (s *Session) readAudio() {
 
 // protocolError sends protocol.error and waits until it is written, so it
 // precedes the close that follows.
-func (s *Session) protocolError(code, detail string) {
-	data, err := marshalEnvelope(s.link.cfg.DeviceID, &s.id, proto.TypeProtocolError, newUUID(), 0,
+func (s *Session) protocolError(code proto.ErrorCode, detail string) {
+	data, err := marshalEnvelope(s.link.cfg.DeviceID, &s.id, proto.TypeProtocolError, uuid.NewV4().String(), 0,
 		proto.ProtocolError{Code: code, Detail: detail})
 	if err != nil {
 		return
@@ -308,7 +307,7 @@ func (s *Session) protocolError(code, detail string) {
 
 // fail records the first loss reason and closes the control socket, which
 // ends readControl.
-func (s *Session) fail(reason string) {
+func (s *Session) fail(reason LostReason) {
 	select {
 	case s.lostWhy <- reason:
 	default:
@@ -322,33 +321,4 @@ func (s *Session) close() {
 	s.ctrl.Close()
 	s.audio.Close()
 	s.assets.close()
-}
-
-// newUUID returns a random RFC 4122 version 4 UUID.
-func newUUID() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		panic("client: crypto/rand: " + err.Error())
-	}
-	b[6] = b[6]&0x0f | 0x40
-	b[8] = b[8]&0x3f | 0x80
-	var out [36]byte
-	hex.Encode(out[0:8], b[0:4])
-	out[8] = '-'
-	hex.Encode(out[9:13], b[4:6])
-	out[13] = '-'
-	hex.Encode(out[14:18], b[6:8])
-	out[18] = '-'
-	hex.Encode(out[19:23], b[8:10])
-	out[23] = '-'
-	hex.Encode(out[24:36], b[10:16])
-	return string(out[:])
-}
-
-// MonoNow is CLOCK_MONOTONIC in nanoseconds, the clock of every device
-// mono_ns field and EMA1 timestamp.
-func MonoNow() int64 {
-	var ts unix.Timespec
-	_ = unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts)
-	return ts.Nano()
 }

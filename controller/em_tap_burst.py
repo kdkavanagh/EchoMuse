@@ -12,8 +12,8 @@ once as single/double/triple. Anything beyond three reports as triple:
 HA only knows the event types advertised at connect time, so there is no
 "quadruple" to send.
 
-Pure asyncio, no imports from the rest of the controller — unit-tested in
-tests/test_tap_burst.py.
+Pure asyncio; its only controller import is em_button's event vocabulary —
+unit-tested in tests/test_tap_burst.py.
 """
 
 from __future__ import annotations
@@ -21,8 +21,10 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 
+from em_button import ButtonEvent
+
 MAX_TAP_COUNT = 3
-TAP_EVENT_NAMES = {1: "single", 2: "double", 3: "triple"}
+TAP_EVENT_NAMES = {1: ButtonEvent.SINGLE, 2: ButtonEvent.DOUBLE, 3: ButtonEvent.TRIPLE}
 
 
 class TapCoalescer:
@@ -37,15 +39,15 @@ class TapCoalescer:
 
     def __init__(
         self,
-        emit: Callable[[str], None],
+        emit: Callable[[ButtonEvent], None],
         enabled: Callable[[], bool] = lambda: True,
-        on_error: Callable[[asyncio.Task], None] | None = None,
+        on_error: Callable[[asyncio.Task[None]], None] | None = None,
     ) -> None:
         self._emit = emit
         self._enabled = enabled
         self._on_error = on_error
         self._count = 0
-        self._timer: asyncio.Task | None = None
+        self._timer: asyncio.Task[None] | None = None
 
     @property
     def count(self) -> int:

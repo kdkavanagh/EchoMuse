@@ -73,6 +73,8 @@ from em_samples import (          # one definition of the wire format
     CHANNELS,
     SAMPLE_RATE,
     SAMPLE_WIDTH,
+    ClipEntry,
+    StoreUsage,
     duration_ms,
     safe_device_id,
 )
@@ -191,6 +193,21 @@ def parse_filename(name: str) -> int | None:
     return int(m.group("ts")) if m else None
 
 
+def _free_name(path: Path) -> Path:
+    """
+    `path`, or the next free millisecond after it. A collision means the
+    clock stepped back onto an existing recording; taking the next name
+    rather than overwriting keeps half an hour of someone's audio.
+    """
+    stamp = parse_filename(path.name)
+    if stamp is None:
+        raise ValueError(f"not a recording name: {path.name}")
+    while path.exists():
+        stamp += 1
+        path = path.with_name(filename(stamp))
+    return path
+
+
 # ─── the open recording ───────────────────────────────────────────────────────
 
 class Recorder:
@@ -295,12 +312,7 @@ class Recorder:
         if self.written <= 0:
             self.part.unlink(missing_ok=True)
             return None
-        # A name collision means the clock stepped back onto an existing
-        # recording; take the next free millisecond rather than overwrite
-        # half an hour of someone's audio.
-        path = self.path
-        while path.exists():
-            path = path.with_name(filename(parse_filename(path.name) + 1))
+        path = _free_name(self.path)
         self.part.replace(path)
         self.path = path
         return path.name
@@ -358,9 +370,7 @@ def recover(device_id: str, db_path: str | None = None) -> list[str]:
             if not finalize(child):
                 child.unlink()
                 continue
-            target = directory / filename(int(m.group("ts")))
-            while target.exists():
-                target = target.with_name(filename(parse_filename(target.name) + 1))
+            target = _free_name(directory / filename(int(m.group("ts"))))
             child.replace(target)
             out.append(target.name)
             log.info(f"[ambient] Recovered {target.name} for {device_id} "
@@ -374,7 +384,7 @@ def recover(device_id: str, db_path: str | None = None) -> list[str]:
 
 # ─── the closed recordings ────────────────────────────────────────────────────
 
-def list_for(device_id: str, db_path: str | None = None) -> list[dict]:
+def list_for(device_id: str, db_path: str | None = None) -> list[ClipEntry]:
     """
     This device's recordings, newest first: name, epoch seconds, bytes and
     duration. Only closed ones — a `.part` is not a file anyone can play.
@@ -386,7 +396,7 @@ def list_for(device_id: str, db_path: str | None = None) -> list[dict]:
     directory = device_dir(device_id, db_path)
     if directory is None or not directory.is_dir():
         return []
-    out: list[dict] = []
+    out: list[ClipEntry] = []
     for child in directory.iterdir():
         ts = parse_filename(child.name)
         if ts is None:
@@ -405,7 +415,7 @@ def list_for(device_id: str, db_path: str | None = None) -> list[dict]:
     return out
 
 
-def usage(device_id: str, db_path: str | None = None) -> dict:
+def usage(device_id: str, db_path: str | None = None) -> StoreUsage:
     """Recording count, total bytes and total duration for a device."""
     items = list_for(device_id, db_path)
     return {

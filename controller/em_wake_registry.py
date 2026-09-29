@@ -13,11 +13,12 @@ import os
 import re
 import shutil
 import tempfile
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Protocol
 
-from em_wake_scorer import load_spec, onnx_infer, probe_model, validate_probe
+from em_wake_scorer import BcresnetSpec, Infer, load_spec, onnx_infer, probe_model, validate_probe
 
 DEPLOYED_GRAPH_SHA256 = "4eb745120ea56f5681eddbf788a0c69e1fd406d4694a04a4dba0c1e41d862d3f"
 DEPLOYED_SIDECAR_SHA256 = "25da0c652c562bf0a45a8f34bb46e38788bfc689e31401f33950831a0f2af51f"
@@ -64,13 +65,26 @@ class WakeModel:
     probe: dict[str, float]
 
     @classmethod
-    def from_dict(cls, raw: dict) -> "WakeModel":
+    def from_dict(cls, raw: object) -> WakeModel:
+        if not isinstance(raw, Mapping):
+            raise RegistryError("malformed registry entry: not an object")
+        entry: Mapping[str, object] = raw
+
+        def text(key: str) -> str:
+            value = entry[key]
+            if not isinstance(value, str):
+                raise TypeError(f"{key} must be a string")
+            return value
+
         try:
+            thresholds, probe = entry["thresholds"], entry["probe"]
+            if not isinstance(thresholds, Mapping) or not isinstance(probe, Mapping):
+                raise TypeError("thresholds and probe must be objects")
             model = cls(
-                raw["graph_sha256"], raw["graph_file"], raw["sidecar_sha256"],
-                raw["sidecar_file"], Thresholds(**raw["thresholds"]),
-                raw["wake_phrase"], raw["verify_core"],
-                {k: float(v) for k, v in raw["probe"].items()},
+                text("graph_sha256"), text("graph_file"), text("sidecar_sha256"),
+                text("sidecar_file"), Thresholds(**thresholds),
+                text("wake_phrase"), text("verify_core"),
+                {str(k): float(v) for k, v in probe.items()},
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise RegistryError(f"malformed registry entry: {exc}") from None
@@ -80,7 +94,7 @@ class WakeModel:
         validate_probe(model.probe, model.thresholds.near_miss)
         return model
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, object]:
         return asdict(self)
 
 
@@ -91,7 +105,7 @@ class ValidatedUpload:
     probe: dict[str, float]
 
 
-def sha256_file(path: str | os.PathLike) -> str:
+def sha256_file(path: str | os.PathLike[str]) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as src:
         for chunk in iter(lambda: src.read(1024 * 1024), b""):
@@ -106,12 +120,16 @@ def _validate_words(wake_phrase: str, verify_core: str) -> None:
         raise RegistryError("verify_core must contain lowercase ASCII letters only")
 
 
-def default_registry_dir(db_path: str | os.PathLike | None = None) -> Path:
+def default_registry_dir(db_path: str | os.PathLike[str] | None = None) -> Path:
     db = Path(db_path or os.environ.get("DB_PATH", "echomuse.db")).resolve()
     return db.parent / "oww_models"
 
 
-InferLoader = Callable[..., tuple[Callable, str]]
+class InferLoader(Protocol):
+    """Opens a graph for the upload probe (`em_wake_scorer.onnx_infer`)."""
+
+    def __call__(self, model_path: str | os.PathLike[str], *,
+                 spec: BcresnetSpec | None = None) -> tuple[Infer, str]: ...
 
 
 class WakeRegistry:
@@ -120,8 +138,8 @@ class WakeRegistry:
     `infer_loader(graph, spec=spec)` opens a graph for the upload probe
     (default: `em_wake_scorer.onnx_infer`)."""
 
-    def __init__(self, directory: str | os.PathLike | None = None,
-                 active_getter: Callable[[], str | dict | None] = lambda: None,
+    def __init__(self, directory: str | os.PathLike[str] | None = None,
+                 active_getter: Callable[[], str | Mapping[str, object] | None] = lambda: None,
                  infer_loader: InferLoader = onnx_infer):
         self.directory = Path(directory) if directory is not None else default_registry_dir()
         self.active_getter = active_getter
@@ -138,10 +156,11 @@ class WakeRegistry:
             raw = json.loads(self.index_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise RegistryError(f"cannot read {self.index_path}: {exc}") from None
-        if raw.get("version") != INDEX_VERSION or not isinstance(raw.get("models"), list):
+        models = raw.get("models") if isinstance(raw, dict) else None
+        if not isinstance(models, list) or raw.get("version") != INDEX_VERSION:
             raise RegistryError("unsupported or malformed registry index")
-        loaded = {}
-        for item in raw["models"]:
+        loaded: dict[str, WakeModel] = {}
+        for item in models:
             model = WakeModel.from_dict(item)
             if model.graph_sha256 in loaded:
                 raise RegistryError(f"duplicate registry SHA {model.graph_sha256}")
@@ -194,9 +213,8 @@ class WakeRegistry:
 
     @property
     def active_sha256(self) -> str | None:
-        value = self.active_getter()
-        if isinstance(value, dict):
-            value = value.get("wakeModel")
+        selected = self.active_getter()
+        value = selected.get("wakeModel") if isinstance(selected, Mapping) else selected
         if value is None:
             return None
         if not isinstance(value, str) or not _SHA_RE.fullmatch(value):
@@ -209,11 +227,15 @@ class WakeRegistry:
             raise RegistryError("fleet wakeModel is not configured")
         return self.get(sha)
 
-    def for_config(self, config: dict | None) -> WakeModel:
+    def for_config(self, config: Mapping[str, object] | None) -> WakeModel:
         """The model an effective device config selects (its `wakeModel`,
         which inherits the fleet value unless the device overrides it)."""
         sha = (config or {}).get("wakeModel")
-        return self.active() if sha is None else self.get(sha)
+        if sha is None:
+            return self.active()
+        if not isinstance(sha, str):
+            raise RegistryError(f"wakeModel is not a SHA-256: {sha!r}")
+        return self.get(sha)
 
     def graph_path(self, graph_sha256: str) -> Path:
         return self.directory / self.get(graph_sha256).graph_file
@@ -230,7 +252,7 @@ class WakeRegistry:
                 return self.directory / model.sidecar_file
         return None
 
-    def validate_upload(self, graph: str | os.PathLike, sidecar: str | os.PathLike,
+    def validate_upload(self, graph: str | os.PathLike[str], sidecar: str | os.PathLike[str],
                         thresholds: Thresholds, wake_phrase: str,
                         verify_core: str) -> ValidatedUpload:
         graph, sidecar = Path(graph), Path(sidecar)
@@ -248,7 +270,7 @@ class WakeRegistry:
             raise RegistryError(f"invalid BCResNet pair: {exc}") from None
         return ValidatedUpload(sha256_file(graph), sha256_file(sidecar), scores)
 
-    def register(self, graph: str | os.PathLike, sidecar: str | os.PathLike,
+    def register(self, graph: str | os.PathLike[str], sidecar: str | os.PathLike[str],
                  thresholds: Thresholds, wake_phrase: str,
                  verify_core: str) -> WakeModel:
         """Validate and atomically register, without activating it."""
@@ -294,7 +316,7 @@ class WakeRegistry:
                 path.unlink(missing_ok=True)
             raise
 
-    def install_deployed(self, graph: str | os.PathLike, sidecar: str | os.PathLike) -> WakeModel:
+    def install_deployed(self, graph: str | os.PathLike[str], sidecar: str | os.PathLike[str]) -> WakeModel:
         """Install the pinned deployed entry from verified repository bytes."""
         if sha256_file(graph) != DEPLOYED_GRAPH_SHA256:
             raise RegistryError("deployed graph fixture has the wrong SHA-256")

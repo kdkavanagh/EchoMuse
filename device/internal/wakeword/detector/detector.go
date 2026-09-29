@@ -1,8 +1,6 @@
 package detector
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -10,7 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/sys/unix"
+	"github.com/wilbowes/EchoMuse/internal/monoclock"
+	"github.com/wilbowes/EchoMuse/internal/uuid"
 )
 
 type itemKind uint8
@@ -104,10 +103,10 @@ func New(cb Callbacks) (*Detector, error) {
 		return nil, errors.New("detector: OnStats callback is required")
 	}
 	if cb.NowMonoNS == nil {
-		cb.NowMonoNS = monotonicNS
+		cb.NowMonoNS = monoclock.Now
 	}
 	if cb.NewID == nil {
-		cb.NewID = newUUID
+		cb.NewID = func() string { return uuid.NewV4().String() }
 	}
 	d := &Detector{
 		cb:       cb,
@@ -493,26 +492,6 @@ func (d *Detector) FlushStats() {
 func (d *Detector) Close() {
 	d.closeOnce.Do(func() { close(d.quit) })
 	<-d.done
-}
-
-func newUUID() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		panic(fmt.Sprintf("detector: crypto/rand: %v", err))
-	}
-	b[6] = b[6]&0x0f | 0x40
-	b[8] = b[8]&0x3f | 0x80
-	h := hex.EncodeToString(b[:])
-	return h[:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:]
-}
-
-// monotonicNS is CLOCK_MONOTONIC, the device monotonic clock of the WIRE.
-func monotonicNS() int64 {
-	var ts unix.Timespec
-	if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts); err != nil {
-		panic(fmt.Sprintf("detector: clock_gettime(CLOCK_MONOTONIC): %v", err))
-	}
-	return ts.Nano()
 }
 
 func finite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }

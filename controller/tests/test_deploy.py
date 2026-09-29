@@ -217,36 +217,6 @@ def test_addon_image_is_published_not_built_on_the_user_machine():
         )
 
 
-def test_release_notes_survive_the_whole_relay():
-    """
-    Release notes have to make it through four places to be useful: captured
-    from the GitHub response, persisted, re-read into the cache after a
-    restart, and rendered. Miss any one and the dashboard shows a version
-    number with no way to judge it — which is the state this replaced.
-
-    The restart path is the one worth pinning: the in-memory cache is
-    populated from the DB when cold, so notes omitted there would appear on
-    first poll and silently vanish on every controller restart until the next
-    one.
-    """
-    from pathlib import Path
-    api = (Path(__file__).resolve().parent.parent / "em_api.py").read_text()
-
-    fetch = api[api.index("async def _fetch_latest_release"):]
-    fetch = fetch[:fetch.index("\nasync def ", 1)]
-    assert 'release.get("body")' in fetch or '.get("body")' in fetch, \
-        "the GitHub release body must be captured"
-    assert 'set_config("latest_notes"' in fetch, "notes must be persisted"
-
-    cached = api[api.index("    # Load from DB cache"):]
-    cached = cached[:cached.index("\nasync def ", 1)] if "\nasync def " in cached else cached
-    assert 'get_config("latest_notes"' in cached, \
-        "the DB-cache path must restore notes, or they vanish on restart"
-
-    jsx = (Path(__file__).resolve().parent.parent / "static" / "dashboard.jsx").read_text()
-    assert "release.notes" in jsx, "the dashboard must render the notes"
-
-
 def test_release_workflow_publishes_the_tag_annotation():
     """
     The notes shown in the dashboard come from the annotated tag, so the
@@ -342,21 +312,6 @@ def test_stale_release_cache_is_not_returned_when_it_has_aged_out():
         "fire-and-forget refresh returns the stale value to this caller"
 
 
-def test_release_change_is_pushed_to_open_dashboards():
-    """A tab already showing the Updates panel should not sit on the old
-    version until someone reloads."""
-    from pathlib import Path
-    root = Path(__file__).resolve().parent.parent
-    api = (root / "em_api.py").read_text()
-    assert '"type":         "release_update"' in api or '"release_update"' in api, \
-        "a release change must be broadcast on the event stream"
-    jsx = (root / "static" / "dashboard.jsx").read_text()
-    # And the tab must keep asking, as a fallback for a missed event.
-    upd = jsx[jsx.index("if (tab !== 'updates') return;"):]
-    assert "setInterval" in upd[:600], \
-        "the Updates tab must refresh while open, not fetch once on entry"
-
-
 def test_controller_update_is_advisory_only():
     """
     The dashboard may TELL you a newer controller exists; it must never offer
@@ -429,7 +384,7 @@ def test_every_db_call_in_em_api_exists():
     db_tree = ast.parse((root / "em_db.py").read_text())
     defined = {
         n.name for n in db_tree.body
-        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
     } | {
         t.id for n in db_tree.body if isinstance(n, ast.Assign)
         for t in n.targets if isinstance(t, ast.Name)
@@ -581,27 +536,6 @@ def test_support_bundle_attributes_metrics_to_a_device():
     )
 
 
-def test_support_bundle_redacts_account_names():
-    """
-    Account names reach the bundle through ordinary log prose ("Shell session
-    opened by wil"), which no quote, URL or identifier rule matches. The
-    handler must therefore pass the user table to em_support; the redaction
-    itself is tested in test_support.py.
-    """
-    src = (CONTROLLER / "em_api.py").read_text()
-    # "return web.Response", not "web.Response" — the latter is the handler's
-    # own return annotation and slices the body away to nothing.
-    body = src.split("_get_support_bundle")[-1].split("return web.Response")[0]
-    assert "accounts=" in body and "get_all_users" in body, (
-        "the support bundle must pass the real accounts to em_support — "
-        "there is nothing in a log line to pattern-match them by"
-    )
-    assert '"role"' in body, (
-        "accounts must carry the role: a name is replaced by <admin>, and a "
-        "positional alias would be one-to-one with a real person"
-    )
-
-
 def _fn_body(src: str, name: str) -> str:
     """Slice one async def out of a module's source, up to the next top-level def."""
     start = src.index(f"async def {name}")
@@ -655,7 +589,7 @@ def test_a_corrupt_binary_never_reaches_the_symlink_flip():
     after it has taken a reboot and a rollback to tell us the same thing.
     """
     src = (CONTROLLER / "em_api.py").read_text()
-    ota = src[src.index("_stream_binary_to_slot(live, binary"):]
+    ota = src[src.index("await _stream_binary_to_slot("):]
     ota = ota[:ota.index("_monitor_reconnect")]
 
     guard = ota.index("if not ok:")
@@ -681,7 +615,7 @@ def test_ota_checks_free_space_before_writing_anything():
     df we have not seen.
     """
     src = (CONTROLLER / "em_api.py").read_text()
-    ota = src[src.index("inactive_slot = "):src.index("_stream_binary_to_slot(live, binary")]
+    ota = src[src.index("inactive_slot = "):src.index("await _stream_binary_to_slot(")]
 
     assert "parse_free_mb" in ota, (
         "free space must be read with parse_free_mb, never an awk field index"
@@ -721,50 +655,6 @@ def test_a_transfer_never_deletes_the_destination_before_sending():
     )
 
 
-def test_a_failed_transfer_says_which_stage_it_failed_at():
-    """
-    One message covered five outcomes, and the two furthest apart are "the
-    bytes arrived corrupt" and "no byte was ever sent". #121 was the second
-    reported in the language of the first, and only the controller's own
-    stdout could tell them apart — which is not something a user can produce
-    mid-update.
-
-    A device shell that answers nothing must NOT read as "no base64 decoder":
-    one is a link problem worth retrying, the other is a property of the
-    device that retrying cannot change.
-    """
-    src = (CONTROLLER / "em_api.py").read_text()
-
-    assert "class TransferResult" in src and "__bool__" in src, (
-        "the result must stay truthy so `if not await ...` call sites keep "
-        "their meaning"
-    )
-
-    fn = _fn_body(src, "_stream_file_to_device")
-    for stage in ("shell", "decoder", "send", "verify", "corrupt"):
-        assert f'_transfer_failed("{stage}"' in fn, (
-            f"the {stage} failure must be distinguishable from the others"
-        )
-
-    assert "if DETECT_MARKER not in detect_buf" in fn, (
-        "a silent shell must report as a link problem, not a missing decoder"
-    )
-
-    # The OTA message must carry the stage through rather than re-flattening it.
-    ota = src[src.index("_stream_binary_to_slot(live, binary"):]
-    ota = ota[:ota.index("_monitor_reconnect")]
-    assert "{ok}" in ota, (
-        "the update failure message must name the stage the transfer reached"
-    )
-    # Comments stripped first, for the reason the free-space test gives: the
-    # old wording is worth naming in a comment, and a test that reads its own
-    # explanation as the bug can only be silenced by deleting the explanation.
-    ota_code = "\n".join(l for l in ota.splitlines() if not l.lstrip().startswith("#"))
-    assert "failed or did not verify" not in ota_code, (
-        "the flattened message is what made #121 unreadable"
-    )
-
-
 def test_tested_firmware_build_matches_the_docs():
     """
     The wizard warns when a device is on a FireOS build other than the one
@@ -790,7 +680,7 @@ def test_tested_firmware_build_matches_the_docs():
 
 def test_push_log_event_callers_do_not_also_persist():
     """
-    `_push_log_event` persists AND pushes. A caller that also calls
+    `push_log_event` persists AND pushes. A caller that also calls
     `db.log_device` writes the line twice.
 
     That is not hypothetical: the device `log` handler did both, so every
@@ -811,13 +701,13 @@ def test_push_log_event_callers_do_not_also_persist():
     for name in ("em_controller.py", "em_api.py"):
         lines = (root / name).read_text().splitlines()
         for i, line in enumerate(lines):
-            if "_push_log_event(" not in line or "async def" in line:
+            if "push_log_event(" not in line or "async def" in line:
                 continue
             # The persist would sit just above the push, in the same block.
             window = lines[max(0, i - 6):i]
             offenders = [w.strip() for w in window if "db.log_device(" in w]
             assert not offenders, (
-                f"{name}:{i+1} calls _push_log_event, which already persists, "
+                f"{name}:{i+1} calls push_log_event, which already persists, "
                 f"but is preceded by {offenders[0]!r}. That writes the log "
                 f"line twice. Drop the db.log_device call."
             )

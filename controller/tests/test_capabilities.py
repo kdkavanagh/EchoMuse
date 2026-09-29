@@ -8,8 +8,10 @@ import pytest
 
 pytest.importorskip("websockets")
 
+import em_audio_timeline as tl  # noqa: E402
 import em_device  # noqa: E402
-from _device_fakes import ALL_V1, FakeLink, FakeStore, hello, make_hub, run  # noqa: E402
+from _device_fakes import ALL_V1, FakeLink, FakeStore, hello, hello_body, make_hub, run  # noqa: E402
+from em_device_link import Capability, SessionHello  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 PROTO_GO = ROOT / "device" / "internal" / "proto" / "proto.go"
@@ -29,14 +31,8 @@ def test_required_set_is_the_spec_list_and_the_firmware_declares_it():
     assert em_device.REQUIRED_CAPABILITIES <= _go_capabilities()
 
 
-def test_every_capability_the_controller_tests_is_one_the_firmware_can_send():
-    checked = set()
-    for name in ("em_device.py", "em_esphome.py"):
-        src = (ROOT / "controller" / name).read_text()
-        checked |= set(re.findall(r'"([a-z0-9_]+)" in self\.capabilities', src))
-        checked |= set(re.findall(r'_device_has\("([a-z0-9_]+)"\)', src))
-    assert checked, "no capability checks found"
-    assert checked <= _go_capabilities()
+def test_every_capability_the_controller_knows_is_one_the_firmware_can_send():
+    assert {c.value for c in Capability} <= _go_capabilities()
 
 
 def _admit(hello_body):
@@ -60,10 +56,11 @@ def test_admission_accepts_the_full_set_whatever_the_version_string():
 
 @pytest.mark.parametrize("bad", [{"protocols": [2]}, {"protocols": None},
                                  {"capabilities": "audio_timeline_v1"}])
-def test_admission_rejects_a_malformed_or_unsupported_hello(bad):
-    body = hello()
+def test_a_malformed_or_unsupported_hello_is_refused(bad):
+    body = hello_body()
     body.update(bad)
-    assert _admit(body) == em_device.em_device_link.Rejected("protocol")
+    with pytest.raises(tl.ProtocolError):
+        SessionHello.parse(body)
 
 
 @pytest.mark.parametrize("prop, cap", [

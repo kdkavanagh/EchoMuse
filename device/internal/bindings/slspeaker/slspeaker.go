@@ -55,9 +55,6 @@ func New() (*Sink, error) {
 	return s, nil
 }
 
-// Now is the sink's completion clock, CLOCK_MONOTONIC in ns (render.Config.Now).
-func Now() int64 { return opensl.MonoNow() }
-
 func (s *Sink) open() error {
 	p, err := s.eng.NewPlayer(render.SampleRate, render.SinkFrames*2, hardwareBuffers)
 	if err != nil {

@@ -13,7 +13,7 @@ import tempfile
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable, assert_never
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -36,12 +36,37 @@ NAMES = ("pasta", "kitchen", "tea")
 
 
 @dataclass(frozen=True)
-class Node:
-    kind: str
-    value: object
+class Word:
+    text: str
 
 
-def _source(wheel: Path | None) -> tuple[dict, str]:
+@dataclass(frozen=True)
+class Slot:
+    name: str
+
+
+@dataclass(frozen=True)
+class Maybe:
+    child: Node
+
+
+@dataclass(frozen=True)
+class Alt:
+    children: tuple[Node, ...]
+
+
+@dataclass(frozen=True)
+class Seq:
+    children: tuple[Node, ...]
+
+
+Node = Word | Slot | Maybe | Alt | Seq
+
+# The intents wheel's en.json: HA's own schema, read here and nowhere else.
+IntentData = dict[str, Any]
+
+
+def _source(wheel: Path | None) -> tuple[IntentData, str]:
     if wheel is None:
         with tempfile.TemporaryDirectory() as directory:
             subprocess.run(
@@ -53,7 +78,7 @@ def _source(wheel: Path | None) -> tuple[dict, str]:
     return _read_wheel(wheel)
 
 
-def _read_wheel(wheel: Path) -> tuple[dict, str]:
+def _read_wheel(wheel: Path) -> tuple[IntentData, str]:
     raw = wheel.read_bytes()
     digest = hashlib.sha256(raw).hexdigest()
     if digest != WHEEL_SHA256:
@@ -77,7 +102,7 @@ class Parser:
         def flush() -> None:
             if literal:
                 words = normalize("".join(literal)).split()
-                sequence.extend(Node("word", word) for word in words)
+                sequence.extend(Word(word) for word in words)
                 literal.clear()
 
         while self.pos < len(self.text):
@@ -97,7 +122,7 @@ class Parser:
                 if self.pos >= len(self.text) or self.text[self.pos] != close:
                     raise ValueError(f"unclosed {char!r} in {self.text!r}")
                 self.pos += 1
-                sequence.append(Node("optional", child) if char == "[" else child)
+                sequence.append(Maybe(child) if char == "[" else child)
             elif char == "<":
                 flush()
                 stop = self.text.index(">", self.pos)
@@ -108,43 +133,57 @@ class Parser:
                 flush()
                 stop = self.text.index("}", self.pos)
                 name = self.text[self.pos + 1 : stop].split(":", 1)[0]
-                sequence.append(Node("slot", name))
+                sequence.append(Slot(name))
                 self.pos = stop + 1
             else:
                 literal.append(char)
                 self.pos += 1
         flush()
         alternatives.append(_sequence(sequence))
-        return alternatives[0] if len(alternatives) == 1 else Node("alt", tuple(alternatives))
+        return alternatives[0] if len(alternatives) == 1 else Alt(tuple(alternatives))
 
 
 def _sequence(items: list[Node]) -> Node:
     if not items:
-        return Node("seq", ())
-    return items[0] if len(items) == 1 else Node("seq", tuple(items))
+        return Seq(())
+    return items[0] if len(items) == 1 else Seq(tuple(items))
 
 
 def _expand(node: Node) -> list[tuple[str, ...]]:
-    if node.kind == "word":
-        return [(str(node.value),)]
-    if node.kind == "slot":
-        return [("{" + str(node.value) + "}",)]
-    if node.kind == "optional":
-        return [()] + _expand(node.value)  # type: ignore[arg-type]
-    if node.kind == "alt":
-        return [item for child in node.value for item in _expand(child)]  # type: ignore[union-attr]
-    result: list[tuple[str, ...]] = [()]
-    for child in node.value:  # type: ignore[union-attr]
-        result = [left + right for left in result for right in _expand(child)]
-    return result
+    empty: tuple[str, ...] = ()
+    match node:
+        case Word(text):
+            return [(text,)]
+        case Slot(name):
+            return [("{" + name + "}",)]
+        case Maybe(child):
+            return [empty] + _expand(child)
+        case Alt(children):
+            return [item for child in children for item in _expand(child)]
+        case Seq(children):
+            result = [empty]
+            for child in children:
+                result = [left + right for left in result for right in _expand(child)]
+            return result
+        case _:
+            assert_never(node)
 
 
-def _plain(node: Node) -> tuple:
-    if node.kind in {"word", "slot"}:
-        return (node.kind, node.value)
-    if node.kind == "optional":
-        return ("optional", _plain(node.value))
-    return (node.kind, tuple(_plain(child) for child in node.value))
+def _plain(node: Node) -> tuple[object, ...]:
+    """The node in timer_data.py's tuple form, which echomuse_grammar reads."""
+    match node:
+        case Word(text):
+            return ("word", text)
+        case Slot(name):
+            return ("slot", name)
+        case Maybe(child):
+            return ("optional", _plain(child))
+        case Alt(children):
+            return ("alt", tuple(_plain(child) for child in children))
+        case Seq(children):
+            return ("seq", tuple(_plain(child) for child in children))
+        case _:
+            assert_never(node)
 
 
 # §16.6 table forms that the HA 2026.7.30 English templates lack; compiled
@@ -157,7 +196,7 @@ SPEC_SENTENCES = (
 )
 
 
-def _patterns(data: dict) -> list[tuple[str, Node]]:
+def _patterns(data: IntentData) -> list[tuple[str, Node]]:
     rules = data["expansion_rules"]
     sentences = [
         (intent, sentence)
@@ -348,7 +387,7 @@ HAND_CASES = {
 }
 
 
-def _write_data(patterns: list[tuple[str, Node]], data: dict, digest: str) -> None:
+def _write_data(patterns: list[tuple[str, Node]], data: IntentData, digest: str) -> None:
     ranges = {
         name: (data["lists"][name]["range"]["from"], data["lists"][name]["range"]["to"])
         for name in ("timer_hours", "timer_minutes", "timer_seconds")

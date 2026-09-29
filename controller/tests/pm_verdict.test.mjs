@@ -42,7 +42,7 @@ function liftArrow(name) {
 
 const { _pmVerdict, _pmNotReady } = await import(
   "data:text/javascript;base64," + Buffer.from(
-    liftArrow("_pmVerdict") + "\n" + liftArrow("_pmNotReady")
+    liftConst("PM_VERDICT") + "\n" + liftArrow("_pmVerdict") + "\n" + liftArrow("_pmNotReady")
     + "\nexport { _pmVerdict, _pmNotReady };"
   ).toString("base64"));
 
@@ -103,11 +103,19 @@ console.log("pm_verdict: all checks passed.");
 // amonet's unlock payload, so a retried Patch Boot Image there would write
 // over the unlock.
 
-function liftConstObject(name) {
-  const start = src.indexOf(`const ${name} = {`);
+// A `const NAME = …;` declaration of any shape, to its terminating `;` at
+// bracket depth 0 (the same scan as liftArrow).
+function liftConst(name) {
+  const start = src.indexOf(`const ${name} = `);
   if (start < 0) throw new Error(`dashboard.jsx no longer defines ${name}`);
-  const end = src.indexOf("};", start);
-  return src.slice(start, end + 2);
+  let depth = 0;
+  for (let i = start; i < src.length; i++) {
+    const ch = src[i];
+    if (ch === "{" || ch === "(" || ch === "[") depth++;
+    else if (ch === "}" || ch === ")" || ch === "]") depth--;
+    else if (ch === ";" && depth === 0) return src.slice(start, i + 1);
+  }
+  throw new Error(`could not find the end of ${name}`);
 }
 
 function liftFunctionDecl(name) {
@@ -121,10 +129,11 @@ function liftFunctionDecl(name) {
   return src.slice(start, i + 1);
 }
 
-const { _bannerMode, _STEP_MODE } = await import(
+const { _bannerMode, _WIZARD_STEPS, STEP } = await import(
   "data:text/javascript;base64," + Buffer.from(
-    liftFunctionDecl("_bannerMode") + "\n" + liftConstObject("_STEP_MODE")
-    + "\nexport { _bannerMode, _STEP_MODE };"
+    [liftConst("BOOT_MODE"), liftFunctionDecl("_bannerMode"),
+     liftConst("_WIZARD_STEPS"), liftConst("STEP"),
+     "export { _bannerMode, _WIZARD_STEPS, STEP };"].join("\n")
   ).toString("base64"));
 
 // Real banners, from provisioning transcripts.
@@ -145,15 +154,16 @@ check("a missing banner is not guessed at", _bannerMode(undefined) === "unknown"
 
 // The boot-image step must be a TWRP step. If this ever flips, the wizard
 // would invite a write to boot_b.
-check("patch boot image is a TWRP step", _STEP_MODE[2] === "twrp", _STEP_MODE[2]);
-check("connect device is an Android step", _STEP_MODE[0] === "android");
-check("verify root is an Android step", _STEP_MODE[7] === "android");
+const modeOf = id => _WIZARD_STEPS[STEP[id]].mode;
+check("patch boot image is a TWRP step", modeOf("PATCH_BOOT") === "twrp", modeOf("PATCH_BOOT"));
+check("connect device is an Android step", modeOf("CONNECT_ANDROID") === "android");
+check("verify root is an Android step", modeOf("VERIFY_ROOT") === "android");
 
 // Every step must have a mode, or the check silently does nothing for it.
-for (let i = 0; i <= 12; i++) {
-  check(`step ${i} has a mode`, _STEP_MODE[i] === "twrp" || _STEP_MODE[i] === "android",
-        String(_STEP_MODE[i]));
-}
+_WIZARD_STEPS.forEach((s, i) => {
+  check(`step ${i} (${s.id}) has a mode`, s.mode === "twrp" || s.mode === "android",
+        String(s.mode));
+});
 
 // ─── Disconnect-shaped errors ─────────────────────────────────────────────────
 //

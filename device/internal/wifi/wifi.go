@@ -92,9 +92,9 @@ const (
 // Result is the outcome of a change attempt, reported to the controller
 // as a wifi_result message once a connection exists to carry it.
 type Result struct {
-	OK    bool   `json:"ok"`
-	SSID  string `json:"ssid"`
-	Error string `json:"error,omitempty"`
+	OK    bool
+	SSID  string
+	Error string // empty on success
 }
 
 // Network is one scan result row.
@@ -111,8 +111,8 @@ type marker struct {
 var (
 	mu       sync.Mutex
 	inFlight bool
-	// pending holds an unreported Result until the controller connection
-	// can carry it (drained by TakeResult from the OnConnected callback).
+	// pending holds an unacknowledged Result until the controller's
+	// wifi_commit clears it (see PendingResult).
 	pending *Result
 )
 
@@ -434,7 +434,7 @@ func Commit() {
 // Change switches to a new network with automatic rollback. Runs
 // synchronously (call from a goroutine); connected must report whether
 // the control WebSocket is currently registered with the controller.
-// The outcome lands in TakeResult either way.
+// The outcome lands in PendingResult either way.
 func Change(ssid, psk string, connected func() bool) {
 	mu.Lock()
 	if inFlight {

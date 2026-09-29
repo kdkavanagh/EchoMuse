@@ -28,6 +28,8 @@ Usage:
 
 import math
 import logging
+from collections.abc import Sequence
+
 import numpy as np
 from scipy.signal import sosfilt
 
@@ -91,7 +93,14 @@ def _loudness_sos(fs: float) -> np.ndarray:
 
 # ─── Public API ───────────────────────────────────────────────────────────────
 
-def build_sos(bands: list, sample_rate: int, loudness: bool = False) -> np.ndarray:
+def _bands(bands: Sequence[float] | None) -> list[float]:
+    """Exactly NUM_BANDS gains: None is flat, a short list is zero-padded."""
+    if bands is None:
+        return list(DEFAULT_BANDS)
+    return list(bands) + [0.0] * (NUM_BANDS - len(bands))
+
+
+def build_sos(bands: Sequence[float], sample_rate: int, loudness: bool = False) -> np.ndarray:
     """
     Build a stacked SOS matrix for the given band gains and sample rate.
 
@@ -114,7 +123,7 @@ def build_sos(bands: list, sample_rate: int, loudness: bool = False) -> np.ndarr
 def apply(
     pcm: bytes,
     sample_rate: int,
-    bands: list | None = None,
+    bands: Sequence[float] | None = None,
     loudness: bool = False,
 ) -> bytes:
     """
@@ -133,19 +142,16 @@ def apply(
     if len(pcm) < 2:
         return pcm
 
-    if bands is None:
-        bands = DEFAULT_BANDS
-
-    if len(bands) != NUM_BANDS:
+    if bands is not None and len(bands) != NUM_BANDS:
         log.warning(f"[eq] Expected {NUM_BANDS} bands, got {len(bands)} — padding with zeros")
-        bands = list(bands) + [0.0] * (NUM_BANDS - len(bands))
+    gains = _bands(bands)
 
     # Short-circuit if everything is flat and loudness is off
-    if not loudness and all(b == 0.0 for b in bands):
+    if not loudness and all(b == 0.0 for b in gains):
         return pcm
 
     samples  = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
-    sos      = build_sos(bands, sample_rate, loudness)
+    sos      = build_sos(gains, sample_rate, loudness)
     filtered = sosfilt(sos, samples)
     filtered = np.clip(filtered, -32768, 32767).astype(np.int16)
     return filtered.tobytes()
@@ -159,16 +165,12 @@ class StreamingEQ:
     and click; this is bit-identical to apply() over the concatenation.
     """
 
-    def __init__(self, sample_rate: int, bands: list | None = None,
+    def __init__(self, sample_rate: int, bands: Sequence[float] | None = None,
                  loudness: bool = False):
-        if bands is None:
-            bands = DEFAULT_BANDS
-        if len(bands) != NUM_BANDS:
-            bands = list(bands) + [0.0] * (NUM_BANDS - len(bands))
-        if not loudness and all(b == 0.0 for b in bands):
-            self._sos = None  # flat — pure passthrough
-        else:
-            self._sos = build_sos(bands, sample_rate, loudness)
+        gains = _bands(bands)
+        self._sos: np.ndarray | None = None      # None: flat — pure passthrough
+        if loudness or any(b != 0.0 for b in gains):
+            self._sos = build_sos(gains, sample_rate, loudness)
             self._zi  = np.zeros((self._sos.shape[0], 2), dtype=np.float64)
 
     def process(self, pcm: bytes) -> bytes:

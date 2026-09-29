@@ -13,8 +13,8 @@ final-mix sample the clock estimate places at mic sample `mic_first - MAX_LAG + 
 
 from __future__ import annotations
 
+import enum
 from collections import deque
-from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -23,30 +23,51 @@ import numpy as np
 SAMPLE_RATE = 16_000
 CELL = 512
 
-# Cell classes, §8.2 order.
-GAP = "gap"
-SELF_OUTPUT = "self_output"
-NON_SPEECH = "non_speech"
-BACKGROUND_SPEECH = "background_speech"
-COMMAND_SPEECH = "command_speech"
-UNKNOWN = "unknown"
 
-# Deciding rules recorded in the decision trace (§8.2); gap cells record why they are gaps.
-RULE_GAP = "gap"
-RULE_MUTE = "mute"
-RULE_ECHO = "echo"
-RULE_VAD = "vad"
-RULE_LEVEL = "level"
-RULE_HYSTERESIS = "hysteresis"
+class CellClass(enum.StrEnum):
+    """Cell classes, §8.2 order."""
 
-# Reference comparison results (§16.6); NO_REFERENCE is per-cell only.
-ECHO_ONLY = "echo_only"
-NEAR_END_PRESENT = "near_end_present"
-NO_REFERENCE = "no_reference"
+    GAP = "gap"
+    SELF_OUTPUT = "self_output"
+    NON_SPEECH = "non_speech"
+    BACKGROUND_SPEECH = "background_speech"
+    COMMAND_SPEECH = "command_speech"
+    UNKNOWN = "unknown"
 
-# render.progress reference_coverage values.
-COVERAGE_FULL = "full"
-COVERAGE_PARTIAL = "partial"
+
+class Rule(enum.StrEnum):
+    """Deciding rules recorded in the decision trace (§8.2); gap cells record why they are gaps."""
+
+    GAP = "gap"
+    MUTE = "mute"
+    ECHO = "echo"
+    VAD = "vad"
+    LEVEL = "level"
+    HYSTERESIS = "hysteresis"
+
+
+class EchoResult(enum.StrEnum):
+    """Reference comparison results (§16.6); NO_REFERENCE is per-cell only."""
+
+    ECHO_ONLY = "echo_only"
+    NEAR_END_PRESENT = "near_end_present"
+    NO_REFERENCE = "no_reference"
+    UNKNOWN = "unknown"
+
+
+class Coverage(enum.StrEnum):
+    """render.progress reference_coverage values."""
+
+    FULL = "full"
+    PARTIAL = "partial"
+
+
+class PlaybackVerdict(enum.StrEnum):
+    """Why a mic candidate is rejected while the device produces sound (§6.1 steps 1–2)."""
+
+    SELF_OUTPUT = "self_output"
+    ECHO_ONLY = "echo_only"
+
 
 # §16.6 activity and level.
 BACKGROUND_WINDOW = 10 * SAMPLE_RATE
@@ -107,7 +128,7 @@ class Cell:
     start: int
     level: float | None
     vad: float | None = None
-    echo: str | None = None
+    echo: EchoResult | None = None
     gap: bool = False
     muted: bool = False
 
@@ -117,7 +138,12 @@ class Cell:
 
     @property
     def valid(self) -> bool:
-        return not self.gap and not self.muted and self.level is not None
+        return self.valid_level is not None
+
+    @property
+    def valid_level(self) -> float | None:
+        """`level` when the cell is valid evidence (not a gap, not muted, measured), else None."""
+        return None if self.gap or self.muted else self.level
 
     @property
     def speech_positive(self) -> bool:
@@ -129,8 +155,8 @@ class ClassifiedCell:
     """One classified cell. `command` is command speech proper: `command_speech` ending after the trigger."""
 
     start: int
-    cls: str
-    rule: str
+    cls: CellClass
+    rule: Rule
     speech_positive: bool
     command: bool
     background: float | None = None
@@ -146,8 +172,8 @@ class ClassifiedCell:
 class TraceSegment:
     """Run-length decision-trace segment [start, end) (§8.2, §11.3)."""
 
-    cls: str
-    rule: str
+    cls: CellClass
+    rule: Rule
     start: int
     end: int
 
@@ -156,18 +182,21 @@ class TraceSegment:
         return (self.end - self.start) // CELL
 
 
-def wake_trigger_sample(
-    hops: Sequence[tuple[int, float | None] | Mapping[str, object]], threshold: float
-) -> int:
+@dataclass(frozen=True, slots=True)
+class WakeHop:
+    """One scored hop of a device wake candidate (WIRE `wake.candidate.hops[]`); None = not scored."""
+
+    end_sample: int
+    raw: float | None
+    smoothed: float | None = None
+
+
+def wake_trigger_sample(hops: Sequence[WakeHop], threshold: float) -> int:
     """§16.6 trigger: end of the last WIRE hop whose raw value reaches the latched threshold."""
     ends: list[int] = []
     for hop in hops:
-        if isinstance(hop, Mapping):
-            end, raw = int(hop["end_sample"]), hop.get("raw")
-        else:
-            end, raw = hop
-        if raw is not None and float(raw) >= threshold:
-            ends.append(end)
+        if hop.raw is not None and hop.raw >= threshold:
+            ends.append(hop.end_sample)
     if not ends:
         raise ValueError("no hop reached the latched threshold")
     return ends[-1]
@@ -183,7 +212,7 @@ class BackgroundTracker:
 
     def __init__(self) -> None:
         self._cells: deque[tuple[int, float]] = deque()
-        self._next = None
+        self._next: int | None = None
 
     def reset(self) -> None:
         self._cells.clear()
@@ -202,11 +231,12 @@ class BackgroundTracker:
         if self._next is not None and cell.start < self._next:
             raise ValueError("cells must be observed in sample order")
         self._next = cell.end
-        if not cell.valid:
+        level = cell.valid_level
+        if level is None:
             return
         if cell.vad is not None and cell.vad >= BACKGROUND_VAD_EXCLUDE:
             return
-        self._cells.append((cell.start, float(cell.level)))
+        self._cells.append((cell.start, float(level)))
 
 
 class Attributor:
@@ -256,23 +286,25 @@ class Attributor:
             self._close_seed()
 
         f_before = self._f
+        level = cell.valid_level
         ratio = None
-        if cell.valid and background is not None and f_before is not None:
-            ratio = (cell.level - background) / max(f_before - background, R_MIN_SPAN_DB)
+        if level is not None and background is not None and f_before is not None:
+            ratio = (level - background) / max(f_before - background, R_MIN_SPAN_DB)
 
         cls, rule = self._decide(cell, background)
-        command = cls == COMMAND_SPEECH and cell.end > self._trigger
-        if command:
-            self._add_foreground(float(cell.level))
+        command = cls == CellClass.COMMAND_SPEECH and cell.end > self._trigger
+        if command and level is not None:
+            self._add_foreground(float(level))
         if (
             self._seed is not None
-            and cell.valid
+            and self._seed_start is not None
+            and level is not None
             and cell.start >= self._seed_start
             and cell.end <= self._trigger
             and cell.vad is not None
             and cell.vad >= SEED_VAD
         ):
-            self._seed.append(float(cell.level))
+            self._seed.append(float(level))
 
         last = self._trace[-1] if self._trace else None
         if last is not None and last.cls == cls and last.rule == rule and last.end == cell.start:
@@ -290,38 +322,39 @@ class Attributor:
             ratio,
         )
 
-    def _decide(self, cell: Cell, background: float | None) -> tuple[str, str]:
+    def _decide(self, cell: Cell, background: float | None) -> tuple[CellClass, Rule]:
         f = self._f
-        if not cell.valid:
+        level = cell.valid_level
+        if level is None:
             self._in_run = False
-            return GAP, RULE_MUTE if cell.muted else RULE_GAP
-        if cell.echo == ECHO_ONLY:
+            return CellClass.GAP, Rule.MUTE if cell.muted else Rule.GAP
+        if cell.echo == EchoResult.ECHO_ONLY:
             self._in_run = False
-            return SELF_OUTPUT, RULE_ECHO
+            return CellClass.SELF_OUTPUT, Rule.ECHO
         vad = cell.vad
         if vad is None:
             self._in_run = False
-            return UNKNOWN, RULE_VAD
+            return CellClass.UNKNOWN, Rule.VAD
         if vad <= NON_SPEECH_MAX_VAD:
             self._in_run = False
-            return NON_SPEECH, RULE_VAD
-        if vad >= SPEECH_POSITIVE_VAD and f is not None and cell.level <= f - BACKGROUND_MARGIN_DB:
+            return CellClass.NON_SPEECH, Rule.VAD
+        if vad >= SPEECH_POSITIVE_VAD and f is not None and level <= f - BACKGROUND_MARGIN_DB:
             self._in_run = False
-            return BACKGROUND_SPEECH, RULE_LEVEL
+            return CellClass.BACKGROUND_SPEECH, Rule.LEVEL
         if self._in_run:
-            return COMMAND_SPEECH, RULE_HYSTERESIS
+            return CellClass.COMMAND_SPEECH, Rule.HYSTERESIS
         if vad >= RUN_OPEN_VAD:
             r = None
             if background is not None and f is not None:
-                r = (cell.level - background) / max(f - background, R_MIN_SPAN_DB)
+                r = (level - background) / max(f - background, R_MIN_SPAN_DB)
             if r is None:
                 self._in_run = True
-                return COMMAND_SPEECH, RULE_VAD
+                return CellClass.COMMAND_SPEECH, Rule.VAD
             if r >= RUN_OPEN_R:
                 self._in_run = True
-                return COMMAND_SPEECH, RULE_LEVEL
-            return UNKNOWN, RULE_LEVEL
-        return UNKNOWN, RULE_VAD
+                return CellClass.COMMAND_SPEECH, Rule.LEVEL
+            return CellClass.UNKNOWN, Rule.LEVEL
+        return CellClass.UNKNOWN, Rule.VAD
 
 
 # --- Reference comparison ---------------------------------------------------
@@ -478,17 +511,17 @@ def judge(
     stats: CellStats,
     vad: Sequence[float | None] | np.ndarray,
     background: Sequence[float | None] | np.ndarray,
-    coverage: str,
-) -> str:
+    coverage: Coverage,
+) -> EchoResult:
     """The §16.6 three-way result over compared cells at an accepted lag."""
     n = len(stats.valid)
     vad_a = _optional(vad, n, "vad")
     b = _optional(background, n, "background")
     valid = stats.valid
-    if coverage != COVERAGE_FULL or n == 0 or valid.sum() < MIN_VALID_FRACTION * n:
-        return UNKNOWN
+    if coverage != Coverage.FULL or n == 0 or valid.sum() < MIN_VALID_FRACTION * n:
+        return EchoResult.UNKNOWN
     if np.isnan(b[valid]).any():
-        return UNKNOWN
+        return EchoResult.UNKNOWN
     with np.errstate(invalid="ignore"):
         speech = valid & (vad_a >= SPEECH_POSITIVE_VAD)
         loud = speech & (stats.unexplained_db >= b + NEAR_END_MARGIN_DB)
@@ -496,15 +529,15 @@ def judge(
             stats.unexplained_ratio <= ECHO_UNEXPLAINED_RATIO
         )
     if (loud[:-1] & loud[1:]).any():
-        return NEAR_END_PRESENT
+        return EchoResult.NEAR_END_PRESENT
     if explained.sum() >= ECHO_CELL_FRACTION * speech.sum():
-        return ECHO_ONLY
-    return UNKNOWN
+        return EchoResult.ECHO_ONLY
+    return EchoResult.UNKNOWN
 
 
 @dataclass(frozen=True, slots=True)
 class Comparison:
-    result: str
+    result: EchoResult
     lag: int | None
 
 
@@ -515,13 +548,13 @@ def compare_reference(
     cell_valid: Sequence[bool] | np.ndarray,
     vad: Sequence[float | None] | np.ndarray,
     background: Sequence[float | None] | np.ndarray,
-    coverage: str,
+    coverage: Coverage,
     reference_valid: np.ndarray | None = None,
 ) -> Comparison:
     """Reference comparison over a mic candidate's support cells (§16.6)."""
     lag = estimate_lag(mic, reference, cell_valid, reference_valid)
     if lag is None:
-        return Comparison(UNKNOWN, None)
+        return Comparison(EchoResult.UNKNOWN, None)
     stats = compare_cells(mic, reference, lag, cell_valid, reference_valid)
     return Comparison(judge(stats, vad, background, coverage), lag)
 
@@ -538,16 +571,16 @@ def reference_candidate_overlaps(
     return lo < support_end and support_start < hi
 
 
-def self_playback_verdict(*, reference_candidate_overlaps: bool, comparison: str) -> str | None:
+def self_playback_verdict(*, reference_candidate_overlaps: bool, comparison: EchoResult) -> PlaybackVerdict | None:
     """§6.1 steps 1–2 for a mic candidate while the device produces sound.
 
     Returns the rejection reason (`self_output`, `echo_only`), or None to continue
     to wake verification. `near_end_present` rescues double-talk in step 1 only.
     """
-    if reference_candidate_overlaps and comparison != NEAR_END_PRESENT:
-        return SELF_OUTPUT
-    if comparison == ECHO_ONLY:
-        return ECHO_ONLY
+    if reference_candidate_overlaps and comparison != EchoResult.NEAR_END_PRESENT:
+        return PlaybackVerdict.SELF_OUTPUT
+    if comparison == EchoResult.ECHO_ONLY:
+        return PlaybackVerdict.ECHO_ONLY
     return None
 
 
@@ -595,9 +628,9 @@ class EchoTracker:
         cell_valid: Sequence[bool] | np.ndarray,
         vad: Sequence[float | None] | np.ndarray,
         background: Sequence[float | None] | np.ndarray,
-        coverage: str,
+        coverage: Coverage,
         reference_valid: np.ndarray | None = None,
-    ) -> str:
+    ) -> EchoResult:
         """Label the last of 1–6 trailing cells.
 
         `no_reference` when the reference over that cell's 0–500 ms lag span is
@@ -611,11 +644,11 @@ class EchoTracker:
         ref_ok = _reference_valid(reference_valid, len(reference))
         span = slice((n - 1) * CELL, n * CELL + MAX_LAG)
         if not ref_ok[span].all():
-            return UNKNOWN
+            return EchoResult.UNKNOWN
         if _level_db(_pcm(reference[span])) < SILENT_REFERENCE_DB:
-            return NO_REFERENCE if coverage == COVERAGE_FULL else UNKNOWN
+            return EchoResult.NO_REFERENCE if coverage == Coverage.FULL else EchoResult.UNKNOWN
         if self.lag is None:
-            return UNKNOWN
+            return EchoResult.UNKNOWN
         stats = compare_cells(mic, reference, self.lag, cell_valid, reference_valid)
         return judge(stats, vad, background, coverage)
 
@@ -639,13 +672,14 @@ class EarlyAnswerDetector:
         if self._next is not None and cell.start != self._next:
             self._run = 0
         self._next = cell.end
+        level = cell.valid_level
         qualifies = (
-            cell.valid
+            level is not None
             and cell.vad is not None
             and cell.vad >= EARLY_ANSWER_VAD
             and background is not None
-            and cell.level >= background + EARLY_ANSWER_MARGIN_DB
-            and cell.echo in (NEAR_END_PRESENT, NO_REFERENCE)
+            and level >= background + EARLY_ANSWER_MARGIN_DB
+            and cell.echo in (EchoResult.NEAR_END_PRESENT, EchoResult.NO_REFERENCE)
         )
         if not qualifies:
             self._run = 0
@@ -684,7 +718,7 @@ class ReplyOnsetScanner:
         if self._next is not None and cell.start != self._next:
             self._quiet = self._speech = 0
         self._next = cell.end
-        own_echo = cell.echo == ECHO_ONLY
+        own_echo = cell.echo == EchoResult.ECHO_ONLY
         speech = cell.valid and not own_echo and cell.vad is not None and cell.vad >= ONSET_VAD
         quiet = cell.valid and (own_echo or (cell.vad is not None and cell.vad <= NON_SPEECH_MAX_VAD))
         if speech:

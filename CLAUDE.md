@@ -71,10 +71,19 @@ Tests only cover pure-Go logic — hardware-dependent code is not testable on th
 
 ```bash
 cd controller
-python -m pytest tests/        # needs: pytest numpy scipy websockets aiohttp — not the full requirements.txt
+python -m pytest tests/        # needs: pytest numpy scipy websockets aiohttp bcrypt zeroconf protobuf — not the full requirements.txt
 ```
 
-Controller tests cover pure-logic modules plus the device link, legacy handler and HA client, which need `websockets` and `aiohttp` (CI installs exactly `pytest numpy scipy websockets aiohttp`). Tests that load real models (`test_speech_worker`, parts of `test_wake_registry`/`test_wake_scorer`) skip without `onnxruntime`/`sherpa-onnx`. Keep new tests in that shape: evidence fixtures, not live models or a live HA. Both suites (plus `go vet`) run in CI on every push/PR (`.github/workflows/ci.yml`).
+Controller tests cover pure-logic modules plus the device link, legacy handler, HA client, auth and BT proxy, which need `websockets`, `aiohttp`, `bcrypt`, `zeroconf` and `protobuf` (CI installs exactly `pytest numpy scipy websockets aiohttp bcrypt zeroconf protobuf`). Tests that load real models (`test_speech_worker`, parts of `test_wake_registry`/`test_wake_scorer`) skip without `onnxruntime`/`sherpa-onnx`. Keep new tests in that shape: evidence fixtures, not live models or a live HA. The suites (plus `go vet` and mypy) run in CI on every push/PR (`.github/workflows/ci.yml`).
+
+**Type check the controller (host):**
+
+```bash
+cd controller
+python -m mypy      # settings and file set in mypy.ini; needs mypy + the typed deps CI installs
+```
+
+The controller is held at zero mypy errors under `mypy.ini` (untyped defs disallowed, no bare generics, strict equality). Closed string vocabularies are `enum.StrEnum` (identical on the wire, since values serialize and compare as the raw string); structured data is a dataclass, or a `TypedDict` where a JSON dict passes through. `Any` stays at the genuinely dynamic boundary and is parsed into a typed object there.
 
 **Device/controller compatibility.** The two halves version independently, so any pairing can occur in the field. Guarded by `tests/test_capabilities.py`:
 

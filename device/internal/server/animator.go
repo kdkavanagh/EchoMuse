@@ -12,10 +12,7 @@ import (
 // `led_anim` body's "anim" object (WIRE §4.8), also used for the device's own
 // link and alert indications. Frames are rendered on the device's ticker.
 type AnimSpec struct {
-	// Pattern: "off", "solid", "spin" (head+trail dot), "rotate" (palette
-	// rotates around the ring), "pulse" (sinusoidal throb) or "meter"
-	// (brightness follows the final-mix level).
-	Pattern string `json:"pattern"`
+	Pattern AnimPattern `json:"pattern"`
 	// Colors per pattern: solid — palette 1:1 (one colour fills the ring);
 	// spin — [head, trail]; rotate — palette rotated one LED per frame;
 	// pulse/meter — palette whose brightness is modulated.
@@ -35,6 +32,18 @@ type AnimSpec struct {
 	Ref    *float64 `json:"ref"`    // RMS mapped to full scale
 	Curve  *float64 `json:"curve"`  // input exponent; <1 lifts quiet detail
 }
+
+// AnimPattern is an AnimSpec pattern.
+type AnimPattern string
+
+const (
+	PatternOff    AnimPattern = "off"
+	PatternSolid  AnimPattern = "solid"
+	PatternSpin   AnimPattern = "spin"   // head+trail dot
+	PatternRotate AnimPattern = "rotate" // palette rotates around the ring
+	PatternPulse  AnimPattern = "pulse"  // sinusoidal throb
+	PatternMeter  AnimPattern = "meter"  // brightness follows the final-mix level
+)
 
 // meterDefaults: decay 0.30 (τ≈133 ms) tracks syllables; the paint is
 // (floor+span·env)^gamma, a perceptual target; ref/curve lift quiet
@@ -80,14 +89,14 @@ func (r *ring) animate(layer Layer, spec AnimSpec) {
 		ttl = time.Duration(spec.TTLSec) * time.Second
 	}
 	switch spec.Pattern {
-	case "off":
+	case PatternOff:
 		r.clearGen(layer, gen)
-	case "solid":
+	case PatternSolid:
 		r.update(layer, gen, paletteFrame(spec.Colors))
 		if ttl > 0 {
 			time.AfterFunc(ttl, func() { r.expire(layer, gen) })
 		}
-	case "spin", "rotate":
+	case PatternSpin, PatternRotate:
 		period := defaultAnimPeriod
 		if spec.PeriodMs > 0 {
 			period = time.Duration(spec.PeriodMs) * time.Millisecond
@@ -95,7 +104,7 @@ func (r *ring) animate(layer Layer, spec AnimSpec) {
 		go r.run(layer, gen, period, ttl, func(n int, _ time.Duration) []led.Led {
 			return animFrame(spec, n%numLEDs)
 		})
-	case "pulse":
+	case PatternPulse:
 		cycle := defaultPulseCycle
 		if spec.PeriodMs > 0 {
 			cycle = time.Duration(spec.PeriodMs) * time.Millisecond
@@ -106,7 +115,7 @@ func (r *ring) animate(layer Layer, spec AnimSpec) {
 			b := pulseMinBrightness + (1-pulseMinBrightness)*(0.5-0.5*math.Cos(2*math.Pi*phase))
 			return scaleFrame(base, b)
 		})
-	case "meter":
+	case PatternMeter:
 		base := paletteFrame(spec.Colors)
 		attack, decay, floor, gamma, ref, curve := resolveMeter(spec)
 		span := 1.0 - floor
@@ -169,7 +178,7 @@ func scaleFrame(frame []led.Led, b float64) []led.Led {
 func animFrame(spec AnimSpec, pos int) []led.Led {
 	frame := blackFrame()
 	switch spec.Pattern {
-	case "spin":
+	case PatternSpin:
 		var head, trail [3]uint8
 		if len(spec.Colors) > 0 {
 			head = spec.Colors[0]
@@ -180,7 +189,7 @@ func animFrame(spec AnimSpec, pos int) []led.Led {
 		frame[pos%numLEDs] = led.Led{ID: pos % numLEDs, R: head[0], G: head[1], B: head[2]}
 		p := (pos + numLEDs - 1) % numLEDs
 		frame[p] = led.Led{ID: p, R: trail[0], G: trail[1], B: trail[2]}
-	case "rotate":
+	case PatternRotate:
 		n := len(spec.Colors)
 		if n == 0 {
 			return frame

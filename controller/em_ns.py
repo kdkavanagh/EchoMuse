@@ -19,11 +19,15 @@ Dockerfile), not committed; bare-metal runs point NS_MODEL_DIR at a
 directory containing model_1.onnx / model_2.onnx.
 """
 
+from __future__ import annotations
+
 import logging
 import os
 import threading
 import time
 import wave
+from dataclasses import dataclass
+from typing import Mapping, Protocol, Sequence
 
 import numpy as np
 
@@ -44,66 +48,106 @@ MODEL_FILES = ("model_1.onnx", "model_2.onnx")
 # directory is created on first use.
 DEBUG_DIR = os.environ.get("NS_DEBUG_DIR", "")
 
-_lock = threading.Lock()
-_sessions = None      # ((sess, data_in, state_in, data_out, state_out) × 2)
-_load_failed = False
+
+
+class _TensorInfo(Protocol):
+    name: str
+    shape: Sequence[int | str | None]
+
+
+class _OrtSession(Protocol):
+    """What this module uses of `onnxruntime.InferenceSession`."""
+
+    def get_inputs(self) -> Sequence[_TensorInfo]: ...
+    def get_outputs(self) -> Sequence[_TensorInfo]: ...
+    def run(self, output_names: list[str], input_feed: Mapping[str, np.ndarray]) -> list[np.ndarray]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _Model:
+    """One DTLN stage: its session and the (data, state) tensor names in and out."""
+
+    session: _OrtSession
+    data_in: str
+    state_in: str
+    data_out: str
+    state_out: str
+
+    @classmethod
+    def of(cls, session: _OrtSession) -> _Model:
+        """
+        Split the session's inputs/outputs into (data, state) by shape —
+        the LSTM state tensor is always (1, 2, 128, 2). Derived rather than
+        hardcoded so a re-exported model with different tensor names still
+        loads.
+        """
+        def pick(entries: Sequence[_TensorInfo]) -> tuple[str, str]:
+            state = next(e.name for e in entries if tuple(e.shape) == STATE_SHAPE)
+            data = next(e.name for e in entries if tuple(e.shape) != STATE_SHAPE)
+            return data, state
+        d_in, s_in = pick(session.get_inputs())
+        d_out, s_out = pick(session.get_outputs())
+        return cls(session, d_in, s_in, d_out, s_out)
+
+    def run(self, data: np.ndarray, state: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        out, new_state = self.session.run([self.data_out, self.state_out],
+                                          {self.data_in: data, self.state_in: state})
+        return out, new_state
+
+
+class _Models:
+    """
+    Lazy, load-once pair of ONNX sessions, shared across devices/turns
+    (stateless — LSTM state is an explicit tensor owned by each
+    StreamingDenoiser). Single-threaded sessions: each inference is ~0.1ms
+    on one core; thread fan-out would cost more than it saves and this
+    runs in the shared default executor. A failed load is not retried.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._pair: tuple[_Model, _Model] | None = None
+        self._failed = False
+
+    @property
+    def loaded(self) -> bool:
+        return self._pair is not None
+
+    def get(self) -> tuple[_Model, _Model] | None:
+        if self._pair is not None:
+            return self._pair
+        with self._lock:
+            if self._pair is None and not self._failed:
+                try:
+                    self._pair = self._load()
+                    log.info(f"[ns] DTLN models loaded from {MODEL_DIR}")
+                except Exception as e:
+                    self._failed = True
+                    log.warning(f"[ns] DTLN model load failed ({e}) — NS unavailable")
+        return self._pair
+
+    @staticmethod
+    def _load() -> tuple[_Model, _Model]:
+        import onnxruntime as ort
+        so = ort.SessionOptions()
+        so.intra_op_num_threads = 1
+        so.inter_op_num_threads = 1
+        so.log_severity_level = 3
+        first, second = (
+            _Model.of(ort.InferenceSession(os.path.join(MODEL_DIR, f), so, providers=["CPUExecutionProvider"]))
+            for f in MODEL_FILES
+        )
+        return first, second
+
+
+_models = _Models()
 
 
 def available() -> bool:
     """Model files present (or sessions already loaded) — cheap pre-check."""
-    if _sessions is not None:
+    if _models.loaded:
         return True
     return all(os.path.isfile(os.path.join(MODEL_DIR, f)) for f in MODEL_FILES)
-
-
-def _io_names(sess):
-    """
-    Split a DTLN session's inputs/outputs into (data, state) by shape —
-    the LSTM state tensor is always (1, 2, 128, 2). Derived rather than
-    hardcoded so a re-exported model with different tensor names still
-    loads.
-    """
-    def pick(entries):
-        state = next(e.name for e in entries if tuple(e.shape) == STATE_SHAPE)
-        data  = next(e.name for e in entries if tuple(e.shape) != STATE_SHAPE)
-        return data, state
-    d_in, s_in = pick(sess.get_inputs())
-    d_out, s_out = pick(sess.get_outputs())
-    return d_in, s_in, d_out, s_out
-
-
-def _get_sessions():
-    """
-    Lazy singleton pair of ONNX sessions, shared across devices/turns
-    (stateless — LSTM state is an explicit tensor owned by each
-    StreamingDenoiser). Single-threaded sessions: each inference is ~0.1ms
-    on one core; thread fan-out would cost more than it saves and this
-    runs in the shared default executor.
-    """
-    global _sessions, _load_failed
-    if _sessions is not None:
-        return _sessions
-    with _lock:
-        if _sessions is None and not _load_failed:
-            try:
-                import onnxruntime as ort
-                so = ort.SessionOptions()
-                so.intra_op_num_threads = 1
-                so.inter_op_num_threads = 1
-                so.log_severity_level   = 3
-                loaded = []
-                for f in MODEL_FILES:
-                    sess = ort.InferenceSession(
-                        os.path.join(MODEL_DIR, f), so,
-                        providers=["CPUExecutionProvider"],
-                    )
-                    loaded.append((sess, *_io_names(sess)))
-                _sessions = tuple(loaded)
-                log.info(f"[ns] DTLN models loaded from {MODEL_DIR}")
-            except Exception as e:
-                _load_failed = True
-                log.warning(f"[ns] DTLN model load failed ({e}) — NS unavailable")
-    return _sessions
 
 
 class StreamingDenoiser:
@@ -114,11 +158,11 @@ class StreamingDenoiser:
     so in practice output length == input length).
     """
 
-    def __init__(self):
-        sessions = _get_sessions()
-        if sessions is None:
+    def __init__(self) -> None:
+        models = _models.get()
+        if models is None:
             raise RuntimeError(f"DTLN models not loadable from {MODEL_DIR}")
-        self._m1, self._m2 = sessions
+        self._m1, self._m2 = models
         self._states_1 = np.zeros(STATE_SHAPE, dtype=np.float32)
         self._states_2 = np.zeros(STATE_SHAPE, dtype=np.float32)
         self._in_buf   = np.zeros(BLOCK_LEN, dtype=np.float32)
@@ -134,26 +178,18 @@ class StreamingDenoiser:
         x = np.frombuffer(data[:usable], dtype=np.int16).astype(np.float32) / 32768.0
         out = np.empty_like(x)
 
-        sess1, d1_in, s1_in, d1_out, s1_out = self._m1
-        sess2, d2_in, s2_in, d2_out, s2_out = self._m2
-
         for i in range(0, x.size, BLOCK_SHIFT):
             self._in_buf = np.roll(self._in_buf, -BLOCK_SHIFT)
             self._in_buf[-BLOCK_SHIFT:] = x[i:i + BLOCK_SHIFT]
 
             spectrum = np.fft.rfft(self._in_buf)
             mag = np.abs(spectrum).astype(np.float32).reshape(1, 1, -1)
-            mask, self._states_1 = sess1.run(
-                [d1_out, s1_out], {d1_in: mag, s1_in: self._states_1}
-            )
+            mask, self._states_1 = self._m1.run(mag, self._states_1)
             # Mask is real-valued — applying it to the complex spectrum
             # reuses the noisy phase, as in the reference implementation.
             est_block = np.fft.irfft(spectrum * mask.reshape(-1)).astype(np.float32)
 
-            enhanced, self._states_2 = sess2.run(
-                [d2_out, s2_out],
-                {d2_in: est_block.reshape(1, 1, -1), s2_in: self._states_2},
-            )
+            enhanced, self._states_2 = self._m2.run(est_block.reshape(1, 1, -1), self._states_2)
 
             self._out_buf = np.roll(self._out_buf, -BLOCK_SHIFT)
             self._out_buf[-BLOCK_SHIFT:] = 0.0

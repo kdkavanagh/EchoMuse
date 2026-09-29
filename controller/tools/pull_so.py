@@ -4,19 +4,19 @@ import websockets
 DEVICE = "G090LF11803611NF"; DB = "/app/data/echomuse.db"
 SRC = sys.argv[1]
 
-def tok_add():
+def tok_add() -> str:
     t = secrets.token_hex(32); c = sqlite3.connect(DB)
     c.execute("INSERT INTO sessions (token,user_id,created_at,expires_at) VALUES (?,1,datetime('now'),datetime('now','+10 minutes'))",(t,))
     c.commit(); c.close(); return t
-def tok_del(t):
+def tok_del(t: str) -> None:
     c = sqlite3.connect(DB); c.execute("DELETE FROM sessions WHERE token=?",(t,)); c.commit(); c.close()
 
-async def main():
+async def main() -> None:
     t = tok_add()
     try:
         async with websockets.connect(f"ws://127.0.0.1:8768/api/devices/{DEVICE}/shell?token={t}", max_size=None) as ws:
             buf = bytearray()
-            async def drain(marker, timeout=30):
+            async def drain(marker: bytes, timeout: float = 30) -> bool:
                 dl = time.monotonic()+timeout
                 while time.monotonic() < dl:
                     try: m = await asyncio.wait_for(ws.recv(), timeout=dl-time.monotonic())

@@ -33,15 +33,16 @@ import (
 // ── fakes ───────────────────────────────────────────────────────────────────
 
 type sent struct {
-	typ  string
+	typ  proto.MessageType
 	gen  uint32
 	id   string
 	body map[string]any
 }
 
 type ackRec struct {
-	id, status string
-	code       *string
+	id     string
+	status proto.AckStatus
+	code   *proto.AckCode
 }
 
 type fakeSession struct {
@@ -51,7 +52,7 @@ type fakeSession struct {
 	assets assets.Transport // nil: the controller has no assets
 }
 
-func (f *fakeSession) Send(typ string, gen uint32, body any) (string, error) {
+func (f *fakeSession) Send(typ proto.MessageType, gen uint32, body any) (string, error) {
 	b, err := json.Marshal(body)
 	if err != nil {
 		return "", err
@@ -67,7 +68,7 @@ func (f *fakeSession) Send(typ string, gen uint32, body any) (string, error) {
 	return id, nil
 }
 
-func (f *fakeSession) Ack(id, status string, code *string) error {
+func (f *fakeSession) Ack(id string, status proto.AckStatus, code *proto.AckCode) error {
 	f.mu.Lock()
 	f.acks = append(f.acks, ackRec{id, status, code})
 	f.mu.Unlock()
@@ -77,13 +78,22 @@ func (f *fakeSession) Ack(id, status string, code *string) error {
 func (f *fakeSession) Audio() client.AudioSink { return nopAudio{} }
 
 func (f *fakeSession) Assets() assets.Transport {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.assets != nil {
 		return f.assets
 	}
 	return missingAssets{}
 }
 
-func (f *fakeSession) of(typ string) []sent {
+// serve makes the controller hold these assets from now on.
+func (f *fakeSession) serve(a assets.Transport) {
+	f.mu.Lock()
+	f.assets = a
+	f.mu.Unlock()
+}
+
+func (f *fakeSession) of(typ proto.MessageType) []sent {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []sent
@@ -95,10 +105,10 @@ func (f *fakeSession) of(typ string) []sent {
 	return out
 }
 
-func (f *fakeSession) types() []string {
+func (f *fakeSession) types() []proto.MessageType {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	var out []string
+	var out []proto.MessageType
 	for _, m := range f.msgs {
 		out = append(out, m.typ)
 	}
@@ -351,7 +361,7 @@ func (h *harness) ready() {
 
 var msgSeq int
 
-func (h *harness) control(typ string, gen uint32, body any) string {
+func (h *harness) control(typ proto.MessageType, gen uint32, body any) string {
 	b, err := json.Marshal(body)
 	if err != nil {
 		h.t.Fatal(err)
@@ -362,10 +372,10 @@ func (h *harness) control(typ string, gen uint32, body any) string {
 	return id
 }
 
-func (h *harness) expectAck(id, status, code string) {
+func (h *harness) expectAck(id string, status proto.AckStatus, code proto.AckCode) {
 	h.t.Helper()
 	a := h.sess.ackFor(id)
-	got := ""
+	var got proto.AckCode
 	if a.code != nil {
 		got = *a.code
 	}
@@ -519,7 +529,7 @@ func TestDotReleaseStopsRingingAlert(t *testing.T) {
 	if down["handled"] != nil || down["occurrence_id"] != "t1" || down["capture_epoch"] == nil || down["capture_sample"] == nil {
 		t.Fatalf("press %v", down)
 	}
-	if up["handled"] != proto.HandledAlertStopped || up["occurrence_id"] != "t1" {
+	if up["handled"] != string(proto.HandledAlertStopped) || up["occurrence_id"] != "t1" {
 		t.Fatalf("release %v", up)
 	}
 	if up["capture_sample"] != down["capture_sample"] || up["capture_epoch"] != down["capture_epoch"] {
@@ -614,7 +624,7 @@ func TestUplinkOpenRefusedWhileMuted(t *testing.T) {
 	h := newHarness(t, opts{})
 	h.ready()
 	h.phys.MuteToggle()
-	id := h.control(proto.TypeUplinkOpen, 1, proto.UplinkOpen{LeaseID: "L", Reason: proto.LeaseTurn, Streams: map[string]string{"mic": "live"}, TTLMs: 3000})
+	id := h.control(proto.TypeUplinkOpen, 1, proto.UplinkOpen{LeaseID: "L", Reason: proto.LeaseTurn, Streams: map[proto.StreamID]string{"mic": "live"}, TTLMs: 3000})
 	h.expectAck(id, proto.AckRejected, codeMuted)
 }
 
@@ -625,7 +635,7 @@ func TestRenderRoutingAndGenerationFencing(t *testing.T) {
 	h := newHarness(t, opts{})
 	h.ready()
 
-	start := func(id, class string, gen uint32, epoch proto.NullU64, asset *string) string {
+	start := func(id string, class render.SourceClass, gen uint32, epoch proto.NullU64, asset *string) string {
 		return h.control(proto.TypeRenderStart, gen, proto.RenderStart{PlaybackID: id, SourceClass: class, Epoch: epoch, Format: 1, LocalAsset: asset})
 	}
 	h.expectAck(start("p5", "content", 5, proto.U64(77), nil), proto.AckAccepted, "")
@@ -689,7 +699,7 @@ func TestAlertFocusRoutesDACAndVolumeButtons(t *testing.T) {
 // capabilities; alert_cache_v1 only with a working wakelock; ambient_light
 // only when readable.
 func TestHelloCapabilities(t *testing.T) {
-	has := func(caps []string, c string) bool {
+	has := func(caps []proto.Capability, c proto.Capability) bool {
 		for _, x := range caps {
 			if x == c {
 				return true
@@ -699,7 +709,7 @@ func TestHelloCapabilities(t *testing.T) {
 	}
 	h := newHarness(t, opts{})
 	hello := h.s.Hello()
-	for _, c := range []string{"audio_timeline_v1", "uplink_leases_v1", "device_wake_v1", "render_reference_v1",
+	for _, c := range []proto.Capability{"audio_timeline_v1", "uplink_leases_v1", "device_wake_v1", "render_reference_v1",
 		"render_progress_v1", "focus_leases_v1", "alert_cache_v1", "turn_protocol_v1", "leds", "led_anim", "buttons", "button_hold",
 		"alert_prefetch"} {
 		if !has(hello.Capabilities, c) {
@@ -712,7 +722,7 @@ func TestHelloCapabilities(t *testing.T) {
 	if hello.Protocols[0] != 1 || hello.BootID != "boot" || hello.Assets == nil || hello.Privacy.Muted {
 		t.Errorf("hello %+v", hello)
 	}
-	if a := hello.Alerts.(alerts.HelloAlerts); a.Wakeup != "ok" {
+	if a := hello.Alerts; a.Wakeup != "ok" {
 		t.Errorf("alerts %+v", a)
 	}
 
@@ -721,7 +731,7 @@ func TestHelloCapabilities(t *testing.T) {
 	if has(hello.Capabilities, "alert_cache_v1") {
 		t.Error("alert_cache_v1 announced without a wakelock")
 	}
-	if a := hello.Alerts.(alerts.HelloAlerts); a.Wakeup != "alarm_wakeup_unavailable" {
+	if a := hello.Alerts; a.Wakeup != "alarm_wakeup_unavailable" {
 		t.Errorf("wakeup %q", a.Wakeup)
 	}
 	if !has(hello.Capabilities, "ambient_light") {
@@ -754,7 +764,7 @@ func TestAlertPrefetchInstallsTheTimerSoundBeforeItRings(t *testing.T) {
 	h := newHarness(t, opts{})
 	h.ready()
 	wav, sha := alertWAV(4800)
-	h.sess.assets = servedAssets{sha: wav}
+	h.sess.serve(servedAssets{sha: wav})
 	h.expectAck(h.control(proto.TypeAlertPrefetch, 0, proto.AlertPrefetch{Sounds: []string{"builtin:fallback"}}),
 		proto.AckRejected, codeInvalid)
 	if _, installed := h.s.ex.PreviewPCM(sha); installed {

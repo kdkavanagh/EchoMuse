@@ -7,7 +7,7 @@ import pytest
 
 from em_alert_wire import (
     DEFAULT_LOOP_GAP_MS, DEFAULT_MAX_RING_MS, DEFAULT_RAMP_MS, DEFAULT_SNOOZE_MS,
-    EchomuseLine, KIND_ALARM, KIND_SNOOZE, ParentRef, RingSettings, alarm_start_on,
+    EchomuseLine, OccurrenceKind, ParentRef, RingSettings, alarm_start_on,
     build_description, canonical_json, days_from_rrule, delta_body, key_start,
     next_alarm_start, occurrence_from_event, occurrence_id_for, parse_clock,
     parse_description, rrule_for_days, snapshot_pages, snooze_due_utc_ms, snooze_label,
@@ -19,7 +19,7 @@ CHICAGO = ZoneInfo("America/Chicago")
 SOUND = "a" * 64
 
 
-def line(kind=KIND_ALARM, parent=None):
+def line(kind=OccurrenceKind.ALARM, parent=None):
     return EchomuseLine(str(uuid.uuid4()), kind, str(uuid.uuid4()), parent,
                         RingSettings(SOUND))
 
@@ -108,7 +108,7 @@ def test_line_rejects_out_of_range_values_and_kind_parent_mismatch():
         bad = {**good, key: value}
         parsed = parse_description("echomuse: " + canonical_json(bad))
         assert parsed.line is None and parsed.malformed, key
-    snooze = EchomuseLine(str(uuid.uuid4()), KIND_SNOOZE, str(uuid.uuid4()),
+    snooze = EchomuseLine(str(uuid.uuid4()), OccurrenceKind.SNOOZE, str(uuid.uuid4()),
                           ParentRef(str(uuid.uuid4()), "20260928T063000"), RingSettings(SOUND, 0.4))
     assert parse_description(snooze.encode()).line == snooze
 

@@ -63,12 +63,9 @@ class WakeArbiter:
         Returns immediately; there is no waiting on either path.
         """
         now = asyncio.get_running_loop().time()
-        held = (
-            self._winner is not None
-            and now - self._claimed_at < window_s
-        )
-        if held and self._winner != device_id:
-            return self._winner
+        winner = self._winner
+        if winner is not None and winner != device_id and now - self._claimed_at < window_s:
+            return winner
         # Either nothing is claimed, the claim has expired, or this is the
         # same device waking again (a genuinely new utterance in the room
         # that already answered). Re-arm the window from now.

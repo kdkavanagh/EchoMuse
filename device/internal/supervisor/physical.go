@@ -33,7 +33,7 @@ func (s *Supervisor) DotButton(ev pkgbuttons.ButtonClickEvent) {
 	var result *alerts.ActResult
 	if a.OccurrenceID != nil {
 		id := *a.OccurrenceID
-		res := s.ex.Act("", id, "dismiss", "button")
+		res := s.ex.Act("", id, alerts.ActionDismiss, alerts.SourceButton)
 		if res.Status != alerts.StatusRejected {
 			s.fm.AlertEnded(id, true)
 			handled := proto.HandledAlertStopped
@@ -75,7 +75,7 @@ func (s *Supervisor) MuteButton() {
 
 func (s *Supervisor) buttonAction(click pkgbuttons.ClickType, button pkgbuttons.ButtonType, down bool, heldMs, now int64) proto.ButtonAction {
 	a := proto.ButtonAction{
-		ClickType: int(click), Button: string(button), Down: down, HeldMs: heldMs,
+		ClickType: click, Button: button, Down: down, HeldMs: heldMs,
 		Muted: s.cfg.Physical.IsMuted(), MonoNs: now, PhysicalSeq: s.physicalSeq.Add(1),
 	}
 	s.mu.Lock()

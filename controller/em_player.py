@@ -29,9 +29,12 @@ import asyncio
 import contextlib
 import itertools
 import logging
-from typing import TYPE_CHECKING, AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Mapping
+from enum import StrEnum
+from typing import TYPE_CHECKING
 
 import em_media
+from em_render import SourceClass
 
 if TYPE_CHECKING:
     import numpy as np
@@ -46,20 +49,32 @@ RATE = 48000
 SEEK_STALL_S = 5.0
 CANCEL_WAIT_S = 2.0        # render.cancel → render.finished before using last progress
 
-IDLE, PLAYING, PAUSED = "idle", "playing", "paused"
-PAUSE, RESUME, STOP = "pause", "resume", "stop"
+
+class PlayerState(StrEnum):
+    """The content player's state, as reported to HA's media_player entity."""
+    IDLE = "idle"
+    PLAYING = "playing"
+    PAUSED = "paused"
+
+
+class MediaCommand(StrEnum):
+    """A user transport command; the ones deferred under dialog focus."""
+    PAUSE = "pause"
+    RESUME = "resume"
+    STOP = "stop"
+
 
 _get_render: Callable[[str], "RenderClient | None"] = lambda _device_id: None
-_notify_state: Callable[[str, str], Awaitable[None]] | None = None
+_notify_state: Callable[[str, PlayerState], Awaitable[None]] | None = None
 _dialog_active: Callable[[str], bool] = lambda _device_id: False
 
 _sessions: dict[str, "MediaSession"] = {}
 _generations = itertools.count(1)
-_background: set[asyncio.Task] = set()
+_background: set[asyncio.Task[None]] = set()
 
 
 def init(get_render: Callable[[str], "RenderClient | None"],
-         notify_state: Callable[[str, str], Awaitable[None]] | None,
+         notify_state: Callable[[str, PlayerState], Awaitable[None]] | None,
          dialog_active: Callable[[str], bool]) -> None:
     """Inject the device's render client lookup, the HA state push, and the
     dialog-focus query (any dialog lease held on that device)."""
@@ -76,20 +91,20 @@ def _session(device_id: str) -> "MediaSession":
     return s
 
 
-def state(device_id: str) -> str:
+def state(device_id: str) -> PlayerState:
     s = _sessions.get(device_id)
-    return s.state if s else IDLE
+    return s.state if s else PlayerState.IDLE
 
 
 def is_playing(device_id: str) -> bool:
-    return state(device_id) == PLAYING
+    return state(device_id) == PlayerState.PLAYING
 
 
-def reported_state(device_id: str) -> str:
+def reported_state(device_id: str) -> PlayerState:
     """The state HA should show: a deferred command's intended outcome, else
     the actual state. Ducked content is still playing."""
     s = _sessions.get(device_id)
-    return s.intended_state() if s else IDLE
+    return s.intended_state() if s else PlayerState.IDLE
 
 
 async def play(device_id: str, url: str) -> None:
@@ -97,15 +112,15 @@ async def play(device_id: str, url: str) -> None:
 
 
 async def pause(device_id: str) -> None:
-    await _command(device_id, PAUSE)
+    await _command(device_id, MediaCommand.PAUSE)
 
 
 async def resume(device_id: str) -> None:
-    await _command(device_id, RESUME)
+    await _command(device_id, MediaCommand.RESUME)
 
 
 async def stop(device_id: str) -> None:
-    await _command(device_id, STOP)
+    await _command(device_id, MediaCommand.STOP)
 
 
 async def dialog_released(device_id: str) -> None:
@@ -124,7 +139,7 @@ def device_gone(device_id: str) -> None:
         s.abandon()
 
 
-async def _command(device_id: str, command: str) -> None:
+async def _command(device_id: str, command: MediaCommand) -> None:
     s = _session(device_id)
     if _dialog_active(device_id):
         s.deferred = command
@@ -134,8 +149,8 @@ async def _command(device_id: str, command: str) -> None:
     await s.run(command)
 
 
-def _spawn(coro) -> None:
-    task = asyncio.ensure_future(coro)
+def _spawn(coro: Coroutine[object, object, None]) -> None:
+    task = asyncio.create_task(coro)
     _background.add(task)
     task.add_done_callback(_background.discard)
 
@@ -147,7 +162,8 @@ async def _cancel_quietly(playback: "Playback", reason: str) -> None:
         log.warning(f"render.cancel {playback.playback_id} failed: {e}")
 
 
-async def _prepend(first: np.ndarray, rest: AsyncIterator[np.ndarray]) -> AsyncIterator[np.ndarray]:
+async def _prepend(first: np.ndarray,
+                   rest: AsyncGenerator[np.ndarray, None]) -> AsyncGenerator[np.ndarray, None]:
     try:
         yield first
         async for block in rest:
@@ -156,14 +172,15 @@ async def _prepend(first: np.ndarray, rest: AsyncIterator[np.ndarray]) -> AsyncI
         await rest.aclose()
 
 
-async def _start_playback(render: "RenderClient", source: AsyncIterator[np.ndarray]) -> "Playback":
+async def _start_playback(render: "RenderClient",
+                          source: AsyncGenerator[np.ndarray, None]) -> "Playback":
     """`play_stream('content')` that never leaks a device playback: if the
     caller is cancelled while it is in flight, the playback is cancelled as
     soon as it exists."""
-    started = asyncio.ensure_future(
-        render.play_stream("content", source, generation=next(_generations)))
+    started = asyncio.create_task(
+        render.play_stream(SourceClass.CONTENT, source, generation=next(_generations)))
 
-    def reap(fut: asyncio.Future) -> None:
+    def reap(fut: asyncio.Task[Playback]) -> None:
         if fut.cancelled():
             return
         if fut.exception() is not None:
@@ -181,13 +198,20 @@ async def _start_playback(render: "RenderClient", source: AsyncIterator[np.ndarr
         raise
 
 
-def _completed_frames(playback: "Playback", finished: dict | None) -> int | None:
+def _completed_frames(playback: "Playback", finished: Mapping[str, object] | None) -> int | None:
     """Source frames the device reports as rendered, or None if unknown."""
-    if finished is not None and finished.get("last_completed_frame") is not None:
-        return int(finished["last_completed_frame"])
+    last = finished.get("last_completed_frame") if finished is not None else None
+    if isinstance(last, (str, int)):
+        return int(last)
     if playback.last_progress is not None:
         return playback.completed_frames
     return None
+
+
+def _finished_reason(finished: Mapping[str, object]) -> str | None:
+    """`render.finished` `reason`, or None if absent."""
+    reason = finished.get("reason")
+    return reason if isinstance(reason, str) else None
 
 
 class MediaSession:
@@ -196,27 +220,29 @@ class MediaSession:
 
     def __init__(self, device_id: str):
         self.device_id = device_id
-        self.state = IDLE
+        self.state = PlayerState.IDLE
         self.url: str | None = None
         self.position_s = 0.0              # media seconds: bookmark / current playback start
-        self.deferred: str | None = None   # PAUSE | RESUME | STOP recorded under dialog focus
+        self.deferred: MediaCommand | None = None   # recorded under dialog focus
         self._seekable = True              # learned per URL; an unseekable resume rejoins the live edge
         self._base_s = 0.0                 # media position of the current playback's frame 0
         self._playback: Playback | None = None
-        self._task: asyncio.Task | None = None
+        self._task: asyncio.Task[None] | None = None
         self._lock = asyncio.Lock()
 
-    def intended_state(self) -> str:
-        if self.deferred == STOP:
-            return IDLE
-        if self.deferred == PAUSE and self.state != IDLE:
-            return PAUSED
-        if self.deferred == RESUME and self.state != IDLE:
-            return PLAYING
+    def intended_state(self) -> PlayerState:
+        if self.deferred == MediaCommand.STOP:
+            return PlayerState.IDLE
+        if self.deferred == MediaCommand.PAUSE and self.state != PlayerState.IDLE:
+            return PlayerState.PAUSED
+        if self.deferred == MediaCommand.RESUME and self.state != PlayerState.IDLE:
+            return PlayerState.PLAYING
         return self.state
 
-    async def run(self, command: str) -> None:
-        await {PAUSE: self.pause, RESUME: self.resume, STOP: self.stop}[command]()
+    async def run(self, command: MediaCommand) -> None:
+        handlers = {MediaCommand.PAUSE: self.pause, MediaCommand.RESUME: self.resume,
+                    MediaCommand.STOP: self.stop}
+        await handlers[command]()
 
     # ── commands ──────────────────────────────────────────────────────────
 
@@ -227,31 +253,31 @@ class MediaSession:
             self.url = url
             self.position_s = 0.0
             self._seekable = True
-            await self._begin()
+            await self._begin(url)
 
     async def pause(self) -> None:
         async with self._lock:
-            if self.state != PLAYING:
+            if self.state != PlayerState.PLAYING:
                 return
             finished = await self._halt("paused")
             if finished is not None and finished.get("reason") != "cancelled":
-                await self._finish(finished.get("reason"))
+                await self._finish(_finished_reason(finished))
                 return
-            self.state = PAUSED
+            self.state = PlayerState.PAUSED
             log.info(f"[{self.device_id}] Media paused at {self.position_s:.2f}s")
             await self.push_state()
 
     async def resume(self) -> None:
         async with self._lock:
-            if self.state != PAUSED or self.url is None:
+            if self.state != PlayerState.PAUSED or self.url is None:
                 return
-            await self._begin()
+            await self._begin(self.url)
 
     async def stop(self) -> None:
         async with self._lock:
-            was_active = self.state != IDLE
+            was_active = self.state != PlayerState.IDLE
             await self._halt("stopped")
-            self.state = IDLE
+            self.state = PlayerState.IDLE
             self.url = None
             self.position_s = 0.0
             self.deferred = None
@@ -266,7 +292,7 @@ class MediaSession:
         self._playback = None
         if task is not None:
             task.cancel()
-        self.state = IDLE
+        self.state = PlayerState.IDLE
         self.deferred = None
 
     async def push_state(self) -> None:
@@ -279,25 +305,25 @@ class MediaSession:
 
     # ── playback lifecycle ────────────────────────────────────────────────
 
-    async def _begin(self) -> None:
+    async def _begin(self, url: str) -> None:
         render = _get_render(self.device_id)
         if render is None:
             log.warning(f"[{self.device_id}] Media play: device has no render session")
-            self.state = IDLE
+            self.state = PlayerState.IDLE
             self.url = None
             self.position_s = 0.0
             await self.push_state()
             return
-        self.state = PLAYING
-        self._task = asyncio.create_task(self._run(render, self.url, self.position_s))
+        self.state = PlayerState.PLAYING
+        self._task = asyncio.create_task(self._run(render, url, self.position_s))
 
-    async def _halt(self, reason: str) -> dict | None:
+    async def _halt(self, reason: str) -> Mapping[str, object] | None:
         """End the current playback; bookmark what the device rendered.
         Returns its `render.finished` body, or None if there was no playback
         or the device did not answer within CANCEL_WAIT_S."""
         task, self._task = self._task, None
         playback, self._playback = self._playback, None
-        finished = None
+        finished: Mapping[str, object] | None = None
         if playback is not None:
             if not playback.finished.done():
                 await _cancel_quietly(playback, reason)
@@ -314,7 +340,8 @@ class MediaSession:
                 await task
         return finished
 
-    async def _open(self, url: str, start_s: float) -> tuple[AsyncIterator[np.ndarray] | None, float]:
+    async def _open(self, url: str,
+                    start_s: float) -> tuple[AsyncGenerator[np.ndarray, None] | None, float]:
         """Decoder source from `start_s`, and the media position its first
         frame really has. None when the media ends at or before `start_s`."""
         if start_s > 0 and not self._seekable:
@@ -369,7 +396,7 @@ class MediaSession:
         frames = _completed_frames(playback, finished)
         if frames is not None:
             self.position_s = self._base_s + frames / RATE
-        await self._finish(finished.get("reason"))
+        await self._finish(_finished_reason(finished))
 
     async def _finish(self, reason: str | None) -> None:
         """The playback ended by itself (or could not start): idle."""
@@ -377,7 +404,7 @@ class MediaSession:
             log.info(f"[{self.device_id}] Media finished at {self.position_s:.2f}s")
         else:
             log.warning(f"[{self.device_id}] Media playback ended ({reason}) at {self.position_s:.2f}s")
-        self.state = IDLE
+        self.state = PlayerState.IDLE
         self.url = None
         self.position_s = 0.0
         self.deferred = None

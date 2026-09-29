@@ -18,12 +18,6 @@ from pathlib import Path
 import em_support as S
 
 
-class Row(dict):
-    """Stand-in for sqlite3.Row — supports .keys() and subscripting."""
-    def keys(self):
-        return list(super().keys())
-
-
 SECRETS = {
     "token": "tok_9f3aSECRETdeviceauth",
     "psk": "psk_SECRETnoisekey==",
@@ -44,7 +38,7 @@ ACCOUNTS = {SECRETS["username"]: "admin", "wil": "admin", "sam": "readonly"}
 
 
 def _bundle():
-    device = Row({
+    device = {
         "device_id": "G090LF1180130NJG",
         "label": SECRETS["label"],
         "approved": 1,
@@ -52,17 +46,17 @@ def _bundle():
         "ip": SECRETS["ip"],
         "token": SECRETS["token"],
         "esphome_noise_psk": SECRETS["psk"],
-    })
-    turn = Row({
+    }
+    turn = {
         "id": 1, "device_id": "G090LF1180130NJG", "outcome": "ok",
         "wake_score": 0.98, "total_ms": 1200,
         "stt_text": SECRETS["speech"],
-    })
-    metric = Row({
+    }
+    metric = {
         "device_id": "G090LF1180130NJG", "hour_ts": 0, "rtt_samples": 100,
         "rtt_excursions": 20, "wifi_bssid_last": SECRETS["bssid"],
         "wifi_ssid": SECRETS["ssid"],
-    })
+    }
     return S.build(
         controller_version="v2.12.1",
         devices=[device],
@@ -646,11 +640,11 @@ def test_the_wizard_probe_list_matches_the_allowlist():
     block = re.search(r"const _PROVISION_PROBES = \{(.*?)\n  \};", jsx, re.S)
     assert block, "dashboard.jsx no longer defines _PROVISION_PROBES"
     in_jsx = set(re.findall(r"^\s*([a-z_]+):", block.group(1), re.M))
-    in_py = set(S._PROVISION_PROBES)
+    in_py = {str(p) for p in S.ProvisionProbe}
 
     assert not (in_jsx - in_py), (
         f"the wizard collects {sorted(in_jsx - in_py)}, which em_support drops "
-        f"on arrival — add them to _PROVISION_PROBES")
+        f"on arrival — add them to ProvisionProbe")
     assert not (in_py - in_jsx), (
         f"em_support allows {sorted(in_py - in_jsx)}, which the wizard never "
         f"collects")

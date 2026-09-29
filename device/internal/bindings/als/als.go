@@ -65,26 +65,29 @@ const RetryInterval = 30 * time.Second
 // point it at a fixture directory — nothing reassigns it at runtime.
 var i2cGlob = "/sys/bus/i2c/devices/*/name"
 
-// Status codes. Stable identifiers, because the controller and dashboard key
-// off them; the human-readable part rides in Detail.
+// StatusCode is why the sensor is or is not available. Stable identifiers,
+// because the controller and dashboard key off them; the human-readable
+// part rides in Status.Detail.
+type StatusCode string
+
 const (
 	// StatusOK — sensor found and readable.
-	StatusOK = "ok"
+	StatusOK StatusCode = "ok"
 	// StatusNoChip — the bus does not even list a tsl2540. Since the name
 	// is registered by the board file on every unit, this means an
 	// unfamiliar kernel rather than a missing part, and has not been seen
 	// in the field.
-	StatusNoChip = "no_chip"
+	StatusNoChip StatusCode = "no_chip"
 	// StatusNoAttribute — the name is listed but no als_lux appeared, so the
 	// driver's probe found nothing to talk to. This is the ordinary reading
 	// for a batch that was fitted the OTHER ALS (#90) — the Detail text
 	// calls it an unbound driver, which reads as our fault and is not; it is
 	// corrected alongside the IIO fallback rather than on its own, so the
 	// wording changes once, with the behaviour it describes.
-	StatusNoAttribute = "no_attribute"
+	StatusNoAttribute StatusCode = "no_attribute"
 	// StatusUnknown — the bus could not be enumerated. Distinct from
 	// "nothing found", which is a positive result.
-	StatusUnknown = "unknown"
+	StatusUnknown StatusCode = "unknown"
 )
 
 // Status is why the sensor is or is not available.
@@ -97,7 +100,7 @@ const (
 // device already knows at registration — so it should be reported, not left
 // for someone to go and look for.
 type Status struct {
-	Code string `json:"code"`
+	Code StatusCode `json:"code"`
 	// Detail is a sentence for a human reading a support bundle.
 	Detail string `json:"detail,omitempty"`
 	// Seen is every i2c device name on the bus, which is what makes a

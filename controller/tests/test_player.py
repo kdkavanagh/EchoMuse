@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 import em_player
-from em_player import IDLE, PAUSED, PLAYING, RATE
+from em_player import RATE, PlayerState
 
 BLOCK_FRAMES = 3840
 DEV = "office"
@@ -119,16 +119,16 @@ def test_play_streams_decoded_content_with_fresh_generations():
         pb = await env.started()
         assert pb.source_class == "content"
         await pb.consume(2)
-        assert em_player.state(DEV) == PLAYING and em_player.is_playing(DEV)
+        assert em_player.state(DEV) == PlayerState.PLAYING and em_player.is_playing(DEV)
         assert env.decodes == [(URL, 0.0)]
-        assert env.pushed == [PLAYING]
+        assert env.pushed == [PlayerState.PLAYING]
 
         await em_player.play(DEV, "http://music/next.flac")
         pb2 = await env.started(2)
         assert pb.cancels == ["replaced"]
         assert pb2.generation > pb.generation
         await pb2.consume(1)
-        assert em_player.state(DEV) == PLAYING
+        assert em_player.state(DEV) == PlayerState.PLAYING
         await em_player.stop(DEV)
     asyncio.run(main())
 
@@ -142,9 +142,9 @@ def test_pause_cancels_and_bookmarks_rendered_frames():
         await em_player.pause(DEV)
         s = em_player._sessions[DEV]
         assert pb.cancels == ["paused"]
-        assert em_player.state(DEV) == PAUSED
+        assert em_player.state(DEV) == PlayerState.PAUSED
         assert s.position_s == pytest.approx(3 * BLOCK_FRAMES / RATE)
-        assert env.pushed[-1] == PAUSED
+        assert env.pushed[-1] == PlayerState.PAUSED
         assert s._task is None
     asyncio.run(main())
 
@@ -162,7 +162,7 @@ def test_resume_restarts_from_bookmark_and_accumulates_position():
         pb2.completed_frames += len(first)
         bookmark = 3 * BLOCK_FRAMES / RATE
         assert env.decodes == [(URL, 0.0), (URL, pytest.approx(bookmark))]
-        assert em_player.state(DEV) == PLAYING and env.pushed[-1] == PLAYING
+        assert em_player.state(DEV) == PlayerState.PLAYING and env.pushed[-1] == PlayerState.PLAYING
         await pb2.consume(1)
         await em_player.pause(DEV)
         assert em_player._sessions[DEV].position_s == pytest.approx(
@@ -181,7 +181,7 @@ def test_bookmark_uses_last_progress_when_finished_never_arrives():
             pb.cancels.append(reason)
         pb.cancel = silent_cancel
         await em_player.pause(DEV)
-        assert em_player.state(DEV) == PAUSED
+        assert em_player.state(DEV) == PlayerState.PAUSED
         assert em_player._sessions[DEV].position_s == pytest.approx(2 * BLOCK_FRAMES / RATE)
     asyncio.run(main())
 
@@ -195,9 +195,9 @@ def test_stop_cancels_and_clears_session():
         await em_player.stop(DEV)
         s = em_player._sessions[DEV]
         assert pb.cancels == ["stopped"]
-        assert em_player.state(DEV) == IDLE
+        assert em_player.state(DEV) == PlayerState.IDLE
         assert s.url is None and s.position_s == 0.0
-        assert env.pushed[-1] == IDLE
+        assert env.pushed[-1] == PlayerState.IDLE
         await em_player.resume(DEV)
         await _settle()
         assert len(env.render.playbacks) == 1, "nothing to resume after stop"
@@ -214,9 +214,9 @@ def test_playback_ending_by_itself_goes_idle(reason):
         pb.finish(reason)
         await _settle()
         s = em_player._sessions[DEV]
-        assert em_player.state(DEV) == IDLE
+        assert em_player.state(DEV) == PlayerState.IDLE
         assert s.url is None and s._playback is None and s._task is None
-        assert env.pushed[-1] == IDLE
+        assert env.pushed[-1] == PlayerState.IDLE
     asyncio.run(main())
 
 
@@ -230,7 +230,7 @@ def test_pause_racing_a_natural_drain_goes_idle_not_paused():
         await em_player.pause(DEV)    # before the watcher observed the drain
         await _settle()
         assert pb.cancels == [], "no render.cancel for a finished playback"
-        assert em_player.state(DEV) == IDLE
+        assert em_player.state(DEV) == PlayerState.IDLE
     asyncio.run(main())
 
 
@@ -247,7 +247,7 @@ def test_stale_finish_of_a_replaced_playback_is_ignored():
         await env.started(2)
         old.finish("failed")
         await _settle()
-        assert em_player.state(DEV) == PLAYING
+        assert em_player.state(DEV) == PlayerState.PLAYING
         await em_player.stop(DEV)
     asyncio.run(main())
 
@@ -261,17 +261,17 @@ def test_commands_during_dialog_are_deferred_and_the_last_wins():
 
         env.dialog = True
         await em_player.pause(DEV)
-        assert pb.cancels == [] and em_player.state(DEV) == PLAYING
-        assert em_player.reported_state(DEV) == PAUSED
-        assert env.pushed[-1] == PAUSED, "HA is told the intent at once"
+        assert pb.cancels == [] and em_player.state(DEV) == PlayerState.PLAYING
+        assert em_player.reported_state(DEV) == PlayerState.PAUSED
+        assert env.pushed[-1] == PlayerState.PAUSED, "HA is told the intent at once"
         await em_player.stop(DEV)
-        assert em_player.reported_state(DEV) == IDLE and env.pushed[-1] == IDLE
+        assert em_player.reported_state(DEV) == PlayerState.IDLE and env.pushed[-1] == PlayerState.IDLE
         assert pb.cancels == []
 
         env.dialog = False
         await em_player.dialog_released(DEV)
         assert pb.cancels == ["stopped"]
-        assert em_player.state(DEV) == IDLE
+        assert em_player.state(DEV) == PlayerState.IDLE
         assert em_player._sessions[DEV].deferred is None
     asyncio.run(main())
 
@@ -284,10 +284,10 @@ def test_resume_after_pause_during_dialog_leaves_content_playing():
         env.dialog = True
         await em_player.pause(DEV)
         await em_player.resume(DEV)
-        assert em_player.reported_state(DEV) == PLAYING
+        assert em_player.reported_state(DEV) == PlayerState.PLAYING
         env.dialog = False
         await em_player.dialog_released(DEV)
-        assert pb.cancels == [] and em_player.state(DEV) == PLAYING
+        assert pb.cancels == [] and em_player.state(DEV) == PlayerState.PLAYING
         assert len(env.render.playbacks) == 1
         await em_player.stop(DEV)
     asyncio.run(main())
@@ -303,11 +303,11 @@ def test_deferred_resume_of_paused_content_applies_at_release():
         env.dialog = True
         await em_player.resume(DEV)
         await _settle()
-        assert len(env.render.playbacks) == 1 and em_player.state(DEV) == PAUSED
+        assert len(env.render.playbacks) == 1 and em_player.state(DEV) == PlayerState.PAUSED
         env.dialog = False
         await em_player.dialog_released(DEV)
         await env.started(2)
-        assert em_player.state(DEV) == PLAYING
+        assert em_player.state(DEV) == PlayerState.PLAYING
         assert env.decodes[-1] == (URL, pytest.approx(2 * BLOCK_FRAMES / RATE))
         await em_player.stop(DEV)
     asyncio.run(main())
@@ -323,10 +323,10 @@ def test_play_during_dialog_starts_now_and_supersedes_a_deferred_command():
         await em_player.play(DEV, "http://music/jazz")
         pb2 = await env.started(2)
         assert pb.cancels == ["replaced"]
-        assert em_player.state(DEV) == PLAYING == em_player.reported_state(DEV)
+        assert em_player.state(DEV) == PlayerState.PLAYING == em_player.reported_state(DEV)
         env.dialog = False
         await em_player.dialog_released(DEV)
-        assert pb2.cancels == [] and em_player.state(DEV) == PLAYING
+        assert pb2.cancels == [] and em_player.state(DEV) == PlayerState.PLAYING
         await em_player.stop(DEV)
     asyncio.run(main())
 
@@ -340,10 +340,10 @@ def test_natural_end_during_dialog_drops_the_deferred_command():
         await em_player.pause(DEV)
         pb.finish("drained")
         await _settle()
-        assert em_player.reported_state(DEV) == IDLE and env.pushed[-1] == IDLE
+        assert em_player.reported_state(DEV) == PlayerState.IDLE and env.pushed[-1] == PlayerState.IDLE
         env.dialog = False
         await em_player.dialog_released(DEV)
-        assert em_player.state(DEV) == IDLE
+        assert em_player.state(DEV) == PlayerState.IDLE
     asyncio.run(main())
 
 
@@ -352,7 +352,7 @@ def test_no_render_session_means_idle_without_error():
         env = Env()
         env.online = False
         await em_player.play(DEV, URL)
-        assert em_player.state(DEV) == IDLE and env.pushed == [IDLE]
+        assert em_player.state(DEV) == PlayerState.IDLE and env.pushed == [PlayerState.IDLE]
         assert env.render.playbacks == [] and env.decodes == []
 
         env.online = True
@@ -362,7 +362,7 @@ def test_no_render_session_means_idle_without_error():
         await em_player.pause(DEV)
         env.online = False
         await em_player.resume(DEV)
-        assert em_player.state(DEV) == IDLE and env.pushed[-1] == IDLE
+        assert em_player.state(DEV) == PlayerState.IDLE and env.pushed[-1] == PlayerState.IDLE
     asyncio.run(main())
 
 
@@ -379,7 +379,7 @@ def test_device_gone_drops_playback_without_wire_traffic():
         assert task.done()
         assert pb.cancels == []
         assert DEV not in em_player._sessions
-        assert em_player.state(DEV) == IDLE
+        assert em_player.state(DEV) == PlayerState.IDLE
         em_player.device_gone("never-seen")
     asyncio.run(main())
 
@@ -400,7 +400,7 @@ def test_stop_while_playback_is_starting_cancels_it_once_it_exists():
         gate.set()
         await _settle()
         assert env.pb.cancels == ["stopped"]
-        assert em_player.state(DEV) == IDLE
+        assert em_player.state(DEV) == PlayerState.IDLE
     asyncio.run(main())
 
 
@@ -429,10 +429,10 @@ def test_media_ending_before_the_bookmark_goes_idle():
     async def main():
         env = Env(blocks=0)
         s = em_player._session(DEV)
-        s.url, s.position_s, s.state = URL, 12.0, PAUSED
+        s.url, s.position_s, s.state = URL, 12.0, PlayerState.PAUSED
         await em_player.resume(DEV)
         await _settle()
-        assert em_player.state(DEV) == IDLE and env.render.playbacks == []
+        assert em_player.state(DEV) == PlayerState.IDLE and env.render.playbacks == []
     asyncio.run(main())
 
 

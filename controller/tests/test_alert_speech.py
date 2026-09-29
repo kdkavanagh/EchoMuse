@@ -49,7 +49,7 @@ def test_which_timer_is_answered_by_length_name_or_place():
     choices = em_timers.choices(timers)
     assert [match_choice(r, choices) for r in ("the ten minute one", "The pasta timer.", "the first one",
                                                "both", "never mind", "the 12 minute one")] == \
-        [1, 2, 0, em_timers.ALL, em_timers.NONE, None]
+        [1, 2, 0, em_timers.TimerChoice.ALL, em_timers.TimerChoice.NONE, None]
     # A length two offered timers share picks neither.
     assert match_choice("the 5 minute one", em_timers.choices([timer("a"), timer("a2")])) is None
 

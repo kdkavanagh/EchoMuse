@@ -5,6 +5,6 @@ type Controller interface {
 	SubscribeToButton(callback ButtonClickCallback) (*EventSubscription, error)
 	GetDotButton() Button
 	GetVolumeButton() Button
-	SetVolumeCallback(cb func(direction string))
+	SetVolumeCallback(cb func(up bool))
 	SetMuteCallback(cb func())
 }

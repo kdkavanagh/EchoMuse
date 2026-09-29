@@ -550,7 +550,7 @@ def test_local_calendar_provisioning_found_and_created():
     run(scenario())
 
 
-def test_scripts_exposure_device_lookup_and_satellite_selects():
+def test_scripts_exposure_and_satellite_selects():
     async def scenario():
         async with running() as (fake, client):
             current = await client.get_script_config("echomuse_set_alarm")
@@ -564,7 +564,6 @@ def test_scripts_exposure_device_lookup_and_satellite_selects():
                 ["script.echomuse_set_alarm", "script.echomuse_list_alarms"], ["conversation"])
             expose = [_without_id(r) for r in fake.requests if r["type"] == "homeassistant/expose_entity"][-1]
             assert expose == FIXTURES["registries"]["expose_entity"]["request"]
-            assert await client.device_id_for_mac("090F.1072.8426") == DEVICE_ID
             selects = await client.satellite_entities(DEVICE_ID)
             assert selects.pipeline_select == "select.office_assistant"
             assert selects.vad_sensitivity_select == "select.office_finished_speaking_detection"

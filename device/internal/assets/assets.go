@@ -241,15 +241,24 @@ func splitName(name string) (sha, ext string, ok bool) {
 }
 
 func validSHA(sha string) error {
-	if len(sha) != 64 {
-		return fmt.Errorf("assets: %q is not a SHA-256 hex digest", sha)
-	}
-	for _, c := range sha {
-		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
-			return fmt.Errorf("assets: %q is not a lowercase SHA-256 hex digest", sha)
-		}
+	if !IsSHA256(sha) {
+		return fmt.Errorf("assets: %q is not a lowercase SHA-256 hex digest", sha)
 	}
 	return nil
+}
+
+// IsSHA256 reports whether s is a lowercase hex SHA-256, the name of every
+// asset.
+func IsSHA256(s string) bool {
+	if len(s) != sha256.Size*2 {
+		return false
+	}
+	for i := range len(s) {
+		if c := s[i]; !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func validExt(ext string) error {

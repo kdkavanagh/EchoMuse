@@ -6,6 +6,9 @@ import (
 	"strconv"
 	"time"
 	"unicode/utf8"
+
+	"github.com/wilbowes/EchoMuse/internal/assets"
+	"github.com/wilbowes/EchoMuse/internal/uuid"
 )
 
 // occurrence is one alarm occurrence of the device cache (SPEC §16.4). JSON
@@ -13,7 +16,7 @@ import (
 type occurrence struct {
 	DueLocal     string   `json:"due_local"`
 	DueUTCMs     int64    `json:"due_utc_ms,string"`
-	Kind         string   `json:"kind"` // alarm|snooze
+	Kind         Kind     `json:"kind"` // alarm|snooze
 	Label        string   `json:"label"`
 	LoopGapMs    int64    `json:"loop_gap_ms"`
 	MaxRingMs    int64    `json:"max_ring_ms"`
@@ -26,21 +29,27 @@ type occurrence struct {
 	Volume       *float64 `json:"volume"` // nil: ring at the current media volume
 }
 
+// TombstoneReason says why the controller removed an occurrence (SPEC §16.4).
+type TombstoneReason string
+
+const (
+	tombDismissed TombstoneReason = "dismissed"
+	tombSnoozed   TombstoneReason = "snoozed"
+	tombExpired   TombstoneReason = "expired"
+	tombDeleted   TombstoneReason = "deleted"
+)
+
 // tombstone removes an occurrence from the cache (SPEC §16.4).
 type tombstone struct {
 	OccurrenceID string
 	Revision     uint64
-	Reason       string // dismissed|snoozed|expired|deleted
+	Reason       TombstoneReason
 }
 
 // SoundFallback names the built-in fallback tone (SPEC §16.3, §16.5).
 const SoundFallback = "builtin:fallback"
 
 const (
-	kindAlarm  = "alarm"
-	kindSnooze = "snooze"
-	kindTimer  = "timer"
-
 	// SPEC §16.3: snooze child summary prefix and label cap.
 	snoozeLabelPrefix = "Snoozed: "
 	maxLabelRunes     = 120
@@ -65,16 +74,16 @@ func parseObject(v any) (*occurrence, *tombstone, error) {
 		return nil, nil, err
 	}
 	if _, isTomb := m["tombstone"]; isTomb {
-		reason, err := stringField(m, "tombstone")
+		s, err := stringField(m, "tombstone")
 		if err != nil {
 			return nil, nil, err
 		}
-		switch reason {
-		case "dismissed", "snoozed", "expired", "deleted":
+		switch reason := TombstoneReason(s); reason {
+		case tombDismissed, tombSnoozed, tombExpired, tombDeleted:
+			return nil, &tombstone{OccurrenceID: id, Revision: uint64(rev), Reason: reason}, nil
 		default:
-			return nil, nil, fmt.Errorf("alerts: unknown tombstone %q", reason)
+			return nil, nil, fmt.Errorf("alerts: unknown tombstone %q", s)
 		}
-		return nil, &tombstone{OccurrenceID: id, Revision: uint64(rev), Reason: reason}, nil
 	}
 	o := &occurrence{OccurrenceID: id, Revision: uint64(rev)}
 	if o.ScheduleID, err = uuidField(m, "schedule_id"); err != nil {
@@ -93,10 +102,12 @@ func parseObject(v any) (*occurrence, *tombstone, error) {
 	if o.DueUTCMs, err = strconv.ParseInt(due, 10, 64); err != nil || o.DueUTCMs < 0 {
 		return nil, nil, fmt.Errorf("alerts: due_utc_ms %q", due)
 	}
-	if o.Kind, err = stringField(m, "kind"); err != nil {
+	kind, err := stringField(m, "kind")
+	if err != nil {
 		return nil, nil, err
 	}
-	if o.Kind != kindAlarm && o.Kind != kindSnooze {
+	o.Kind = Kind(kind)
+	if o.Kind != KindAlarm && o.Kind != KindSnooze {
 		return nil, nil, fmt.Errorf("alerts: kind %q", o.Kind)
 	}
 	if o.Label, err = stringField(m, "label"); err != nil {
@@ -142,20 +153,7 @@ func parseObject(v any) (*occurrence, *tombstone, error) {
 }
 
 func validSound(s string) bool {
-	return s == SoundFallback || validSHA256(s)
-}
-
-func validSHA256(s string) bool {
-	if len(s) != 64 {
-		return false
-	}
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
-			return false
-		}
-	}
-	return true
+	return s == SoundFallback || assets.IsSHA256(s)
 }
 
 func stringField(m map[string]any, key string) (string, error) {
@@ -185,7 +183,7 @@ func uuidField(m map[string]any, key string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	u, err := ParseUUID(s)
+	u, err := uuid.Parse(s)
 	if err != nil || u.String() != s {
 		return "", fmt.Errorf("alerts: %s %q is not a lowercase uuid", key, s)
 	}
@@ -194,16 +192,16 @@ func uuidField(m map[string]any, key string) (string, error) {
 
 // SnoozeChildScheduleID is UUIDv5(NAMESPACE_URL, "echomuse-snooze:<parent occurrence_id>") (SPEC §16.3).
 func SnoozeChildScheduleID(parentOccurrenceID string) string {
-	return UUID5(NamespaceURL, "echomuse-snooze:"+parentOccurrenceID).String()
+	return uuid.V5(uuid.NamespaceURL, "echomuse-snooze:"+parentOccurrenceID).String()
 }
 
 // OccurrenceID is UUIDv5(schedule_id, occurrence key) (SPEC §16.3).
 func OccurrenceID(scheduleID, key string) (string, error) {
-	ns, err := ParseUUID(scheduleID)
+	ns, err := uuid.Parse(scheduleID)
 	if err != nil {
 		return "", err
 	}
-	return UUID5(ns, key).String(), nil
+	return uuid.V5(ns, key).String(), nil
 }
 
 // snoozeChild derives the snooze child of parent pressed at pressUTCMs (SPEC
@@ -230,7 +228,7 @@ func snoozeChild(parent *occurrence, pressUTCMs int64) (*occurrence, error) {
 	return &occurrence{
 		DueLocal:     dueLocal,
 		DueUTCMs:     due,
-		Kind:         kindSnooze,
+		Kind:         KindSnooze,
 		Label:        string(label),
 		LoopGapMs:    parent.LoopGapMs,
 		MaxRingMs:    parent.MaxRingMs,

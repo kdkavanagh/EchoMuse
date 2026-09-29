@@ -14,17 +14,17 @@ import (
 
 // v1Capabilities are the protocol capabilities this firmware implements
 // (SPEC §11.1); alert_cache_v1 is added only while the wakelock works.
-var v1Capabilities = []string{
+var v1Capabilities = []proto.Capability{
 	proto.CapAudioTimeline, proto.CapUplinkLeases, proto.CapDeviceWake, proto.CapRenderReference,
 	proto.CapRenderProgress, proto.CapFocusLeases, proto.CapTurnProtocol,
 }
 
 // retainedCapabilities are the retained hardware capabilities (§18.2).
-var retainedCapabilities = []string{proto.CapLEDs, proto.CapLEDAnim, proto.CapButtons, proto.CapButtonHold}
+var retainedCapabilities = []proto.Capability{proto.CapLEDs, proto.CapLEDAnim, proto.CapButtons, proto.CapButtonHold}
 
 // Hello builds a fresh session.hello (WIRE §4.1).
 func (s *Supervisor) Hello() proto.SessionHello {
-	caps := append([]string(nil), v1Capabilities...)
+	caps := append([]proto.Capability(nil), v1Capabilities...)
 	if s.ex.CacheCapable() {
 		caps = append(caps, proto.CapAlertCache)
 	}
@@ -104,7 +104,7 @@ func (s *Supervisor) ready(sess Session, r proto.SessionReady) {
 }
 
 // Rejected implements client.Handler; pending approval pulses white.
-func (s *Supervisor) Rejected(reason string) {
+func (s *Supervisor) Rejected(reason proto.RejectReason) {
 	if reason == proto.RejectPendingApproval {
 		s.cfg.Physical.SetLinkState(server.LinkPending)
 		return
@@ -114,7 +114,7 @@ func (s *Supervisor) Rejected(reason string) {
 
 // Lost implements client.Handler: every dialog/uplink lease and network
 // playback ends; local alerts, privacy and physical stop continue (§16.1).
-func (s *Supervisor) Lost(reason string) {
+func (s *Supervisor) Lost(reason client.LostReason) {
 	log.Printf("[session] lost: %s", reason)
 	s.endSession()
 	s.cfg.Physical.SetLinkState(server.LinkDown)

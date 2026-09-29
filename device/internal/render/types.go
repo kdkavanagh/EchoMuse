@@ -78,10 +78,16 @@ const (
 	EventGain     ProgressEvent = "gain"
 )
 
-const (
-	TimingEstimated = "estimated"
-	CoverageFull    = "full"
-)
+// TimingQuality is the render.progress/render.finished timing_quality.
+type TimingQuality string
+
+const TimingEstimated TimingQuality = "estimated"
+
+// ReferenceCoverage is the render.progress reference_coverage: how much of
+// the playback the reference stream carries.
+type ReferenceCoverage string
+
+const CoverageFull ReferenceCoverage = "full"
 
 var (
 	ErrInvalidClass  = errors.New("render: invalid source class")
@@ -146,8 +152,8 @@ type Progress struct {
 	CompletedFrames   uint64
 	MonoNS            int64
 	UncertaintyUS     uint32
-	TimingQuality     string
-	ReferenceCoverage string
+	TimingQuality     TimingQuality
+	ReferenceCoverage ReferenceCoverage
 	MissingFrom       uint64
 	MissingTo         uint64
 	GainDB            float64
@@ -160,7 +166,7 @@ type Finished struct {
 	Generation         uint32
 	LastCompletedFrame uint64
 	Reason             FinishReason
-	TimingQuality      string
+	TimingQuality      TimingQuality
 }
 
 // Anchor relates the render epoch's completed frontier to CLOCK_MONOTONIC.

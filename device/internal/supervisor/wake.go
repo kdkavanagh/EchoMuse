@@ -7,6 +7,7 @@ import (
 	"github.com/wilbowes/EchoMuse/internal/focus"
 	"github.com/wilbowes/EchoMuse/internal/proto"
 	"github.com/wilbowes/EchoMuse/internal/render"
+	"github.com/wilbowes/EchoMuse/internal/uplink"
 	"github.com/wilbowes/EchoMuse/internal/wakeword"
 	"github.com/wilbowes/EchoMuse/internal/wakeword/detector"
 )
@@ -39,7 +40,8 @@ func (s *Supervisor) producingSound(from, to uint64) bool {
 // decides every candidate, including while capture is not permitted.
 func (s *Supervisor) onCandidate(c detector.Candidate) {
 	s.up.OpenCandidate(c.LeaseID, c.SupportStart)
-	s.fm.CandidateOpen(c.CandidateID, c.ProducingSound, candidateAckWindow)
+	// The provisional duck waits for the ack exactly as long as its lease.
+	s.fm.CandidateOpen(c.CandidateID, c.ProducingSound, uplink.CandidateAckWait)
 	body := wakeCandidate{Candidate: c, ActiveAlert: s.activeAlert()}
 
 	s.mu.Lock()

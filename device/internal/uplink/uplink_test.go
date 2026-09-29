@@ -20,7 +20,7 @@ const (
 )
 
 type sentMsg struct {
-	typ  string
+	typ  proto.MessageType
 	gen  uint32
 	body proto.UplinkEnded
 }
@@ -60,7 +60,7 @@ func newHarness(t *testing.T) *harness {
 // CaptureToReference: the test's reference epoch is aligned with capture.
 func (h *harness) CaptureToReference(c uint64) (uint64, bool) { return c, true }
 
-func (h *harness) send(typ string, gen uint32, body any) (string, error) {
+func (h *harness) send(typ proto.MessageType, gen uint32, body any) (string, error) {
 	h.sent = append(h.sent, sentMsg{typ: typ, gen: gen, body: body.(proto.UplinkEnded)})
 	return "id", nil
 }
@@ -93,7 +93,7 @@ func (h *harness) appendRef(n int, v int16) {
 	}
 }
 
-func (h *harness) open(id string, gen uint32, streams map[string]string) error {
+func (h *harness) open(id string, gen uint32, streams map[proto.StreamID]string) error {
 	return h.e.Open(proto.Envelope{Generation: gen}, proto.UplinkOpen{
 		LeaseID: id, Owner: "turn-" + id, Reason: proto.LeaseTurn, Streams: streams, TTLMs: 3000})
 }
@@ -166,7 +166,7 @@ func TestOpenRoundsStartsToGridsAndClipsToRing(t *testing.T) {
 	h := newHarness(t)
 	h.appendMic(100) // 128,000 samples: the 6 s mic ring now starts at 32,000
 	h.appendRef(160000, 7)
-	must(t, h.open("L", 1, map[string]string{"mic": "30000", "cells": "30000", "reference": "41000"}))
+	must(t, h.open("L", 1, map[proto.StreamID]string{"mic": "30000", "cells": "30000", "reference": "41000"}))
 	h.e.step()
 	fs := h.frames()
 
@@ -204,7 +204,7 @@ func TestReferenceStartOutsideClockFitIsClipped(t *testing.T) {
 	h.appendRef(12800, 7)
 	// A start the clock fit cannot map starts at the oldest valid hop.
 	h.e.clock = unmapped{}
-	must(t, h.open("L", 1, map[string]string{"reference": "4000"}))
+	must(t, h.open("L", 1, map[proto.StreamID]string{"reference": "4000"}))
 	h.e.step()
 	if got := byKind(h.frames(), ema.KindReference); len(got) == 0 || got[0].FirstSample != 0 {
 		t.Fatalf("reference packets %+v", got)
@@ -277,7 +277,7 @@ func TestCandidateBackfillPrecedesLiveInStreamOrder(t *testing.T) {
 func TestShortLiveReferenceWaitsOneBlock(t *testing.T) {
 	h := newHarness(t)
 	h.appendMic(1)
-	must(t, h.open("L", 1, map[string]string{"reference": "live"}))
+	must(t, h.open("L", 1, map[proto.StreamID]string{"reference": "live"}))
 	h.e.step()
 	h.appendRef(640, 7)
 	h.e.step()
@@ -296,7 +296,7 @@ func TestGapAdvancesIndicesWithDiscontinuity(t *testing.T) {
 	h.appendMic(1)
 	h.mic.Missing(2 * block)
 	h.appendMic(1)
-	must(t, h.open("L", 1, map[string]string{"mic": "0"}))
+	must(t, h.open("L", 1, map[proto.StreamID]string{"mic": "0"}))
 	h.e.step()
 	fs := h.frames()
 	if len(fs) != 2 {
@@ -325,7 +325,7 @@ func TestReferenceDigitalSilenceHasNoPayload(t *testing.T) {
 	h.appendMic(1)
 	h.appendRef(block, 0)
 	h.appendRef(block, 3)
-	must(t, h.open("L", 1, map[string]string{"reference": "0"}))
+	must(t, h.open("L", 1, map[proto.StreamID]string{"reference": "0"}))
 	h.e.step()
 	raw := h.sink.frames
 	if len(raw) != 2 {
@@ -377,7 +377,7 @@ func TestCandidateConvertsToTurnLease(t *testing.T) {
 	h := newHarness(t)
 	h.appendMic(10)
 	h.e.OpenCandidate("C", 10000)
-	renew := func(gen uint32, reason, owner string) (bool, error) {
+	renew := func(gen uint32, reason proto.LeaseReason, owner string) (bool, error) {
 		return h.e.Renew(proto.Envelope{Generation: gen}, proto.UplinkRenew{LeaseID: "C", TTLMs: 3000, Reason: reason, Owner: owner})
 	}
 	if _, err := renew(2, proto.LeaseTurn, "T"); !errors.Is(err, ErrInvalid) {
@@ -421,7 +421,7 @@ func TestCandidateConvertsToTurnLease(t *testing.T) {
 func TestLeaseExpiresUnlessRenewed(t *testing.T) {
 	h := newHarness(t)
 	h.appendMic(1)
-	must(t, h.open("L", 1, map[string]string{"mic": "live"}))
+	must(t, h.open("L", 1, map[proto.StreamID]string{"mic": "live"}))
 	h.now += int64(2500 * time.Millisecond)
 	if _, err := h.e.Renew(proto.Envelope{Generation: 1}, proto.UplinkRenew{LeaseID: "L", TTLMs: 3000}); err != nil {
 		t.Fatal(err)
@@ -441,8 +441,8 @@ func TestLeaseExpiresUnlessRenewed(t *testing.T) {
 func TestLiveAudioQueuedOverOneSecondEndsLeasesWantingIt(t *testing.T) {
 	h := newHarness(t)
 	h.appendMic(1)
-	must(t, h.open("M", 1, map[string]string{"mic": "live"}))
-	must(t, h.open("R", 1, map[string]string{"reference": "live"}))
+	must(t, h.open("M", 1, map[proto.StreamID]string{"mic": "live"}))
+	must(t, h.open("R", 1, map[proto.StreamID]string{"reference": "live"}))
 	h.sink.full = true
 	h.appendMic(1)
 	h.e.step() // the block is queued at t = 0
@@ -470,7 +470,7 @@ func TestLiveAudioQueuedOverOneSecondEndsLeasesWantingIt(t *testing.T) {
 func TestMuteEndsLeasesAndBlocksOpenUntilNewEpoch(t *testing.T) {
 	h := newHarness(t)
 	h.appendMic(1)
-	must(t, h.open("L", 1, map[string]string{"mic": "live", "cells": "live"}))
+	must(t, h.open("L", 1, map[proto.StreamID]string{"mic": "live", "cells": "live"}))
 	h.e.step()
 	h.appendMic(1)
 	h.e.step()
@@ -481,13 +481,13 @@ func TestMuteEndsLeasesAndBlocksOpenUntilNewEpoch(t *testing.T) {
 		msgs[0].body.LastSample["mic"] != u64(2559) || msgs[0].body.ClippedStart["mic"].Valid {
 		t.Fatalf("ended %+v", msgs)
 	}
-	if err := h.open("N", 1, map[string]string{"mic": "live"}); !errors.Is(err, ErrInvalid) {
+	if err := h.open("N", 1, map[proto.StreamID]string{"mic": "live"}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("open while muted: %v", err)
 	}
 	h.mic.Reset(0)
 	h.cells.Reset(0)
 	h.e.SetEpochs(0x3333, refEpoch)
-	must(t, h.open("N", 1, map[string]string{"mic": "live"}))
+	must(t, h.open("N", 1, map[proto.StreamID]string{"mic": "live"}))
 	h.appendMic(1)
 	h.e.step()
 	if fs := h.frames(); len(fs) != 1 || fs[0].Epoch != 0x3333 || fs[0].Sequence != 0 || fs[0].FirstSample != 0 {
@@ -499,7 +499,7 @@ func TestEpochChanges(t *testing.T) {
 	h := newHarness(t)
 	h.appendMic(1)
 	h.appendRef(block, 5)
-	must(t, h.open("L", 1, map[string]string{"mic": "live", "reference": "live"}))
+	must(t, h.open("L", 1, map[proto.StreamID]string{"mic": "live", "reference": "live"}))
 	h.e.step()
 	h.frames()
 
@@ -529,7 +529,7 @@ func TestEpochChanges(t *testing.T) {
 func TestSessionLossDiscardsLeasesAndAudio(t *testing.T) {
 	h := newHarness(t)
 	h.appendMic(3)
-	must(t, h.open("L", 1, map[string]string{"mic": "0"}))
+	must(t, h.open("L", 1, map[proto.StreamID]string{"mic": "0"}))
 	h.e.Detach()
 	sink := &fakeSink{}
 	h.e.Attach(sink, h.send)
@@ -548,7 +548,7 @@ func TestPacketingDoesNotAllocate(t *testing.T) {
 	h.appendMic(60)
 	h.appendRef(76800, 3)
 	h.sink.full = true
-	must(t, h.open("L", 1, map[string]string{"mic": "0", "cells": "0", "reference": "0"}))
+	must(t, h.open("L", 1, map[proto.StreamID]string{"mic": "0", "cells": "0", "reference": "0"}))
 	allocs := testing.AllocsPerRun(20, func() {
 		if _, _, ok := h.e.packLocked(h.now); !ok {
 			t.Fatal("no packet")

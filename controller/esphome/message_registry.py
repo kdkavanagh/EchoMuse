@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import logging
 
+from google.protobuf.message import Message
+
 from esphome.vendor import api_options_pb2, api_pb2
 
 log = logging.getLogger("echomuse.esphome.registry")
@@ -34,21 +36,17 @@ log = logging.getLogger("echomuse.esphome.registry")
 _ID_EXTENSION = api_options_pb2.id
 
 # msg_type (int) -> message class
-MESSAGE_TYPE_TO_CLASS: dict[int, type] = {}
+MESSAGE_TYPE_TO_CLASS: dict[int, type[Message]] = {}
 # message class -> msg_type (int) — the inverse, for encoding outbound messages
-CLASS_TO_MESSAGE_TYPE: dict[type, int] = {}
+CLASS_TO_MESSAGE_TYPE: dict[type[Message], int] = {}
 
 
 def _build_registry() -> None:
     for name in dir(api_pb2):
         cls = getattr(api_pb2, name)
-        descriptor = getattr(cls, "DESCRIPTOR", None)
-        if descriptor is None or not hasattr(descriptor, "GetOptions"):
+        if not (isinstance(cls, type) and issubclass(cls, Message)):
             continue
-        try:
-            msg_id = descriptor.GetOptions().Extensions[_ID_EXTENSION]
-        except Exception:
-            continue
+        msg_id: int = cls.DESCRIPTOR.GetOptions().Extensions[_ID_EXTENSION]
         if not msg_id:
             continue
         if msg_id in MESSAGE_TYPE_TO_CLASS:
@@ -66,7 +64,7 @@ _build_registry()
 log.debug(f"Message registry built: {len(MESSAGE_TYPE_TO_CLASS)} message types")
 
 
-def decode(msg_type: int, payload: bytes):
+def decode(msg_type: int, payload: bytes) -> Message:
     """
     Decode a raw (msg_type, payload) pair into a protobuf message instance.
 
@@ -77,7 +75,7 @@ def decode(msg_type: int, payload: bytes):
     return cls.FromString(payload)
 
 
-def encode(msg) -> tuple[int, bytes]:
+def encode(msg: Message) -> tuple[int, bytes]:
     """
     Encode a protobuf message instance into a (msg_type, payload) pair
     ready for frame_protocol.encode_frame() / PlaintextFrameProtocol.send_packet().

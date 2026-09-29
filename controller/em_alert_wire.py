@@ -16,7 +16,50 @@ import re
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone, tzinfo
-from typing import Any, Iterable, Sequence
+from enum import StrEnum
+from typing import TYPE_CHECKING, Iterable, NotRequired, TypeGuard, TypedDict
+
+if TYPE_CHECKING:
+    from em_ha_client import CalendarEvent
+
+
+class OccurrenceKind(StrEnum):
+    """`kind` of an `echomuse:` line and of a §16.4 occurrence object."""
+    ALARM = "alarm"
+    SNOOZE = "snooze"
+
+
+class RingKind(StrEnum):
+    """What rings on the device (WIRE §4.7 `alert.state` / `alert.ring_ended`)."""
+    ALARM = "alarm"
+    TIMER = "timer"
+
+
+class TombstoneReason(StrEnum):
+    """§16.4 tombstone `tombstone` values."""
+    DISMISSED = "dismissed"
+    SNOOZED = "snoozed"
+    EXPIRED = "expired"
+    DELETED = "deleted"
+
+
+class Weekday(StrEnum):
+    """Schedule weekday names, Monday first (§16.7 `days`)."""
+    MON = "mon"
+    TUE = "tue"
+    WED = "wed"
+    THU = "thu"
+    FRI = "fri"
+    SAT = "sat"
+    SUN = "sun"
+
+    @classmethod
+    def of(cls, day: date) -> Weekday:
+        return _WEEKDAYS[day.weekday()]
+
+
+_WEEKDAYS: tuple[Weekday, ...] = tuple(Weekday)
+
 
 # §16.3 description line.
 ECHOMUSE_PREFIX = "echomuse: "
@@ -26,8 +69,6 @@ LINE_KEYS = frozenset(
     {"id", "kind", "loop_gap_ms", "max_ring_ms", "op", "parent",
      "ramp_ms", "snooze_ms", "sound", "v", "volume"}
 )
-KIND_ALARM = "alarm"
-KIND_SNOOZE = "snooze"
 
 # §16.3 defaults for events without a valid line, and for new alarms.
 FALLBACK_SOUND = "builtin:fallback"
@@ -42,26 +83,94 @@ EVENT_DURATION = timedelta(minutes=1)          # §16.3: dtend = dtstart + 1 min
 
 # §16.4 delivery.
 SNAPSHOT_PAGE_OBJECTS = 128
-TOMBSTONE_REASONS = ("dismissed", "snoozed", "expired", "deleted")
 
-WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 _BYDAY = ("MO", "TU", "WE", "TH", "FR", "SA", "SU")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)(?::([0-5]\d))?$")
 
 
-def canonical_json(obj: Any) -> str:
+# ── wire shapes ──────────────────────────────────────────────────────────────
+
+class ParentObject(TypedDict):
+    id: str
+    occ: str
+
+
+# The `echomuse:` line object; "id", "op" and "v" are its §16.3 key names.
+EchomuseLineObject = TypedDict("EchomuseLineObject", {
+    "id": str, "kind": OccurrenceKind, "loop_gap_ms": int, "max_ring_ms": int, "op": str,
+    "parent": ParentObject | None, "ramp_ms": int, "snooze_ms": int, "sound": str, "v": int,
+    "volume": float | None,
+})
+
+
+class OccurrenceBody(TypedDict):
+    """The §16.4 occurrence object without `revision`."""
+    due_local: str
+    due_utc_ms: str
+    kind: OccurrenceKind
+    label: str
+    loop_gap_ms: int
+    max_ring_ms: int
+    occurrence_id: str
+    ramp_ms: int
+    schedule_id: str
+    snooze_ms: int
+    sound: str
+    volume: float | None
+
+
+class OccurrenceObject(OccurrenceBody):
+    revision: int
+
+
+class TombstoneObject(TypedDict):
+    occurrence_id: str
+    revision: int
+    tombstone: TombstoneReason
+
+
+CacheObject = OccurrenceObject | TombstoneObject
+
+
+class SnapshotPage(TypedDict):
+    """One `alert.snapshot` body (WIRE §4.7)."""
+    delivery_epoch: str
+    high_water_mark: int
+    page_index: int
+    page_count: int
+    sha256: str
+    objects: list[OccurrenceObject]
+
+
+class DeltaBody(TypedDict):
+    """An `alert.delta` body (WIRE §4.7)."""
+    delivery_epoch: str
+    sequence: int
+    objects: list[CacheObject]
+
+
+class AlarmEventBody(TypedDict):
+    """The `event` of `calendar/event/create|update` (§16.4)."""
+    summary: str
+    dtstart: str
+    dtend: str
+    description: str
+    rrule: NotRequired[str]
+
+
+def canonical_json(obj: object) -> str:
     """Sorted keys, no whitespace, non-ASCII kept as UTF-8 text."""
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
                       allow_nan=False)
 
 
-def sha256_hex(obj: Any) -> str:
+def sha256_hex(obj: object) -> str:
     """SHA-256 of the canonical JSON encoding of `obj`."""
     return hashlib.sha256(canonical_json(obj).encode("utf-8")).hexdigest()
 
 
-def _is_uuid(value: Any) -> bool:
+def _is_uuid(value: object) -> TypeGuard[str]:
     if not isinstance(value, str):
         return False
     try:
@@ -70,11 +179,11 @@ def _is_uuid(value: Any) -> bool:
         return False
 
 
-def _is_int(value: Any) -> bool:
+def _is_int(value: object) -> TypeGuard[int]:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def is_sound_ref(value: Any) -> bool:
+def is_sound_ref(value: object) -> TypeGuard[str]:
     """A sound in a line or cache object: an asset SHA-256 or the fallback."""
     return isinstance(value, str) and (value == FALLBACK_SOUND or bool(_SHA256_RE.match(value)))
 
@@ -87,7 +196,7 @@ def clamp_label(text: str | None) -> str:
 
 # ── description line ─────────────────────────────────────────────────────────
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RingSettings:
     """How one occurrence rings (§16.3). `volume` None = current media volume."""
     sound: str
@@ -98,23 +207,23 @@ class RingSettings:
     ramp_ms: int = DEFAULT_RAMP_MS
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ParentRef:
     """The occurrence a snooze child was created from."""
     schedule_id: str
     occurrence_key: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class EchomuseLine:
     """The parsed `echomuse:` line of an EchoMuse-written event."""
     schedule_id: str
-    kind: str
+    kind: OccurrenceKind
     op_id: str
     parent: ParentRef | None
     settings: RingSettings
 
-    def to_obj(self) -> dict:
+    def to_obj(self) -> EchomuseLineObject:
         s = self.settings
         return {
             "id": self.schedule_id,
@@ -135,7 +244,7 @@ class EchomuseLine:
         return ECHOMUSE_PREFIX + canonical_json(self.to_obj())
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ParsedDescription:
     """`line` is None for a UI/automation event; `malformed` flags a present but
     invalid line (§16.3: defaults apply, never guessed at)."""
@@ -150,42 +259,50 @@ def build_description(line: EchomuseLine, human_text: str | None = None) -> str:
     return f"{text}\n{line.encode()}" if text else line.encode()
 
 
-def _line_from_obj(obj: Any) -> EchomuseLine | None:
+def _parent_ref(parent: object) -> ParentRef | None:
+    if not (isinstance(parent, dict) and set(parent) == {"id", "occ"}):
+        return None
+    schedule_id, key = parent["id"], parent["occ"]
+    if not (_is_uuid(schedule_id) and isinstance(key, str) and key):
+        return None
+    return ParentRef(schedule_id, key)
+
+
+def _line_from_obj(obj: object) -> EchomuseLine | None:
     if not isinstance(obj, dict) or set(obj) != LINE_KEYS:
         return None
-    if obj["v"] != LINE_VERSION or isinstance(obj["v"], bool):
+    version, schedule_id, op_id = obj["v"], obj["id"], obj["op"]
+    if version != LINE_VERSION or isinstance(version, bool):
         return None
-    if not (_is_uuid(obj["id"]) and _is_uuid(obj["op"])):
+    if not (_is_uuid(schedule_id) and _is_uuid(op_id)):
         return None
     kind, parent = obj["kind"], obj["parent"]
-    if kind == KIND_ALARM:
+    parent_ref: ParentRef | None
+    if kind == OccurrenceKind.ALARM:
         if parent is not None:
             return None
         parent_ref = None
-    elif kind == KIND_SNOOZE:
-        if not (isinstance(parent, dict) and set(parent) == {"id", "occ"}
-                and _is_uuid(parent["id"]) and isinstance(parent["occ"], str) and parent["occ"]):
+    elif kind == OccurrenceKind.SNOOZE:
+        parent_ref = _parent_ref(parent)
+        if parent_ref is None:
             return None
-        parent_ref = ParentRef(parent["id"], parent["occ"])
     else:
         return None
-    for key in ("loop_gap_ms", "ramp_ms"):
-        if not _is_int(obj[key]) or obj[key] < 0:
-            return None
-    for key in ("max_ring_ms", "snooze_ms"):
-        if not _is_int(obj[key]) or obj[key] <= 0:
-            return None
-    if not is_sound_ref(obj["sound"]):
+    loop_gap, ramp, max_ring, snooze = obj["loop_gap_ms"], obj["ramp_ms"], obj["max_ring_ms"], obj["snooze_ms"]
+    if not (_is_int(loop_gap) and loop_gap >= 0 and _is_int(ramp) and ramp >= 0):
         return None
-    volume = obj["volume"]
+    if not (_is_int(max_ring) and max_ring > 0 and _is_int(snooze) and snooze > 0):
+        return None
+    sound, volume = obj["sound"], obj["volume"]
+    if not is_sound_ref(sound):
+        return None
     if volume is not None:
         if isinstance(volume, bool) or not isinstance(volume, (int, float)) or not 0.0 <= volume <= 1.0:
             return None
     return EchomuseLine(
-        schedule_id=obj["id"], kind=kind, op_id=obj["op"], parent=parent_ref,
-        settings=RingSettings(sound=obj["sound"], volume=volume, snooze_ms=obj["snooze_ms"],
-                              max_ring_ms=obj["max_ring_ms"], loop_gap_ms=obj["loop_gap_ms"],
-                              ramp_ms=obj["ramp_ms"]),
+        schedule_id=schedule_id, kind=OccurrenceKind(kind), op_id=op_id, parent=parent_ref,
+        settings=RingSettings(sound=sound, volume=volume, snooze_ms=snooze,
+                              max_ring_ms=max_ring, loop_gap_ms=loop_gap, ramp_ms=ramp),
     )
 
 
@@ -284,27 +401,27 @@ def parse_clock(text: str) -> time:
     return time(int(m.group(1)), int(m.group(2)), int(m.group(3) or 0))
 
 
-def normalize_days(days: Iterable[str]) -> tuple[str, ...]:
+def normalize_days(days: Iterable[object]) -> tuple[Weekday, ...]:
     """Distinct weekday names in Monday-first order."""
-    wanted = set()
+    wanted: set[str] = set()
     for d in days:
-        if not isinstance(d, str) or d.strip().lower() not in WEEKDAYS:
+        if not isinstance(d, str) or d.strip().lower() not in _WEEKDAYS:
             raise ValueError(f"unknown weekday {d!r}")
         wanted.add(d.strip().lower())
-    return tuple(d for d in WEEKDAYS if d in wanted)
+    return tuple(d for d in _WEEKDAYS if d in wanted)
 
 
-def rrule_for_days(days: Sequence[str]) -> str | None:
+def rrule_for_days(days: Iterable[object]) -> str | None:
     """None for a one-shot, `FREQ=DAILY` for every day, else `FREQ=WEEKLY;BYDAY=…`."""
-    days = normalize_days(days)
-    if not days:
+    wanted = normalize_days(days)
+    if not wanted:
         return None
-    if len(days) == len(WEEKDAYS):
+    if len(wanted) == len(_WEEKDAYS):
         return "FREQ=DAILY"
-    return "FREQ=WEEKLY;BYDAY=" + ",".join(_BYDAY[WEEKDAYS.index(d)] for d in days)
+    return "FREQ=WEEKLY;BYDAY=" + ",".join(_BYDAY[_WEEKDAYS.index(d)] for d in wanted)
 
 
-def days_from_rrule(rrule: str | None) -> tuple[str, ...] | None:
+def days_from_rrule(rrule: str | None) -> tuple[Weekday, ...] | None:
     """Weekdays of a DAILY/WEEKLY;BYDAY rule; () for none; None for other rules."""
     if not rrule:
         return ()
@@ -313,12 +430,12 @@ def days_from_rrule(rrule: str | None) -> tuple[str, ...] | None:
     if extra or parts.get("INTERVAL", "1") != "1":
         return None
     if parts.get("FREQ") == "DAILY" and "BYDAY" not in parts:
-        return WEEKDAYS
+        return _WEEKDAYS
     if parts.get("FREQ") == "WEEKLY" and "BYDAY" in parts:
         codes = parts["BYDAY"].split(",")
         if not all(c in _BYDAY for c in codes):
             return None
-        return tuple(WEEKDAYS[i] for i, c in enumerate(_BYDAY) if c in codes)
+        return tuple(_WEEKDAYS[i] for i, c in enumerate(_BYDAY) if c in codes)
     return None
 
 
@@ -327,18 +444,18 @@ def _wall_exists(day: date, at: time, tz: tzinfo) -> bool:
     return local.astimezone(timezone.utc).astimezone(tz).replace(tzinfo=None) == local.replace(tzinfo=None)
 
 
-def next_alarm_start(now: datetime, tz: tzinfo, at: time, days: Sequence[str]) -> datetime:
+def next_alarm_start(now: datetime, tz: tzinfo, at: time, days: Iterable[object]) -> datetime:
     """First start strictly after `now` at wall time `at` in `tz` on one of `days`
     (any day when empty). A repeating series starts on a day where the wall time
     exists, so HA's expansion keeps the requested time; a one-shot at a skipped
     wall time rings at the equivalent instant."""
-    days = normalize_days(days)
+    wanted = normalize_days(days)
     today = now.astimezone(tz).date()
     for offset in range(15):
         day = today + timedelta(days=offset)
-        if days and WEEKDAYS[day.weekday()] not in days:
+        if wanted and Weekday.of(day) not in wanted:
             continue
-        if days and not _wall_exists(day, at, tz):
+        if wanted and not _wall_exists(day, at, tz):
             continue
         start = datetime.combine(day, at, tzinfo=tz).astimezone(timezone.utc).astimezone(tz)
         if start > now:
@@ -352,9 +469,9 @@ def alarm_start_on(day: date, at: time, tz: tzinfo) -> datetime:
     return datetime.combine(day, at, tzinfo=tz).astimezone(timezone.utc).astimezone(tz)
 
 
-def alarm_event(summary: str, start: datetime, rrule: str | None, description: str) -> dict:
+def alarm_event(summary: str, start: datetime, rrule: str | None, description: str) -> AlarmEventBody:
     """The `event` of `calendar/event/create|update` (§16.4)."""
-    event = {
+    event: AlarmEventBody = {
         "summary": summary,
         "dtstart": iso_seconds(start),
         "dtend": iso_seconds(start + EVENT_DURATION),
@@ -367,7 +484,7 @@ def alarm_event(summary: str, start: datetime, rrule: str | None, description: s
 
 # ── occurrences ──────────────────────────────────────────────────────────────
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Occurrence:
     """One timed instance from a calendar push or backlog fetch."""
     occurrence_id: str
@@ -383,8 +500,8 @@ class Occurrence:
     settings: RingSettings
 
     @property
-    def kind(self) -> str:
-        return self.line.kind if self.line else KIND_ALARM
+    def kind(self) -> OccurrenceKind:
+        return self.line.kind if self.line else OccurrenceKind.ALARM
 
     @property
     def label(self) -> str:
@@ -402,7 +519,7 @@ class Occurrence:
     def is_echomuse(self) -> bool:
         return self.line is not None
 
-    def cache_body(self) -> dict:
+    def cache_body(self) -> OccurrenceBody:
         """The §16.4 occurrence object without `revision`."""
         s = self.settings
         return {
@@ -420,11 +537,13 @@ class Occurrence:
             "volume": s.volume,
         }
 
-    def cache_object(self, revision: int) -> dict:
-        return {**self.cache_body(), "revision": revision}
+
+def with_revision(body: OccurrenceBody, revision: int) -> OccurrenceObject:
+    """A cache body as the delivered §16.4 occurrence object."""
+    return {**body, "revision": revision}
 
 
-def _parse_start(value: Any) -> datetime | None:
+def _parse_start(value: str | None) -> datetime | None:
     if not isinstance(value, str) or "T" not in value:
         return None  # all-day (date only) or missing
     try:
@@ -434,26 +553,26 @@ def _parse_start(value: Any) -> datetime | None:
     return dt if dt.tzinfo is not None else None
 
 
-def occurrence_from_event(calendar_entity: str, event: dict, default_sound: str) -> Occurrence | None:
+def occurrence_from_event(calendar_entity: str, event: CalendarEvent, default_sound: str) -> Occurrence | None:
     """Occurrence for one pushed item; None for all-day or unidentifiable items,
     which carry no clock time and are not alarms."""
-    uid = event.get("uid")
-    start = _parse_start(event.get("start"))
-    if event.get("all_day") or not uid or start is None:
+    uid = event["uid"]
+    start = _parse_start(event["start"])
+    if event["all_day"] or not uid or start is None:
         return None
-    parsed = parse_description(event.get("description"))
+    parsed = parse_description(event["description"])
     line = parsed.line
     schedule_id = line.schedule_id if line else ui_schedule_id(calendar_entity, uid)
-    key = occurrence_key(event.get("recurrence_id"), start)
+    key = occurrence_key(event["recurrence_id"], start)
     settings = line.settings if line else RingSettings(sound=default_sound)
     return Occurrence(
         occurrence_id=occurrence_id_for(schedule_id, key),
         schedule_id=schedule_id,
         key=key,
         uid=uid,
-        recurrence_id=event.get("recurrence_id") or None,
-        rrule=event.get("rrule") or None,
-        summary=event.get("summary") or "",
+        recurrence_id=event["recurrence_id"] or None,
+        rrule=event["rrule"] or None,
+        summary=event["summary"] or "",
         start=start,
         line=line,
         malformed=parsed.malformed,
@@ -461,18 +580,17 @@ def occurrence_from_event(calendar_entity: str, event: dict, default_sound: str)
     )
 
 
-def tombstone_object(occurrence_id: str, revision: int, reason: str) -> dict:
-    if reason not in TOMBSTONE_REASONS:
-        raise ValueError(f"tombstone reason {reason!r}")
+def tombstone_object(occurrence_id: str, revision: int, reason: TombstoneReason) -> TombstoneObject:
     return {"occurrence_id": occurrence_id, "revision": revision, "tombstone": reason}
 
 
-def sort_occurrence_objects(objects: Iterable[dict]) -> list[dict]:
+def sort_occurrence_objects(objects: Iterable[OccurrenceObject]) -> list[OccurrenceObject]:
     """Snapshot order: `due_utc_ms` (numerically), then `occurrence_id`."""
     return sorted(objects, key=lambda o: (int(o["due_utc_ms"]), o["occurrence_id"]))
 
 
-def snapshot_pages(delivery_epoch: str, high_water_mark: int, objects: Iterable[dict]) -> list[dict]:
+def snapshot_pages(delivery_epoch: str, high_water_mark: int,
+                   objects: Iterable[OccurrenceObject]) -> list[SnapshotPage]:
     """`alert.snapshot` bodies: live occurrences only, ≤128 per page, one digest
     over the canonical array of all pages' objects in order. An empty cache is
     one empty page."""
@@ -487,5 +605,5 @@ def snapshot_pages(delivery_epoch: str, high_water_mark: int, objects: Iterable[
     ]
 
 
-def delta_body(delivery_epoch: str, sequence: int, objects: list[dict]) -> dict:
+def delta_body(delivery_epoch: str, sequence: int, objects: list[CacheObject]) -> DeltaBody:
     return {"delivery_epoch": delivery_epoch, "sequence": sequence, "objects": objects}

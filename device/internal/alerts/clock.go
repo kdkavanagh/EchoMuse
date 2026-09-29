@@ -4,7 +4,8 @@ import (
 	"errors"
 	"time"
 
-	"golang.org/x/sys/unix"
+	"github.com/wilbowes/EchoMuse/internal/monoclock"
+	"github.com/wilbowes/EchoMuse/internal/uuid"
 )
 
 // SPEC §16.5 and WIRE clock.request: trust UTC after two replies with round
@@ -27,13 +28,7 @@ type MonoClock interface {
 type SystemMonoClock struct{}
 
 // MonoNowNs implements MonoClock.
-func (SystemMonoClock) MonoNowNs() int64 {
-	var ts unix.Timespec
-	if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts); err != nil {
-		panic("alerts: CLOCK_MONOTONIC unavailable: " + err.Error())
-	}
-	return ts.Nano()
-}
+func (SystemMonoClock) MonoNowNs() int64 { return monoclock.Now() }
 
 var errUnknownNonce = errors.New("alerts: clock.reply for an unknown nonce")
 
@@ -76,7 +71,7 @@ func (c *clockEstimator) requestIfDue() (string, bool) {
 	if c.sentAny && now-c.lastSentNs < period {
 		return "", false
 	}
-	nonce := NewUUID4().String()
+	nonce := uuid.NewV4().String()
 	if len(c.outstanding) == maxOutstandingPing {
 		c.outstanding = append(c.outstanding[:0], c.outstanding[1:]...)
 	}

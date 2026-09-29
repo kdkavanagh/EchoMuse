@@ -11,7 +11,7 @@ READ ONLY, in practice: a shell opened here is a CHILD OF THE SERVER, so
 `stop`ping the service kills this shell at the first word and takes the device
 down until it is power cycled. Inspect freely; do not stop the server.
 """
-import asyncio, json, secrets, sqlite3, sys, time
+import asyncio, secrets, sqlite3, sys, time
 import websockets
 
 # Default when neither -d nor --all is given — kept so existing invocations
@@ -20,7 +20,7 @@ DEVICE = "G090LF11803611NF"
 DB = "/app/data/echomuse.db"
 
 
-def all_devices(max_age_s=300):
+def all_devices(max_age_s: float = 300) -> list[str]:
     """Devices seen recently — i.e. ones a shell can actually reach.
 
     Filtered rather than "every row" because the shell proxy has no fast
@@ -37,9 +37,11 @@ def all_devices(max_age_s=300):
     return rows
 
 
-def parse_args(argv):
+def parse_args(argv: list[str]) -> tuple[list[str], list[str]]:
     """Returns (devices, commands). Anything not a flag is a command."""
-    devices, cmds, i = [], [], 0
+    devices: list[str] = []
+    cmds: list[str] = []
+    i = 0
     while i < len(argv):
         a = argv[i]
         if a in ("-d", "--device"):
@@ -54,7 +56,7 @@ def parse_args(argv):
         i += 1
     return (devices or [DEVICE]), cmds
 
-def make_token():
+def make_token() -> str:
     tok = secrets.token_hex(32)
     con = sqlite3.connect(DB)
     # mirror schema: inspect columns
@@ -67,18 +69,18 @@ def make_token():
     con.commit(); con.close()
     return tok
 
-def drop_token(tok):
+def drop_token(tok: str) -> None:
     con = sqlite3.connect(DB)
     con.execute("DELETE FROM sessions WHERE token=?", (tok,))
     con.commit(); con.close()
 
-async def run(cmds, device=DEVICE):
+async def run(cmds: list[str], device: str = DEVICE) -> None:
     tok = make_token()
     try:
         uri = f"ws://127.0.0.1:8768/api/devices/{device}/shell?token={tok}"
         async with websockets.connect(uri, max_size=None) as ws:
             out = bytearray()
-            async def read_until(marker, timeout=15):
+            async def read_until(marker: bytes, timeout: float = 15) -> None:
                 deadline = time.monotonic() + timeout
                 while time.monotonic() < deadline:
                     try:

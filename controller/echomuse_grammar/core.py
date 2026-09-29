@@ -3,23 +3,93 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import StrEnum
 from functools import lru_cache
 from typing import Any, Iterable, Literal, Mapping, Sequence
+
+from em_alert_wire import RingKind, Weekday
 
 from .alerts import parse_alarm_query
 from .normalize import normalize, tokens
 from .timer_data import SKIP_WORDS, SLOT_RANGES, TIMER_PATTERNS
 
-COMPLETE = "complete"
-EXTENDABLE = "extendable"
-NEEDS_MORE = "needs_more"
-UNKNOWN = "unknown"
-_CLASSES = {COMPLETE, EXTENDABLE, NEEDS_MORE, UNKNOWN}
+# A generated timer_data node: ('word' | 'slot', str), ('optional', node) or
+# ('alt' | 'seq', (node, ...)). The payload's type follows the tag, which a
+# static type cannot express, so it is the generated data's own shape.
+_Node = tuple[str, Any]
+
+
+class GrammarClass(StrEnum):
+    """The §16.6 completeness classes, weakest first."""
+    UNKNOWN = "unknown"
+    NEEDS_MORE = "needs_more"
+    EXTENDABLE = "extendable"
+    COMPLETE = "complete"
+
+
+class GrammarFamily(StrEnum):
+    """The §16.6 families, in `classify` tie-break order."""
+    REPLY = "reply"
+    ALARM = "alarm"
+    TIMER = "timer"
+    ALARM_QUERY = "alarm_query"
+    HOME = "home"
+    LOCAL = "local"
+
+
+class AlarmAction(StrEnum):
+    SET = "set"
+    CANCEL = "cancel"
+    CANCEL_ALL = "cancel_all"
+
+
+class MissingSlot(StrEnum):
+    """A slot an alarm parse still needs from a reply (§9.1)."""
+    AMPM = "ampm"
+
+
+class Meridiem(StrEnum):
+    AM = "am"
+    PM = "pm"
+
+
+class RelativeDay(StrEnum):
+    TODAY = "today"
+    TOMORROW = "tomorrow"
+
+
+class HomeAction(StrEnum):
+    ON = "on"
+    OFF = "off"
+
+
+class LocalVerb(StrEnum):
+    """The verb of a §16.2 local command."""
+    STOP = "stop"
+    CANCEL = "cancel"
+    SNOOZE = "snooze"
+    TURN_OFF = "turn off"
+    DISMISS = "dismiss"
+
+
+class ContextKind(StrEnum):
+    """What the wake interrupted (§6.3 step 1)."""
+    ALERT = "alert"
+    DIALOG = "dialog"
+
+
+class LocalAction(StrEnum):
+    """The §6.3 local action a command resolves to."""
+    DISMISS = "dismiss"
+    SNOOZE = "snooze"
+    STOP = "stop"
+
+
 _TERMINAL = frozenset({"a", "an", "the", "for", "to", "in", "on", "at", "and", "or", "with"})
-_WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+_WEEKDAYS = tuple(Weekday)
 _DAY_NAMES = {
-    "monday": "mon", "tuesday": "tue", "wednesday": "wed", "thursday": "thu",
-    "friday": "fri", "saturday": "sat", "sunday": "sun",
+    "monday": Weekday.MON, "tuesday": Weekday.TUE, "wednesday": Weekday.WED, "thursday": Weekday.THU,
+    "friday": Weekday.FRI, "saturday": Weekday.SAT, "sunday": Weekday.SUN,
 }
 
 
@@ -34,13 +104,9 @@ class Result:
     parse exists.
     """
 
-    klass: Literal["complete", "extendable", "needs_more", "unknown"]
-    family: str | None = None
-    parse: Any = None
-
-    def __post_init__(self) -> None:
-        if self.klass not in _CLASSES:
-            raise ValueError(f"invalid grammar class: {self.klass}")
+    klass: GrammarClass
+    family: GrammarFamily | None = None
+    parse: object = None
 
 
 @dataclass(frozen=True)
@@ -54,18 +120,18 @@ class AlarmParse:
     without a time has ``hour24 = minute = None``.
     """
 
-    action: Literal["set", "cancel", "cancel_all"]
+    action: AlarmAction
     hour24: int | None
     minute: int | None
-    days: frozenset[str] | Literal["today", "tomorrow"] | None
-    missing: Literal["ampm"] | None = None
+    days: frozenset[Weekday] | RelativeDay | None
+    missing: MissingSlot | None = None
     hour12: int | None = None
-    ampm: Literal["am", "pm"] | None = None
+    ampm: Meridiem | None = None
 
 
 @dataclass(frozen=True)
 class HomeParse:
-    action: Literal["on", "off"]
+    action: HomeAction
     target: str
 
 
@@ -73,14 +139,14 @@ class HomeParse:
 class LocalParse:
     """A §16.2 local command: bare ``stop|cancel|snooze`` (kind None) or a noun form."""
 
-    action: Literal["stop", "cancel", "snooze", "turn off", "dismiss"]
-    kind: Literal["timer", "alarm"] | None = None
+    action: LocalVerb
+    kind: RingKind | None = None
     name: str | None = None
 
 
 @dataclass(frozen=True)
 class Choice:
-    value: Any
+    value: object
     aliases: tuple[str, ...]
 
 
@@ -88,8 +154,8 @@ class Choice:
 class CommandContext:
     """Command context captured at wake acceptance (§6.3 step 1)."""
 
-    kind: Literal["alert", "dialog"]
-    alert_kind: Literal["timer", "alarm"] | None = None
+    kind: ContextKind
+    alert_kind: RingKind | None = None
     name: str | None = None
 
 
@@ -129,7 +195,7 @@ class _TimerAutomaton:
         self.states.append(_State())
         return len(self.states) - 1
 
-    def _compile(self, node: tuple, start: int, end: int) -> None:
+    def _compile(self, node: _Node, start: int, end: int) -> None:
         kind, value = node
         if kind == "word":
             self.states[start].words.append((value, end))
@@ -223,11 +289,11 @@ class _TimerAutomaton:
                 for ending in self._slot_ends(slot, words, pos, vocabulary):
                     active[ending].update(targets)
         if not words or not active[-1]:
-            return Result(UNKNOWN, "timer")
+            return Result(GrammarClass.UNKNOWN, GrammarFamily.TIMER)
         _, _, pending, finals = self._step(frozenset(active[-1]))
         if finals:
-            return Result(COMPLETE, "timer", tuple(sorted(finals)))
-        return Result(NEEDS_MORE if pending else UNKNOWN, "timer")
+            return Result(GrammarClass.COMPLETE, GrammarFamily.TIMER, tuple(sorted(finals)))
+        return Result(GrammarClass.NEEDS_MORE if pending else GrammarClass.UNKNOWN, GrammarFamily.TIMER)
 
 
 _TIMER = _TimerAutomaton()
@@ -252,13 +318,13 @@ def _timer(text: str, vocabulary: Iterable[str]) -> Result:
     return _TIMER.match(_without_skip_words(tokens(text)), vocab)
 
 
-_AMPM_PHRASES: tuple[tuple[tuple[str, ...], Literal["am", "pm"]], ...] = (
-    (("am",), "am"),
-    (("pm",), "pm"),
-    (("in", "the", "morning"), "am"),
-    (("in", "the", "afternoon"), "pm"),
-    (("in", "the", "evening"), "pm"),
-    (("at", "night"), "pm"),
+_AMPM_PHRASES: tuple[tuple[tuple[str, ...], Meridiem], ...] = (
+    (("am",), Meridiem.AM),
+    (("pm",), Meridiem.PM),
+    (("in", "the", "morning"), Meridiem.AM),
+    (("in", "the", "afternoon"), Meridiem.PM),
+    (("in", "the", "evening"), Meridiem.PM),
+    (("at", "night"), Meridiem.PM),
 )
 
 
@@ -267,7 +333,7 @@ class _Time:
     end: int
     hour12: int
     minute: int
-    ampm: Literal["am", "pm"] | None
+    ampm: Meridiem | None
     hour24: int | None
 
 
@@ -275,11 +341,11 @@ def _int(word: str) -> int | None:
     return int(word) if word.isdigit() else None
 
 
-def _hour24(hour12: int, ampm: str, phrase: tuple[str, ...]) -> int:
+def _hour24(hour12: int, ampm: Meridiem, phrase: tuple[str, ...]) -> int:
     # "12 at night" is midnight, not noon; every other pm phrase adds 12.
     if hour12 == 12:
-        return 0 if ampm == "am" or phrase == ("at", "night") else 12
-    return hour12 + (12 if ampm == "pm" else 0)
+        return 0 if ampm == Meridiem.AM or phrase == ("at", "night") else 12
+    return hour12 + (12 if ampm == Meridiem.PM else 0)
 
 
 def _times(words: tuple[str, ...], pos: int) -> list[_Time]:
@@ -288,9 +354,9 @@ def _times(words: tuple[str, ...], pos: int) -> list[_Time]:
     if pos >= len(words):
         return []
     if words[pos] == "noon":
-        return [_Time(pos + 1, 12, 0, "pm", 12)]
+        return [_Time(pos + 1, 12, 0, Meridiem.PM, 12)]
     if words[pos] == "midnight":
-        return [_Time(pos + 1, 12, 0, "am", 0)]
+        return [_Time(pos + 1, 12, 0, Meridiem.AM, 0)]
     hour = _int(words[pos])
     if hour is None or not 1 <= hour <= 12:
         return []
@@ -311,14 +377,14 @@ def _times(words: tuple[str, ...], pos: int) -> list[_Time]:
     return readings
 
 
-def _days(words: tuple[str, ...], pos: int) -> frozenset[str] | str | None | bool:
+def _days(words: tuple[str, ...], pos: int) -> frozenset[Weekday] | RelativeDay | Literal[False] | None:
     """Parse the §16.6 ``days`` tail from ``pos`` to the end; False if it is not one."""
 
     rest = words[pos:]
     if not rest:
         return None
     if rest in (("today",), ("tomorrow",)):
-        return rest[0]
+        return RelativeDay(rest[0])
     if rest in (("every", "day"), ("daily",)):
         return frozenset(_WEEKDAYS)
     if rest in (("weekdays",), ("on", "weekdays")):
@@ -327,7 +393,7 @@ def _days(words: tuple[str, ...], pos: int) -> frozenset[str] | str | None | boo
         return frozenset(_WEEKDAYS[5:])
     if rest[0] in {"every", "on"}:
         rest = rest[1:]
-    found: list[str] = []
+    found: list[Weekday] = []
     expect_day = True
     for word in rest:
         if word in _DAY_NAMES:
@@ -361,25 +427,25 @@ def _set_start(words: tuple[str, ...]) -> int | None:
 def _parse_alarm_words(words: tuple[str, ...]) -> AlarmParse | None:
     if words[:1] in (("cancel",), ("delete",), ("remove",)) and words[1:2] == ("all",):
         pos = 3 if words[2:3] in (("my",), ("the",)) else 2
-        return AlarmParse("cancel_all", None, None, None) if words[pos:] == ("alarms",) else None
+        return AlarmParse(AlarmAction.CANCEL_ALL, None, None, None) if words[pos:] == ("alarms",) else None
     start = _set_start(words)
     if start is not None:
         for time in _times(words, start):
             days = _days(words, time.end)
             if days is not False:
-                return AlarmParse("set", time.hour24, time.minute, days,
-                                  None if time.ampm else "ampm", time.hour12, time.ampm)
+                return AlarmParse(AlarmAction.SET, time.hour24, time.minute, days,
+                                  None if time.ampm else MissingSlot.AMPM, time.hour12, time.ampm)
         return None
     for verb in (("cancel",), ("delete",), ("remove",), ("turn", "off")):
         if words[: len(verb)] != verb:
             continue
         pos = len(verb) + (1 if words[len(verb) : len(verb) + 1] in (("my",), ("the",)) else 0)
         if words[pos:] == ("alarm",):
-            return AlarmParse("cancel", None, None, None)
+            return AlarmParse(AlarmAction.CANCEL, None, None, None)
         for time in _times(words, pos):
             if words[time.end :] == ("alarm",):
-                return AlarmParse("cancel", time.hour24, time.minute, None,
-                                  None if time.ampm else "ampm", time.hour12, time.ampm)
+                return AlarmParse(AlarmAction.CANCEL, time.hour24, time.minute, None,
+                                  None if time.ampm else MissingSlot.AMPM, time.hour12, time.ampm)
     return None
 
 
@@ -406,14 +472,15 @@ def _alarm_result(text: str) -> Result:
     words = tokens(text)
     parsed = _parse_alarm_words(words)
     if parsed is not None:
-        return Result(NEEDS_MORE if parsed.missing else COMPLETE, "alarm", parsed)
+        return Result(GrammarClass.NEEDS_MORE if parsed.missing else GrammarClass.COMPLETE,
+                      GrammarFamily.ALARM, parsed)
     anchored = "alarm" in words or words[:2] == ("wake", "me") or words[1:2] == ("all",)
     if anchored and any(
         (completed := _parse_alarm_words(words + tail)) is not None and completed.missing is None
         for tail in _ALARM_CONTINUATIONS
     ):
-        return Result(NEEDS_MORE, "alarm")
-    return Result(UNKNOWN, "alarm")
+        return Result(GrammarClass.NEEDS_MORE, GrammarFamily.ALARM)
+    return Result(GrammarClass.UNKNOWN, GrammarFamily.ALARM)
 
 
 def _local_syntax(text: str) -> Result:
@@ -422,13 +489,13 @@ def _local_syntax(text: str) -> Result:
     words = tokens(text)
     bare = words[1:] if words[:1] == ("please",) else words[:-1] if words[-1:] == ("please",) else words
     if bare in (("stop",), ("cancel",), ("snooze",)):
-        return Result(COMPLETE, "local", LocalParse(bare[0]))
+        return Result(GrammarClass.COMPLETE, GrammarFamily.LOCAL, LocalParse(LocalVerb(bare[0])))
     if bare[:2] == ("snooze", "for"):
         # "snooze for" (and a number awaiting its unit) needs more; any snooze
         # duration is not a local command and goes to HA.
         if len(bare) == 2 or (len(bare) == 3 and bare[2].isdigit()):
-            return Result(NEEDS_MORE, "local")
-        return Result(UNKNOWN, "local")
+            return Result(GrammarClass.NEEDS_MORE, GrammarFamily.LOCAL)
+        return Result(GrammarClass.UNKNOWN, GrammarFamily.LOCAL)
     body = words[:-1] if words[-1:] == ("please",) else words
     for action in (("turn", "off"), ("stop",), ("cancel",), ("dismiss",)):
         if body[: len(action)] != action:
@@ -437,14 +504,15 @@ def _local_syntax(text: str) -> Result:
         if rest[:1] == ("the",):
             rest = rest[1:]
         if not rest and body == words:
-            return Result(NEEDS_MORE, "local")
+            return Result(GrammarClass.NEEDS_MORE, GrammarFamily.LOCAL)
         if rest[-1:] in (("timer",), ("alarm",)):
             name = " ".join(rest[:-1]) or None
-            return Result(COMPLETE, "local", LocalParse(" ".join(action), rest[-1], name))
-    return Result(UNKNOWN, "local")
+            return Result(GrammarClass.COMPLETE, GrammarFamily.LOCAL,
+                          LocalParse(LocalVerb(" ".join(action)), RingKind(rest[-1]), name))
+    return Result(GrammarClass.UNKNOWN, GrammarFamily.LOCAL)
 
 
-def match_local_command(text: str, context: CommandContext | None) -> str | None:
+def match_local_command(text: str, context: CommandContext | None) -> LocalAction | None:
     """Return the §6.3 local action for ``text`` under ``context``, else None.
 
     ``"dismiss"`` (alert context: stop/cancel, or a noun form naming the
@@ -455,63 +523,67 @@ def match_local_command(text: str, context: CommandContext | None) -> str | None
     if context is None:
         return None
     result = _local_syntax(text)
-    if result.klass != COMPLETE:
+    parsed = result.parse
+    if result.klass != GrammarClass.COMPLETE or not isinstance(parsed, LocalParse):
         return None
-    parsed: LocalParse = result.parse
+    alert = context.kind == ContextKind.ALERT
     if parsed.kind is None:
-        if parsed.action in {"stop", "cancel"}:
-            return "dismiss" if context.kind == "alert" else "stop"
-        if parsed.action == "snooze" and context.kind == "alert" and context.alert_kind == "alarm":
-            return "snooze"
+        if parsed.action in {LocalVerb.STOP, LocalVerb.CANCEL}:
+            return LocalAction.DISMISS if alert else LocalAction.STOP
+        if parsed.action == LocalVerb.SNOOZE and alert and context.alert_kind == RingKind.ALARM:
+            return LocalAction.SNOOZE
         return None
-    if context.kind != "alert" or parsed.kind != context.alert_kind:
+    if not alert or parsed.kind != context.alert_kind:
         return None
     if parsed.name is not None and parsed.name != (normalize(context.name or "") or None):
         return None
-    return "dismiss"
+    return LocalAction.DISMISS
 
 
 def _home(text: str, vocabulary: Iterable[str]) -> Result:
     words = tokens(text)
     targets = {tokens(value): normalize(value) for value in vocabulary if normalize(value)}
     if not targets or not words:
-        return Result(UNKNOWN, "home")
-    candidates: list[tuple[str, tuple[str, ...]]] = []
+        return Result(GrammarClass.UNKNOWN, GrammarFamily.HOME)
+    candidates: list[tuple[HomeAction, tuple[str, ...]]] = []
     if len(words) >= 2 and words[0] in {"turn", "switch"} and words[1] in {"on", "off"}:
         pos = 2
         if pos < len(words) and words[pos] == "the":
             pos += 1
         if pos == len(words):
-            return Result(NEEDS_MORE, "home")
-        candidates.append((words[1], words[pos:]))
+            return Result(GrammarClass.NEEDS_MORE, GrammarFamily.HOME)
+        candidates.append((HomeAction(words[1]), words[pos:]))
     if len(words) >= 2 and words[-1] in {"on", "off"}:
-        candidates.append((words[-1], words[:-1]))
+        candidates.append((HomeAction(words[-1]), words[:-1]))
     for action, target in candidates:
         if target in targets:
             extendable = any(len(other) > len(target) and other[: len(target)] == target for other in targets)
-            klass = EXTENDABLE if extendable else COMPLETE
-            return Result(klass, "home", HomeParse(action, targets[target]))
+            klass = GrammarClass.EXTENDABLE if extendable else GrammarClass.COMPLETE
+            return Result(klass, GrammarFamily.HOME, HomeParse(action, targets[target]))
         if any(len(other) > len(target) and other[: len(target)] == target for other in targets):
-            return Result(NEEDS_MORE, "home")
+            return Result(GrammarClass.NEEDS_MORE, GrammarFamily.HOME)
     if words in targets or any(len(words) < len(target) and target[: len(words)] == words for target in targets):
         # A bare target still needs its "on"/"off"; a strict target prefix needs the rest.
-        return Result(NEEDS_MORE, "home")
-    return Result(UNKNOWN, "home")
+        return Result(GrammarClass.NEEDS_MORE, GrammarFamily.HOME)
+    return Result(GrammarClass.UNKNOWN, GrammarFamily.HOME)
 
 
-def _choice_items(choices: Sequence[Choice | Mapping[str, Any]] | None) -> tuple[Choice, ...]:
+def _choice_items(choices: Sequence[Choice | Mapping[str, object]] | None) -> tuple[Choice, ...]:
     if choices is None:
         return ()
     result = []
     for choice in choices:
         if isinstance(choice, Choice):
             result.append(choice)
-        else:
-            result.append(Choice(choice["value"], tuple(choice["aliases"])))
+            continue
+        aliases = choice["aliases"]
+        if not isinstance(aliases, (list, tuple)):
+            raise TypeError(f"choice aliases must be a list: {aliases!r}")
+        result.append(Choice(choice["value"], tuple(str(alias) for alias in aliases)))
     return tuple(result)
 
 
-def match_choice(text: str, choices: Sequence[Choice | Mapping[str, Any]]) -> Any | None:
+def match_choice(text: str, choices: Sequence[Choice | Mapping[str, object]]) -> object | None:
     """Return the unique choice value whose alias exactly equals the reply."""
 
     wanted = normalize(text)
@@ -519,61 +591,61 @@ def match_choice(text: str, choices: Sequence[Choice | Mapping[str, Any]]) -> An
     return next(iter(matches)) if len(matches) == 1 else None
 
 
-def _reply(text: str, choices: Sequence[Choice | Mapping[str, Any]] | None) -> Result:
+def _reply(text: str, choices: Sequence[Choice | Mapping[str, object]] | None) -> Result:
     items = _choice_items(choices)
     matched = match_choice(text, items)
     if matched is not None:
-        return Result(COMPLETE, "reply", matched)
+        return Result(GrammarClass.COMPLETE, GrammarFamily.REPLY, matched)
     words = tokens(text)
     if words and any(words == tokens(alias)[: len(words)] and len(words) < len(tokens(alias))
                      for choice in items for alias in choice.aliases):
-        return Result(NEEDS_MORE, "reply")
-    return Result(UNKNOWN, "reply")
+        return Result(GrammarClass.NEEDS_MORE, GrammarFamily.REPLY)
+    return Result(GrammarClass.UNKNOWN, GrammarFamily.REPLY)
 
 
-FAMILIES = ("reply", "alarm", "timer", "alarm_query", "home", "local")
-_RANK = {UNKNOWN: 0, NEEDS_MORE: 1, EXTENDABLE: 2, COMPLETE: 3}
+_RANK = {klass: rank for rank, klass in enumerate(GrammarClass)}
 
 
-def family_result(family: str, text: str, vocabulary: Iterable[str] = (),
-                  choices: Sequence[Choice | Mapping[str, Any]] | None = None) -> Result:
+def family_result(family: GrammarFamily, text: str, vocabulary: Iterable[str] = (),
+                  choices: Sequence[Choice | Mapping[str, object]] | None = None) -> Result:
     """Classify ``text`` against one family, including the terminal-token rule."""
 
-    if family == "reply":
+    if family == GrammarFamily.REPLY:
         result = _reply(text, choices)
-    elif family == "alarm":
+    elif family == GrammarFamily.ALARM:
         result = _alarm_result(text)
-    elif family == "timer":
+    elif family == GrammarFamily.TIMER:
         result = _timer(text, vocabulary)
-    elif family == "alarm_query":
+    elif family == GrammarFamily.ALARM_QUERY:
         parsed = parse_alarm_query(text)
-        result = Result(COMPLETE, "alarm_query", parsed) if parsed is not None else Result(UNKNOWN, "alarm_query")
-    elif family == "home":
+        result = (Result(GrammarClass.COMPLETE, GrammarFamily.ALARM_QUERY, parsed) if parsed is not None
+                  else Result(GrammarClass.UNKNOWN, GrammarFamily.ALARM_QUERY))
+    elif family == GrammarFamily.HOME:
         result = _home(text, vocabulary)
-    elif family == "local":
+    elif family == GrammarFamily.LOCAL:
         result = _local_syntax(text)
     else:
         raise ValueError(f"unknown grammar family: {family}")
     words = tokens(text)
-    if result.klass in {COMPLETE, EXTENDABLE} and words and words[-1] in _TERMINAL:
+    if result.klass in {GrammarClass.COMPLETE, GrammarClass.EXTENDABLE} and words and words[-1] in _TERMINAL:
         # §16.6 table: "<exposed target> on/off" is complete; its on/off is the
         # command itself, not a dangling preposition.
         if not (isinstance(result.parse, HomeParse) and words[-1] == result.parse.action):
-            return Result(NEEDS_MORE, result.family, result.parse)
+            return Result(GrammarClass.NEEDS_MORE, result.family, result.parse)
     return result
 
 
 def classify(text: str, vocabulary: Iterable[str] = (),
-             choices: Sequence[Choice | Mapping[str, Any]] | None = None) -> Result:
+             choices: Sequence[Choice | Mapping[str, object]] | None = None) -> Result:
     """Classify ``text`` across every §16.6 family; the strongest class wins.
 
-    Ties go to the first family in ``FAMILIES``. Reply matching needs the
+    Ties go to the first family in ``GrammarFamily`` order. Reply matching needs the
     expectation's ``choices``; ``vocabulary`` is the §16.7 target snapshot.
     """
 
     vocabulary = tuple(vocabulary)
-    best = Result(UNKNOWN)
-    for family in FAMILIES:
+    best = Result(GrammarClass.UNKNOWN)
+    for family in GrammarFamily:
         result = family_result(family, text, vocabulary, choices)
         if _RANK[result.klass] > _RANK[best.klass]:
             best = result
@@ -581,6 +653,6 @@ def classify(text: str, vocabulary: Iterable[str] = (),
 
 
 AMPM_CHOICES = (
-    Choice("am", ("am", "a m", "morning", "in the morning")),
-    Choice("pm", ("pm", "p m", "evening", "in the evening", "afternoon", "at night")),
+    Choice(Meridiem.AM, ("am", "a m", "morning", "in the morning")),
+    Choice(Meridiem.PM, ("pm", "p m", "evening", "in the evening", "afternoon", "at night")),
 )

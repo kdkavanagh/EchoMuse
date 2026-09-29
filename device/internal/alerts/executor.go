@@ -14,6 +14,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/wilbowes/EchoMuse/internal/assets"
+	"github.com/wilbowes/EchoMuse/internal/uuid"
 )
 
 const (
@@ -26,35 +29,124 @@ const (
 	// persistRetryNs spaces retries of operations whose persistence failed.
 	persistRetryNs = int64(5 * time.Second)
 
-	defaultBootIDPath = "/proc/sys/kernel/random/boot_id"
+	bootIDPath = "/proc/sys/kernel/random/boot_id"
 )
 
-// Local operation actions, expiry reasons and sources (WIRE alert.local_operation).
+// ReadBootID returns the kernel's ID for this boot, which scopes persisted
+// monotonic deadlines (SPEC §16.5).
+func ReadBootID() (string, error) {
+	b, err := os.ReadFile(bootIDPath)
+	if err != nil {
+		return "", fmt.Errorf("alerts: boot id: %w", err)
+	}
+	id := strings.TrimSpace(string(b))
+	if id == "" {
+		return "", errors.New("alerts: empty boot id")
+	}
+	return id, nil
+}
+
+// Kind is an alert kind: a cached occurrence is an alarm or a snooze child
+// (SPEC §16.4); a ring is an alarm or an HA timer (WIRE alert.state,
+// alert.ring_ended).
+type Kind string
+
 const (
-	actionDismiss = "dismiss"
-	actionSnooze  = "snooze"
-	actionExpire  = "expire"
-
-	reasonTimedOut = "timed_out"
-	reasonMissed   = "missed"
-
-	sourceExecutor = "executor"
+	KindAlarm  Kind = "alarm"
+	KindSnooze Kind = "snooze"
+	KindTimer  Kind = "timer"
 )
 
-// Ring-ended reasons (WIRE alert.ring_ended).
+// Action is a local operation action (WIRE alert.local_operation); alert.act
+// carries only dismiss or snooze.
+type Action string
+
 const (
-	endStopped = "stopped"
-	endButton  = "button"
-	endEntity  = "entity"
-	endLimit   = "limit"
-	endRestart = "restart"
+	ActionDismiss Action = "dismiss"
+	ActionSnooze  Action = "snooze"
+	ActionExpire  Action = "expire"
 )
 
-// Act result statuses (WIRE command.ack).
+// ExpireReason is the reason of an executor expiry (WIRE alert.local_operation).
+type ExpireReason string
+
 const (
-	StatusApplied  = "applied"
-	StatusDurable  = "durable"
-	StatusRejected = "rejected"
+	reasonTimedOut ExpireReason = "timed_out"
+	reasonMissed   ExpireReason = "missed"
+)
+
+// Source says who requested a local operation (WIRE alert.local_operation).
+type Source string
+
+const (
+	SourceButton    Source = "button"
+	SourceVoice     Source = "voice"
+	SourceEntity    Source = "entity"
+	SourceLLM       Source = "llm"
+	SourceDashboard Source = "dashboard"
+	SourceExecutor  Source = "executor"
+)
+
+// actSource reports whether s may request Act; executor is the device's own.
+func (s Source) actSource() bool {
+	switch s {
+	case SourceButton, SourceVoice, SourceEntity, SourceLLM, SourceDashboard:
+		return true
+	}
+	return false
+}
+
+// RingEndReason is the WIRE alert.ring_ended reason.
+type RingEndReason string
+
+const (
+	endStopped RingEndReason = "stopped"
+	endButton  RingEndReason = "button"
+	endEntity  RingEndReason = "entity"
+	endLimit   RingEndReason = "limit"
+	endRestart RingEndReason = "restart"
+)
+
+// Status is an Act result status (WIRE command.ack) and an alert.op_result
+// state (applied or rejected only).
+type Status string
+
+const (
+	StatusApplied  Status = "applied"
+	StatusDurable  Status = "durable"
+	StatusRejected Status = "rejected"
+)
+
+// ActError is an Act command.ack error code (WIRE alert.act).
+type ActError string
+
+const (
+	errInvalidOpID       ActError = "invalid_op_id"
+	errInvalidSource     ActError = "invalid_source"
+	errInvalidAction     ActError = "invalid_action"
+	errNotSnoozable      ActError = "not_snoozable"
+	errUnknownTarget     ActError = "unknown_target"
+	errAlreadyHandled    ActError = "already_handled"
+	errNotRinging        ActError = "not_ringing"
+	errClockUntrusted    ActError = "clock_untrusted"
+	errInvalidDueLocal   ActError = "invalid_due_local"
+	errPersistenceFailed ActError = "persistence_failed"
+)
+
+// StoreStatus is alert.state's store health.
+type StoreStatus string
+
+const (
+	storeOK      StoreStatus = "ok"
+	storeCorrupt StoreStatus = "corrupt"
+)
+
+// Wakeup is session.hello's alarm wakeup capability.
+type Wakeup string
+
+const (
+	wakeupOK          Wakeup = "ok"
+	wakeupUnavailable Wakeup = "alarm_wakeup_unavailable"
 )
 
 // EventSink receives executor-originated events. Methods are called from the
@@ -69,12 +161,11 @@ type EventSink interface {
 
 // Config configures an Executor. Zero values select the device defaults.
 type Config struct {
-	Root       string // alert store directory; default DefaultRoot
-	BootID     string // this boot's ID; default read from BootIDPath
-	BootIDPath string // default /proc/sys/kernel/random/boot_id
-	Clock      MonoClock
-	WakeLock   WakeLockPaths
-	Events     EventSink // required
+	Root     string // alert store directory; default DefaultRoot
+	BootID   string // this boot's ID (ReadBootID); required
+	Clock    MonoClock
+	WakeLock WakeLockPaths
+	Events   EventSink // required
 }
 
 // TimerRing is the WIRE alert.ring body (HA timers; never persisted).
@@ -88,17 +179,17 @@ type TimerRing struct {
 
 // AlertState is the WIRE alert.state body.
 type AlertState struct {
-	Active       *ActiveState `json:"active"`
-	Queue        []string     `json:"queue"`
-	ClockTrusted bool         `json:"clock_trusted"`
-	WakeLock     string       `json:"wakelock"`
-	Store        string       `json:"store"`
+	Active       *ActiveState   `json:"active"`
+	Queue        []string       `json:"queue"`
+	ClockTrusted bool           `json:"clock_trusted"`
+	WakeLock     WakeLockStatus `json:"wakelock"`
+	Store        StoreStatus    `json:"store"`
 }
 
 // ActiveState is the ringing or backgrounded alert of AlertState.
 type ActiveState struct {
 	ID             string `json:"id"`
-	Kind           string `json:"kind"` // alarm|timer
+	Kind           Kind   `json:"kind"` // alarm|timer
 	Name           string `json:"name"`
 	Foreground     bool   `json:"foreground"`
 	StartedMonoNs  string `json:"started_mono_ns"`
@@ -107,21 +198,21 @@ type ActiveState struct {
 
 // RingEnded is the WIRE alert.ring_ended body.
 type RingEnded struct {
-	ID     string `json:"id"`
-	Kind   string `json:"kind"`
-	Reason string `json:"reason"`
+	ID     string        `json:"id"`
+	Kind   Kind          `json:"kind"`
+	Reason RingEndReason `json:"reason"`
 }
 
 // LocalOperation is the WIRE alert.local_operation body.
 type LocalOperation struct {
-	OpID         string    `json:"op_id"`
-	Action       string    `json:"action"`
-	OccurrenceID string    `json:"occurrence_id"`
-	ScheduleID   string    `json:"schedule_id"`
-	Revision     uint64    `json:"revision"`
-	Reason       *string   `json:"reason"`
-	Source       string    `json:"source"`
-	Child        *ChildRef `json:"child,omitempty"`
+	OpID         string        `json:"op_id"`
+	Action       Action        `json:"action"`
+	OccurrenceID string        `json:"occurrence_id"`
+	ScheduleID   string        `json:"schedule_id"`
+	Revision     uint64        `json:"revision"`
+	Reason       *ExpireReason `json:"reason"`
+	Source       Source        `json:"source"`
+	Child        *ChildRef     `json:"child,omitempty"`
 }
 
 // ChildRef is the snooze child of a snooze LocalOperation.
@@ -135,7 +226,7 @@ type ChildRef struct {
 // OpResult is the WIRE alert.op_result body.
 type OpResult struct {
 	OpID  string  `json:"op_id"`
-	State string  `json:"state"` // applied|rejected
+	State Status  `json:"state"` // applied|rejected
 	Error *string `json:"error"`
 }
 
@@ -145,7 +236,7 @@ type OpResult struct {
 type AlertFocus struct {
 	Active     bool
 	ID         string
-	Kind       string
+	Kind       Kind
 	Foreground bool
 	Volume     *float64
 }
@@ -157,8 +248,8 @@ type AlertFocus struct {
 // Operation as alert.local_operation, then Ended as alert.ring_ended.
 type ActResult struct {
 	OpID      string
-	Status    string
-	Error     string
+	Status    Status
+	Error     ActError
 	Operation *LocalOperation
 	Ended     *RingEnded
 }
@@ -186,7 +277,7 @@ type ClockInfo struct {
 type HelloAlerts struct {
 	DeliveryEpoch *string `json:"delivery_epoch"`
 	AckedSequence uint64  `json:"acked_sequence"`
-	Wakeup        string  `json:"wakeup"` // ok|alarm_wakeup_unavailable
+	Wakeup        Wakeup  `json:"wakeup"`
 }
 
 // Executor owns the durable alert cache, the local ring queue, and the alert
@@ -228,11 +319,12 @@ type timerRing struct {
 }
 
 type activeRing struct {
-	id, kind, name string
-	volume         *float64
-	startedNs      int64
-	deadlineNs     int64
-	occ            *occurrence // nil for a timer
+	id, name   string
+	kind       Kind
+	volume     *float64
+	startedNs  int64
+	deadlineNs int64
+	occ        *occurrence // nil for a timer
 }
 
 type volatileOp struct {
@@ -250,18 +342,7 @@ func NewExecutor(cfg Config) (*Executor, error) {
 	}
 	bootID := cfg.BootID
 	if bootID == "" {
-		path := cfg.BootIDPath
-		if path == "" {
-			path = defaultBootIDPath
-		}
-		b, err := os.ReadFile(path)
-		if err != nil {
-			return nil, fmt.Errorf("alerts: boot id: %w", err)
-		}
-		bootID = strings.TrimSpace(string(b))
-	}
-	if bootID == "" {
-		return nil, errors.New("alerts: empty boot id")
+		return nil, errors.New("alerts: Config.BootID is required")
 	}
 	mono := cfg.Clock
 	if mono == nil {
@@ -348,7 +429,7 @@ func (e *Executor) Poll() {
 			op := e.expireLocked(c.occ, reason)
 			ev.ops = append(ev.ops, wireOp(op))
 			if c.ring != nil {
-				ev.ended = append(ev.ended, RingEnded{ID: c.id, Kind: kindAlarm, Reason: endRestart})
+				ev.ended = append(ev.ended, RingEnded{ID: c.id, Kind: KindAlarm, Reason: endRestart})
 			}
 			continue
 		}
@@ -385,14 +466,14 @@ func (e *Executor) checkActiveLocked(now int64, ev *pollEvents) {
 		if now >= a.deadlineNs {
 			delete(e.timers, a.id)
 			e.endActiveLocked()
-			ev.ended = append(ev.ended, RingEnded{ID: a.id, Kind: kindTimer, Reason: endLimit})
+			ev.ended = append(ev.ended, RingEnded{ID: a.id, Kind: KindTimer, Reason: endLimit})
 		}
 		return
 	}
 	o := e.currentOccurrenceLocked(a.occ)
 	if o == nil || !e.executableLocked(o) {
 		e.endActiveLocked()
-		ev.ended = append(ev.ended, RingEnded{ID: a.id, Kind: kindAlarm, Reason: endStopped})
+		ev.ended = append(ev.ended, RingEnded{ID: a.id, Kind: KindAlarm, Reason: endStopped})
 		return
 	}
 	a.id, a.occ, a.name, a.volume = o.OccurrenceID, o, o.Label, o.Volume
@@ -400,7 +481,7 @@ func (e *Executor) checkActiveLocked(now int64, ev *pollEvents) {
 		op := e.expireLocked(o, reasonTimedOut)
 		ev.ops = append(ev.ops, wireOp(op))
 		e.endActiveLocked()
-		ev.ended = append(ev.ended, RingEnded{ID: a.id, Kind: kindAlarm, Reason: endLimit})
+		ev.ended = append(ev.ended, RingEnded{ID: a.id, Kind: KindAlarm, Reason: endLimit})
 	}
 }
 
@@ -492,7 +573,7 @@ func (e *Executor) alarmCandidateLocked(o *occurrence) *candidate {
 // expiryLocked returns the expire reason for an alarm at the head of the
 // queue: its original ring deadline passed (restart never grants another full
 // ring), or it never rang and is past the catch-up window.
-func (e *Executor) expiryLocked(c *candidate, now int64) string {
+func (e *Executor) expiryLocked(c *candidate, now int64) ExpireReason {
 	if c.occ == nil {
 		return ""
 	}
@@ -521,12 +602,12 @@ func (e *Executor) startLocked(c *candidate, now int64) {
 	a := &activeRing{id: c.id, startedNs: now}
 	v := &voice{id: c.id}
 	if t := c.timer; t != nil {
-		a.kind, a.name = kindTimer, t.Name
+		a.kind, a.name = KindTimer, t.Name
 		a.deadlineNs = now + t.MaxRingMs*int64(time.Millisecond)
 		v.pcm, v.gap = e.soundLocked(t.Sound, t.LoopGapMs)
 	} else {
 		o := c.occ
-		a.kind, a.name, a.volume, a.occ = kindAlarm, o.Label, o.Volume, o
+		a.kind, a.name, a.volume, a.occ = KindAlarm, o.Label, o.Volume, o
 		if r := c.ring; r != nil {
 			a.startedNs, _ = e.ringMonoLocked(r.BootID, r.FirstMonoNs, r.FirstUTCMs)
 			a.deadlineNs, _ = e.ringMonoLocked(r.BootID, r.DeadlineMonoNs, r.DeadlineUTCMs)
@@ -559,6 +640,37 @@ func (e *Executor) soundLocked(sound string, loopGapMs int64) ([]int16, int64) {
 	return FallbackPCM(), 0
 }
 
+// cachedSound returns the validated PCM of an installed alert sound, nil for
+// the fallback or an unavailable asset. A miss is read and admitted without
+// the executor lock, so a timer ring or preview never holds Poll's due
+// deadlines behind a WAV read (§16.5).
+func (e *Executor) cachedSound(sound string) []int16 {
+	if sound == SoundFallback || !assets.IsSHA256(sound) {
+		return nil
+	}
+	e.mu.Lock()
+	pcm := e.sounds[sound]
+	e.mu.Unlock()
+	if pcm != nil {
+		return pcm
+	}
+	pcm, err := readAsset(e.assetPath(sound), sound)
+	if err != nil {
+		return nil
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if cur := e.sounds[sound]; cur != nil {
+		return cur
+	}
+	e.sounds[sound] = pcm
+	return pcm
+}
+
+// cacheSoundLocked admits an installed sound with e.mu held: while the
+// executor is being built, and after alert.delta / the final alert.snapshot
+// page commit. Those delivery paths already hold the lock across their
+// durable journal commit, so the WAV read adds to I/O done under it anyway.
 func (e *Executor) cacheSoundLocked(sound string) {
 	if sound == SoundFallback || e.sounds[sound] != nil {
 		return
@@ -571,7 +683,7 @@ func (e *Executor) cacheSoundLocked(sound string) {
 // AssetInstalled validates and admits an alert WAV after the asset fetcher has
 // atomically installed it. Invalid files remain unavailable and use fallback.
 func (e *Executor) AssetInstalled(sha string) error {
-	if !validSHA256(sha) {
+	if !assets.IsSHA256(sha) {
 		return errors.New("alerts: invalid asset hash")
 	}
 	pcm, err := readAsset(e.assetPath(sha), sha)
@@ -584,8 +696,17 @@ func (e *Executor) AssetInstalled(sha string) error {
 	return nil
 }
 
+// AssetExt is the extension of an installed alert sound, <sha256>.wav (§16.5).
+const AssetExt = "wav"
+
+// AssetDir is where the asset fetcher installs alert sounds for the alert
+// store at root.
+func AssetDir(root string) string {
+	return filepath.Join(root, "assets")
+}
+
 func (e *Executor) assetPath(sha string) string {
-	return filepath.Join(e.root, "assets", sha+".wav")
+	return filepath.Join(AssetDir(e.root), sha+"."+AssetExt)
 }
 
 // armedLocked lists every occurrence that may still ring: delivered or local
@@ -649,7 +770,7 @@ func (e *Executor) findLocked(id string) *occurrence {
 	return nil
 }
 
-func (e *Executor) newOpLocked(opID string, o *occurrence, action, source string) *localOp {
+func (e *Executor) newOpLocked(opID string, o *occurrence, action Action, source Source) *localOp {
 	e.nextSeq++
 	return &localOp{
 		Seq: e.nextSeq, OpID: opID, Action: action,
@@ -694,8 +815,8 @@ func (e *Executor) retryVolatileLocked(now int64) {
 	e.volatileOps = kept
 }
 
-func (e *Executor) expireLocked(o *occurrence, reason string) *localOp {
-	op := e.newOpLocked(NewUUID4().String(), o, actionExpire, sourceExecutor)
+func (e *Executor) expireLocked(o *occurrence, reason ExpireReason) *localOp {
+	op := e.newOpLocked(uuid.NewV4().String(), o, ActionExpire, SourceExecutor)
 	op.Reason = &reason
 	_ = e.persistOpLocked(op, o, nil)
 	return op
@@ -729,9 +850,9 @@ func (e *Executor) reconcileWakeLockLocked() {
 }
 
 func (e *Executor) stateLocked() AlertState {
-	s := AlertState{Queue: []string{}, ClockTrusted: e.clock.trusted, WakeLock: e.wake.status(), Store: "ok"}
+	s := AlertState{Queue: []string{}, ClockTrusted: e.clock.trusted, WakeLock: e.wake.status(), Store: storeOK}
 	if e.st.st.corrupt {
-		s.Store = "corrupt"
+		s.Store = storeCorrupt
 	}
 	if a := e.active; a != nil {
 		s.Active = &ActiveState{
@@ -815,9 +936,9 @@ func (e *Executor) HandleTimerRing(r TimerRing) error {
 	if r.RingID == "" || !validSound(r.Sound) || r.LoopGapMs < 0 || r.MaxRingMs <= 0 {
 		return errors.New("alerts: invalid alert.ring")
 	}
+	e.cachedSound(r.Sound)
 	e.mu.Lock()
 	arrived := e.mono.MonoNowNs()
-	e.cacheSoundLocked(r.Sound)
 	if e.timers[r.RingID] == nil && (e.active == nil || e.active.id != r.RingID) {
 		e.timers[r.RingID] = &timerRing{TimerRing: r, arrivedNs: arrived}
 	}
@@ -835,24 +956,22 @@ func (e *Executor) HandleTimerRing(r TimerRing) error {
 // 10 ms, then journals the operation, with a snooze's child in the same
 // transaction, before reporting StatusDurable (SPEC §10.7). Snooze applies
 // only to a ringing alarm. A timer ring is stopped without persistence.
-func (e *Executor) Act(opID, targetID, action, source string) ActResult {
+func (e *Executor) Act(opID, targetID string, action Action, source Source) ActResult {
 	if opID == "" {
-		opID = NewUUID4().String()
+		opID = uuid.NewV4().String()
 	}
 	res := ActResult{OpID: opID, Status: StatusRejected}
-	u, err := ParseUUID(opID)
+	u, err := uuid.Parse(opID)
 	if err != nil || u.String() != opID || u[8]>>6 != 2 {
-		res.Error = "invalid_op_id"
+		res.Error = errInvalidOpID
 		return res
 	}
-	switch source {
-	case "button", "voice", "entity", "llm", "dashboard":
-	default:
-		res.Error = "invalid_source"
+	if !source.actSource() {
+		res.Error = errInvalidSource
 		return res
 	}
-	if action != actionDismiss && action != actionSnooze {
-		res.Error = "invalid_action"
+	if action != ActionDismiss && action != ActionSnooze {
+		res.Error = errInvalidAction
 		return res
 	}
 	e.mu.Lock()
@@ -869,7 +988,7 @@ func (e *Executor) Act(opID, targetID, action, source string) ActResult {
 	}
 	for _, v := range e.volatileOps {
 		if v.op.OpID == opID {
-			res.Status, res.Error = StatusApplied, "persistence_failed"
+			res.Status, res.Error = StatusApplied, errPersistenceFailed
 			if v.op.Result == nil {
 				w := wireOp(v.op)
 				res.Operation = &w
@@ -879,14 +998,14 @@ func (e *Executor) Act(opID, targetID, action, source string) ActResult {
 	}
 	isActive := e.active != nil && e.active.id == targetID
 	if t := e.timers[targetID]; t != nil {
-		if action == actionSnooze {
-			res.Error = "not_snoozable"
+		if action == ActionSnooze {
+			res.Error = errNotSnoozable
 			return res
 		}
 		delete(e.timers, targetID)
 		if isActive {
 			e.endActiveLocked()
-			res.Ended = &RingEnded{ID: targetID, Kind: kindTimer, Reason: ringEndReason(source)}
+			res.Ended = &RingEnded{ID: targetID, Kind: KindTimer, Reason: ringEndReason(source)}
 		}
 		res.Status = StatusApplied
 		e.reconcileWakeLockLocked()
@@ -895,31 +1014,31 @@ func (e *Executor) Act(opID, targetID, action, source string) ActResult {
 	o := e.findLocked(targetID)
 	switch {
 	case o == nil:
-		res.Error = "unknown_target"
+		res.Error = errUnknownTarget
 		return res
 	case !e.executableLocked(o):
-		res.Error = "already_handled"
+		res.Error = errAlreadyHandled
 		return res
-	case action == actionSnooze && !isActive:
-		res.Error = "not_ringing"
+	case action == ActionSnooze && !isActive:
+		res.Error = errNotRinging
 		return res
 	}
 	var child *occurrence
-	if action == actionSnooze {
+	if action == ActionSnooze {
 		press, ok := e.clock.utcNowMs()
 		if !ok {
-			res.Error = "clock_untrusted"
+			res.Error = errClockUntrusted
 			return res
 		}
 		var err error
 		if child, err = snoozeChild(o, press); err != nil {
-			res.Error = "invalid_due_local"
+			res.Error = errInvalidDueLocal
 			return res
 		}
 	}
 	if isActive {
 		e.endActiveLocked()
-		res.Ended = &RingEnded{ID: targetID, Kind: kindAlarm, Reason: ringEndReason(source)}
+		res.Ended = &RingEnded{ID: targetID, Kind: KindAlarm, Reason: ringEndReason(source)}
 	}
 	op := e.newOpLocked(opID, o, action, source)
 	if child != nil {
@@ -927,7 +1046,7 @@ func (e *Executor) Act(opID, targetID, action, source string) ActResult {
 			DueUTCMs: child.DueUTCMs, DueLocal: child.DueLocal}
 	}
 	if err := e.persistOpLocked(op, o, child); err != nil {
-		res.Status, res.Error = StatusApplied, "persistence_failed"
+		res.Status, res.Error = StatusApplied, errPersistenceFailed
 	} else {
 		res.Status = StatusDurable
 	}
@@ -937,11 +1056,16 @@ func (e *Executor) Act(opID, targetID, action, source string) ActResult {
 	return res
 }
 
-func ringEndReason(source string) string {
-	if source == endButton || source == endEntity {
-		return source
+// ringEndReason is the alert.ring_ended reason of a stop requested by source.
+func ringEndReason(source Source) RingEndReason {
+	switch source {
+	case SourceButton:
+		return endButton
+	case SourceEntity:
+		return endEntity
+	default:
+		return endStopped
 	}
-	return endStopped
 }
 
 // PendingOperations returns every operation the controller has not answered,
@@ -1079,13 +1203,13 @@ func (e *Executor) UTCNowMs() (int64, bool) {
 func (e *Executor) Hello() HelloAlerts {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	h := HelloAlerts{AckedSequence: e.st.st.acked, Wakeup: "ok"}
+	h := HelloAlerts{AckedSequence: e.st.st.acked, Wakeup: wakeupOK}
 	if e.st.st.epoch != nil && !e.st.st.corrupt {
 		epoch := *e.st.st.epoch
 		h.DeliveryEpoch = &epoch
 	}
 	if e.wake.unavailable {
-		h.Wakeup = "alarm_wakeup_unavailable"
+		h.Wakeup = wakeupUnavailable
 	}
 	return h
 }
@@ -1102,25 +1226,24 @@ func (e *Executor) CacheCapable() bool {
 // installed under <root>/assets, for background fetching.
 func (e *Executor) MissingSounds() []string {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	seen := map[string]bool{}
-	var out []string
+	var uncached []string
 	for _, o := range e.armedLocked() {
 		if o.Sound == SoundFallback || seen[o.Sound] || e.sounds[o.Sound] != nil {
 			continue
 		}
 		seen[o.Sound] = true
-		if _, err := os.Stat(e.assetPath(o.Sound)); err != nil {
-			out = append(out, o.Sound)
+		uncached = append(uncached, o.Sound)
+	}
+	e.mu.Unlock()
+	var out []string
+	for _, sound := range uncached {
+		if _, err := os.Stat(e.assetPath(sound)); err != nil {
+			out = append(out, sound)
 		}
 	}
 	sort.Strings(out)
 	return out
-}
-
-// AssetDir is where the asset fetcher installs alert sounds as <sha256>.wav.
-func (e *Executor) AssetDir() string {
-	return filepath.Join(e.root, "assets")
 }
 
 // Close silences the source, releases the wakelock (clean shutdown), and

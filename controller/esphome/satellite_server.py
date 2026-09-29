@@ -27,12 +27,14 @@ Differences from the reference implementation, intentional:
 from __future__ import annotations
 
 import asyncio
+import enum
 import logging
-from abc import abstractmethod
-from typing import Iterable, Optional
+from collections.abc import Callable, Iterator
+
+from google.protobuf.message import Message
 
 import esphome.message_registry as registry
-from esphome.frame_protocol import FrameProtocolError, PlaintextFrameProtocol
+from esphome.frame_protocol import PlaintextFrameProtocol
 from esphome.vendor import api_pb2
 
 log = logging.getLogger("echomuse.esphome.satellite")
@@ -42,6 +44,13 @@ log = logging.getLogger("echomuse.esphome.satellite")
 # than guessing keeps us behaving like hardware HA already knows how to talk to.
 API_VERSION_MAJOR = 1
 API_VERSION_MINOR = 10
+
+
+class Handled(enum.Enum):
+    """Sentinel type for ``HANDLED``."""
+
+    HANDLED = enum.auto()
+
 
 # Sentinel yielded by handle_message() subclass implementations that handle
 # a message but have nothing to send in response. Distinguishes "handled,
@@ -54,7 +63,9 @@ API_VERSION_MINOR = 10
 #       do_work()
 #       yield HANDLED
 #       return
-_HANDLED = object()
+HANDLED = Handled.HANDLED
+
+Reply = Message | Handled
 
 
 class SatelliteServerProtocol(PlaintextFrameProtocol):
@@ -67,19 +78,12 @@ class SatelliteServerProtocol(PlaintextFrameProtocol):
     """
 
     def __init__(self, server_name: str, log_name: str = "esphome") -> None:
-        super().__init__(
-            on_packet=self._on_packet,
-            on_connected=None,
-            on_disconnected=self._on_disconnected_internal,
-            log_name=log_name,
-        )
+        super().__init__(log_name=log_name)
         self.server_name = server_name
-        self._disconnected_hook: Optional[callable] = None
 
     # ── Required override ───────────────────────────────────────────────
 
-    @abstractmethod
-    def handle_message(self, msg) -> Iterable:
+    def handle_message(self, msg: Message) -> Iterator[Reply]:
         """
         Handle any message not covered by the base handshake.
 
@@ -88,11 +92,11 @@ class SatelliteServerProtocol(PlaintextFrameProtocol):
         reference implementation's generator-based style (cheap to extend
         without restructuring callers).
         """
-        return iter(())
+        raise NotImplementedError
 
     # ── Packet dispatch ──────────────────────────────────────────────────
 
-    def _on_packet(self, proto, msg_type: int, payload: bytes) -> None:
+    def packet_received(self, msg_type: int, payload: bytes) -> None:
         try:
             msg = registry.decode(msg_type, payload)
         except KeyError:
@@ -111,7 +115,7 @@ class SatelliteServerProtocol(PlaintextFrameProtocol):
 
         self._process_message(msg)
 
-    def _process_message(self, msg) -> None:
+    def _process_message(self, msg: Message) -> None:
         if isinstance(msg, api_pb2.HelloRequest):
             log.info(
                 f"[{self._log_name}] {self.peer}: Hello from "
@@ -151,19 +155,19 @@ class SatelliteServerProtocol(PlaintextFrameProtocol):
 
         try:
             responses = list(self.handle_message(msg))
-        except Exception as e:
-            log.error(
+        except Exception:
+            log.exception(
                 f"[{self._log_name}] {self.peer}: handle_message raised for "
-                f"{type(msg).__name__}: {e}"
+                f"{type(msg).__name__}"
             )
             return
 
-        # Filter out _HANDLED sentinels before deciding what to send.
-        # A subclass yields _HANDLED to signal "I dealt with this, nothing
+        # Filter out HANDLED sentinels before deciding what to send.
+        # A subclass yields HANDLED to signal "I dealt with this, nothing
         # to send" — distinct from an empty list which means the message
         # wasn't recognised at all.
-        was_handled = any(r is _HANDLED for r in responses)
-        to_send = [r for r in responses if r is not _HANDLED]
+        was_handled = any(r is HANDLED for r in responses)
+        to_send = [r for r in responses if not isinstance(r, Handled)]
 
         if to_send:
             self._send_many(to_send)
@@ -175,23 +179,29 @@ class SatelliteServerProtocol(PlaintextFrameProtocol):
 
     # ── Sending ──────────────────────────────────────────────────────────
 
-    def _send_one(self, msg) -> None:
+    def _send_one(self, msg: Message) -> None:
         msg_type, payload = registry.encode(msg)
         self.send_packet(msg_type, payload)
 
-    def _send_many(self, msgs) -> None:
+    def _send_many(self, msgs: list[Message]) -> None:
         packets = [registry.encode(m) for m in msgs]
         self.send_packets(packets)
 
-    # ── Lifecycle ────────────────────────────────────────────────────────
 
-    def _on_disconnected_internal(self, proto) -> None:
-        if self._disconnected_hook:
-            self._disconnected_hook(self)
+class RejectProtocol(SatelliteServerProtocol):
+    """A second HA claimant on a single-claimant port: answers the handshake
+    (Hello is base-handled), then closes on its first real request."""
+
+    def __init__(self) -> None:
+        super().__init__(server_name="reject", log_name="esphome.reject")
+
+    def handle_message(self, msg: Message) -> Iterator[Reply]:
+        self.close()
+        yield HANDLED
 
 
 async def serve(
-    protocol_factory,
+    protocol_factory: Callable[[], SatelliteServerProtocol],
     host: str,
     port: int,
 ) -> asyncio.AbstractServer:
@@ -202,7 +212,7 @@ async def serve(
     One call per device port (ESPHOME_SPEC.md §2.1 — per-device listener,
     not a shared/multiplexed port).
     """
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     server = await loop.create_server(protocol_factory, host, port)
     log.info(f"ESPHome satellite server listening on {host}:{port}")
     return server

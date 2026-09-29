@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 
 import em_speech_worker as sw
-from em_audio_timeline import SampleTimeline, ReferenceTimeline
+from em_audio_timeline import ReferenceTimeline, SampleTimeline, StreamId
 
 ROOT = Path(__file__).resolve().parents[2]
 CONTROLLER = ROOT / "controller"
@@ -34,6 +34,21 @@ def test_evidence_copy_is_times_ten_clamped_to_int16():
     out = sw.evidence_copy(pcm)
     assert out.dtype == np.int16
     assert out.tolist() == [0, 10, -10, 32760, 32767, -32768, 32767, -32768]
+
+
+def test_observations_with_a_callback_are_not_also_queued():
+    """The controller consumes observations through `on_observation` and never reads the
+    queue; buffering them there as well kept every VAD/ASR/echo result for the process lifetime."""
+    got = []
+
+    async def main():
+        w = sw.SpeechWorker(None, on_observation=got.append)
+        await w._emit(sw.Observation("dev", 7, StreamId.MIC, sw.ObservationSource.CONTROLLER,
+                                     sw.ObservationKind.VAD, 512, None, None, None,
+                                     sw.VadPayload(0, (0.1,)), 0, "L"))
+        return w.observations.qsize()
+
+    assert asyncio.run(main()) == 0 and len(got) == 1
 
 
 @pytest.fixture(scope="module")

@@ -26,8 +26,8 @@ class Sink:
         self.link = link
         self.ready.set()
 
-    def on_message(self, msg_type, envelope):
-        self.messages.append((msg_type, envelope))
+    def on_message(self, envelope):
+        self.messages.append((envelope.type, envelope))
 
     def on_audio(self, frame):
         if self.fail_audio:
@@ -89,21 +89,31 @@ async def recv_type(ws, wanted):
             return msg
 
 
+def grant(capture_permitted=True):
+    return dl.ReadyGrant(
+        capture_permitted=capture_permitted,
+        assets=em_device_assets.SpeechAssets("r", "g", "s"),
+        detector=dl.DetectorConfig(dl.DetectorThresholds(0.9, 0.65, 0.17),
+                                   dl.ProvisionalDuck(-18.0)))
+
+
 async def start_server(hub, assets=None, timing=dl.DEFAULT_TIMING):
+    links = dl.LinkRegistry()
+
     async def route(ws):
         path = ws.request.path.split("?", 1)[0]
         if path == dl.CONTROL_PATH:
-            await dl.serve_control(ws, secure=False, hub=hub, timing=timing)
+            await dl.serve_control(ws, secure=False, hub=hub, links=links, timing=timing)
         elif path == dl.AUDIO_PATH:
-            await dl.serve_audio(ws, secure=False)
+            await dl.serve_audio(ws, secure=False, links=links)
         elif path == dl.ASSETS_PATH:
-            await dl.serve_assets(ws, secure=False, assets=assets)
+            await dl.serve_assets(ws, secure=False, links=links, assets=assets)
         else:
             await ws.close()
 
     server = await websockets.serve(
         route, "127.0.0.1", 0, compression=None,
-        process_request=dl.process_request, max_size=1024 * 1024,
+        process_request=links.process_request, max_size=1024 * 1024,
     )
     port = server.sockets[0].getsockname()[1]
     return server, f"ws://127.0.0.1:{port}"
@@ -126,25 +136,27 @@ async def connect_control(base, *, token="token", device_id="device-1"):
 def test_admit_ready_and_reject():
     async def run():
         sink = Sink()
-        hub = Hub(dl.Admitted({"capture_permitted": True}, sink))
+        hub = Hub(dl.Admitted(grant(), sink))
         server, base = await start_server(hub)
         try:
             control, ready, hello = await connect_control(base)
             await sink.ready.wait()
-            assert hub.calls == [(hello, {
+            assert hub.calls == [(dl.SessionHello.parse(hello), {
                 "device_id": "device-1", "peer_ip": "127.0.0.1",
                 "secure": False, "token": "token",
             })]
             assert ready["body"]["protocol"] == 1
             assert ready["body"]["capture_permitted"] is True
+            assert ready["body"]["detector"]["provisional_duck"] == {
+                "duck_db": -18.0, "max_per_window": 2, "window_ms": 5000}
             assert ready["body"]["session_id"] == sink.link.session_id
             assert ready["body"]["server_boot_id"] == dl.SERVER_BOOT_ID
             tl.parse_u64(ready["body"]["utc_ms"], "utc_ms")
-            assert sink.link.hello == hello
+            assert sink.link.hello == dl.SessionHello.parse(hello)
             assert sink.link.capabilities == frozenset(hello["capabilities"])
             await control.close()
 
-            rejected = Hub(dl.Rejected("pending_approval"))
+            rejected = Hub(dl.Rejected(dl.RejectReason.PENDING_APPROVAL))
             server.close()
             await server.wait_closed()
             server, base = await start_server(rejected)
@@ -167,7 +179,7 @@ def test_heartbeat_degraded_and_session_lost():
         timing = dl.Timing(heartbeat_s=0.01, degraded_s=0.04, lost_s=0.08,
                            hello_timeout_s=1.0, audio_attach_s=1.0)
         server, base = await start_server(
-            Hub(dl.Admitted({"capture_permitted": True}, sink)), timing=timing)
+            Hub(dl.Admitted(grant(), sink)), timing=timing)
         try:
             control, _, _ = await connect_control(base)
             await sink.ready.wait()
@@ -188,21 +200,19 @@ def test_heartbeat_degraded_and_session_lost():
 def test_request_ack_correlation_and_clock_reply():
     async def run():
         sink = Sink()
-        server, base = await start_server(Hub(dl.Admitted({}, sink)))
+        server, base = await start_server(Hub(dl.Admitted(grant(), sink)))
         try:
             control, ready, _ = await connect_control(base)
             await sink.ready.wait()
             session_id = ready["body"]["session_id"]
             pending = asyncio.create_task(
-                sink.link.request("focus.acquire", {"lease_id": "lease"}, generation=4))
+                sink.link.request(dl.MessageType.FOCUS_ACQUIRE, {"lease_id": "lease"}, generation=4))
             command = await recv_type(control, "focus.acquire")
             await control.send(envelope(
                 "command.ack", session_id=session_id,
                 body={"message_id": command["message_id"], "status": "accepted", "error": None},
             ))
-            assert await pending == {
-                "message_id": command["message_id"], "status": "accepted", "error": None,
-            }
+            assert await pending == dl.CommandAck(command["message_id"], dl.AckStatus.ACCEPTED, None)
             assert sink.messages == []
 
             await control.send(envelope(
@@ -238,7 +248,7 @@ def test_request_ack_correlation_and_clock_reply():
 def test_audio_binding_and_protocol_error():
     async def run():
         sink = Sink()
-        server, base = await start_server(Hub(dl.Admitted({}, sink)))
+        server, base = await start_server(Hub(dl.Admitted(grant(), sink)))
         try:
             control, ready, _ = await connect_control(base)
             await sink.ready.wait()
@@ -284,7 +294,7 @@ def test_assets_resume_not_found_and_second_request_closes(tmp_path):
         sha = "a" * 64
         assets = Assets(sha, path)
         sink = Sink()
-        server, base = await start_server(Hub(dl.Admitted({}, sink)), assets)
+        server, base = await start_server(Hub(dl.Admitted(grant(), sink)), assets)
         try:
             control, ready, _ = await connect_control(base)
             session_id = ready["body"]["session_id"]

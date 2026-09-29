@@ -557,7 +557,7 @@ Set once on the server; a change needs a controller restart.
 
 | Variable | Default | What it is |
 |---|---|---|
-| `SERVER_IP` | — | The controller's LAN IP, advertised over mDNS; devices connect here. |
+| `SERVER_IP` | detected | The controller's LAN IP, advertised over mDNS; devices connect here. Unset, the controller advertises the address of the interface holding its default route and logs a warning; set it when that is not the address the Dots should use. |
 | `HA_URL` | — | Home Assistant's base URL, for example `http://homeassistant.local:8123`. |
 | `HA_TOKEN` | — | A long-lived access token for a Home Assistant **administrator** (Profile → Security). Administrator rights are needed to create the calendars and scripts and to receive the scripts' requests. |
 | `DEVICE_APPROVAL` | `strict` | `strict`: an administrator approves each new device. `auto`: new devices are approved as `Unknown` plus the first 8 characters of their serial. See the note below. |

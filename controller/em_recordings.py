@@ -35,6 +35,8 @@ import re
 import wave
 from pathlib import Path
 
+from em_samples import safe_device_id    # one definition of a device path component
+
 log = logging.getLogger("echomuse.recordings")
 
 RECORDINGS_SUBDIR = "recordings"
@@ -69,13 +71,6 @@ def recordings_dir(db_path: str | None = None) -> Path:
     if db_path is None:
         db_path = os.environ.get("DB_PATH", "echomuse.db")
     return (Path(db_path).resolve().parent / RECORDINGS_SUBDIR)
-
-
-def safe_device_id(device_id: str) -> str | None:
-    """The device id as a path component, or None if it isn't one."""
-    if device_id and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", device_id):
-        return device_id
-    return None
 
 
 def filename(device_id: str, turn_id: int) -> str | None:

@@ -19,13 +19,17 @@ import (
 	"github.com/wilbowes/EchoMuse/internal/audio/ema"
 	"github.com/wilbowes/EchoMuse/internal/discovery"
 	"github.com/wilbowes/EchoMuse/internal/proto"
+	"github.com/wilbowes/EchoMuse/internal/uuid"
 )
+
+// LostReason says why a session ended (Handler.Lost).
+type LostReason string
 
 // Session loss reasons passed to Handler.Lost.
 const (
-	LostClosed   = "closed"       // a socket closed or failed
-	LostTimeout  = "session_lost" // 3 s without a control message (§16.1)
-	LostProtocol = "protocol"     // a protocol.error ended the session
+	LostClosed   LostReason = "closed"       // a socket closed or failed
+	LostTimeout  LostReason = "session_lost" // 3 s without a control message (§16.1)
+	LostProtocol LostReason = "protocol"     // a protocol.error ended the session
 )
 
 // Handler receives the session lifecycle and every C→D message the link does
@@ -35,8 +39,8 @@ const (
 type Handler interface {
 	Hello() proto.SessionHello              // fresh snapshot per attempt
 	Ready(s *Session, r proto.SessionReady) // session established
-	Rejected(reason string)                 // session.rejected; the link retries after 10 s
-	Lost(reason string)                     // all sockets closed; s is dead
+	Rejected(reason proto.RejectReason)     // session.rejected; the link retries after 10 s
+	Lost(reason LostReason)                 // all sockets closed; s is dead
 	Control(env proto.Envelope)             // every other C→D message
 	RenderAudio(h ema.Header, pcm []byte)   // validated kind-3 frame; pcm borrowed for the call
 }
@@ -200,7 +204,7 @@ func (l *Link) connect(ctx context.Context, server *discovery.ServerInfo) error 
 // session.rejected (WIRE §1, §4.1).
 func (l *Link) handshake(ctrl *websocket.Conn) (proto.SessionReady, error) {
 	var ready proto.SessionReady
-	hello, err := marshalEnvelope(l.cfg.DeviceID, nil, proto.TypeSessionHello, newUUID(), 0, l.h.Hello())
+	hello, err := marshalEnvelope(l.cfg.DeviceID, nil, proto.TypeSessionHello, uuid.NewV4().String(), 0, l.h.Hello())
 	if err != nil {
 		return ready, err
 	}
@@ -262,7 +266,7 @@ func decodeEnvelope(raw []byte, deviceID string) (proto.Envelope, error) {
 	return env, nil
 }
 
-func marshalEnvelope(deviceID string, sessionID *string, typ, messageID string, generation uint32, body any) ([]byte, error) {
+func marshalEnvelope(deviceID string, sessionID *string, typ proto.MessageType, messageID string, generation uint32, body any) ([]byte, error) {
 	b, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("client: marshal %s body: %w", typ, err)

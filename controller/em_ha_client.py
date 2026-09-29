@@ -17,12 +17,22 @@ import asyncio
 import json
 import logging
 import os
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Protocol
+from enum import StrEnum
+from typing import TYPE_CHECKING, Any, Protocol, TypedDict, TypeGuard
+
+from em_alert_scripts import RelayEvent, ScriptId
+
+if TYPE_CHECKING:
+    import aiohttp
 
 log = logging.getLogger("em_ha_client")
+
+# HA's websocket/REST JSON as received: the dynamic boundary. Everything read
+# from one is narrowed where it is used (dataclasses, TypedDicts below).
+HaMessage = dict[str, Any]
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -50,7 +60,6 @@ ENTITY_LOOKUP_ATTEMPTS = 5     # calendar entity registration after a new config
 ENTITY_LOOKUP_DELAY_S = 0.5
 
 VOCAB_DEBOUNCE_S = 1.0
-VOCAB_EVENTS = ("entity_registry_updated", "area_registry_updated", "floor_registry_updated")  # §16.7
 CONVERSATION_ASSISTANT = "conversation"  # Assist's key in exposed-entity settings
 
 PREFERRED_PIPELINE = "preferred"   # assist_pipeline OPTION_PREFERRED
@@ -59,16 +68,77 @@ PIPELINE_SELECT_SUFFIX = "-pipeline"          # assist_pipeline select unique_id
 VAD_SELECT_SUFFIX = "-vad_sensitivity"        # "<mac>-vad_sensitivity"
 
 LOCAL_CALENDAR_DOMAIN = "local_calendar"
-CALENDAR_EVENT_KEYS = ("summary", "start", "end", "description", "uid",
-                       "recurrence_id", "rrule", "all_day")  # §16.4
 # local_calendar surfaces ical's EventStoreError for an unknown uid/recurrence
 # as code "failed" with this text (ical/store.py EventStore.delete).
 _DELETE_NOT_FOUND_TEXT = "No existing item with uid"
 
-FEATURES = ("voice", "calendar", "scripts", "vocabulary", "timers")
-PROBE_SCRIPT_ID = "echomuse_set_alarm"        # §16.7 script; 200 or 404 both prove access
-PROBE_EVENT_TYPE = "echomuse_alert_request"   # §16.7 relay event; subscribing needs admin
 _TIMER_COMPONENTS = ("intent", "esphome", "assist_satellite")
+
+
+class HaFeature(StrEnum):
+    """What the startup probe checks (§16.7); a failure disables only that feature."""
+    VOICE = "voice"
+    CALENDAR = "calendar"
+    SCRIPTS = "scripts"
+    VOCABULARY = "vocabulary"
+    TIMERS = "timers"
+
+
+class VocabEvent(StrEnum):
+    """Registry events that rebuild the vocabulary snapshot (§16.7)."""
+    ENTITY_REGISTRY_UPDATED = "entity_registry_updated"
+    AREA_REGISTRY_UPDATED = "area_registry_updated"
+    FLOOR_REGISTRY_UPDATED = "floor_registry_updated"
+
+
+class PipelineEventType(StrEnum):
+    """assist_pipeline run event `type`s this client reads."""
+    RUN_START = "run-start"
+    STT_END = "stt-end"
+    INTENT_END = "intent-end"
+    TTS_END = "tts-end"
+    ERROR = "error"
+    RUN_END = "run-end"
+
+
+# ── HA reply shapes ──────────────────────────────────────────────────────────
+
+class CalendarEvent(TypedDict):
+    """One calendar item, normalized (§16.4): absent fields None."""
+    summary: str | None
+    start: str | None
+    end: str | None
+    description: str | None
+    uid: str | None
+    recurrence_id: str | None
+    rrule: str | None
+    all_day: bool
+
+
+CALENDAR_EVENT_KEYS = tuple(CalendarEvent.__annotations__)  # §16.4
+
+
+class HaTimer(TypedDict, total=False):
+    """One timer of HA's `HassTimerStatus` `speech_slots.timers`."""
+    id: str
+    name: str | None
+    device_id: str | None
+    start_hours: int
+    start_minutes: int
+    start_seconds: int
+    is_active: bool
+
+
+class SpeechSlots(TypedDict, total=False):
+    timers: list[HaTimer]
+
+
+class IntentResponse(TypedDict, total=False):
+    """HA's `POST /api/intent/handle` reply (an IntentResponse as_dict)."""
+    response_type: str
+    speech: dict[str, Any]
+    data: dict[str, Any]
+    speech_slots: SpeechSlots
 
 
 # ── Errors and the alert engine's interface ──────────────────────────────────
@@ -94,21 +164,23 @@ class HaApi(Protocol):
     connected: bool
 
     async def time_zone(self) -> str: ...
-    async def calendar_create(self, entity_id: str, event: dict) -> None: ...
-    async def calendar_update(self, entity_id: str, uid: str, event: dict,
+    async def calendar_create(self, entity_id: str, event: Mapping[str, object]) -> None: ...
+    async def calendar_update(self, entity_id: str, uid: str, event: Mapping[str, object],
                               recurrence_id: str | None = None) -> None: ...
     async def calendar_delete(self, entity_id: str, uid: str,
                               recurrence_id: str | None = None) -> bool: ...
     async def calendar_subscribe(self, entity_id: str, start: datetime, end: datetime,
-                                 handler: Callable[[list[dict]], None]) -> Subscription: ...
-    async def calendar_events(self, entity_id: str, start: datetime, end: datetime) -> list[dict]: ...
-    async def subscribe_events(self, event_type: str, handler: Callable[[dict], None]) -> Subscription: ...
-    async def fire_event(self, event_type: str, data: dict) -> None: ...
+                                 handler: Callable[[list[CalendarEvent]], None]) -> Subscription: ...
+    async def calendar_events(self, entity_id: str, start: datetime, end: datetime) -> list[CalendarEvent]: ...
+    async def subscribe_events(self, event_type: str,
+                               handler: Callable[[HaMessage], None]) -> Subscription: ...
+    async def fire_event(self, event_type: str, data: Mapping[str, object]) -> None: ...
     async def ensure_local_calendar(self, title: str) -> tuple[str, str]: ...
-    async def get_script_config(self, object_id: str) -> dict | None: ...
-    async def put_script_config(self, object_id: str, config: dict) -> None: ...
-    async def call_service(self, domain: str, service: str, data: dict | None = None) -> Any: ...
-    async def expose_entities(self, entity_ids: list[str], assistants: list[str]) -> None: ...
+    async def get_script_config(self, object_id: str) -> HaMessage | None: ...
+    async def put_script_config(self, object_id: str, config: Mapping[str, object]) -> None: ...
+    async def call_service(self, domain: str, service: str,
+                           data: Mapping[str, object] | None = None) -> object: ...
+    async def expose_entities(self, entity_ids: Sequence[str], assistants: Sequence[str]) -> None: ...
 
 
 # ── Endpoint ─────────────────────────────────────────────────────────────────
@@ -137,13 +209,13 @@ class HaEndpoint:
         return cls(ws_url=SUPERVISOR_WS_URL, http_url=SUPERVISOR_HTTP_URL, token=token)
 
     @classmethod
-    def from_env(cls, env: dict[str, str] | None = None) -> HaEndpoint | None:
+    def from_env(cls, env: Mapping[str, str] | None = None) -> HaEndpoint | None:
         """HA_URL + HA_TOKEN (Docker, bare metal), else SUPERVISOR_TOKEN (add-on)."""
-        env = os.environ if env is None else env
-        url, token = env.get("HA_URL", "").strip(), env.get("HA_TOKEN", "").strip()
+        source: Mapping[str, str] = os.environ if env is None else env
+        url, token = source.get("HA_URL", "").strip(), source.get("HA_TOKEN", "").strip()
         if url and token:
             return cls.from_url(url, token)
-        supervisor_token = env.get("SUPERVISOR_TOKEN", "").strip()
+        supervisor_token = source.get("SUPERVISOR_TOKEN", "").strip()
         if supervisor_token:
             return cls.supervisor(supervisor_token)
         return None
@@ -276,8 +348,9 @@ def _unique(names: Iterable[str | None]) -> tuple[str, ...]:
     return tuple(seen)
 
 
-def build_vocabulary(exposed: dict[str, dict], entries: dict[str, dict | None],
-                     devices: list[dict], areas: list[dict], floors: list[dict]) -> Vocabulary:
+def build_vocabulary(exposed: Mapping[str, HaMessage], entries: Mapping[str, HaMessage | None],
+                     devices: Sequence[HaMessage], areas: Sequence[HaMessage],
+                     floors: Sequence[HaMessage]) -> Vocabulary:
     """Assemble the snapshot from raw HA replies.
 
     `exposed` is `homeassistant/expose_entity/list`'s `exposed_entities`; only
@@ -319,38 +392,49 @@ def build_vocabulary(exposed: dict[str, dict], entries: dict[str, dict | None],
 
 # ── Calendar normalization (§16.4) ───────────────────────────────────────────
 
-def normalize_calendar_event(item: dict) -> dict:
+def _opt_str(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def normalize_calendar_event(item: Mapping[str, object]) -> CalendarEvent:
     """One event with exactly CALENDAR_EVENT_KEYS.
 
     Subscription pushes use `CalendarEvent.as_dict`, which drops None fields;
     the REST view wraps times as {"dateTime": …} or {"date": …}. Both become
     ISO strings, absent fields None, and `all_day` true for date-only events.
     """
-    out = {k: item.get(k) for k in CALENDAR_EVENT_KEYS}
     all_day = item.get("all_day")
+    times: dict[str, str | None] = {}
     for key in ("start", "end"):
         value = item.get(key)
         if isinstance(value, dict):
             if "date" in value:
-                out[key] = value["date"]
+                times[key] = _opt_str(value["date"])
                 all_day = True if all_day is None else all_day
             else:
-                out[key] = value.get("dateTime")
+                times[key] = _opt_str(value.get("dateTime"))
+        else:
+            times[key] = _opt_str(value)
+    start = times["start"]
     if all_day is None:
-        all_day = isinstance(out["start"], str) and "T" not in out["start"]
-    out["all_day"] = bool(all_day)
-    return out
+        all_day = start is not None and "T" not in start
+    return CalendarEvent(
+        summary=_opt_str(item.get("summary")), start=start, end=times["end"],
+        description=_opt_str(item.get("description")), uid=_opt_str(item.get("uid")),
+        recurrence_id=_opt_str(item.get("recurrence_id")), rrule=_opt_str(item.get("rrule")),
+        all_day=bool(all_day),
+    )
 
 
 # ── Probe ────────────────────────────────────────────────────────────────────
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class FeatureStatus:
     ok: bool
     detail: str | None = None   # failure reason; None when ok
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SatelliteEntities:
     pipeline_select: str | None
     vad_sensitivity_select: str | None
@@ -363,12 +447,12 @@ class _Channel:
 
     done_on_result = False
 
-    def on_result(self, msg: dict) -> None: ...
-    def on_event(self, event: Any) -> None: ...
+    def on_result(self, msg: HaMessage) -> None: ...
+    def on_event(self, event: object) -> None: ...
     def on_lost(self) -> None: ...
 
 
-def _error_of(msg: dict) -> HaError:
+def _error_of(msg: HaMessage) -> HaError:
     err = msg.get("error") or {}
     return HaError(str(err.get("code", "unknown_error")), str(err.get("message", "")))
 
@@ -376,10 +460,10 @@ def _error_of(msg: dict) -> HaError:
 class _CommandChannel(_Channel):
     done_on_result = True
 
-    def __init__(self, future: asyncio.Future) -> None:
+    def __init__(self, future: asyncio.Future[Any]) -> None:
         self.future = future
 
-    def on_result(self, msg: dict) -> None:
+    def on_result(self, msg: HaMessage) -> None:
         if self.future.done():
             return
         if msg.get("success"):
@@ -393,18 +477,18 @@ class _CommandChannel(_Channel):
 
 
 class _EventChannel(_Channel):
-    def __init__(self, future: asyncio.Future, handler: Callable[[Any], None]) -> None:
+    def __init__(self, future: asyncio.Future[None], handler: Callable[[Any], None]) -> None:
         self.future = future
         self.handler = handler
 
-    def on_result(self, msg: dict) -> None:
+    def on_result(self, msg: HaMessage) -> None:
         if not self.future.done():
             if msg.get("success"):
                 self.future.set_result(None)
             else:
                 self.future.set_exception(_error_of(msg))
 
-    def on_event(self, event: Any) -> None:
+    def on_event(self, event: object) -> None:
         try:
             self.handler(event)
         except Exception:
@@ -415,22 +499,31 @@ class _EventChannel(_Channel):
             self.future.set_exception(HaUnavailable("connection lost"))
 
 
+class _RunItem(StrEnum):
+    """What a run channel queued: HA's `result`, one run `event`, the connection
+    `lost`, or the handle `abandoned`."""
+    RESULT = "result"
+    EVENT = "event"
+    LOST = "lost"
+    ABANDONED = "abandoned"
+
+
 class _RunChannel(_Channel):
     """Queues a pipeline run's result, events, and loss in arrival order."""
 
     def __init__(self) -> None:
-        self.queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+        self.queue: asyncio.Queue[tuple[_RunItem, Any]] = asyncio.Queue()
         self.msg_id = 0
         self.generation = 0
 
-    def on_result(self, msg: dict) -> None:
-        self.queue.put_nowait(("result", msg))
+    def on_result(self, msg: HaMessage) -> None:
+        self.queue.put_nowait((_RunItem.RESULT, msg))
 
-    def on_event(self, event: Any) -> None:
-        self.queue.put_nowait(("event", event))
+    def on_event(self, event: object) -> None:
+        self.queue.put_nowait((_RunItem.EVENT, event))
 
     def on_lost(self) -> None:
-        self.queue.put_nowait(("lost", None))
+        self.queue.put_nowait((_RunItem.LOST, None))
 
 
 class _WsSubscription:
@@ -472,7 +565,7 @@ class PipelineRun:
     async def __anext__(self) -> RunEvent:
         while not self._finished:
             kind, payload = await self._channel.queue.get()
-            if self._finished:
+            if self._fenced():
                 break
             event = self._translate(kind, payload)
             if event is None:
@@ -485,48 +578,52 @@ class PipelineRun:
     def abandon(self) -> None:
         if not self._finished:
             self._finish()
-            self._channel.queue.put_nowait(("abandoned", None))
+            self._channel.queue.put_nowait((_RunItem.ABANDONED, None))
 
     @property
     def finished(self) -> bool:
+        return self._finished
+
+    def _fenced(self) -> bool:
+        """Abandoned while the iterator awaited (a method, so the loop re-reads it)."""
         return self._finished
 
     def _finish(self) -> None:
         self._finished = True
         self._client._channels.pop(self._channel.msg_id, None)
 
-    def _translate(self, kind: str, payload: Any) -> RunEvent | None:
-        if kind == "lost":
+    def _translate(self, kind: _RunItem, payload: Any) -> RunEvent | None:
+        if kind == _RunItem.LOST:
             return RunLost()
-        if kind == "result":
+        if kind == _RunItem.RESULT:
             if payload.get("success"):
                 return None
             err = _error_of(payload)
             return RunRejected(err.code, err.message)
-        if kind != "event":
+        if kind != _RunItem.EVENT:
             return None
         etype = payload.get("type")
         data = payload.get("data") or {}
-        if etype == "run-start":
+        if etype == PipelineEventType.RUN_START:
             tts = data.get("tts_output") or {}
             if tts.get("stream_response") and tts.get("url") and not self._tts_sent:
                 self._tts_sent = True
                 return TtsReady(url=self._client.endpoint.absolute(tts["url"]), streamed=True)
-        elif etype == "intent-end":
+        elif etype == PipelineEventType.INTENT_END:
             return _intent_ended(data)
-        elif etype == "tts-end":
+        elif etype == PipelineEventType.TTS_END:
             url = (data.get("tts_output") or {}).get("url")
             if url and not self._tts_sent:
                 self._tts_sent = True
                 return TtsReady(url=self._client.endpoint.absolute(url), streamed=False)
-        elif etype == "error":
+        elif etype == PipelineEventType.ERROR:
             return RunFailed(str(data.get("code", "unknown")), str(data.get("message", "")))
-        elif etype == "run-end":
+        elif etype == PipelineEventType.RUN_END:
             return RunEnded()
         return None
 
 
-def _intent_ended(data: dict) -> IntentEnded:
+def _intent_ended(data: HaMessage) -> IntentEnded:
     output = data.get("intent_output") or {}
     response = output.get("response") or {}
     speech_by_kind = response.get("speech") or {}
@@ -545,13 +642,9 @@ def _intent_ended(data: dict) -> IntentEnded:
     )
 
 
-def _aiohttp():
-    import aiohttp
-    return aiohttp
-
-
 def _transport_errors() -> tuple[type[BaseException], ...]:
-    return (_aiohttp().ClientError, ConnectionError, OSError, RuntimeError)
+    import aiohttp
+    return (aiohttp.ClientError, ConnectionError, OSError, RuntimeError)
 
 
 # ── Client ───────────────────────────────────────────────────────────────────
@@ -565,9 +658,9 @@ class HaClient:
         self.last_error: str | None = None       # latest connect/auth failure, for the dashboard
         self.ha_version: str | None = None
         self.vocabulary: Vocabulary | None = None
-        self._session = None
-        self._ws = None
-        self._task: asyncio.Task | None = None
+        self._session: aiohttp.ClientSession | None = None
+        self._ws: aiohttp.ClientWebSocketResponse | None = None
+        self._task: asyncio.Task[None] | None = None
         self._closing = False
         self._next_id = 0
         self._generation = 0
@@ -576,9 +669,9 @@ class HaClient:
         self._connected_event = asyncio.Event()
         self._connect_listeners: list[Callable[[], Awaitable[None]]] = []
         self._disconnect_listeners: list[Callable[[], None]] = []
-        self._background: set[asyncio.Task] = set()
+        self._background: set[asyncio.Task[None]] = set()
         self._vocab_listener: Callable[[Vocabulary], None] | None = None
-        self._vocab_task: asyncio.Task | None = None
+        self._vocab_task: asyncio.Task[None] | None = None
         self._vocab_dirty = False
 
     # ── lifecycle ──
@@ -587,7 +680,7 @@ class HaClient:
         """Open the HTTP session and keep the websocket connected until close()."""
         if self._task is not None:
             return
-        aiohttp = _aiohttp()
+        import aiohttp
         self._session = aiohttp.ClientSession()
         self._task = asyncio.create_task(self._run_forever(), name="ha-client")
 
@@ -628,11 +721,14 @@ class HaClient:
         return lambda: self._disconnect_listeners.remove(listener)
 
     async def _run_forever(self) -> None:
-        aiohttp = _aiohttp()
+        import aiohttp
+        session = self._session
+        if session is None:
+            return
         delay = RECONNECT_INITIAL_S
         while not self._closing:
             try:
-                ws = await self._session.ws_connect(
+                ws = await session.ws_connect(
                     self.endpoint.ws_url, max_msg_size=WS_MAX_MSG_BYTES, heartbeat=HEARTBEAT_S)
             except (aiohttp.ClientError, OSError, TimeoutError) as err:
                 self.last_error = f"connect: {err}"
@@ -670,10 +766,10 @@ class HaClient:
                 log.warning("HA connection lost; reconnecting in %.0fs", delay)
                 await asyncio.sleep(delay)
 
-    async def _authenticate(self, ws) -> None:
-        aiohttp = _aiohttp()
+    async def _authenticate(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        import aiohttp
 
-        async def receive() -> dict:
+        async def receive() -> HaMessage:
             try:
                 async with asyncio.timeout(COMMAND_TIMEOUT_S):
                     msg = await ws.receive_json()
@@ -698,8 +794,8 @@ class HaClient:
             raise HaError("auth_invalid", str(reply.get("message", "")))
         raise HaUnavailable(f"auth handshake: unexpected {reply.get('type')!r}")
 
-    async def _read(self, ws) -> None:
-        aiohttp = _aiohttp()
+    async def _read(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        import aiohttp
         async for frame in ws:
             if frame.type != aiohttp.WSMsgType.TEXT:
                 if frame.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
@@ -711,16 +807,20 @@ class HaClient:
                 log.warning("HA sent non-JSON text frame")
                 continue
             for msg in payload if isinstance(payload, list) else (payload,):
-                self._dispatch(msg)
+                if isinstance(msg, dict):
+                    self._dispatch(msg)
 
-    def _dispatch(self, msg: dict) -> None:
-        channel = self._channels.get(msg.get("id"))
+    def _dispatch(self, msg: HaMessage) -> None:
+        msg_id = msg.get("id")
+        if not isinstance(msg_id, int):
+            return
+        channel = self._channels.get(msg_id)
         if channel is None:
             return
         mtype = msg.get("type")
         if mtype == "result":
             if channel.done_on_result or not msg.get("success") and isinstance(channel, _EventChannel):
-                self._channels.pop(msg["id"], None)
+                self._channels.pop(msg_id, None)
             channel.on_result(msg)
         elif mtype == "event":
             channel.on_event(msg.get("event"))
@@ -740,7 +840,7 @@ class HaClient:
                 except Exception:
                     log.exception("HA disconnect listener failed")
 
-    def _spawn(self, coro: Awaitable[Any], what: str) -> None:
+    def _spawn(self, coro: Awaitable[object], what: str) -> None:
         async def guarded() -> None:
             try:
                 await coro
@@ -757,7 +857,7 @@ class HaClient:
 
     # ── transport primitives ──
 
-    async def _send(self, channel: _Channel, msg: dict) -> int:
+    async def _send(self, channel: _Channel, msg: Mapping[str, object]) -> int:
         async with self._send_lock:
             ws = self._ws
             if ws is None or ws.closed or not self.connected:
@@ -784,9 +884,10 @@ class HaClient:
                 await ws.close()
                 raise HaUnavailable(f"send failed: {err}") from err
 
-    async def command(self, msg: dict, timeout: float = COMMAND_TIMEOUT_S) -> Any:
-        """Send one command; return its `result` or raise HaError/HaUnavailable."""
-        future = asyncio.get_running_loop().create_future()
+    async def command(self, msg: Mapping[str, object], timeout: float = COMMAND_TIMEOUT_S) -> Any:
+        """Send one command; return its `result` (raw HA JSON, narrowed by the
+        caller) or raise HaError/HaUnavailable."""
+        future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
         msg_id = await self._send(_CommandChannel(future), msg)
         try:
             async with asyncio.timeout(timeout):
@@ -795,9 +896,9 @@ class HaClient:
             self._channels.pop(msg_id, None)
             raise HaUnavailable(f"{msg.get('type')}: no reply within {timeout}s") from None
 
-    async def subscribe(self, msg: dict, handler: Callable[[Any], None]) -> Subscription:
+    async def subscribe(self, msg: Mapping[str, object], handler: Callable[[Any], None]) -> Subscription:
         """Open a subscription; `handler` receives each message's `event` field."""
-        future = asyncio.get_running_loop().create_future()
+        future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         msg_id = await self._send(_EventChannel(future, handler), msg)
         generation = self._generation
         try:
@@ -808,12 +909,12 @@ class HaClient:
             raise HaUnavailable(f"{msg.get('type')}: no reply within {COMMAND_TIMEOUT_S}s") from None
         return _WsSubscription(self, msg_id, generation)
 
-    async def rest(self, method: str, path: str, *, json_body: Any = None,
-                   params: dict[str, str] | None = None) -> tuple[int, Any]:
+    async def rest(self, method: str, path: str, *, json_body: object = None,
+                   params: Mapping[str, str] | None = None) -> tuple[int, Any]:
         """REST call to <http_url>/api<path> with the bearer token; returns (status, body)."""
         if self._session is None:
             raise HaUnavailable("client not started")
-        aiohttp = _aiohttp()
+        import aiohttp
         url = f"{self.endpoint.http_url}/api{path}"
         try:
             async with self._session.request(
@@ -830,8 +931,9 @@ class HaClient:
         except (aiohttp.ClientError, OSError, TimeoutError) as err:
             raise HaUnavailable(f"{method} {path}: {err!r}") from err
 
-    async def _rest_ok(self, method: str, path: str, **kwargs: Any) -> Any:
-        status, body = await self.rest(method, path, **kwargs)
+    async def _rest_ok(self, method: str, path: str, *, json_body: object = None,
+                       params: Mapping[str, str] | None = None) -> Any:
+        status, body = await self.rest(method, path, json_body=json_body, params=params)
         if status != 200:
             raise HaError(f"http_{status}", _message_of(body))
         return body
@@ -841,7 +943,7 @@ class HaClient:
         add-on's Supervisor proxy requires. Fetch immediately: TTS URLs expire."""
         if self._session is None:
             raise HaUnavailable("client not started")
-        aiohttp = _aiohttp()
+        import aiohttp
         try:
             async with self._session.get(
                 self.endpoint.absolute(url),
@@ -858,23 +960,31 @@ class HaClient:
 
     # ── core ──
 
-    async def get_config(self) -> dict:
-        return await self.command({"type": "get_config"})
+    async def get_config(self) -> HaMessage:
+        config = await self.command({"type": "get_config"})
+        if not isinstance(config, dict):
+            raise HaError("bad_response", f"get_config: {config!r}")
+        return config
 
     async def time_zone(self) -> str:
-        return (await self.get_config())["time_zone"]
+        zone = (await self.get_config()).get("time_zone")
+        if not isinstance(zone, str):
+            raise HaError("bad_response", f"time_zone: {zone!r}")
+        return zone
 
-    async def subscribe_events(self, event_type: str, handler: Callable[[dict], None]) -> Subscription:
+    async def subscribe_events(self, event_type: str,
+                               handler: Callable[[HaMessage], None]) -> Subscription:
         return await self.subscribe({"type": "subscribe_events", "event_type": event_type},
                                     lambda event: handler(event.get("data") or {}))
 
-    async def fire_event(self, event_type: str, data: dict) -> None:
+    async def fire_event(self, event_type: str, data: Mapping[str, object]) -> None:
         await self.command({"type": "fire_event", "event_type": event_type, "event_data": data})
 
-    async def call_service(self, domain: str, service: str, data: dict | None = None, *,
-                           target: dict | None = None, return_response: bool = False) -> Any:
+    async def call_service(self, domain: str, service: str, data: Mapping[str, object] | None = None, *,
+                           target: Mapping[str, object] | None = None,
+                           return_response: bool = False) -> object:
         """Call a service; with return_response, return its response data, else None."""
-        msg: dict[str, Any] = {"type": "call_service", "domain": domain, "service": service}
+        msg: dict[str, object] = {"type": "call_service", "domain": domain, "service": service}
         if target is not None:
             msg["target"] = target
         if data is not None:
@@ -911,7 +1021,7 @@ class HaClient:
         option = await self.entity_state(selects.pipeline_select) if selects.pipeline_select else None
         return await self.resolve_pipeline(option)
 
-    async def _start_run(self, msg: dict) -> _RunChannel:
+    async def _start_run(self, msg: Mapping[str, object]) -> _RunChannel:
         channel = _RunChannel()
         channel.msg_id = await self._send(channel, msg)
         channel.generation = self._generation
@@ -939,24 +1049,24 @@ class HaClient:
             async with asyncio.timeout(timeout + RUN_REPLY_MARGIN_S):
                 while True:
                     kind, payload = await run.queue.get()
-                    if kind == "lost":
+                    if kind == _RunItem.LOST:
                         raise HaUnavailable("connection lost during STT run")
-                    if kind == "result":
+                    if kind == _RunItem.RESULT:
                         if not payload.get("success"):
                             raise _error_of(payload)
                         continue
                     etype = payload.get("type")
                     data = payload.get("data") or {}
-                    if etype == "run-start":
+                    if etype == PipelineEventType.RUN_START:
                         handler = (data.get("runner_data") or {}).get("stt_binary_handler_id")
                         if not isinstance(handler, int) or not 0 < handler < 256:
                             raise HaError("bad_handler", f"stt_binary_handler_id={handler!r}")
                         await self._send_stt_audio(run, handler, pcm)
-                    elif etype == "stt-end":
-                        return ((data.get("stt_output") or {}).get("text") or "").strip()
-                    elif etype == "error":
+                    elif etype == PipelineEventType.STT_END:
+                        return str((data.get("stt_output") or {}).get("text") or "").strip()
+                    elif etype == PipelineEventType.ERROR:
                         raise HaError(str(data.get("code", "unknown")), str(data.get("message", "")))
-                    elif etype == "run-end":
+                    elif etype == PipelineEventType.RUN_END:
                         raise HaError("no_transcript", "STT run ended without stt-end")
         except TimeoutError:
             raise HaError("timeout", f"no STT result within {timeout + RUN_REPLY_MARGIN_S}s") from None
@@ -984,8 +1094,8 @@ class HaClient:
 
     async def run_tts(self, pipeline_id: str, text: str, device_id: str | None = None) -> str:
         """TTS-only run with the pipeline's engine and voice; returns the absolute URL."""
-        msg: dict[str, Any] = {"type": "assist_pipeline/run", "start_stage": "tts", "end_stage": "tts",
-                               "input": {"text": text}, "pipeline": pipeline_id}
+        msg: dict[str, object] = {"type": "assist_pipeline/run", "start_stage": "tts", "end_stage": "tts",
+                                  "input": {"text": text}, "pipeline": pipeline_id}
         if device_id is not None:
             msg["device_id"] = device_id
         msg["timeout"] = TTS_TIMEOUT_S
@@ -994,29 +1104,30 @@ class HaClient:
             async with asyncio.timeout(TTS_TIMEOUT_S + RUN_REPLY_MARGIN_S):
                 while True:
                     kind, payload = await run.queue.get()
-                    if kind == "lost":
+                    if kind == _RunItem.LOST:
                         raise HaUnavailable("connection lost during TTS run")
-                    if kind == "result":
+                    if kind == _RunItem.RESULT:
                         if not payload.get("success"):
                             raise _error_of(payload)
                         continue
                     etype = payload.get("type")
                     data = payload.get("data") or {}
-                    if etype == "tts-end":
+                    if etype == PipelineEventType.TTS_END:
                         url = (data.get("tts_output") or {}).get("url")
                         if not url:
                             raise HaError("no_tts_output", "tts-end without a URL")
-                        return self.endpoint.absolute(url)
-                    if etype == "error":
+                        return self.endpoint.absolute(str(url))
+                    if etype == PipelineEventType.ERROR:
                         raise HaError(str(data.get("code", "unknown")), str(data.get("message", "")))
-                    if etype == "run-end":
+                    if etype == PipelineEventType.RUN_END:
                         raise HaError("no_tts_output", "TTS run ended without tts-end")
         except TimeoutError:
             raise HaError("timeout", "no TTS result") from None
         finally:
             self._channels.pop(run.msg_id, None)
 
-    async def handle_intent(self, name: str, slots: dict[str, Any], device_id: str | None) -> dict:
+    async def handle_intent(self, name: str, slots: Mapping[str, object],
+                            device_id: str | None) -> IntentResponse:
         """Run one of HA's intents directly, through the stock `POST /api/intent/handle`,
         for the speaker's HA device (EchoMuse's own timer grammar, §10.8). No conversation
         agent reads it. Returns HA's intent response; raises `HaError` when HA refused
@@ -1024,7 +1135,7 @@ class HaClient:
         sent means its outcome is unknown: never resend it."""
         response = await self._rest_ok("POST", "/intent/handle",
                                        json_body={"name": name, "data": slots, "device_id": device_id})
-        if not isinstance(response, dict):
+        if not _is_intent_response(response):
             raise HaError("bad_response", f"{name}: {response!r}")
         if response.get("response_type") == "error":
             speech = ((response.get("speech") or {}).get("plain") or {}).get("speech")
@@ -1033,12 +1144,12 @@ class HaClient:
 
     # ── calendar (§16.4, §10.4) ──
 
-    async def calendar_create(self, entity_id: str, event: dict) -> None:
+    async def calendar_create(self, entity_id: str, event: Mapping[str, object]) -> None:
         await self.command({"type": "calendar/event/create", "entity_id": entity_id, "event": event})
 
-    async def calendar_update(self, entity_id: str, uid: str, event: dict,
+    async def calendar_update(self, entity_id: str, uid: str, event: Mapping[str, object],
                               recurrence_id: str | None = None) -> None:
-        msg: dict[str, Any] = {"type": "calendar/event/update", "entity_id": entity_id, "uid": uid}
+        msg: dict[str, object] = {"type": "calendar/event/update", "entity_id": entity_id, "uid": uid}
         if recurrence_id is not None:
             msg["recurrence_id"] = recurrence_id
         msg["event"] = event
@@ -1047,7 +1158,7 @@ class HaClient:
     async def calendar_delete(self, entity_id: str, uid: str,
                               recurrence_id: str | None = None) -> bool:
         """Delete an event (no recurrence_id: the whole series). False = not found."""
-        msg: dict[str, Any] = {"type": "calendar/event/delete", "entity_id": entity_id, "uid": uid}
+        msg: dict[str, object] = {"type": "calendar/event/delete", "entity_id": entity_id, "uid": uid}
         if recurrence_id is not None:
             msg["recurrence_id"] = recurrence_id
         try:
@@ -1059,11 +1170,11 @@ class HaClient:
         return True
 
     async def calendar_subscribe(self, entity_id: str, start: datetime, end: datetime,
-                                 handler: Callable[[list[dict]], None]) -> Subscription:
+                                 handler: Callable[[list[CalendarEvent]], None]) -> Subscription:
         """Each push is the full event list in [start, end), normalized. HA
         pushes null when its own fetch fails; such pushes carry no list and are
         dropped rather than read as "everything deleted"."""
-        def on_event(event: dict) -> None:
+        def on_event(event: HaMessage) -> None:
             events = event.get("events")
             if events is None:
                 log.warning("HA calendar %s push failed on the HA side; ignored", entity_id)
@@ -1073,7 +1184,7 @@ class HaClient:
         return await self.subscribe({"type": "calendar/event/subscribe", "entity_id": entity_id,
                                      "start": start.isoformat(), "end": end.isoformat()}, on_event)
 
-    async def calendar_events(self, entity_id: str, start: datetime, end: datetime) -> list[dict]:
+    async def calendar_events(self, entity_id: str, start: datetime, end: datetime) -> list[CalendarEvent]:
         body = await self._rest_ok("GET", f"/calendars/{entity_id}",
                                    params={"start": start.isoformat(), "end": end.isoformat()})
         return [normalize_calendar_event(e) for e in body]
@@ -1113,33 +1224,27 @@ class HaClient:
             raise HaError("flow_aborted", str(result.get("reason")))
         raise HaError("flow_failed", f"unexpected flow result: {result!r}")
 
-    async def get_script_config(self, object_id: str) -> dict | None:
+    async def get_script_config(self, object_id: str) -> HaMessage | None:
         status, body = await self.rest("GET", f"/config/script/config/{object_id}")
         if status == 404:
             return None
         if status != 200:
             raise HaError(f"http_{status}", _message_of(body))
+        if not isinstance(body, dict):
+            raise HaError("bad_response", f"script {object_id}: {body!r}")
         return body
 
-    async def put_script_config(self, object_id: str, config: dict) -> None:
+    async def put_script_config(self, object_id: str, config: Mapping[str, object]) -> None:
         await self._rest_ok("POST", f"/config/script/config/{object_id}", json_body=config)
 
-    async def expose_entities(self, entity_ids: list[str], assistants: list[str]) -> None:
-        await self.command({"type": "homeassistant/expose_entity", "assistants": assistants,
-                            "entity_ids": entity_ids, "should_expose": True})
-
-    async def device_id_for_mac(self, mac: str) -> str | None:
-        """HA device whose connections include this MAC (HA stores lowercase colon form)."""
-        want = _format_mac(mac)
-        for device in await self.command({"type": "config/device_registry/list"}):
-            for kind, value in device.get("connections") or []:
-                if kind == "mac" and _format_mac(value) == want:
-                    return device["id"]
-        return None
+    async def expose_entities(self, entity_ids: Sequence[str], assistants: Sequence[str]) -> None:
+        await self.command({"type": "homeassistant/expose_entity", "assistants": list(assistants),
+                            "entity_ids": list(entity_ids), "should_expose": True})
 
     async def satellite_entities(self, device_id: str) -> SatelliteEntities:
         """The device's stock assist_pipeline selects (first pipeline select, VAD sensitivity)."""
-        pipeline = vad = None
+        pipeline: str | None = None
+        vad: str | None = None
         for entry in await self.command({"type": "config/entity_registry/list"}):
             if entry.get("device_id") != device_id or not entry["entity_id"].startswith("select."):
                 continue
@@ -1156,7 +1261,8 @@ class HaClient:
             return None
         if status != 200:
             raise HaError(f"http_{status}", _message_of(body))
-        return body.get("state")
+        state = body.get("state") if isinstance(body, dict) else None
+        return state if isinstance(state, str) else None
 
     async def set_select_option(self, entity_id: str, option: str) -> None:
         await self.call_service("select", "select_option", {"option": option},
@@ -1187,11 +1293,11 @@ class HaClient:
             self._spawn(self._vocab_on_connect(), "HA vocabulary")
 
     async def _vocab_on_connect(self) -> None:
-        for event_type in VOCAB_EVENTS:
+        for event_type in VocabEvent:
             await self.subscribe_events(event_type, self._vocab_changed)
         await self.refresh_vocabulary()
 
-    def _vocab_changed(self, _data: dict) -> None:
+    def _vocab_changed(self, _data: HaMessage) -> None:
         self._vocab_dirty = True
         if self._vocab_task is None or self._vocab_task.done():
             self._vocab_task = asyncio.create_task(self._vocab_debounced())
@@ -1210,13 +1316,13 @@ class HaClient:
 
     # ── startup probe (§16.7) ──
 
-    async def probe(self) -> dict[str, FeatureStatus]:
+    async def probe(self) -> dict[HaFeature, FeatureStatus]:
         """Exercise each dependency with a harmless call. A failure marks only
         its feature."""
         if not self.connected:
             reason = self.last_error or "not connected"
-            return {f: FeatureStatus(False, reason) for f in FEATURES}
-        config: dict | None = None
+            return {f: FeatureStatus(False, reason) for f in HaFeature}
+        config: HaMessage | None = None
         config_error: str | None = None
         try:
             config = await self.get_config()
@@ -1244,8 +1350,10 @@ class HaClient:
 
         async def scripts() -> None:
             components("script")
-            await self.get_script_config(PROBE_SCRIPT_ID)
-            subscription = await self.subscribe_events(PROBE_EVENT_TYPE, lambda _data: None)
+            # §16.7 script and relay event: 200 or 404 both prove access;
+            # subscribing to the relay event needs admin.
+            await self.get_script_config(ScriptId.SET_ALARM)
+            subscription = await self.subscribe_events(RelayEvent.REQUEST, lambda _data: None)
             await subscription.unsubscribe()
 
         async def vocabulary() -> None:
@@ -1260,10 +1368,11 @@ class HaClient:
             # with a device (§10.8); a status question changes nothing.
             await self.handle_intent("HassTimerStatus", {}, None)
 
-        checks = {"voice": voice, "calendar": calendar, "scripts": scripts,
-                  "vocabulary": vocabulary, "timers": timers}
-        status: dict[str, FeatureStatus] = {}
-        for feature in FEATURES:
+        checks: dict[HaFeature, Callable[[], Awaitable[None]]] = {
+            HaFeature.VOICE: voice, HaFeature.CALENDAR: calendar, HaFeature.SCRIPTS: scripts,
+            HaFeature.VOCABULARY: vocabulary, HaFeature.TIMERS: timers}
+        status: dict[HaFeature, FeatureStatus] = {}
+        for feature in HaFeature:
             try:
                 await checks[feature]()
                 status[feature] = FeatureStatus(True)
@@ -1280,13 +1389,21 @@ class _ProbeFailure(Exception):
     pass
 
 
-def _message_of(body: Any) -> str:
+def _is_intent_response(value: object) -> TypeGuard[IntentResponse]:
+    """A JSON object whose IntentResponse fields, where present, are objects."""
+    return isinstance(value, dict) and all(
+        isinstance(value.get(key, {}), dict) for key in ("speech", "data", "speech_slots"))
+
+
+def _message_of(body: object) -> str:
     if isinstance(body, dict) and "message" in body:
         return str(body["message"])
     return str(body)
 
 
-def _format_mac(mac: str) -> str:
+def format_mac(mac: str) -> str:
+    """A MAC in HA's device-registry form (lowercase, colon-separated); a
+    string that is not 12 hex digits is only lowercased."""
     hexdigits = "".join(c for c in mac.lower() if c in "0123456789abcdef")
     if len(hexdigits) != 12:
         return mac.lower()

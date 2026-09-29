@@ -17,19 +17,35 @@ Everything else about a press is controller policy and lives here.
 
 from __future__ import annotations
 
-# The device already stopped an alert with this press (`handled:"alert_stopped"`).
-ALERT_STOPPED = "alert_stopped"
-# A hold, forwarded to HA as the `long` event. Not speech, so mute does not block it.
-HOLD = "hold"
-# A tap forwarded to HA as an event instead of starting a turn
-# (buttonSingleTapEvent). Not speech, so mute does not block it.
-TAP_EVENT = "tap_event"
-# A tap while muted. Does nothing.
-BLOCKED = "blocked"
-# A tap during an active turn cancels it.
-CANCEL = "cancel"
-# A tap otherwise starts a turn.
-TURN = "turn"
+from enum import StrEnum
+
+
+class ButtonAction(StrEnum):
+    """What `decide` makes of a release."""
+
+    # The device already stopped an alert with this press (`handled:"alert_stopped"`).
+    ALERT_STOPPED = "alert_stopped"
+    # A hold, forwarded to HA as the `long` event. Not speech, so mute does not block it.
+    HOLD = "hold"
+    # A tap forwarded to HA as an event instead of starting a turn
+    # (buttonSingleTapEvent). Not speech, so mute does not block it.
+    TAP_EVENT = "tap_event"
+    # A tap while muted. Does nothing.
+    BLOCKED = "blocked"
+    # A tap during an active turn cancels it.
+    CANCEL = "cancel"
+    # A tap otherwise starts a turn.
+    TURN = "turn"
+
+
+class ButtonEvent(StrEnum):
+    """HA event types of the Action-button event entity. Declaration order is
+    the order advertised to HA at connect time."""
+
+    LONG = "long"
+    SINGLE = "single"
+    DOUBLE = "double"
+    TRIPLE = "triple"
 
 
 def decide(
@@ -40,7 +56,7 @@ def decide(
     turn_active: bool,
     tap_event: bool = False,
     active_occurrence_id: str | None = None,
-) -> str:
+) -> ButtonAction:
     """
     Classify a dot-button release.
 
@@ -58,13 +74,13 @@ def decide(
     event nothing receives.
     """
     if active_occurrence_id is not None:
-        return ALERT_STOPPED
+        return ButtonAction.ALERT_STOPPED
     if held_ms >= hold_ms:
-        return HOLD
+        return ButtonAction.HOLD
     if tap_event:
-        return TAP_EVENT
+        return ButtonAction.TAP_EVENT
     if muted:
-        return BLOCKED
+        return ButtonAction.BLOCKED
     if turn_active:
-        return CANCEL
-    return TURN
+        return ButtonAction.CANCEL
+    return ButtonAction.TURN

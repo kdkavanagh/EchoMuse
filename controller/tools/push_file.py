@@ -42,7 +42,10 @@ wrong answer first:
 Success is md5 agreement, not "no errors". Exit status is non-zero otherwise.
 """
 import asyncio, base64, hashlib, os, secrets, sqlite3, sys, time
+from pathlib import Path
+
 import websockets
+from websockets.asyncio.client import ClientConnection
 
 DB = "/app/data/echomuse.db"
 
@@ -60,7 +63,7 @@ BLOCK_TRIES = 4
 DELIM = "__END_B64_42__"
 
 
-def make_token():
+def make_token() -> str:
     tok = secrets.token_hex(32)
     con = sqlite3.connect(DB)
     cols = [r[1] for r in con.execute("PRAGMA table_info(sessions)")]
@@ -76,7 +79,7 @@ def make_token():
     return tok
 
 
-def drop_token(tok):
+def drop_token(tok: str) -> None:
     con = sqlite3.connect(DB)
     con.execute("DELETE FROM sessions WHERE token=?", (tok,))
     con.commit()
@@ -86,11 +89,11 @@ def drop_token(tok):
 class Shell:
     """One shell session. Short-lived by design — see RECONNECT_S."""
 
-    def __init__(self, ws):
+    def __init__(self, ws: ClientConnection) -> None:
         self.ws = ws
         self.buf = bytearray()
 
-    async def read_until(self, marker, timeout=30):
+    async def read_until(self, marker: bytes, timeout: float = 30) -> bool:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
@@ -104,10 +107,10 @@ class Shell:
                 return True
         return False
 
-    async def send(self, text):
+    async def send(self, text: str) -> None:
         await self.ws.send(b"\x00" + text.encode())
 
-    async def cmd(self, line, timeout=30):
+    async def cmd(self, line: str, timeout: float = 30) -> str:
         """Run a command and return its output, prompt-delimited."""
         self.buf.clear()
         await self.send(line + "\n")
@@ -116,7 +119,7 @@ class Shell:
             raise RuntimeError(f"timed out waiting for prompt after: {line[:60]}")
         return bytes(self.buf).decode("utf-8", "replace")
 
-    async def append_block(self, dest, blk):
+    async def append_block(self, dest: str, blk: bytes) -> None:
         """Append one block to dest as base64 lines inside a heredoc.
 
         Every line is short (76 chars) because the PTY's canonical-mode line
@@ -132,7 +135,7 @@ class Shell:
             raise RuntimeError("timed out waiting for prompt after a heredoc block")
 
 
-async def connect(device, tok):
+async def connect(device: str, tok: str) -> tuple[ClientConnection, Shell]:
     uri = f"ws://127.0.0.1:8768/api/devices/{device}/shell?token={tok}"
     ws = await websockets.connect(uri, max_size=None)
     sh = Shell(ws)
@@ -143,14 +146,14 @@ async def connect(device, tok):
     return ws, sh
 
 
-async def close_quietly(ws):
+async def close_quietly(ws: ClientConnection) -> None:
     try:
         await ws.close()
     except Exception:
         pass
 
 
-async def trim_to(sh, path, size):
+async def trim_to(sh: Shell, path: str, size: int) -> None:
     """Cut path back to exactly `size` bytes.
 
     Uses dd + mv because `busybox truncate` silently does nothing on this
@@ -167,7 +170,7 @@ async def trim_to(sh, path, size):
         raise RuntimeError(f"trim to {size} left {got} bytes")
 
 
-async def remote_size(sh, path):
+async def remote_size(sh: Shell, path: str) -> int:
     out = await sh.cmd(f"busybox wc -c < {path} 2>/dev/null || echo 0")
     for tok in reversed(out.split()):
         if tok.isdigit():
@@ -175,7 +178,7 @@ async def remote_size(sh, path):
     return 0
 
 
-async def remote_md5(sh, path):
+async def remote_md5(sh: Shell, path: str) -> str:
     # Split marker: the PTY echoes this command back, and an unsplit marker
     # would match its own echo.
     out = await sh.cmd(f"echo M'D'5:$(busybox md5sum {path} | busybox cut -d' ' -f1)", timeout=120)
@@ -186,8 +189,8 @@ async def remote_md5(sh, path):
     raise RuntimeError(f"could not read md5 of {path}; got: {out[-200:]!r}")
 
 
-async def push(device, local, remote, mode, resume):
-    data = open(local, "rb").read()
+async def push(device: str, local: str, remote: str, mode: str | None, resume: bool) -> int:
+    data = Path(local).read_bytes()
     want_md5 = hashlib.md5(data).hexdigest()
     payload = BLOCK_BYTES
     print(f"{local} -> {device}:{remote}", file=sys.stderr)
@@ -202,11 +205,10 @@ async def push(device, local, remote, mode, resume):
             if resume:
                 have = await remote_size(sh, remote)
                 # Only resume on a whole-chunk boundary; trim the partial tail
-                # with dd, because truncate silently does nothing here.
+                # (to nothing, when not even one chunk landed).
                 sent = have - (have % payload)
                 if have != sent:
-                    await sh.cmd(f"busybox dd if={remote} of={remote}.t bs={sent} count=1 "
-                                 f"2>/dev/null && busybox mv {remote}.t {remote}")
+                    await trim_to(sh, remote, sent)
                 if sent:
                     print(f"resuming at {sent} bytes", file=sys.stderr)
             else:

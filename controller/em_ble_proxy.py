@@ -35,14 +35,19 @@ monotonic advert counter is genuinely useful (rate via HA derivative).
 """
 
 import asyncio
+import base64
 import logging
-from typing import Optional
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
+from typing import TypedDict
 
+from google.protobuf.message import Message
 from zeroconf import ServiceInfo
 
 import em_db as db
-from esphome.satellite_server import SatelliteServerProtocol, serve, _HANDLED
+import em_esphome
 from esphome.feature_flags import BluetoothProxyFeature
+from esphome.satellite_server import HANDLED, RejectProtocol, Reply, SatelliteServerProtocol, serve
 from esphome.vendor import api_pb2
 
 log = logging.getLogger("echomuse.bleproxy")
@@ -55,41 +60,61 @@ BT_PROXY_FLAGS = int(
 ADVERTS_SENSOR_KEY = 1
 
 
+class BleProxyStatus(TypedDict):
+    """``bleProxy`` in the dashboard's device detail (HTTP API)."""
+    port: int
+    listening: bool
+    haConnected: bool
+    haSubscribed: bool
+    advertsReceived: int
+    advertsForwarded: int
+
+
+@dataclass(frozen=True, slots=True)
+class _Advert:
+    address: int
+    address_type: int
+    rssi: int
+    data: bytes
+
+
+def _proxy_name(device_id: str) -> str:
+    return f"{em_esphome.satellite_name(device_id)}-bt"
+
+
 # ─── Satellite (one per active HA connection) ────────────────────────────────
 
 class BluetoothProxySatellite(SatelliteServerProtocol):
     """ESPHome native API endpoint for one device's BT proxy."""
 
-    def __init__(self, device_id: str, label: str, mac_address: str,
-                 on_disconnected_cb, owning_server) -> None:
+    def __init__(self, server: "DeviceBleProxyServer") -> None:
         super().__init__(
-            server_name=f"echomuse-{device_id[-12:].lower()}-bt",
-            log_name=f"bleproxy.{device_id[-8:]}",
+            server_name=_proxy_name(server.device_id),
+            log_name=f"bleproxy.{server.device_id[-8:]}",
         )
-        self.device_id     = device_id
-        self.label         = label
-        self.mac_address   = mac_address
-        self._owning_server = owning_server
-        self._disconnected_hook = on_disconnected_cb
+        self.server = server
         # Set by SubscribeBluetoothLEAdvertisementsRequest; forward_adverts
         # only encodes/sends while HA is actually subscribed.
         self.subscribed = False
         self._states_subscribed = False
 
-    def handle_message(self, msg):
+    def connection_closed(self) -> None:
+        self.server._on_satellite_disconnected(self)
+
+    def handle_message(self, msg: Message) -> Iterator[Reply]:
         if isinstance(msg, api_pb2.DeviceInfoRequest):
             yield api_pb2.DeviceInfoResponse(
                 uses_password=False,
                 name=self.server_name,
-                friendly_name=f"{self.label} BT Proxy",
-                mac_address=self.mac_address,
+                friendly_name=f"{self.server.label} BT Proxy",
+                mac_address=self.server.mac_address,
                 manufacturer="EchoMuse",
-                model=_device_model(),
+                model=em_esphome.ESPHOME_DEVICE_MODEL,
                 # Dot required — HA splits project_name on "." (see
                 # em_esphome.EchoMuseSatellite.handle_message), and shows
                 # the part after it as the device Model.
-                project_name=f"EchoMuse.{_device_model()}",
-                project_version=_project_version(),
+                project_name=f"EchoMuse.{em_esphome.ESPHOME_DEVICE_MODEL}",
+                project_version=em_esphome.ESPHOME_PROJECT_VERSION,
                 bluetooth_proxy_feature_flags=BT_PROXY_FLAGS,
             )
             return
@@ -111,7 +136,7 @@ class BluetoothProxySatellite(SatelliteServerProtocol):
             self._states_subscribed = True
             yield api_pb2.SensorStateResponse(
                 key=ADVERTS_SENSOR_KEY,
-                state=float(self._owning_server.adverts_seen),
+                state=float(self.server.adverts_seen),
             )
             return
 
@@ -119,13 +144,13 @@ class BluetoothProxySatellite(SatelliteServerProtocol):
             log.info(f"[{self._log_name}] HA subscribed to BLE advertisements "
                      f"(flags={msg.flags})")
             self.subscribed = True
-            yield _HANDLED
+            yield HANDLED
             return
 
         if isinstance(msg, api_pb2.UnsubscribeBluetoothLEAdvertisementsRequest):
             log.info(f"[{self._log_name}] HA unsubscribed from BLE advertisements")
             self.subscribed = False
-            yield _HANDLED
+            yield HANDLED
             return
 
         if isinstance(msg, api_pb2.SubscribeBluetoothConnectionsFreeRequest):
@@ -134,7 +159,7 @@ class BluetoothProxySatellite(SatelliteServerProtocol):
             return
 
         if isinstance(msg, api_pb2.SubscribeHomeassistantServicesRequest):
-            yield _HANDLED
+            yield HANDLED
             return
 
     def push_adverts_sensor(self, total: int) -> None:
@@ -153,37 +178,30 @@ class DeviceBleProxyServer:
         self.label       = label
         self.mac_address = mac_address
         self.port        = port
-        self._server: Optional[asyncio.AbstractServer] = None
-        self._active_satellite: Optional[BluetoothProxySatellite] = None
-        self._mdns_info: Optional[ServiceInfo] = None
+        self._server: asyncio.AbstractServer | None = None
+        self._active_satellite: BluetoothProxySatellite | None = None
+        self._mdns_info: ServiceInfo | None = None
         # Forwarding counters (controller-side view, dashboard diagnostics).
         self.adverts_received = 0   # batches' adverts arriving from the device
         self.adverts_forwarded = 0  # actually sent to a subscribed HA
         self.adverts_seen = 0       # device-reported cumulative counter (stats)
 
-    def _protocol_factory(self):
+    def _protocol_factory(self) -> SatelliteServerProtocol:
         if self._active_satellite is not None:
             log.warning(f"[bleproxy.{self.device_id[-8:]}] Second connection "
                         f"attempt — rejecting (single-claimant)")
-            from em_esphome import _RejectProtocol
-            return _RejectProtocol()
-        satellite = BluetoothProxySatellite(
-            device_id=self.device_id,
-            label=self.label,
-            mac_address=self.mac_address,
-            on_disconnected_cb=self._on_satellite_disconnected,
-            owning_server=self,
-        )
+            return RejectProtocol()
+        satellite = BluetoothProxySatellite(self)
         self._active_satellite = satellite
         log.info(f"[bleproxy.{self.device_id[-8:]}] HA connected on port {self.port}")
         return satellite
 
-    def _on_satellite_disconnected(self, satellite) -> None:
+    def _on_satellite_disconnected(self, satellite: BluetoothProxySatellite) -> None:
         if self._active_satellite is satellite:
             self._active_satellite = None
             log.info(f"[bleproxy.{self.device_id[-8:]}] HA disconnected")
 
-    def get_satellite(self) -> Optional[BluetoothProxySatellite]:
+    def get_satellite(self) -> BluetoothProxySatellite | None:
         return self._active_satellite
 
     async def start(self, host: str) -> None:
@@ -215,16 +233,6 @@ _online: set[str] = set()   # device_ids with a live /control connection
 _host: str = "0.0.0.0"
 
 
-def _project_version() -> str:
-    from em_esphome import ESPHOME_PROJECT_VERSION
-    return ESPHOME_PROJECT_VERSION
-
-
-def _device_model() -> str:
-    from em_esphome import ESPHOME_DEVICE_MODEL
-    return ESPHOME_DEVICE_MODEL
-
-
 def _proxy_mac(device_id: str) -> str:
     """
     Stable, distinct MAC identity for the BT proxy: the voice satellite's
@@ -232,39 +240,9 @@ def _proxy_mac(device_id: str) -> str:
     on the first octet). XOR guarantees it differs from the voice MAC that
     HA keys the satellite device on.
     """
-    from em_esphome import _serialno_to_mac
-    mac = _serialno_to_mac(device_id)
+    mac = em_esphome.serialno_to_mac(device_id)
     first = int(mac[0:2], 16) ^ 0x02
     return f"{first:02X}{mac[2:]}"
-
-
-def _make_mdns_info(device_id: str, label: str, port: int) -> ServiceInfo:
-    from em_esphome import SERVER_IP
-    import socket
-    svc_name = f"echomuse-{device_id[-12:].lower()}-bt"
-    return ServiceInfo(
-        "_esphomelib._tcp.local.",
-        f"{svc_name}._esphomelib._tcp.local.",
-        addresses=[socket.inet_aton(SERVER_IP)],
-        port=port,
-        properties={
-            "version": _project_version(),
-            "friendly_name": f"{label} BT Proxy",
-            # mac TXT is MANDATORY for HA discovery (mdns_missing_mac) and
-            # must match DeviceInfoResponse.mac_address — see
-            # em_esphome._make_device_mdns_info.
-            "mac": _proxy_mac(device_id).replace(":", "").lower(),
-            "network": "ethwifi",
-            "project_name": f"EchoMuse.{_device_model()}",
-            "project_version": _project_version(),
-        },
-        server=f"{svc_name}.local.",
-    )
-
-
-def _azc():
-    from em_esphome import _azc as azc
-    return azc
 
 
 # ─── Lifecycle ───────────────────────────────────────────────────────────────
@@ -277,13 +255,12 @@ async def reconcile(device_id: str) -> None:
     (allocating a port on first enable), starts/stops the listener based on
     device online state, and tears everything down when disabled. Idempotent.
     """
-    loop = asyncio.get_event_loop()
-    row = await loop.run_in_executor(None, db.get_device, device_id)
+    row = await asyncio.to_thread(db.get_device, device_id)
     enabled = False
     label = device_id[-8:]
-    if row is not None and row["approved"]:
-        label = row["label"] or f"EchoMuse {device_id[-8:]}"
-        cfg = await loop.run_in_executor(None, db.get_effective_device_config, device_id)
+    if row is not None and row.approved:
+        label = row.label or f"EchoMuse {device_id[-8:]}"
+        cfg = await asyncio.to_thread(db.get_effective_device_config, device_id)
         enabled = bool(cfg.get("bleProxyEnabled", False))
 
     proxy = _proxies.get(device_id)
@@ -295,21 +272,23 @@ async def reconcile(device_id: str) -> None:
 
     if proxy is None:
         # BLE port is the voice satellite port + offset (paired, deterministic).
-        port = await loop.run_in_executor(None, db.ensure_ble_proxy_port, device_id)
+        port = await asyncio.to_thread(db.ensure_ble_proxy_port, device_id)
         if port is None:
             log.warning(f"[{device_id}] BLE proxy enabled but device has no "
                         f"ESPHome voice port yet — deferring until it does")
             return
         proxy = DeviceBleProxyServer(device_id, label, _proxy_mac(device_id), port)
         _proxies[device_id] = proxy
-        azc = _azc()
-        if azc is not None:
-            mdns_info = _make_mdns_info(device_id, label, port)
+        mdns = em_esphome.mdns()
+        if mdns is not None:
+            # mac TXT must match DeviceInfoResponse.mac_address (the proxy MAC).
+            mdns_info = mdns.service_info(
+                _proxy_name(device_id), f"{label} BT Proxy", proxy.mac_address, port)
             try:
-                await azc.async_register_service(mdns_info, allow_name_change=True)
+                await mdns.zc.async_register_service(mdns_info, allow_name_change=True)
                 proxy._mdns_info = mdns_info
                 log.info(f"[{device_id}] BT proxy mDNS registered: "
-                         f"echomuse-{device_id[-12:].lower()}-bt → port {port}")
+                         f"{_proxy_name(device_id)} → port {port}")
             except Exception as e:
                 log.warning(f"[{device_id}] BT proxy mDNS registration failed: {e}")
 
@@ -322,12 +301,12 @@ async def reconcile(device_id: str) -> None:
 
 async def _teardown(device_id: str, proxy: DeviceBleProxyServer) -> None:
     _proxies.pop(device_id, None)
-    azc = _azc()
-    if proxy._mdns_info is not None and azc is not None:
+    mdns = em_esphome.mdns()
+    if proxy._mdns_info is not None and mdns is not None:
         try:
-            await azc.async_unregister_service(proxy._mdns_info)
-        except Exception:
-            pass
+            await mdns.zc.async_unregister_service(proxy._mdns_info)
+        except Exception as e:
+            log.warning(f"[{device_id}] BT proxy mDNS unregistration failed: {e}")
         proxy._mdns_info = None
     await proxy.stop()
     log.info(f"[{device_id}] BT proxy disabled — listener + mDNS removed")
@@ -340,11 +319,10 @@ async def start_ble_proxy_servers(host: str = "0.0.0.0") -> None:
     """
     global _host
     _host = host
-    loop = asyncio.get_event_loop()
-    all_devices = await loop.run_in_executor(None, db.get_all_devices)
+    all_devices = await asyncio.to_thread(db.get_all_devices)
     for row in all_devices:
-        if row["approved"]:
-            await reconcile(row["device_id"])
+        if row.approved:
+            await reconcile(row.device_id)
     log.info(f"BLE proxy servers ready ({len(_proxies)} enabled)")
 
 
@@ -372,53 +350,70 @@ async def device_disconnected(device_id: str) -> None:
 
 # ─── Data path ───────────────────────────────────────────────────────────────
 
-def forward_adverts(device_id: str, adverts: list) -> None:
+def _parse_advert(raw: object) -> _Advert | None:
+    """One entry of the device's `ble_adverts` batch — the Go bluetooth.Advert
+    JSON shape {"addr": "AA:BB:..", "addrType": 0, "rssi": -62, "data":
+    "<base64>"|null} — or None when malformed."""
+    if not isinstance(raw, Mapping):
+        return None
+    addr, rssi = raw.get("addr"), raw.get("rssi")
+    addr_type, data = raw.get("addrType", 0), raw.get("data") or ""
+    if not (isinstance(addr, str) and isinstance(rssi, int)
+            and isinstance(addr_type, int) and isinstance(data, str)):
+        return None
+    try:
+        return _Advert(int(addr.replace(":", ""), 16), addr_type, rssi,
+                       base64.b64decode(data))
+    except ValueError:   # includes binascii.Error
+        return None
+
+
+def forward_adverts(device_id: str, adverts: object) -> None:
     """
-    Forward one ble_adverts batch from the device to the subscribed HA
-    connection. adverts: [{"addr": "aa:bb:..", "addrType": 0, "rssi": -62,
-    "data": "<base64>"}] — the device's bluetooth.Advert JSON shape.
+    Forward one ble_adverts batch (the device's raw JSON list) to the
+    subscribed HA connection; malformed entries are skipped.
     """
     proxy = _proxies.get(device_id)
-    if proxy is None:
+    if proxy is None or not isinstance(adverts, list):
         return
     proxy.adverts_received += len(adverts)
     satellite = proxy.get_satellite()
     if satellite is None or not satellite.subscribed:
         return
 
-    import base64
     resp = api_pb2.BluetoothLERawAdvertisementsResponse()
-    for a in adverts:
-        try:
-            adv = resp.advertisements.add()
-            adv.address = int(a["addr"].replace(":", ""), 16)
-            adv.rssi = int(a["rssi"])
-            adv.address_type = int(a.get("addrType", 0))
-            adv.data = base64.b64decode(a.get("data") or "")
-        except (KeyError, ValueError, TypeError) as e:
-            log.debug(f"[{device_id}] Malformed advert skipped: {e}")
+    for raw in adverts:
+        advert = _parse_advert(raw)
+        if advert is None:
+            log.debug(f"[{device_id}] Malformed advert skipped: {raw!r}")
             continue
+        adv = resp.advertisements.add()
+        adv.address = advert.address
+        adv.rssi = advert.rssi
+        adv.address_type = advert.address_type
+        adv.data = advert.data
     if not resp.advertisements:
         return
     satellite._send_one(resp)
     proxy.adverts_forwarded += len(resp.advertisements)
 
 
-def update_stats(device_id: str, ble_stats: dict) -> None:
+def update_stats(device_id: str, ble_stats: object) -> None:
     """
     Called by em_controller when a device stats message carries a `ble`
     object. Pushes the adverts-seen counter to HA's diagnostic sensor.
     """
     proxy = _proxies.get(device_id)
-    if proxy is None or not isinstance(ble_stats, dict):
+    if proxy is None or not isinstance(ble_stats, Mapping):
         return
-    proxy.adverts_seen = int(ble_stats.get("advertsSeen") or 0)
+    seen = ble_stats.get("advertsSeen")
+    proxy.adverts_seen = seen if isinstance(seen, int) else 0
     satellite = proxy.get_satellite()
     if satellite is not None:
         satellite.push_adverts_sensor(proxy.adverts_seen)
 
 
-def get_status(device_id: str) -> Optional[dict]:
+def get_status(device_id: str) -> BleProxyStatus | None:
     """Controller-side proxy state for the dashboard (None when disabled)."""
     proxy = _proxies.get(device_id)
     if proxy is None:

@@ -260,7 +260,7 @@ def test_wake_stats_windows_accumulate_into_the_hour(fresh_db):
     rows = db.get_wake_counters("dev2", 0)
     assert len(rows) == 1
     r = rows[0]
-    assert (r["near_misses"], r["dev_hops"], r["dev_drops"], r["dev_crossings"]) == (3, 380, 1, 1)
-    assert r["near_miss_max"] == 0.31
-    assert r["dev_max_score"] == 0.93
-    assert r["dev_max_infer_ms"] == 131
+    assert (r.near_misses, r.dev_hops, r.dev_drops, r.dev_crossings) == (3, 380, 1, 1)
+    assert r.near_miss_max == 0.31
+    assert r.dev_max_score == 0.93
+    assert r.dev_max_infer_ms == 131

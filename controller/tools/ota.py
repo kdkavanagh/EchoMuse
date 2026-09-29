@@ -1,24 +1,24 @@
 """OTA the built binary to a device via the controller API."""
-import asyncio, json, secrets, sqlite3, sys
+import asyncio, secrets, sqlite3, sys
 import aiohttp
 
 DEVICE = sys.argv[1]
 BINARY = "/tmp/server-new"
 DB = "/app/data/echomuse.db"
 
-def make_token():
+def make_token() -> str:
     tok = secrets.token_hex(32)
     con = sqlite3.connect(DB)
     con.execute("INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, 1, datetime('now'), datetime('now', '+15 minutes'))", (tok,))
     con.commit(); con.close()
     return tok
 
-def drop_token(tok):
+def drop_token(tok: str) -> None:
     con = sqlite3.connect(DB)
     con.execute("DELETE FROM sessions WHERE token=?", (tok,))
     con.commit(); con.close()
 
-async def main():
+async def main() -> None:
     tok = make_token()
     try:
         async with aiohttp.ClientSession(headers={"Authorization": f"Bearer {tok}"}) as s:

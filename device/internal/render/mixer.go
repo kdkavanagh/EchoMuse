@@ -1,10 +1,10 @@
 package render
 
 import (
-	"crypto/rand"
-	"encoding/binary"
 	"fmt"
 	"sync"
+
+	"github.com/wilbowes/EchoMuse/internal/audio/ema"
 )
 
 // Playback slots: at most one playback per class (SPEC §16.2).
@@ -211,7 +211,7 @@ func NewMixer(cfg Config) (*Mixer, error) {
 		alert:       cfg.Alert,
 		now:         cfg.Now,
 		hooks:       cfg.Hooks,
-		epoch:       newEpoch(),
+		epoch:       ema.NewEpoch(),
 		completions: make(chan int64, 2*maxOutstandingWrites),
 		stop:        make(chan struct{}),
 	}
@@ -224,18 +224,6 @@ func NewMixer(cfg Config) (*Mixer, error) {
 		}
 	})
 	return m, nil
-}
-
-func newEpoch() uint64 {
-	var b [8]byte
-	for {
-		if _, err := rand.Read(b[:]); err != nil {
-			panic(fmt.Sprintf("render: epoch: %v", err))
-		}
-		if v := binary.LittleEndian.Uint64(b[:]); v != 0 {
-			return v
-		}
-	}
 }
 
 // Epoch is the current render epoch.
@@ -829,7 +817,7 @@ func (m *Mixer) restart() error {
 		}
 	}
 	m.mu.Lock()
-	m.epoch = newEpoch()
+	m.epoch = ema.NewEpoch()
 	m.mixed, m.submitted, m.completed, m.lastDone = 0, 0, 0, 0
 	m.wrHead, m.wrN = 0, 0
 	epoch := m.epoch

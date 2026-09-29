@@ -13,6 +13,15 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// defaultStatePath persists mute state across reboots and OTA restarts. It
+// lives next to the TLS credentials in /data/local/etc — OTA slot flips only
+// touch /data/local/bin, so the file survives them.
+//
+// Only mute lives here: mute is device-sovereign (the physical button cannot
+// be overridden remotely, so the device must restore it itself, controller or
+// no controller). Volume is the opposite — the controller's stored
+// startupVolume is the source of truth, re-applied via SeedVolume on the
+// first config push each run.
 const defaultStatePath = "/data/local/etc/echomuse/state.json"
 
 // Config wires the physical server. Nil Hardware selects Dot tinymix/GPIO;
@@ -97,9 +106,9 @@ const (
 func (s *Server) SetLinkState(state LinkState) {
 	switch state {
 	case LinkPending:
-		s.ring.animate(LayerLink, AnimSpec{Pattern: "pulse", Colors: [][3]uint8{{80, 80, 80}}, PeriodMs: 2800})
+		s.ring.animate(LayerLink, AnimSpec{Pattern: PatternPulse, Colors: [][3]uint8{{80, 80, 80}}, PeriodMs: 2800})
 	case LinkDown:
-		s.ring.animate(LayerLink, AnimSpec{Pattern: "pulse", Colors: [][3]uint8{{200, 50, 0}}, PeriodMs: 2000})
+		s.ring.animate(LayerLink, AnimSpec{Pattern: PatternPulse, Colors: [][3]uint8{{200, 50, 0}}, PeriodMs: 2000})
 	default:
 		s.ring.clear(LayerLink)
 	}
@@ -112,9 +121,9 @@ func (s *Server) SetAlertIndication(active, foreground bool) {
 	case !active:
 		s.ring.clear(LayerAlert)
 	case foreground:
-		s.ring.animate(LayerAlert, AnimSpec{Pattern: "pulse", Colors: [][3]uint8{{0, 140, 220}}, PeriodMs: 900})
+		s.ring.animate(LayerAlert, AnimSpec{Pattern: PatternPulse, Colors: [][3]uint8{{0, 140, 220}}, PeriodMs: 900})
 	default:
-		s.ring.animate(LayerAlert, AnimSpec{Pattern: "solid", Colors: [][3]uint8{{0, 24, 38}}})
+		s.ring.animate(LayerAlert, AnimSpec{Pattern: PatternSolid, Colors: [][3]uint8{{0, 24, 38}}})
 	}
 }
 

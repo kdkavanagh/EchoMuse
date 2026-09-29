@@ -4,6 +4,7 @@
 package ema
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 )
@@ -284,5 +285,19 @@ func PCM(dst []int16, src []byte) {
 	dst = dst[:len(src)/pcmSampleSize]
 	for i := range dst {
 		dst[i] = int16(binary.LittleEndian.Uint16(src[i*pcmSampleSize:]))
+	}
+}
+
+// NewEpoch draws a random nonzero stream epoch (§16.1). It panics if the
+// system random source fails: epochs must never repeat.
+func NewEpoch() uint64 {
+	var b [8]byte
+	for {
+		if _, err := rand.Read(b[:]); err != nil {
+			panic("ema: crypto/rand: " + err.Error())
+		}
+		if v := binary.LittleEndian.Uint64(b[:]); v != 0 {
+			return v
+		}
 	}
 }

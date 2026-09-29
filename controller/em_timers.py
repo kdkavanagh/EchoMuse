@@ -8,14 +8,16 @@ timer the user meant.
 
 from __future__ import annotations
 
-from typing import Any, Sequence
+from enum import StrEnum
+from typing import Sequence
 
 from echomuse_grammar import Choice, tokens
+from em_ha_client import HaTimer
 
 Start = tuple[int, int, int]      # (hours, minutes, seconds) the timer started with
 
 
-def start_of(timer: dict) -> Start:
+def start_of(timer: HaTimer) -> Start:
     return (int(timer.get("start_hours") or 0), int(timer.get("start_minutes") or 0),
             int(timer.get("start_seconds") or 0))
 
@@ -28,7 +30,7 @@ def _norm(name: object) -> str:
     return " ".join(tokens(str(name or "")))
 
 
-def matches(timer: dict, start: Start | None, name: str | None) -> bool:
+def matches(timer: HaTimer, start: Start | None, name: str | None) -> bool:
     """Whether "the <start> <name> timer" means `timer`. A start matches by length, so
     "the 90 second timer" is also the one started as "1 minute 30 seconds"."""
     if start is not None and _seconds(start_of(timer)) != _seconds(start):
@@ -36,7 +38,7 @@ def matches(timer: dict, start: Start | None, name: str | None) -> bool:
     return name is None or _norm(timer.get("name")) == _norm(name)
 
 
-def cancel_slots(target: dict, every: Sequence[dict], device_id: str) -> dict[str, Any] | None:
+def cancel_slots(target: HaTimer, every: Sequence[HaTimer], device_id: str | None) -> dict[str, object] | None:
     """`HassCancelTimer` slots under which HA picks exactly `target` from `every` timer in
     HA, or None when HA cannot tell it apart (another timer of this speaker with the same
     length and name).
@@ -44,7 +46,7 @@ def cancel_slots(target: dict, every: Sequence[dict], device_id: str) -> dict[st
     Mirrors HA's `_find_timer`: filter by name, then by the exact start units, returning a
     lone match at each step, then prefer the requesting device's timers. HA stores only
     the units a start gave, and EchoMuse's own starts give only non-zero ones."""
-    slots: dict[str, Any] = {unit: value for unit, value in zip(
+    slots: dict[str, object] = {unit: value for unit, value in zip(
         ("start_hours", "start_minutes", "start_seconds"), start_of(target)) if value}
     if target.get("name"):
         slots["name"] = str(target["name"])
@@ -57,10 +59,15 @@ def cancel_slots(target: dict, every: Sequence[dict], device_id: str) -> dict[st
 
 
 _ORDINALS = ("first", "second", "third", "fourth", "fifth")
-ALL, NONE = "all", "none"
 
 
-def choices(timers: Sequence[dict]) -> tuple[Choice, ...]:
+class TimerChoice(StrEnum):
+    """The "which timer?" replies that are not one timer's index."""
+    ALL = "all"
+    NONE = "none"
+
+
+def choices(timers: Sequence[HaTimer]) -> tuple[Choice, ...]:
     """Reply choices for "which timer?": each timer by its length, its name, or its place
     in the question ("the second one"); all of them; or none. Choice values are indexes
     into `timers`. An alias two timers share selects neither."""
@@ -81,8 +88,8 @@ def choices(timers: Sequence[dict]) -> tuple[Choice, ...]:
             ordinal = _ORDINALS[index]
             aliases += [ordinal, f"the {ordinal}", f"the {ordinal} one", f"the {ordinal} timer"]
         items.append(Choice(index, tuple(aliases)))
-    items.append(Choice(ALL, ("all", "both", "all of them", "both of them", "all timers", "both timers",
+    items.append(Choice(TimerChoice.ALL, ("all", "both", "all of them", "both of them", "all timers", "both timers",
                               "all of them please", "cancel all", "cancel both", "every timer")))
-    items.append(Choice(NONE, ("none", "neither", "none of them", "neither of them", "never mind",
+    items.append(Choice(TimerChoice.NONE, ("none", "neither", "none of them", "neither of them", "never mind",
                                "nevermind", "no", "nothing", "leave them", "leave it")))
     return tuple(items)

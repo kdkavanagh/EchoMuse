@@ -10,8 +10,10 @@ import json
 import os
 import tarfile
 import wave
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 import numpy as np
 
@@ -32,6 +34,77 @@ class BundleError(Exception):
     pass
 
 
+class RecognizerStream(Protocol):
+    """What the controller uses of a `sherpa_onnx.OnlineStream`."""
+
+    def accept_waveform(self, sample_rate: int, waveform: np.ndarray) -> None: ...
+    def input_finished(self) -> None: ...
+
+
+class Recognizer(Protocol):
+    """What the controller uses of a `sherpa_onnx.OnlineRecognizer`."""
+
+    def create_stream(self) -> RecognizerStream: ...
+    def is_ready(self, stream: RecognizerStream) -> bool: ...
+    def decode_stream(self, stream: RecognizerStream) -> None: ...
+    def get_result_as_json_string(self, stream: RecognizerStream) -> str: ...
+
+
+@dataclass(frozen=True, slots=True)
+class FileEntry:
+    """One hash-pinned bundle file, relative to the bundle directory."""
+
+    path: str
+    size: int
+    sha256: str
+
+    @classmethod
+    def parse(cls, raw: object, label: str) -> FileEntry:
+        if not isinstance(raw, Mapping):
+            raise BundleError(f"manifest {label} entry is malformed")
+        path, size, sha256 = raw.get("path"), raw.get("size"), raw.get("sha256")
+        if not isinstance(path, str) or isinstance(size, bool) or not isinstance(size, int) \
+                or not isinstance(sha256, str):
+            raise BundleError(f"manifest {label} entry is malformed")
+        return cls(path, size, sha256)
+
+
+@dataclass(frozen=True, slots=True)
+class Manifest:
+    """`speech_bundle.json` (version 1): what the bundle holds and each file's pin."""
+
+    package: str                      # the sherpa-onnx distribution name
+    package_version: str
+    wheel: FileEntry
+    archive: FileEntry                # the Kroko model archive
+    asr_files: Mapping[str, FileEntry]   # encoder, decoder, joiner, tokens
+    test_wav_member: str              # qualification WAV inside `archive`
+    vad: FileEntry
+    attribution_path: str
+
+    @classmethod
+    def parse(cls, raw: object) -> Manifest:
+        if not isinstance(raw, Mapping):
+            raise BundleError("speech bundle manifest is not an object")
+        if raw.get("version") != 1:
+            raise BundleError(f"unsupported speech bundle manifest version {raw.get('version')!r}")
+        runtime, asr, attribution = raw.get("runtime"), raw.get("asr"), raw.get("attribution")
+        if not isinstance(runtime, Mapping) or not isinstance(asr, Mapping) or not isinstance(attribution, Mapping):
+            raise BundleError("speech bundle manifest lacks runtime, asr or attribution")
+        package, version = runtime.get("package"), runtime.get("version")
+        files, member, attribution_path = asr.get("files"), asr.get("test_wav_member"), attribution.get("path")
+        if not isinstance(package, str) or not isinstance(version, str) or not isinstance(files, Mapping) \
+                or not isinstance(member, str) or not isinstance(attribution_path, str):
+            raise BundleError("speech bundle manifest is malformed")
+        asr_files = {str(name): FileEntry.parse(entry, f"Kroko {name}") for name, entry in files.items()}
+        missing = {"encoder", "decoder", "joiner", "tokens"} - set(asr_files)
+        if missing:
+            raise BundleError(f"speech bundle manifest lacks Kroko {sorted(missing)}")
+        return cls(package, version, FileEntry.parse(runtime.get("wheel"), "sherpa wheel"),
+                   FileEntry.parse(asr.get("archive"), "Kroko archive"), asr_files, member,
+                   FileEntry.parse(raw.get("vad"), "Silero v5"), attribution_path)
+
+
 @dataclass(frozen=True, slots=True)
 class SpeechBundle:
     directory: Path
@@ -44,7 +117,7 @@ class SpeechBundle:
     vad: Path
     attribution: Path
     package_version: str
-    manifest: dict
+    manifest: Manifest
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,14 +127,12 @@ class Qualification:
     final_trailing_blank_frames: int
 
 
-def load_manifest(path: str | os.PathLike = MANIFEST_PATH) -> dict:
+def load_manifest(path: str | os.PathLike[str] = MANIFEST_PATH) -> Manifest:
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise BundleError(f"cannot read speech bundle manifest: {exc}") from None
-    if raw.get("version") != 1:
-        raise BundleError(f"unsupported speech bundle manifest version {raw.get('version')!r}")
-    return raw
+    return Manifest.parse(raw)
 
 
 def _sha256(path: Path) -> str:
@@ -72,12 +143,8 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def _verify_file(directory: Path, entry: dict, label: str) -> Path:
-    try:
-        rel, size, expected = entry["path"], entry["size"], entry["sha256"]
-    except (KeyError, TypeError):
-        raise BundleError(f"manifest {label} entry is malformed") from None
-    path = directory / rel
+def _verify_file(directory: Path, entry: FileEntry, label: str) -> Path:
+    path, size, expected = directory / entry.path, entry.size, entry.sha256
     try:
         actual_size = path.stat().st_size
     except FileNotFoundError:
@@ -90,28 +157,28 @@ def _verify_file(directory: Path, entry: dict, label: str) -> Path:
     return path
 
 
-def verify_bundle(directory: str | os.PathLike | None = None, *,
+def verify_bundle(directory: str | os.PathLike[str] | None = None, *,
                   check_installed_package: bool = True,
-                  manifest_path: str | os.PathLike = MANIFEST_PATH) -> SpeechBundle:
+                  manifest_path: str | os.PathLike[str] = MANIFEST_PATH) -> SpeechBundle:
     """Verify every §16.6 hash. Startup must complete this before loading models."""
     root = Path(directory or os.environ.get(BUNDLE_ENV, BUNDLE_DEFAULT))
     manifest = load_manifest(manifest_path)
-    wheel = _verify_file(root, manifest["runtime"]["wheel"], "sherpa wheel")
-    archive = _verify_file(root, manifest["asr"]["archive"], "Kroko archive")
+    wheel = _verify_file(root, manifest.wheel, "sherpa wheel")
+    archive = _verify_file(root, manifest.archive, "Kroko archive")
     members = {name: _verify_file(root, entry, f"Kroko {name}")
-               for name, entry in manifest["asr"]["files"].items()}
-    vad = _verify_file(root, manifest["vad"], "Silero v5")
-    attribution = root / manifest["attribution"]["path"]
+               for name, entry in manifest.asr_files.items()}
+    vad = _verify_file(root, manifest.vad, "Silero v5")
+    attribution = root / manifest.attribution_path
     try:
         text = attribution.read_text(encoding="utf-8")
     except FileNotFoundError:
         raise BundleError(f"Kroko attribution is missing: {attribution}") from None
     if text != ATTRIBUTION_TEXT:
         raise BundleError(f"Kroko attribution is incomplete or modified: {attribution}")
-    package_version = manifest["runtime"]["version"]
+    package_version = manifest.package_version
     if check_installed_package:
         try:
-            installed = importlib.metadata.version(manifest["runtime"]["package"])
+            installed = importlib.metadata.version(manifest.package)
         except importlib.metadata.PackageNotFoundError:
             raise BundleError("sherpa-onnx is not installed") from None
         if installed != package_version:
@@ -121,20 +188,21 @@ def verify_bundle(directory: str | os.PathLike | None = None, *,
                         package_version, manifest)
 
 
-def create_recognizer(bundle: SpeechBundle):
+def create_recognizer(bundle: SpeechBundle) -> Recognizer:
     """Immutable shared Kroko recognizer with the exact §16.6 constructor."""
     import sherpa_onnx
 
-    return sherpa_onnx.OnlineRecognizer.from_transducer(
+    recognizer: Recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
         tokens=str(bundle.tokens), encoder=str(bundle.encoder), decoder=str(bundle.decoder),
         joiner=str(bundle.joiner), num_threads=1, sample_rate=16_000, feature_dim=80,
         decoding_method="greedy_search", enable_endpoint_detection=False, provider="cpu",
     )
+    return recognizer
 
 
 def read_qualification_wav(bundle: SpeechBundle) -> tuple[int, np.ndarray]:
     """Read the archive's distributed `test_wavs/0.wav` without extracting it."""
-    member_name = bundle.manifest["asr"]["test_wav_member"]
+    member_name = bundle.manifest.test_wav_member
     try:
         with tarfile.open(bundle.archive, "r:bz2") as archive:
             member = archive.getmember(member_name)
@@ -152,7 +220,7 @@ def read_qualification_wav(bundle: SpeechBundle) -> tuple[int, np.ndarray]:
     return rate, samples
 
 
-def qualify_bundle(bundle: SpeechBundle, recognizer=None) -> Qualification:
+def qualify_bundle(bundle: SpeechBundle, recognizer: Recognizer | None = None) -> Qualification:
     """Install-time qualification: test WAV + 4 s silence must produce a
     22–27/s trailing-blank slope (§16.6). This is not run at every startup."""
     recognizer = recognizer or create_recognizer(bundle)

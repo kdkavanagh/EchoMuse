@@ -30,7 +30,7 @@ def level_to_db(level: int) -> float:
     return (level - DEVICE_VOLUME_MAX) * DB_PER_STEP
 
 
-def device_level_to_ha(level: int) -> float:
+def device_level_to_ha(level: float) -> float:
     """Convert a device volume level to an HA float (0.0–1.0)."""
     try:
         return max(0.0, min(1.0, float(level) / DEVICE_VOLUME_MAX))

@@ -6,6 +6,9 @@ and the dashboard event and shell WebSockets.
 """
 
 import asyncio
+import base64
+import contextlib
+import enum
 import hashlib
 import html as _html
 import io
@@ -18,18 +21,25 @@ import shutil
 import sqlite3 as _sqlite3
 import tempfile
 import time
+import uuid
 import zipfile
+from collections.abc import AsyncIterator, Callable, Coroutine, Mapping
+from dataclasses import asdict, dataclass
 from datetime import date
 from pathlib import Path
-from typing import Any, Optional
+from typing import Generic, NotRequired, Protocol, TypedDict, TypeVar
 
 import aiohttp
 from aiohttp import web
+from aiohttp.typedefs import Handler
 
+import em_alerts
 import em_db as db
 import em_auth as auth
 import em_ble_proxy
 import em_config_sections as sections_mod
+import em_device
+import em_ha_client
 import em_pki
 import em_player
 import em_recordings
@@ -42,8 +52,12 @@ import em_sounds
 import em_device_assets
 import em_device_link
 import em_wake_registry
+import em_shell
 import em_support
+from em_device_link import MessageType
+from em_session import ActorState
 from version import VERSION as CONTROLLER_VERSION
+from version import UpdateStatus
 from version import compare as _compare_versions
 from version import parse as _parse_version
 
@@ -101,11 +115,54 @@ INGRESS_GATEWAY_IP = "172.30.32.2"
 # release that is actually a device firmware release.
 GITHUB_API_URL = "https://api.github.com/repos/{repo}/releases?per_page=10"
 
+T = TypeVar("T")
+
+
+@dataclass(slots=True)
+class _Cached(Generic[T]):
+    """One in-memory value and when it was fetched (monotonic)."""
+
+    value: T | None = None
+    at: float = 0.0
+
+    def fresh(self, ttl: float) -> T | None:
+        """The value if it is younger than `ttl` seconds, else None."""
+        if self.value is not None and time.monotonic() - self.at < ttl:
+            return self.value
+        return None
+
+    def put(self, value: T) -> T:
+        self.value, self.at = value, time.monotonic()
+        return value
+
+
+class ReleaseInfo(TypedDict):
+    """The newest device firmware release, as /api/releases/latest serves it."""
+
+    version: str
+    url: str
+    notes: str
+    release_url: str
+    published_at: str
+
+
+class ControllerRelease(TypedDict):
+    """/api/releases/controller. Without any known release only version (None),
+    current, status and available are present."""
+
+    version: str | None
+    current: str
+    notes: NotRequired[str]
+    published_at: NotRequired[str]
+    release_url: NotRequired[str]
+    status: UpdateStatus
+    available: bool
+
+
 # How long to cache GitHub release info in memory (seconds).
 # DB is the persistent cache; this avoids hitting the DB on every
 # /api/releases/latest request.
-_release_cache: dict = {}
-_release_cache_ts: float = 0.0
+_release_cache: _Cached[ReleaseInfo] = _Cached()
 RELEASE_CACHE_TTL = 60  # seconds
 
 # Controller releases are `controller-v*` TAGS with no GitHub Release behind
@@ -124,20 +181,19 @@ GITHUB_TAGS_URL = (
 )
 GITHUB_TAG_OBJECT_URL = "https://api.github.com/repos/{repo}/git/tags/{sha}"
 
-_controller_cache: dict = {}
-_controller_cache_ts: float = 0.0
+_controller_cache: _Cached[ControllerRelease] = _Cached()
 
 # Reference to the live devices dict from em_controller — set by init().
-_devices: dict = {}
+_devices: dict[str, em_device.Device] = {}
 
 
-def _online(device_id: str):
+def _online(device_id: str) -> em_device.Device | None:
     """The connected Device (v1 or upgrade-only legacy), otherwise None."""
     device = _devices.get(device_id)
     return device if device is not None and device.online else None
 
 
-def _v1(device_id: str):
+def _v1(device_id: str) -> em_device.Device | None:
     """A connected v1 Device, otherwise None; diagnostics/alerts need v1."""
     device = _online(device_id)
     return device if device is not None and device.link is not None else None
@@ -166,7 +222,32 @@ def set_tls_dir(tls_dir: str) -> None:
 _event_clients: set[web.WebSocketResponse] = set()
 
 # Track in-progress OTA updates per device_id to enforce one-at-a-time.
+# Claimed by the request handler, before the task is scheduled, so two
+# requests cannot both pass the check; released by the task when it ends.
 _updates_in_progress: set[str] = set()
+
+# Background tasks started from here. The event loop keeps only a weak
+# reference to a task, so one nobody holds can be collected mid-flight.
+_background_tasks: set[asyncio.Task[None]] = set()
+
+
+def _spawn(coro: Coroutine[object, object, None], name: str) -> asyncio.Task[None]:
+    """Run `coro` in the background, held until done; a crash is logged."""
+    task = asyncio.create_task(coro, name=name)
+    _background_tasks.add(task)
+    task.add_done_callback(_task_done)
+    return task
+
+
+def _task_done(task: asyncio.Task[None]) -> None:
+    _background_tasks.discard(task)
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        log.error(f"[api] Unhandled exception in background task {task.get_name()}: {exc}",
+                  exc_info=exc)
+
 
 # Last OTA failure per device, surfaced as `update_error` in /api/devices so
 # the dashboard (fleet deploy modal + per-device update log) can show *why* a
@@ -180,80 +261,157 @@ _update_errors: dict[str, str] = {}
 # Pending local binary uploads — keyed by UUID token, expire after 10 minutes.
 _pending_uploads: dict[str, bytes] = {}
 
-# WiFi change state per device_id — {"pending": {...}|None, "last_result":
-# {...}|None}. Deliberately NOT on the live Device object: the connection
-# (and with it the Device) dies when the network switches, and the outcome
-# arrives on the replacement connection. In-memory only — a controller
-# restart mid-change just means the result event is lost, not the change
-# itself (the device self-manages commit/rollback).
-_wifi_states: dict[str, dict] = {}
+
+@dataclass(frozen=True, slots=True)
+class _WifiPending:
+    ssid: str
+    started_at: float
+
+
+@dataclass(frozen=True, slots=True)
+class _WifiResult:
+    ok: bool
+    ssid: str
+    error: str
+    at: float
+
+
+@dataclass(slots=True)
+class _WifiChange:
+    """
+    One device's WiFi switch: the one in flight, and how the last one ended.
+
+    Deliberately NOT on the live Device object: the connection (and with it
+    the Device) dies when the network switches, and the outcome arrives on
+    the replacement connection. In-memory only — a controller restart
+    mid-change just means the result event is lost, not the change itself
+    (the device self-manages commit/rollback).
+    """
+
+    pending: _WifiPending | None = None
+    last_result: _WifiResult | None = None
+
+    def wire(self) -> dict[str, object]:
+        """The device JSON's `wifi` field."""
+        return {
+            "pending": None if self.pending is None else asdict(self.pending),
+            "last_result": None if self.last_result is None else asdict(self.last_result),
+        }
+
+
+_wifi_changes: dict[str, _WifiChange] = {}
 
 # A change whose result never arrived (device bricked its network AND
 # rollback failed, or controller restarted) must not block retries forever.
 _WIFI_PENDING_TTL = 240  # device gates total ≤ ~135s + margin
 
 
-def wifi_state(device_id: str) -> dict:
+def _wifi_change(device_id: str) -> _WifiChange:
     """Current wifi change state for a device, with stale pending expiry."""
-    st = _wifi_states.setdefault(device_id, {"pending": None, "last_result": None})
-    pending = st.get("pending")
-    if pending and time.time() - pending["started_at"] > _WIFI_PENDING_TTL:
-        st["pending"] = None
-        st["last_result"] = {
-            "ok": False, "ssid": pending["ssid"],
-            "error": "no result from device — change timed out (device may "
-                     "be offline, or its rollback failed)",
-            "at": time.time(),
-        }
+    st = _wifi_changes.setdefault(device_id, _WifiChange())
+    pending = st.pending
+    if pending is not None and time.time() - pending.started_at > _WIFI_PENDING_TTL:
+        st.pending = None
+        st.last_result = _WifiResult(
+            ok=False, ssid=pending.ssid,
+            error="no result from device — change timed out (device may "
+                  "be offline, or its rollback failed)",
+            at=time.time(),
+        )
     return st
 
 
 def wifi_record_result(device_id: str, ok: bool, ssid: str, error: str
-                       ) -> tuple[dict, bool]:
+                       ) -> tuple[dict[str, object], bool]:
     """
     Store a wifi_result reported by the device.
 
-    Returns (state, duplicate). The device re-sends its result until the
+    Returns (state JSON, duplicate). The device re-sends its result until the
     wifi_commit ack lands, so re-arrivals of the same outcome are flagged
     (duplicate=True) and don't refresh the timestamp — callers ack every
     arrival but log/record only the first.
     """
-    st = wifi_state(device_id)
-    last = st.get("last_result")
-    if (last and last.get("ok") == ok and last.get("ssid") == ssid
-            and last.get("error") == error and st.get("pending") is None):
-        return st, True
-    st["pending"] = None
-    st["last_result"] = {"ok": ok, "ssid": ssid, "error": error, "at": time.time()}
-    return st, False
+    st = _wifi_change(device_id)
+    last = st.last_result
+    if (last is not None and last.ok == ok and last.ssid == ssid
+            and last.error == error and st.pending is None):
+        return st.wire(), True
+    st.pending = None
+    st.last_result = _WifiResult(ok=ok, ssid=ssid, error=error, at=time.time())
+    return st.wire(), False
 
 # ─── Initialisation ───────────────────────────────────────────────────────────
 
-_shell_pending:   dict = {}
-_shell_dashboard: dict = {}
-_shell_ws:        dict = {}   # device_id → live ws for programmatic sessions
-_shell_lock:      dict = {}   # device_id → asyncio.Lock (one session at a time)
+class FeatureStatusWire(TypedDict):
+    """One HA feature's probe result as the dashboard reads it."""
 
-def init(devices_ref: dict, shell_pending_ref: dict, shell_dashboard_ref: dict) -> None:
+    ok: bool
+    detail: str | None
+
+
+class SpeechWorkerStatus(TypedDict, total=False):
+    """The speech worker as `/api/system/status` reports it."""
+
+    started: bool
+    available: bool
+    policy: str
+
+
+class ControllerServices(Protocol):
+    """What the API asks of the running controller.
+
+    em_controller implements it and hands it to `create_runner`; handlers
+    read it from `request.app[SERVICES]`. The accessors raise before the
+    controller has created what they return.
     """
-    Bind live shared state from em_controller.
+
+    @property
+    def shell(self) -> em_shell.ShellBroker: ...
+    def alerts(self) -> em_alerts.AlertEngine: ...
+    def registry(self) -> em_wake_registry.WakeRegistry: ...
+    def device_assets(self) -> em_device_assets.DeviceAssets: ...
+    def ha_status(self) -> dict[em_ha_client.HaFeature, FeatureStatusWire]: ...
+    def speech_worker_status(self) -> SpeechWorkerStatus: ...
+    def loop_lag_peak_ms(self) -> float: ...
+    async def remove_device(self, device_id: str) -> None: ...
+    async def set_collect_mode(self, device: em_device.Device, enabled: bool) -> None: ...
+    async def set_ambient_mode(self, device: em_device.Device, enabled: bool) -> None: ...
+    def capture_state(self, device: em_device.Device | None) -> dict[str, object]: ...
+    async def set_capture_mode(self, device: em_device.Device, enabled: bool,
+                               webhook: str | None = None,
+                               idle_s: float | None = None) -> None: ...
+    async def open_capture_window(self, device: em_device.Device, tag: str,
+                                  max_ms: int) -> em_capture.Window: ...
+    async def close_capture_window(self, device: em_device.Device,
+                                   session: str | None = None) -> bool: ...
+    async def take_recording(self, device: em_device.Device, session: str | None,
+                             wait_s: float) -> em_capture.CaptureResult | None: ...
+    async def preview_sound(self, device: em_device.Device, sound_id: str) -> dict[str, object]: ...
+    async def stop_preview(self, device: em_device.Device) -> None: ...
+
+
+SERVICES: web.AppKey[ControllerServices] = web.AppKey("services")
+
+
+def init(devices_ref: dict[str, em_device.Device]) -> None:
+    """
+    Bind the live devices dict from em_controller.
 
     Must be called before create_app().
     """
-    global _devices, _shell_pending, _shell_dashboard
-    _devices         = devices_ref
-    _shell_pending   = shell_pending_ref
-    _shell_dashboard = shell_dashboard_ref
+    global _devices
+    _devices = devices_ref
 
 
-async def create_app() -> web.Application:
+async def create_app(services: ControllerServices) -> web.Application:
     """
-    Build and return the aiohttp Application.
+    Build and return the aiohttp Application, serving `services`.
 
     Routes are registered here. The app is not started — the caller
     creates an AppRunner and TCPSite.
     """
     app = web.Application(middlewares=[_ingress_only_middleware, _error_middleware])
+    app[SERVICES] = services
 
     # Static / setup
     app.router.add_get("/",           _serve_spa)
@@ -375,18 +533,85 @@ async def create_app() -> web.Application:
     return app
 
 
-async def create_runner(devices_ref: dict, shell_pending_ref: dict,
-                        shell_dashboard_ref: dict) -> web.AppRunner:
+async def create_runner(devices_ref: dict[str, em_device.Device],
+                        services: ControllerServices) -> web.AppRunner:
     """Convenience wrapper — init + create_app + AppRunner."""
-    init(devices_ref, shell_pending_ref, shell_dashboard_ref)
-    app = await create_app()
+    init(devices_ref)
+    app = await create_app(services)
     return web.AppRunner(app)
+
+
+# ─── Errors ───────────────────────────────────────────────────────────────────
+
+class ErrorCode(enum.StrEnum):
+    """The `code` of an API error body, `{"error": message, "code": code}`."""
+
+    ALREADY_APPROVED = "already_approved"
+    BAD_REQUEST = "bad_request"
+    BAD_WEBHOOK = "bad_webhook"
+    COLLECTING = "collecting"
+    DECODE_FAILED = "decode_failed"
+    DEVICE_NOT_FOUND = "device_not_found"
+    DEVICE_OFFLINE = "device_offline"
+    EMPTY_UPLOAD = "empty_upload"
+    FETCH_FAILED = "fetch_failed"
+    INTERNAL_ERROR = "internal_error"
+    INVALID_CONFIG = "invalid_config"
+    INVALID_CREDENTIALS = "invalid_credentials"
+    INVALID_FILENAME = "invalid_filename"
+    INVALID_ID = "invalid_id"
+    INVALID_INPUT = "invalid_input"
+    INVALID_JSON = "invalid_json"
+    INVALID_MODEL = "invalid_model"
+    INVALID_PARAM = "invalid_param"
+    INVALID_TOKEN = "invalid_token"
+    INVALID_UPLOAD = "invalid_upload"
+    MISSING_FIELD = "missing_field"
+    MODEL_IN_USE = "model_in_use"
+    NO_RECORDING = "no_recording"
+    NO_RELEASE = "no_release"
+    NO_ROLLBACK_AVAILABLE = "no_rollback_available"
+    NO_SAMPLE = "no_sample"
+    NO_SAMPLES = "no_samples"
+    NO_WAKE_CLIP = "no_wake_clip"
+    NO_WAKE_CLIPS = "no_wake_clips"
+    NOT_APPROVED = "not_approved"
+    NOT_CAPTURING = "not_capturing"
+    NOT_CONNECTED = "not_connected"
+    NOT_FOUND = "not_found"
+    RECORDING_AMBIENT = "recording_ambient"
+    REMOVED_CONFIG_KEY = "removed_config_key"
+    SCAN_FAILED = "scan_failed"
+    SCAN_IN_PROGRESS = "scan_in_progress"
+    SCAN_TIMEOUT = "scan_timeout"
+    SOUND_IN_USE = "sound_in_use"
+    TLS_UNAVAILABLE = "tls_unavailable"
+    TOO_LARGE = "too_large"
+    UNKNOWN_CONFIG_KEY = "unknown_config_key"
+    UNKNOWN_WAKE_MODEL = "unknown_wake_model"
+    UPDATE_IN_PROGRESS = "update_in_progress"
+    UPGRADE_REQUIRED = "upgrade_required"
+    UPLOAD_FAILED = "upload_failed"
+    USER_NOT_FOUND = "user_not_found"
+    WIFI_CHANGE_IN_PROGRESS = "wifi_change_in_progress"
+    WOULD_DROP_KEYS = "would_drop_keys"
+
+
+class ApiError(Exception):
+    """A refused request, raised from a request helper and answered by
+    `_error_middleware` with the API's error body."""
+
+    def __init__(self, code: ErrorCode, message: str, status: int) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.status = status
 
 
 # ─── Middleware ───────────────────────────────────────────────────────────────
 
 @web.middleware
-async def _ingress_only_middleware(request: web.Request, handler):
+async def _ingress_only_middleware(request: web.Request, handler: Handler) -> web.StreamResponse:
     """
     As a Home Assistant add-on, the dashboard/API must only be reachable
     through the authenticated ingress gateway — the add-on has no other
@@ -400,22 +625,24 @@ async def _ingress_only_middleware(request: web.Request, handler):
 
 
 @web.middleware
-async def _error_middleware(request: web.Request, handler):
+async def _error_middleware(request: web.Request, handler: Handler) -> web.StreamResponse:
     """
     Catch unhandled exceptions and return a consistent error shape.
 
-    AuthError from em_auth is also caught here so route handlers don't
-    need to handle it explicitly.
+    AuthError from em_auth and ApiError from the request helpers are also
+    caught here so route handlers don't need to handle them explicitly.
     """
     try:
         return await handler(request)
     except auth.AuthError as e:
         return e.to_response()
+    except ApiError as e:
+        return _error(e.code, e.message, e.status)
     except web.HTTPException:
         raise  # let aiohttp handle its own HTTP exceptions normally
     except Exception:
         log.exception(f"Unhandled error in {request.method} {request.path}")
-        return _error("internal_error", "An internal error occurred", 500)
+        return _error(ErrorCode.INTERNAL_ERROR, "An internal error occurred", 500)
 
 
 # ─── Static / setup ───────────────────────────────────────────────────────────
@@ -536,7 +763,7 @@ async def _post_logout(request: web.Request) -> web.Response:
 @auth.require_auth
 async def _get_me(request: web.Request) -> web.Response:
     """GET /api/auth/me — current user info."""
-    user = request["user"]
+    user: auth.SessionUser = request["user"]
     return _ok({
         "id":       user["id"],
         "username": user["username"],
@@ -549,7 +776,7 @@ async def _get_me(request: web.Request) -> web.Response:
 @auth.require_auth
 async def _get_devices(request: web.Request) -> web.Response:
     """GET /api/devices — all devices, live state merged with DB."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     rows = await loop.run_in_executor(None, db.get_all_devices)
     return _ok([_merge_device(row) for row in rows])
 
@@ -557,7 +784,7 @@ async def _get_devices(request: web.Request) -> web.Response:
 @auth.require_auth
 async def _get_pending(request: web.Request) -> web.Response:
     """GET /api/devices/pending — unapproved devices."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     rows = await loop.run_in_executor(None, db.get_pending_devices)
     return _ok([_merge_device(row) for row in rows])
 
@@ -566,10 +793,7 @@ async def _get_pending(request: web.Request) -> web.Response:
 async def _get_device(request: web.Request) -> web.Response:
     """GET /api/devices/{id}"""
     device_id = request.match_info["id"]
-    loop = asyncio.get_event_loop()
-    row = await loop.run_in_executor(None, db.get_device, device_id)
-    if row is None:
-        return _error("device_not_found", f"No device: {device_id}", 404)
+    row = await _device_row(device_id)
     return _ok(_merge_device(row))
 
 
@@ -583,11 +807,11 @@ async def _get_device_turns(request: web.Request) -> web.Response:
     device_id = request.match_info["id"]
     try:
         limit = min(int(request.query.get("limit", 50)), 1000)
-        since = request.query.get("since")
-        since = float(since) if since is not None else None
+        raw_since = request.query.get("since")
+        since = float(raw_since) if raw_since is not None else None
     except ValueError:
-        return _error("bad_request", "limit/since must be numeric", 400)
-    loop  = asyncio.get_event_loop()
+        return _error(ErrorCode.BAD_REQUEST, "limit/since must be numeric", 400)
+    loop  = asyncio.get_running_loop()
     turns = await loop.run_in_executor(
         None, lambda: db.get_turns(device_id, limit, since)
     )
@@ -595,7 +819,7 @@ async def _get_device_turns(request: web.Request) -> web.Response:
 
 
 @auth.require_auth
-async def _get_turn_audio(request: web.Request) -> web.Response:
+async def _get_turn_audio(request: web.Request) -> web.StreamResponse:
     """GET /api/devices/{id}/turns/{turn}/audio — the saved mic audio for
     one voice turn, as a downloadable WAV.
 
@@ -612,20 +836,17 @@ async def _get_turn_audio(request: web.Request) -> web.Response:
     try:
         turn_id = int(request.match_info["turn"])
     except ValueError:
-        return _error("bad_request", "turn must be an integer", 400)
+        return _error(ErrorCode.BAD_REQUEST, "turn must be an integer", 400)
 
-    loop = asyncio.get_event_loop()
-    row  = await loop.run_in_executor(None, db.get_device, device_id)
-    if row is None:
-        return _error("device_not_found", f"No device: {device_id}", 404)
+    row = await _device_row(device_id)
 
     name = em_recordings.filename(device_id, turn_id)
     path = em_recordings.resolve(device_id, name) if name else None
     if path is None:
-        return _error("no_recording",
+        return _error(ErrorCode.NO_RECORDING,
                       "No saved audio for this turn", 404)
 
-    label = _slug(row["label"] or device_id)
+    label = _slug(row.label or device_id)
     return web.FileResponse(
         path,
         headers={
@@ -671,42 +892,35 @@ async def _post_device_collect(request: web.Request) -> web.Response:
     handle_control on its next connect.
     """
     device_id = request.match_info["id"]
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
+    body = await _optional_json_body(request)
     enabled = bool(body.get("enabled"))
 
-    loop = asyncio.get_event_loop()
-    row  = await loop.run_in_executor(None, db.get_device, device_id)
-    if row is None:
-        return _error("device_not_found", f"No device: {device_id}", 404)
-    if not row["approved"]:
-        return _error("not_approved",
+    loop = asyncio.get_running_loop()
+    row = await _device_row(device_id)
+    if not row.approved:
+        return _error(ErrorCode.NOT_APPROVED,
                       "Approve this device before collecting from it", 409)
     # The mirror of the guard in _post_device_ambient: the two modes want the
     # same frames for opposite purposes, so they are mutually exclusive at
     # the API rather than resolved by a precedence rule nobody can see.
-    if enabled and bool(row["ambient_mode"]):
-        return _error("recording_ambient",
+    if enabled and bool(row.ambient_mode):
+        return _error(ErrorCode.RECORDING_AMBIENT,
                       "Stop ambient recording on this device first", 409)
 
     connected = _online(device_id)
     if enabled and connected is not None and connected.link is None:
-        return _error("upgrade_required", "Device firmware must be upgraded", 409)
+        return _error(ErrorCode.UPGRADE_REQUIRED, "Device firmware must be upgraded", 409)
     await loop.run_in_executor(None, db.set_collect_mode, device_id, enabled)
 
     live = connected if connected is not None and connected.link is not None else None
     if live is not None:
-        # Lazy import — em_controller imports em_api at module level. It
-        # writes the device log line itself, since it is the thing that
-        # knows the mode actually took effect (and how many clips a session
-        # produced on the way out).
-        import em_controller
-        await em_controller.set_collect_mode(live, enabled)
+        # The controller writes the device log line itself, since it is the
+        # thing that knows the mode actually took effect (and how many clips
+        # a session produced on the way out).
+        await request.app[SERVICES].set_collect_mode(live, enabled)
     else:
-        await _push_log_event(
-            device_id, "info", "controller",
+        await push_log_event(
+            device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
             f"Sample collection {'armed' if enabled else 'disarmed'} — "
             f"device offline, takes effect on its next connect",
         )
@@ -738,10 +952,8 @@ async def _get_samples(request: web.Request) -> web.Response:
     a hand-deleted file) would be a second source of truth for no gain.
     """
     device_id = request.match_info["id"]
-    loop = asyncio.get_event_loop()
-    row  = await loop.run_in_executor(None, db.get_device, device_id)
-    if row is None:
-        return _error("device_not_found", f"No device: {device_id}", 404)
+    loop = asyncio.get_running_loop()
+    row = await _device_row(device_id)
     clips = await loop.run_in_executor(None, em_samples.list_for, device_id)
     live  = _online(device_id)
     # What the segmenter is hearing, while it is hearing it. Without this,
@@ -749,9 +961,9 @@ async def _get_samples(request: web.Request) -> web.Response:
     # a room whose floor sits 3dB under the open threshold and one where the
     # mic is muted produce the same empty list. `dropped_short` separates a
     # third case — something IS crossing the threshold, and it is a click.
-    seg = getattr(live, "collect_seg", None) if live else None
+    seg = live.collect_seg if live is not None else None
     return _ok({
-        "enabled":  bool(row["collect_mode"]),
+        "enabled":  bool(row.collect_mode),
         "clips":    clips,
         "count":    len(clips),
         "bytes":    sum(c["bytes"] for c in clips),
@@ -759,7 +971,7 @@ async def _get_samples(request: web.Request) -> web.Response:
         "keep":     em_samples.KEEP_PER_DEVICE,
         # Session counters live on the connection, so they reset when the
         # device does — the file count above is the durable number.
-        "session":  getattr(live, "collect_clips", 0) if live else 0,
+        "session":  live.collect_clips if live is not None else 0,
         "live": None if seg is None else {
             "floor_db":      round(seg.floor_db, 1),
             "open_db":       round(seg.open_db, 1),
@@ -771,7 +983,7 @@ async def _get_samples(request: web.Request) -> web.Response:
 
 
 @auth.require_auth
-async def _get_sample_audio(request: web.Request) -> web.Response:
+async def _get_sample_audio(request: web.Request) -> web.StreamResponse:
     """GET /api/devices/{id}/samples/{name} — one clip, as a WAV.
 
     em_samples.resolve re-checks that the name belongs to the device in the
@@ -781,7 +993,7 @@ async def _get_sample_audio(request: web.Request) -> web.Response:
     name      = request.match_info["name"]
     path = em_samples.resolve(device_id, name)
     if path is None:
-        return _error("no_sample", "No such sample", 404)
+        return _error(ErrorCode.NO_SAMPLE, "No such sample", 404)
     label = _slug(device_id)
     return web.FileResponse(
         path,
@@ -807,31 +1019,16 @@ async def _get_samples_zip(request: web.Request) -> web.Response:
     temporary file on the same volume the clips live on.
     """
     device_id = request.match_info["id"]
-    loop = asyncio.get_event_loop()
-    row  = await loop.run_in_executor(None, db.get_device, device_id)
-    if row is None:
-        return _error("device_not_found", f"No device: {device_id}", 404)
+    loop = asyncio.get_running_loop()
+    row = await _device_row(device_id)
 
-    label = _slug(row["label"] or device_id)
+    label = _slug(row.label or device_id)
 
-    def _build() -> bytes | None:
-        clips = em_samples.list_for(device_id)
-        if not clips:
-            return None
-        buf = io.BytesIO()
-        # ZIP_STORED: WAV of speech does not compress meaningfully and
-        # deflating 64MB would hold a worker for seconds.
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
-            for clip in clips:
-                path = em_samples.resolve(device_id, clip["name"])
-                if path is None:
-                    continue      # pruned between listing and reading
-                z.write(path, arcname=f"{label}/{clip['name']}")
-        return buf.getvalue()
-
-    blob = await loop.run_in_executor(None, _build)
+    blob = await loop.run_in_executor(None, lambda: _zip_clips(
+        label, [clip["name"] for clip in em_samples.list_for(device_id)],
+        lambda name: em_samples.resolve(device_id, name)))
     if blob is None:
-        return _error("no_samples", "No samples collected yet", 404)
+        return _error(ErrorCode.NO_SAMPLES, "No samples collected yet", 404)
     return web.Response(
         body=blob,
         headers={
@@ -852,8 +1049,8 @@ async def _delete_sample(request: web.Request) -> web.Response:
     name      = request.match_info["name"]
     path = em_samples.resolve(device_id, name)
     if path is None:
-        return _error("no_sample", "No such sample", 404)
-    loop = asyncio.get_event_loop()
+        return _error(ErrorCode.NO_SAMPLE, "No such sample", 404)
+    loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, path.unlink)
     return _ok({"deleted": name})
 
@@ -862,13 +1059,11 @@ async def _delete_sample(request: web.Request) -> web.Response:
 async def _delete_samples(request: web.Request) -> web.Response:
     """DELETE /api/devices/{id}/samples — drop every clip for this device."""
     device_id = request.match_info["id"]
-    loop = asyncio.get_event_loop()
-    row  = await loop.run_in_executor(None, db.get_device, device_id)
-    if row is None:
-        return _error("device_not_found", f"No device: {device_id}", 404)
+    loop = asyncio.get_running_loop()
+    await _device_row(device_id)
     removed = await loop.run_in_executor(None, em_samples.delete_all, device_id)
-    await _push_log_event(
-        device_id, "info", "controller",
+    await push_log_event(
+        device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
         f"Deleted {removed} collected sample(s)",
     )
     return _ok({"deleted": removed})
@@ -882,7 +1077,7 @@ async def _delete_samples(request: web.Request) -> web.Response:
 
 
 @auth.require_auth
-async def _get_turn_wake_audio(request: web.Request) -> web.Response:
+async def _get_turn_wake_audio(request: web.Request) -> web.StreamResponse:
     """GET /api/devices/{id}/turns/{turn}/wake — the pre-detection audio that
     triggered one voice turn, as a downloadable WAV.
 
@@ -900,19 +1095,16 @@ async def _get_turn_wake_audio(request: web.Request) -> web.Response:
     try:
         turn_id = int(request.match_info["turn"])
     except ValueError:
-        return _error("bad_request", "turn must be an integer", 400)
+        return _error(ErrorCode.BAD_REQUEST, "turn must be an integer", 400)
 
-    loop = asyncio.get_event_loop()
-    row  = await loop.run_in_executor(None, db.get_device, device_id)
-    if row is None:
-        return _error("device_not_found", f"No device: {device_id}", 404)
+    row = await _device_row(device_id)
 
     path = em_wakeclips.resolve(device_id, em_wakeclips.filename(turn_id))
     if path is None:
-        return _error("no_wake_clip",
+        return _error(ErrorCode.NO_WAKE_CLIP,
                       "No saved wake clip for this turn", 404)
 
-    label = _slug(row["label"] or device_id)
+    label = _slug(row.label or device_id)
     return web.FileResponse(
         path,
         headers={
@@ -924,6 +1116,27 @@ async def _get_turn_wake_audio(request: web.Request) -> web.Response:
             "Cache-Control":       "private, max-age=60",
         },
     )
+
+
+def _zip_clips(label: str, names: list[str],
+               resolve: Callable[[str], Path | None]) -> bytes | None:
+    """
+    Every listed clip that still resolves, under `label/` in one in-memory
+    zip; None when nothing is listed. Blocking — call it in an executor.
+
+    ZIP_STORED: WAV of speech does not compress meaningfully, and deflating
+    tens of MB would hold a worker for seconds.
+    """
+    if not names:
+        return None
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
+        for name in names:
+            path = resolve(name)
+            if path is None:
+                continue      # pruned between listing and reading
+            z.write(path, arcname=f"{label}/{name}")
+    return buf.getvalue()
 
 
 @auth.require_auth
@@ -940,31 +1153,16 @@ async def _get_wakeclips_zip(request: web.Request) -> web.Response:
     temporary file on the same volume the clips live on.
     """
     device_id = request.match_info["id"]
-    loop = asyncio.get_event_loop()
-    row  = await loop.run_in_executor(None, db.get_device, device_id)
-    if row is None:
-        return _error("device_not_found", f"No device: {device_id}", 404)
+    loop = asyncio.get_running_loop()
+    row = await _device_row(device_id)
 
-    label = _slug(row["label"] or device_id)
+    label = _slug(row.label or device_id)
 
-    def _build() -> bytes | None:
-        clips = em_wakeclips.list_for(device_id)
-        if not clips:
-            return None
-        buf = io.BytesIO()
-        # ZIP_STORED: WAV of speech does not compress meaningfully and
-        # deflating tens of MB would hold a worker for seconds.
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
-            for clip in clips:
-                path = em_wakeclips.resolve(device_id, clip["name"])
-                if path is None:
-                    continue      # pruned between listing and reading
-                z.write(path, arcname=f"{label}/{clip['name']}")
-        return buf.getvalue()
-
-    blob = await loop.run_in_executor(None, _build)
+    blob = await loop.run_in_executor(None, lambda: _zip_clips(
+        label, [clip["name"] for clip in em_wakeclips.list_for(device_id)],
+        lambda name: em_wakeclips.resolve(device_id, name)))
     if blob is None:
-        return _error("no_wake_clips", "No wake clips saved yet", 404)
+        return _error(ErrorCode.NO_WAKE_CLIPS, "No wake clips saved yet", 404)
     return web.Response(
         body=blob,
         headers={
@@ -984,13 +1182,11 @@ async def _delete_wakeclips(request: web.Request) -> web.Response:
     written, and rewriting history to hide a file someone deleted on purpose
     would cost a write per turn to say nothing the 404 does not already."""
     device_id = request.match_info["id"]
-    loop = asyncio.get_event_loop()
-    row  = await loop.run_in_executor(None, db.get_device, device_id)
-    if row is None:
-        return _error("device_not_found", f"No device: {device_id}", 404)
+    loop = asyncio.get_running_loop()
+    await _device_row(device_id)
     removed = await loop.run_in_executor(None, em_wakeclips.delete_all, device_id)
-    await _push_log_event(
-        device_id, "info", "controller",
+    await push_log_event(
+        device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
         f"Deleted {removed} wake clip(s)",
     )
     return _ok({"deleted": removed})
@@ -1029,39 +1225,33 @@ async def _post_device_ambient(request: web.Request) -> web.Response:
     the next connect, in a new file.
     """
     device_id = request.match_info["id"]
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
+    body = await _optional_json_body(request)
     enabled = bool(body.get("enabled"))
 
-    loop = asyncio.get_event_loop()
-    row  = await loop.run_in_executor(None, db.get_device, device_id)
-    if row is None:
-        return _error("device_not_found", f"No device: {device_id}", 404)
-    if not row["approved"]:
-        return _error("not_approved",
+    loop = asyncio.get_running_loop()
+    row = await _device_row(device_id)
+    if not row.approved:
+        return _error(ErrorCode.NOT_APPROVED,
                       "Approve this device before recording from it", 409)
-    if enabled and bool(row["collect_mode"]):
-        return _error("collecting",
+    if enabled and bool(row.collect_mode):
+        return _error(ErrorCode.COLLECTING,
                       "Stop wake-word sample collection on this device first",
                       409)
 
     connected = _online(device_id)
     if enabled and connected is not None and connected.link is None:
-        return _error("upgrade_required", "Device firmware must be upgraded", 409)
+        return _error(ErrorCode.UPGRADE_REQUIRED, "Device firmware must be upgraded", 409)
     await loop.run_in_executor(None, db.set_ambient_mode, device_id, enabled)
 
     live = connected if connected is not None and connected.link is not None else None
     if live is not None:
-        # Lazy import — em_controller imports em_api at module level. It
-        # writes the device log line itself: it is the thing that knows
-        # whether a file was opened, and which one was kept on the way out.
-        import em_controller
-        await em_controller.set_ambient_mode(live, enabled)
+        # The controller writes the device log line itself: it is the thing
+        # that knows whether a file was opened, and which one was kept on the
+        # way out.
+        await request.app[SERVICES].set_ambient_mode(live, enabled)
     else:
-        await _push_log_event(
-            device_id, "info", "controller",
+        await push_log_event(
+            device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
             f"Ambient recording {'armed' if enabled else 'disarmed'} — "
             f"device offline, takes effect on its next connect",
         )
@@ -1071,7 +1261,7 @@ async def _post_device_ambient(request: web.Request) -> web.Response:
         # A live device reports what actually happened: arming can fail if
         # the file cannot be opened, and reporting the request back would be
         # a dashboard showing a recording that is not running.
-        "recording": bool(getattr(live, "ambient_mode", False)) if live else False,
+        "recording": live.ambient_mode if live is not None else False,
         "usage":     await loop.run_in_executor(
             None, em_ambient.usage, device_id
         ),
@@ -1090,22 +1280,20 @@ async def _get_ambient(request: web.Request) -> web.Response:
     feedback a mode with one artefact at the end can give while it runs.
     """
     device_id = request.match_info["id"]
-    loop = asyncio.get_event_loop()
-    row  = await loop.run_in_executor(None, db.get_device, device_id)
-    if row is None:
-        return _error("device_not_found", f"No device: {device_id}", 404)
+    loop = asyncio.get_running_loop()
+    row = await _device_row(device_id)
     items = await loop.run_in_executor(None, em_ambient.list_for, device_id)
     live  = _online(device_id)
-    rec   = getattr(live, "ambient_rec", None) if live else None
+    rec   = live.ambient_rec if live is not None else None
     return _ok({
-        "enabled":  bool(row["ambient_mode"]),
+        "enabled":  bool(row.ambient_mode),
         "clips":    items,
         "count":    len(items),
         "bytes":    sum(i["bytes"] for i in items),
         "ms":       sum(i["ms"] for i in items),
         "keep":     em_ambient.KEEP_PER_DEVICE,
         "maxMs":    em_ambient.MAX_RECORDING_MS,
-        "session":  getattr(live, "ambient_files", 0) if live else 0,
+        "session":  live.ambient_files if live is not None else 0,
         "live": None if rec is None else {
             "ms":         rec.duration_ms,
             "bytes":      rec.data_bytes,
@@ -1115,7 +1303,7 @@ async def _get_ambient(request: web.Request) -> web.Response:
 
 
 @auth.require_auth
-async def _get_ambient_audio(request: web.Request) -> web.Response:
+async def _get_ambient_audio(request: web.Request) -> web.StreamResponse:
     """GET /api/devices/{id}/ambient/{name} — one recording, as a WAV.
 
     Served with FileResponse rather than read into memory: these are tens of
@@ -1126,7 +1314,7 @@ async def _get_ambient_audio(request: web.Request) -> web.Response:
     name      = request.match_info["name"]
     path = em_ambient.resolve(device_id, name)
     if path is None:
-        return _error("no_recording", "No such recording", 404)
+        return _error(ErrorCode.NO_RECORDING, "No such recording", 404)
     label = _slug(device_id)
     return web.FileResponse(
         path,
@@ -1149,8 +1337,8 @@ async def _delete_ambient(request: web.Request) -> web.Response:
     name      = request.match_info["name"]
     path = em_ambient.resolve(device_id, name)
     if path is None:
-        return _error("no_recording", "No such recording", 404)
-    loop = asyncio.get_event_loop()
+        return _error(ErrorCode.NO_RECORDING, "No such recording", 404)
+    loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, path.unlink)
     return _ok({"deleted": name})
 
@@ -1162,16 +1350,136 @@ async def _delete_ambient_all(request: web.Request) -> web.Response:
     The recording currently open is untouched: it is not one of these files
     yet, and stopping the mode is how you end it."""
     device_id = request.match_info["id"]
-    loop = asyncio.get_event_loop()
-    row  = await loop.run_in_executor(None, db.get_device, device_id)
-    if row is None:
-        return _error("device_not_found", f"No device: {device_id}", 404)
+    loop = asyncio.get_running_loop()
+    await _device_row(device_id)
     removed = await loop.run_in_executor(None, em_ambient.delete_all, device_id)
-    await _push_log_event(
-        device_id, "info", "controller",
+    await push_log_event(
+        device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
         f"Deleted {removed} ambient recording(s)",
     )
     return _ok({"deleted": removed})
+
+
+def _number(value: object) -> int | float | None:
+    """A numeric DB value as stored (int stays int on the wire), else None."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value
+    return None
+
+
+def _pct(sorted_values: list[int | float], p: float) -> int | float | None:
+    if not sorted_values:
+        return None
+    return sorted_values[min(len(sorted_values) - 1, int(len(sorted_values) * p))]
+
+
+class _DayRollup(TypedDict):
+    date: str
+    turns: int
+    ok: int
+    outcomes: dict[str, int]
+    terminal_reasons: dict[str, int]
+    commit_routes: dict[str, int]
+    attributions: dict[str, int]
+    total_ms_p50: int | float | None
+    total_ms_p95: int | float | None
+    wake_score_avg: float | None
+    wake_score_min: float | None
+    underruns: int | float
+
+
+class _ModelRollup(TypedDict):
+    turns: int
+    score_avg: float | None
+    score_min: int | float | None
+
+
+def _day_rollups(turns: list[dict[str, object]]) -> list[_DayRollup]:
+    """Per local-calendar-day turn counts, outcomes and latency/score figures."""
+    day_buckets: dict[str, list[dict[str, object]]] = {}
+    for turn in turns:
+        ts = _number(turn.get("ts"))
+        if ts is None:
+            continue
+        day = time.strftime("%Y-%m-%d", time.localtime(ts))
+        day_buckets.setdefault(day, []).append(turn)
+
+    days_out: list[_DayRollup] = []
+    for day in sorted(day_buckets):
+        bucket = day_buckets[day]
+        ok = [turn for turn in bucket if turn.get("outcome") == "ok"]
+        totals = sorted(total for turn in ok
+                        if (total := _number(turn.get("total_ms"))) is not None and total > 0)
+        scores = [score for turn in bucket
+                  if (score := _number(turn.get("wake_score"))) is not None]
+        outcomes: dict[str, int] = {}
+        terminal: dict[str, int] = {}
+        routes: dict[str, int] = {}
+        attribution: dict[str, int] = {}
+        for turn in bucket:
+            for column, dest in (("outcome", outcomes), ("terminal_reason", terminal),
+                                 ("commit_route", routes), ("wake_attribution", attribution)):
+                value = turn.get(column)
+                key = value if isinstance(value, str) and value else "?"
+                dest[key] = dest.get(key, 0) + 1
+        days_out.append({
+            "date": day,
+            "turns": len(bucket),
+            "ok": len(ok),
+            "outcomes": outcomes,
+            "terminal_reasons": terminal,
+            "commit_routes": routes,
+            "attributions": attribution,
+            "total_ms_p50": _pct(totals, 0.50),
+            "total_ms_p95": _pct(totals, 0.95),
+            "wake_score_avg": round(sum(scores) / len(scores), 3) if scores else None,
+            "wake_score_min": round(min(scores), 3) if scores else None,
+            "underruns": sum(_number(turn.get("underruns")) or 0 for turn in bucket),
+        })
+    return days_out
+
+
+def _model_rollups(turns: list[dict[str, object]]) -> dict[str, _ModelRollup]:
+    """Turn count and wake-score figures per wake graph."""
+    scores_by_graph: dict[str, list[int | float]] = {}
+    turns_by_graph: dict[str, int] = {}
+    for turn in turns:
+        graph = turn.get("wake_model_sha256")
+        if not isinstance(graph, str) or not graph:
+            continue
+        turns_by_graph[graph] = turns_by_graph.get(graph, 0) + 1
+        scores = scores_by_graph.setdefault(graph, [])
+        score = _number(turn.get("wake_score"))
+        if score is not None:
+            scores.append(score)
+    return {
+        graph: {
+            "turns": count,
+            "score_avg": (round(sum(scores_by_graph[graph]) / len(scores_by_graph[graph]), 3)
+                          if scores_by_graph[graph] else None),
+            "score_min": min(scores_by_graph[graph]) if scores_by_graph[graph] else None,
+        }
+        for graph, count in turns_by_graph.items()
+    }
+
+
+def _device_wake_totals(counters: list[dict[str, object]]) -> dict[str, int | float]:
+    """The device's own wake counters (wake.stats), summed or maxed over hours."""
+    def total(column: str) -> int | float:
+        return sum(_number(row.get(column)) or 0 for row in counters)
+
+    def peak(column: str) -> int | float:
+        return max((_number(row.get(column)) or 0 for row in counters), default=0)
+
+    return {
+        "hops": total("dev_hops"),
+        "overruns": total("dev_drops"),
+        "candidates": total("dev_crossings"),
+        "near_misses": total("near_misses"),
+        "near_miss_max": peak("near_miss_max"),
+        "max_infer_ms": peak("dev_max_infer_ms"),
+        "max_score": peak("dev_max_score"),
+    }
 
 
 @auth.require_auth
@@ -1181,7 +1489,7 @@ async def _get_device_activity(request: web.Request) -> web.Response:
     try:
         days = min(max(int(request.query.get("days", 7)), 1), 180)
     except ValueError:
-        return _error("bad_request", "days must be an integer", 400)
+        return _error(ErrorCode.BAD_REQUEST, "days must be an integer", 400)
     since = time.time() - days * 86400
     loop = asyncio.get_running_loop()
     turns, raw_counters, metrics = await asyncio.gather(
@@ -1189,80 +1497,9 @@ async def _get_device_activity(request: web.Request) -> web.Response:
         loop.run_in_executor(None, db.get_wake_counters, device_id, since),
         loop.run_in_executor(None, db.get_device_metrics, device_id, since),
     )
-    counters = [dict(row) for row in raw_counters]
-
-    def pct(sorted_values, p):
-        if not sorted_values:
-            return None
-        return sorted_values[min(len(sorted_values) - 1,
-                                 int(len(sorted_values) * p))]
-
-    day_buckets: dict[str, list[dict]] = {}
-    for turn in turns:
-        day = time.strftime("%Y-%m-%d", time.localtime(turn["ts"]))
-        day_buckets.setdefault(day, []).append(turn)
-
-    days_out = []
-    for day in sorted(day_buckets):
-        bucket = day_buckets[day]
-        ok = [turn for turn in bucket if turn.get("outcome") == "ok"]
-        totals = sorted(turn["total_ms"] for turn in ok if (turn.get("total_ms") or 0) > 0)
-        scores = [turn["wake_score"] for turn in bucket
-                  if turn.get("wake_score") is not None]
-        outcomes: dict[str, int] = {}
-        terminal: dict[str, int] = {}
-        routes: dict[str, int] = {}
-        attribution: dict[str, int] = {}
-        for turn in bucket:
-            for value, dest in ((turn.get("outcome") or "?", outcomes),
-                                (turn.get("terminal_reason") or "?", terminal),
-                                (turn.get("commit_route") or "?", routes),
-                                (turn.get("wake_attribution") or "?", attribution)):
-                dest[value] = dest.get(value, 0) + 1
-        days_out.append({
-            "date": day,
-            "turns": len(bucket),
-            "ok": len(ok),
-            "outcomes": outcomes,
-            "terminal_reasons": terminal,
-            "commit_routes": routes,
-            "attributions": attribution,
-            "total_ms_p50": pct(totals, 0.50),
-            "total_ms_p95": pct(totals, 0.95),
-            "wake_score_avg": round(sum(scores) / len(scores), 3) if scores else None,
-            "wake_score_min": round(min(scores), 3) if scores else None,
-            "underruns": sum(turn.get("underruns") or 0 for turn in bucket),
-        })
-
-    model_rollups: dict[str, dict] = {}
-    for turn in turns:
-        graph = turn.get("wake_model_sha256")
-        if not graph:
-            continue
-        model = model_rollups.setdefault(graph, {"turns": 0, "scores": []})
-        model["turns"] += 1
-        if turn.get("wake_score") is not None:
-            model["scores"].append(turn["wake_score"])
-    models_out = {
-        graph: {
-            "turns": model["turns"],
-            "score_avg": (round(sum(model["scores"]) / len(model["scores"]), 3)
-                          if model["scores"] else None),
-            "score_min": min(model["scores"]) if model["scores"] else None,
-        }
-        for graph, model in model_rollups.items()
-    }
-    device_wake = {
-        "hops": sum(row.get("dev_hops") or 0 for row in counters),
-        "overruns": sum(row.get("dev_drops") or 0 for row in counters),
-        "candidates": sum(row.get("dev_crossings") or 0 for row in counters),
-        "near_misses": sum(row.get("near_misses") or 0 for row in counters),
-        "near_miss_max": max((row.get("near_miss_max") or 0 for row in counters), default=0),
-        "max_infer_ms": max((row.get("dev_max_infer_ms") or 0 for row in counters), default=0),
-        "max_score": max((row.get("dev_max_score") or 0 for row in counters), default=0),
-    }
-    return _ok({"days": days_out, "wake_models": models_out,
-                "wake_counters": counters, "device_wake": device_wake,
+    counters: list[dict[str, object]] = [asdict(row) for row in raw_counters]
+    return _ok({"days": _day_rollups(turns), "wake_models": _model_rollups(turns),
+                "wake_counters": counters, "device_wake": _device_wake_totals(counters),
                 "metrics": metrics})
 
 
@@ -1273,17 +1510,14 @@ async def _patch_device(request: web.Request) -> web.Response:
     body  = await _json_body(request)
     label = _require_str(body, "label")
 
-    loop = asyncio.get_event_loop()
-    row = await loop.run_in_executor(None, db.get_device, device_id)
-    if row is None:
-        return _error("device_not_found", f"No device: {device_id}", 404)
+    loop = asyncio.get_running_loop()
+    await _device_row(device_id)
 
     await loop.run_in_executor(None, db.set_device_label, device_id, label)
     device = _devices.get(device_id)
     if device is not None:
         device.label = label
-    await _push_event({"type": "device_update", "device_id": device_id,
-                       "state": {"label": label}})
+    await push_device_update(device_id, {"label": label})
     return _ok({"device_id": device_id, "label": label})
 
 
@@ -1291,17 +1525,14 @@ async def _patch_device(request: web.Request) -> web.Response:
 async def _delete_device(request: web.Request) -> web.Response:
     """DELETE /api/devices/{id} — remove from registry."""
     device_id = request.match_info["id"]
-    loop = asyncio.get_event_loop()
-    row = await loop.run_in_executor(None, db.get_device, device_id)
-    if row is None:
-        return _error("device_not_found", f"No device: {device_id}", 404)
+    loop = asyncio.get_running_loop()
+    await _device_row(device_id)
 
     await loop.run_in_executor(None, db.delete_device, device_id)
-    import em_controller
-    await em_controller.remove_device(device_id)
+    await request.app[SERVICES].remove_device(device_id)
     # Row gone → reconcile tears down any BT proxy listener/mDNS for it.
     await em_ble_proxy.reconcile(device_id)
-    await _push_event({"type": "device_deleted", "device_id": device_id})
+    await _push_event(EventType.DEVICE_DELETED, device_id=device_id)
     return _ok({})
 
 
@@ -1313,71 +1544,70 @@ async def _post_approve(request: web.Request) -> web.Response:
     label = _require_str(body, "label")
     config = body.get("config")
     if config is not None and not isinstance(config, dict):
-        return _error("bad_request", "config must be an object", 400)
+        return _error(ErrorCode.BAD_REQUEST, "config must be an object", 400)
     if config:
-        error = _validate_config(config)
+        error = _validate_config(config, request.app[SERVICES].registry())
         if error is not None:
             return error
     loop = asyncio.get_running_loop()
-    row = await loop.run_in_executor(None, db.get_device, device_id)
-    if row is None:
-        return _error("device_not_found", f"No device: {device_id}", 404)
-    if row["approved"]:
-        return _error("already_approved", "Device is already approved", 409)
+    row = await _device_row(device_id)
+    if row.approved:
+        return _error(ErrorCode.ALREADY_APPROVED, "Device is already approved", 409)
     await loop.run_in_executor(None, db.approve_device, device_id, label, config)
-    await _push_event({"type": "device_approved", "device_id": device_id,
-                       "label": label})
+    await _push_event(EventType.DEVICE_APPROVED, device_id=device_id, label=label)
     return _ok({"device_id": device_id, "label": label})
 
 
-async def _apply_live_config(device_id: str, device, effective: dict) -> bool:
+async def _apply_live_config(device_id: str, device: em_device.Device,
+                             effective: Mapping[str, object]) -> bool:
     """Apply a full effective config through the Device-owned fanout."""
     if not device.online:
         return False
     try:
-        await device.apply_config(effective)
+        await device.apply_config(dict(effective))
     except Exception:
         # A session can close between the online check and send. Persisted
         # config is still authoritative and will apply at the next admission.
-        if not device.online:
+        if _online(device_id) is None:
             log.info("[api] %s disconnected during config apply", device_id)
             return False
         raise
     return True
 
 
-def _validate_config(values: dict) -> web.Response | None:
+def _validate_config(values: Mapping[str, object],
+                     registry: em_wake_registry.WakeRegistry) -> web.Response | None:
     """Validate config keys and post-AFE keys before any persistence."""
     for key in values:
         if key in db.REMOVED_CONFIG_KEYS:
-            return _error("removed_config_key",
+            return _error(ErrorCode.REMOVED_CONFIG_KEY,
                           f"Configuration key '{key}' was removed", 400)
         if key not in db.DEFAULT_DEVICE_CONFIG:
-            return _error("unknown_config_key",
+            return _error(ErrorCode.UNKNOWN_CONFIG_KEY,
                           f"Unknown configuration key: {key}", 400)
     if "wakeModel" in values:
         value = values["wakeModel"]
         if not isinstance(value, str):
-            return _error("invalid_config", "wakeModel must be a graph SHA-256", 400)
+            return _error(ErrorCode.INVALID_CONFIG, "wakeModel must be a graph SHA-256", 400)
         try:
-            _wake_registry().get(value)
+            registry.get(value)
         except em_wake_registry.RegistryError:
-            return _error("unknown_wake_model",
+            return _error(ErrorCode.UNKNOWN_WAKE_MODEL,
                           f"wakeModel is not registered: {value}", 400)
     if "extendedUtterances" in values and not isinstance(values["extendedUtterances"], bool):
-        return _error("invalid_config", "extendedUtterances must be boolean", 400)
-    for key in _SOUND_KEYS:
+        return _error(ErrorCode.INVALID_CONFIG, "extendedUtterances must be boolean", 400)
+    for key in em_sounds.SOUND_CONFIG_KEYS:
         if key not in values:
             continue
         value = values[key]
         if value in (None, ""):
             continue
         if not isinstance(value, str) or em_sounds.safe_sound_id(value) is None:
-            return _error("invalid_config", f"{key} must be a valid sound id or empty", 400)
+            return _error(ErrorCode.INVALID_CONFIG, f"{key} must be a valid sound id or empty", 400)
     if "timerRingSeconds" in values:
         value = values["timerRingSeconds"]
         if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 3600:
-            return _error("invalid_config",
+            return _error(ErrorCode.INVALID_CONFIG,
                           "timerRingSeconds must be an integer from 1 through 3600", 400)
     return None
 
@@ -1387,9 +1617,7 @@ async def _get_device_config(request: web.Request) -> web.Response:
     """GET /api/devices/{id}/config — effective config and section scoping."""
     device_id = request.match_info["id"]
     loop = asyncio.get_running_loop()
-    row = await loop.run_in_executor(None, db.get_device, device_id)
-    if row is None:
-        return _error("device_not_found", f"No device: {device_id}", 404)
+    await _device_row(device_id)
     config, section_ids = await asyncio.gather(
         loop.run_in_executor(None, db.get_effective_device_config, device_id),
         loop.run_in_executor(None, db.get_device_config_sections, device_id),
@@ -1405,30 +1633,29 @@ async def _post_device_config(request: web.Request) -> web.Response:
     device_id = request.match_info["id"]
     body = await _json_body(request)
     loop = asyncio.get_running_loop()
-    if await loop.run_in_executor(None, db.get_device, device_id) is None:
-        return _error("device_not_found", f"No device: {device_id}", 404)
+    await _device_row(device_id)
 
     sections_body = body.pop("config_sections", None)
     use_global = body.pop("use_global_config", None)
     explicit_replace = bool(body.pop("replace", False))
-    error = _validate_config(body)
+    error = _validate_config(body, request.app[SERVICES].registry())
     if error is not None:
         return error
 
     if sections_body is None and use_global is not None:
         if not isinstance(use_global, bool):
-            return _error("bad_request", "use_global_config must be boolean", 400)
+            return _error(ErrorCode.BAD_REQUEST, "use_global_config must be boolean", 400)
         sections_body = [] if use_global else list(sections_mod.SECTION_IDS)
     if sections_body is None:
         new_sections = await loop.run_in_executor(
             None, db.get_device_config_sections, device_id)
     else:
         if not isinstance(sections_body, list):
-            return _error("bad_request", "config_sections must be a list", 400)
+            return _error(ErrorCode.BAD_REQUEST, "config_sections must be a list", 400)
         unknown = [section for section in sections_body
                    if section not in sections_mod.SECTIONS]
         if unknown:
-            return _error("bad_request",
+            return _error(ErrorCode.BAD_REQUEST,
                           f"Unknown config section(s): {', '.join(map(str, unknown))}", 400)
         new_sections = sections_mod.normalise(sections_body)
 
@@ -1437,7 +1664,7 @@ async def _post_device_config(request: web.Request) -> web.Response:
     stored_in_scope = {key: value for key, value in stored.items() if key in in_scope}
     dropped = _dropped_keys(body, stored_in_scope)
     if dropped and not explicit_replace:
-        return _error("would_drop_keys",
+        return _error(ErrorCode.WOULD_DROP_KEYS,
                       "This body would delete existing setting(s): " + ", ".join(dropped), 409)
 
     if sections_body is not None:
@@ -1483,30 +1710,35 @@ async def _post_device_wifi(request: web.Request) -> web.Response:
     # Mirror the device's own validation so obvious mistakes fail fast
     # with a readable message instead of a full switch/rollback cycle.
     if any(ch in ssid or ch in psk for ch in ('"', "\\")):
-        return _error("invalid_credentials",
+        return _error(ErrorCode.INVALID_CREDENTIALS,
                       "SSID/passphrase cannot contain double-quote or "
                       "backslash characters (wpa_supplicant.conf cannot "
                       "represent them safely)", 400)
     if psk and not 8 <= len(psk) <= 63:
-        return _error("invalid_credentials",
+        return _error(ErrorCode.INVALID_CREDENTIALS,
                       f"WPA passphrase must be 8–63 characters (got {len(psk)})", 400)
 
-    live = _online(device_id)
-    if live is None:
-        return _error("device_offline", "Device is not connected", 409)
-
-    st = wifi_state(device_id)
-    if st["pending"]:
-        return _error("wifi_change_in_progress",
-                      f"A change to \"{st['pending']['ssid']}\" is already "
+    live = _require_v1(device_id)
+    st = _wifi_change(device_id)
+    if st.pending is not None:
+        return _error(ErrorCode.WIFI_CHANGE_IN_PROGRESS,
+                      f"A change to \"{st.pending.ssid}\" is already "
                       f"in progress", 409)
 
-    st["pending"] = {"ssid": ssid, "started_at": time.time()}
-    st["last_result"] = None
-    await live.send("wifi_change", {"ssid": ssid, "psk": psk})
-    db.log_device(device_id, "info", "controller", f'WiFi change to "{ssid}" requested')
-    await _push_event({"type": "device_update", "device_id": device_id,
-                       "state": {"wifi": st}})
+    previous = st.last_result
+    st.pending = _WifiPending(ssid=ssid, started_at=time.time())
+    st.last_result = None
+    try:
+        await live.send(MessageType.WIFI_CHANGE, {"ssid": ssid, "psk": psk})
+    except em_device_link.LinkClosed:
+        # Nothing reached the device, so nothing is pending: left set, the
+        # change would block every retry until _WIFI_PENDING_TTL.
+        st.pending, st.last_result = None, previous
+        return _error(ErrorCode.DEVICE_OFFLINE, "Device is not connected", 409)
+    await asyncio.get_running_loop().run_in_executor(
+        None, db.log_device, device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
+        f'WiFi change to "{ssid}" requested')
+    await push_device_update(device_id, {"wifi": st.wire()})
     return _ok({"device_id": device_id, "ssid": ssid, "status": "switching"},
                status=202)
 
@@ -1521,25 +1753,26 @@ async def _post_device_wifi_scan(request: web.Request) -> web.Response:
     takes ~5s).
     """
     device_id = request.match_info["id"]
-    live = _online(device_id)
-    if live is None:
-        return _error("device_offline", "Device is not connected", 409)
-    if getattr(live, "wifi_scan_future", None) is not None:
-        return _error("scan_in_progress", "A scan is already running", 409)
+    live = _require_v1(device_id)
+    if live.wifi_scan_future is not None:
+        return _error(ErrorCode.SCAN_IN_PROGRESS, "A scan is already running", 409)
 
-    fut = asyncio.get_event_loop().create_future()
+    fut: asyncio.Future[dict[str, object]] = asyncio.get_running_loop().create_future()
     live.wifi_scan_future = fut
     try:
-        await live.send("wifi_scan", {})
+        await live.send(MessageType.WIFI_SCAN, {})
         msg = await asyncio.wait_for(fut, timeout=20)
+    except em_device_link.LinkClosed:
+        return _error(ErrorCode.DEVICE_OFFLINE, "Device is not connected", 409)
     except asyncio.TimeoutError:
-        return _error("scan_timeout",
+        return _error(ErrorCode.SCAN_TIMEOUT,
                       "Device did not return scan results within 20s "
                       "(old firmware without WiFi support?)", 504)
     finally:
         live.wifi_scan_future = None
-    if msg.get("error"):
-        return _error("scan_failed", msg["error"], 502)
+    error = msg.get("error")
+    if error:
+        return _error(ErrorCode.SCAN_FAILED, str(error), 502)
     return _ok({"networks": msg.get("networks") or []})
 
 
@@ -1553,16 +1786,14 @@ async def _get_device_logs(request: web.Request) -> web.Response:
       before — cursor: return entries with ts < before (unix ms)
     """
     device_id = request.match_info["id"]
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
-    row = await loop.run_in_executor(None, db.get_device, device_id)
-    if row is None:
-        return _error("device_not_found", f"No device: {device_id}", 404)
+    await _device_row(device_id)
 
     try:
         limit = int(request.rel_url.query.get("limit", "100"))
     except ValueError:
-        return _error("invalid_param", "limit must be an integer", 400)
+        return _error(ErrorCode.INVALID_PARAM, "limit must be an integer", 400)
 
     before_param = request.rel_url.query.get("before")
     before_ts = None
@@ -1570,18 +1801,18 @@ async def _get_device_logs(request: web.Request) -> web.Response:
         try:
             before_ts = int(before_param)
         except ValueError:
-            return _error("invalid_param", "before must be a unix ms timestamp", 400)
+            return _error(ErrorCode.INVALID_PARAM, "before must be a unix ms timestamp", 400)
 
     rows = await loop.run_in_executor(
         None, db.get_device_logs, device_id, limit, before_ts
     )
     entries = [
         {
-            "id":        r["id"],
-            "ts":        r["ts"],
-            "level":     r["level"],
-            "source":    r["source"],
-            "message":   r["message"],
+            "id":        r.id,
+            "ts":        r.ts,
+            "level":     r.level,
+            "source":    r.source,
+            "message":   r.message,
         }
         for r in rows
     ]
@@ -1594,11 +1825,6 @@ async def _get_device_logs(request: web.Request) -> web.Response:
 # sample collection this is NOT persisted and cannot be armed on an offline
 # device: the webhook is a running process's address, so there is nothing
 # useful to remember about it — see em_capture's docstring.
-
-
-def _live_capture_device(device_id: str):
-    """The connected v1 Device, or None."""
-    return _v1(device_id)
 
 
 @auth.require_admin
@@ -1619,32 +1845,26 @@ async def _post_device_capture(request: web.Request) -> web.Response:
     that is about to start playing audio at a device that is not listening.
     """
     device_id = request.match_info["id"]
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
+    body = await _optional_json_body(request)
     enabled = bool(body.get("enabled"))
 
-    loop = asyncio.get_event_loop()
-    row  = await loop.run_in_executor(None, db.get_device, device_id)
-    if row is None:
-        return _error("device_not_found", f"No device: {device_id}", 404)
+    row = await _device_row(device_id)
 
-    live = _live_capture_device(device_id)
-    import em_controller
+    live = _v1(device_id)
+    services = request.app[SERVICES]
 
     if not enabled:
         if live is not None:
-            await em_controller.set_capture_mode(live, False)
-        return _ok(em_controller.capture_state(live))
+            await services.set_capture_mode(live, False)
+        return _ok(services.capture_state(live))
 
-    if not row["approved"]:
-        return _error("not_approved",
+    if not row.approved:
+        return _error(ErrorCode.NOT_APPROVED,
                       "Approve this device before capturing from it", 409)
     if live is None:
         if _online(device_id) is not None:
-            return _error("upgrade_required", "Device firmware must be upgraded", 409)
-        return _error("not_connected",
+            return _error(ErrorCode.UPGRADE_REQUIRED, "Device firmware must be upgraded", 409)
+        return _error(ErrorCode.NOT_CONNECTED,
                       "Capture mode needs a connected device — it is not "
                       "persisted and cannot be armed in advance", 409)
 
@@ -1654,13 +1874,15 @@ async def _post_device_capture(request: web.Request) -> web.Response:
     # the caller, which a controller on a macvlan network does not have.
     webhook = body.get("webhook") or None
     if webhook is not None and not em_capture.valid_webhook(webhook):
-        return _error("bad_webhook",
+        return _error(ErrorCode.BAD_WEBHOOK,
                       "webhook must be an http(s) URL with a host", 400)
+    idle_s = body.get("idle_s")
 
-    await em_controller.set_capture_mode(
-        live, True, webhook=webhook, idle_s=body.get("idle_s"),
+    await services.set_capture_mode(
+        live, True, webhook=webhook,
+        idle_s=None if idle_s is None else em_capture.clamp_idle_s(idle_s),
     )
-    return _ok(em_controller.capture_state(live))
+    return _ok(services.capture_state(live))
 
 
 @auth.require_admin
@@ -1677,20 +1899,16 @@ async def _post_capture_window(request: web.Request) -> web.Response:
     controller understood would be a second copy to drift.
     """
     device_id = request.match_info["id"]
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
+    body = await _optional_json_body(request)
 
-    live = _live_capture_device(device_id)
+    live = _v1(device_id)
     if live is None:
-        return _error("not_connected", f"Device not connected: {device_id}", 409)
-    if not getattr(live, "capture_mode", False):
-        return _error("not_capturing",
+        return _error(ErrorCode.NOT_CONNECTED, f"Device not connected: {device_id}", 409)
+    if not live.capture_mode:
+        return _error(ErrorCode.NOT_CAPTURING,
                       "Arm capture mode before opening a window", 409)
 
-    import em_controller
-    window = await em_controller.open_capture_window(
+    window = await request.app[SERVICES].open_capture_window(
         live,
         tag=str(body.get("tag") or ""),
         max_ms=em_capture.clamp_max_ms(body.get("max_ms")),
@@ -1713,20 +1931,18 @@ async def _post_capture_window_stop(request: web.Request) -> web.Response:
     way.
     """
     device_id = request.match_info["id"]
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
+    body = await _optional_json_body(request)
+    session = body.get("session")
 
-    live = _live_capture_device(device_id)
+    live = _v1(device_id)
     if live is None:
-        return _error("not_connected", f"Device not connected: {device_id}", 409)
+        return _error(ErrorCode.NOT_CONNECTED, f"Device not connected: {device_id}", 409)
 
-    import em_controller
-    closed = await em_controller.close_capture_window(
-        live, session=(body.get("session") or None)
+    services = request.app[SERVICES]
+    closed = await services.close_capture_window(
+        live, session=str(session) if session else None
     )
-    return _ok({"closed": closed, **em_controller.capture_state(live)})
+    return _ok({"closed": closed, **services.capture_state(live)})
 
 
 @auth.require_admin
@@ -1748,11 +1964,11 @@ async def _get_capture_recording(request: web.Request) -> web.Response:
     error — the driver decides whether to retry or record the cell as failed.
     """
     device_id = request.match_info["id"]
-    live = _live_capture_device(device_id)
+    live = _v1(device_id)
     if live is None:
-        return _error("not_connected", f"Device not connected: {device_id}", 409)
-    if not getattr(live, "capture_mode", False):
-        return _error("not_capturing", "Capture mode is not armed", 409)
+        return _error(ErrorCode.NOT_CONNECTED, f"Device not connected: {device_id}", 409)
+    if not live.capture_mode:
+        return _error(ErrorCode.NOT_CAPTURING, "Capture mode is not armed", 409)
 
     session = request.query.get("session") or None
     try:
@@ -1761,10 +1977,9 @@ async def _get_capture_recording(request: web.Request) -> web.Response:
         wait_s = 30.0
     wait_s = max(0.0, min(wait_s, 120.0))
 
-    import em_controller
-    result = await em_controller.take_recording(live, session, wait_s)
+    result = await request.app[SERVICES].take_recording(live, session, wait_s)
     if result is None:
-        return _error("no_recording", "No recording available", 404)
+        return _error(ErrorCode.NO_RECORDING, "No recording available", 404)
     return web.Response(
         body=result.wav(),
         headers=em_capture.headers(result, device_id),
@@ -1778,8 +1993,7 @@ async def _get_device_capture(request: web.Request) -> web.Response:
     Everything here is per-connection, so an offline device reports the mode
     off rather than a stale sink."""
     device_id = request.match_info["id"]
-    import em_controller
-    return _ok(em_controller.capture_state(_live_capture_device(device_id)))
+    return _ok(request.app[SERVICES].capture_state(_v1(device_id)))
 
 
 # ─── OTA: update + rollback ───────────────────────────────────────────────────
@@ -1796,43 +2010,31 @@ async def _post_device_update(request: web.Request) -> web.Response:
     Returns 202 Accepted — update runs in the background.
     """
     device_id = request.match_info["id"]
-
-    body = {}
-    try:
-        body = await request.json()
-    except Exception:
-        pass
-
+    body = await _optional_json_body(request)
     upload_token = body.get("upload_token")
-    binary_override = None
-    release = None
 
+    await _device_row(device_id)
+    _require_online(device_id)
+    if device_id in _updates_in_progress:
+        return _error(ErrorCode.UPDATE_IN_PROGRESS, "An update is already in progress", 409)
+
+    binary_override: bytes | None = None
     if upload_token:
-        binary_override = _pending_uploads.pop(upload_token, None)
+        # Taken only once the device can accept it: a refused request must
+        # leave the upload usable for the retry.
+        binary_override = _pending_uploads.pop(str(upload_token), None)
         if binary_override is None:
-            return _error("invalid_token", "Upload token not found or expired", 404)
-        _embedded = _extract_binary_version(binary_override)
-        _ver      = _embedded or f"local-{time.strftime('%Y%m%d-%H%M')}"
-        release   = {"version": _ver, "url": None}
+            return _error(ErrorCode.INVALID_TOKEN, "Upload token not found or expired", 404)
+        target = _upload_target(binary_override)
     else:
         release = await _get_cached_release()
         if release is None:
-            return _error("no_release", "No release information available", 409)
+            return _error(ErrorCode.NO_RELEASE, "No release information available", 409)
+        target = _UpdateTarget(version=release["version"], url=release["url"])
 
-    loop = asyncio.get_event_loop()
-    row  = await loop.run_in_executor(None, db.get_device, device_id)
-    if row is None:
-        return _error("device_not_found", f"No device: {device_id}", 404)
-
-    live = _online(device_id)
-    if live is None:
-        return _error("device_offline", "Device is not connected", 409)
-
-    if device_id in _updates_in_progress:
-        return _error("update_in_progress", "An update is already in progress", 409)
-
-    asyncio.create_task(_run_update(device_id, release, binary_override))
-    return _ok({"status": "started", "version": release["version"]}, status=202)
+    _begin_ota(device_id, _run_update(request.app[SERVICES].shell, device_id, target,
+                                      binary_override))
+    return _ok({"status": "started", "version": target.version}, status=202)
 
 
 @auth.require_admin
@@ -1845,24 +2047,25 @@ async def _post_device_rollback(request: web.Request) -> web.Response:
     Returns 202 Accepted.
     """
     device_id = request.match_info["id"]
-    loop = asyncio.get_event_loop()
-    row  = await loop.run_in_executor(None, db.get_device, device_id)
-    if row is None:
-        return _error("device_not_found", f"No device: {device_id}", 404)
+    row = await _device_row(device_id)
+    previous: str | None = row.firmware_previous
 
-    if not row["firmware_previous"]:
-        return _error("no_rollback_available",
+    if not previous:
+        return _error(ErrorCode.NO_ROLLBACK_AVAILABLE,
                       "No previous version recorded — cannot roll back", 404)
 
-    live = _online(device_id)
-    if live is None:
-        return _error("device_offline", "Device is not connected", 409)
+    _require_online(device_id)
 
     if device_id in _updates_in_progress:
-        return _error("update_in_progress", "An update is already in progress", 409)
+        return _error(ErrorCode.UPDATE_IN_PROGRESS, "An update is already in progress", 409)
 
-    asyncio.create_task(_run_rollback(device_id, row["firmware_previous"]))
-    return _ok({"status": "started", "rolling_back_to": row["firmware_previous"]}, status=202)
+    _begin_ota(device_id, _run_rollback(request.app[SERVICES].shell, device_id, previous))
+    return _ok({"status": "started", "rolling_back_to": previous}, status=202)
+
+
+# How long an uploaded binary waits for a deploy before it is dropped.
+UPLOAD_TTL_S = 600
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 
 
 @auth.require_admin
@@ -1874,42 +2077,31 @@ async def _post_upload_binary(request: web.Request) -> web.Response:
     10 minutes. Pass the token to /api/devices/{id}/update or
     /api/releases/deploy to deploy it.
     """
-    import uuid as _uuid
     try:
         reader = await request.multipart()
         field  = await reader.next()
-        if field is None or field.name != "binary":
-            return _error("invalid_upload", "Expected multipart field 'binary'", 400)
-        binary = await field.read()
+        if not isinstance(field, aiohttp.BodyPartReader) or field.name != "binary":
+            return _error(ErrorCode.INVALID_UPLOAD, "Expected multipart field 'binary'", 400)
+        binary = await _read_part(field, MAX_UPLOAD_BYTES)
+        if binary is None:
+            return _error(ErrorCode.TOO_LARGE, "Binary exceeds 50 MB limit", 413)
         if not binary:
-            return _error("empty_upload", "Uploaded binary is empty", 400)
-        if len(binary) > 50 * 1024 * 1024:
-            return _error("too_large", "Binary exceeds 50 MB limit", 413)
+            return _error(ErrorCode.EMPTY_UPLOAD, "Uploaded binary is empty", 400)
 
-        token = str(_uuid.uuid4())
+        token = str(uuid.uuid4())
         _pending_uploads[token] = binary
         log.info(f"[api] Binary uploaded: {len(binary):,} bytes token={token[:8]}…")
-
-        async def _expire():
-            await asyncio.sleep(600)
-            _pending_uploads.pop(token, None)
-        asyncio.create_task(_expire())
+        asyncio.get_running_loop().call_later(UPLOAD_TTL_S, _pending_uploads.pop, token, None)
 
         return _ok({"upload_token": token, "size": len(binary)})
     except Exception as e:
         log.error(f"[api] Upload error: {e}")
-        return _error("upload_failed", str(e), 500)
+        return _error(ErrorCode.UPLOAD_FAILED, str(e), 500)
 
 
 # ─── Wake model registry ─────────────────────────────────────────────────────
 
 _wake_registry_lock = asyncio.Lock()
-
-
-def _wake_registry():
-    # Lazy import: em_controller imports this module during startup.
-    import em_controller
-    return em_controller.registry()
 
 
 def _wake_model_users(graph_sha256: str) -> list[str]:
@@ -1918,13 +2110,14 @@ def _wake_model_users(graph_sha256: str) -> list[str]:
     if db.get_global_device_config().get("wakeModel") == graph_sha256:
         users.append("global")
     for row in db.get_all_devices():
-        device_id = row["device_id"]
+        device_id = row.device_id
         if db.get_effective_device_config(device_id).get("wakeModel") == graph_sha256:
             users.append(device_id)
     return users
 
 
-def _wake_model_json(model, active: str | None, users: list[str]) -> dict:
+def _wake_model_json(model: em_wake_registry.WakeModel, active: str | None,
+                     users: list[str]) -> dict[str, object]:
     return {**model.to_dict(), "active": model.graph_sha256 == active,
             "in_use_by": users}
 
@@ -1932,7 +2125,7 @@ def _wake_model_json(model, active: str | None, users: list[str]) -> dict:
 @auth.require_auth
 async def _get_wake_models(request: web.Request) -> web.Response:
     """GET /api/wake_models — registered BCResNet pairs and active graph."""
-    registry = _wake_registry()
+    registry = request.app[SERVICES].registry()
     active = registry.active_sha256
     loop = asyncio.get_running_loop()
     models = registry.list()
@@ -1949,7 +2142,7 @@ async def _get_wake_models(request: web.Request) -> web.Response:
     })
 
 
-async def _read_part(field, limit: int) -> bytes | None:
+async def _read_part(field: aiohttp.BodyPartReader, limit: int) -> bytes | None:
     """Read one multipart part without retaining bytes beyond its limit."""
     out = bytearray()
     while True:
@@ -1961,69 +2154,76 @@ async def _read_part(field, limit: int) -> bytes | None:
             return None
 
 
+# The multipart text fields of a wake model upload, all required.
+_WAKE_MODEL_TEXT_FIELDS = frozenset({"idle", "playback", "reference", "near_miss",
+                                     "wake_phrase", "verify_core"})
+
+
 @auth.require_admin
 async def _post_wake_model_upload(request: web.Request) -> web.Response:
     """POST /api/wake_models/upload — validate, probe, and register a graph pair."""
     try:
         reader = await request.multipart()
     except Exception:
-        return _error("invalid_upload", "Expected multipart form data", 400)
+        return _error(ErrorCode.INVALID_UPLOAD, "Expected multipart form data", 400)
 
-    raw: dict[str, bytes | None] = {}
+    graph_bytes: bytes | None = None
+    sidecar_bytes: bytes | None = None
     text: dict[str, str] = {}
     while True:
         field = await reader.next()
         if field is None:
             break
-        if field.name == "graph":
-            raw["graph"] = await _read_part(field, em_wake_registry.MAX_GRAPH_BYTES)
-            if raw["graph"] is None:
-                return _error("too_large", "Graph exceeds the upload limit", 413)
+        if not isinstance(field, aiohttp.BodyPartReader):
+            await field.release()      # a nested multipart is nothing we asked for
+        elif field.name == "graph":
+            graph_bytes = await _read_part(field, em_wake_registry.MAX_GRAPH_BYTES)
+            if graph_bytes is None:
+                return _error(ErrorCode.TOO_LARGE, "Graph exceeds the upload limit", 413)
         elif field.name == "sidecar":
-            raw["sidecar"] = await _read_part(field, em_wake_registry.MAX_SIDECAR_BYTES)
-            if raw["sidecar"] is None:
-                return _error("too_large", "Sidecar exceeds the upload limit", 413)
-        elif field.name in {"idle", "playback", "reference", "near_miss",
-                            "wake_phrase", "verify_core"}:
+            sidecar_bytes = await _read_part(field, em_wake_registry.MAX_SIDECAR_BYTES)
+            if sidecar_bytes is None:
+                return _error(ErrorCode.TOO_LARGE, "Sidecar exceeds the upload limit", 413)
+        elif field.name in _WAKE_MODEL_TEXT_FIELDS:
             value = await _read_part(field, 1024)
             if value is None:
-                return _error("invalid_upload", f"Field {field.name} is too long", 400)
+                return _error(ErrorCode.INVALID_UPLOAD, f"Field {field.name} is too long", 400)
             text[field.name] = value.decode("utf-8", "replace").strip()
         else:
             await field.release()
 
-    required = {"graph", "sidecar"}
-    missing = sorted(required - raw.keys())
-    missing += sorted({"idle", "playback", "reference", "near_miss",
-                       "wake_phrase", "verify_core"} - text.keys())
+    missing = sorted(name for name, part in (("graph", graph_bytes), ("sidecar", sidecar_bytes))
+                     if part is None)
+    missing += sorted(_WAKE_MODEL_TEXT_FIELDS - text.keys())
     if missing:
-        return _error("invalid_upload", f"Missing multipart field(s): {', '.join(missing)}", 400)
-    if not raw["graph"] or not raw["sidecar"]:
-        return _error("invalid_upload", "Graph and sidecar must not be empty", 400)
+        return _error(ErrorCode.INVALID_UPLOAD, f"Missing multipart field(s): {', '.join(missing)}", 400)
+    if not graph_bytes or not sidecar_bytes:
+        return _error(ErrorCode.INVALID_UPLOAD, "Graph and sidecar must not be empty", 400)
     try:
         thresholds = em_wake_registry.Thresholds(
             idle=float(text["idle"]), playback=float(text["playback"]),
             reference=float(text["reference"]), near_miss=float(text["near_miss"]),
         )
     except (TypeError, ValueError, em_wake_registry.RegistryError) as exc:
-        return _error("invalid_model", str(exc), 400)
+        return _error(ErrorCode.INVALID_MODEL, str(exc), 400)
 
-    registry = _wake_registry()
+    registry = request.app[SERVICES].registry()
 
-    def register():
+    def register(graph_bytes: bytes, sidecar_bytes: bytes) -> em_wake_registry.WakeModel:
         with tempfile.TemporaryDirectory(prefix="wake-upload-") as directory:
             graph = Path(directory) / "graph.onnx"
             sidecar = Path(directory) / "sidecar.json"
-            graph.write_bytes(raw["graph"])
-            sidecar.write_bytes(raw["sidecar"])
+            graph.write_bytes(graph_bytes)
+            sidecar.write_bytes(sidecar_bytes)
             return registry.register(graph, sidecar, thresholds,
                                      text["wake_phrase"], text["verify_core"])
 
     try:
         async with _wake_registry_lock:
-            model = await asyncio.get_running_loop().run_in_executor(None, register)
+            model = await asyncio.get_running_loop().run_in_executor(
+                None, register, graph_bytes, sidecar_bytes)
     except em_wake_registry.RegistryError as exc:
-        return _error("invalid_model", str(exc), 400)
+        return _error(ErrorCode.INVALID_MODEL, str(exc), 400)
 
     users = await asyncio.get_running_loop().run_in_executor(
         None, _wake_model_users, model.graph_sha256)
@@ -2034,23 +2234,23 @@ async def _post_wake_model_upload(request: web.Request) -> web.Response:
 async def _delete_wake_model(request: web.Request) -> web.Response:
     """DELETE /api/wake_models/{sha256}; selected graphs cannot be removed."""
     graph_sha256 = request.match_info["sha256"]
-    registry = _wake_registry()
+    registry = request.app[SERVICES].registry()
     try:
         registry.get(graph_sha256)
     except em_wake_registry.RegistryError:
-        return _error("not_found", "No such wake model", 404)
+        return _error(ErrorCode.NOT_FOUND, "No such wake model", 404)
 
     async with _wake_registry_lock:
         users = await asyncio.get_running_loop().run_in_executor(
             None, _wake_model_users, graph_sha256)
         if users:
-            return _error("model_in_use",
+            return _error(ErrorCode.MODEL_IN_USE,
                           f"Wake model is selected by: {', '.join(users)}", 409)
         try:
             await asyncio.get_running_loop().run_in_executor(
                 None, registry.delete, graph_sha256)
         except em_wake_registry.RegistryError as exc:
-            return _error("model_in_use", str(exc), 409)
+            return _error(ErrorCode.MODEL_IN_USE, str(exc), 409)
     return _ok({"deleted": graph_sha256})
 
 
@@ -2058,18 +2258,16 @@ async def _delete_wake_model(request: web.Request) -> web.Response:
 async def _get_speech_assets(request: web.Request) -> web.Response:
     """GET /api/devices/{id}/speech_assets — named, installed, and wake state."""
     device_id = request.match_info["id"]
-    row = await asyncio.get_running_loop().run_in_executor(None, db.get_device, device_id)
-    if row is None:
-        return _error("device_not_found", f"No device: {device_id}", 404)
+    await _device_row(device_id)
 
-    import em_controller
-    named = None
-    named_error = None
+    services = request.app[SERVICES]
+    named: dict[str, str] | None = None
+    named_error: str | None = None
     try:
         effective = await asyncio.get_running_loop().run_in_executor(
             None, db.get_effective_device_config, device_id)
-        named = em_controller.device_assets().speech_assets(
-            em_controller.registry().for_config(effective)).wire()
+        named = services.device_assets().speech_assets(
+            services.registry().for_config(effective)).wire()
     except em_wake_registry.RegistryError as exc:
         # No active registered graph: the named set is unavailable (null),
         # never guessed (§8.1).
@@ -2079,7 +2277,7 @@ async def _get_speech_assets(request: web.Request) -> web.Response:
     live = device if device is not None and device.online else None
     hello = live.link.hello if live is not None and live.link is not None else None
     wake_stats = device.wake_stats if device is not None else None
-    installed = (em_device_assets.installed_speech_assets(hello.get("assets") or [], named, wake_stats)
+    installed = (em_device_assets.installed_speech_assets(hello.assets, named, wake_stats)
                  if hello is not None else None)
     missing = ([digest for digest in named.values() if digest not in set(installed)]
                if named is not None and installed is not None else None)
@@ -2096,22 +2294,26 @@ async def _get_speech_assets(request: web.Request) -> web.Response:
 
 # ─── Alert sound catalog ──────────────────────────────────────────────────────
 
-_SOUND_KEYS = ("timerSound", "alarmSound")
+class _UnresolvedSound(TypedDict):
+    scope: str
+    key: str
+    sound_id: str
 
 
-def _sound_configs() -> dict[str, dict]:
-    configs = {"global": db.get_global_device_config_raw()}
+def _sound_configs() -> dict[str, dict[str, object]]:
+    """Stored (not underlaid) config per scope: "global", then each device."""
+    configs: dict[str, dict[str, object]] = {"global": db.get_global_device_config_raw()}
     for row in db.get_all_devices():
-        configs[row["device_id"]] = db.get_device_config(row["device_id"])
+        configs[row.device_id] = db.get_device_config(row.device_id)
     return configs
 
 
-def _unresolved_sounds(configs: dict[str, dict]) -> list[dict]:
-    unresolved = []
+def _unresolved_sounds(configs: Mapping[str, Mapping[str, object]]) -> list[_UnresolvedSound]:
+    unresolved: list[_UnresolvedSound] = []
     for scope, config in configs.items():
-        for key in _SOUND_KEYS:
+        for key in em_sounds.SOUND_CONFIG_KEYS:
             sound_id = config.get(key)
-            if not sound_id:
+            if not sound_id or not isinstance(sound_id, str):
                 continue
             _, flagged = em_sounds.alert_asset(sound_id)
             if flagged:
@@ -2144,33 +2346,38 @@ async def _post_sound_upload(request: web.Request) -> web.Response:
     try:
         reader = await request.multipart()
     except Exception:
-        return _error("invalid_upload", "Expected multipart form data", 400)
-    sound_id = None
-    suffix = None
-    data = None
+        return _error(ErrorCode.INVALID_UPLOAD, "Expected multipart form data", 400)
+    sound_id: str | None = None
+    suffix: str | None = None
+    data: bytes | None = None
     while True:
         field = await reader.next()
         if field is None:
             break
-        if field.name == "id":
-            sound_id = (await field.read()).decode("utf-8", "replace").strip()
+        if not isinstance(field, aiohttp.BodyPartReader):
+            await field.release()      # a nested multipart is nothing we asked for
+        elif field.name == "id":
+            raw_id = await _read_part(field, 1024)
+            if raw_id is None:
+                return _error(ErrorCode.INVALID_ID, "Sound id must be letters, digits, _ - . only", 400)
+            sound_id = raw_id.decode("utf-8", "replace").strip()
         elif field.name == "sound":
             suffix = em_sounds.safe_upload_suffix(field.filename or "")
             if suffix is None:
-                return _error("invalid_filename",
+                return _error(ErrorCode.INVALID_FILENAME,
                               "Sound must be one of: " + ", ".join(em_sounds.ALLOWED_SUFFIXES), 400)
             data = await _read_part(field, em_sounds.MAX_UPLOAD_BYTES)
             if data is None:
-                return _error("too_large", "Sound exceeds the upload limit", 413)
+                return _error(ErrorCode.TOO_LARGE, "Sound exceeds the upload limit", 413)
         else:
             await field.release()
-    if data is None:
-        return _error("invalid_upload", "Expected multipart field 'sound'", 400)
+    if data is None or suffix is None:
+        return _error(ErrorCode.INVALID_UPLOAD, "Expected multipart field 'sound'", 400)
     if not data:
-        return _error("empty_upload", "Uploaded sound is empty", 400)
+        return _error(ErrorCode.EMPTY_UPLOAD, "Uploaded sound is empty", 400)
     sid = em_sounds.safe_sound_id(sound_id or em_sounds.DEFAULT_ID)
     if sid is None:
-        return _error("invalid_id", "Sound id must be letters, digits, _ - . only", 400)
+        return _error(ErrorCode.INVALID_ID, "Sound id must be letters, digits, _ - . only", 400)
 
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, em_sounds.store, sid, suffix, data)
@@ -2178,7 +2385,7 @@ async def _post_sound_upload(request: web.Request) -> web.Response:
         exported = await loop.run_in_executor(None, em_sounds.export, sid)
     except em_sounds.ExportError as exc:
         await loop.run_in_executor(None, em_sounds.delete, sid)
-        return _error("decode_failed", str(exc), 400)
+        return _error(ErrorCode.DECODE_FAILED, str(exc), 400)
     entry = next((item for item in await loop.run_in_executor(None, em_sounds.scan)
                   if item["id"] == sid), None)
     log.info("[api] Alert sound installed: %s (%d bytes, %.3fs%s)",
@@ -2191,29 +2398,19 @@ async def _delete_sound(request: web.Request) -> web.Response:
     """DELETE /api/sounds/{id}; refuse while any stored scope selects it."""
     sid = em_sounds.safe_sound_id(request.match_info["id"])
     if sid is None:
-        return _error("invalid_id", "Bad sound id", 400)
+        return _error(ErrorCode.INVALID_ID, "Bad sound id", 400)
     loop = asyncio.get_running_loop()
     sounds, configs = await asyncio.gather(
         loop.run_in_executor(None, em_sounds.scan),
         loop.run_in_executor(None, _sound_configs),
     )
     if not any(item["id"] == sid for item in sounds):
-        return _error("not_found", "No such sound", 404)
+        return _error(ErrorCode.NOT_FOUND, "No such sound", 404)
     users = await loop.run_in_executor(None, em_sounds.in_use_by, sid, configs)
     if users:
-        return _error("sound_in_use", f"Sound is selected by: {', '.join(users)}", 409)
+        return _error(ErrorCode.SOUND_IN_USE, f"Sound is selected by: {', '.join(users)}", 409)
     await loop.run_in_executor(None, em_sounds.delete, sid)
     return _ok({"deleted": sid})
-
-
-def _v1_response(device_id: str):
-    """(device, error response) for a route that needs a v1 session."""
-    device = _online(device_id)
-    if device is None:
-        return None, _error("device_offline", "Device is not connected", 409)
-    if device.link is None:
-        return None, _error("upgrade_required", "Device firmware must be upgraded", 409)
-    return device, None
 
 
 @auth.require_auth
@@ -2222,54 +2419,45 @@ async def _post_sound_preview(request: web.Request) -> web.Response:
     body = await _json_body(request)
     sound_id = _require_str(body, "sound_id")
     if em_sounds.safe_sound_id(sound_id) is None:
-        return _error("invalid_id", "Bad sound id", 400)
-    device, error = _v1_response(request.match_info["id"])
-    if error is not None:
-        return error
-    import em_controller
-    result = await em_controller.preview_sound(device, sound_id)
+        return _error(ErrorCode.INVALID_ID, "Bad sound id", 400)
+    device = _require_v1(request.match_info["id"])
+    result = await request.app[SERVICES].preview_sound(device, sound_id)
     if result.get("error") == "offline":
-        return _error("device_offline", "Device disconnected", 409)
+        return _error(ErrorCode.DEVICE_OFFLINE, "Device disconnected", 409)
     return _ok(result)
 
 
 @auth.require_auth
 async def _post_sound_stop(request: web.Request) -> web.Response:
     """POST /api/devices/{id}/sounds/stop — stop the current preview."""
-    device, error = _v1_response(request.match_info["id"])
-    if error is not None:
-        return error
-    import em_controller
-    await em_controller.stop_preview(device)
+    device = _require_v1(request.match_info["id"])
+    await request.app[SERVICES].stop_preview(device)
     return _ok({"stopped": True})
 
 
 # ─── Alerts panel ─────────────────────────────────────────────────────────────
 
-def _alert_status(endpoint_id: str) -> dict | None:
-    import em_controller
-    status = em_controller.alerts().status(endpoint_id)
+def _alert_status(engine: em_alerts.AlertEngine, endpoint_id: str) -> dict[str, object] | None:
+    """AlertEngine's status, each occurrence marked with where it stands:
+    stored in HA always, and pending delivery until the endpoint armed it."""
+    status = engine.status(endpoint_id)
     if status is None:
         return None
-    status = {**status}
-    occurrences = []
-    for occurrence in status.get("occurrences") or []:
-        armed = bool(occurrence.get("armed_on_endpoint"))
-        occurrences.append({**occurrence, "stored_in_ha": True,
-                            "delivery_pending": not armed})
-    status["occurrences"] = occurrences
-    return status
+    return {**status, "occurrences": [
+        {**occurrence, "stored_in_ha": True,
+         "delivery_pending": not bool(occurrence.get("armed_on_endpoint"))}
+        for occurrence in status.get("occurrences") or []
+    ]}
 
 
 @auth.require_auth
 async def _get_device_alerts(request: web.Request) -> web.Response:
     """GET /api/devices/{id}/alerts — one endpoint's full alert panel."""
     device_id = request.match_info["id"]
-    row = await asyncio.get_running_loop().run_in_executor(None, db.get_device, device_id)
-    if row is None:
-        return _error("device_not_found", f"No device: {device_id}", 404)
-    import em_controller
-    return _ok({"status": _alert_status(device_id), "ha": em_controller.ha_status()})
+    await _device_row(device_id)
+    services = request.app[SERVICES]
+    return _ok({"status": _alert_status(services.alerts(), device_id),
+                "ha": services.ha_status()})
 
 
 @auth.require_admin
@@ -2280,21 +2468,21 @@ async def _post_alarm(request: web.Request) -> web.Response:
     alarm_time = _require_str(body, "time")
     days = body.get("days", [])
     if not isinstance(days, list) or not all(isinstance(day, str) for day in days):
-        return _error("bad_request", "days must be a list of weekday names", 400)
+        return _error(ErrorCode.BAD_REQUEST, "days must be a list of weekday names", 400)
     name = body.get("name") or ""
     if not isinstance(name, str):
-        return _error("bad_request", "name must be a string", 400)
+        return _error(ErrorCode.BAD_REQUEST, "name must be a string", 400)
     on_date = None
-    if body.get("date") not in (None, ""):
+    raw_date = body.get("date")
+    if raw_date not in (None, ""):
         try:
-            on_date = date.fromisoformat(body["date"])
-        except (TypeError, ValueError):
-            return _error("bad_request", "date must be YYYY-MM-DD", 400)
-    if await asyncio.get_running_loop().run_in_executor(None, db.get_device, device_id) is None:
-        return _error("device_not_found", f"No device: {device_id}", 404)
-    import em_controller
-    result = await em_controller.alerts().set_alarm(
-        device_id, alarm_time, days, name, on_date=on_date, source="dashboard")
+            on_date = date.fromisoformat(raw_date if isinstance(raw_date, str) else "")
+        except ValueError:
+            return _error(ErrorCode.BAD_REQUEST, "date must be YYYY-MM-DD", 400)
+    await _device_row(device_id)
+    result = await request.app[SERVICES].alerts().set_alarm(
+        device_id, alarm_time, days, name, on_date=on_date,
+        source=em_alerts.JournalSource.DASHBOARD)
     return _ok(result)
 
 
@@ -2306,17 +2494,58 @@ async def _post_alarm_cancel(request: web.Request) -> web.Response:
     name = body.get("name") or ""
     alarm_time = body.get("time") or ""
     if not isinstance(name, str) or not isinstance(alarm_time, str):
-        return _error("bad_request", "name and time must be strings", 400)
-    if await asyncio.get_running_loop().run_in_executor(None, db.get_device, device_id) is None:
-        return _error("device_not_found", f"No device: {device_id}", 404)
-    import em_controller
-    result = await em_controller.alerts().cancel_alarm(
+        return _error(ErrorCode.BAD_REQUEST, "name and time must be strings", 400)
+    await _device_row(device_id)
+    result = await request.app[SERVICES].alerts().cancel_alarm(
         device_id, name=name, time=alarm_time, all_alarms=bool(body.get("all")),
-        source="dashboard")
+        source=em_alerts.JournalSource.DASHBOARD)
     return _ok(result)
 
 
 # ─── OTA background tasks ─────────────────────────────────────────────────────
+
+@dataclass(frozen=True, slots=True)
+class _UpdateTarget:
+    """What an OTA installs: a release's version, and where to fetch its
+    binary (None for an uploaded binary, which is passed in whole)."""
+
+    version: str
+    url: str | None
+
+
+def _begin_ota(device_id: str, job: Coroutine[object, object, None]) -> None:
+    """
+    Claim the device's OTA slot and run `job` in the background.
+
+    The claim happens here, synchronously with the caller's
+    `_updates_in_progress` check: claimed inside the task instead, two
+    requests that both arrive before it first runs would both pass the check
+    and run two transfers into the same slot. The job releases it.
+    """
+    _updates_in_progress.add(device_id)
+    _update_errors.pop(device_id, None)  # fresh attempt clears the last failure
+    _spawn(job, f"ota:{device_id}")
+
+
+class _Slot(enum.StrEnum):
+    """The A/B firmware slots /data/local/bin/server links to."""
+
+    A = "server_a"
+    B = "server_b"
+
+    @property
+    def other(self) -> "_Slot":
+        return _Slot.B if self is _Slot.A else _Slot.A
+
+
+def _parse_active_slot(detect_output: str) -> _Slot | None:
+    """The slot a `SLOT:<name>` line names, or None."""
+    for line in detect_output.splitlines():
+        if "SLOT:" in line:
+            words = line.split("SLOT:")[-1].split()
+            if words and words[0] in (_Slot.A, _Slot.B):
+                return _Slot(words[0])
+    return None
 
 
 def _extract_binary_version(binary: bytes) -> str | None:
@@ -2326,8 +2555,7 @@ def _extract_binary_version(binary: bytes) -> str | None:
     Pattern matches e.g. 20260614-1152-dev, 20260614-0513-release, etc.
     Falls back to None if not found, caller generates a local-YYYYMMDD-HHMM label.
     """
-    import re as _re
-    match = _re.search(rb'20\d{6}-\d{4}-[a-z][a-z0-9]*', binary)
+    match = re.search(rb'20\d{6}-\d{4}-[a-z][a-z0-9]*', binary)
     return match.group(0).decode("ascii") if match else None
 
 
@@ -2340,18 +2568,14 @@ async def _update_failed(device_id: str, reason: str) -> None:
     "updating…" indefinitely.
     """
     _update_errors[device_id] = reason
-    await _push_log_event(device_id, "error", "controller", reason)
-    await _push_event({
-        "type":      "device_update_failed",
-        "device_id": device_id,
-        "error":     reason,
-    })
+    await push_log_event(device_id, db.LogLevel.ERROR, db.LogSource.CONTROLLER, reason)
+    await _push_event(EventType.DEVICE_UPDATE_FAILED, device_id=device_id, error=reason)
 
 
-async def _run_update(device_id: str, release: dict,
+async def _run_update(shell: em_shell.ShellBroker, device_id: str, target: _UpdateTarget,
                       binary_override: bytes | None = None) -> None:
     """
-    Background task: A/B slot update.
+    Background task (started by _begin_ota): A/B slot update.
 
     1. Fetch binary (GitHub or pre-uploaded).
     2. Detect active slot via readlink; migrate legacy layout if needed.
@@ -2360,30 +2584,29 @@ async def _run_update(device_id: str, release: dict,
     5. Restart service and monitor reconnect.
     6. Detect auto-rollback (start_server.sh retry exhausted).
     """
-    _updates_in_progress.add(device_id)
-    _update_errors.pop(device_id, None)  # fresh attempt clears the last failure
-    loop = asyncio.get_event_loop()
-    version = release["version"]
+    loop = asyncio.get_running_loop()
+    version = target.version
 
     try:
-        await _push_log_event(device_id, "info", "controller",
-                              f"OTA update starting → {version}")
+        await push_log_event(device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
+                             f"OTA update starting → {version}")
 
         # Fetch binary
         if binary_override is not None:
             binary = binary_override
-            await _push_log_event(device_id, "info", "controller",
-                                  f"Using uploaded binary ({len(binary):,} bytes)")
+            await push_log_event(device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
+                                 f"Using uploaded binary ({len(binary):,} bytes)")
         else:
-            binary = await _fetch_binary(release["url"])
-            if binary is None:
+            fetched = await _fetch_binary(target.url) if target.url else None
+            if fetched is None:
                 await _update_failed(device_id,
                                      "Failed to fetch binary from GitHub")
                 return
+            binary = fetched
 
         # Record current version as previous before anything changes
         row = await loop.run_in_executor(None, db.get_device, device_id)
-        current_ver = row["firmware_ver"] if row else None
+        current_ver = row.firmware_ver if row else None
         await loop.run_in_executor(None, db.set_firmware_previous, device_id, current_ver)
 
         live = _online(device_id)
@@ -2405,7 +2628,7 @@ async def _run_update(device_id: str, release: dict,
             "  echo \"SLOT:server_a MIGRATED\" || echo \"MIGRATE_FAILED\"; "
             "fi"
         )
-        detect_result = await _shell_run(live, detect_cmd, timeout=60.0)
+        detect_result = await _shell_run(shell, live, detect_cmd, timeout=60.0)
         log.info(f"[api] Slot detect result for {device_id}: {detect_result!r}")
 
         if "MIGRATE_FAILED" in detect_result:
@@ -2413,13 +2636,7 @@ async def _run_update(device_id: str, release: dict,
                                  "A/B migration failed — aborting update")
             return
 
-        active_slot = None
-        for line in detect_result.splitlines():
-            if "SLOT:" in line:
-                candidate = line.split("SLOT:")[-1].strip().split()[0]
-                if candidate in ("server_a", "server_b"):
-                    active_slot = candidate
-                    break
+        active_slot = _parse_active_slot(detect_result)
 
         if active_slot is None:
             await _update_failed(device_id,
@@ -2427,17 +2644,17 @@ async def _run_update(device_id: str, release: dict,
             return
 
         if "MIGRATED" in detect_result:
-            await _push_log_event(device_id, "info", "controller",
-                                  "A/B migration complete — active slot: server_a")
+            await push_log_event(device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
+                                 "A/B migration complete — active slot: server_a")
 
         # Sync the startup script while we're here — OTA is the only update
         # path existing devices have for it (see _sync_start_script).
-        await _sync_start_script(live, device_id)
+        await _sync_start_script(shell, live, device_id)
         # Payload drift is not limited to the start script — the debloat
         # halves had no update path at all until 2026-07-30.
-        await _sync_debloat(live, device_id)
+        await _sync_debloat(shell, live, device_id)
 
-        inactive_slot = "server_b" if active_slot == "server_a" else "server_a"
+        inactive_slot = active_slot.other
 
         # Free space, checked BEFORE writing anything. The transfer needs room
         # for the new binary alongside its .part, and running /data out of
@@ -2446,7 +2663,7 @@ async def _run_update(device_id: str, release: dict,
         # its own line, so $4 is the percentage on these devices.
         need_mb  = (len(binary) * 2) // 1048576 + 8   # binary + .part + slack
         free_out = await _shell_run(
-            live, 'echo "FREE $(busybox df -m /data | busybox tail -1)"')
+            shell, live, 'echo "FREE $(busybox df -m /data | busybox tail -1)"')
         free_mb = None
         for line in (free_out or "").splitlines():
             if line.startswith("FREE"):
@@ -2464,13 +2681,13 @@ async def _run_update(device_id: str, release: dict,
             log.warning(f"[api] Could not read free space on {device_id} "
                         f"from {free_out!r} — proceeding with update")
 
-        await _push_log_event(device_id, "info", "controller",
-                              f"Deploying to slot {inactive_slot} (active: {active_slot})")
+        await push_log_event(device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
+                             f"Deploying to slot {inactive_slot} (active: {active_slot})")
 
         # Stream binary to inactive slot. Verified by md5 before it is renamed
         # into place, so a corrupt transfer leaves the slot as it was and never
         # reaches the symlink flip below (#76).
-        ok = await _stream_binary_to_slot(live, binary, inactive_slot)
+        ok = await _stream_binary_to_slot(shell, live, binary, inactive_slot)
         if not ok:
             # Name the stage. "failed or did not verify" covered everything
             # from a shell that never opened to a corrupt payload, and #121
@@ -2485,9 +2702,9 @@ async def _run_update(device_id: str, release: dict,
         await asyncio.sleep(1.0)
 
         # Atomic symlink flip + service restart
-        await _push_log_event(device_id, "info", "controller",
-                              f"Flipping symlink → {inactive_slot} and restarting")
-        await _shell_run(live,
+        await push_log_event(device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
+                             f"Flipping symlink → {inactive_slot} and restarting")
+        await _shell_run(shell, live,
             f"ln -sf {inactive_slot} /data/local/bin/server && "
             f"kill $PPID"
         )
@@ -2499,16 +2716,12 @@ async def _run_update(device_id: str, release: dict,
 
         if confirmed:
             _update_errors.pop(device_id, None)
-            await _push_log_event(device_id, "info", "controller",
-                                  f"✓ Update confirmed: {version}")
-            await _push_event({
-                "type":      "device_updated",
-                "device_id": device_id,
-                "version":   version,
-            })
+            await push_log_event(device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
+                                 f"✓ Update confirmed: {version}")
+            await _push_event(EventType.DEVICE_UPDATED, device_id=device_id, version=version)
         else:
             row     = await loop.run_in_executor(None, db.get_device, device_id)
-            running = row["firmware_ver"] if row else "unknown"
+            running = row.firmware_ver if row else "unknown"
 
             if running == current_ver:
                 # Device came back on old version — auto-rollback by start_server.sh
@@ -2519,27 +2732,20 @@ async def _run_update(device_id: str, release: dict,
                     f"auto-rolled back to {running} — new binary failed to start"
                 )
                 _supervisor_log_wanted.add(device_id)
-                await _push_log_event(device_id, "warn", "controller",
+                await push_log_event(device_id, db.LogLevel.WARN, db.LogSource.CONTROLLER,
                     f"Device auto-rolled back to {running} "
                     f"— new binary failed {3} start attempts")
-                await _push_event({
-                    "type":      "device_auto_rolled_back",
-                    "device_id": device_id,
-                    "version":   running,
-                })
+                await _push_event(EventType.DEVICE_AUTO_ROLLED_BACK,
+                                  device_id=device_id, version=running)
             else:
                 _update_errors[device_id] = (
                     f"timed out — device running {running}"
                 )
                 _supervisor_log_wanted.add(device_id)
-                await _push_log_event(device_id, "warn", "controller",
+                await push_log_event(device_id, db.LogLevel.WARN, db.LogSource.CONTROLLER,
                     f"Update timed out — device running: {running}")
-                await _push_event({
-                    "type":      "device_update_failed",
-                    "device_id": device_id,
-                    "error":     _update_errors[device_id],
-                    "running":   running,
-                })
+                await _push_event(EventType.DEVICE_UPDATE_FAILED, device_id=device_id,
+                                  error=_update_errors[device_id], running=running)
 
     except Exception as e:
         log.exception(f"[api] OTA update error for {device_id}: {e}")
@@ -2548,17 +2754,16 @@ async def _run_update(device_id: str, release: dict,
         _updates_in_progress.discard(device_id)
 
 
-async def _run_rollback(device_id: str, target_version: str) -> None:
+async def _run_rollback(shell: em_shell.ShellBroker, device_id: str, target_version: str) -> None:
     """
-    Background task: flip to inactive A/B slot.
+    Background task (started by _begin_ota): flip to inactive A/B slot.
 
     No binary transfer needed — the old binary is already in the inactive slot.
     """
-    _updates_in_progress.add(device_id)
-    _update_errors.pop(device_id, None)  # fresh attempt clears the last failure
+    loop = asyncio.get_running_loop()
     try:
-        await _push_log_event(device_id, "info", "controller",
-                              f"Rolling back to {target_version}")
+        await push_log_event(device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
+                             f"Rolling back to {target_version}")
 
         live = _online(device_id)
         if live is None:
@@ -2566,38 +2771,33 @@ async def _run_rollback(device_id: str, target_version: str) -> None:
                                  "Device disconnected before rollback")
             return
 
-        active_slot = None
-        detect_result = await _shell_run(live,
+        detect_result = await _shell_run(shell, live,
             "CURRENT=$(readlink /data/local/bin/server 2>/dev/null); "
             "if [ \"$CURRENT\" = \"server_a\" ] || [ \"$CURRENT\" = \"server_b\" ]; then "
             "  echo \"SLOT:$CURRENT\"; "
             "else echo \"SLOT_UNKNOWN\"; fi"
         )
-        for line in detect_result.splitlines():
-            if "SLOT:" in line:
-                candidate = line.split("SLOT:")[-1].strip().split()[0]
-                if candidate in ("server_a", "server_b"):
-                    active_slot = candidate
-                    break
+        active_slot = _parse_active_slot(detect_result)
 
         if active_slot is None:
             await _update_failed(device_id,
                                  "Cannot determine active slot — is A/B set up?")
             return
 
-        inactive_slot = "server_b" if active_slot == "server_a" else "server_a"
-        await _push_log_event(device_id, "info", "controller",
-                              f"Flipping {active_slot} → {inactive_slot}")
+        inactive_slot = active_slot.other
+        await push_log_event(device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
+                             f"Flipping {active_slot} → {inactive_slot}")
 
-        await _shell_run(live,
+        # The version running now, read before the flip restarts the server.
+        row_pre = await loop.run_in_executor(None, db.get_device, device_id)
+        current_fw = row_pre.firmware_ver if row_pre else None
+
+        await _shell_run(shell, live,
             f"ln -sf {inactive_slot} /data/local/bin/server && "
             f"kill $PPID"
         )
         # Shell dies when the server process is killed — ROLLBACK_OK will never arrive.
 
-        loop = asyncio.get_event_loop()
-        row_pre = await loop.run_in_executor(None, db.get_device, device_id)
-        current_fw = row_pre["firmware_ver"] if row_pre else None
         confirmed = await _monitor_reconnect(
             device_id, target_version,
             previous_version=current_fw,
@@ -2609,13 +2809,10 @@ async def _run_rollback(device_id: str, target_version: str) -> None:
             await loop.run_in_executor(
                 None, db.set_firmware_previous, device_id, None
             )
-            await _push_log_event(device_id, "info", "controller",
-                                  f"✓ Rollback confirmed: {target_version}")
-            await _push_event({
-                "type":      "device_rolled_back",
-                "device_id": device_id,
-                "version":   target_version,
-            })
+            await push_log_event(device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
+                                 f"✓ Rollback confirmed: {target_version}")
+            await _push_event(EventType.DEVICE_ROLLED_BACK,
+                              device_id=device_id, version=target_version)
         else:
             await _update_failed(device_id,
                                  "Rollback did not reconnect within 90s")
@@ -2642,7 +2839,7 @@ async def _monitor_reconnect(
     binary reports its own version string, not the controller's local-YYYYMMDD
     tracking string).
     """
-    loop     = asyncio.get_event_loop()
+    loop     = asyncio.get_running_loop()
     deadline = time.monotonic() + timeout
     await asyncio.sleep(8)  # give device time to stop and restart
 
@@ -2650,7 +2847,7 @@ async def _monitor_reconnect(
         if _online(device_id) is not None:
             row = await loop.run_in_executor(None, db.get_device, device_id)
             if row:
-                running = row["firmware_ver"]
+                running = row.firmware_ver
                 if running == expected_version:
                     return True
                 if previous_version is not None and running != previous_version:
@@ -2662,100 +2859,81 @@ async def _monitor_reconnect(
 
 # ─── Shell helpers ────────────────────────────────────────────────────────────
 
-async def _get_device_shell_ws(live) -> object:
+@contextlib.asynccontextmanager
+async def _device_shell(shell: em_shell.ShellBroker,
+                        live: em_device.Device) -> AsyncIterator[em_shell.ShellConnection]:
     """
-    Request a programmatic shell connection from the device.
+    A programmatic shell session on the device, strictly one at a time.
 
-    Acquires a per-device lock so sessions are strictly sequential.
-    handle_shell resolves the future with the ws, then waits for ws.close()
-    before returning — so the connection stays alive while we use it.
+    handle_shell answers the request with the socket, then waits for it to
+    close before returning — so the connection stays alive until this exits.
+    On the way out it releases exactly what it took: a caller that timed out
+    waiting for the lock never reaches the session, so it can never close
+    another caller's socket (an OTA transfer mid-flight) or free the lock
+    that caller holds.
     """
     device_id = live.device_id
-    loop      = asyncio.get_event_loop()
-
-    if device_id not in _shell_lock:
-        _shell_lock[device_id] = asyncio.Lock()
-
+    lock = shell.lock(device_id)
     try:
-        await asyncio.wait_for(_shell_lock[device_id].acquire(), timeout=20.0)
+        await asyncio.wait_for(lock.acquire(), timeout=20.0)
     except asyncio.TimeoutError:
-        raise RuntimeError(f"Shell lock acquisition timed out for {device_id}")
+        raise RuntimeError(f"Shell lock acquisition timed out for {device_id}") from None
 
-    future = loop.create_future()
-    _shell_pending[device_id] = future
-    # Deliberately do NOT set _shell_dashboard — signals programmatic mode.
-
-    await live.send("shell_open", {})
+    # No dashboard socket — signals programmatic mode.
+    req = shell.request(device_id)
+    ws: em_shell.ShellConnection | None = None
     try:
-        ws = await asyncio.wait_for(future, timeout=15.0)
-        _shell_ws[device_id] = ws
-        return ws
-    except asyncio.TimeoutError:
-        _shell_pending.pop(device_id, None)
-        _shell_ws.pop(device_id, None)
-        _shell_lock[device_id].release()
-        raise
-
-
-async def _release_shell_ws(device_id: str, live=None) -> None:
-    """
-    Close the programmatic shell session.
-
-    Closing ws wakes handle_shell's ws.wait_closed(), which then returns
-    and lets the device clean up its side too.
-    """
-    ws = _shell_ws.pop(device_id, None)
-    if ws:
+        await live.send(MessageType.SHELL_OPEN, {})
+        ws = await req.wait(timeout=15.0)
+        if ws is None:
+            raise RuntimeError(f"Shell session for {device_id} ended before it opened")
+        yield ws
+    finally:
+        # Closing ws wakes handle_shell's ws.wait_closed(), which then returns
+        # and lets the device clean up its side too.
+        if ws is not None:
+            with contextlib.suppress(Exception):
+                await ws.close()
+        shell.release(device_id, req)
         try:
-            await ws.close()
-        except Exception:
-            pass
-    _shell_pending.pop(device_id, None)
-    if live is not None:
-        try:
-            await live.send("shell_close", {})
+            await live.send(MessageType.SHELL_CLOSE, {})
         except em_device_link.LinkClosed:
             pass    # the session is gone (an OTA flip restarts the server): no shell left to close
-    lock = _shell_lock.get(device_id)
-    if lock and lock.locked():
-        try:
+        finally:
             lock.release()
-        except RuntimeError:
-            pass
 
 
-async def _shell_run(live, cmd: str, timeout: float = 30.0) -> str:
+async def _shell_run(shell: em_shell.ShellBroker, live: em_device.Device, cmd: str,
+                     timeout: float = 30.0) -> str:
     """
     Run a shell command on the device and return its stdout as a string.
 
     Appends a sentinel marker to detect when output is complete.
     """
     SENTINEL = "__CMD_DONE_9f3a__"
-    device_id = live.device_id
     output: list[str] = []
     try:
-        ws = await _get_device_shell_ws(live)
-        await ws.send(f"{cmd} ; echo '{SENTINEL}'\n")
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            try:
-                msg  = await asyncio.wait_for(ws.recv(), timeout=5.0)
-                text = msg.decode("utf-8", errors="replace") if isinstance(msg, bytes) else msg
-                if SENTINEL in text:
-                    output.append(text[:text.index(SENTINEL)])
+        async with _device_shell(shell, live) as ws:
+            await ws.send(f"{cmd} ; echo '{SENTINEL}'\n")
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                try:
+                    msg  = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                    text = msg.decode("utf-8", errors="replace") if isinstance(msg, bytes) else msg
+                    if SENTINEL in text:
+                        output.append(text[:text.index(SENTINEL)])
+                        break
+                    output.append(text)
+                except asyncio.TimeoutError:
                     break
-                output.append(text)
-            except asyncio.TimeoutError:
-                break
         return "".join(output).strip()
     except Exception as e:
         log.error(f"[api] shell_run failed ({cmd!r}): {e}")
         return ""
-    finally:
-        await _release_shell_ws(device_id, live)
 
 
-async def _stream_binary_to_slot(live, binary: bytes, slot: str) -> "TransferResult":
+async def _stream_binary_to_slot(shell: em_shell.ShellBroker, live: em_device.Device,
+                                 binary: bytes, slot: _Slot) -> "TransferResult":
     """
     Transfer a firmware binary to /data/local/bin/{slot}.
 
@@ -2765,10 +2943,25 @@ async def _stream_binary_to_slot(live, binary: bytes, slot: str) -> "TransferRes
     so shipping one to the slot we are about to boot costs a reboot and a
     rollback to learn nothing (#76).
     """
-    return await _stream_file_to_device(live, binary, f"/data/local/bin/{slot}",
+    return await _stream_file_to_device(shell, live, binary, f"/data/local/bin/{slot}",
                                         require_verify=True)
 
 
+class TransferStage(enum.StrEnum):
+    """Where a device file transfer ended."""
+
+    OK = "ok"                    # verified by md5
+    UNVERIFIED = "unverified"    # landed, but the device has no md5 tool
+    SHELL = "shell"
+    DECODER = "decoder"
+    MD5TOOL = "md5tool"
+    SEND = "send"
+    VERIFY = "verify"
+    CORRUPT = "corrupt"
+    ERROR = "error"
+
+
+@dataclass(frozen=True, slots=True)
 class TransferResult:
     """
     The outcome of a device file transfer, carrying the STAGE it stopped at.
@@ -2785,12 +2978,9 @@ class TransferResult:
     could tell them apart, and a user cannot be asked for that mid-update.
     """
 
-    __slots__ = ("ok", "stage", "detail")
-
-    def __init__(self, ok: bool, stage: str = "ok", detail: str = ""):
-        self.ok     = ok
-        self.stage  = stage
-        self.detail = detail
+    ok: bool
+    stage: TransferStage = TransferStage.OK
+    detail: str = ""
 
     def __bool__(self) -> bool:
         return self.ok
@@ -2804,24 +2994,25 @@ class TransferResult:
 # that is the difference between "retry, the link was bad" and "the payload or
 # the device is wrong".
 _TRANSFER_STAGES = {
-    "shell":   "could not open a shell session on the device — no data was sent",
-    "decoder": "no base64 decoder found on the device — no data was sent",
-    "md5tool": "device has no md5 tool, refusing to send unverified",
-    "send":    "timed out part-way through sending",
-    "verify":  "sent, but timed out waiting for md5 verification",
-    "corrupt": "arrived corrupt — md5 did not match what was sent",
-    "error":   "transfer error",
+    TransferStage.SHELL:   "could not open a shell session on the device — no data was sent",
+    TransferStage.DECODER: "no base64 decoder found on the device — no data was sent",
+    TransferStage.MD5TOOL: "device has no md5 tool, refusing to send unverified",
+    TransferStage.SEND:    "timed out part-way through sending",
+    TransferStage.VERIFY:  "sent, but timed out waiting for md5 verification",
+    TransferStage.CORRUPT: "arrived corrupt — md5 did not match what was sent",
+    TransferStage.ERROR:   "transfer error",
 }
 
 
-def _transfer_failed(stage: str, extra: str = "") -> TransferResult:
+def _transfer_failed(stage: TransferStage, extra: str = "") -> TransferResult:
     detail = _TRANSFER_STAGES.get(stage, stage)
     if extra:
         detail = f"{detail} ({extra})"
     return TransferResult(False, stage, detail)
 
 
-async def _stream_file_to_device(live, data: bytes, dest: str,
+async def _stream_file_to_device(shell: em_shell.ShellBroker, live: em_device.Device,
+                                 data: bytes, dest: str,
                                  mode: str = "755",
                                  require_verify: bool = False) -> TransferResult:
     """
@@ -2844,19 +3035,18 @@ async def _stream_file_to_device(live, data: bytes, dest: str,
     they had before this existed, and the base64 detection below already treats
     a busybox-less device as a contemplated state. Firmware passes True.
     """
-    import base64 as _b64
-
     device_id     = live.device_id
     DELIM         = "__END_B64_42__"
     DETECT_MARKER = "__DETECT_DONE__"
 
+    session = contextlib.AsyncExitStack()
     try:
         try:
-            ws = await _get_device_shell_ws(live)
+            ws = await session.enter_async_context(_device_shell(shell, live))
         except Exception as e:
             log.error(f"[api] Could not open a shell to {device_id} for "
                       f"{dest}: {e}")
-            return _transfer_failed("shell", str(e))
+            return _transfer_failed(TransferStage.SHELL, str(e))
 
         # `dest` is NOT deleted here, and must not be. This used to open with
         # `rm -f {dest}` to clear a previous attempt, which for firmware means
@@ -2919,11 +3109,10 @@ async def _stream_file_to_device(live, data: bytes, dest: str,
                 log.error(f"[api] Shell produced no output in 15s while probing "
                           f"{device_id} for a decoder — link problem, not a "
                           f"missing tool. Output so far: {detect_buf!r}")
-                return _transfer_failed(
-                    "shell", "device shell produced no output within 15s")
+                return _transfer_failed(TransferStage.SHELL, "device shell produced no output within 15s")
             log.error(f"[api] No base64 decoder found on device. "
                       f"Detection output: {detect_buf!r}")
-            return _transfer_failed("decoder")
+            return _transfer_failed(TransferStage.DECODER)
 
         log.info(f"[api] Decoder: {decode_cmd.split()[0]} {decode_cmd.split()[1]}")
 
@@ -2936,12 +3125,12 @@ async def _stream_file_to_device(live, data: bytes, dest: str,
             if require_verify:
                 log.error(f"[api] No md5 tool on device — refusing to transfer "
                           f"{dest} unverified. Detection output: {detect_buf!r}")
-                return _transfer_failed("md5tool")
+                return _transfer_failed(TransferStage.MD5TOOL)
             log.warning(f"[api] No md5 tool on device — {dest} will be "
                         f"transferred WITHOUT verification")
 
         # ── Heredoc transfer ─────────────────────────────────────────────────
-        lines = _b64.encodebytes(data).decode("ascii").splitlines(keepends=True)
+        lines = base64.encodebytes(data).decode("ascii").splitlines(keepends=True)
         log.info(f"[api] Transferring {len(data):,} bytes to {dest} "
                  f"({len(lines)} base64 lines via heredoc)")
 
@@ -2985,11 +3174,11 @@ async def _stream_file_to_device(live, data: bytes, dest: str,
 
         if not transferred:
             log.error(f"[api] Transfer to {dest} timed out waiting for TRANSFER_OK")
-            return _transfer_failed("send")
+            return _transfer_failed(TransferStage.SEND)
 
         if md5_cmd is None:
             log.info(f"[api] Transfer to {dest} confirmed (unverified)")
-            return TransferResult(True, "unverified")
+            return TransferResult(True, TransferStage.UNVERIFIED)
 
         # ── Verify, then promote ─────────────────────────────────────────────
         # Same shell session, so this is a round trip on an open socket rather
@@ -3022,24 +3211,23 @@ async def _stream_file_to_device(live, data: bytes, dest: str,
                     log.error(f"[api] Transfer to {dest} CORRUPT — md5 {want} "
                               f"expected, device reported {got[0] if got else '(none)'}. "
                               f"{dest} left untouched.")
-                    return _transfer_failed("corrupt",
+                    return _transfer_failed(TransferStage.CORRUPT,
                                             f"device reported {got[0] if got else '(none)'}")
             except asyncio.TimeoutError:
                 continue
 
         log.error(f"[api] Transfer to {dest} timed out waiting for md5 verification "
                   f"— {dest} left untouched")
-        return _transfer_failed("verify")
+        return _transfer_failed(TransferStage.VERIFY)
 
     except Exception as e:
         log.error(f"[api] File transfer to {dest} failed: {e}")
-        return _transfer_failed("error", str(e))
+        return _transfer_failed(TransferStage.ERROR, str(e))
     finally:
-        await _release_shell_ws(device_id, live)
+        await session.aclose()
 
-
-
-async def _sync_start_script(live, device_id: str) -> None:
+async def _sync_start_script(shell: em_shell.ShellBroker, live: em_device.Device,
+                             device_id: str) -> None:
     """
     OTA-time payload sync: heal /data/local/bin/start_server.sh drift.
 
@@ -3062,38 +3250,44 @@ async def _sync_start_script(live, device_id: str) -> None:
         return
     want = hashlib.md5(script).hexdigest()
 
-    out = await _shell_run(live, f"busybox md5sum {path} 2>/dev/null")
+    out = await _shell_run(shell, live, f"busybox md5sum {path} 2>/dev/null")
     if want in out:
         return  # in sync — the common case
     await asyncio.sleep(1.0)  # let the md5 shell session close cleanly
 
-    await _push_log_event(device_id, "info", "controller",
-                          "start_server.sh out of date — syncing canonical version")
+    await push_log_event(device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
+                         "start_server.sh out of date — syncing canonical version")
     tmp = path + ".new"
-    res = await _stream_file_to_device(live, script, tmp)
-    if not res:
-        await _push_log_event(device_id, "warn", "controller",
-                              f"start_server.sh sync failed: {res} — continuing OTA")
+    pushed = await _stream_file_to_device(shell, live, script, tmp)
+    if not pushed:
+        await push_log_event(device_id, db.LogLevel.WARN, db.LogSource.CONTROLLER,
+                             f"start_server.sh sync failed: {pushed} — continuing OTA")
         return
     await asyncio.sleep(1.0)
 
-    res = await _shell_run(live,
+    res = await _shell_run(shell, live,
         f'NEW=$(busybox md5sum {tmp} | busybox cut -d" " -f1); '
         f'if [ "$NEW" = "{want}" ]; then '
         f'mv {tmp} {path} && chmod 755 {path} && echo SCRIPT_SYNCED; '
         f'else rm -f {tmp}; echo SCRIPT_MD5_MISMATCH:$NEW; fi')
     if "SCRIPT_SYNCED" in res:
-        await _push_log_event(device_id, "info", "controller",
-                              "start_server.sh synced — takes effect on next device reboot")
+        await push_log_event(device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
+                             "start_server.sh synced — takes effect on next device reboot")
     else:
-        await _push_log_event(device_id, "warn", "controller",
-                              f"start_server.sh sync failed ({res.strip() or 'no output'}) — continuing OTA")
+        await push_log_event(device_id, db.LogLevel.WARN, db.LogSource.CONTROLLER,
+                             f"start_server.sh sync failed ({res.strip() or 'no output'}) — continuing OTA")
     await asyncio.sleep(1.0)
 
 
 # Magisk service.d location of the boot-time debloat script. Installed by the
 # provisioning wizard; synced from here afterwards.
 DEBLOAT_SCRIPT_PATH = "/sbin/.core/img/.core/service.d/echomuse-debloat.sh"
+
+
+def _package_list(text: str) -> list[str]:
+    """debloat_packages.txt's package names: comments and blank lines dropped."""
+    return [ln.strip() for ln in text.splitlines()
+            if ln.strip() and not ln.lstrip().startswith("#")]
 
 
 def _debloat_packages() -> list[str]:
@@ -3103,11 +3297,11 @@ def _debloat_packages() -> list[str]:
     except OSError as e:
         log.error(f"[api] debloat_packages.txt unreadable: {e}")
         return []
-    return [ln.strip() for ln in raw.splitlines()
-            if ln.strip() and not ln.lstrip().startswith("#")]
+    return _package_list(raw)
 
 
-async def _sync_debloat(live, device_id: str) -> None:
+async def _sync_debloat(shell: em_shell.ShellBroker, live: em_device.Device,
+                        device_id: str) -> None:
     """
     Heal debloat drift on a device that is already in the field.
 
@@ -3146,32 +3340,33 @@ async def _sync_debloat(live, device_id: str) -> None:
 
     if script is not None:
         want = hashlib.md5(script).hexdigest()
-        out = await _shell_run(live, f"busybox md5sum {DEBLOAT_SCRIPT_PATH} 2>/dev/null")
+        out = await _shell_run(shell, live, f"busybox md5sum {DEBLOAT_SCRIPT_PATH} 2>/dev/null")
         if want not in out:
             # An empty result also lands here — a device provisioned before the
             # script existed has no file at all, and installing it is right.
             await asyncio.sleep(1.0)
-            await _push_log_event(device_id, "info", "controller",
-                                  "debloat script out of date — syncing canonical version")
+            await push_log_event(device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
+                                 "debloat script out of date — syncing canonical version")
             tmp = DEBLOAT_SCRIPT_PATH + ".new"
-            pushed = await _stream_file_to_device(live, script, tmp)
+            pushed = await _stream_file_to_device(shell, live, script, tmp)
             if pushed:
                 await asyncio.sleep(1.0)
-                res = await _shell_run(live,
+                res = await _shell_run(shell, live,
                     f'NEW=$(busybox md5sum {tmp} | busybox cut -d" " -f1); '
                     f'if [ "$NEW" = "{want}" ]; then '
                     f'mv {tmp} {DEBLOAT_SCRIPT_PATH} && chmod 755 {DEBLOAT_SCRIPT_PATH} '
                     f'&& echo DEBLOAT_SYNCED; '
                     f'else rm -f {tmp}; echo DEBLOAT_MD5_MISMATCH:$NEW; fi')
-                await _push_log_event(
+                synced = "DEBLOAT_SYNCED" in res
+                await push_log_event(
                     device_id,
-                    "info" if "DEBLOAT_SYNCED" in res else "warn", "controller",
+                    db.LogLevel.INFO if synced else db.LogLevel.WARN, db.LogSource.CONTROLLER,
                     "debloat script synced — daemon stops take effect on next device reboot"
-                    if "DEBLOAT_SYNCED" in res else
+                    if synced else
                     f"debloat script sync failed ({res.strip() or 'no output'})")
             else:
-                await _push_log_event(device_id, "warn", "controller",
-                                      f"debloat script sync failed: {pushed}")
+                await push_log_event(device_id, db.LogLevel.WARN, db.LogSource.CONTROLLER,
+                                     f"debloat script sync failed: {pushed}")
             await asyncio.sleep(1.0)
 
     # ── half 2: the pm-hide list ─────────────────────────────────────────────
@@ -3184,10 +3379,10 @@ async def _sync_debloat(live, device_id: str) -> None:
     # thirty-third package.
     listing = ("\n".join(pkgs) + "\n").encode()
     remote_list = "/data/local/tmp/em_debloat_pkgs.txt"
-    pushed = await _stream_file_to_device(live, listing, remote_list, mode="644")
+    pushed = await _stream_file_to_device(shell, live, listing, remote_list, mode="644")
     if not pushed:
-        await _push_log_event(device_id, "warn", "controller",
-                              f"debloat hide-list sync failed: {pushed}")
+        await push_log_event(device_id, db.LogLevel.WARN, db.LogSource.CONTROLLER,
+                             f"debloat hide-list sync failed: {pushed}")
         return
     await asyncio.sleep(1.0)
 
@@ -3208,7 +3403,7 @@ async def _sync_debloat(live, device_id: str) -> None:
     # because a *different*, longer-named package was visible. That produced a
     # confident warning about a FireOS limitation that did not exist — `pm hide`
     # had worked, and dumpsys said hidden=true throughout.
-    res = await _shell_run(live,
+    res = await _shell_run(shell, live,
         f'PKGS=$(cat {remote_list}); VIS=$(pm list packages); N=0; '
         f'for p in $PKGS; do '
         f'if echo "$VIS" | busybox grep -qx "package:$p"; then '
@@ -3233,26 +3428,14 @@ async def _sync_debloat(live, device_id: str) -> None:
         if line.strip().startswith("STILL_VISIBLE:"):
             still = line.split(":", 1)[1].strip()
     if applied:
-        await _push_log_event(device_id, "info", "controller",
-                              f"debloat: hid {applied} newly-listed package(s) — "
-                              f"persistent ones stop at the next device reboot")
+        await push_log_event(device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
+                             f"debloat: hid {applied} newly-listed package(s) — "
+                             f"persistent ones stop at the next device reboot")
     if still:
-        await _push_log_event(device_id, "warn", "controller",
-                              f"debloat: {len(still.split())} package(s) could not be "
-                              f"hidden and are still active: {still}")
+        await push_log_event(device_id, db.LogLevel.WARN, db.LogSource.CONTROLLER,
+                             f"debloat: {len(still.split())} package(s) could not be "
+                             f"hidden and are still active: {still}")
     await asyncio.sleep(1.0)
-
-
-async def _exec_shell(live, cmd: str) -> None:
-    """Send a command to the device shell and return immediately (fire-and-forget)."""
-    try:
-        ws = await _get_device_shell_ws(live)
-        await ws.send(cmd + "\n")
-        await asyncio.sleep(0.5)
-    except Exception as e:
-        log.warning(f"[api] Shell exec failed ({cmd!r}): {e}")
-    finally:
-        await _release_shell_ws(live.device_id, live)
 
 
 # ─── Shell WebSocket proxy (interactive dashboard terminal) ───────────────────
@@ -3266,14 +3449,15 @@ async def _ws_shell(request: web.Request) -> web.WebSocketResponse:
     Do NOT add @auth.require_admin here — _extract_token doesn't read query
     params and would reject every connection before this function runs.
 
-    Sets _shell_dashboard so handle_shell proxies in interactive mode.
+    Registers a shell request carrying the dashboard socket, so handle_shell
+    proxies in interactive mode.
     """
     device_id = request.match_info["id"]
 
     user = await auth.ws_resolve_session(request)
     if user is None:
         raise web.HTTPUnauthorized()
-    if user["role"] != "admin":
+    if user["role"] != auth.Role.ADMIN:
         raise web.HTTPForbidden()
 
     live = _online(device_id)
@@ -3283,41 +3467,38 @@ async def _ws_shell(request: web.Request) -> web.WebSocketResponse:
     # Refuse if a programmatic shell session (e.g. OTA transfer) is in progress.
     # Opening a terminal mid-transfer sends shell_open to the device, which cancels
     # the current shell context and kills the transfer.
-    lock = _shell_lock.get(device_id)
-    if lock and lock.locked():
+    shell = request.app[SERVICES].shell
+    if shell.busy(device_id):
         raise web.HTTPConflict(reason="Device shell is busy — an OTA update is in progress")
 
     ws = web.WebSocketResponse()
     await ws.prepare(request)
 
     log.info(f"[api] Shell session requested: {device_id} by {user['username']}")
-    await _push_log_event(device_id, "info", "controller",
-                          f"Shell session opened by {user['username']}")
+    await push_log_event(device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
+                         f"Shell session opened by {user['username']}")
 
-    loop = asyncio.get_event_loop()
-    done_future = loop.create_future()
-    _shell_pending[device_id]   = done_future
-    _shell_dashboard[device_id] = ws
-    # Do NOT set _shell_ws or acquire _shell_lock — interactive sessions
-    # bypass the programmatic shell mechanism entirely.
+    req = shell.request(device_id, dashboard=ws)
+    # Do NOT take the shell lock — interactive sessions bypass the
+    # programmatic shell mechanism entirely.
 
     try:
         # pty:true — interactive terminal wants a real PTY (mksh prompt,
         # line editing, top/vi, resize). Old firmware ignores the field and
         # opens the legacy pipe; handle_shell reports the established mode
         # to the dashboard via shell_meta. Programmatic sessions
-        # (_get_device_shell_ws) deliberately do not set it.
-        await live.send("shell_open", {"pty": True})
-        await done_future
+        # (_device_shell) deliberately do not set it.
+        await live.send(MessageType.SHELL_OPEN, {"pty": True})
+        await req.wait()
     except Exception as e:
         log.warning(f"[api] Shell session error ({device_id}): {e}")
     finally:
-        _shell_pending.pop(device_id, None)
-        _shell_dashboard.pop(device_id, None)
-        await live.send("shell_close", {})
+        shell.release(device_id, req)
+        with contextlib.suppress(em_device_link.LinkClosed):
+            await live.send(MessageType.SHELL_CLOSE, {})
         log.info(f"[api] Shell session closed: {device_id}")
-        await _push_log_event(device_id, "info", "controller",
-                              f"Shell session closed by {user['username']}")
+        await push_log_event(device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
+                             f"Shell session closed by {user['username']}")
 
     return ws
 
@@ -3329,7 +3510,7 @@ async def _get_latest_release(request: web.Request) -> web.Response:
     """GET /api/releases/latest — latest GitHub release, from cache."""
     release = await _get_cached_release()
     if release is None:
-        return _error("no_release", "No release information available", 404)
+        return _error(ErrorCode.NO_RELEASE, "No release information available", 404)
     return _ok(release)
 
 
@@ -3338,8 +3519,24 @@ async def _post_check_release(request: web.Request) -> web.Response:
     """POST /api/releases/check — force re-poll GitHub."""
     release = await _fetch_latest_release(force=True)
     if release is None:
-        return _error("no_release", "Could not fetch release from GitHub", 502)
+        return _error(ErrorCode.NO_RELEASE, "Could not fetch release from GitHub", 502)
     return _ok(release)
+
+
+class DeploySkipReason(enum.StrEnum):
+    """Why a fleet deploy passed a device over."""
+
+    OFFLINE = "offline"
+    NOT_APPROVED = "not_approved"
+    ALREADY_CURRENT = "already_current"
+    UPDATE_IN_PROGRESS = "update_in_progress"
+
+
+def _upload_target(binary: bytes) -> _UpdateTarget:
+    """An uploaded binary's version: the one compiled into it, else a
+    local-YYYYMMDD-HHMM label."""
+    version = _extract_binary_version(binary) or f"local-{time.strftime('%Y%m%d-%H%M')}"
+    return _UpdateTarget(version=version, url=None)
 
 
 @auth.require_admin
@@ -3351,50 +3548,47 @@ async def _post_deploy_all(request: web.Request) -> web.Response:
     Accepts optional {"upload_token": "..."} to deploy a local binary
     to the whole fleet instead of the latest GitHub release.
     """
-    body = {}
-    try:
-        body = await request.json()
-    except Exception:
-        pass
-
+    body = await _optional_json_body(request)
     upload_token = body.get("upload_token")
-    binary_override = None
-    release = None
+    binary_override: bytes | None = None
 
     if upload_token:
-        binary_override = _pending_uploads.pop(upload_token, None)
+        binary_override = _pending_uploads.pop(str(upload_token), None)
         if binary_override is None:
-            return _error("invalid_token", "Upload token not found or expired", 404)
-        release = {"version": f"local-{time.strftime('%Y%m%d-%H%M')}", "url": None}
+            return _error(ErrorCode.INVALID_TOKEN, "Upload token not found or expired", 404)
+        target = _upload_target(binary_override)
     else:
         release = await _get_cached_release()
         if release is None:
-            return _error("no_release", "No release information available", 409)
+            return _error(ErrorCode.NO_RELEASE, "No release information available", 409)
+        target = _UpdateTarget(version=release["version"], url=release["url"])
 
-    started = []
-    skipped = []
-    loop = asyncio.get_event_loop()
+    started: list[str] = []
+    skipped: list[dict[str, str]] = []
+    loop = asyncio.get_running_loop()
 
     for device_id, device in list(_devices.items()):
         if not device.online:
-            skipped.append({"device_id": device_id, "reason": "offline"})
+            skipped.append({"device_id": device_id, "reason": DeploySkipReason.OFFLINE})
             continue
         row = await loop.run_in_executor(None, db.get_device, device_id)
-        if row is None or not row["approved"]:
-            skipped.append({"device_id": device_id, "reason": "not_approved"})
+        if row is None or not row.approved:
+            skipped.append({"device_id": device_id, "reason": DeploySkipReason.NOT_APPROVED})
             continue
-        if not upload_token and row["firmware_ver"] == release["version"]:
-            skipped.append({"device_id": device_id, "reason": "already_current"})
+        if not upload_token and row.firmware_ver == target.version:
+            skipped.append({"device_id": device_id, "reason": DeploySkipReason.ALREADY_CURRENT})
             continue
         if device_id in _updates_in_progress:
-            skipped.append({"device_id": device_id, "reason": "update_in_progress"})
+            skipped.append({"device_id": device_id,
+                            "reason": DeploySkipReason.UPDATE_IN_PROGRESS})
             continue
 
-        asyncio.create_task(_run_update(device_id, release, binary_override))
+        _begin_ota(device_id, _run_update(request.app[SERVICES].shell, device_id, target,
+                                          binary_override))
         started.append(device_id)
 
     return _ok({
-        "version": release["version"],
+        "version": target.version,
         "started": started,
         "skipped": skipped,
     }, status=202)
@@ -3447,12 +3641,7 @@ async def _get_provision_debloat_packages(request: web.Request) -> web.Response:
     has to understand the file format and list edits ship without a
     dashboard rebuild.
     """
-    packages = [
-        line.strip()
-        for line in _read_payload("debloat_packages.txt").splitlines()
-        if line.strip() and not line.strip().startswith("#")
-    ]
-    return _ok({"packages": packages})
+    return _ok({"packages": _package_list(_read_payload("debloat_packages.txt"))})
 
 
 @auth.require_admin
@@ -3471,11 +3660,11 @@ async def _get_provision_latest_binary(request: web.Request) -> web.Response:
     """
     release = await _get_cached_release()
     if release is None:
-        return _error("no_release", "No release information available", 404)
+        return _error(ErrorCode.NO_RELEASE, "No release information available", 404)
 
     binary = await _fetch_binary(release["url"])
     if binary is None:
-        return _error("fetch_failed", "Could not download binary from GitHub", 502)
+        return _error(ErrorCode.FETCH_FAILED, "Could not download binary from GitHub", 502)
 
     return web.Response(
         body=binary,
@@ -3498,50 +3687,49 @@ async def _get_provision_magisk_db(request: web.Request) -> web.Response:
         fd, path = tempfile.mkstemp(suffix='.db')
         os.close(fd)
         try:
-            con = _sqlite3.connect(path)
-            # Schema confirmed against a real Magisk v17.3 device dump
-            # (sqlite> .schema on a working /data/adb/magisk.db) — NOT
-            # guessed. magiskd queries settings and strings on every su
-            # request regardless of whether anything's stored in them;
-            # the previous version of this function only created
-            # `policies` (and with the wrong columns — no package_name in
-            # the real schema, PRIMARY KEY is uid alone). Missing
-            # settings/strings meant every single su call hit
-            # "sqlite3_exec: no such table" on each of those two tables
-            # and got hard-rejected — which looked like a hang from the
-            # wizard side because su was taking up to ~60s per rejection
-            # cycle, far longer than the wizard's retry loop accounted for.
-            con.execute(
-                "CREATE TABLE policies ("
-                "  uid INT,"
-                "  policy INT,"
-                "  until INT,"
-                "  logging INT,"
-                "  notification INT,"
-                "  PRIMARY KEY(uid)"
-                ")"
-            )
-            con.execute(
-                "CREATE TABLE settings (key TEXT, value INT, PRIMARY KEY(key))"
-            )
-            con.execute(
-                "CREATE TABLE strings (key TEXT, value TEXT, PRIMARY KEY(key))"
-            )
-            con.execute(
-                "CREATE TABLE denylist (package_name TEXT, process TEXT, "
-                "PRIMARY KEY(package_name, process))"
-            )
-            # policy=2 → always grant. Matches the confirmed real schema:
-            # uid, policy, until, logging, notification — no package_name.
-            con.execute("INSERT INTO policies (uid, policy, until, logging, notification) VALUES (2000, 2, 0, 1, 1)")
-            con.execute("INSERT INTO policies (uid, policy, until, logging, notification) VALUES (0, 2, 0, 1, 1)")
-            con.commit()
-            con.close()
+            with contextlib.closing(_sqlite3.connect(path)) as con:
+                # Schema confirmed against a real Magisk v17.3 device dump
+                # (sqlite> .schema on a working /data/adb/magisk.db) — NOT
+                # guessed. magiskd queries settings and strings on every su
+                # request regardless of whether anything's stored in them;
+                # the previous version of this function only created
+                # `policies` (and with the wrong columns — no package_name in
+                # the real schema, PRIMARY KEY is uid alone). Missing
+                # settings/strings meant every single su call hit
+                # "sqlite3_exec: no such table" on each of those two tables
+                # and got hard-rejected — which looked like a hang from the
+                # wizard side because su was taking up to ~60s per rejection
+                # cycle, far longer than the wizard's retry loop accounted for.
+                con.execute(
+                    "CREATE TABLE policies ("
+                    "  uid INT,"
+                    "  policy INT,"
+                    "  until INT,"
+                    "  logging INT,"
+                    "  notification INT,"
+                    "  PRIMARY KEY(uid)"
+                    ")"
+                )
+                con.execute(
+                    "CREATE TABLE settings (key TEXT, value INT, PRIMARY KEY(key))"
+                )
+                con.execute(
+                    "CREATE TABLE strings (key TEXT, value TEXT, PRIMARY KEY(key))"
+                )
+                con.execute(
+                    "CREATE TABLE denylist (package_name TEXT, process TEXT, "
+                    "PRIMARY KEY(package_name, process))"
+                )
+                # policy=2 → always grant. Matches the confirmed real schema:
+                # uid, policy, until, logging, notification — no package_name.
+                con.execute("INSERT INTO policies (uid, policy, until, logging, notification) VALUES (2000, 2, 0, 1, 1)")
+                con.execute("INSERT INTO policies (uid, policy, until, logging, notification) VALUES (0, 2, 0, 1, 1)")
+                con.commit()
             return Path(path).read_bytes()
         finally:
             os.unlink(path)
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     data = await loop.run_in_executor(None, _build_db)
     return web.Response(
         body=data,
@@ -3573,16 +3761,18 @@ async def _post_provision_tls_credentials(request: web.Request) -> web.Response:
     token (minting one — and a pending device row — if needed) so the
     wizard can install them over adb before the device's first contact.
     """
-    if _tls_dir is None:
-        return _error("tls_unavailable",
+    tls_dir = _tls_dir
+    if tls_dir is None:
+        return _error(ErrorCode.TLS_UNAVAILABLE,
                       "Device-link TLS is not active on this controller", 503)
     body      = await _json_body(request)
     device_id = _require_str(body, "device_id")
 
-    loop  = asyncio.get_event_loop()
+    loop  = asyncio.get_running_loop()
     token = await loop.run_in_executor(None, db.ensure_device_token, device_id)
+    ca    = await loop.run_in_executor(None, em_pki.ca_pem, tls_dir)
     return _ok({
-        "ca_pem": em_pki.ca_pem(_tls_dir),
+        "ca_pem": ca,
         "token":  token,
         "dir":    DEVICE_TLS_DIR,
     })
@@ -3598,16 +3788,14 @@ async def _post_secure_link(request: web.Request) -> web.Response:
     control connection so the device redials — over wss, now that the CA
     file exists. Requires the device to be connected.
     """
-    if _tls_dir is None:
-        return _error("tls_unavailable",
+    tls_dir = _tls_dir
+    if tls_dir is None:
+        return _error(ErrorCode.TLS_UNAVAILABLE,
                       "Device-link TLS is not active on this controller", 503)
     device_id = request.match_info["id"]
-    live = _online(device_id)
-    if live is None:
-        return _error("device_offline", f"Device not connected: {device_id}", 409)
+    live = _require_online(device_id, f"Device not connected: {device_id}")
 
-    task = asyncio.create_task(_run_secure_link(device_id))
-    task.add_done_callback(_log_task_exception_api)
+    _spawn(_run_secure_link(request.app[SERVICES].shell, live, tls_dir), f"secure-link:{device_id}")
     return _ok({"started": True})
 
 
@@ -3626,63 +3814,48 @@ async def _post_debloat(request: web.Request) -> web.Response:
     pressing it twice costs a `pm list packages` and nothing else.
     """
     device_id = request.match_info["id"]
-    live = _online(device_id)
-    if live is None:
-        return _error("device_offline", f"Device not connected: {device_id}", 409)
+    live = _require_online(device_id, f"Device not connected: {device_id}")
 
-    # No explicit shell release here: _shell_run and _stream_file_to_device each
-    # acquire and release the session in their own finally, which is why
-    # _sync_start_script does not either. Releasing it from out here could close
-    # a session a concurrent caller had opened.
-    task = asyncio.create_task(_sync_debloat(live, device_id))
-    task.add_done_callback(_log_task_exception_api)
+    # No explicit shell release here: _shell_run and _stream_file_to_device
+    # each hold a _device_shell session only for their own duration.
+    _spawn(_sync_debloat(request.app[SERVICES].shell, live, device_id), f"debloat:{device_id}")
     return _ok({"started": True})
 
 
-def _log_task_exception_api(task: asyncio.Task) -> None:
-    if task.cancelled():
-        return
-    exc = task.exception()
-    if exc is not None:
-        log.error(f"[api] Unhandled exception in background task: {exc}", exc_info=exc)
-
-
-async def _run_secure_link(device_id: str) -> None:
+async def _run_secure_link(shell: em_shell.ShellBroker, live: em_device.Device, tls_dir: str) -> None:
     """Background task: install TLS credentials on a live device."""
-    loop = asyncio.get_event_loop()
-    live = _online(device_id)
-    if live is None:
-        return
+    loop = asyncio.get_running_loop()
+    device_id = live.device_id
     try:
-        await _push_log_event(device_id, "info", "controller",
-                              "Secure link: pushing TLS credentials")
+        await push_log_event(device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
+                             "Secure link: pushing TLS credentials")
         token = await loop.run_in_executor(None, db.ensure_device_token, device_id)
-        ca    = em_pki.ca_pem(_tls_dir)
+        ca    = await loop.run_in_executor(None, em_pki.ca_pem, tls_dir)
 
-        await _shell_run(live, f"mkdir -p {DEVICE_TLS_DIR}")
+        await _shell_run(shell, live, f"mkdir -p {DEVICE_TLS_DIR}")
         await asyncio.sleep(1.0)  # let the shell session close cleanly
 
         ok = await _stream_file_to_device(
-            live, ca.encode("ascii"), f"{DEVICE_TLS_DIR}/ca.pem", mode="644")
+            shell, live, ca.encode("ascii"), f"{DEVICE_TLS_DIR}/ca.pem", mode="644")
         if ok:
             await asyncio.sleep(1.0)
             ok = await _stream_file_to_device(
-                live, token.encode("ascii"), f"{DEVICE_TLS_DIR}/token", mode="600")
+                shell, live, token.encode("ascii"), f"{DEVICE_TLS_DIR}/token", mode="600")
         if not ok:
-            await _push_log_event(device_id, "error", "controller",
-                                  f"Secure link: credential transfer failed: {ok}")
+            await push_log_event(device_id, db.LogLevel.ERROR, db.LogSource.CONTROLLER,
+                                 f"Secure link: credential transfer failed: {ok}")
             return
 
-        await _push_log_event(
-            device_id, "info", "controller",
+        await push_log_event(
+            device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
             "Secure link: credentials installed — bouncing connection to switch to wss")
         # The device reloads credentials on every dial, so a reconnect is
         # enough to move to the TLS listener.
         await live.disconnect()
     except Exception as e:
         log.exception(f"[api] Secure link failed for {device_id}: {e}")
-        await _push_log_event(device_id, "error", "controller",
-                              f"Secure link failed: {e}")
+        await push_log_event(device_id, db.LogLevel.ERROR, db.LogSource.CONTROLLER,
+                             f"Secure link failed: {e}")
 
 
 # ─── System ───────────────────────────────────────────────────────────────────
@@ -3690,13 +3863,15 @@ async def _run_secure_link(device_id: str) -> None:
 @auth.require_auth
 async def _get_system_status(request: web.Request) -> web.Response:
     """GET /api/system/status"""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     all_rows = await loop.run_in_executor(None, db.get_all_devices)
     release = await _get_cached_release()
+    approval_mode = await loop.run_in_executor(
+        None, db.get_config, db.SystemConfigKey.DEVICE_APPROVAL, "strict")
 
-    # Lazy import — em_controller imports em_api at module level.
-    import em_controller as _ctrl
+    services = request.app[SERVICES]
 
+    controller = _controller_cache.value
     return _ok({
         "controller_version": CONTROLLER_VERSION,
         # True when running as a Home Assistant add-on behind Supervisor's
@@ -3708,25 +3883,25 @@ async def _get_system_status(request: web.Request) -> web.Response:
         "ha_ingress": INGRESS_ONLY,
         # Peak asyncio event-loop stall since start (ms). Non-trivial values
         # mean the controller itself delayed speaker frames and LED updates.
-        "loop_lag_peak_ms": round(_ctrl._loop_lag_peak_ms, 1),
+        "loop_lag_peak_ms": round(services.loop_lag_peak_ms(), 1),
         "connected":      sum(1 for d in list(_devices.values()) if d.online),
         "total_devices":  len(all_rows),
-        "pending":        sum(1 for r in all_rows if not r["approved"]),
-        "approval_mode":  db.get_config("device_approval", "strict"),
+        "pending":        sum(1 for r in all_rows if not r.approved),
+        "approval_mode":  approval_mode,
         "latest_release": release["version"] if release else None,
         # Controller update, surfaced alongside the firmware one so the header
         # can badge it without a second round trip. Read-only by design: the
         # controller runs as a container the user owns, and updating it is a
         # `docker compose pull` they perform — there is deliberately no action
         # here, only the information needed to decide to take it.
-        "controller_update": _controller_cache.get("version")
-            if _controller_cache.get("available") else None,
+        "controller_update": (controller["version"]
+                              if controller is not None and controller["available"] else None),
         "updates_available": sum(
             1 for r in all_rows
-            if r["firmware_ver"] and release
-            and r["firmware_ver"] != release["version"]
+            if r.firmware_ver and release
+            and r.firmware_ver != release["version"]
         ),
-        "speech": _ctrl.speech_worker_status(),
+        "speech": services.speech_worker_status(),
     })
 
 
@@ -3743,14 +3918,14 @@ def _ha_calendar_url() -> str | None:
 async def _get_ha_status(request: web.Request) -> web.Response:
     """GET /api/ha/status — per-feature HA probe results (SPEC §16.7: a failure
     disables only the dependent feature) and where HA's calendar UI lives."""
-    import em_controller
-    return _ok({"features": em_controller.ha_status(), "calendar_url": _ha_calendar_url()})
+    return _ok({"features": request.app[SERVICES].ha_status(),
+                "calendar_url": _ha_calendar_url()})
 
 
 @auth.require_admin
 async def _get_system_config(request: web.Request) -> web.Response:
     """GET /api/system/config — full system_config table."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     config = await loop.run_in_executor(None, db.get_all_config)
     # Don't expose schema_version — internal detail
     config.pop("schema_version", None)
@@ -3765,31 +3940,29 @@ async def _patch_system_config(request: web.Request) -> web.Response:
     Body: {key: value, ...}
     Only known, mutable keys are accepted.
     """
-    MUTABLE_KEYS = {
-        "device_approval",
-        "session_expiry_days",
-        "update_check_interval",
-        "github_repo",
+    # The system settings the dashboard may change; everything else in
+    # system_config is the controller's own bookkeeping.
+    mutable_keys = {
+        db.SystemConfigKey.DEVICE_APPROVAL,
+        db.SystemConfigKey.SESSION_EXPIRY_DAYS,
+        db.SystemConfigKey.UPDATE_CHECK_INTERVAL,
+        db.SystemConfigKey.GITHUB_REPO,
     }
     body = await _json_body(request)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
-    updated = {}
-    unknown = []
-    for key, value in body.items():
-        if key not in MUTABLE_KEYS:
-            unknown.append(key)
-            continue
-        await loop.run_in_executor(None, db.set_config, key, str(value))
-        updated[key] = value
-
+    # Every key is checked before any is written: a body refused for one
+    # unknown key must not have applied the others.
+    unknown = [key for key in body if key not in mutable_keys]
     if unknown:
         return _error(
-            "unknown_config_key",
+            ErrorCode.UNKNOWN_CONFIG_KEY,
             f"Unknown or immutable config key(s): {', '.join(unknown)}",
             400,
         )
-    return _ok(updated)
+    for key, value in body.items():
+        await loop.run_in_executor(None, db.set_config, db.SystemConfigKey(key), str(value))
+    return _ok(body)
 
 
 # ─── Global device config ─────────────────────────────────────────────────────
@@ -3802,7 +3975,7 @@ async def _get_global_config(request: web.Request) -> web.Response:
     return _ok(config)
 
 
-def _dropped_keys(incoming: dict, stored: dict) -> list[str]:
+def _dropped_keys(incoming: dict[str, object], stored: dict[str, object]) -> list[str]:
     """Stored keys a replacement body would delete."""
     return sorted(set(stored) - set(incoming))
 
@@ -3812,19 +3985,19 @@ async def _post_global_config(request: web.Request) -> web.Response:
     """Replace fleet defaults and apply each connected device's effective config."""
     config = await _json_body(request)
     explicit_replace = bool(config.pop("replace", False))
-    error = _validate_config(config)
+    error = _validate_config(config, request.app[SERVICES].registry())
     if error is not None:
         return error
     loop = asyncio.get_running_loop()
     stored = await loop.run_in_executor(None, db.get_global_device_config_raw)
     dropped = _dropped_keys(config, stored)
     if dropped and not explicit_replace:
-        return _error("would_drop_keys",
+        return _error(ErrorCode.WOULD_DROP_KEYS,
                       "This body would delete existing setting(s): " + ", ".join(dropped), 409)
     await loop.run_in_executor(None, db.set_global_device_config, config)
     saved = await loop.run_in_executor(None, db.get_global_device_config)
 
-    pushed = []
+    pushed: list[str] = []
     for device_id, device in list(_devices.items()):
         if not device.online:
             continue
@@ -3835,8 +4008,8 @@ async def _post_global_config(request: web.Request) -> web.Response:
 
     all_rows = await loop.run_in_executor(None, db.get_all_devices)
     for row in all_rows:
-        if row["approved"]:
-            await em_ble_proxy.reconcile(row["device_id"])
+        if row.approved:
+            await em_ble_proxy.reconcile(row.device_id)
     return _ok({"config": saved, "pushed_to": pushed})
 
 
@@ -3851,21 +4024,21 @@ async def _post_change_password(request: web.Request) -> web.Response:
     Any authenticated user can change their own password.
     Verifies current password before accepting the new one.
     """
-    user = request["user"]
+    user: auth.SessionUser = request["user"]
     body = await _json_body(request)
     current_password = _require_str(body, "current_password")
     new_password     = _require_str(body, "new_password")
 
     if len(new_password) < 8:
-        return _error("invalid_input", "New password must be at least 8 characters", 400)
+        return _error(ErrorCode.INVALID_INPUT, "New password must be at least 8 characters", 400)
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     db_user = await loop.run_in_executor(None, db.get_user_by_id, user["id"])
     if db_user is None:
-        return _error("user_not_found", "User not found", 404)
+        return _error(ErrorCode.USER_NOT_FOUND, "User not found", 404)
 
-    if not await auth.verify_password_async(current_password, db_user["password_hash"]):
-        return _error("invalid_credentials", "Current password is incorrect", 401)
+    if not await auth.verify_password_async(current_password, db_user.password_hash):
+        return _error(ErrorCode.INVALID_CREDENTIALS, "Current password is incorrect", 401)
 
     new_hash = await auth.hash_password_async(new_password)
     await loop.run_in_executor(None, db.update_user_password, user["id"], new_hash)
@@ -3896,10 +4069,10 @@ async def _ws_events(request: web.Request) -> web.WebSocketResponse:
     try:
         # Send full device snapshot on connect so the dashboard has
         # immediate state without waiting for the first push event.
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         rows = await loop.run_in_executor(None, db.get_all_devices)
         await ws.send_str(json.dumps({
-            "type":    "snapshot",
+            "type":    EventType.SNAPSHOT,
             "devices": [_merge_device(r) for r in rows],
         }))
 
@@ -3916,18 +4089,43 @@ async def _ws_events(request: web.Request) -> web.WebSocketResponse:
     return ws
 
 
-async def _push_event(event: dict) -> None:
+class EventType(enum.StrEnum):
+    """`type` of a message on the dashboard's /api/events socket."""
+
+    SNAPSHOT = "snapshot"
+    DEVICE_UPDATE = "device_update"
+    DEVICE_LOG = "device_log"
+    DEVICE_CONNECTED = "device_connected"
+    DEVICE_DISCONNECTED = "device_disconnected"
+    DEVICE_PENDING = "device_pending"
+    DEVICE_APPROVED = "device_approved"
+    DEVICE_DELETED = "device_deleted"
+    DEVICE_UPDATED = "device_updated"
+    DEVICE_UPDATE_FAILED = "device_update_failed"
+    DEVICE_AUTO_ROLLED_BACK = "device_auto_rolled_back"
+    DEVICE_ROLLED_BACK = "device_rolled_back"
+    RELEASE_UPDATE = "release_update"
+    CONTROLLER_UPDATE = "controller_update"
+    TURN_COMPLETE = "turn_complete"
+    ALERTS = "alerts"
+    HA_STATUS = "ha_status"
+
+
+async def _push_event(event_type: EventType, /, **fields: object) -> None:
     """
-    Broadcast a JSON event to all connected /api/events clients.
+    Broadcast `{"type": event_type, **fields}` to all connected /api/events
+    clients.
 
     Called by route handlers and background tasks whenever device
     state changes.
     """
     if not _event_clients:
         return
-    payload = json.dumps(event)
-    dead = set()
-    for ws in _event_clients:
+    payload = json.dumps({"type": event_type, **fields})
+    dead: set[web.WebSocketResponse] = set()
+    # A snapshot: sending yields to the loop, and a client that connects or
+    # drops meanwhile changes the set under a live iterator.
+    for ws in list(_event_clients):
         try:
             await ws.send_str(payload)
         except Exception:
@@ -3935,72 +4133,115 @@ async def _push_event(event: dict) -> None:
     _event_clients.difference_update(dead)
 
 
-async def _push_log_event(
+async def push_log_event(
     device_id: str,
-    level: str,
-    source: str,
+    level: db.LogLevel,
+    source: db.LogSource,
     message: str,
 ) -> None:
     """
     Persist a controller-generated log entry and push it to event clients.
     """
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, db.log_device, device_id, level, source, message)
-    await _push_event({
-        "type":      "device_log",
-        "device_id": device_id,
-        "entry": {
-            "ts":      int(time.time() * 1000),
-            "level":   level,
-            "source":  source,
-            "message": message,
-        },
+    await _push_event(EventType.DEVICE_LOG, device_id=device_id, entry={
+        "ts":      int(time.time() * 1000),
+        "level":   level,
+        "source":  source,
+        "message": message,
     })
 
 
-async def push_device_update(device_id: str, state: dict) -> None:
+async def push_device_update(device_id: str, state: Mapping[str, object]) -> None:
     """Broadcast a partial device JSON (same keys as _merge_device)."""
-    await _push_event({"type": "device_update", "device_id": device_id, "state": state})
+    await _push_event(EventType.DEVICE_UPDATE, device_id=device_id, state=state)
 
 
-async def push_alerts(device_id: str, kind: str, data: dict) -> None:
+async def push_turn_complete(device_id: str, turn: Mapping[str, object]) -> None:
+    """Broadcast a persisted voice turn (a turns row, with its turn_id)."""
+    await _push_event(EventType.TURN_COMPLETE, device_id=device_id, turn=turn)
+
+
+async def push_alerts(device_id: str, kind: str, data: Mapping[str, object]) -> None:
     """Broadcast an AlertEngine notification (`kind` = its notify code)."""
-    await _push_event({"type": "alerts", "device_id": device_id, "kind": kind, "data": data})
+    await _push_event(EventType.ALERTS, device_id=device_id, kind=kind, data=data)
 
 
-async def push_ha_status(features: dict) -> None:
+async def push_ha_status(features: object) -> None:
     """Broadcast a changed em_controller.ha_status()."""
-    await _push_event({"type": "ha_status", "features": features})
+    await _push_event(EventType.HA_STATUS, features=features)
 
 
 # ─── GitHub release fetching ──────────────────────────────────────────────────
 
-async def _get_cached_release() -> Optional[dict]:
+# Fallback poll interval (s) when the stored update_check_interval is unusable.
+DEFAULT_UPDATE_CHECK_INTERVAL = 3600
+DEFAULT_GITHUB_REPO = "wilbowes/EchoMuse"
+
+
+def _update_check_interval() -> int:
+    """The configured release poll interval. Blocking (DB). A value that is
+    not a positive integer — it is a free-text PATCH — falls back to the
+    default rather than crashing the poll loop or spinning it."""
+    raw = db.get_config(db.SystemConfigKey.UPDATE_CHECK_INTERVAL,
+                        str(DEFAULT_UPDATE_CHECK_INTERVAL))
+    try:
+        interval = int(raw or DEFAULT_UPDATE_CHECK_INTERVAL)
+    except ValueError:
+        return DEFAULT_UPDATE_CHECK_INTERVAL
+    return interval if interval > 0 else DEFAULT_UPDATE_CHECK_INTERVAL
+
+
+def _github_repo() -> str:
+    """Blocking (DB)."""
+    return db.get_config(db.SystemConfigKey.GITHUB_REPO, DEFAULT_GITHUB_REPO) or DEFAULT_GITHUB_REPO
+
+
+def _json_str(value: object) -> str:
+    """A string field from GitHub's JSON, or "" when absent or not a string."""
+    return value if isinstance(value, str) else ""
+
+
+def _stored_release() -> tuple[ReleaseInfo | None, bool]:
+    """
+    The release the DB last cached, and whether that cache has aged past the
+    check interval. Blocking (DB).
+    """
+    K = db.SystemConfigKey
+    version = db.get_config(K.LATEST_VERSION)
+    url     = db.get_config(K.LATEST_BINARY_URL)
+    if not version or not url:
+        return None, True
+    release: ReleaseInfo = {
+        "version":      version,
+        "url":          url,
+        "notes":        db.get_config(K.LATEST_NOTES, "") or "",
+        "release_url":  db.get_config(K.LATEST_RELEASE_URL, "") or "",
+        "published_at": db.get_config(K.LATEST_PUBLISHED_AT, "") or "",
+    }
+    try:
+        last_check = float(db.get_config(K.LAST_UPDATE_CHECK) or 0.0)
+    except ValueError:
+        last_check = 0.0
+    stale = not last_check or (time.time() - last_check) > _update_check_interval()
+    return release, stale
+
+
+async def _get_cached_release() -> ReleaseInfo | None:
     """
     Return the latest release info, using the in-memory cache if fresh.
     Falls back to the DB cache if the in-memory cache is cold.
     Triggers a background fetch if the DB cache is stale.
     """
-    global _release_cache, _release_cache_ts
-
     # In-memory cache hit
-    if _release_cache and (time.monotonic() - _release_cache_ts) < RELEASE_CACHE_TTL:
-        return _release_cache
+    cached = _release_cache.fresh(RELEASE_CACHE_TTL)
+    if cached is not None:
+        return cached
 
     # Load from DB cache
-    version = db.get_config("latest_version")
-    url     = db.get_config("latest_binary_url")
-    last_check = db.get_config("last_update_check")
-
-    if version and url:
-        _release_cache = {
-            "version":      version,
-            "url":          url,
-            "notes":        db.get_config("latest_notes", "") or "",
-            "release_url":  db.get_config("latest_release_url", "") or "",
-            "published_at": db.get_config("latest_published_at", "") or "",
-        }
-        _release_cache_ts = time.monotonic()
+    stored, stale = await asyncio.get_running_loop().run_in_executor(None, _stored_release)
+    if stored is not None:
+        _release_cache.put(stored)
 
         # If the DB cache has aged out, AWAIT the refresh rather than firing it
         # into the background and returning the stale value.
@@ -4017,27 +4258,63 @@ async def _get_cached_release() -> Optional[dict]:
         # interval lapses — release_poll_loop normally refreshes ahead of any
         # caller. A failed refresh falls through to the stale cache, which is
         # better than no answer.
-        interval = int(db.get_config("update_check_interval", "3600") or 3600)
-        if not last_check or (time.time() - float(last_check)) > interval:
+        if stale:
             fresh = await _fetch_latest_release()
             if fresh:
                 return fresh
 
-        return _release_cache
+        return stored
 
     # No cache at all — fetch synchronously
     return await _fetch_latest_release()
 
 
-async def _fetch_latest_release(force: bool = False) -> Optional[dict]:
+def _firmware_release(releases: object) -> tuple[str, str, dict[str, object]] | None:
+    """
+    (tag, binary URL, release) of the newest device firmware release in
+    GitHub's newest-first releases list: a plain v* tag (controller releases
+    use controller-v* and ship no binary), published, with the compiled
+    `server` asset attached.
+    """
+    if not isinstance(releases, list):
+        return None
+    for data in releases:
+        if not isinstance(data, dict) or data.get("draft") or data.get("prerelease"):
+            continue
+        tag = _json_str(data.get("tag_name"))
+        if not tag.startswith("v"):
+            continue
+        assets = data.get("assets")
+        binary = next((a for a in assets if isinstance(a, dict) and a.get("name") == "server"),
+                      None) if isinstance(assets, list) else None
+        if binary is None:
+            continue
+        url = binary.get("browser_download_url")
+        return (tag, url, data) if isinstance(url, str) else None
+    return None
+
+
+def _store_release(release: ReleaseInfo) -> str | None:
+    """Persist the release cache; returns the version it replaces. Blocking (DB)."""
+    K = db.SystemConfigKey
+    previous = db.get_config(K.LATEST_VERSION)
+    db.set_config(K.LATEST_VERSION,      release["version"])
+    db.set_config(K.LATEST_BINARY_URL,   release["url"])
+    db.set_config(K.LATEST_NOTES,        release["notes"])
+    db.set_config(K.LATEST_RELEASE_URL,  release["release_url"])
+    db.set_config(K.LATEST_PUBLISHED_AT, release["published_at"])
+    db.set_config(K.LAST_UPDATE_CHECK,   str(time.time()))
+    return previous
+
+
+async def _fetch_latest_release(force: bool = False) -> ReleaseInfo | None:
     """
     Poll the GitHub releases API and update the DB cache.
 
     Returns the release dict or None on failure.
     """
-    global _release_cache, _release_cache_ts
-
-    repo = db.get_config("github_repo", "wilbowes/EchoMuse")
+    loop = asyncio.get_running_loop()
+    repo = await loop.run_in_executor(None, _github_repo)
     url  = GITHUB_API_URL.format(repo=repo)
 
     log.info(f"[api] Polling GitHub releases: {url}")
@@ -4053,64 +4330,26 @@ async def _fetch_latest_release(force: bool = False) -> Optional[dict]:
                     return None
                 releases = await resp.json()
 
-        # Newest device firmware release: plain v* tag (controller releases
-        # use controller-v* and ship no binary), published, with the compiled
-        # `server` asset attached. The list is newest-first.
-        tag = None
-        binary = None
-        # Initialised explicitly: it is only assigned inside the loop, and
-        # while the `binary is None` return below happens to cover that today,
-        # relying on one guard to protect another variable is how a later edit
-        # introduces a NameError on a path nobody runs in testing.
-        release: dict = {}
-        for data in releases:
-            if data.get("draft") or data.get("prerelease"):
-                continue
-            candidate_tag = data.get("tag_name", "")
-            if not candidate_tag.startswith("v"):
-                continue
-            candidate_binary = next(
-                (a for a in data.get("assets", []) if a.get("name") == "server"),
-                None,
-            )
-            if candidate_binary is None:
-                continue
-            tag, binary = candidate_tag, candidate_binary
-            release = data
-            break
-
-        if binary is None:
+        found = _firmware_release(releases)
+        if found is None:
             log.warning("[api] No device firmware release with a 'server' asset found")
             return None
-
-        download_url = binary["browser_download_url"]
+        tag, download_url, data = found
 
         # Release notes, so the dashboard can show WHAT an update changes
         # rather than only that one exists. Deciding whether to push firmware
         # to a device you rely on, from a version number alone, is not a
         # decision — it is a guess. The body comes from the annotated tag (see
         # .github/workflows/release.yml), which is why tags are annotated.
-        notes = (release.get("body") or "").strip()
-
-        previous_tag = db.get_config("latest_version")
-
-        # Persist to DB
-        db.set_config("latest_version",    tag)
-        db.set_config("latest_binary_url", download_url)
-        db.set_config("latest_notes",      notes)
-        db.set_config("latest_release_url", release.get("html_url") or "")
-        db.set_config("latest_published_at", release.get("published_at") or "")
-        db.set_config("last_update_check", str(time.time()))
-
-        # Update in-memory cache
-        _release_cache    = {
+        release: ReleaseInfo = {
             "version":      tag,
             "url":          download_url,
-            "notes":        notes,
-            "release_url":  release.get("html_url") or "",
-            "published_at": release.get("published_at") or "",
+            "notes":        _json_str(data.get("body")).strip(),
+            "release_url":  _json_str(data.get("html_url")),
+            "published_at": _json_str(data.get("published_at")),
         }
-        _release_cache_ts = time.monotonic()
+        previous_tag = await loop.run_in_executor(None, _store_release, release)
+        _release_cache.put(release)
 
         log.info(f"[api] Latest release: {tag}")
         if tag != previous_tag:
@@ -4118,21 +4357,46 @@ async def _fetch_latest_release(force: bool = False) -> Optional[dict]:
             # Updates panel does not sit on the old version until someone
             # reloads or presses Check now.
             log.info(f"[api] Release changed {previous_tag or '(none)'} -> {tag}")
-            await _push_event({
-                "type":         "release_update",
-                "version":      tag,
-                "notes":        notes,
-                "release_url":  release.get("html_url") or "",
-                "published_at": release.get("published_at") or "",
-            })
-        return _release_cache
+            await _push_event(EventType.RELEASE_UPDATE,
+                              version=tag,
+                              notes=release["notes"],
+                              release_url=release["release_url"],
+                              published_at=release["published_at"])
+        return release
 
     except Exception as e:
         log.error(f"[api] GitHub release fetch failed: {e}")
         return None
 
 
-async def _fetch_controller_release(force: bool = False) -> Optional[dict]:
+def _store_controller_release(version: str, notes: str, published_at: str) -> str | None:
+    """Persist the controller release; returns the version it replaces. Blocking (DB)."""
+    K = db.SystemConfigKey
+    previous = db.get_config(K.LATEST_CONTROLLER_VERSION)
+    db.set_config(K.LATEST_CONTROLLER_VERSION, version)
+    db.set_config(K.LATEST_CONTROLLER_NOTES, notes)
+    db.set_config(K.LATEST_CONTROLLER_PUBLISHED_AT, published_at)
+    return previous
+
+
+def _newest_controller_tag(refs: object) -> tuple[str, dict[str, object]] | None:
+    """(tag, git object) of the highest-versioned controller-v* ref — by
+    parsed version, since the API sorts refs lexically (v2.9.0 after v2.10.0)."""
+    newest: tuple[tuple[int, ...], str, dict[str, object]] | None = None
+    for ref in refs if isinstance(refs, list) else []:
+        if not isinstance(ref, dict):
+            continue
+        tag = _json_str(ref.get("ref")).removeprefix("refs/tags/")
+        parsed = _parse_version(tag)
+        if parsed is None:
+            continue
+        if newest is None or parsed > newest[0]:
+            obj = ref.get("object")
+            newest = (parsed, tag, obj if isinstance(obj, dict) else {})
+    return None if newest is None else (newest[1], newest[2])
+
+
+async def _fetch_controller_release(force: bool = False) -> ControllerRelease | None:
     """
     Find the newest controller-v* tag and its annotation.
 
@@ -4145,13 +4409,13 @@ async def _fetch_controller_release(force: bool = False) -> Optional[dict]:
     release, not a broken one, so it still reports the version with empty
     notes.
     """
-    global _controller_cache, _controller_cache_ts
+    if not force:
+        cached = _controller_cache.fresh(RELEASE_CACHE_TTL)
+        if cached is not None:
+            return cached
 
-    if (not force and _controller_cache
-            and (time.monotonic() - _controller_cache_ts) < RELEASE_CACHE_TTL):
-        return _controller_cache
-
-    repo = db.get_config("github_repo", "wilbowes/EchoMuse")
+    loop = asyncio.get_running_loop()
+    repo = await loop.run_in_executor(None, _github_repo)
     headers = {"Accept": "application/vnd.github+json"}
     timeout = aiohttp.ClientTimeout(total=10)
 
@@ -4162,89 +4426,88 @@ async def _fetch_controller_release(force: bool = False) -> Optional[dict]:
             ) as resp:
                 if resp.status != 200:
                     log.warning(f"[api] Controller tag list returned {resp.status}")
-                    return _controller_cache or None
+                    return _controller_cache.value
                 refs = await resp.json()
 
-            newest = None
-            for ref in refs or []:
-                tag = (ref.get("ref") or "").removeprefix("refs/tags/")
-                parsed = _parse_version(tag)
-                if parsed is None:
-                    continue
-                if newest is None or parsed > newest[0]:
-                    newest = (parsed, tag, ref.get("object") or {})
-
+            newest = _newest_controller_tag(refs)
             if newest is None:
                 log.info("[api] No controller-v* tags published yet")
                 return None
 
-            _, tag, obj = newest
+            tag, obj = newest
             notes = ""
             published_at = ""
-            if obj.get("type") == "tag" and obj.get("sha"):
+            sha = obj.get("sha")
+            if obj.get("type") == "tag" and isinstance(sha, str) and sha:
                 async with session.get(
-                    GITHUB_TAG_OBJECT_URL.format(repo=repo, sha=obj["sha"]),
+                    GITHUB_TAG_OBJECT_URL.format(repo=repo, sha=sha),
                     headers=headers, timeout=timeout,
                 ) as resp:
                     if resp.status == 200:
                         tag_obj = await resp.json()
-                        notes = (tag_obj.get("message") or "").strip()
-                        published_at = (tag_obj.get("tagger") or {}).get("date", "")
+                        if isinstance(tag_obj, dict):
+                            notes = _json_str(tag_obj.get("message")).strip()
+                            tagger = tag_obj.get("tagger")
+                            published_at = (_json_str(tagger.get("date"))
+                                            if isinstance(tagger, dict) else "")
 
         version = tag.removeprefix("controller-")
-        previous = db.get_config("latest_controller_version")
+        previous = await loop.run_in_executor(
+            None, _store_controller_release, version, notes, published_at)
 
-        db.set_config("latest_controller_version", version)
-        db.set_config("latest_controller_notes", notes)
-        db.set_config("latest_controller_published_at", published_at)
-
-        _controller_cache = {
+        check = _compare_versions(CONTROLLER_VERSION, version)
+        release = _controller_cache.put({
             "version":      version,
             "current":      CONTROLLER_VERSION,
             "notes":        notes,
             "published_at": published_at,
             "release_url":  f"https://github.com/{repo}/releases/tag/{tag}",
-            **_compare_versions(CONTROLLER_VERSION, version),
-        }
-        _controller_cache_ts = time.monotonic()
+            "status":       check["status"],
+            "available":    check["available"],
+        })
 
         log.info(f"[api] Latest controller release: {version} "
-                 f"(running {CONTROLLER_VERSION}, {_controller_cache['status']})")
+                 f"(running {CONTROLLER_VERSION}, {check['status']})")
         if version != previous:
             # Same live-push as device releases: a dashboard left open should
             # not sit on stale information until someone reloads.
-            await _push_event({
-                "type":         "controller_update",
-                "version":      version,
-                "notes":        notes,
-                "published_at": published_at,
-                **_compare_versions(CONTROLLER_VERSION, version),
-            })
-        return _controller_cache
+            await _push_event(EventType.CONTROLLER_UPDATE,
+                              version=version, notes=notes, published_at=published_at,
+                              status=check["status"], available=check["available"])
+        return release
 
     except Exception as e:
         log.error(f"[api] Controller release fetch failed: {e}")
-        return _controller_cache or None
+        return _controller_cache.value
 
 
+def _stored_controller_release() -> ControllerRelease:
+    """The controller release the DB last cached, for when GitHub cannot be
+    reached — offline is not the same as "no update exists". Blocking (DB)."""
+    K = db.SystemConfigKey
+    version = db.get_config(K.LATEST_CONTROLLER_VERSION, "") or ""
+    if not version:
+        return {"version": None, "current": CONTROLLER_VERSION,
+                "status": UpdateStatus.UNKNOWN, "available": False}
+    check = _compare_versions(CONTROLLER_VERSION, version)
+    return {
+        "version":      version,
+        "current":      CONTROLLER_VERSION,
+        "notes":        db.get_config(K.LATEST_CONTROLLER_NOTES, "") or "",
+        "published_at": db.get_config(K.LATEST_CONTROLLER_PUBLISHED_AT, "") or "",
+        "release_url":  "",
+        "status":       check["status"],
+        "available":    check["available"],
+    }
+
+
+@auth.require_auth
 async def _get_controller_release(request: web.Request) -> web.Response:
     """GET /api/releases/controller"""
     data = await _fetch_controller_release()
     if data is None:
-        # Fall back to the DB cache so a GitHub outage does not blank the
-        # panel — offline is not the same as "no update exists".
-        version = db.get_config("latest_controller_version", "") or ""
-        if not version:
-            return _ok({"version": None, "current": CONTROLLER_VERSION,
-                        "status": "unknown", "available": False})
-        data = {
-            "version":      version,
-            "current":      CONTROLLER_VERSION,
-            "notes":        db.get_config("latest_controller_notes", "") or "",
-            "published_at": db.get_config("latest_controller_published_at", "") or "",
-            "release_url":  "",
-            **_compare_versions(CONTROLLER_VERSION, version),
-        }
+        data = await asyncio.get_running_loop().run_in_executor(
+            None, _stored_controller_release)
     return _ok(data)
 
 
@@ -4268,7 +4531,7 @@ def _proc_meminfo() -> dict[str, float]:
     return out
 
 
-def _controller_stats() -> dict:
+def _controller_stats(loop_lag_peak_ms: float) -> dict[str, object]:
     """
     The controller's own CPU, memory and storage.
 
@@ -4282,12 +4545,7 @@ def _controller_stats() -> dict:
     directory carries the account name, which is the leak this same change
     fixes in the log tail.
     """
-    stats: dict[str, Any] = {}
-    try:
-        import em_controller as _ctrl
-        stats["loop_lag_peak_ms"] = round(_ctrl._loop_lag_peak_ms, 1)
-    except Exception:
-        pass
+    stats: dict[str, object] = {"loop_lag_peak_ms": round(loop_lag_peak_ms, 1)}
 
     stats["python"] = platform.python_version()
     stats["platform"] = f"{platform.system()} {platform.machine()}"
@@ -4434,27 +4692,31 @@ async def _get_support_bundle(request: web.Request) -> web.Response:
     em_support (allowlist, no speech, no labels, no network identifiers) and
     is enforced there, not here — this function only gathers.
     """
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     rows = await loop.run_in_executor(None, db.get_all_devices)
 
     since = time.time() - 24 * 3600
-    turns, metrics, counters = [], [], []
-    device_configs, live_state, logs = {}, {}, []
+    turns: list[dict[str, object]] = []
+    metrics: list[dict[str, object]] = []
+    counters: list[dict[str, object]] = []
+    device_configs: dict[str, dict[str, object]] = {}
+    live_state: dict[str, dict[str, object]] = {}
+    logs: list[tuple[int, str]] = []
 
     for row in rows:
-        did = row["device_id"]
+        did = row.device_id
         device_configs[did] = await loop.run_in_executor(
             None, db.get_effective_device_config, did)
         device = _devices.get(did)
         live = device if device is not None and device.online else None
-        hello = live.link.hello if live is not None and live.link is not None else {}
+        hello = live.link.hello if live is not None and live.link is not None else None
         live_state[did] = {
             "connected":        live is not None,
             "upgrade_required": bool(live is not None and live.upgrade_required),
             # Capabilities decide which HA entities and controls exist.
             "capabilities":     sorted(live.capabilities) if live is not None else [],
             # Why ambient_light is absent: no_chip, no_attribute, or ok (#90).
-            "ambient_light_status": hello.get("ambient_light_status"),
+            "ambient_light_status": hello.ambient_light_status if hello is not None else None,
             "muted":        live.muted if live is not None else None,
             "rtt_ms":       live.rtt_last_ms if live is not None else None,
             "volume":       live.volume if live is not None else None,
@@ -4471,12 +4733,12 @@ async def _get_support_bundle(request: web.Request) -> web.Response:
         # whose was whose. (`_pick` wants .keys(), which a dict already has.)
         metrics += [dict(m, device_id=did)
                     for m in await loop.run_in_executor(None, db.get_device_metrics, did, since)]
-        counters += await loop.run_in_executor(None, db.get_wake_counters, did, since)
+        counters += [asdict(c) for c in await loop.run_in_executor(None, db.get_wake_counters, did, since)]
         # Fetch deep and thin, rather than fetching 100 and shipping noise:
         # 89% of this table is [mem] heap dumps, so a flat 100 was ~11 lines
         # of evidence. Newest first, which is what thin_noise expects.
         raw = await loop.run_in_executor(None, db.get_device_logs, did, 500, None)
-        pairs = [(lg["ts"], f"{lg['ts']} [{lg['level']}] {lg['source']}: {lg['message']}")
+        pairs = [(lg.ts, f"{lg.ts} [{lg.level}] {lg.source}: {lg.message}")
                  for lg in raw]
         # Sorted oldest-first at the end: a log someone reads should run
         # forwards, and per-device blocks in reverse order do not.
@@ -4484,7 +4746,7 @@ async def _get_support_bundle(request: web.Request) -> web.Response:
 
     bundle = em_support.build(
         controller_version=CONTROLLER_VERSION,
-        devices=rows,
+        devices=[asdict(row) for row in rows],
         fleet_config=await loop.run_in_executor(None, db.get_global_device_config),
         schema_version=len(db.MIGRATIONS),
         turns=turns,
@@ -4499,9 +4761,10 @@ async def _get_support_bundle(request: web.Request) -> web.Response:
         # with — "an admin opened a shell" is the diagnostic content, and
         # this is a single-operator system, so a positional alias would be a
         # one-to-one stand-in for a real person.
-        accounts={u["username"]: u["role"] for u in
+        accounts={u.username: u.role for u in
                   await loop.run_in_executor(None, db.get_all_users)},
-        controller_stats=await loop.run_in_executor(None, _controller_stats),
+        controller_stats=await loop.run_in_executor(
+            None, _controller_stats, request.app[SERVICES].loop_lag_peak_ms()),
     )
     body = em_support.to_json(bundle)
     stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -4513,7 +4776,7 @@ async def _get_support_bundle(request: web.Request) -> web.Response:
     )
 
 
-async def _fetch_binary(download_url: str) -> Optional[bytes]:
+async def _fetch_binary(download_url: str) -> bytes | None:
     """Download the binary from a GitHub release asset URL."""
     log.info(f"[api] Fetching binary: {download_url}")
     try:
@@ -4557,7 +4820,7 @@ async def release_poll_loop() -> None:
         except Exception as e:
             log.error(f"[api] Controller release poll error: {e}")
 
-        interval = int(db.get_config("update_check_interval", "3600") or 3600)
+        interval = await asyncio.get_running_loop().run_in_executor(None, _update_check_interval)
         await asyncio.sleep(interval)
 
 
@@ -4566,7 +4829,7 @@ async def session_prune_loop() -> None:
     while True:
         await asyncio.sleep(3600)
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, db.prune_sessions)
         except Exception as e:
             log.error(f"[api] Session prune error: {e}")
@@ -4584,7 +4847,7 @@ _supervisor_log_wanted: set[str] = set()
 SUPERVISOR_LOG = "/data/local/etc/echomuse/supervisor.log"
 
 
-async def _collect_supervisor_log(device_id: str) -> None:
+async def _collect_supervisor_log(shell: em_shell.ShellBroker, device_id: str) -> None:
     """
     Pull the device's supervisor log after a failed update, on reconnect.
 
@@ -4602,19 +4865,20 @@ async def _collect_supervisor_log(device_id: str) -> None:
     live = _online(device_id)
     if live is None:
         return
-    out = await _shell_run(live, f"busybox tail -c 4096 {SUPERVISOR_LOG}", timeout=30.0)
+    out = await _shell_run(shell, live, f"busybox tail -c 4096 {SUPERVISOR_LOG}", timeout=30.0)
     text = (out or "").strip()
     if not text:
-        await _push_log_event(device_id, "warn", "controller",
+        await push_log_event(device_id, db.LogLevel.WARN, db.LogSource.CONTROLLER,
             "Update failed, and the device has no supervisor log — firmware "
             "predating it, or start_server.sh has not been synced yet "
             "(it takes effect on the next device reboot).")
         return
-    await _push_log_event(device_id, "warn", "controller",
+    await push_log_event(device_id, db.LogLevel.WARN, db.LogSource.CONTROLLER,
         "Supervisor log from the failed update:\n" + text)
 
 
-async def notify_device_connected(device_id: str, version: str | None = None) -> None:
+async def notify_device_connected(shell: em_shell.ShellBroker, device_id: str,
+                                  version: str | None = None) -> None:
     """
     Called by em_controller when a device successfully registers.
 
@@ -4627,15 +4891,14 @@ async def notify_device_connected(device_id: str, version: str | None = None) ->
     If omitted, falls back to a DB lookup; assumes em_controller has already
     written the new firmware_ver before calling this.
     """
-    event: dict = {"type": "device_connected", "device_id": device_id}
+    fields: dict[str, object] = {}
     if version is not None:
-        event["firmware_ver"] = version
+        fields["firmware_ver"] = version
     else:
-        loop = asyncio.get_event_loop()
-        row = await loop.run_in_executor(None, db.get_device, device_id)
+        row = await asyncio.get_running_loop().run_in_executor(None, db.get_device, device_id)
         if row:
-            event["firmware_ver"] = row["firmware_ver"]
-    await _push_event(event)
+            fields["firmware_ver"] = row.firmware_ver
+    await _push_event(EventType.DEVICE_CONNECTED, device_id=device_id, **fields)
 
     # Owed an explanation from a failed update? Collect it now the device is
     # reachable again. Removed from the set on the way in, so a flapping
@@ -4643,36 +4906,32 @@ async def notify_device_connected(device_id: str, version: str | None = None) ->
     # so a slow shell never delays the connect path.
     if device_id in _supervisor_log_wanted:
         _supervisor_log_wanted.discard(device_id)
+        _spawn(_collect_supervisor_log_soon(shell, device_id), f"supervisor-log:{device_id}")
 
-        async def _collect_soon(_id=device_id):
-            # The device has just registered; give its shell plane a moment
-            # before demanding a session on it.
-            await asyncio.sleep(3.0)
-            try:
-                await _collect_supervisor_log(_id)
-            except Exception as e:
-                log.warning(f"[api] supervisor log fetch failed for {_id}: {e}")
 
-        asyncio.create_task(_collect_soon())
+async def _collect_supervisor_log_soon(shell: em_shell.ShellBroker, device_id: str) -> None:
+    # The device has just registered; give its shell plane a moment
+    # before demanding a session on it.
+    await asyncio.sleep(3.0)
+    try:
+        await _collect_supervisor_log(shell, device_id)
+    except Exception as e:
+        log.warning(f"[api] supervisor log fetch failed for {device_id}: {e}")
 
 
 async def notify_device_disconnected(device_id: str) -> None:
     """Called by em_controller when a device disconnects."""
-    await _push_event({"type": "device_disconnected", "device_id": device_id})
+    await _push_event(EventType.DEVICE_DISCONNECTED, device_id=device_id)
 
 
 async def notify_device_pending(device_id: str, ip: str) -> None:
     """Called by em_controller when an unapproved device attempts connection."""
-    await _push_event({
-        "type":      "device_pending",
-        "device_id": device_id,
-        "ip":        ip,
-    })
+    await _push_event(EventType.DEVICE_PENDING, device_id=device_id, ip=ip)
 
 
 # ─── Response helpers ─────────────────────────────────────────────────────────
 
-def _ok(data, status: int = 200) -> web.Response:
+def _ok(data: object, status: int = 200) -> web.Response:
     return web.Response(
         status=status,
         content_type="application/json",
@@ -4680,7 +4939,7 @@ def _ok(data, status: int = 200) -> web.Response:
     )
 
 
-def _error(code: str, message: str, status: int) -> web.Response:
+def _error(code: ErrorCode, message: str, status: int) -> web.Response:
     return web.Response(
         status=status,
         content_type="application/json",
@@ -4690,44 +4949,71 @@ def _error(code: str, message: str, status: int) -> web.Response:
 
 # ─── Request helpers ──────────────────────────────────────────────────────────
 
-async def _json_body(request: web.Request) -> dict:
+# A request body once it is known to be a JSON object; fields are narrowed
+# where they are read.
+JsonObject = dict[str, object]
+
+
+async def _json_body(request: web.Request) -> JsonObject:
     """The request body as a JSON object; 400 when missing, invalid, or not an object."""
     try:
         body = await request.json()
     except Exception:
         body = None
     if not isinstance(body, dict):
-        raise web.HTTPBadRequest(
-            content_type="application/json",
-            body=json.dumps({
-                "error": "Request body must be a JSON object",
-                "code":  "invalid_json",
-            }),
-        )
+        raise ApiError(ErrorCode.INVALID_JSON, "Request body must be a JSON object", 400)
     return body
 
 
-def _require_str(body: dict, key: str) -> str:
+async def _optional_json_body(request: web.Request) -> JsonObject:
+    """For a body whose every field is optional: a missing, unparseable or
+    non-object body reads as `{}`."""
+    try:
+        body = await request.json()
+    except Exception:
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
+def _require_str(body: Mapping[str, object], key: str) -> str:
     """Extract a required string field from a parsed JSON body."""
     value = body.get(key)
     if not isinstance(value, str) or not value.strip():
-        raise web.HTTPBadRequest(
-            content_type="application/json",
-            body=json.dumps({
-                "error": f"Missing or empty required field: {key}",
-                "code":  "missing_field",
-            }),
-        )
+        raise ApiError(ErrorCode.MISSING_FIELD, f"Missing or empty required field: {key}", 400)
     return value.strip()
+
+
+async def _device_row(device_id: str) -> db.DeviceRow:
+    """The registered device's row; 404 device_not_found when there is none."""
+    row = await asyncio.get_running_loop().run_in_executor(None, db.get_device, device_id)
+    if row is None:
+        raise ApiError(ErrorCode.DEVICE_NOT_FOUND, f"No device: {device_id}", 404)
+    return row
+
+
+def _require_online(device_id: str, message: str = "Device is not connected") -> em_device.Device:
+    """The connected Device (v1 or legacy); 409 device_offline otherwise."""
+    device = _online(device_id)
+    if device is None:
+        raise ApiError(ErrorCode.DEVICE_OFFLINE, message, 409)
+    return device
+
+
+def _require_v1(device_id: str) -> em_device.Device:
+    """The connected v1 Device; 409 device_offline / upgrade_required otherwise."""
+    device = _require_online(device_id)
+    if device.link is None:
+        raise ApiError(ErrorCode.UPGRADE_REQUIRED, "Device firmware must be upgraded", 409)
+    return device
 
 
 # ─── Device state merge ───────────────────────────────────────────────────────
 
-def _stored_volume(row):
+def _stored_volume(row: db.DeviceRow) -> float | None:
     """Last-known volume as an HA 0..1 float, from the persisted config."""
     try:
-        level = json.loads(row["config"] or "{}").get("startupVolume")
-    except (json.JSONDecodeError, TypeError):
+        level = json.loads(row.config or "{}").get("startupVolume")
+    except (json.JSONDecodeError, TypeError, AttributeError):
         return None
     if level is None:
         return None
@@ -4741,30 +5027,79 @@ def _stored_volume(row):
         return None
 
 
-def _row_sections(row) -> list:
+def _row_sections(row: db.DeviceRow) -> list[sections_mod.SectionId]:
     """
-    Overridden config sections from a device row, tolerant of a row that
-    predates the v8 column or carries unparseable JSON — either way the safe
-    reading is "overrides nothing", which shows the device as fleet-scoped
-    rather than inventing overrides it does not have.
+    Overridden config sections from a device row, tolerant of unparseable
+    JSON — the safe reading is "overrides nothing", which shows the device as
+    fleet-scoped rather than inventing overrides it does not have.
     """
     try:
-        raw = row["config_sections"]
-    except (IndexError, KeyError):
-        return []
-    try:
-        return sections_mod.normalise(json.loads(raw or "[]"))
+        return sections_mod.normalise(json.loads(row.config_sections or "[]"))
     except (json.JSONDecodeError, TypeError):
         return []
 
 
-# Actor states (em_session.SessionActor.state) the dashboard shows as listening
-# or thinking; SPEAKING is shown as speaking.
-_LISTENING_STATES = frozenset({"ARMED", "LISTENING", "END_PENDING", "EXPECT_REPLY"})
-_THINKING_STATES = frozenset({"COMMITTED", "THINKING"})
+# Actor states the dashboard shows as listening or thinking; SPEAKING is
+# shown as speaking.
+_LISTENING_STATES = frozenset({ActorState.ARMED, ActorState.LISTENING,
+                               ActorState.END_PENDING, ActorState.EXPECT_REPLY})
+_THINKING_STATES = frozenset({ActorState.COMMITTED, ActorState.THINKING})
 
 
-def _merge_device(row) -> dict:
+class DeviceJson(TypedDict):
+    """One device as the dashboard receives it (/api/devices, the events
+    snapshot). `device_update` events carry a partial one."""
+
+    # Persistent
+    device_id: str
+    label: str | None
+    approved: bool
+    ip: str | None
+    firmware_ver: str | None
+    firmware_previous: str | None
+    first_seen: int | None
+    last_seen: int | None
+    config: dict[str, object]
+    config_sections: list[sections_mod.SectionId]
+    use_global_config: bool
+    esphome_port: int | None
+    ble_proxy_port: int | None
+    # Live connection
+    connected: bool
+    upgrade_required: bool
+    capabilities: list[str]
+    missing_capabilities: list[str]
+    firmware_version: str | None
+    turn_state: ActorState | None
+    speaking: bool
+    listening: bool
+    thinking: bool
+    muted: bool | None
+    volume: float | None
+    ambient: dict[str, object] | None
+    alert_state: dict[str, object] | None
+    ringing: bool | None
+    wake_stats: dict[str, object] | None
+    diagnostic: bool
+    stats: dict[str, object] | None
+    collectMode: bool
+    collectClips: int
+    collectLastMs: int | None
+    ambientMode: bool
+    ambientFiles: int
+    ambientMs: int
+    captureMode: bool
+    captureDelivered: int
+    rttMs: int | None
+    bleProxy: em_ble_proxy.BleProxyStatus | None
+    linkTokenIssued: bool
+    linkTls: bool
+    wifi: dict[str, object]
+    update_in_progress: bool
+    update_error: str | None
+
+
+def _merge_device(row: db.DeviceRow) -> DeviceJson:
     """
     One device's dashboard JSON: the DB row plus live Device state.
 
@@ -4772,7 +5107,7 @@ def _merge_device(row) -> dict:
     the device is offline; `wake_stats` is the last report received (it carries
     `received_ms`), so it survives a disconnect.
     """
-    device_id = row["device_id"]
+    device_id = row.device_id
     device = _devices.get(device_id)
     live = device if device is not None and device.online else None
     turn_state = live.actor.state if live is not None and live.link is not None else None
@@ -4782,18 +5117,18 @@ def _merge_device(row) -> dict:
     return {
         # Persistent
         "device_id":          device_id,
-        "label":              row["label"],
-        "approved":           bool(row["approved"]),
-        "ip":                 row["ip"],
-        "firmware_ver":       row["firmware_ver"],
-        "firmware_previous":  row["firmware_previous"],
-        "first_seen":         row["first_seen"],
-        "last_seen":          row["last_seen"],
-        "config":             json.loads(row["config"] or "{}"),
+        "label":              row.label,
+        "approved":           bool(row.approved),
+        "ip":                 row.ip,
+        "firmware_ver":       row.firmware_ver,
+        "firmware_previous":  row.firmware_previous,
+        "first_seen":         row.first_seen,
+        "last_seen":          row.last_seen,
+        "config":             json.loads(row.config or "{}"),
         "config_sections":    sections,
         "use_global_config":  not sections,
-        "esphome_port":       row["esphome_api_port"],
-        "ble_proxy_port":     row["ble_proxy_port"],
+        "esphome_port":       row.esphome_api_port,
+        "ble_proxy_port":     row.ble_proxy_port,
         # Live connection
         "connected":          live is not None,
         "upgrade_required":   bool(live is not None and live.upgrade_required),
@@ -4803,7 +5138,7 @@ def _merge_device(row) -> dict:
         "missing_capabilities": sorted(live.missing_capabilities) if live is not None else [],
         "firmware_version":   live.firmware_version if live is not None else None,
         "turn_state":         turn_state,
-        "speaking":           turn_state == "SPEAKING",
+        "speaking":           turn_state == ActorState.SPEAKING,
         "listening":          turn_state in _LISTENING_STATES,
         "thinking":           turn_state in _THINKING_STATES,
         "muted":              live.muted if live is not None else None,
@@ -4822,23 +5157,22 @@ def _merge_device(row) -> dict:
         "stats":              live.stats if live is not None else None,
         # Recording modes. collect/ambient are persisted device-row columns
         # (armed whether or not the device is up); counters are per connection.
-        "collectMode":        bool(row["collect_mode"]),
-        "collectClips":       getattr(live, "collect_clips", 0) if live is not None else 0,
-        "collectLastMs":      getattr(live, "collect_last_ms", None) if live is not None else None,
-        "ambientMode":        bool(row["ambient_mode"]),
-        "ambientFiles":       getattr(live, "ambient_files", 0) if live is not None else 0,
-        "ambientMs":          (getattr(live.ambient_rec, "duration_ms", 0)
-                               if live is not None and getattr(live, "ambient_rec", None) is not None
-                               else 0),
+        "collectMode":        bool(row.collect_mode),
+        "collectClips":       live.collect_clips if live is not None else 0,
+        "collectLastMs":      live.collect_last_ms if live is not None else None,
+        "ambientMode":        bool(row.ambient_mode),
+        "ambientFiles":       live.ambient_files if live is not None else 0,
+        "ambientMs":          (live.ambient_rec.duration_ms
+                               if live is not None and live.ambient_rec is not None else 0),
         # Script-driven capture is live-only; nothing is persisted.
-        "captureMode":        bool(getattr(live, "capture_mode", False)) if live is not None else False,
-        "captureDelivered":   getattr(live, "capture_delivered", 0) if live is not None else 0,
+        "captureMode":        live.capture_mode if live is not None else False,
+        "captureDelivered":   live.capture_delivered if live is not None else 0,
         # Controller-measured control-plane round trip.
         "rttMs":              live.rtt_last_ms if live is not None else None,
         "bleProxy":           em_ble_proxy.get_status(device_id),
-        "linkTokenIssued":    bool(row["token"]),
+        "linkTokenIssued":    bool(row.token),
         "linkTls":            bool(live is not None and live.secure),
-        "wifi":               wifi_state(device_id),
+        "wifi":               _wifi_change(device_id).wire(),
         "update_in_progress": device_id in _updates_in_progress,
         # Last OTA/rollback failure; None when the last attempt succeeded.
         "update_error":       _update_errors.get(device_id),

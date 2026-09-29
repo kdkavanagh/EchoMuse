@@ -17,26 +17,32 @@ returns decisions. Positions are capture-epoch sample indices at 16 kHz.
 
 from __future__ import annotations
 
+import enum
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Iterable, Literal, Sequence
+from typing import Iterable, Sequence, TypedDict
 
 import echomuse_grammar
-from echomuse_grammar import Choice, CommandContext
+from echomuse_grammar import Choice, CommandContext, GrammarClass, LocalAction
 from em_attribution import (
     CELL,
-    COMMAND_SPEECH,
     Attributor,
     BackgroundTracker,
     Cell,
+    CellClass,
     ClassifiedCell,
     EarlyAnswerDetector,
+    EchoResult,
     ReplyOnsetScanner,
+    Rule,
 )
 from em_audio_timeline import CELL_FLAG_GAP, CELL_FLAG_MUTED
+from em_endpoint_policy import Commit as ReducerCommit
 from em_endpoint_policy import (
+    CloseReason,
     EndpointReducer,
+    Route,
     StableText,
     TextStability,
     local_command_preconditions,
@@ -54,7 +60,14 @@ BLOCK = 1_280          # one 80 ms capture block; the reducer's evaluation grid 
 PREROLL = 4_800        # 300 ms before the trigger/onset (§8.1)
 RETAIN_CELLS = 10 * SAMPLE_RATE // CELL + 1   # retained evidence for B, onset and echo windows
 
-UtteranceKind = Literal["wake", "button", "reply", "ha_reply"]
+
+class UtteranceKind(enum.StrEnum):
+    """What opened the utterance: a wake word, the button, a no-wake reply (websocket or ESPHome path)."""
+
+    WAKE = "wake"
+    BUTTON = "button"
+    REPLY = "reply"
+    HA_REPLY = "ha_reply"
 
 
 # --- Lease-level evidence ----------------------------------------------------------
@@ -90,7 +103,7 @@ class CellAssembler:
     def __init__(self) -> None:
         self._records: dict[int, tuple[float, int]] = {}
         self._vad: dict[int, float] = {}
-        self._echo: dict[int, str] = {}
+        self._echo: dict[int, EchoResult] = {}
         self._gaps: list[tuple[int, int]] = []
         self._next: int | None = None
         self._vad_from: int | None = None
@@ -132,7 +145,7 @@ class CellAssembler:
         for i, p in enumerate(probabilities):
             self._vad[first_cell_sample + i * CELL] = float(p)
 
-    def add_echo(self, first_cell_sample: int, results: Sequence[str]) -> None:
+    def add_echo(self, first_cell_sample: int, results: Sequence[EchoResult]) -> None:
         for i, r in enumerate(results):
             self._echo[first_cell_sample + i * CELL] = r
 
@@ -180,7 +193,7 @@ class CellAssembler:
     def release(self) -> list[Evidence]:
         """Complete cells in order; each is released once and retained in `history`."""
         self._stage()
-        out = []
+        out: list[Evidence] = []
         while self._staged:
             ev = self._staged[0]
             echo = None
@@ -215,13 +228,13 @@ class CellAssembler:
 class Pending:
     boundary: int
     since: int
-    route: str
+    route: Route
 
 
 @dataclass(frozen=True, slots=True)
 class Revoked:
     boundary: int
-    route: str
+    route: Route
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,21 +253,54 @@ class Commit:
     start: int
     boundary: int
     end: int
-    route: str
+    route: Route
     text: str
     redecode_required: bool
     wake_window: Window | None
-    local_action: str | None
+    local_action: LocalAction | None
     decided_at: int
-    completeness: str
+    completeness: GrammarClass
 
 
 @dataclass(frozen=True, slots=True)
 class Close:
-    reason: str
+    reason: CloseReason
 
 
 Decision = Pending | Revoked | Commit | Close
+
+
+class EndpointEvent(TypedDict, total=False):
+    """One entry of the §11.3 endpoint decision trace."""
+
+    event: str                     # pending | revoked | commit | close
+    route: Route
+    boundary: int
+    since: int
+    at: int
+    end: int
+    commit_id: str
+    local_action: LocalAction | None
+    reason: CloseReason
+
+
+class UtteranceTrace(TypedDict):
+    """§11.3 decision-trace fields for one utterance (logged with the turn row)."""
+
+    utterance_id: str
+    kind: UtteranceKind
+    start: int
+    trigger: int
+    evidence_frontier: int
+    segments: list[tuple[CellClass, Rule, int, int]]
+    foreground_db: float | None
+    background_available: int
+    cells: int
+    command_cells: int
+    stable_prefix: str
+    streaming_text: str
+    heard: str
+    endpoint: list[EndpointEvent]
 
 
 @dataclass(frozen=True, slots=True)
@@ -294,7 +340,7 @@ def streaming_command(spec: UtteranceSpec, transcript: StreamingTranscript) -> t
     Returns (text, wake window, first command token sample). Non-wake turns
     never strip anything.
     """
-    if spec.kind == "wake" and spec.wake_phrase and spec.wake_open is not None:
+    if spec.kind == UtteranceKind.WAKE and spec.wake_phrase and spec.wake_open is not None:
         window = locate_streaming(transcript, spec.wake_phrase, spec.wake_open + LOOKAHEAD_SAMPLES)
         cut = command_text(transcript, window)
         return cut.text, window, cut.first_token_sample
@@ -310,7 +356,7 @@ def local_action(
     boundary: int,
     cells: Sequence[ClassifiedCell],
     context: CommandContext | None,
-) -> str | None:
+) -> LocalAction | None:
     """§16.2/§6.3: the local action (`dismiss`/`snooze`/`stop`) for a committed wake utterance, or None."""
     if context is None:
         return None
@@ -338,18 +384,16 @@ class Utterance:
         if spec.start > spec.trigger:
             raise ValueError("utterance start must not follow its trigger")
         self.spec = spec
-        vocabulary, choices = spec.vocabulary, spec.choices
-        self._completeness = lambda text: echomuse_grammar.classify(text, vocabulary, choices).klass
         self._reducer = EndpointReducer(
             utterance_start=spec.start,
             trigger_sample=spec.trigger,
             completeness=self._completeness,
             extended_utterances=spec.extended,
-            esphome_reply=spec.kind == "ha_reply",
+            esphome_reply=spec.kind == UtteranceKind.HA_REPLY,
         )
         self._attributor = Attributor(
             trigger_sample=spec.trigger,
-            seed_start=spec.seed_start if spec.kind == "wake" else None,
+            seed_start=spec.seed_start if spec.kind == UtteranceKind.WAKE else None,
         )
         self._stability = TextStability(spec.trigger)
         self._first_cell = spec.start - spec.start % CELL
@@ -363,10 +407,13 @@ class Utterance:
         self._heard = ""
         self._window: Window | None = None
         self._first_token: int | None = None
-        self._events: list[dict] = []
+        self._events: list[EndpointEvent] = []
         self._pending_since: int | None = None
         self.decision: Commit | Close | None = None
         self.has_command_speech = False
+
+    def _completeness(self, text: str) -> GrammarClass:
+        return echomuse_grammar.classify(text, self.spec.vocabulary, self.spec.choices).klass
 
     @property
     def utterance_id(self) -> str:
@@ -423,14 +470,6 @@ class Utterance:
                                     trailing_blanks))
         self._asr_through = through
 
-    def close(self, reason: str) -> Close | None:
-        """Actor-imposed close (mute, session loss, worker error, overrun, preemption); once only."""
-        if self.done:
-            return None
-        self.decision = Close(reason)
-        self._events.append({"event": "close", "reason": reason})
-        return self.decision
-
     def advance(self, valid_audio_end: int) -> list[Decision]:
         """Evaluate every block end the evidence frontier has passed.
 
@@ -444,7 +483,7 @@ class Utterance:
             self._evaluated = block_end
             while self._asr and self._asr[0].through <= block_end:
                 self._push_text(self._asr.popleft())
-            new_cells = []
+            new_cells: list[ClassifiedCell] = []
             while self._reducer_observed < len(self._cells):
                 cell = self._cells[self._reducer_observed]
                 if cell.end > block_end:
@@ -459,21 +498,22 @@ class Utterance:
             )
             if decision.revoked is not None:
                 self._pending_since = None
-                event: Decision = Revoked(decision.revoked.boundary, decision.revoked.route)
-                self._events.append({"event": "revoked", "route": event.route, "boundary": event.boundary,
-                                     "at": block_end})
-                out.append(event)
+                revoked = Revoked(decision.revoked.boundary, decision.revoked.route)
+                self._events.append(EndpointEvent(event="revoked", route=revoked.route, boundary=revoked.boundary,
+                                                  at=block_end))
+                out.append(revoked)
             elif decision.commit is not None:
                 out.append(self._commit(decision.commit, block_end))
             elif decision.close is not None:
-                self.decision = Close(decision.close.reason)
-                self._events.append({"event": "close", "reason": decision.close.reason, "at": block_end})
-                out.append(self.decision)
+                close = Close(decision.close.reason)
+                self.decision = close
+                self._events.append(EndpointEvent(event="close", reason=close.reason, at=block_end))
+                out.append(close)
             elif decision.pending is not None and decision.pending.since != self._pending_since:
                 p = decision.pending
                 self._pending_since = p.since
-                self._events.append({"event": "pending", "route": p.route, "boundary": p.boundary,
-                                     "since": p.since})
+                self._events.append(EndpointEvent(event="pending", route=p.route, boundary=p.boundary,
+                                                  since=p.since))
                 out.append(Pending(p.boundary, p.since, p.route))
         return out
 
@@ -483,9 +523,9 @@ class Utterance:
         self._heard = result.transcript.text.strip()
         self._stability.push(text, result.through, result.blanks)
 
-    def _commit(self, commit, decided_at: int) -> Commit:
+    def _commit(self, commit: ReducerCommit, decided_at: int) -> Commit:
         action = None
-        if self.spec.kind == "wake":
+        if self.spec.kind == UtteranceKind.WAKE:
             action = local_action(
                 text=self._text,
                 stable=self._stability.current,
@@ -494,7 +534,7 @@ class Utterance:
                 cells=self._cells,
                 context=self.spec.context,
             )
-        self.decision = Commit(
+        committed = Commit(
             commit_id=str(uuid.uuid4()),
             start=commit.start,
             boundary=commit.boundary,
@@ -507,28 +547,29 @@ class Utterance:
             decided_at=decided_at,
             completeness=self._completeness(commit.text),
         )
-        self._events.append({"event": "commit", "route": commit.route, "boundary": commit.boundary,
-                             "end": commit.end, "commit_id": self.decision.commit_id, "local_action": action})
-        return self.decision
+        self.decision = committed
+        self._events.append(EndpointEvent(event="commit", route=commit.route, boundary=commit.boundary,
+                                          end=commit.end, commit_id=committed.commit_id, local_action=action))
+        return committed
 
-    def trace(self) -> dict:
+    def trace(self) -> UtteranceTrace:
         """§11.3 decision-trace fields for this utterance."""
-        return {
-            "utterance_id": self.spec.utterance_id,
-            "kind": self.spec.kind,
-            "start": self.spec.start,
-            "trigger": self.spec.trigger,
-            "evidence_frontier": self.frontier,
-            "segments": [[s.cls, s.rule, s.start, s.end] for s in self._attributor.trace],
-            "foreground_db": self._attributor.foreground,
-            "background_available": sum(c.background is not None for c in self._cells),
-            "cells": len(self._cells),
-            "command_cells": sum(c.cls == COMMAND_SPEECH and c.command for c in self._cells),
-            "stable_prefix": self._stability.current.prefix,
-            "streaming_text": self._text,
-            "heard": self._heard,
-            "endpoint": list(self._events),
-        }
+        return UtteranceTrace(
+            utterance_id=self.spec.utterance_id,
+            kind=self.spec.kind,
+            start=self.spec.start,
+            trigger=self.spec.trigger,
+            evidence_frontier=self.frontier,
+            segments=[(s.cls, s.rule, s.start, s.end) for s in self._attributor.trace],
+            foreground_db=self._attributor.foreground,
+            background_available=sum(c.background is not None for c in self._cells),
+            cells=len(self._cells),
+            command_cells=sum(c.cls == CellClass.COMMAND_SPEECH and c.command for c in self._cells),
+            stable_prefix=self._stability.current.prefix,
+            streaming_text=self._text,
+            heard=self._heard,
+            endpoint=list(self._events),
+        )
 
 
 def redecoded_command(spec: UtteranceSpec, tokens: Sequence[str], seconds: Sequence[float]) -> str:

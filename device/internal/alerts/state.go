@@ -33,17 +33,17 @@ type state struct {
 
 // localOp is a journaled dismiss/snooze/expire (SPEC §10.7, WIRE alert.local_operation).
 type localOp struct {
-	Seq          uint64    `json:"seq"`
-	OpID         string    `json:"op_id"`
-	Action       string    `json:"action"` // dismiss|snooze|expire
-	OccurrenceID string    `json:"occurrence_id"`
-	ScheduleID   string    `json:"schedule_id"`
-	Revision     uint64    `json:"revision"`
-	DueUTCMs     int64     `json:"due_utc_ms,string"` // the target's due time
-	Reason       *string   `json:"reason"`            // expire only: timed_out|missed
-	Source       string    `json:"source"`
-	Child        *ChildRef `json:"child,omitempty"` // snooze only
-	Result       *OpResult `json:"result,omitempty"`
+	Seq          uint64        `json:"seq"`
+	OpID         string        `json:"op_id"`
+	Action       Action        `json:"action"` // dismiss|snooze|expire
+	OccurrenceID string        `json:"occurrence_id"`
+	ScheduleID   string        `json:"schedule_id"`
+	Revision     uint64        `json:"revision"`
+	DueUTCMs     int64         `json:"due_utc_ms,string"` // the target's due time
+	Reason       *ExpireReason `json:"reason"`            // expire only: timed_out|missed
+	Source       Source        `json:"source"`
+	Child        *ChildRef     `json:"child,omitempty"` // snooze only
+	Result       *OpResult     `json:"result,omitempty"`
 }
 
 // localChild is a snooze child created on the device.

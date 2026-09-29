@@ -7,15 +7,11 @@ pytest.importorskip("websockets")
 
 import em_device  # noqa: E402
 from _device_fakes import (  # noqa: E402
-    FakeLink, FakeRender, FakeStore, hello, make_hub, run, settle,
+    FakeLink, FakeRender, FakeStore, envelope, hello, make_hub, run, settle,
 )
 
 Rejected = em_device.em_device_link.Rejected
 Admitted = em_device.em_device_link.Admitted
-
-
-def _env(body: dict, msg_type: str = "x") -> dict:
-    return {"type": msg_type, "body": body, "generation": 0, "message_id": "m"}
 
 
 async def _online(store=None, host=None):
@@ -47,7 +43,7 @@ def test_unknown_device_in_auto_mode_is_approved_and_admitted():
         result = await hub.admit(hello(), device_id="NEW12345", peer_ip="1.2.3.4",
                                  secure=False, token=None)
         assert isinstance(result, Admitted)
-        assert store.rows["NEW12345"]["approved"] and hub.devices["NEW12345"].label == "Unknown NEW12345"
+        assert store.rows["NEW12345"].approved and hub.devices["NEW12345"].label == "Unknown NEW12345"
         await hub.devices["NEW12345"].close()
     run(scenario())
 
@@ -83,7 +79,7 @@ def test_ready_carries_speech_assets_active_thresholds_and_duck_depth():
         store.configs["DEV1"] = {"duckDb": -9.0}
         hub, _, _ = make_hub(store)
         result = await hub.admit(hello(), device_id="DEV1", peer_ip="x", secure=True, token=None)
-        ready = result.ready
+        ready = result.ready.wire()
         assert ready["capture_permitted"] is True
         assert ready["assets"] == {"runtime_sha256": "r", "graph_sha256": "g", "sidecar_sha256": "s"}
         detector = ready["detector"]
@@ -126,7 +122,7 @@ def test_changing_the_selected_wake_model_renegotiates_the_session():
 def test_render_messages_are_consumed_before_anything_else():
     async def scenario():
         device, _, host, _, sink = await _online()
-        sink.on_message("render.finished", _env({"playback_id": "p"}))
+        sink.on_message(envelope("render.finished", {"playback_id": "p"}))
         assert device.actor.messages == [] and "render.finished" in host.render.seen
         await device.close()
     run(scenario())
@@ -136,12 +132,12 @@ def test_actor_and_alert_messages_reach_their_owners():
     async def scenario():
         device, _, host, _, sink = await _online()
         for typ in ("wake.candidate", "uplink.ended", "stream.open", "privacy.changed"):
-            sink.on_message(typ, _env({"muted": True} if typ == "privacy.changed" else {}, typ))
-        sink.on_message("alert.state", _env({"active": {"id": "a"}}))
-        sink.on_message("alert.ring_ended", _env({"id": "t", "kind": "timer"}))
-        sink.on_message("alert.local_operation", _env({"op_id": "o"}))
-        sink.on_message("alert.ack", _env({"applied_through": 3}))
-        sink.on_message("command.ack", _env({"message_id": "m1", "status": "applied"}))
+            sink.on_message(envelope(typ, {"muted": True} if typ == "privacy.changed" else {}))
+        sink.on_message(envelope("alert.state", {"active": {"id": "a"}}))
+        sink.on_message(envelope("alert.ring_ended", {"id": "t", "kind": "timer"}))
+        sink.on_message(envelope("alert.local_operation", {"op_id": "o"}))
+        sink.on_message(envelope("alert.ack", {"applied_through": 3}))
+        sink.on_message(envelope("command.ack", {"message_id": "m1", "status": "applied"}))
         await settle()
         assert [m for m, _ in device.actor.messages] == [
             "wake.candidate", "uplink.ended", "stream.open", "privacy.changed",
@@ -158,7 +154,7 @@ def test_wake_stats_are_kept_with_receipt_time_and_persisted():
     async def scenario():
         device, _, _, store, sink = await _online()
         body = {"hops_scored": 187, "near_misses": [{"peak": 0.3}], "wake_unavailable": None}
-        sink.on_message("wake.stats", _env(body))
+        sink.on_message(envelope("wake.stats", body))
         await settle()
         assert store.wake == [body]
         assert device.wake_stats["hops_scored"] == 187 and isinstance(device.wake_stats["received_ms"], int)
@@ -183,21 +179,21 @@ def test_wake_stats_map_onto_the_wake_counter_columns(monkeypatch):
 # ── button policy ────────────────────────────────────────────────────────
 
 def _press(seq, **kw):
-    return _env({"click_type": 138, "down": False, "held_ms": 120, "muted": False,
+    return envelope("button.action", {"click_type": 138, "down": False, "held_ms": 120, "muted": False,
                  "physical_seq": seq, "occurrence_id": None, "handled": None, **kw})
 
 
 def test_button_policy_routes_each_gesture():
     async def scenario():
         device, _, host, _, sink = await _online()
-        sink.on_message("button.action", _press(1))                     # tap → turn
-        sink.on_message("button.action", _press(1))                     # duplicate seq
-        sink.on_message("button.action", _press(2, handled="alert_stopped", occurrence_id="o"))
-        sink.on_message("button.action", _press(3, held_ms=900))        # hold → HA event
-        sink.on_message("button.action", _press(4, muted=True))         # blocked
+        sink.on_message(_press(1))                     # tap → turn
+        sink.on_message(_press(1))                     # duplicate seq
+        sink.on_message(_press(2, handled="alert_stopped", occurrence_id="o"))
+        sink.on_message(_press(3, held_ms=900))        # hold → HA event
+        sink.on_message(_press(4, muted=True))         # blocked
         await settle()
         device.actor.turn_active = True
-        sink.on_message("button.action", _press(5))                     # cancel
+        sink.on_message(_press(5))                     # cancel
         await settle()
         assert [t["physical_seq"] for t in device.actor.turns] == [1]
         assert device.actor.cancels == ["interrupted"]

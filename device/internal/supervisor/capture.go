@@ -23,7 +23,7 @@ func (s *Supervisor) captureBlock(in pkgmic.Block) {
 	}
 	b := s.timeline.Add(in.PCM, in.MonoNs)
 	if b.NewEpoch {
-		s.startCaptureEpochLocked(b.Epoch, string(b.Reason))
+		s.startCaptureEpochLocked(b.Epoch, proto.StreamReason(b.Reason))
 	}
 	s.cellMeta = ring.Meta{UncertaintyUs: b.UncertaintyUs, Flags: ema.FlagEstimated}
 	if b.HasMissing {
@@ -56,7 +56,7 @@ func (s *Supervisor) appendCells(firstCell uint64, c []ema.Cell, monoNs int64) {
 // rings, then moves uplink and detector to the new epoch before its first
 // sample is appended. An epoch already announced by an unmute only needs
 // its first block. capMu held.
-func (s *Supervisor) startCaptureEpochLocked(epoch uint64, reason string) {
+func (s *Supervisor) startCaptureEpochLocked(epoch uint64, reason proto.StreamReason) {
 	s.announceMu.Lock()
 	defer s.announceMu.Unlock()
 	if epoch == s.micEpoch {
@@ -89,7 +89,7 @@ func (s *Supervisor) openCaptureStreamsLocked() {
 
 // endCaptureStreamsLocked reports the final capture sample of the mic and
 // cell streams (cells in capture samples). announceMu held.
-func (s *Supervisor) endCaptureStreamsLocked(reason string) {
+func (s *Supervisor) endCaptureStreamsLocked(reason proto.StreamReason) {
 	s.logSend(proto.TypeStreamEnd, 0, proto.StreamEnd{StreamID: proto.StreamMic, Epoch: s.micEpoch,
 		FinalSample: s.micRing.End(), Reason: reason})
 	s.logSend(proto.TypeStreamEnd, 0, proto.StreamEnd{StreamID: proto.StreamCells, Epoch: s.micEpoch,

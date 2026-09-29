@@ -29,7 +29,7 @@ Design constraints (see CLAUDE.md "TLS device link"):
 from __future__ import annotations
 
 import datetime
-import ipaddress  # noqa: F401  (kept: handy in a REPL when debugging SANs)
+import importlib.util
 import logging
 import os
 import ssl
@@ -64,9 +64,15 @@ def _generate(tls_dir: str) -> None:
     not_after  = now + _VALIDITY
 
     def _write(path: str, data: bytes) -> None:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        # Temp file + rename: a crash mid-write leaves the old file or none,
+        # never a truncated one that ensure_pki would accept as present.
+        tmp = f"{path}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "wb") as f:
             f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
 
     # ── CA ────────────────────────────────────────────────────────────────
     ca_key  = ec.generate_private_key(ec.SECP256R1())
@@ -135,9 +141,7 @@ def ensure_pki(db_path: str) -> str | None:
     needed  = ("ca.pem", "ca.key", "server.pem", "server.key")
     if all(os.path.exists(os.path.join(tls_dir, f)) for f in needed):
         return tls_dir
-    try:
-        import cryptography  # noqa: F401
-    except ImportError:
+    if importlib.util.find_spec("cryptography") is None:
         log.warning("python 'cryptography' package not installed — "
                     "device-link TLS listener disabled")
         return None

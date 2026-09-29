@@ -7,17 +7,13 @@ therefore acquired-audio sample time; wall time is never an input.
 
 from __future__ import annotations
 
+import enum
 from collections import deque
 from dataclasses import dataclass
-from typing import Callable, Literal, Sequence
+from typing import Callable, Sequence
 
-from em_attribution import (
-    BACKGROUND_SPEECH,
-    GAP,
-    NON_SPEECH,
-    SELF_OUTPUT,
-    ClassifiedCell,
-)
+from echomuse_grammar import GrammarClass
+from em_attribution import CellClass, ClassifiedCell
 from em_wake_phrase import normalize_command, words
 
 SAMPLE_RATE = 16_000
@@ -32,11 +28,12 @@ MIN_COMMAND_CELLS = 6  # 192 ms
 PAUSE_WINDOW_CELLS = 19
 PAUSE_QUIET_CELLS = 15
 MIN_TRAILING_BLANKS = 10  # one blank frame = 40 ms
+
 ROUTE_A_PAUSE = {
-    "complete": 9_728,  # 608 ms
-    "extendable": 19_456,  # 1,216 ms
-    "needs_more": 28_672,  # 1,792 ms
-    "unknown": 28_672,
+    GrammarClass.COMPLETE: 9_728,  # 608 ms
+    GrammarClass.EXTENDABLE: 19_456,  # 1,216 ms
+    GrammarClass.NEEDS_MORE: 28_672,  # 1,792 ms
+    GrammarClass.UNKNOWN: 28_672,
 }
 ROUTE_B_STABLE = 9_728  # 608 ms
 ROUTE_B_BACKGROUND_FRACTION = 0.80
@@ -47,13 +44,23 @@ STABILITY_SPAN = 3_840  # 240 ms
 # §16.2 local-command precondition.
 LOCAL_PRE_ROLL = 7_680  # 480 ms
 
-Completeness = Literal["complete", "extendable", "needs_more", "unknown"]
-CompletenessFn = Callable[[str], Completeness]
+CompletenessFn = Callable[[str], GrammarClass]   # `echomuse_grammar.classify(...).klass` of a text
 
-LISTENING = "LISTENING"
-END_PENDING = "END_PENDING"
-COMMITTED = "COMMITTED"
-CLOSED = "CLOSED"
+
+class EndpointState(enum.StrEnum):
+    LISTENING = "LISTENING"
+    END_PENDING = "END_PENDING"
+    COMMITTED = "COMMITTED"
+    CLOSED = "CLOSED"
+
+
+class Route(enum.StrEnum):
+    """How an endpoint was found (§16.6): pause (A), background speech (B), ESPHome reply (R), no-progress fallback."""
+
+    A = "A"
+    B = "B"
+    R = "R"
+    FALLBACK = "fallback"
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,7 +162,7 @@ class TextStability:
 class Pending:
     boundary: int
     since: int
-    route: Literal["A", "B", "R"]
+    route: Route
     text: str
 
 
@@ -166,12 +173,19 @@ class Commit:
     start: int
     boundary: int
     end: int
-    route: Literal["A", "B", "R", "fallback"]
+    route: Route
     text: str
     redecode_required: bool
 
 
-CloseReason = Literal["muted", "session_lost", "interrupted", "audio_overrun", "no_input", "too_long", "retry"]
+class CloseReason(enum.StrEnum):
+    MUTED = "muted"
+    SESSION_LOST = "session_lost"
+    INTERRUPTED = "interrupted"
+    AUDIO_OVERRUN = "audio_overrun"
+    NO_INPUT = "no_input"
+    TOO_LONG = "too_long"
+    RETRY = "retry"
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,7 +197,7 @@ class Close:
 
 @dataclass(frozen=True, slots=True)
 class Decision:
-    state: str
+    state: EndpointState
     pending: Pending | None = None
     revoked: Pending | None = None
     commit: Commit | None = None
@@ -209,7 +223,7 @@ class EndpointReducer:
         self.completeness = completeness
         self.extended_utterances = extended_utterances
         self.esphome_reply = esphome_reply
-        self.state = LISTENING
+        self.state = EndpointState.LISTENING
         self.pending: Pending | None = None
         self._cells: list[ClassifiedCell] = []
         self._command_ends: list[int] = []
@@ -236,14 +250,14 @@ class EndpointReducer:
 
     def _close_once(self, reason: CloseReason) -> Decision:
         self._close = Close(reason)
-        self.state = CLOSED
+        self.state = EndpointState.CLOSED
         return Decision(self.state, close=self._close)
 
     def finalize_once(
         self,
         boundary: int,
         *,
-        route: Literal["A", "B", "R", "fallback"],
+        route: Route,
         text: str,
         valid_audio_end: int,
     ) -> Commit:
@@ -260,10 +274,10 @@ class EndpointReducer:
             end=min(boundary + LOOKAHEAD, valid_audio_end),
             route=route,
             text=text,
-            redecode_required=route in ("B", "fallback"),
+            redecode_required=route in (Route.B, Route.FALLBACK),
         )
         self.pending = None
-        self.state = COMMITTED
+        self.state = EndpointState.COMMITTED
         return self._commit
 
     def _cells_through(self, frontier: int) -> list[ClassifiedCell]:
@@ -275,39 +289,38 @@ class EndpointReducer:
     def _route_a(self, frontier: int, stable: StableText, cells: list[ClassifiedCell]) -> Pending | None:
         if len(self._command_ends) < MIN_COMMAND_CELLS or not stable.prefix or len(cells) < PAUSE_WINDOW_CELLS:
             return None
-        if sum(c.cls in (NON_SPEECH, SELF_OUTPUT) for c in cells[-PAUSE_WINDOW_CELLS:]) < PAUSE_QUIET_CELLS:
+        quiet = (CellClass.NON_SPEECH, CellClass.SELF_OUTPUT)
+        if sum(c.cls in quiet for c in cells[-PAUSE_WINDOW_CELLS:]) < PAUSE_QUIET_CELLS:
             return None
         if stable.trailing_blank_frames < MIN_TRAILING_BLANKS:
             return None
-        kind = self.completeness(stable.prefix)
-        if kind not in ROUTE_A_PAUSE:
-            raise ValueError(f"invalid completeness result: {kind!r}")
-        if frontier - self._command_ends[-1] < ROUTE_A_PAUSE[kind]:
+        if frontier - self._command_ends[-1] < ROUTE_A_PAUSE[self.completeness(stable.prefix)]:
             return None
-        return Pending(self._command_ends[-1], frontier, "A", stable.prefix)
+        return Pending(self._command_ends[-1], frontier, Route.A, stable.prefix)
 
     def _route_b(self, frontier: int, stable: StableText, cells: list[ClassifiedCell]) -> Pending | None:
         if not stable.prefix or stable.prefix_sample is None:
             return None
-        if self.completeness(stable.prefix) != "complete":
+        if self.completeness(stable.prefix) != GrammarClass.COMPLETE:
             return None
         if frontier - stable.prefix_sample < ROUTE_B_STABLE:
             return None
         combined = stable.prefix if not stable.tail else f"{stable.prefix} {stable.tail}"
-        if stable.tail and self.completeness(combined) != "unknown":
+        if stable.tail and self.completeness(combined) != GrammarClass.UNKNOWN:
             return None
         after = [c for c in cells if c.end > stable.prefix_sample and c.speech_positive]
-        if not after or sum(c.cls == BACKGROUND_SPEECH for c in after) < ROUTE_B_BACKGROUND_FRACTION * len(after):
+        background = sum(c.cls == CellClass.BACKGROUND_SPEECH for c in after)
+        if not after or background < ROUTE_B_BACKGROUND_FRACTION * len(after):
             return None
         boundary = self._command_boundary_at(stable.prefix_sample)
         if boundary is None:
             return None
-        return Pending(boundary, frontier, "B", stable.prefix)
+        return Pending(boundary, frontier, Route.B, stable.prefix)
 
     def _route_r(self, frontier: int, stable: StableText) -> Pending | None:
         if not self._command_ends or frontier - self._command_ends[-1] < ROUTE_R_PAUSE:
             return None
-        return Pending(self._command_ends[-1], frontier, "R", stable.prefix)
+        return Pending(self._command_ends[-1], frontier, Route.R, stable.prefix)
 
     def step(
         self,
@@ -321,7 +334,7 @@ class EndpointReducer:
         overrun: bool = False,
     ) -> Decision:
         """Evaluate one 80 ms block after the evidence frontier reaches `frontier`."""
-        if self.state in (COMMITTED, CLOSED):
+        if self.state in (EndpointState.COMMITTED, EndpointState.CLOSED):
             raise RuntimeError("terminal utterance was evaluated again")
         if frontier < self._frontier:
             raise ValueError("evidence frontier moved backwards")
@@ -331,26 +344,26 @@ class EndpointReducer:
 
         # Actor priority (§16.2) and reducer close order (§16.6).
         if muted:
-            return self._close_once("muted")
+            return self._close_once(CloseReason.MUTED)
         if session_lost:
-            return self._close_once("session_lost")
+            return self._close_once(CloseReason.SESSION_LOST)
         cells = self._cells_through(frontier)
-        if gap or any(c.cls == GAP for c in cells):
-            return self._close_once("interrupted")
+        if gap or any(c.cls == CellClass.GAP for c in cells):
+            return self._close_once(CloseReason.INTERRUPTED)
         if overrun:
-            return self._close_once("audio_overrun")
+            return self._close_once(CloseReason.AUDIO_OVERRUN)
         if not self._command_ends and frontier - self.trigger_sample >= NO_INPUT:
-            return self._close_once("no_input")
+            return self._close_once(CloseReason.NO_INPUT)
         maximum = TOO_LONG_EXTENDED if self.extended_utterances else TOO_LONG
         if frontier - self.trigger_sample >= maximum:
-            return self._close_once("too_long")
+            return self._close_once(CloseReason.TOO_LONG)
 
         if self.pending is not None:
             pending = self.pending
             resumed = sum(end > pending.since for end in self._command_ends) >= REVOCATION_CELLS
             if resumed:
                 self.pending = None
-                self.state = LISTENING
+                self.state = EndpointState.LISTENING
                 return Decision(self.state, revoked=pending)
             if frontier - pending.since >= LOOKAHEAD:
                 commit = self.finalize_once(
@@ -362,25 +375,25 @@ class EndpointReducer:
                 return Decision(self.state, commit=commit)
             return Decision(self.state, pending=pending)
 
-        pending = self._route_r(frontier, stable) if self.esphome_reply else self._route_a(frontier, stable, cells)
-        if pending is None and not self.esphome_reply:
-            pending = self._route_b(frontier, stable, cells)
-        if pending is not None:
-            self.pending = pending
-            self.state = END_PENDING
-            return Decision(self.state, pending=pending)
+        found = self._route_r(frontier, stable) if self.esphome_reply else self._route_a(frontier, stable, cells)
+        if found is None and not self.esphome_reply:
+            found = self._route_b(frontier, stable, cells)
+        if found is not None:
+            self.pending = found
+            self.state = EndpointState.END_PENDING
+            return Decision(self.state, pending=found)
 
         if self._command_ends and frontier - stable.progress_sample >= NO_PROGRESS:
             boundary = self._command_boundary_at(stable.prefix_sample) if stable.prefix_sample is not None else None
-            if stable.prefix and self.completeness(stable.prefix) == "complete" and boundary is not None:
+            if stable.prefix and self.completeness(stable.prefix) == GrammarClass.COMPLETE and boundary is not None:
                 commit = self.finalize_once(
                     boundary,
-                    route="fallback",
+                    route=Route.FALLBACK,
                     text=stable.prefix,
                     valid_audio_end=valid_audio_end,
                 )
                 return Decision(self.state, commit=commit)
-            return self._close_once("retry")
+            return self._close_once(CloseReason.RETRY)
         return Decision(self.state)
 
 
@@ -430,26 +443,5 @@ def local_command_preconditions(
     relevant = [c for c in cells if c.speech_positive and c.end > start and c.end <= commit_boundary]
     if not relevant:
         return False
-    self_output = sum(c.cls == SELF_OUTPUT for c in relevant)
+    self_output = sum(c.cls == CellClass.SELF_OUTPUT for c in relevant)
     return 2 * self_output < len(relevant)
-
-
-@dataclass(frozen=True, slots=True)
-class ReplyChoice:
-    value: str
-    aliases: tuple[str, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class ChoiceResult:
-    status: Literal["selected", "reprompt", "abandon"]
-    value: str | None = None
-
-
-def resolve_reply_choice(text: str, choices: Sequence[ReplyChoice], *, already_reprompted: bool) -> ChoiceResult:
-    """§9.1/§16.6 exact normalized alias selection and one-reprompt policy."""
-    normalized = normalize_command(text)
-    for choice in choices:
-        if any(normalized == normalize_command(alias) for alias in choice.aliases):
-            return ChoiceResult("selected", choice.value)
-    return ChoiceResult("abandon" if already_reprompted else "reprompt")

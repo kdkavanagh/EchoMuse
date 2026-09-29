@@ -1852,7 +1852,7 @@ The fleet-wide cutover (section 12) deletes everything REMOVED or REPLACED. The 
 | `pkg/speaker` `Speaker`/`FullSpeaker` (`PumpPeriod`, `EndStream`, `Flush`, `PumpMusic`, `EndMusicStream`, `FlushMusic`, `SetDuck`, `IsStreaming`, `PlayCue`, `OnStreamStats`) | Plane-based playback interface | REPLACED | Source-class render interface: start/pump/cancel per playback ID, lease gains, progress callbacks, reference tap |
 | `pkg/mic` `AudioCallback func([]byte)`, `Subscribable` | Untimed capture callback and fan-out | MODIFIED | Callback carries the capture monotonic timestamp and sample index |
 | `pkg/buttons`, `pkg/led` | Button and LED interfaces | RETAINED | — |
-| `internal/server/animator.go`, `state.go`, `shell.go`; `bindings/buttons`, `led`, `als`, `jack`, `opensl`; `bluetooth`, `discovery`, `wifi`; `client/stats.go`, `pty.go`, `tlscreds.go` | LED rendering, persistence, hardware, networking | RETAINED | — |
+| `internal/server/animator.go`, `state.go`, `shell.go`; `bindings/buttons`, `led`, `als`, `jack`, `opensl`; `bluetooth`, `discovery`, `wifi`; `client/pty.go`, `tlscreds.go`; the `stats` body (`client/stats.go`, now `proto.Stats`) | LED rendering, persistence, hardware, networking | RETAINED | — |
 | — | — | NEW | Audio supervisor, mic/reference/cell rings, cell loudness, uplink-lease executor, `/device/v1/assets` fetcher, alert cache/journal/executor, kernel wakelock (§4.4, §16.5) |
 | `device/tools/oww_probe` | On-device openWakeWord probe | REMOVED | — |
 | `device/tools/afe_probe`, `capture_mics`, `bf_capture`, `analyse_capture.py` | AFE/array diagnostics | RETAINED | — |

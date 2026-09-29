@@ -7,6 +7,11 @@ pytest.importorskip("websockets")  # em_render imports em_device_link
 
 import em_audio_timeline as tl  # noqa: E402
 import em_render  # noqa: E402
+from em_device_link import AckStatus, CommandAck, Envelope, MessageType  # noqa: E402
+
+
+def envelope(msg_type, body, generation):
+    return Envelope(MessageType(msg_type), "s", "m", "dev", generation, body)
 
 
 class FakeLink:
@@ -28,7 +33,7 @@ class FakeLink:
         if self.auto_start:
             asyncio.get_running_loop().call_soon(
                 self.progress, body["playback_id"], generation, "start")
-        return {"message_id": "start", "status": "accepted", "error": None}
+        return CommandAck("start", AckStatus.ACCEPTED, None)
     async def send(self, msg_type, body, *, generation=0):
         self._message += 1
         mid = f"message-{self._message}"
@@ -60,27 +65,21 @@ class FakeLink:
         self.progress(playback_id, generation, "progress")
 
     def progress(self, playback_id, generation, event):
-        self.client.on_message("render.progress", {
-            "generation": generation,
-            "body": {
-                "playback_id": playback_id,
-                "event": event,
-                "submitted_frames": tl.format_u64(self.sent_frames),
-                "completed_frames": tl.format_u64(self.completed_frames),
-                "mono_ns": "1",
-            },
-        })
+        self.client.on_message(envelope("render.progress", {
+            "playback_id": playback_id,
+            "event": event,
+            "submitted_frames": tl.format_u64(self.sent_frames),
+            "completed_frames": tl.format_u64(self.completed_frames),
+            "mono_ns": "1",
+        }, generation))
 
     def finish(self, playback, *, generation=None, reason="drained"):
-        self.client.on_message("render.finished", {
-            "generation": playback.generation if generation is None else generation,
-            "body": {
-                "playback_id": playback.playback_id,
-                "last_completed_frame": tl.format_u64(self.completed_frames),
-                "reason": reason,
-                "timing_quality": "estimated",
-            },
-        })
+        self.client.on_message(envelope("render.finished", {
+            "playback_id": playback.playback_id,
+            "last_completed_frame": tl.format_u64(self.completed_frames),
+            "reason": reason,
+            "timing_quality": "estimated",
+        }, playback.generation if generation is None else generation))
 
 
 def chunks(count, frames=em_render.PACKET_FRAMES, value=1):
@@ -160,11 +159,9 @@ def test_cancel_is_idempotent_and_stale_generation_is_fenced():
             "announcement": False,
         }
 
-        stale_progress = client.on_message("render.progress", {
-            "generation": 6,
-            "body": {"playback_id": playback.playback_id, "event": "start",
-                     "submitted_frames": "0", "completed_frames": "0"},
-        })
+        stale_progress = client.on_message(envelope("render.progress", {
+            "playback_id": playback.playback_id, "event": "start",
+            "submitted_frames": "0", "completed_frames": "0"}, 6))
         assert stale_progress is True
         assert not playback.started.done()
         link.progress(playback.playback_id, 7, "start")

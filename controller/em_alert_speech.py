@@ -8,14 +8,18 @@ EchoMuse speaks only the timer cancels it runs itself. Alarms are the alert engi
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Iterable, Sequence
+from typing import TYPE_CHECKING, Iterable, Sequence
 
 from echomuse_grammar import AlarmParse
-from em_alert_wire import DEFAULT_LABEL, KIND_SNOOZE
+from em_alert_wire import DEFAULT_LABEL, OccurrenceKind, Weekday
+from em_ha_client import HaTimer
 from em_timers import start_of
 
-WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
-DAY_NAMES = dict(zip(WEEKDAYS, ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")))
+if TYPE_CHECKING:
+    from em_alerts import AlertResult, ListedAlarm
+
+_WEEKDAYS = tuple(Weekday)
+DAY_NAMES = dict(zip(_WEEKDAYS, ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")))
 MONTHS = ("January", "February", "March", "April", "May", "June", "July", "August",
           "September", "October", "November", "December")
 MAX_SPOKEN = 5              # timers or alarms read out one by one; the rest are counted
@@ -36,23 +40,23 @@ def _capital(text: str) -> str:
     return text[:1].upper() + text[1:]
 
 
-def _length(timer: dict) -> str:
+def _length(timer: HaTimer) -> str:
     """ "5 minute", "1 hour 30 minute pasta": a timer's length (and name) as an adjective."""
     parts = [f"{n} {unit}" for n, unit in zip(start_of(timer), ("hour", "minute", "second")) if n]
     return " ".join(parts + ([str(timer["name"]).strip()] if timer.get("name") else []))
 
 
-def timer_label(timer: dict) -> str:
+def timer_label(timer: HaTimer) -> str:
     """ "5 minute timer", "10 minute pasta timer"."""
     return f"{_length(timer)} timer".strip()
 
 
-def timer_cancelled_line(timer: dict) -> str:
+def timer_cancelled_line(timer: HaTimer) -> str:
     """ "5 second timer cancelled.", as HA's own cancel sentences answer."""
     return _capital(f"{timer_label(timer)} cancelled.")
 
 
-def timers_cancelled_line(cancelled: Sequence[dict], total: int) -> str:
+def timers_cancelled_line(cancelled: Sequence[HaTimer], total: int) -> str:
     """ "5 minute and 10 minute timers cancelled." for every timer of the speaker."""
     if total == 0:
         return LINE_NO_TIMERS
@@ -67,18 +71,18 @@ def timers_cancelled_line(cancelled: Sequence[dict], total: int) -> str:
     return line if len(cancelled) == total else f"{line} {total - len(cancelled)} could not be cancelled."
 
 
-def timer_gone_line(timer: dict) -> str:
+def timer_gone_line(timer: HaTimer) -> str:
     return f"Your {timer_label(timer)} already finished."
 
 
-def which_timer_line(timers: Sequence[dict]) -> str:
+def which_timer_line(timers: Sequence[HaTimer]) -> str:
     """ "Which one? Your 5 minute timer or your 10 minute timer?" """
     if len(timers) > MAX_SPOKEN:
         return f"You have {len(timers)} timers. Which one? Say its length, like the 5 minute timer."
     return f"Which one? {_capital(_join([f'your {timer_label(t)}' for t in timers], 'or'))}?"
 
 
-def timers_indistinct_line(timer: dict, count: int) -> str:
+def timers_indistinct_line(timer: HaTimer, count: int) -> str:
     """Several of this speaker's timers share a length and name: HA cannot pick one."""
     return (f"You have {count} {timer_label(timer)}s, and I can't tell them apart. "
             "Say cancel all timers to cancel them.")
@@ -91,13 +95,13 @@ def clock_words(hour24: int, minute: int) -> str:
 
 def days_words(days: Iterable[str]) -> str:
     wanted = set(days)
-    if wanted == set(WEEKDAYS):
+    if wanted == set(_WEEKDAYS):
         return "every day"
-    if wanted == set(WEEKDAYS[:5]):
+    if wanted == set(_WEEKDAYS[:5]):
         return "on weekdays"
-    if wanted == set(WEEKDAYS[5:]):
+    if wanted == set(_WEEKDAYS[5:]):
         return "on weekends"
-    return "on " + _join([DAY_NAMES[d] + "s" for d in WEEKDAYS if d in wanted])
+    return "on " + _join([DAY_NAMES[d] + "s" for d in _WEEKDAYS if d in wanted])
 
 
 def date_words(due: datetime, now: datetime) -> str:
@@ -108,7 +112,7 @@ def date_words(due: datetime, now: datetime) -> str:
     if days == 1:
         return "tomorrow"
     if 1 < days < 7:
-        return f"on {DAY_NAMES[WEEKDAYS[due.weekday()]]}"
+        return f"on {DAY_NAMES[Weekday.of(due.date())]}"
     return f"on {MONTHS[due.month - 1]} {due.day}"
 
 
@@ -117,18 +121,21 @@ def _when(due: datetime, repeats: Iterable[str], now: datetime) -> str:
     return days_words(repeats) if repeats else date_words(due, now)
 
 
-def alarm_set_line(parsed: AlarmParse, result: dict, now: datetime) -> str:
+def alarm_set_line(parsed: AlarmParse, result: AlertResult, now: datetime) -> str:
     """ "Alarm set for 7 AM tomorrow.": the first due time the alert engine computed."""
     days = result.get("days") or []
-    if result.get("first_due"):
-        due = datetime.fromisoformat(result["first_due"])
+    first_due = result.get("first_due")
+    if first_due:
+        due = datetime.fromisoformat(first_due)
         return f"Alarm set for {clock_words(due.hour, due.minute)} {_when(due, days, now)}."
     # Still pending in HA: the parse is all there is.
+    if parsed.hour24 is None:
+        raise ValueError("an alarm set without its hour")
     when = f" {days_words(days)}" if days else ""
     return f"Alarm set for {clock_words(parsed.hour24, parsed.minute or 0)}{when}."
 
 
-def alarm_cancel_line(result: dict) -> str:
+def alarm_cancel_line(result: AlertResult) -> str:
     if not result.get("ok"):
         return "Which alarm? Say its time." if result.get("error") == "which alarm" \
             else "I couldn't find that alarm."
@@ -136,21 +143,21 @@ def alarm_cancel_line(result: dict) -> str:
     return "Alarm cancelled." if count <= 1 else f"Cancelled {count} alarms."
 
 
-def _alarm_item(alarm: dict, now: datetime) -> str:
+def _alarm_item(alarm: ListedAlarm, now: datetime) -> str:
     due = datetime.fromisoformat(alarm["due"])
-    at = f"{clock_words(due.hour, due.minute)} {_when(due, alarm.get('repeats') or [], now)}"
-    if alarm.get("kind") == KIND_SNOOZE:
+    at = f"{clock_words(due.hour, due.minute)} {_when(due, alarm['repeats'], now)}"
+    if alarm["kind"] == OccurrenceKind.SNOOZE:
         return f"a snoozed alarm at {at}"
-    name = str(alarm.get("name") or "").strip()
+    name = alarm["name"].strip()
     return at if not name or name == DEFAULT_LABEL else f"{name} at {at}"
 
 
-def alarms_line(alarms: list[dict], now: datetime, *, next_only: bool = False) -> str:
+def alarms_line(alarms: Sequence[ListedAlarm], now: datetime, *, next_only: bool = False) -> str:
     """The speaker's alarms, one entry per schedule (a repeating alarm is listed once, by
     its days), soonest first."""
-    schedules: dict[str, dict] = {}
+    schedules: dict[str, ListedAlarm] = {}
     for alarm in sorted(alarms, key=lambda a: datetime.fromisoformat(a["due"])):
-        schedules.setdefault(alarm.get("schedule_id") or alarm["due"], alarm)
+        schedules.setdefault(alarm["schedule_id"] or alarm["due"], alarm)
     items = [_alarm_item(a, now) for a in schedules.values()]
     if not items:
         return "You don't have any alarms."

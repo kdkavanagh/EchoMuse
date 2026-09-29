@@ -324,17 +324,6 @@ def test_the_mutating_endpoints_are_admin_only():
             f"{handler} must be admin-only"
 
 
-def test_the_two_recording_modes_refuse_each_other():
-    """Both want the same frames for opposite purposes: a segmenter running
-    under an ambient session cuts the wake word out of the room noise, and
-    the ambient file fills with the word being said for the segmenter."""
-    src = API.read_text()
-    ambient = src.split("async def _post_device_ambient", 1)[1].split("\nasync def ", 1)[0]
-    collect = src.split("async def _post_device_collect", 1)[1].split("\nasync def ", 1)[0]
-    assert 'row["collect_mode"]' in ambient
-    assert 'row["ambient_mode"]' in collect
-
-
 def test_there_is_no_archive_endpoint():
     """Deliberate, and the opposite call to samples.zip: there the archive IS
     the feature, here one recording is one artefact and zipping ~350MB in

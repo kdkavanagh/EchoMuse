@@ -8,16 +8,13 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"runtime"
 	"runtime/pprof"
-	"strings"
 	"syscall"
 	"time"
 
@@ -42,7 +39,6 @@ const (
 	// legacyModelDir held the removed on-device openWakeWord/BCResNet
 	// copies; v1 deletes it on start and never loads from it (§18.2).
 	legacyModelDir = "/data/local/share/echomuse/oww"
-	bootIDPath     = "/proc/sys/kernel/random/boot_id"
 
 	statsInterval = 30 * time.Second
 	memLogEvery   = 10 // stats ticks (~5 min) between [mem] log lines
@@ -79,7 +75,7 @@ func run() error {
 	defer stop()
 	go dumpHeapOnSIGUSR1()
 
-	bootID, err := readBootID()
+	bootID, err := alerts.ReadBootID()
 	if err != nil {
 		return err
 	}
@@ -107,18 +103,20 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	alertSounds, err := assets.Open(filepath.Join(alerts.DefaultRoot, "assets"))
+	alertSounds, err := assets.Open(alerts.AssetDir(alerts.DefaultRoot))
 	if err != nil {
 		return err
 	}
 
 	var sup *supervisor.Supervisor
 	ble := bluetooth.NewScanner(func(batch []bluetooth.Advert) {
-		sup.SendRetained(proto.TypeBLEAdverts, map[string]any{"adverts": batch})
+		sup.SendRetained(proto.TypeBLEAdverts, proto.BLEAdverts{Adverts: batch})
 	})
+	var stats statsCollector
 	sendStats := func() {
-		st := collectStats()
-		st.Ble = ble.Stats()
+		st := stats.collect()
+		bs := ble.Stats()
+		st.Ble = &bs
 		sup.SendRetained(proto.TypeStats, st)
 	}
 	sup, err = supervisor.Assemble(supervisor.Config{
@@ -126,9 +124,9 @@ func run() error {
 		FirmwareVersion: client.Version,
 		BootID:          bootID,
 		IP:              client.LocalIP,
-		AmbientStatus: func() json.RawMessage {
-			b, _ := json.Marshal(als.Report())
-			return b
+		AmbientStatus: func() *als.Status {
+			st := als.Report()
+			return &st
 		},
 		AmbientReadable: als.Present,
 		Mic:             mic,
@@ -164,14 +162,14 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("buttons: %w", err)
 	}
-	buttons.SetVolumeCallback(func(dir string) { sup.VolumeButton(dir == "up") })
+	buttons.SetVolumeCallback(sup.VolumeButton)
 	buttons.SetMuteCallback(sup.MuteButton)
 	if _, err := buttons.SubscribeToButton(sup.DotButton); err != nil {
 		return fmt.Errorf("buttons: %w", err)
 	}
 
 	go als.Watch(ctx, func(lux int) {
-		sup.SendRetained(proto.TypeAmbientLight, map[string]int{"lux": lux})
+		sup.SendRetained(proto.TypeAmbientLight, proto.AmbientLight{Lux: lux})
 	})
 	go jack.Watch(ctx, phys.SetHeadphones)
 	go client.New(client.Config{DeviceID: deviceID}, sup).Run(ctx)
@@ -185,14 +183,6 @@ func run() error {
 		log.Printf("amp off: %v", err)
 	}
 	return runErr
-}
-
-func readBootID() (string, error) {
-	b, err := os.ReadFile(bootIDPath)
-	if err != nil {
-		return "", fmt.Errorf("boot id: %w", err)
-	}
-	return strings.TrimSpace(string(b)), nil
 }
 
 // reportStats sends the retained stats body every 30 s and, every ~5 min,
@@ -216,7 +206,7 @@ func reportStats(ctx context.Context, sup *supervisor.Supervisor, sendStats func
 			runtime.NumGoroutine(), ms.HeapAlloc/1024, ms.HeapSys/1024, ms.HeapIdle/1024,
 			ms.HeapReleased/1024, ms.StackSys/1024, selfRSSKb(), ms.NumGC, ms.PauseTotalNs/1e6)
 		log.Print(line)
-		sup.SendRetained(proto.TypeLog, map[string]string{"level": "info", "message": line})
+		sup.SendRetained(proto.TypeLog, proto.Log{Level: proto.LogInfo, Message: line})
 	}
 }
 
@@ -237,14 +227,14 @@ func changeWifi(sup *supervisor.Supervisor, ssid, psk string) {
 }
 
 func sendWifiResult(sup *supervisor.Supervisor, r *wifi.Result) {
-	sup.SendRetained(proto.TypeWifiResult, map[string]any{"ok": r.OK, "ssid": r.SSID, "error": r.Error})
+	sup.SendRetained(proto.TypeWifiResult, proto.WifiResult{OK: r.OK, SSID: r.SSID, Error: r.Error})
 }
 
 func scanWifi(sup *supervisor.Supervisor) {
 	nets, err := wifi.Scan()
-	body := map[string]any{"networks": nets, "error": ""}
+	body := proto.WifiScanResult{Networks: nets}
 	if err != nil {
-		body = map[string]any{"networks": nil, "error": err.Error()}
+		body = proto.WifiScanResult{Error: err.Error()}
 	}
 	sup.SendRetained(proto.TypeWifiScanRes, body)
 }
