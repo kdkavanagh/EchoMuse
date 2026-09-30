@@ -12,6 +12,7 @@ from _device_fakes import (  # noqa: E402
 
 Rejected = em_device.em_device_link.Rejected
 Admitted = em_device.em_device_link.Admitted
+ActorState = em_device.em_session.ActorState
 
 
 async def _online(store=None, host=None):
@@ -240,8 +241,9 @@ def test_send_while_offline_raises_link_closed():
 
 # ── LED projection (§11.2) ───────────────────────────────────────────────
 
-@pytest.mark.parametrize("state, key", [("LISTENING", "listening_anim"), ("EXPECT_REPLY", "listening_anim"),
-                                        ("THINKING", "spin_anim")])
+@pytest.mark.parametrize("state, key", [(ActorState.LISTENING, "listening_anim"),
+                                        (ActorState.EXPECT_REPLY, "listening_anim"),
+                                        (ActorState.THINKING, "spin_anim")])
 def test_led_projection_follows_actor_state(state, key):
     async def scenario():
         device, _, _, _, _ = await _online()

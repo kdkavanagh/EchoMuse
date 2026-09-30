@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import em_db
 import em_device
+import em_session
 from em_device_link import Envelope, MessageType, SessionHello
 
 ALL_V1 = sorted(em_device.REQUIRED_CAPABILITIES)
@@ -39,7 +40,7 @@ def envelope(msg_type: str, body: dict) -> Envelope:
 
 class FakeActor:
     def __init__(self) -> None:
-        self.state = "IDLE"
+        self.state = em_session.ActorState.IDLE
         self.awaiting_intent = False
         self.turn_active = False
         self.messages: list[tuple[str, dict]] = []
@@ -177,6 +178,7 @@ class FakeHost:
         self.events.append(("button_event", event_type))
 
     def ambient_lux(self, device_id, lux): ...
+    def voice_phase(self, device_id, phase): ...
     def volume(self, device_id, value): ...
     def ble_adverts(self, device_id, adverts): ...
     def ble_stats(self, device_id, stats): ...

@@ -238,7 +238,13 @@ the request.
 **Benefit:** short commands finish quickly, questions get time for a
 thinking pause, and failure modes are named rather than guessed. See
 [led-ring-states.md](led-ring-states.md) for what the ring shows at each
-point.
+point. Home Assistant's **Voice state** sensor follows the same phases as the
+ring: `listening` (from the accepted wake word or button press until the
+request is frozen, and again while a follow-up answer is awaited), `thinking`
+(speech-to-text, intent and TTS), `speaking` (the response or question
+plays), and `idle`. Wake-word and button turns run over Home Assistant's
+websocket API, not through the satellite, so the stock Assist satellite
+entity stays idle for them.
 
 **Caveat:** a free-form question asked over a TV about as loud as you only
 ends at a real pause, or at the length limit. And in a free-form question,

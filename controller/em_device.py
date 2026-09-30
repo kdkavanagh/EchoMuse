@@ -76,12 +76,6 @@ BUTTON_HOLD_MS = 750
 NUM_LEDS = 12
 ALERT_STOPPED = "alert_stopped"          # `button.action.handled` (WIRE §4.6)
 
-# Actor states projected onto the LED ring (§11.2).
-_LISTENING_STATES = frozenset({em_session.ActorState.ARMED, em_session.ActorState.LISTENING,
-                               em_session.ActorState.END_PENDING,
-                               em_session.ActorState.EXPECT_REPLY})
-_THINKING_STATES = frozenset({em_session.ActorState.COMMITTED, em_session.ActorState.THINKING})
-
 LedSpec = dict[str, Any]                 # one em_scenes layer: the `led_anim.anim` wire object
 
 
@@ -142,6 +136,7 @@ class Host(Protocol):
     async def push_log(self, device_id: str, level: em_db.LogLevel, message: str) -> None: ...
     def button_event(self, device_id: str, event_type: em_button.ButtonEvent) -> None: ...
     def ambient_lux(self, device_id: str, lux: int | None) -> None: ...
+    def voice_phase(self, device_id: str, phase: em_session.VoicePhase) -> None: ...
     def volume(self, device_id: str, value: float) -> None: ...
     def ble_adverts(self, device_id: str, adverts: list[object]) -> None: ...
     def ble_stats(self, device_id: str, stats: object) -> None: ...
@@ -693,6 +688,8 @@ class Device:
             self.dialog_active = bool(event.dialog_active)
             if not self.dialog_active:
                 self._spawn(self.host.dialog_released(self.device_id), "dialog release")
+        elif event.kind is kind.STATE:
+            self.host.voice_phase(self.device_id, event.state.phase)
         self._led_event.set()
         self._spawn(self.host.push_state(self, {
             "actor_state": event.state,
@@ -744,13 +741,13 @@ class Device:
         if self.diagnostic:
             return {"pattern": "pulse", "colors": [[180, 0, 200]], "periodMs": 2600,
                     "ttlSec": 20}
-        state = self.actor.state
-        if state in _LISTENING_STATES:
-            return self.led_scene["listening_anim"]
-        if state in _THINKING_STATES:
-            return self.led_scene["spin_anim"]
-        if state is em_session.ActorState.SPEAKING:
-            return self.led_scene["meter_anim"]
+        match self.actor.state.phase:
+            case em_session.VoicePhase.LISTENING:
+                return self.led_scene["listening_anim"]
+            case em_session.VoicePhase.THINKING:
+                return self.led_scene["spin_anim"]
+            case em_session.VoicePhase.SPEAKING:
+                return self.led_scene["meter_anim"]
         if self._timer_fraction is not None and self._timer_fraction > 0:
             count = max(1, min(NUM_LEDS, math.ceil(NUM_LEDS * self._timer_fraction)))
             base = self.led_scene["listening"]

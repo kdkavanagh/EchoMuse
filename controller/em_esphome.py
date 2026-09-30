@@ -2,7 +2,9 @@
 
 The ESPHome voice path is deliberately narrow: only a committed reply to an
 HA-started conversation enters it.  Ordinary wake/button turns use
-``em_ha_client`` websocket pipeline runs owned by ``SessionActor``.
+``em_ha_client`` websocket pipeline runs owned by ``SessionActor``, so HA's
+own assist-satellite state never sees them; the “Voice state” sensor shows
+the actor's phase instead.
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ import em_volume
 from em_alerts import TimerEvent
 from em_button import ButtonEvent
 from em_device_link import Capability
+from em_session import VoicePhase
 from esphome.feature_flags import MediaPlayerEntityFeature, MediaPlayerState, VoiceAssistantFeature
 from esphome.satellite_server import HANDLED, RejectProtocol, Reply, SatelliteServerProtocol, serve
 from esphome.vendor import api_pb2
@@ -41,6 +44,7 @@ EVENT_KEY = 2
 AMBIENT_LUX_KEY = 3
 ALERT_RINGING_KEY = 4
 STOP_ALERT_KEY = 5
+VOICE_STATE_KEY = 6
 BUTTON_EVENT_TYPES = [e.value for e in ButtonEvent]
 
 MEDIA_PLAYER_FEATURES = int(
@@ -159,6 +163,10 @@ class EchoMuseSatellite(SatelliteServerProtocol):
                 object_id="stop_alert", key=STOP_ALERT_KEY,
                 name=f"{self.server.label} Stop alert", device_class="restart",
             )
+            yield api_pb2.ListEntitiesTextSensorResponse(
+                object_id="voice_state", key=VOICE_STATE_KEY,
+                name=f"{self.server.label} Voice state", icon="mdi:account-voice",
+            )
             yield api_pb2.ListEntitiesDoneResponse()
             return
 
@@ -168,6 +176,7 @@ class EchoMuseSatellite(SatelliteServerProtocol):
             if self._device_has(Capability.AMBIENT_LIGHT):
                 yield self._ambient_state_msg()
             yield self._alert_state_msg()
+            yield self._voice_state_msg()
             return
 
         if isinstance(msg, api_pb2.SubscribeVoiceAssistantRequest):
@@ -340,6 +349,9 @@ class EchoMuseSatellite(SatelliteServerProtocol):
         return api_pb2.BinarySensorStateResponse(
             key=ALERT_RINGING_KEY, state=bool(ringing), missing_state=ringing is None)
 
+    def _voice_state_msg(self) -> Message:
+        return api_pb2.TextSensorStateResponse(key=VOICE_STATE_KEY, state=self.server.voice_phase)
+
     def _spawn(self, coro: HookCoro, name: str) -> None:
         # Held until done: the loop keeps only weak references to tasks.
         task = asyncio.create_task(coro, name=f"{name}:{self.device_id}")
@@ -364,6 +376,7 @@ class DeviceESPhomeServer:
         self.volume = 1.0
         self.ambient_lux: int | None = None
         self.alert_ringing: bool | None = None
+        self.voice_phase = VoicePhase.IDLE
         self.hooks = Hooks()
         self._server: asyncio.AbstractServer | None = None
         self._active_satellite: EchoMuseSatellite | None = None
@@ -491,6 +504,7 @@ async def device_connected(
     hooks: Hooks,
     volume: float | None = None,
     ambient_lux: int | None = None,
+    voice_phase: VoicePhase,
 ) -> None:
     server = _servers.get(device_id)
     if server is None:
@@ -503,6 +517,7 @@ async def device_connected(
     server.capabilities = frozenset(capabilities)
     server.hooks = hooks
     server.ambient_lux = ambient_lux
+    server.voice_phase = voice_phase
     if volume is not None:
         server.volume = max(0.0, min(1.0, volume))
     if before != server.capabilities and server._active_satellite is not None:
@@ -552,6 +567,16 @@ def update_alert_ringing(device_id: str, ringing: bool | None) -> None:
     satellite = server._active_satellite
     if satellite is not None:
         satellite._send_one(satellite._alert_state_msg())
+
+
+def update_voice_phase(device_id: str, phase: VoicePhase) -> None:
+    server = _servers.get(device_id)
+    if server is None or server.voice_phase is phase:
+        return
+    server.voice_phase = phase
+    satellite = server._active_satellite
+    if satellite is not None:
+        satellite._send_one(satellite._voice_state_msg())
 
 
 async def push_media_state(device_id: str, _state: em_player.PlayerState) -> None:

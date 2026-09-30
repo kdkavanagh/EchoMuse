@@ -55,7 +55,7 @@ import em_wake_registry
 import em_shell
 import em_support
 from em_device_link import MessageType
-from em_session import ActorState
+from em_session import ActorState, VoicePhase
 from version import VERSION as CONTROLLER_VERSION
 from version import UpdateStatus
 from version import compare as _compare_versions
@@ -5039,13 +5039,6 @@ def _row_sections(row: db.DeviceRow) -> list[sections_mod.SectionId]:
         return []
 
 
-# Actor states the dashboard shows as listening or thinking; SPEAKING is
-# shown as speaking.
-_LISTENING_STATES = frozenset({ActorState.ARMED, ActorState.LISTENING,
-                               ActorState.END_PENDING, ActorState.EXPECT_REPLY})
-_THINKING_STATES = frozenset({ActorState.COMMITTED, ActorState.THINKING})
-
-
 class DeviceJson(TypedDict):
     """One device as the dashboard receives it (/api/devices, the events
     snapshot). `device_update` events carry a partial one."""
@@ -5111,6 +5104,7 @@ def _merge_device(row: db.DeviceRow) -> DeviceJson:
     device = _devices.get(device_id)
     live = device if device is not None and device.online else None
     turn_state = live.actor.state if live is not None and live.link is not None else None
+    phase = turn_state.phase if turn_state is not None else None
     alert_state = live.alert_state if live is not None else None
     sections = _row_sections(row)
 
@@ -5138,9 +5132,9 @@ def _merge_device(row: db.DeviceRow) -> DeviceJson:
         "missing_capabilities": sorted(live.missing_capabilities) if live is not None else [],
         "firmware_version":   live.firmware_version if live is not None else None,
         "turn_state":         turn_state,
-        "speaking":           turn_state == ActorState.SPEAKING,
-        "listening":          turn_state in _LISTENING_STATES,
-        "thinking":           turn_state in _THINKING_STATES,
+        "speaking":           phase is VoicePhase.SPEAKING,
+        "listening":          phase is VoicePhase.LISTENING,
+        "thinking":           phase is VoicePhase.THINKING,
         "muted":              live.muted if live is not None else None,
         # Live level while connected, otherwise the last one the device
         # reported (persisted as startupVolume), as an HA 0..1 float.

@@ -25,7 +25,7 @@ from collections.abc import AsyncGenerator, Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import (TYPE_CHECKING, AsyncIterator, Awaitable, Callable, Coroutine, Protocol, TypedDict,
-                    runtime_checkable)
+                    assert_never, runtime_checkable)
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -168,6 +168,16 @@ P_MUTE, P_STOP, P_LOSS, P_INTERRUPT, P_GAP, P_SPEECH, P_RESULT, P_DEADLINE = ran
 P_CLOSE = -1
 
 
+class VoicePhase(enum.StrEnum):
+    """What a turn is doing, as the LED ring, the dashboard and HA's “Voice state”
+    sensor show it (§11.2, §16.7)."""
+
+    IDLE = "idle"
+    LISTENING = "listening"
+    THINKING = "thinking"
+    SPEAKING = "speaking"
+
+
 class ActorState(enum.StrEnum):
     """§7 turn states, as the dashboard and LEDs see them."""
 
@@ -180,6 +190,21 @@ class ActorState(enum.StrEnum):
     SPEAKING = "SPEAKING"
     EXPECT_REPLY = "EXPECT_REPLY"
     CLOSING = "CLOSING"
+
+    @property
+    def phase(self) -> VoicePhase:
+        match self:
+            case ActorState.IDLE | ActorState.CLOSING:
+                return VoicePhase.IDLE
+            case (ActorState.ARMED | ActorState.LISTENING | ActorState.END_PENDING
+                  | ActorState.EXPECT_REPLY):
+                return VoicePhase.LISTENING
+            case ActorState.COMMITTED | ActorState.THINKING:
+                return VoicePhase.THINKING
+            case ActorState.SPEAKING:
+                return VoicePhase.SPEAKING
+            case _:
+                assert_never(self)
 
 
 class ActorEventKind(enum.StrEnum):

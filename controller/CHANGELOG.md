@@ -85,8 +85,11 @@ the device wire protocol is [docs/protocol-v1.md](../docs/protocol-v1.md).
   set by voice (handled by the controller's alarm grammar) and from the new
   **Alerts** tab. Each Dot caches the next 7 days of alarms and rings them
   even while the controller or Home Assistant is down.
-- **New HA entities per Dot:** "Alert ringing" (binary sensor) and "Stop
-  alert" (button).
+- **New HA entities per Dot:** "Alert ringing" (binary sensor), "Stop
+  alert" (button) and "Voice state" (sensor: `idle`, `listening`, `thinking`
+  or `speaking`, the phases the LED ring shows). Wake-word and button turns
+  do not run through the stock Assist satellite entity, which stays idle
+  during them; automate on "Voice state" instead.
 - **Alert sounds.** New `alarmSound` setting (initialised from
   `timerSound`). Each catalog sound is also exported to the Dot as its first
   10 s with a 50 ms fade-out; longer uploads are flagged. The sound test

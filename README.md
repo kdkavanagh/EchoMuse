@@ -54,7 +54,8 @@ hear the answer through the Dot's speaker.
   get the sensor. Holding the action button fires an event you can trigger
   automations from, while a normal press starts a voice turn — or fires its
   own event instead, if you'd rather bind the tap. Each Dot also gets an
-  "Alert ringing" sensor and a "Stop alert" button.
+  "Alert ringing" sensor, a "Stop alert" button, and a "Voice state" sensor
+  (`idle`, `listening`, `thinking` or `speaking`) for automations.
 - **Headphones** — plug into the 3.5mm jack and audio moves there, unplug and
   it comes back, no reboot needed.
 - **Fleet dashboard** — provisioning wizard, per-device or fleet config

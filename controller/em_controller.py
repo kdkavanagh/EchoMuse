@@ -456,6 +456,7 @@ class _Host:
             ),
             volume=None if device.volume is None else _ha_volume(device.volume),
             ambient_lux=lux if isinstance(lux := (device.stats or {}).get("ambientLux"), int) else None,
+            voice_phase=device.actor.state.phase,
         )
         await em_ble_proxy.device_connected(did)
         await em_ble_proxy.reconcile(did)
@@ -486,6 +487,9 @@ class _Host:
 
     def ambient_lux(self, device_id: str, lux: int | None) -> None:
         esphome.update_ambient_lux(device_id, lux)
+
+    def voice_phase(self, device_id: str, phase: em_session.VoicePhase) -> None:
+        esphome.update_voice_phase(device_id, phase)
 
     def volume(self, device_id: str, value: float) -> None:
         esphome.update_device_volume(device_id, value)
