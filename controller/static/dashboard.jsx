@@ -1262,14 +1262,15 @@ function TurnDetail({ turn: t, turns, onSelect }) {
         )}
       </>)}
 
-      {(t.response_text || measured(t.tts_url_ms) || measured(t.playback_ms) || t.playback_reason) && stage('Spoke', <>
+      {(t.response_text || measured(t.tts_url_ms) || measured(t.playback_ms) || measured(t.first_audio_ms) || t.playback_reason) && stage('Spoke', <>
         {quote(t.response_text)}
-        {(measured(t.tts_url_ms) || measured(t.playback_ms) || t.playback_reason) && (
+        {(measured(t.tts_url_ms) || measured(t.playback_ms) || measured(t.first_audio_ms) || t.playback_reason) && (
           <div style={{ color: 'var(--muted)' }}>
             {[measured(t.tts_url_ms) && `audio ready ${fmtS(t.tts_url_ms)} after dispatch`,
+              measured(t.first_audio_ms) && `first audio ${fmtS(t.first_audio_ms)} after endpoint`,
               measured(t.playback_ms) && `audible ${fmtS(t.playback_ms)}`].filter(Boolean).join(' · ')}
             {t.playback_reason && <>
-              {(measured(t.tts_url_ms) || measured(t.playback_ms)) && ' · '}
+              {(measured(t.tts_url_ms) || measured(t.first_audio_ms) || measured(t.playback_ms)) && ' · '}
               <span style={{ color: t.playback_reason === PLAYBACK_END.DRAINED ? undefined : 'var(--warn)' }}>
                 {PLAYBACK_ENDS[t.playback_reason] || t.playback_reason.replace(/_/g, ' ')}
               </span>
@@ -6224,7 +6225,7 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
         {wakeGap && <div style={{ marginTop:8, fontFamily:MONO, fontSize:9, color:'var(--warn)' }}>Wake controls unavailable: {wakeGap}</div>}
         <div className="em-grid2" style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:'0 24px', marginTop:16, ...inputStyle }}>
           <Toggle label="Wake chime"
-            sub={renderGap || 'plays the built-in confirmation earcon immediately after an accepted wake'}
+            sub={renderGap || 'plays the moment the Echo hears the wake word (on supporting firmware); while it is playing audio, once the wake is confirmed'}
             value={!renderGap && (config.wakeSound ?? false)}
             disabled={!!renderGap}
             onChange={v => set('wakeSound', v)}/>

@@ -244,6 +244,8 @@ class FakeHA:
             events = FIXTURES["assist_pipeline"]["tts_run"]["events"]
         elif msg["input"]["text"] == "tell me a story":
             events = FIXTURES["assist_pipeline"]["intent_tts_streaming_run"]["events"]
+        elif msg["input"]["text"] == "turn on the lights":
+            events = FIXTURES["assist_pipeline"]["intent_tts_acknowledge_run"]["events"]
         elif msg["input"]["text"] == "make this fail":
             events = FIXTURES["assist_pipeline"]["intent_error_run"]["events"]
         else:
@@ -420,13 +422,21 @@ def test_intent_tts_typed_events_streaming_error_and_abandonment():
                 TtsReady(_fake.base_url + "/api/tts_proxy/Vn6uQ8.flac", False),
                 RunEnded(),
             ]
+            # A streamable reply is fetched only once intent-progress says HA will
+            # stream it; that arrives before intent-end.
             streaming = await collect(await client.run_intent_tts(
                 PIPELINE_ID, DEVICE_ID, "tell me a story", "old-conversation"))
-            assert isinstance(streaming[0], TtsReady)
-            assert streaming[0].streamed
+            assert streaming[0] == TtsReady(_fake.base_url + "/api/tts_proxy/Vn6uQ8.flac", True)
             assert isinstance(streaming[1], IntentEnded)
             assert streaming[1].continue_conversation
             assert streaming[-1] == RunEnded()
+            # Run-start announces a streamable URL but HA never starts streaming (a
+            # local intent whose result HA may override with the acknowledge sound):
+            # nothing is fetched before tts-end.
+            acknowledged = await collect(await client.run_intent_tts(
+                PIPELINE_ID, DEVICE_ID, "turn on the lights", None))
+            assert [type(e) for e in acknowledged] == [IntentEnded, TtsReady, RunEnded]
+            assert acknowledged[1] == TtsReady(_fake.base_url + "/api/tts_proxy/Qp2Lx7.flac", False)
             failed = await collect(await client.run_intent_tts(
                 PIPELINE_ID, DEVICE_ID, "make this fail", None))
             assert failed == [RunFailed("intent-failed", "Unexpected error during intent recognition")]

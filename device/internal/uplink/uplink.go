@@ -413,6 +413,20 @@ func (e *Executor) Close(env proto.Envelope, b proto.UplinkClose) (candidateLeas
 	return candidateLease, nil
 }
 
+// DiagnosticLive reports whether a diagnostic lease is live; the controller
+// refuses every wake while one is.
+func (e *Executor) DiagnosticLive() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	now := e.now()
+	for _, l := range e.leases {
+		if l.reason == proto.LeaseDiagnostic && now < l.deadline {
+			return true
+		}
+	}
+	return false
+}
+
 // Notify wakes the sender; the supervisor calls it after ring appends.
 func (e *Executor) Notify() {
 	select {

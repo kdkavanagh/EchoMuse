@@ -1,7 +1,7 @@
 // Package config holds the controller-tunable device settings carried by the
-// retained `config` message (WIRE §4.8): startupVolume, duckDb and
-// bleProxyEnabled. Wake model, runtime, thresholds and hop arrive in
-// session.ready instead (SPEC §16.1, §18.2).
+// retained `config` message (WIRE §4.8): startupVolume, duckDb,
+// bleProxyEnabled and wakeSound. Wake model, runtime, thresholds and hop
+// arrive in session.ready instead (SPEC §16.1, §18.2).
 package config
 
 import (
@@ -23,6 +23,7 @@ type Message struct {
 	StartupVolume   *int     `json:"startupVolume,omitempty"`
 	DuckDB          *float64 `json:"duckDb,omitempty"`
 	BLEProxyEnabled *bool    `json:"bleProxyEnabled,omitempty"`
+	WakeSound       *bool    `json:"wakeSound,omitempty"`
 }
 
 // Values is one consistent snapshot of the settings.
@@ -30,6 +31,9 @@ type Values struct {
 	StartupVolume   int
 	DuckDB          float64
 	BLEProxyEnabled bool
+	// WakeSound plays the wake chime locally the moment an idle wake
+	// candidate opens (local_wake_chime).
+	WakeSound bool
 }
 
 // Device is the live configuration. It is safe for concurrent use.
@@ -39,12 +43,13 @@ type Device struct {
 }
 
 // New returns the configuration seeded from the environment
-// (STARTUP_VOLUME, DUCK_DB, BLE_PROXY_ENABLED) or the defaults.
+// (STARTUP_VOLUME, DUCK_DB, BLE_PROXY_ENABLED, WAKE_SOUND) or the defaults.
 func New() *Device {
 	return &Device{v: Values{
 		StartupVolume:   envInt("STARTUP_VOLUME", DefaultStartupVolume),
 		DuckDB:          envFloat("DUCK_DB", DefaultDuckDB),
 		BLEProxyEnabled: envBool("BLE_PROXY_ENABLED", false),
+		WakeSound:       envBool("WAKE_SOUND", false),
 	}}
 }
 
@@ -61,6 +66,9 @@ func (d *Device) Apply(m Message) Values {
 	}
 	if m.BLEProxyEnabled != nil {
 		d.v.BLEProxyEnabled = *m.BLEProxyEnabled
+	}
+	if m.WakeSound != nil {
+		d.v.WakeSound = *m.WakeSound
 	}
 	return d.v
 }

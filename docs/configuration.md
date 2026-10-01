@@ -213,10 +213,14 @@ installed, and which are missing.
 
 ### Wake chime
 
-Plays a short confirmation sound on the Dot as soon as a wake is accepted.
-Off by default. It does not play when the wake word interrupts a ringing
-timer or alarm or a spoken response — the sound stopping is the
-acknowledgement.
+Plays a short confirmation sound on the Dot when it hears the wake word. Off
+by default. On current firmware the Dot starts it itself as soon as it detects
+the wake word, without a round trip to the controller. While the Dot is playing
+audio (music, a reply) it waits until the controller has confirmed the wake
+was a person and not its own speaker, so it chimes slightly later; older
+firmware always chimes after the controller accepts the wake. It does not play
+when the wake word interrupts a ringing timer or alarm or a spoken response —
+the sound stopping is the acknowledgement.
 
 ### Save wake clips
 
@@ -243,7 +247,9 @@ files in the `wakes/` folder beside the controller's database.
 
 With several Echos in earshot, one spoken wake word can reach more than one.
 The first Echo whose wake the controller accepts answers immediately; any
-other Echo accepted within this window stands down without a chime or a turn.
+other Echo accepted within this window stands down without a turn. An Echo
+that was idle may already have played its wake chime by then: it chimes the
+moment it hears the wake word, before arbitration.
 
 Default **700 ms**; the slider runs from 0 to 2000 ms. The winner does not wait
 out the window, so a single Echo answers just as fast. `0` turns arbitration
@@ -267,7 +273,7 @@ the levers are physical: move it away from walls and the TV and closer to
 where people talk.
 
 When your request has ended is decided by a fixed policy on the controller
-(`post_afe_2`, described in [voice-pipeline.md](voice-pipeline.md)). It has no
+(`post_afe_3`, described in [voice-pipeline.md](voice-pipeline.md)). It has no
 dashboard tuning.
 
 ### Noise suppression
@@ -292,8 +298,9 @@ room noise, distance, or a word the denoiser damaged. It is also the way to
 compare **Noise suppression** or a new position on the same phrase.
 
 **Think before switching it on.** This is the setting that stores recognisable
-speech on the controller. It keeps the **last 10 turns per device** as WAV
-files in the `recordings/` folder beside the database, oldest replaced first.
+speech on the controller. It keeps the **last 300 turns per device** as WAV
+files in the `recordings/` folder beside the database (typically 30–60 MB per
+device), oldest replaced first.
 Turning it off stops new recordings but keeps the saved ones until newer ones
 replace them or you delete the device. To clear them sooner, delete the files.
 An older turn may show no buttons because its recording has already been

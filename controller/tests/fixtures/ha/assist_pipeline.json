@@ -356,6 +356,103 @@
       }
     ]
   },
+  "intent_tts_acknowledge_run": {
+    "events": [
+      {
+        "type": "run-start",
+        "data": {
+          "pipeline": "01hnpec9vt52ec4dkkxqa89z46",
+          "language": "en",
+          "conversation_id": "01K5ZCE000CONV",
+          "runner_data": {
+            "stt_binary_handler_id": null,
+            "timeout": 30
+          },
+          "tts_output": {
+            "token": "Qp2Lx7.flac",
+            "url": "/api/tts_proxy/Qp2Lx7.flac",
+            "mime_type": "audio/flac",
+            "stream_response": true
+          }
+        },
+        "timestamp": "2026-09-23T11:30:00.123456+00:00"
+      },
+      {
+        "type": "intent-start",
+        "data": {
+          "engine": "conversation.claude_conversation",
+          "language": "en",
+          "intent_input": "turn on the lights",
+          "conversation_id": "01K5ZCE000CONV",
+          "device_id": "b285ec5e94b98f4c1cbeabf926be4b77",
+          "satellite_id": null,
+          "prefer_local_intents": true
+        },
+        "timestamp": "2026-09-23T11:30:00.123456+00:00"
+      },
+      {
+        "type": "intent-end",
+        "data": {
+          "processed_locally": true,
+          "intent_output": {
+            "response": {
+              "speech": {
+                "plain": {
+                  "speech": "Turned on the lights.",
+                  "extra_data": null
+                }
+              },
+              "card": {},
+              "language": "en",
+              "response_type": "action_done",
+              "data": {
+                "targets": [],
+                "success": [
+                  {
+                    "name": "Office Lights",
+                    "type": "entity",
+                    "id": "light.office"
+                  }
+                ],
+                "failed": []
+              }
+            },
+            "conversation_id": "01K5ZCE000CONV",
+            "continue_conversation": false
+          }
+        },
+        "timestamp": "2026-09-23T11:30:00.123456+00:00"
+      },
+      {
+        "type": "tts-start",
+        "data": {
+          "engine": "tts.elevenlabs_text_to_speech",
+          "language": "en",
+          "voice": "Rachel",
+          "tts_input": "Turned on the lights.",
+          "acknowledge_override": true
+        },
+        "timestamp": "2026-09-23T11:30:00.123456+00:00"
+      },
+      {
+        "type": "tts-end",
+        "data": {
+          "tts_output": {
+            "media_id": "media-source://tts/-stream-/Qp2Lx7.flac",
+            "token": "Qp2Lx7.flac",
+            "url": "/api/tts_proxy/Qp2Lx7.flac",
+            "mime_type": "audio/flac"
+          }
+        },
+        "timestamp": "2026-09-23T11:30:00.123456+00:00"
+      },
+      {
+        "type": "run-end",
+        "data": null,
+        "timestamp": "2026-09-23T11:30:00.123456+00:00"
+      }
+    ]
+  },
   "intent_error_run": {
     "events": [
       {

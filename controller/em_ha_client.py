@@ -95,6 +95,7 @@ class PipelineEventType(StrEnum):
     """assist_pipeline run event `type`s this client reads."""
     RUN_START = "run-start"
     STT_END = "stt-end"
+    INTENT_PROGRESS = "intent-progress"
     INTENT_END = "intent-end"
     TTS_END = "tts-end"
     ERROR = "error"
@@ -270,8 +271,11 @@ class IntentEnded:
 
 @dataclass(frozen=True)
 class TtsReady:
-    """Response audio URL (absolute). `streamed`: announced by run-start and
-    playable now while the agent is still generating (§16.7)."""
+    """Response audio URL (absolute), sent once HA has decided what the reply
+    is. `streamed`: the run-start URL, released by `intent-progress`
+    `tts_start_streaming` and playable while the agent is still generating;
+    otherwise the `tts-end` URL. An earlier fetch parks forever when HA
+    overrides the result (acknowledge sound, §16.7)."""
     url: str
     streamed: bool
 
@@ -558,6 +562,7 @@ class PipelineRun:
         self._channel = channel
         self._finished = False
         self._tts_sent = False
+        self._stream_url: str | None = None   # run-start URL of a streamable response
 
     def __aiter__(self) -> PipelineRun:
         return self
@@ -606,9 +611,12 @@ class PipelineRun:
         data = payload.get("data") or {}
         if etype == PipelineEventType.RUN_START:
             tts = data.get("tts_output") or {}
-            if tts.get("stream_response") and tts.get("url") and not self._tts_sent:
+            if tts.get("stream_response") and tts.get("url"):
+                self._stream_url = self._client.endpoint.absolute(tts["url"])
+        elif etype == PipelineEventType.INTENT_PROGRESS:
+            if data.get("tts_start_streaming") and self._stream_url and not self._tts_sent:
                 self._tts_sent = True
-                return TtsReady(url=self._client.endpoint.absolute(tts["url"]), streamed=True)
+                return TtsReady(url=self._stream_url, streamed=True)
         elif etype == PipelineEventType.INTENT_END:
             return _intent_ended(data)
         elif etype == PipelineEventType.TTS_END:

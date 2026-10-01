@@ -32,6 +32,7 @@ import numpy as np
 
 import echomuse_grammar
 import em_alert_speech
+import em_config_sections
 import em_db
 import em_recordings
 import em_timers
@@ -147,7 +148,7 @@ WAKE_VERIFY_S = 0.700            # verification deadline from receipt of wake.ca
 FOCUS_TTL_MS = 3_000             # ephemeral dialog focus; renewed every second
 RENEW_S = 1.0
 HA_TIMEOUT_S = 30.0              # intent run sent → intent-end
-RESPONSE_START_S = 5.0           # intent-end → response audio start
+RESPONSE_START_S = 10.0          # intent-end → response audio start
 RESPONSE_STALL_S = 2.0           # no output progress
 RESPONSE_TOTAL_S = 120.0         # one spoken response
 REPLY_S = 7.0                    # reply window after guarded drain
@@ -157,7 +158,7 @@ ACTOR_TICK_S = 0.050
 LOCAL_ACT_TIMEOUT_S = 2.0
 PERSIST_SHUTDOWN_S = 2.0         # shutdown waits this long for pending turn rows (§11.3)
 WAKE_ARBITRATION_MS = 700.0      # default `wakeArbitrationMs`
-PLAYBACK_POLL_S = 0.05           # dialog output progress check while it plays
+PLAYBACK_POLL_S = 0.05           # dialog output start/progress check while it waits or plays
 
 # Sample-time bounds on evidence the actor waits for.
 ECHO_WAIT = SAMPLE_RATE          # reference for a cell's echo label: wait ≤1 s of mic time
@@ -413,6 +414,8 @@ class TurnRow(TypedDict, total=False):
     conversation_id: str | None
     reply_to: str | None
     continuation: Continuation | None
+    first_audio_ms: int | None
+    decision_trace: str | None
 
 
 class _AlertAct(TypedDict):
@@ -502,6 +505,7 @@ class WakeCandidate:
     producing_sound: bool
     profile: object                   # logged with the turn trace
     active_alert: ActiveAlert | None
+    chimed: bool                      # the device already played the wake chime (local_wake_chime)
 
     @classmethod
     def parse(cls, body: Mapping[str, object]) -> WakeCandidate:
@@ -537,6 +541,7 @@ class WakeCandidate:
             producing_sound=bool(body.get("producing_sound")),
             profile=body.get("profile"),
             active_alert=alert,
+            chimed=body.get("chimed") is True,
         )
 
     @property
@@ -775,6 +780,7 @@ class _Turn:
     run: _Abandonable | None = None
     playback: Playback | None = None
     playback_reason: PlaybackEnd | None = None   # how the spoken response ended (render.finished reason, or a limit)
+    committed_at: float | None = None         # monotonic time the endpoint commit was handled
     audible_at: float | None = None           # monotonic time the response became audible
     continuation: Continuation | None = None  # fate of the follow-up this turn asked for; None: it asked none
     persisted: asyncio.Task[int | None] | None = None   # the row write; its result is the row id
@@ -1236,7 +1242,8 @@ class SessionActor:
             await self._reject_candidate(candidate, TerminalReason.VERIFIER_TIMEOUT)
 
     async def _reject_candidate(self, candidate: _Candidate, reason: TerminalReason) -> None:
-        """Close the candidate lease (also releasing any provisional duck); no turn, focus, or chime."""
+        """Close the candidate lease (also releasing any provisional duck); no turn, focus, or chime
+        (a local_wake_chime device may already have chimed an idle candidate; it is not retracted)."""
         self._candidate = None
         close = LeaseEnd.ARBITRATION_LOST if reason == TerminalReason.ARBITRATION_LOST else LeaseEnd.REJECTED
         await self._close_uplink(candidate.lease_id, close)
@@ -1271,8 +1278,10 @@ class SessionActor:
                      inherited.conversation_id if inherited else None, inherited)
         self._turn = turn
         await self._acquire_focus(turn_id, Focus.DIALOG_INPUT, turn.generation)
-        # No chime when the command context is non-empty: the ring/reply stopping is the acknowledgement (§16.2).
-        if context is None and self._config().get("wakeSound") and self.render is not None:
+        # No chime when the command context is non-empty: the ring/reply stopping is the acknowledgement (§16.2);
+        # none when the device already chimed at candidate open (idle wakes on local_wake_chime firmware, §11.2).
+        if (context is None and em_config_sections.wake_sound(self._config()) and self.render is not None
+                and not candidate.wire.chimed):
             try:
                 await self.render.play_local(SourceClass.EARCON, WAKE_CHIME, generation=turn.generation)
             except Exception:
@@ -1281,12 +1290,15 @@ class SessionActor:
         await self._open_utterance(turn)
 
     def _command_context(self, candidate: _Candidate) -> tuple[CommandContext | None, str | None]:
-        """§6.3 step 1: the alert occurrence, else the dialog output this wake cancels."""
+        """§6.3 step 1: the alert occurrence, else the dialog output this wake cancels —
+        only a reply the user can hear: one whose audio has not started is not yet a context
+        (`started` fails only together with `finished`, so an undone playback that has
+        started is audible)."""
         active = candidate.wire.active_alert
         if active is not None:
             return CommandContext(ContextKind.ALERT, active.kind, active.name), active.id
         playback = self._dialog_playback
-        if playback is not None and not playback.done:
+        if playback is not None and not playback.done and playback.started.done():
             return CommandContext(ContextKind.DIALOG), playback.playback_id
         return None, None
 
@@ -1485,7 +1497,8 @@ class SessionActor:
             case AsrPayload() as asr:
                 if runtime.utterance is not None and obs.utterance_id == runtime.utterance.utterance_id:
                     runtime.utterance.push_asr(asr.tokens, asr.token_emission_sample,
-                                               asr.trailing_blank_frames, obs.through_sample)
+                                               asr.trailing_blank_frames, obs.through_sample,
+                                               finalized=asr.finalized)
             case EchoPayload() as echo:
                 if obs.utterance_id and obs.utterance_id.startswith(CANDIDATE_TAG):
                     if candidate is not None:
@@ -1759,6 +1772,7 @@ class SessionActor:
             await self._finish_turn(turn, TerminalReason.INTERRUPTED)
             return
         turn.commit = commit
+        turn.committed_at = time.monotonic()
         turn.coverage = (turn.runtime.echo_known / turn.runtime.echo_total) if turn.runtime.echo_total else None
         self._set_state(ActorState.COMMITTED)
         pcm = timeline.mic.read(commit.start, commit.end)
@@ -1860,6 +1874,16 @@ class SessionActor:
         intent: IntentEnded | None = None
         tts: TtsReady | None = None
         playback: asyncio.Task[PlaybackEnd] | None = None
+        dispatched = sent
+        intent_at: float | None = None
+
+        def start_by() -> float:
+            # §7: response audio starts ≤ RESPONSE_START_S after intent-end. A response
+            # streamed before then is bounded by the intent limit until intent-end tightens it.
+            if intent_at is None:
+                return dispatched + HA_TIMEOUT_S + RESPONSE_START_S
+            return intent_at + RESPONSE_START_S
+
         try:
             async with asyncio.timeout(HA_TIMEOUT_S):
                 while intent is None:
@@ -1877,7 +1901,7 @@ class SessionActor:
                         tts = event
                         turn.timings["tts_url_ms"] = round((time.monotonic() - sent) * 1000)
                         if event.streamed and playback is None:
-                            playback = self._spawn(self._play_response(turn, event.url, RESPONSE_TOTAL_S))
+                            playback = self._spawn(self._play_response(turn, event.url, start_by))
                     elif isinstance(event, RunLost):
                         await self._finish_turn(turn, TerminalReason.OUTCOME_UNKNOWN)
                         return
@@ -1894,7 +1918,7 @@ class SessionActor:
                 await self._finish_turn(turn, TerminalReason.OUTCOME_UNKNOWN)
             return
         self.awaiting_intent = False
-        intent_at = asyncio.get_running_loop().time()
+        intent_at = time.monotonic()
         turn.timings["intent_ms"] = round((time.monotonic() - sent) * 1000)
         turn.response_text = intent.speech or None
         turn.response_type = intent.response_type
@@ -1936,8 +1960,7 @@ class SessionActor:
         if not self._current(turn):
             return
         if tts is not None and playback is None:
-            remaining = max(0.0, RESPONSE_START_S - (asyncio.get_running_loop().time() - intent_at))
-            playback = self._spawn(self._play_response(turn, tts.url, remaining))
+            playback = self._spawn(self._play_response(turn, tts.url, start_by))
         reason = await playback if playback is not None else FinishReason.DRAINED
         if not self._current(turn):
             return
@@ -1966,10 +1989,14 @@ class SessionActor:
             except Exception:
                 pass
 
-    async def _play_response(self, turn: _Turn, url: str, start_timeout: float) -> PlaybackEnd:
-        """The turn's response as dialog output; the reply lease opens when its audio starts (§9.1)."""
+    async def _play_response(self, turn: _Turn, url: str,
+                             start_by: Callable[[], float] | None = None) -> PlaybackEnd:
+        """The turn's response as dialog output; the reply lease opens when its audio starts (§9.1).
+        `start_by`: as `_play_dialog`'s."""
         async def started() -> None:
             turn.audible_at = time.monotonic()
+            if turn.committed_at is not None:
+                turn.timings["first_audio_ms"] = round((turn.audible_at - turn.committed_at) * 1000)
             self._set_state(ActorState.SPEAKING)
             await self._watch_reply(turn)
 
@@ -1977,7 +2004,7 @@ class SessionActor:
             turn.playback = playback
 
         reason = await self._play_dialog(turn.turn_id, turn.generation, url, bind=bind, started=started,
-                                         start_timeout=start_timeout, fence=lambda: self._current(turn))
+                                         start_by=start_by, fence=lambda: self._current(turn))
         turn.playback_reason = reason
         if turn.audible_at is not None:
             turn.timings["playback_ms"] = round((time.monotonic() - turn.audible_at) * 1000)
@@ -2265,7 +2292,7 @@ class SessionActor:
             self._cue(Cue.ERROR_ANIM)
         else:
             turn.timings["tts_url_ms"] = round((time.monotonic() - started) * 1000)
-            reason = await self._play_response(turn, url, RESPONSE_START_S)
+            reason = await self._play_response(turn, url)
             if not self._current(turn):
                 return
             if reason not in (FinishReason.DRAINED, FinishReason.CANCELLED):
@@ -2506,12 +2533,14 @@ class SessionActor:
                            bind: Callable[[Playback], None] | None = None,
                            started: Callable[[], Awaitable[None]] | None = None,
                            drained: Callable[[], Awaitable[None]] | None = None,
-                           start_timeout: float = RESPONSE_START_S,
+                           start_by: Callable[[], float] | None = None,
                            fence: Callable[[], bool] = lambda: True) -> PlaybackEnd:
         """Play `url` as dialog output under a dialog_output lease for `owner`.
 
         Returns the finish reason (`drained`, `cancelled`, `failed`, `underrun`),
         `response_timeout` for §7's start/progress/length limits, or `fenced`.
+        `start_by`: the monotonic time the audio must start by, re-read while waiting so
+        a later intent-end can tighten it; None: RESPONSE_START_S after the stream opens.
         `drained` runs after a drain and before the dialog_output lease is released,
         so focus a prompt hands on never lapses in between.
         """
@@ -2530,12 +2559,14 @@ class SessionActor:
             if bind is not None:
                 bind(playback)
             began = time.monotonic()
-            try:
-                await asyncio.wait_for(asyncio.shield(playback.started), start_timeout)
-            except TimeoutError:
-                await playback.cancel(DialogEnd.RESPONSE_TIMEOUT)
-                return DialogEnd.RESPONSE_TIMEOUT
-            except Exception:
+            deadline = start_by if start_by is not None else (lambda: began + RESPONSE_START_S)
+            while not playback.started.done():
+                remaining = deadline() - time.monotonic()
+                if remaining <= 0:
+                    await playback.cancel(DialogEnd.RESPONSE_TIMEOUT)
+                    return DialogEnd.RESPONSE_TIMEOUT
+                await asyncio.wait({playback.started}, timeout=min(PLAYBACK_POLL_S, remaining))
+            if playback.started.exception() is not None:
                 return playback.finished.result()["reason"] if playback.done else FinishReason.FAILED
             if not fence():
                 return DialogEnd.FENCED
@@ -2709,9 +2740,11 @@ class SessionActor:
             conversation_id=turn.conversation_id,
             reply_to=turn.expectation.originating_turn_id if turn.expectation is not None else None,
             continuation=turn.continuation,
+            first_audio_ms=turn.timings.get("first_audio_ms"),
         )
-        log.info("[%s] turn %s trace %s", self.device_id, turn.turn_id, json.dumps(
-            _trace(turn, row, turn.utterance.trace()), default=str, separators=(",", ":")))
+        trace = json.dumps(_trace(turn, row, turn.utterance.trace()), default=str, separators=(",", ":"))
+        log.info("[%s] turn %s trace %s", self.device_id, turn.turn_id, trace)
+        row["decision_trace"] = trace
         try:
             row_id = await self.deps.persist_turn(row)
         except Exception:
@@ -2817,7 +2850,7 @@ class SessionActor:
 
 
 def _trace(turn: _Turn, row: TurnRow, utterance: UtteranceTrace) -> dict[str, object]:
-    """The §11.3 decision trace logged with a turn row."""
+    """The §11.3 decision trace logged and stored with a turn row."""
     candidate = turn.candidate
     wire = candidate.wire if candidate is not None else None
     return {
@@ -2825,6 +2858,7 @@ def _trace(turn: _Turn, row: TurnRow, utterance: UtteranceTrace) -> dict[str, ob
         "candidate_id": wire.candidate_id if wire is not None else None,
         "profile": wire.profile if wire is not None else None,
         "producing_sound": wire.producing_sound if wire is not None else None,
+        "chimed": wire.chimed if wire is not None else None,
         "hops": [asdict(h) for h in wire.hops] if wire is not None else None,
         "lease_id": turn.runtime.lease_id, "terminal": turn.terminal,
         "utterance": utterance, **{k: v for k, v in row.items() if k != "ts"},

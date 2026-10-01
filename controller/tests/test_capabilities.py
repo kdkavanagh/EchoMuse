@@ -67,6 +67,7 @@ def test_a_malformed_or_unsupported_hello_is_refused(bad):
     ("led_anim_capable", "led_anim"),
     ("button_hold_capable", "button_hold"),
     ("ambient_light_capable", "ambient_light"),
+    ("local_wake_chime_capable", "local_wake_chime"),
 ])
 def test_ui_capability_properties_follow_the_announced_set(prop, cap):
     async def scenario():

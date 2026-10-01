@@ -238,6 +238,33 @@ def test_trace_is_null_when_unrecorded_and_history_columns_are_not_written(fresh
     assert rec["dev_wake_score"] is None and rec["delivery_ms"] is None
 
 
+def _stored_traces(device_id: str) -> list:
+    return [r[0] for r in db._conn.execute(
+        "SELECT decision_trace FROM turns WHERE device_id = ? ORDER BY ts", (device_id,))]
+
+
+def test_the_decision_trace_is_stored_with_the_row_but_not_returned_by_get_turns(fresh_db):
+    """The trace JSON is for sqlite analysis; the Activity list gets
+    first_audio_ms but never the 3–6 KB trace."""
+    db.insert_turn("dev1", {"ts": 1_800_000_000, "first_audio_ms": 1_430,
+                            "decision_trace": '{"turn_id":"t-1"}'})
+    rec = db.get_turns("dev1")[-1]
+    assert rec["first_audio_ms"] == 1_430
+    assert "decision_trace" not in rec
+    assert _stored_traces("dev1") == ['{"turn_id":"t-1"}']
+
+
+def test_only_each_devices_newest_trace_retention_turns_keep_their_trace(fresh_db, monkeypatch):
+    monkeypatch.setattr(db, "TRACE_RETENTION", 3)
+    db.insert_turn("dev2", {"ts": 1_700_000_000, "decision_trace": "other"})
+    for i in range(5):
+        db.insert_turn("dev1", {"ts": 1_800_000_000 + i, "first_audio_ms": i,
+                                "decision_trace": f"t{i}"})
+    assert _stored_traces("dev1") == [None, None, "t2", "t3", "t4"]
+    assert [r["first_audio_ms"] for r in db.get_turns("dev1")] == [0, 1, 2, 3, 4]   # rows kept
+    assert _stored_traces("dev2") == ["other"]                                     # per device
+
+
 def test_numpy_scores_are_stored_as_numbers(fresh_db):
     np = pytest.importorskip("numpy")
     db.insert_turn("dev1", {"ts": 1_800_000_000, "wake_score": np.float32(0.9),

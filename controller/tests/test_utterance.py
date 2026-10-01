@@ -46,7 +46,7 @@ def drive(u: Utterance, cell, tokens, until: int, *, gap_at: int | None = None):
         if emitted:
             last_emission = emitted[-1][1]
         blanks = (block_end - (last_emission if last_emission is not None else u.spec.start)) // 640
-        u.push_asr([t for t, _ in emitted], [s for _, s in emitted], blanks, block_end)
+        u.push_asr([t for t, _ in emitted], [s for _, s in emitted], blanks, block_end, finalized=False)
         decisions += u.advance(block_end)
         if u.done:
             break
@@ -180,6 +180,65 @@ def test_route_r_ends_an_esphome_reply_at_a_1024_ms_pause_whatever_the_text():
     assert pending.route == "R"
     assert 16_384 <= pending.since - 9_728 < 16_384 + BLOCK
     assert isinstance(decisions[-1], Commit) and decisions[-1].route == "R"
+
+
+# --- finalize at the pause (§16.6) --------------------------------------------------------
+
+CHUNK_FIRST, CHUNK = 23_040, 20_480   # Kroko: text at 1.44 s of stream audio, then every 1.28 s
+
+
+def drive_chunked(u: Utterance, cell, tokens, until: int, *, speech_end: int, finalize_at: int | None):
+    """Feed ASR the way the worker does: the live stream only knows tokens its
+    last 1.28 s chunk covered and counts blanks to that chunk edge; from
+    `finalize_at` a finalized result carries every token and counts blanks in
+    real audio since `speech_end` while the live tokens are a prefix of it."""
+    decisions = []
+    next_cell = 0
+    for block_end in range(BLOCK, until + BLOCK, BLOCK):
+        while next_cell + CELL <= block_end:
+            level, vad = cell(next_cell)
+            u.push_cell(Evidence(Cell(next_cell, level, vad, None), ROOM_DB))
+            next_cell += CELL
+        coverage = 0 if block_end < CHUNK_FIRST else (1 + (block_end - CHUNK_FIRST) // CHUNK) * CHUNK
+        live = [(t, s) for t, s in tokens if s < coverage]
+        if finalize_at is not None and block_end >= finalize_at and len(live) < len(tokens):
+            emitted, blanks = tokens, (block_end - speech_end) // 640
+        else:
+            emitted = live
+            blanks = (coverage - (live[-1][1] if live else u.spec.start)) // 640
+        u.push_asr([t for t, _ in emitted], [s for _, s in emitted], blanks, block_end,
+                   finalized=block_end == finalize_at)
+        decisions += u.advance(block_end)
+        if u.done:
+            break
+    return decisions
+
+
+# "lights" ends just past the first chunk edge; Kroko emits it late, inside the finalize flush.
+LATE_END = 22_528                       # last speech cell
+KITCHEN_LATE = [("▁TURN", 6_000), ("▁ON", 9_000), ("▁THE", 12_000), ("▁KITCHEN", 16_000), ("▁LIGHTS", 29_500)]
+
+
+def test_a_finalized_complete_command_goes_pending_at_the_608_ms_pause():
+    finalize_at = LATE_END + 5_120 + (-(LATE_END + 5_120)) % BLOCK   # first block 320 ms into the pause
+    u = Utterance(spec(vocabulary=("kitchen lights",)))
+    decisions = drive_chunked(u, speech_between((4_608, LATE_END)), KITCHEN_LATE, 80_000,
+                              speech_end=LATE_END, finalize_at=finalize_at)
+    pending = next(d for d in decisions if isinstance(d, Pending))
+    assert pending.route == "A" and pending.boundary == LATE_END
+    assert 9_728 <= pending.since - LATE_END < 9_728 + BLOCK         # the complete pause, not a chunk edge
+    commit = decisions[-1]
+    assert isinstance(commit, Commit) and commit.text == "turn on the kitchen lights"
+    assert u.trace()["finalized"] == [finalize_at]
+
+
+def test_without_finalize_the_last_word_waits_for_the_next_chunk_edge():
+    u = Utterance(spec(vocabulary=("kitchen lights",)))
+    decisions = drive_chunked(u, speech_between((4_608, LATE_END)), KITCHEN_LATE, 80_000,
+                              speech_end=LATE_END, finalize_at=None)
+    pending = next(d for d in decisions if isinstance(d, Pending))
+    assert pending.since >= CHUNK_FIRST + CHUNK                      # "lights" arrives with the second chunk
+    assert u.trace()["finalized"] == []
 
 
 # --- wake turns: wake-phrase cut and §16.2 local commands ---------------------------------

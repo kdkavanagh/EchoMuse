@@ -63,6 +63,10 @@ const (
 
 	// CapAlertPrefetch: the device installs the sounds alert.prefetch names.
 	CapAlertPrefetch Capability = "alert_prefetch"
+	// CapLocalWakeChime: the device plays the wake chime itself at candidate
+	// open when config wakeSound is on, and reports it in wake.candidate's
+	// chimed.
+	CapLocalWakeChime Capability = "local_wake_chime"
 )
 
 // MessageType is an envelope type.

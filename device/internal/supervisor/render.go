@@ -97,8 +97,12 @@ func (s *Supervisor) openReferenceStreamLocked() {
 }
 
 // onProgress forwards render.progress (generation in the envelope) and
-// tells focus when dialog output becomes audible.
+// tells focus when dialog output becomes audible. Device-local playbacks
+// are not the controller's and are not reported.
 func (s *Supervisor) onProgress(p render.Progress) {
+	if p.Local {
+		return
+	}
 	if p.Event == render.EventStart {
 		s.mu.Lock()
 		pb, ok := s.playbacks[p.PlaybackID]
@@ -125,7 +129,11 @@ func (s *Supervisor) onProgress(p render.Progress) {
 }
 
 // onFinished forwards render.finished and releases dialog-output focus.
+// Device-local playbacks are not reported.
 func (s *Supervisor) onFinished(f render.Finished) {
+	if f.Local {
+		return
+	}
 	s.mu.Lock()
 	pb, ok := s.playbacks[f.PlaybackID]
 	if ok && pb.gen == f.Generation {

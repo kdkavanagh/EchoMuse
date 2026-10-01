@@ -389,6 +389,10 @@ class Device:
         return Capability.ALERT_CACHE in self.capabilities
 
     @property
+    def local_wake_chime_capable(self) -> bool:
+        return Capability.LOCAL_WAKE_CHIME in self.capabilities
+
+    @property
     def capture_permitted(self) -> bool:
         return not self.diagnostic
 
@@ -432,7 +436,11 @@ class Device:
         self.button_multi_tap_ms = int(cfg.get("buttonMultiTapMs", 0))
         link = self.link
         if link is not None and not link.closed:
-            await self.send(MessageType.CONFIG, {k: cfg[k] for k in DEVICE_CONFIG_KEYS if k in cfg})
+            body: dict[str, object] = {k: cfg[k] for k in DEVICE_CONFIG_KEYS if k in cfg}
+            if self.local_wake_chime_capable:
+                # Only to firmware that knows the key: it chimes at candidate open (§11.2).
+                body["wakeSound"] = em_config_sections.wake_sound(cfg)
+            await self.send(MessageType.CONFIG, body)
             # The wake graph is named only in session.ready (§16.1): a changed
             # selection renegotiates the session so device and controller agree.
             if cfg.get("wakeModel") not in (None, self.wake_model_sha256):

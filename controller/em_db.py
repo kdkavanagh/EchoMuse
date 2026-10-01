@@ -185,9 +185,10 @@ DEPLOYED_WAKE_MODEL = "4eb745120ea56f5681eddbf788a0c69e1fd406d4694a04a4dba0c1e41
 # `config` message only where the device uses them; the rest are controller-
 # side. Sections: em_config_sections.SECTIONS.
 DEFAULT_DEVICE_CONFIG: DeviceConfig = {
-    # Confirmation chime on an accepted wake, played by the device as an
-    # `earcon` source (§11.2). Off by default: an audible change on every
-    # device it reaches is a decision, not an upgrade side effect.
+    # Confirmation chime on a wake, played by the device as an `earcon`
+    # source (§11.2): at candidate open on `local_wake_chime` firmware for
+    # idle wakes, otherwise on acceptance. Off by default: an audible change
+    # on every device it reaches is a decision, not an upgrade side effect.
     "wakeSound":        False,
     # Device state, not a setting (em_config_sections.STATE_KEYS).
     "startupVolume":    85,
@@ -269,6 +270,10 @@ LOG_RETENTION = 10_000
 # Maximum voice-turn rows retained per device (pruned on insert). At even
 # 100 turns/day this is many months of history.
 TURN_RETENTION = 20_000
+
+# Voice-turn rows per device that keep their §11.3 decision_trace (3–6 KB
+# each); insert_turn NULLs it on older rows in the same transaction.
+TRACE_RETENTION = 1_000
 
 # Hourly wake_counters rows older than this are pruned on upsert.
 WAKE_COUNTER_RETENTION_DAYS = 180
@@ -928,6 +933,19 @@ MIGRATIONS: list[str] = [
     ALTER TABLE turns ADD COLUMN continuation TEXT;
     ALTER TABLE turns ADD COLUMN playback_reason TEXT;
     UPDATE system_config SET value = '25' WHERE key = 'schema_version';
+    """,
+
+    # ── v26 — decision trace and time-to-first-audio on the turn row ─────────
+    #
+    # `decision_trace` is the §11.3 trace JSON the actor logs with every turn,
+    # kept for the newest TRACE_RETENTION rows per device (older rows have it
+    # NULLed on insert) and read by sqlite analysis, never by get_turns.
+    # `first_audio_ms` is the endpoint commit → the response becoming audible
+    # (NULL: nothing became audible).
+    """
+    ALTER TABLE turns ADD COLUMN first_audio_ms INTEGER;
+    ALTER TABLE turns ADD COLUMN decision_trace TEXT;
+    UPDATE system_config SET value = '26' WHERE key = 'schema_version';
     """,
 ]
 
@@ -1974,7 +1992,8 @@ def get_device_logs(
 # Turn dict keys ↔ column names written by insert_turn. "trigger" is stored
 # as trigger_type because TRIGGER is an SQLite keyword. The §11.3 decision
 # trace arrived in schema 22, the per-stage Activity detail in schema 24, the
-# follow-up question detail in schema 25.
+# follow-up question detail in schema 25, the stored trace JSON and
+# time-to-first-audio in schema 26.
 _TURN_COLUMNS = {
     "trigger":            "trigger_type",
     "wake_model":         "wake_model",
@@ -2008,7 +2027,14 @@ _TURN_COLUMNS = {
     "conversation_id":    "conversation_id", # HA conversation the turn ran in
     "reply_to":           "reply_to",        # turn_uuid of the question this turn answered
     "continuation":       "continuation",    # fate of the question this turn asked (em_session FOLLOWUP_*)
+    "first_audio_ms":     "first_audio_ms",  # endpoint commit → response audible
+    "decision_trace":     "decision_trace",  # §11.3 trace JSON; newest TRACE_RETENTION rows only
 }
+
+# Written but not returned by get_turns (nor pushed as turn_complete): the
+# Activity list never reads the trace, and at 3–6 KB a row it would dominate
+# every turns response.
+TURN_WRITE_ONLY_COLUMNS = frozenset({"decision_trace"})
 
 # Columns get_turns returns but nothing writes any more (SPEC §18.4 step 3):
 # the legacy data-plane delivery measurements and the shadow/device-wake
@@ -2035,7 +2061,8 @@ def insert_turn(device_id: str, rec: Mapping[str, object]) -> int:
     Persist one completed voice turn. `rec` keys are those of _TURN_COLUMNS
     plus optional `ts` (epoch s); missing keys are NULL, other keys ignored.
     Returns the rowid (set_turn_audio/set_turn_wake attach files by it).
-    Prunes to TURN_RETENTION rows per device.
+    Prunes to TURN_RETENTION rows per device, and NULLs decision_trace on
+    all but the newest TRACE_RETENTION of them.
     """
     cols   = ["device_id", "ts"] + list(_TURN_COLUMNS.values())
     values = [device_id, _py(rec.get("ts", time.time()))] + [
@@ -2059,6 +2086,20 @@ def insert_turn(device_id: str, rec: Mapping[str, object]) -> int:
               )
             """,
             (device_id, device_id, TURN_RETENTION),
+        )
+        conn.execute(
+            """
+            UPDATE turns SET decision_trace = NULL
+            WHERE device_id = ?
+              AND decision_trace IS NOT NULL
+              AND id NOT IN (
+                  SELECT id FROM turns
+                  WHERE device_id = ?
+                  ORDER BY ts DESC
+                  LIMIT ?
+              )
+            """,
+            (device_id, device_id, TRACE_RETENTION),
         )
         return _rowid(cur)
 
@@ -2097,8 +2138,9 @@ def get_turns(
 ) -> list[dict[str, object]]:
     """
     Recent turns for a device, oldest first: {turn_id, ts} plus every
-    _TURN_COLUMNS key and every _TURN_READ_ONLY_COLUMNS column (NULL = not
-    recorded). since: optional epoch-seconds lower bound.
+    _TURN_COLUMNS key except TURN_WRITE_ONLY_COLUMNS, and every
+    _TURN_READ_ONLY_COLUMNS column (NULL = not recorded). since: optional
+    epoch-seconds lower bound.
     """
     if since is not None:
         rows = _q(
@@ -2115,7 +2157,8 @@ def get_turns(
     for row in reversed(rows):
         rec: dict[str, object] = {"turn_id": row["id"], "ts": row["ts"]}
         for key, col in _TURN_COLUMNS.items():
-            rec[key] = row[col]
+            if key not in TURN_WRITE_ONLY_COLUMNS:
+                rec[key] = row[col]
         for col in _TURN_READ_ONLY_COLUMNS:
             rec[col] = row[col]
         out.append(rec)

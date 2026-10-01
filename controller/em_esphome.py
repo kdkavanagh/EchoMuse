@@ -103,6 +103,10 @@ class EchoMuseSatellite(SatelliteServerProtocol):
         )
         self.server = server
         self._run_queue: asyncio.Queue[em_ha_client.RunEvent] | None = None
+        # Current reply run: RUN_START's URL, released by INTENT_PROGRESS
+        # `tts_start_streaming`; whether its TtsReady has been sent (§16.7).
+        self._reply_stream_url: str | None = None
+        self._reply_tts_sent = False
         self._reply_lock = asyncio.Lock()
         self._tasks: set[asyncio.Task[object]] = set()
 
@@ -291,10 +295,17 @@ class EchoMuseSatellite(SatelliteServerProtocol):
                 response_type=None,
                 processed_locally=None,
             ))
-        elif typ in (_ET.VOICE_ASSISTANT_TTS_END, _ET.VOICE_ASSISTANT_RUN_START):
-            if data.get("url"):
-                queue.put_nowait(em_ha_client.TtsReady(
-                    data["url"], typ == _ET.VOICE_ASSISTANT_RUN_START))
+        elif typ == _ET.VOICE_ASSISTANT_RUN_START:
+            self._reply_stream_url = data.get("url") or None
+        elif typ == _ET.VOICE_ASSISTANT_INTENT_PROGRESS:
+            if (data.get("tts_start_streaming") == "1" and self._reply_stream_url
+                    and not self._reply_tts_sent):
+                self._reply_tts_sent = True
+                queue.put_nowait(em_ha_client.TtsReady(self._reply_stream_url, True))
+        elif typ == _ET.VOICE_ASSISTANT_TTS_END:
+            if data.get("url") and not self._reply_tts_sent:
+                self._reply_tts_sent = True
+                queue.put_nowait(em_ha_client.TtsReady(data["url"], False))
         elif typ == _ET.VOICE_ASSISTANT_ERROR:
             queue.put_nowait(em_ha_client.RunFailed(
                 data.get("code", "unknown"), data.get("message", "")))
@@ -310,6 +321,8 @@ class EchoMuseSatellite(SatelliteServerProtocol):
         async with self._reply_lock:
             queue: asyncio.Queue[em_ha_client.RunEvent] = asyncio.Queue()
             self._run_queue = queue
+            self._reply_stream_url = None
+            self._reply_tts_sent = False
             try:
                 self._send_one(api_pb2.VoiceAssistantRequest(
                     start=True, conversation_id=str(uuid.uuid4()),

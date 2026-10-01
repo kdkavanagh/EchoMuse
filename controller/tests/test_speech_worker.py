@@ -164,6 +164,88 @@ def test_real_vad_and_streaming_asr_over_an_utterance(bundle_dir, registry, spee
     assert final.stable_prefix is not None and final.stable_prefix.split()[0] == "ask"
 
 
+def test_finalize_at_each_pause_carries_the_last_word_before_the_live_chunk(bundle_dir, registry, speech):
+    """[1 s zeros, clip, 1 s zeros, clip, 3 s zeros]: the clip's own sentence pause
+    is shorter than 320 ms, so exactly the two real pauses are finalized."""
+    async def main():
+        w = sw.SpeechWorker(registry, bundle_dir=str(bundle_dir), job_deadline_s=60.0)
+        await w.start()
+        try:
+            silence = np.zeros(16_000, np.int16)
+            audio = np.concatenate([silence, speech, silence, speech, silence, silence, silence])
+            audio = audio[: audio.size // 1280 * 1280]
+            w.open_lease("dev", 7, "L", registry.active().graph_sha256)
+            w.open_utterance("L", "U", 0, 0, SampleTimeline())
+            for k in range(0, audio.size, 1280):
+                w.submit_mic_block("L", k, audio[k:k + 1280])
+                await asyncio.sleep(0)
+            return await drain(w, lambda got: any(o.kind == "asr" and o.through_sample == audio.size for o in got))
+        finally:
+            await w.close()
+
+    obs = run(main())
+    assert not [o for o in obs if o.kind == "error"]
+    probs = np.concatenate([o.payload.probabilities for o in obs if o.kind == "vad"])
+    positive = np.nonzero(probs >= 0.50)[0]
+    pauses = [(i + 1) * 512 for i, j in zip(positive, [*positive[1:], 10**9]) if j - i > 10]
+    asr = [o for o in obs if o.kind == "asr"]
+    finals = [i for i, o in enumerate(asr) if o.payload.finalized]
+    assert len(pauses) == 2 and len(finals) == 2
+    for speech_end, i in zip(pauses, finals):
+        assert 0 <= asr[i].through_sample - (speech_end + sw.FINALIZE_PAUSE) < sw.BLOCK_SAMPLES
+        assert asr[i].payload.text.lower().endswith("your country")
+
+    first = asr[finals[0]]
+    assert not asr[finals[0] - 1].payload.text.lower().endswith("your country")   # live still lacks it
+    assert first.through_sample < 23_040 + 3 * 20_480        # before the live stream's next chunk edge
+    # Held while the live tokens are a prefix of it; blanks count real audio since the
+    # latest speech-positive cell (Kroko emits the last word late), never the flush.
+    held = [first]
+    for o in asr[finals[0] + 1:]:
+        if o.payload.tokens != first.payload.tokens:
+            break
+        held.append(o)
+    assert len(held) > 1 and not any(o.payload.finalized for o in held[1:])
+    ends = (positive + 1) * 512
+    for o in held:
+        speech_end = ends[ends <= o.through_sample].max()
+        assert o.payload.trailing_blank_frames == (o.through_sample - speech_end) // sw.BLANK_FRAME_SAMPLES
+    assert first.payload.trailing_blank_frames >= sw.FINALIZE_PAUSE // sw.BLANK_FRAME_SAMPLES
+    assert min(o.payload.trailing_blank_frames for o in held) < first.payload.trailing_blank_frames  # new speech
+    # The live stream resumes once its own chunk adds tokens: the second clip's first words.
+    resumed = asr[finals[0] + len(held)]
+    assert resumed.through_sample < pauses[1]
+    assert resumed.payload.tokens[:len(first.payload.tokens)] == first.payload.tokens
+    assert len(resumed.payload.tokens) > len(first.payload.tokens)
+
+
+def test_the_flush_reaches_speech_just_past_a_chunk_edge(bundle_dir, registry, speech):
+    """A 1.43 s window ends 150 ms past Kroko's first 1.28 s chunk: a 0.5 s flush
+    left it at "Ask not what your"; the flush must decode through "country"."""
+    window = speech[:22_880]
+
+    async def main():
+        w = sw.SpeechWorker(registry, bundle_dir=str(bundle_dir), job_deadline_s=60.0)
+        await w.start()
+        try:
+            tokens, _ = await w.decode_span(window)
+            mic = SampleTimeline()
+            mic.write(0, np.concatenate([np.zeros(16_000, np.int16), speech]))
+            w.open_lease("dev", 7, "L", registry.active().graph_sha256)
+            # Verification input [support_start − 300 ms, open + 480 ms) is exactly the window.
+            end = 16_000 + window.size
+            w.submit_verification("L", "C", mic, 16_000 + sw.VERIFICATION_PREROLL, end - sw.VERIFICATION_LOOKAHEAD,
+                                  "country")
+            got = await drain(w, lambda got: any(o.kind == "verification" for o in got))
+            return tokens, next(o for o in got if o.kind == "verification")
+        finally:
+            await w.close()
+
+    tokens, verification = run(main())
+    assert "country" in "".join(tokens).lower()
+    assert verification.payload.result == "pass" and "country" in verification.payload.text.lower()
+
+
 def test_verification_decodes_candidate_window_and_matches_the_core(bundle_dir, registry, speech):
     async def main():
         w = sw.SpeechWorker(registry, bundle_dir=str(bundle_dir), job_deadline_s=60.0)

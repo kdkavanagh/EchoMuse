@@ -254,6 +254,21 @@ def test_v23_strips_microphone_processing_keys_the_api_would_reject(tmp_path):
     assert set(dead) <= em_db.REMOVED_CONFIG_KEYS
 
 
+def test_v26_adds_first_audio_and_trace_columns_to_existing_turns(tmp_path):
+    p = str(tmp_path / "v25.db")
+    c = sqlite3.connect(p)
+    for sql in em_db.MIGRATIONS[:25]:
+        c.executescript(sql)
+    c.execute("INSERT INTO turns (device_id, ts, outcome, turn_uuid) VALUES ('D', 1.0, 'ha', 't-1')")
+    c.commit()
+    c.close()
+
+    em_db.init(p)
+    c = sqlite3.connect(p)
+    row = c.execute("SELECT turn_uuid, first_audio_ms, decision_trace FROM turns").fetchone()
+    assert row == ("t-1", None, None)                  # history kept; unmeasured reads NULL
+
+
 def test_connect_alerts_shares_database_but_not_connection(tmp_path):
     p = str(tmp_path / "alerts.db")
     em_db.init(p)

@@ -142,6 +142,7 @@ class Capability(enum.StrEnum):
     BUTTON_HOLD = "button_hold"
     AMBIENT_LIGHT = "ambient_light"
     ALERT_PREFETCH = "alert_prefetch"
+    LOCAL_WAKE_CHIME = "local_wake_chime"
 
 
 class RejectReason(enum.StrEnum):

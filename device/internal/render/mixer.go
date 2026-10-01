@@ -56,6 +56,7 @@ type playback struct {
 	class  SourceClass
 	slot   int
 	mask   uint8
+	local  bool // device-originated (StartLocal): its events carry Local
 	epoch  uint64
 	baseDB float64
 
@@ -273,6 +274,22 @@ func (m *Mixer) Close() error {
 // playback, which finishes cancelled with a 30 ms fade; an older generation
 // is rejected with ErrStale; repeating the current start is a no-op.
 func (m *Mixer) Start(v Playback) error {
+	return m.start(v, false)
+}
+
+// StartLocal begins a device-originated local playback (no render.start
+// behind it) at the class's current generation fence, which it neither
+// raises nor can be refused by: the controller's next start at that
+// generation or newer still replaces it. Its Progress and Finished carry
+// Local, so they are never reported as controller playbacks.
+func (m *Mixer) StartLocal(id string, class SourceClass, pcm []int16, gainDB float64) error {
+	if class.Network() {
+		return ErrInvalidClass
+	}
+	return m.start(Playback{ID: id, Class: class, GainDB: gainDB, PCM: pcm}, true)
+}
+
+func (m *Mixer) start(v Playback, local bool) error {
 	s, ok := slotOf(v.Class)
 	if !ok {
 		return ErrInvalidClass
@@ -284,6 +301,9 @@ func (m *Mixer) Start(v Playback) error {
 		return ErrNoAudio
 	}
 	m.mu.Lock()
+	if local {
+		v.Generation = m.highGen[s]
+	}
 	if v.Generation < m.highGen[s] {
 		m.mu.Unlock()
 		return ErrStale
@@ -301,6 +321,7 @@ func (m *Mixer) Start(v Playback) error {
 		class:  v.Class,
 		slot:   s,
 		mask:   maskOf(v.Class),
+		local:  local,
 		epoch:  v.Epoch,
 		baseDB: v.GainDB,
 	}
@@ -508,6 +529,7 @@ func (m *Mixer) finishLocked(p *playback, reason FinishReason) {
 	m.enqueue(event{finished: true, fin: Finished{
 		PlaybackID:         p.id,
 		Generation:         p.gen,
+		Local:              p.local,
 		LastCompletedFrame: p.completed,
 		Reason:             reason,
 		TimingQuality:      TimingEstimated,
@@ -526,6 +548,7 @@ func (m *Mixer) progressLocked(p *playback, ev ProgressEvent, now int64, missing
 	m.enqueue(event{progress: Progress{
 		PlaybackID:        p.id,
 		Generation:        p.gen,
+		Local:             p.local,
 		Event:             ev,
 		SubmittedFrames:   p.submitted,
 		CompletedFrames:   p.completed,

@@ -36,13 +36,11 @@ def stable(
     progress_sample=3_072,
     through_sample=20_000,
     blanks=10,
-    tail="",
 ):
     return StableText(
         prefix=prefix,
         prefix_tokens=tuple(prefix.split()),
-        tail=tail,
-        latest_text=prefix if not tail else f"{prefix} {tail}",
+        latest_text=prefix,
         prefix_sample=prefix_sample,
         progress_sample=progress_sample,
         trailing_blank_frames=blanks,
@@ -60,15 +58,28 @@ def reducer(*, esphome=False, extended=False):
     )
 
 
-def test_text_stability_needs_three_results_spanning_240_ms_and_ignores_punctuation():
+def test_stable_prefix_is_the_latest_result_and_its_sample_is_where_it_last_changed():
     tracker = TextStability(trigger_sample=123)
-    assert tracker.push("Turn off lights", 0, 0).prefix == ""
-    assert tracker.push("Turn off lights!", 1_920, 0).prefix == ""
+    got = tracker.push("Turn off", 1_280, 0)
+    assert got.prefix == "turn off"                       # no repeat needed: Kroko only appends at chunk edges
+    assert got.prefix_sample == got.progress_sample == 1_280
+    got = tracker.push("Turn off!", 2_560, 3)             # punctuation is not a change
+    assert (got.prefix, got.prefix_sample, got.progress_sample) == ("turn off", 1_280, 1_280)
+    assert got.through_sample == 2_560 and got.trailing_blank_frames == 3
     got = tracker.push("turn off lights.", 3_840, 4)
     assert got.prefix == "turn off lights"
-    assert got.prefix_sample == 3_840
-    assert got.progress_sample == 3_840
-    assert got.trailing_blank_frames == 4
+    assert got.prefix_sample == got.progress_sample == 3_840
+
+
+def test_progress_waits_at_the_trigger_until_text_exists_then_follows_every_change():
+    tracker = TextStability(trigger_sample=4_800)
+    got = tracker.push("", 1_280, 0)                      # pre-roll result before the trigger
+    assert (got.prefix, got.prefix_sample, got.progress_sample) == ("", None, 4_800)
+    got = tracker.push("", 6_400, 5)
+    assert got.progress_sample == 4_800
+    tracker.push("stop", 7_680, 0)
+    got = tracker.push("", 8_960, 0)                      # a wake cut can empty the text again
+    assert (got.prefix, got.prefix_sample, got.progress_sample) == ("", None, 8_960)
 
 
 def test_route_a_pending_then_commit_with_immutable_192_ms_tail():
@@ -143,23 +154,6 @@ def test_route_a_counts_background_speech_as_pause_only_for_long_pause_text(pref
     got = r.step(frontier=pause_end, valid_audio_end=pause_end, stable=stable(prefix, through_sample=pause_end))
     if ends:
         assert got.pending.route == "A" and got.pending.boundary == 6 * CELL
-    else:
-        assert got.pending is None and got.state == EndpointState.LISTENING
-
-
-@pytest.mark.parametrize(("tail", "routed"), [("in the", False), ("and the news tonight", True)])
-def test_route_b_requires_tail_that_does_not_extend_the_parse(tail, routed):
-    # §16.6: route B holds only when prefix + tail parses `unknown` (TV words); an extending tail blocks it.
-    r = reducer()
-    r.observe([classified(i, CellClass.COMMAND_SPEECH) for i in range(6)])
-    r.observe([classified(i, CellClass.BACKGROUND_SPEECH, command=False) for i in range(6, 25)])
-    got = r.step(
-        frontier=25 * CELL,
-        valid_audio_end=25 * CELL,
-        stable=stable(tail=tail, through_sample=25 * CELL, blanks=0),
-    )
-    if routed:
-        assert got.pending.route == "B"
     else:
         assert got.pending is None and got.state == EndpointState.LISTENING
 
@@ -252,7 +246,7 @@ def test_redecode_parse_difference_except_final_word_completion(before, after, d
 
 
 def test_local_command_preconditions_are_stable_and_not_mostly_self_output():
-    s = stable(prefix="stop", prefix_sample=1_000, through_sample=5_000, tail="")
+    s = stable(prefix="stop", prefix_sample=1_000, through_sample=5_000)
     cells = [classified(i, CellClass.COMMAND_SPEECH, speech=True) for i in range(5)]
     cells += [classified(i, CellClass.SELF_OUTPUT, speech=True, command=False) for i in range(5, 7)]
     assert local_command_preconditions(

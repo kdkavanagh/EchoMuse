@@ -7,7 +7,7 @@ pytest.importorskip("websockets")
 
 import em_device  # noqa: E402
 from _device_fakes import (  # noqa: E402
-    FakeLink, FakeRender, FakeStore, envelope, hello, make_hub, run, settle,
+    ALL_V1, FakeLink, FakeRender, FakeStore, envelope, hello, make_hub, run, settle,
 )
 
 Rejected = em_device.em_device_link.Rejected
@@ -15,12 +15,12 @@ Admitted = em_device.em_device_link.Admitted
 ActorState = em_device.em_session.ActorState
 
 
-async def _online(store=None, host=None):
+async def _online(store=None, host=None, capabilities=None):
     store = store or FakeStore()
     store.add("DEV1", approved=True)
     hub, host, store = make_hub(store, host)
-    admitted = await hub.admit(hello(), device_id="DEV1", peer_ip="10.0.0.5", secure=True, token=None)
-    link = FakeLink(hello())
+    admitted = await hub.admit(hello(capabilities), device_id="DEV1", peer_ip="10.0.0.5", secure=True, token=None)
+    link = FakeLink(hello(capabilities))
     await admitted.sink.on_ready(link)
     device = hub.devices["DEV1"]
     return device, link, host, store, admitted.sink
@@ -100,6 +100,22 @@ def test_ready_pushes_only_device_owned_config_keys():
         assert ("config", {"duckDb": -18.0, "startupVolume": 90}) in link.sent
         assert ("connected", "DEV1") in host.events
         assert host.alerts.calls[0][0] == "hello"
+        await device.close()
+    run(scenario())
+
+
+@pytest.mark.parametrize("stored, capable, pushed", [
+    (True, True, {"wakeSound": True}),
+    ("true", True, {"wakeSound": False}),     # only JSON true is on, as for the controller's own chime
+    (True, False, {}),                        # firmware without local_wake_chime never sees the key
+])
+def test_wake_sound_is_pushed_as_a_bool_only_to_a_local_wake_chime_device(stored, capable, pushed):
+    async def scenario():
+        store = FakeStore()
+        store.configs["DEV1"] = {"duckDb": -18.0, "wakeSound": stored}
+        caps = ALL_V1 + ["local_wake_chime"] if capable else None
+        device, link, *_ = await _online(store, capabilities=caps)
+        assert ("config", {"duckDb": -18.0, **pushed}) in link.sent
         await device.close()
     run(scenario())
 

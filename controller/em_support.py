@@ -88,6 +88,8 @@ _TURN_FIELDS = (
     "commit_route", "terminal_reason", "commit_id",
     # per-stage detail (schema 24)
     "endpoint_class", "endpoint_ms", "intent_ms", "intent_local", "response_type",
+    # endpoint commit → response audible (schema 26)
+    "first_audio_ms",
 )
 
 # Hourly device metrics, named as `db.get_device_metrics` RETURNS them, not as

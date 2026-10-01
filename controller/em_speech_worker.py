@@ -28,7 +28,7 @@ from typing import Callable
 import numpy as np
 
 from echomuse_grammar import Result as GrammarResult
-from em_attribution import EchoResult, WakeHop
+from em_attribution import SPEECH_POSITIVE_VAD, EchoResult, WakeHop
 from em_audio_timeline import (
     FLAG_DISCONTINUITY, FLAG_MUTED, REFERENCE_HOP, ReferenceView, SampleTimeline, StreamId, ceil_to,
 )
@@ -49,7 +49,12 @@ VAD_STATE_SHAPE = (2, 1, 128)
 EVIDENCE_GAIN = 10                    # +20 dB evidence copy (§16.6)
 VERIFICATION_PREROLL = 4_800          # support_start − 300 ms
 VERIFICATION_LOOKAHEAD = 7_680        # candidate open + 480 ms
-VERIFICATION_FLUSH = 8_000            # 0.5 s of internal zeros, never counted
+# Internal zeros after every fresh decode (wake verification, span re-decode,
+# finalize at a pause), never counted as audio. Kroko decodes 128-frame (1.28 s)
+# chunks and each needs 13 more frames of right context, so audio just past a
+# chunk edge needs up to 141 frames (1.41 s) of padding before it is decoded.
+ASR_FLUSH = 24_000                    # 1.5 s
+FINALIZE_PAUSE = 5_120                # 10 VAD cells (320 ms) past the last speech-positive cell
 BLANK_FRAME_SAMPLES = 640             # one trailing blank frame = 40 ms
 JOB_DEADLINE_S = 0.750                # §4.4
 ERROR_WINDOW_S = 60.0                 # §8.1: three errors within 60 s
@@ -57,7 +62,7 @@ ERRORS_UNAVAILABLE = 3
 PROBE_INTERVAL_S = 10.0
 PROBE_DEADLINE_S = 1.0
 PROBES_TO_RECOVER = 2
-POLICY_REVISION = "post_afe_2"
+POLICY_REVISION = "post_afe_3"
 
 
 class ObservationSource(enum.StrEnum):
@@ -136,7 +141,14 @@ class EchoPayload:
 @dataclass(frozen=True, slots=True)
 class AsrPayload:
     """`text` is the raw streaming text; `stable_prefix` and `grammar_result`
-    are judged on the utterance's transformed (wake-cut) text."""
+    are judged on the utterance's transformed (wake-cut) text.
+
+    `finalized` marks a result made at a pause by a fresh decode of the whole
+    utterance flushed with zeros (§16.6). While the live stream's tokens are a
+    prefix of it, later results repeat it with `finalized` false. Whenever that
+    result is reported, `trailing_blank_frames` counts real audio since the end
+    of the last speech-positive VAD cell, never the flush: Kroko emits the last
+    word and punctuation late, often inside the flush."""
 
     tokens: tuple[str, ...]
     token_emission_sample: tuple[int, ...]
@@ -144,6 +156,7 @@ class AsrPayload:
     stable_prefix: str | None
     trailing_blank_frames: int
     grammar_result: GrammarResult | None
+    finalized: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,6 +281,15 @@ class SpeechModels:
         while self.recognizer.is_ready(stream):
             self.recognizer.decode_stream(stream)
 
+    def decode_fresh(self, evidence: np.ndarray) -> AsrResult:
+        """Greedy decode of int16 evidence by a new stream, fed in 80 ms blocks
+        and flushed with `ASR_FLUSH` zeros so its last words are decoded."""
+        stream = self.recognizer.create_stream()
+        for i in range(0, evidence.size, BLOCK_SAMPLES):
+            self.decode(stream, evidence[i:i + BLOCK_SAMPLES])
+        self.decode(stream, np.zeros(ASR_FLUSH, dtype=np.int16))
+        return self.result(stream)
+
     def result(self, stream: RecognizerStream) -> AsrResult:
         return AsrResult.parse(self.recognizer.get_result_as_json_string(stream))
 
@@ -324,6 +346,15 @@ class _VadState:
         self.next_sample = None
 
 
+@dataclass(frozen=True, slots=True)
+class _Finalized:
+    """A finalize decode's result, emissions as capture-epoch samples."""
+
+    tokens: tuple[str, ...]
+    emissions: tuple[int, ...]
+    text: str
+
+
 @dataclass
 class _Utterance:
     utterance_id: str
@@ -333,6 +364,10 @@ class _Utterance:
     text_transform: Callable[[StreamingTranscript], str] | None
     grammar: Callable[[str], GrammarResult] | None
     fed_through: int
+    evidence: list[np.ndarray] = field(default_factory=list)   # evidence copy of [start_sample, fed_through)
+    speech_end: int | None = None        # end of the last speech-positive VAD cell since open
+    finalized_end: int | None = None     # the speech end a finalize decode already covered
+    finalized: _Finalized | None = None  # reported instead of the live result until the live one adds to it
 
 
 @dataclass
@@ -535,6 +570,7 @@ class SpeechWorker:
                 return ()
             for i in range(0, preroll.size, BLOCK_SAMPLES):
                 models.decode(stream, preroll[i:i + BLOCK_SAMPLES])
+            utterance.evidence.append(preroll)
             utterance.fed_through = start_sample + preroll.size
             return (self._asr_observation(models, lease, utterance),)
         self._submit(_Job(f"mic:{lease_id}", ObservationKind.ASR, self._now(), run, lease, StreamId.MIC,
@@ -601,6 +637,10 @@ class SpeechWorker:
             vad.pending = vad.pending[n_cells * VAD_CELL_SAMPLES:]
             vad.next_sample = first_cell + n_cells * VAD_CELL_SAMPLES
             u = lease.utterance
+            if u is not None:
+                for i, p in enumerate(probs):
+                    if p >= SPEECH_POSITIVE_VAD:
+                        u.speech_end = first_cell + (i + 1) * VAD_CELL_SAMPLES
             out.append(self._observe(lease, StreamId.MIC, ObservationKind.VAD, vad.next_sample,
                                      VadPayload(first_cell, probs), u.utterance_id if u else None))
         u = lease.utterance
@@ -609,23 +649,56 @@ class SpeechWorker:
             if first > u.fed_through:
                 lease.utterance = None   # gap inside the utterance: stream is dead
             elif end > u.fed_through:
-                models.decode(u.stream, evidence[u.fed_through - first:])
+                fed = evidence[u.fed_through - first:]
+                models.decode(u.stream, fed)
+                u.evidence.append(fed)
                 u.fed_through = end
                 out.append(self._asr_observation(models, lease, u))
         return tuple(out)
 
     def _asr_observation(self, models: SpeechModels, lease: _Lease, u: _Utterance) -> Observation:
-        result = models.result(u.stream)
-        tokens = result.tokens
-        emissions = tuple(u.start_sample + round(t * SAMPLE_RATE) for t in result.timestamps)
-        blanks = result.trailing_blanks
-        raw_text = result.text
+        """The block's ASR result (§16.6 finalize at the pause).
+
+        Once VAD has analyzed `FINALIZE_PAUSE` past the last speech-positive
+        cell, a fresh stream decodes the whole utterance with the flush, once
+        per pause. That result stands in for the live one while the live tokens
+        are a prefix of it: the live stream decodes 1.28 s chunks, and its
+        trailing-blank count stops at its last chunk edge. The first live result
+        that adds or changes a token replaces it. While it stands, its trailing
+        blanks are the real audio since the last speech-positive cell, so new
+        speech drops them before the live stream has new tokens."""
+        analyzed = lease.vad.next_sample
+        finalize = (u.speech_end is not None and u.speech_end != u.finalized_end
+                    and analyzed is not None and analyzed - u.speech_end >= FINALIZE_PAUSE)
+        live: AsrResult | None = None
+        if finalize:
+            shadow = models.decode_fresh(np.concatenate(u.evidence))
+            u.finalized = _Finalized(shadow.tokens, self._emissions(u, shadow), shadow.text)
+            u.finalized_end = u.speech_end
+        elif u.finalized is not None:
+            live = models.result(u.stream)
+            if live.tokens != u.finalized.tokens[:len(live.tokens)]:
+                u.finalized = None
+        if u.finalized is not None:
+            tokens, emissions, raw_text = u.finalized.tokens, u.finalized.emissions, u.finalized.text
+            # Real audio since the latest speech-positive cell; token emissions
+            # can fall late, even inside the flush, and the flush never counts.
+            speech_end = u.speech_end if u.speech_end is not None else u.start_sample
+            blanks = max(0, u.fed_through - speech_end) // BLANK_FRAME_SAMPLES
+        else:
+            result = live if live is not None else models.result(u.stream)
+            tokens, emissions, raw_text = result.tokens, self._emissions(u, result), result.text
+            blanks = result.trailing_blanks
         text = raw_text if u.text_transform is None else u.text_transform(
             StreamingTranscript.from_tokens(tokens, emissions))
         stable = u.stability.push(text, u.fed_through, blanks)
         payload = AsrPayload(tokens, emissions, raw_text, stable.prefix if stable.prefix_sample is not None else None,
-                             blanks, None if u.grammar is None else u.grammar(text))
+                             blanks, None if u.grammar is None else u.grammar(text), finalize)
         return self._observe(lease, StreamId.MIC, ObservationKind.ASR, u.fed_through, payload, u.utterance_id)
+
+    @staticmethod
+    def _emissions(u: _Utterance, result: AsrResult) -> tuple[int, ...]:
+        return tuple(u.start_sample + round(t * SAMPLE_RATE) for t in result.timestamps)
 
     # -- echo ----------------------------------------------------------------
 
@@ -702,7 +775,7 @@ class SpeechWorker:
     def submit_verification(self, lease_id: str, candidate_id: str, mic: SampleTimeline,
                             support_start: int, open_sample: int, verify_core: str) -> None:
         """Fresh greedy decode of the evidence copy over
-        [support_start − 300 ms, open + 480 ms), flushed with 0.5 s of zeros.
+        [support_start − 300 ms, open + 480 ms), flushed with `ASR_FLUSH` zeros.
         Call once the mic timeline covers that range."""
         lease = self._lease(lease_id)
         models = self._require_started()
@@ -718,11 +791,7 @@ class SpeechWorker:
 
     def _run_verification(self, models: SpeechModels, lease: _Lease, candidate_id: str, evidence: np.ndarray,
                           core: str, through: int) -> tuple[Observation, ...]:
-        stream = models.recognizer.create_stream()
-        for i in range(0, evidence.size, BLOCK_SAMPLES):
-            models.decode(stream, evidence[i:i + BLOCK_SAMPLES])
-        models.decode(stream, np.zeros(VERIFICATION_FLUSH, dtype=np.int16))
-        text = models.result(stream).text
+        text = models.decode_fresh(evidence).text
         v = verify_wake(text, core)
         payload = VerificationPayload(candidate_id, text, v.distance,
                                       VerificationResult.PASS if v.passed else VerificationResult.FAIL)
@@ -732,18 +801,14 @@ class SpeechWorker:
 
     async def decode_span(self, canonical_pcm: np.ndarray) -> tuple[tuple[str, ...], tuple[float, ...]]:
         """Fresh greedy decode of a committed span's evidence copy, flushed with
-        0.5 s of internal zeros (§16.6 route B / fallback re-decode). Returns
+        `ASR_FLUSH` internal zeros (§16.6 route B / fallback re-decode). Returns
         tokens and their emission times in seconds from the span start. A
         failure counts toward `speech_unavailable` and raises SpeechWorkerError."""
         models = self._require_started()
         evidence = evidence_copy(canonical_pcm)
 
         def run() -> tuple[tuple[str, ...], tuple[float, ...]]:
-            stream = models.recognizer.create_stream()
-            for i in range(0, evidence.size, BLOCK_SAMPLES):
-                models.decode(stream, evidence[i:i + BLOCK_SAMPLES])
-            models.decode(stream, np.zeros(VERIFICATION_FLUSH, dtype=np.int16))
-            result = models.result(stream)
+            result = models.decode_fresh(evidence)
             return result.tokens, result.timestamps
         try:
             return await asyncio.get_running_loop().run_in_executor(self._executor, run)

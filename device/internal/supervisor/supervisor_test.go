@@ -20,6 +20,7 @@ import (
 	"github.com/wilbowes/EchoMuse/internal/audio/ema"
 	"github.com/wilbowes/EchoMuse/internal/client"
 	"github.com/wilbowes/EchoMuse/internal/config"
+	"github.com/wilbowes/EchoMuse/internal/cue"
 	"github.com/wilbowes/EchoMuse/internal/proto"
 	"github.com/wilbowes/EchoMuse/internal/render"
 	"github.com/wilbowes/EchoMuse/internal/server"
@@ -171,19 +172,25 @@ func alertWAV(samples int) ([]byte, string) {
 type epochCall struct{ mic, ref, micRingEnd uint64 }
 
 type fakeUplink struct {
-	rings    uplink.Rings
-	mu       sync.Mutex
-	epochs   []epochCall
-	opened   map[string]uint64
-	accepted map[string]bool
-	gens     map[string]uint32
-	mutes    int
+	rings      uplink.Rings
+	mu         sync.Mutex
+	epochs     []epochCall
+	opened     map[string]uint64
+	accepted   map[string]bool
+	gens       map[string]uint32
+	mutes      int
+	diagnostic bool
 }
 
 func (f *fakeUplink) Attach(client.AudioSink, uplink.SendFunc) {}
 func (f *fakeUplink) Detach()                                  {}
 func (f *fakeUplink) Notify()                                  {}
 func (f *fakeUplink) Run(context.Context)                      {}
+func (f *fakeUplink) DiagnosticLive() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.diagnostic
+}
 func (f *fakeUplink) SetEpochs(mic, ref uint64) {
 	f.mu.Lock()
 	f.epochs = append(f.epochs, epochCall{mic, ref, f.rings.Mic.End()})
@@ -239,12 +246,20 @@ func (m *fakeMic) Read() (pkgmic.Block, error) { <-m.closed; return pkgmic.Block
 func (m *fakeMic) Drops() uint64               { return 0 }
 func (m *fakeMic) Close()                      {}
 
-type fakeSink struct{}
+// gateSink lets a test run the real mixer: each Write blocks until the test
+// takes it from writes, or done closes.
+type gateSink struct{ writes, done chan struct{} }
 
-func (fakeSink) Write([]int16) error       { return nil }
-func (fakeSink) SetOnComplete(func(int64)) {}
-func (fakeSink) Restart() error            { return nil }
-func (fakeSink) Close() error              { return nil }
+func (g gateSink) Write([]int16) error {
+	select {
+	case g.writes <- struct{}{}:
+	case <-g.done:
+	}
+	return nil
+}
+func (gateSink) SetOnComplete(func(int64)) {}
+func (gateSink) Restart() error            { return nil }
+func (gateSink) Close() error              { return nil }
 
 type fakeHW struct {
 	mu  sync.Mutex
@@ -276,6 +291,8 @@ type harness struct {
 	phys *server.Server
 	up   *fakeUplink
 	sess *fakeSession
+	gate gateSink
+	mixg sync.WaitGroup // the mixer goroutine, once mix runs it
 	now  atomic.Int64
 	pcm  []int16
 }
@@ -304,7 +321,8 @@ func newHarness(t *testing.T, o opts) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := &harness{t: t, hw: &fakeHW{dac: 90}, pcm: make([]int16, 1280)}
+	h := &harness{t: t, hw: &fakeHW{dac: 90}, pcm: make([]int16, 1280),
+		gate: gateSink{writes: make(chan struct{}), done: make(chan struct{})}}
 	h.now.Store(int64(1000 * time.Second))
 	h.phys = server.New(server.Config{Hardware: h.hw, StatePath: filepath.Join(dir, "state.json")})
 	s, err := Assemble(Config{
@@ -315,7 +333,7 @@ func newHarness(t *testing.T, o opts) *harness {
 		SpeechStore: speech, AlertStore: sounds,
 		NowMonoNS: h.now.Load,
 	}, Deps{
-		Sink:      fakeSink{},
+		Sink:      h.gate,
 		LoadModel: func(wakeword.Paths) (detector.Scorer, error) { return nil, os.ErrNotExist },
 		Alerts:    alerts.Config{Root: filepath.Join(dir, "alerts"), BootID: "boot", WakeLock: lock, Clock: &monoClock{ns: h.now.Load()}},
 		NewUplink: func(r uplink.Rings, _ uplink.Clock, _ func() int64) Uplink {
@@ -328,12 +346,35 @@ func newHarness(t *testing.T, o opts) *harness {
 	}
 	h.s = s
 	t.Cleanup(func() {
+		close(h.gate.done)
+		_ = s.mix.Close()
+		h.mixg.Wait()
 		s.endSession()
 		s.wg.Wait()
 		s.det.Close()
 		_ = s.ex.Close()
 	})
 	return h
+}
+
+// mix runs the real mixer for two sink writes, so every event of the first
+// write's blocks has been delivered, and returns the latest final-mix mask.
+// The mixer stays parked in its next write until cleanup.
+func (h *harness) mix() uint8 {
+	h.t.Helper()
+	h.mixg.Add(1)
+	go func() {
+		defer h.mixg.Done()
+		_ = h.s.mix.Run()
+	}()
+	for range 2 {
+		select {
+		case <-h.gate.writes:
+		case <-time.After(5 * time.Second):
+			h.t.Fatal("mixer made no sink write")
+		}
+	}
+	return uint8(h.s.lastMask.Load())
 }
 
 // block delivers one 80 ms capture callback completing at doneNs.
@@ -505,6 +546,89 @@ func TestSilentCandidateDoesNotDuck(t *testing.T) {
 	h.s.onCandidate(detector.Candidate{CandidateID: "c1", LeaseID: "L1", ProducingSound: false})
 	if out := h.s.fm.Output(); out.Mix.ContentDuckDB != 0 {
 		t.Fatalf("idle candidate ducked: %+v", out)
+	}
+}
+
+// wakeSound pushes the retained config message's wakeSound.
+func (h *harness) wakeSound(on bool) {
+	h.control(proto.TypeConfig, 0, config.Message{WakeSound: &on})
+}
+
+// local_wake_chime: with config wakeSound on, an idle candidate on a
+// connected device starts the built-in chime and reports chimed:true; while
+// producing sound, with an alert active, during a diagnostic lease, without
+// a session or with wakeSound off the chime is left to the controller.
+func TestLocalWakeChimeOnlyForIdleConnectedCandidates(t *testing.T) {
+	cases := []struct {
+		name      string
+		setup     func(*harness)
+		producing bool
+		lost      bool
+		chimed    bool
+	}{
+		{name: "idle", chimed: true},
+		{name: "wakeSound off", setup: func(h *harness) { h.wakeSound(false) }},
+		{name: "producing sound", producing: true},
+		{name: "active alert", setup: func(h *harness) { h.ringTimer("t1") }},
+		{name: "diagnostic lease", setup: func(h *harness) { h.up.diagnostic = true }},
+		{name: "no session", lost: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, opts{})
+			h.ready()
+			h.wakeSound(true)
+			if tc.setup != nil {
+				tc.setup(h)
+			}
+			if tc.lost {
+				h.s.Lost(client.LostTimeout)
+			}
+			h.s.onCandidate(detector.Candidate{CandidateID: "c1", LeaseID: "L1", ProducingSound: tc.producing})
+			if earcon := h.mix()&render.MaskEarcon != 0; earcon != tc.chimed {
+				t.Fatalf("earcon in the final mix = %v, want %v", earcon, tc.chimed)
+			}
+			wc := h.sess.of(proto.TypeWakeCandidate)
+			switch {
+			case tc.lost && len(wc) != 0:
+				t.Fatalf("wake.candidate without a session: %v", wc)
+			case !tc.lost && (len(wc) != 1 || wc[0].body["chimed"] != tc.chimed):
+				t.Fatalf("wake.candidate %v, want chimed:%v", wc, tc.chimed)
+			}
+			if p := h.sess.of(proto.TypeRenderProgress); len(p) != 0 {
+				t.Fatalf("device-local chime reported: %v", p)
+			}
+		})
+	}
+}
+
+// The local chime replaces a playing controller earcon (reported cancelled)
+// without deadlocking on the mixer's synchronous hooks, is itself never
+// reported, and leaves the earcon fence where the controller set it.
+func TestLocalWakeChimeIsUnreportedAndUnfenced(t *testing.T) {
+	h := newHarness(t, opts{})
+	h.ready()
+	h.wakeSound(true)
+	chime := cue.WakeChime
+	start := func(id string) string {
+		return h.control(proto.TypeRenderStart, 3, proto.RenderStart{PlaybackID: id, SourceClass: render.Earcon, Format: 1, LocalAsset: &chime})
+	}
+	h.expectAck(start("e1"), proto.AckAccepted, "")
+	h.s.onCandidate(detector.Candidate{CandidateID: "c1", LeaseID: "L1"})
+	if wc := h.sess.of(proto.TypeWakeCandidate); len(wc) != 1 || wc[0].body["chimed"] != true {
+		t.Fatalf("wake.candidate %v", wc)
+	}
+	if h.mix()&render.MaskEarcon == 0 {
+		t.Fatal("local chime not in the final mix")
+	}
+	h.expectAck(start("e2"), proto.AckAccepted, "")
+
+	if p := h.sess.of(proto.TypeRenderProgress); len(p) != 0 {
+		t.Fatalf("render.progress %v: only the unmixed controller earcons exist", p)
+	}
+	fin := h.sess.of(proto.TypeRenderFinished)
+	if len(fin) != 1 || fin[0].body["playback_id"] != "e1" || fin[0].body["reason"] != string(render.Cancelled) {
+		t.Fatalf("render.finished %v, want only e1 cancelled", fin)
 	}
 }
 

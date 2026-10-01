@@ -144,9 +144,12 @@ type Playback struct {
 // frames handed to the sink and completed by it. MonoNS anchors the render
 // epoch's completed frontier. MissingFrom/MissingTo (render-epoch frames,
 // half-open) are meaningful only for EventUnderrun; GainDB only for EventGain.
+// Local marks a device-originated playback (Mixer.StartLocal), which the
+// controller never started and is not told about.
 type Progress struct {
 	PlaybackID        string
 	Generation        uint32
+	Local             bool
 	Event             ProgressEvent
 	SubmittedFrames   uint64
 	CompletedFrames   uint64
@@ -160,10 +163,11 @@ type Progress struct {
 }
 
 // Finished is a render.finished body. LastCompletedFrame is the exclusive
-// completed source-frame frontier.
+// completed source-frame frontier. Local is as for Progress.
 type Finished struct {
 	PlaybackID         string
 	Generation         uint32
+	Local              bool
 	LastCompletedFrame uint64
 	Reason             FinishReason
 	TimingQuality      TimingQuality

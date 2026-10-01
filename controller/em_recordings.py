@@ -10,8 +10,8 @@ capture quality before spending an evening on the room and the placement.
 Storage: files live in `recordings/` beside the
 SQLite DB, so they sit inside the persisted Docker volume and survive image
 upgrades. Retention is a hard per-device file count (KEEP_PER_DEVICE) —
-utterances are the one artefact here that contains raw speech, so "a
-bounded handful, then gone" is the point, not an optimisation. Pruning is
+utterances are the one artefact here that contains raw speech, so a bounded
+window, then gone, is the point, not an optimisation. Pruning is
 by turn id parsed out of the filename rather than mtime: ids are monotonic
 rowids, so the order is exact even if the volume is restored from a backup
 that flattened timestamps.
@@ -41,9 +41,10 @@ log = logging.getLogger("echomuse.recordings")
 
 RECORDINGS_SUBDIR = "recordings"
 
-# How many utterances to keep per device. Ten is what the feature was asked
-# for and is deliberately small — see the module docstring.
-KEEP_PER_DEVICE = 10
+# How many utterances to keep per device: enough for an endpoint and ASR
+# evaluation corpus. The STT copy runs ~100–200 kB per turn, so 300 is
+# ~30–60 MB per device (at most 300 × MAX_UTTERANCE_BYTES ≈ 290 MB).
+KEEP_PER_DEVICE = 300
 
 # Format of the STT copy (em_stt_copy): 16 kHz mono PCM16.
 SAMPLE_RATE  = 16000

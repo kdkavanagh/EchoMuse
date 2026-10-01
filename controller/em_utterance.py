@@ -300,6 +300,7 @@ class UtteranceTrace(TypedDict):
     stable_prefix: str
     streaming_text: str
     heard: str
+    finalized: list[int]           # through-samples of ASR results finalized at a pause (§16.6)
     endpoint: list[EndpointEvent]
 
 
@@ -408,6 +409,7 @@ class Utterance:
         self._window: Window | None = None
         self._first_token: int | None = None
         self._events: list[EndpointEvent] = []
+        self._finalized: list[int] = []
         self._pending_since: int | None = None
         self.decision: Commit | Close | None = None
         self.has_command_speech = False
@@ -461,7 +463,8 @@ class Utterance:
             self.has_command_speech = True
 
     def push_asr(self, tokens: Sequence[str], emission_samples: Sequence[int], trailing_blanks: int,
-                 through: int) -> None:
+                 through: int, *, finalized: bool) -> None:
+        """One ASR observation; `finalized` marks a result finalized at a pause (§16.6)."""
         if self.done:
             return
         if through < self._asr_through:
@@ -469,6 +472,8 @@ class Utterance:
         self._asr.append(_AsrResult(through, StreamingTranscript.from_tokens(tokens, emission_samples),
                                     trailing_blanks))
         self._asr_through = through
+        if finalized:
+            self._finalized.append(through)
 
     def advance(self, valid_audio_end: int) -> list[Decision]:
         """Evaluate every block end the evidence frontier has passed.
@@ -568,6 +573,7 @@ class Utterance:
             stable_prefix=self._stability.current.prefix,
             streaming_text=self._text,
             heard=self._heard,
+            finalized=list(self._finalized),
             endpoint=list(self._events),
         )
 

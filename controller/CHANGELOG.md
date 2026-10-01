@@ -220,6 +220,45 @@ the device wire protocol is [docs/protocol-v1.md](../docs/protocol-v1.md).
   alerts; an input-device handle leaked when the second button device failed
   to open.
 
+### Turn latency and reliability
+
+Based on a review of Office turns 433–476 (`docs/turn-latency-review.md`,
+`docs/streaming-asr-eou-evaluation.md`).
+
+- **Replies no longer hang when Home Assistant answers with its
+  acknowledge chime.** A local command aimed at the speaker's own area ("next",
+  "stop") makes HA play `acknowledge.mp3`. A reply fetch that reached HA before
+  it had made that choice was never answered, and the turn stayed open for
+  about 20 s. The controller now fetches the reply at `intent-progress`
+  `tts_start_streaming` (streaming LLM answers) or at `tts-end`, never at
+  `run-start`. The ESPHome reply path follows the same rule.
+- **A reply that does not start within 10 s of intent-end ends as a response
+  timeout.** The limit was 5 s, and streamed replies were allowed 120 s.
+- **"Stop" said while a reply is still silent reaches Home Assistant.** It was
+  treated as "stop the reply", so HA never received it and the music kept
+  playing. A wake now cancels a reply only once its audio can be heard.
+- **Faster endpoints (policy `post_afe_3`).**
+  - After 320 ms of pause, the controller re-decodes the whole utterance to
+    get the streaming model's final words at once. Previously it waited up to
+    1.28 s for the model's next update.
+  - The 240 ms text-stability wait is removed; it checked nothing.
+  - For text taken from that re-decode, route A's trailing-silence check uses
+    VAD silence after the last speech.
+- **Wake verification and span re-decode decode the end of their window.**
+  Their zero flush is 1.5 s (was 0.5 s), which reaches the model's next chunk
+  edge. Replayed wake clips that returned empty text now transcribe.
+- **Turn rows keep their decision trace** (schema v26): `decision_trace`,
+  kept for the newest 1,000 turns per device, and `first_audio_ms`, the time
+  from the endpoint to the reply becoming audible. Activity shows it as "first
+  audio … after endpoint".
+- **Save utterances keeps the last 300 turns per device** (was 10).
+- **The Dot starts the wake chime itself, without a controller round trip.** Firmware
+  with the new `local_wake_chime` capability chimes on its own when it opens
+  an idle wake, instead of waiting for the controller to accept it; the
+  controller sends it `wakeSound` and skips its own chime when
+  `wake.candidate` reports `chimed`. Wakes heard while the Dot is playing
+  audio, and older firmware, still chime after acceptance.
+
 ### Earlier in this release
 
 - ASR gain: the STT copy sent to Home Assistant is amplified by

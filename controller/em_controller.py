@@ -532,7 +532,8 @@ async def _pipeline_id(device_id: str) -> str:
 
 async def _persist_turn(device_id: str, record: Mapping[str, object]) -> int:
     turn_id = await asyncio.to_thread(db.insert_turn, device_id, record)
-    await api.push_turn_complete(device_id, {**record, "turn_id": turn_id})
+    pushed = {k: v for k, v in record.items() if k not in db.TURN_WRITE_ONLY_COLUMNS}
+    await api.push_turn_complete(device_id, {**pushed, "turn_id": turn_id})
     return turn_id
 
 

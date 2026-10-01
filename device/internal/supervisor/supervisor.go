@@ -57,6 +57,8 @@ type Uplink interface {
 	Renew(proto.Envelope, proto.UplinkRenew) (converted bool, err error)
 	Close(proto.Envelope, proto.UplinkClose) (candidateLease bool, err error)
 	Notify()
+	// DiagnosticLive reports a live diagnostic lease (no local wake chime).
+	DiagnosticLive() bool
 	Run(context.Context)
 }
 

@@ -167,7 +167,10 @@ also carries the loudness readings and, when the Dot is making sound, what it
 played. The controller renews the lease every second; if the controller
 disappears, the lease expires on its own within 3 seconds.
 
-If **Wake chime** is on (off by default), the Dot plays a short earcon.
+If **Wake chime** is on (off by default), the Dot plays a short earcon. On
+current firmware it does not wait for this stage: it chimes the moment it
+detects the wake word. Only a wake heard while the Dot is playing audio, or on
+older firmware, chimes here, once the controller has accepted it.
 
 **Benefit:** microphone audio flows only while a turn needs it, and only to
 your controller.
@@ -204,14 +207,17 @@ after you, counts as your command.
 
 ## Stage 7 — Deciding you've finished
 
-The **endpoint reducer** (`em_endpoint_policy`, fixed policy `post_afe_2`)
+The **endpoint reducer** (`em_endpoint_policy`, fixed policy `post_afe_3`)
 decides when your utterance ends, measured in audio time, never wall-clock
 time, so a slow network cannot shorten or lengthen a pause. It ends a turn in
 one of these ways:
 
 - **Normal pause.** The speech detector, the transcriber's trailing silence,
-  and stable text all agree you stopped. How long it waits depends on whether
-  your words already form a complete command: 608 ms for a complete one
+  and the transcript all agree you stopped. The streaming transcriber only
+  updates every 1.28 s, so 320 ms into each pause the controller re-transcribes
+  the whole utterance at once to get your last word without waiting for it.
+  How long it waits depends on whether your words already form a complete
+  command: 608 ms for a complete one
   ("turn off the kitchen lights", "stop"), 1,216 ms when a longer name could
   follow ("turn off the kitchen…"), 1,792 ms otherwise, including every
   free-form question. For those 1,792 ms waits, speech clearly quieter than

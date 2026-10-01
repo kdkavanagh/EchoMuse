@@ -121,3 +121,10 @@ def summarise(section_ids: Iterable[object] | None) -> str:
     if n == 0:
         return "Fleet"
     return f"Local override ({n} of {len(SECTION_IDS)})"
+
+
+def wake_sound(cfg: Mapping[str, object]) -> bool:
+    """Whether wakeSound is on, for both chime gates: the controller's chime
+    on acceptance and the `wakeSound` pushed to a `local_wake_chime` device.
+    Only JSON true counts: the device decodes the key as a strict boolean."""
+    return cfg.get("wakeSound") is True

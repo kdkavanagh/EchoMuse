@@ -102,7 +102,7 @@ is never filled.
 ```json
 {"capabilities":["audio_timeline_v1","uplink_leases_v1","device_wake_v1",
   "render_reference_v1","render_progress_v1","focus_leases_v1","alert_cache_v1",
-  "turn_protocol_v1","leds","led_anim","buttons","button_hold","alert_prefetch","ambient_light"],
+  "turn_protocol_v1","leds","led_anim","buttons","button_hold","alert_prefetch","local_wake_chime","ambient_light"],
  "firmware_version":"v3.0.0","boot_id":"<proc boot_id>","protocols":[1],
  "ip":"10.0.0.5","ambient_light_status":{},
  "privacy":{"muted":false,"capture_epoch":"123"},
@@ -114,6 +114,8 @@ is never filled.
 `alert_cache_v1` is withheld when the wakelock cannot be acquired
 (`alerts.wakeup = "alarm_wakeup_unavailable"`). `ambient_light` only when the
 sensor is readable. `ambient_light_status` is the legacy `als.Report()` object.
+`local_wake_chime`: the device plays the wake chime itself at candidate open
+when `config` `wakeSound` is true (§4.4).
 
 **`session.ready`** C→D
 ```json
@@ -190,6 +192,10 @@ Per-event fields present only for that event.
 `{"playback_id":"…","last_completed_frame":"…","reason":"drained|cancelled|failed|underrun","timing_quality":"estimated"}`.
 `drained` is declared 150 ms after the last buffer completion.
 
+`render.progress` and `render.finished` report only playbacks the controller
+started. A device-originated local playback (the `local_wake_chime` chime) is
+mixed like any other, reference included, but never reported.
+
 ### 4.3 Focus
 
 **`focus.acquire`** C→D, gen = owner generation:
@@ -209,7 +215,7 @@ playback plays unless ducked or paused by an alert foreground.
 ```json
 {"candidate_id":"uuid","lease_id":"uuid","capture_epoch":"…","graph_sha256":"…",
  "scorer_revision":3,"profile":"idle|playback","threshold":0.9,
- "producing_sound":false,"first_crossing_end":"…","support_start":"…",
+ "producing_sound":false,"chimed":false,"first_crossing_end":"…","support_start":"…",
  "mono_ns":"…",
  "active_alert":{"id":"…","kind":"alarm|timer","name":"…","foreground":true},
  "hops":[{"end_sample":"…","raw":0.93,"smoothed":0.91,"profile":"idle"}]}
@@ -217,6 +223,14 @@ playback plays unless ducked or paused by an alert foreground.
 `hops` holds one record per hop slot from the slot whose window starts at
 `support_start` through the opening hop; `raw`/`smoothed` null for unscored slots.
 `active_alert` is null when nothing is ringing or backgrounded.
+`chimed` is true iff the device started the built-in wake chime for this
+candidate. It does so before sending `wake.candidate`, only with `config`
+`wakeSound` true, a session, `producing_sound` false, `active_alert` null and
+no live `diagnostic` lease, as an `earcon` at the slot's current generation
+(the fence is not raised; the controller's next earcon `render.start` replaces
+it). The chime is not cancelled if the candidate is rejected. The controller
+plays the chime on acceptance only when `chimed` is false; absent (older
+firmware) means false.
 
 **`wake.candidate_end`** D→C: `{"candidate_id":"…","support_end":"…","peak_smoothed":0.95,"reason":"below|gap|reset|mute|overrun"}`.
 
@@ -341,7 +355,8 @@ fields unchanged:
 - D→C: `volume_state`, `ambient_light`, `log`, `wifi_result`,
   `wifi_scan_result`, `ble_adverts`, `stats`, `pong`.
 
-`config` keys after cutover: `startupVolume`, `duckDb`, `bleProxyEnabled`.
+`config` keys after cutover: `startupVolume`, `duckDb`, `bleProxyEnabled`, and
+`wakeSound` (JSON boolean) only to a device announcing `local_wake_chime`.
 
 ## 5. Transport rules
 

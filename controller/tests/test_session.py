@@ -9,6 +9,7 @@ endpoint decision runs through the real CellAssembler/Attributor/reducer.
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from dataclasses import dataclass
 
@@ -128,11 +129,13 @@ class FakeRender:
         self.streams: list[FakePlayback] = []
         self.local: list[tuple[str, str]] = []
         self.failed = None
+        self.autostart = True          # False: a stream's audio starts only when the test says
 
     async def play_stream(self, source_class, pcm48, *, generation, gain_db=0.0, announcement=False):
         assert source_class == "dialog_output"
         playback = FakePlayback(pcm48, generation, announcement)
-        playback.start()
+        if self.autostart:
+            playback.start()
         self.streams.append(playback)
         return playback
 
@@ -266,7 +269,7 @@ class FakeWorker:
         emitted = [(t, s) for t, s in self.tokens if start <= s <= fed]
         last = emitted[-1][1] if emitted else start
         self.post(lease_id, "asr", fed, AsrPayload(
-            tuple(t for t, _ in emitted), tuple(s for _, s in emitted), "", None, (fed - last) // 640, None),
+            tuple(t for t, _ in emitted), tuple(s for _, s in emitted), "", None, (fed - last) // 640, None, False),
             utt_id)
 
     def submit_mic_block(self, lease_id, first, pcm, *, flags=0):
@@ -452,15 +455,18 @@ S = 48_000                  # candidate support start
 OPEN = S + 12_800           # opening hop end = trigger
 
 
-def candidate(*, producing_sound=False, active_alert=None, lease="L1", cid="C1"):
+def candidate(*, producing_sound=False, active_alert=None, lease="L1", cid="C1", chimed=None):
     hops = [{"end_sample": str(S + 2_560 * k), "raw": 0.95 if k == 5 else 0.3,
              "smoothed": 0.92 if k == 5 else 0.3, "profile": "playback" if producing_sound else "idle"}
             for k in range(1, 6)]
-    return envelope("wake.candidate", {
+    body = {
         "candidate_id": cid, "lease_id": lease, "capture_epoch": str(MIC_EPOCH), "graph_sha256": "g" * 64,
         "scorer_revision": 3, "profile": hops[0]["profile"], "threshold": 0.9 if not producing_sound else 0.65,
         "producing_sound": producing_sound, "first_crossing_end": str(OPEN), "support_start": str(S),
-        "mono_ns": "1", "active_alert": active_alert, "hops": hops}, message_id=f"msg-{cid}")
+        "mono_ns": "1", "active_alert": active_alert, "hops": hops}
+    if chimed is not None:
+        body["chimed"] = chimed
+    return envelope("wake.candidate", body, message_id=f"msg-{cid}")
 
 
 def speech(*spans):
@@ -488,6 +494,19 @@ def test_idle_wake_is_accepted_and_its_candidate_lease_becomes_the_turn_lease():
         assert h.render.local == [("earcon", "builtin:wake_chime")]
         assert h.actor.state == "ARMED" and h.actor.turn_active
         assert h.arbiter.claim("other", 0.7) == "dev1"
+        await h.actor.close()
+    run(main())
+
+
+@pytest.mark.parametrize("chimed, controller_chime", [(False, True), (True, False)])
+def test_the_controller_chimes_an_accepted_wake_only_when_the_device_did_not(chimed, controller_chime):
+    async def main():
+        h = Harness()
+        await h.start()
+        h.actor.on_message(candidate(chimed=chimed))
+        await h.settle()
+        assert h.actor.state == "ARMED" and h.actor.turn_active
+        assert h.render.local == ([("earcon", "builtin:wake_chime")] if controller_chime else [])
         await h.actor.close()
     run(main())
 
@@ -638,6 +657,9 @@ def test_a_wake_turn_records_each_stage_what_asr_heard_what_ha_transcribed_and_w
         assert row["response_text"] == "It is noon." and row["response_type"] == "query_answer"
         assert row["intent_local"] is True
         assert row["intent_ms"] is not None and row["tts_url_ms"] is not None
+        assert row["first_audio_ms"] is not None and 0 <= row["first_audio_ms"] <= row["total_ms"]
+        trace = json.loads(row["decision_trace"])
+        assert trace["turn_id"] == row["turn_uuid"] and trace["first_audio_ms"] == row["first_audio_ms"]
         await h.actor.close()
     run(main())
 
@@ -904,7 +926,7 @@ def test_an_answer_to_home_assistants_question_is_sent_on_in_its_conversation_wi
 def test_a_streamed_answer_that_ends_in_a_question_watches_for_a_reply_while_it_plays():
     async def main():
         h = Harness()
-        run_ = FakeRun([TtsReady("http://ha/tts/s", True)])
+        run_ = FakeRun([TtsReady("http://ha/tts/s", True)])   # intent-progress released the stream
         h.ha.next_run = run_
         await button_turn(h, PRESS + 50_000)
         await h.wait_for(lambda: h.render.streams)          # audible before intent-end
@@ -916,6 +938,64 @@ def test_a_streamed_answer_that_ends_in_a_question_watches_for_a_reply_while_it_
         assert not response.done
         response.finish("drained")
         await h.wait_for(lambda: h.actor.state == "EXPECT_REPLY")
+        await h.actor.close()
+    run(main())
+
+
+def test_a_streamed_reply_whose_audio_never_starts_times_out_response_start_s_after_intent_end(monkeypatch):
+    monkeypatch.setattr(em_session, "RESPONSE_START_S", 0.3)
+
+    async def main():
+        h = Harness()
+        h.render.autostart = False
+        run_ = FakeRun([TtsReady("http://ha/tts/s", True)])
+        h.ha.next_run = run_
+        await button_turn(h, PRESS + 50_000)
+        await h.wait_for(lambda: h.render.streams)
+        await asyncio.sleep(0.5)            # before intent-end only HA's own limit bounds the start
+        assert not h.render.streams[0].done and not h.terminals()
+        loop = asyncio.get_running_loop()
+        run_.queue.put_nowait(IntentEnded("Once upon a time.", "conv-1", False, "action_done", False))
+        run_.queue.put_nowait(RunEnded())
+        intent_end = loop.time()
+        await h.wait_for(lambda: h.terminals(), timeout=3)
+        assert h.terminals()[0] == "response_timeout"
+        assert 0.25 <= loop.time() - intent_end < 1.5
+        assert h.render.streams[0].done
+        await h.wait_for(lambda: h.rows)
+        row = h.rows[0]
+        assert row["playback_reason"] == "response_timeout" and row["first_audio_ms"] is None
+        await h.actor.close()
+    run(main())
+
+
+@pytest.mark.parametrize("audible", [True, False])
+def test_stop_is_a_local_dialog_stop_only_while_the_reply_is_audible(audible):
+    async def main():
+        h = Harness()
+        h.render.autostart = audible
+        stop = (OPEN + 3_200, OPEN + 7_296)
+        h.worker.vad = speech((S, OPEN - 512), stop)
+        h.device.level = levels((S, OPEN - 512), stop)
+        h.worker.tokens = [("▁OPHELIA", OPEN - 1_800), ("▁STOP", OPEN + 5_200)]
+        h.ha.stt_text = "Ophelia, stop."
+        h.ha.next_run = FakeRun([IntentEnded("", None, False, "action_done", True), RunEnded()])
+        await h.start()
+        announce = asyncio.create_task(h.actor.announce("http://ha/announce", preannounce_url=None,
+                                                        start_conversation=False))
+        await h.wait_for(lambda: h.render.streams)
+        h.actor.on_message(candidate())
+        await h.settle()
+        # A reply the user cannot hear yet is no command context: an ordinary wake, chime included.
+        assert h.render.local == ([] if audible else [("earcon", "builtin:wake_chime")])
+        await h.feed(S - 4_800 - 20_000, OPEN + 40_000)
+        await h.wait_for(lambda: h.rows)
+        row = h.rows[0]
+        if audible:
+            assert row["outcome"] == "local_command" and h.ha.stt_calls == [] and h.ha.intents == []
+        else:
+            assert row["outcome"] == "ha" and len(h.ha.intents) == 1
+        announce.cancel()
         await h.actor.close()
     run(main())
 

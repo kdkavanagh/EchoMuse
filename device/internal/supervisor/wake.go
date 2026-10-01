@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 
+	"github.com/wilbowes/EchoMuse/internal/cue"
 	"github.com/wilbowes/EchoMuse/internal/focus"
 	"github.com/wilbowes/EchoMuse/internal/proto"
 	"github.com/wilbowes/EchoMuse/internal/render"
@@ -12,11 +13,17 @@ import (
 	"github.com/wilbowes/EchoMuse/internal/wakeword/detector"
 )
 
+// localChimePrefix names the device-local wake chime's playback; the
+// mixer marks it Local, so it is never reported.
+const localChimePrefix = "local-wake-chime:"
+
 // wakeCandidate is the wake.candidate body: the detector's fields plus the
-// supervisor's active_alert, marshalled flat (WIRE §4.4).
+// supervisor's active_alert and whether the device chimed, marshalled flat
+// (WIRE §4.4).
 type wakeCandidate struct {
 	detector.Candidate
 	ActiveAlert *proto.ActiveAlert `json:"active_alert"`
+	Chimed      bool               `json:"chimed"`
 }
 
 // profile selects the §5.3 threshold profile from the device's own mix:
@@ -36,13 +43,17 @@ func (s *Supervisor) producingSound(from, to uint64) bool {
 }
 
 // onCandidate opens the candidate lease and, when the device was producing
-// sound, the provisional duck, then reports the candidate. The controller
-// decides every candidate, including while capture is not permitted.
+// sound, the provisional duck, starts the local wake chime when it applies,
+// then reports the candidate. The controller decides every candidate,
+// including while capture is not permitted.
 func (s *Supervisor) onCandidate(c detector.Candidate) {
 	s.up.OpenCandidate(c.LeaseID, c.SupportStart)
 	// The provisional duck waits for the ack exactly as long as its lease.
 	s.fm.CandidateOpen(c.CandidateID, c.ProducingSound, uplink.CandidateAckWait)
 	body := wakeCandidate{Candidate: c, ActiveAlert: s.activeAlert()}
+	// Before the report and outside mu: the mixer delivers its queued
+	// finished/progress hooks, which lock mu, on this goroutine.
+	body.Chimed = s.localWakeChime(c, body.ActiveAlert != nil)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -57,6 +68,28 @@ func (s *Supervisor) onCandidate(c detector.Candidate) {
 		return
 	}
 	s.candidateAck[id] = c.LeaseID
+}
+
+// localWakeChime plays the wake chime the moment an idle candidate opens
+// (config wakeSound) instead of after the controller's acceptance. Never
+// while disconnected (a chime followed by nothing), producing sound (the
+// controller verifies those wakes and chimes on acceptance), with an alert
+// active (the wake stops it) or during a diagnostic lease (wakes are
+// refused). A rejected candidate keeps its chime. Must not hold mu.
+func (s *Supervisor) localWakeChime(c detector.Candidate, alertActive bool) bool {
+	if !s.cfg.DeviceConfig.Get().WakeSound || c.ProducingSound || alertActive ||
+		!s.connected() || s.up.DiagnosticLive() {
+		return false
+	}
+	pcm, err := cue.Asset(cue.WakeChime)
+	if err == nil {
+		err = s.mix.StartLocal(localChimePrefix+c.CandidateID, render.Earcon, pcm, 0)
+	}
+	if err != nil {
+		log.Printf("[wake] local chime: %v", err)
+		return false
+	}
+	return true
 }
 
 func (s *Supervisor) onCandidateEnd(e detector.CandidateEnd) {

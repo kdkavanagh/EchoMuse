@@ -326,6 +326,36 @@ func TestGenerationFencing(t *testing.T) {
 	}
 }
 
+// A device-local earcon plays at the slot's fence without raising it: the
+// controller's next earcon at that generation still replaces it, and the
+// local playback's events are marked Local.
+func TestLocalStartNeitherRaisesNorIsBlockedByTheFence(t *testing.T) {
+	r := newRig(t, nil, true)
+	r.must(r.m.Start(Playback{ID: "ctl1", Generation: 5, Class: Earcon, PCM: make([]int16, 5000)}))
+	r.must(r.m.StartLocal("local", Earcon, make([]int16, 5000), 0))
+	r.step(1)
+	if len(r.finished) != 1 || r.finished[0].PlaybackID != "ctl1" || r.finished[0].Local {
+		t.Fatalf("local start did not replace the controller earcon: %+v", r.finished)
+	}
+	if got := r.masks[len(r.masks)-1]; got != MaskEarcon {
+		t.Fatalf("local earcon not in the mix: mask %d", got)
+	}
+	if starts := r.events(EventStart); len(starts) != 1 || starts[0].PlaybackID != "local" || !starts[0].Local {
+		t.Fatalf("local start events %+v", starts)
+	}
+
+	r.must(r.m.Start(Playback{ID: "ctl2", Generation: 5, Class: Earcon, PCM: make([]int16, 5000)}))
+	if len(r.finished) != 2 || r.finished[1].PlaybackID != "local" || !r.finished[1].Local {
+		t.Fatalf("controller earcon at the fence did not replace the local one: %+v", r.finished)
+	}
+	if err := r.m.Start(Playback{ID: "old", Generation: 4, Class: Earcon, PCM: make([]int16, 5000)}); !errors.Is(err, ErrStale) {
+		t.Fatalf("fence lowered: older generation start = %v", err)
+	}
+	if err := r.m.StartLocal("net", Content, nil, 0); !errors.Is(err, ErrInvalidClass) {
+		t.Fatalf("local network start = %v", err)
+	}
+}
+
 // startContent plays constant content at unity and returns the tap index of
 // its first sample.
 func startContent(r *rig, value int16, frames int) int {

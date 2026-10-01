@@ -8,7 +8,6 @@ therefore acquired-audio sample time; wall time is never an input.
 from __future__ import annotations
 
 import enum
-from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Sequence
 
@@ -46,10 +45,10 @@ ROUTE_B_STABLE = 9_728  # 608 ms
 ROUTE_B_BACKGROUND_FRACTION = 0.80
 ROUTE_R_PAUSE = 16_384  # 1,024 ms
 NO_PROGRESS = 3 * SAMPLE_RATE
-STABILITY_SPAN = 3_840  # 240 ms
 
-# §16.2 local-command precondition.
+# §16.2 local-command preconditions.
 LOCAL_PRE_ROLL = 7_680  # 480 ms
+LOCAL_STABLE = 3_840  # 240 ms without newer text before the commit
 
 CompletenessFn = Callable[[str], GrammarClass]   # `echomuse_grammar.classify(...).klass` of a text
 
@@ -76,7 +75,6 @@ class StableText:
 
     prefix: str
     prefix_tokens: tuple[str, ...]
-    tail: str
     latest_text: str
     prefix_sample: int | None
     progress_sample: int
@@ -88,22 +86,15 @@ def _tokens(text: str) -> tuple[str, ...]:
     return tuple(w.text for w in words(text))
 
 
-def _common_prefix(results: Sequence[tuple[str, ...]]) -> tuple[str, ...]:
-    if not results:
-        return ()
-    n = min(map(len, results))
-    i = 0
-    while i < n and all(tokens[i] == results[0][i] for tokens in results[1:]):
-        i += 1
-    return results[0][:i]
-
-
 class TextStability:
-    """Longest normalized token prefix unchanged across ≥3 results spanning ≥240 ms.
+    """The stable prefix is the latest result's normalized tokens (§16.6).
 
-    `prefix_sample` is the through-sample of the result in which the current
-    stable prefix became stable; `progress_sample` starts at the trigger and is
-    updated to that same sample whenever the stable prefix changes.
+    Kroko's greedy transducer only appends tokens, and only at its 1.28 s chunk
+    edges, so between edges consecutive results are identical and waiting for a
+    result to repeat checks nothing. `prefix_sample` is the through-sample of the
+    result in which the prefix last changed (None while it is empty);
+    `progress_sample` starts at the trigger and is updated to that same sample
+    whenever the prefix changes once a non-empty prefix has existed.
     """
 
     def __init__(
@@ -113,23 +104,19 @@ class TextStability:
     ) -> None:
         # Wake-turn ASR starts in the pre-roll, so results may precede the trigger.
         self._normalize_tokens = normalize_tokens or _tokens
-        self._results: deque[tuple[int, tuple[str, ...], str, int]] = deque()
         self._prefix: tuple[str, ...] = ()
         self._prefix_sample: int | None = None
         self._progress_sample = trigger_sample
         self._through: int | None = None
         self._trailing_blanks = 0
-        self._latest_tokens: tuple[str, ...] = ()
         self._latest_text = ""
         self._has_nonempty_prefix = False
 
     @property
     def current(self) -> StableText:
-        tail = " ".join(self._latest_tokens[len(self._prefix) :])
         return StableText(
             prefix=" ".join(self._prefix),
             prefix_tokens=self._prefix,
-            tail=tail,
             latest_text=self._latest_text,
             prefix_sample=self._prefix_sample,
             progress_sample=self._progress_sample,
@@ -141,27 +128,15 @@ class TextStability:
         if self._through is not None and through_sample < self._through:
             raise ValueError("ASR results must be in sample order")
         tokens = tuple(self._normalize_tokens(text))
-        self._results.append((through_sample, tokens, text, trailing_blank_frames))
         self._through = through_sample
         self._trailing_blanks = trailing_blank_frames
-        self._latest_tokens = tokens
         self._latest_text = text
-
-        history = list(self._results)
-        eligible = [i for i, r in enumerate(history) if through_sample - r[0] >= STABILITY_SPAN]
-        if eligible:
-            window = history[eligible[-1] :]
-            if len(window) >= 3:
-                prefix = _common_prefix([r[1] for r in window])
-                if prefix != self._prefix:
-                    self._prefix = prefix
-                    self._prefix_sample = through_sample if prefix else None
-                    if prefix or self._has_nonempty_prefix:
-                        self._progress_sample = through_sample
-                    self._has_nonempty_prefix |= bool(prefix)
-        # Only samples needed to establish a future 240 ms span are retained.
-        while len(self._results) > 1 and through_sample - self._results[1][0] >= STABILITY_SPAN:
-            self._results.popleft()
+        if tokens != self._prefix:
+            self._prefix = tokens
+            self._prefix_sample = through_sample if tokens else None
+            if tokens or self._has_nonempty_prefix:
+                self._progress_sample = through_sample
+            self._has_nonempty_prefix |= bool(tokens)
         return self.current
 
 
@@ -317,9 +292,6 @@ class EndpointReducer:
             return None
         if frontier - stable.prefix_sample < ROUTE_B_STABLE:
             return None
-        combined = stable.prefix if not stable.tail else f"{stable.prefix} {stable.tail}"
-        if stable.tail and self.completeness(combined) != GrammarClass.UNKNOWN:
-            return None
         after = [c for c in cells if c.end > stable.prefix_sample and c.speech_positive]
         background = sum(c.cls == CellClass.BACKGROUND_SPEECH for c in after)
         if not after or background < ROUTE_B_BACKGROUND_FRACTION * len(after):
@@ -440,16 +412,16 @@ def local_command_preconditions(
 ) -> bool:
     """§16.2 local-command gates after normal endpoint commit.
 
-    The full command text must have been stable for at least 240 ms. From
-    480 ms before the first command token's emission through the commit
-    boundary, fewer than half of speech-positive cells may be `self_output`.
+    The full command text must be unchanged for at least 240 ms before the
+    commit. From 480 ms before the first command token's emission through the
+    commit boundary, fewer than half of speech-positive cells may be `self_output`.
     """
     text = normalize_command(normalized_text)
     if not text or stable.prefix_sample is None or first_command_token_sample is None:
         return False
-    if stable.prefix != text or stable.tail:
+    if stable.prefix != text:
         return False
-    if stable.through_sample - stable.prefix_sample < STABILITY_SPAN:
+    if stable.through_sample - stable.prefix_sample < LOCAL_STABLE:
         return False
     start = first_command_token_sample - LOCAL_PRE_ROLL
     relevant = [c for c in cells if c.speech_positive and c.end > start and c.end <= commit_boundary]
