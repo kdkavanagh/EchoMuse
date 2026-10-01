@@ -269,6 +269,25 @@ def test_v26_adds_first_audio_and_trace_columns_to_existing_turns(tmp_path):
     assert row == ("t-1", None, None)                  # history kept; unmeasured reads NULL
 
 
+def test_v27_adds_the_wake_shadow_tables_to_an_existing_database(tmp_path):
+    p = str(tmp_path / "v26.db")
+    c = sqlite3.connect(p)
+    for sql in em_db.MIGRATIONS[:26]:
+        c.executescript(sql)
+    c.execute("INSERT INTO wake_counters (device_id, hour_ts, near_misses) VALUES ('D', 3600, 2)")
+    c.commit()
+    c.close()
+
+    em_db.init(p)
+    c = sqlite3.connect(p)
+    assert int(c.execute(VER).fetchone()[0]) == 27 == len(em_db.MIGRATIONS)
+    assert c.execute("SELECT near_misses FROM wake_counters").fetchone() == (2,)     # history kept
+    assert c.execute("SELECT COUNT(*) FROM wake_shadow").fetchone() == (0,)           # no data, not zeros
+    assert c.execute("SELECT COUNT(*) FROM wake_shadow_events").fetchone() == (0,)
+    assert "idx_wake_shadow_events_device_ts" in {
+        r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
+
+
 def test_connect_alerts_shares_database_but_not_connection(tmp_path):
     p = str(tmp_path / "alerts.db")
     em_db.init(p)

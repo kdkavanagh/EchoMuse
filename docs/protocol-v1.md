@@ -102,7 +102,8 @@ is never filled.
 ```json
 {"capabilities":["audio_timeline_v1","uplink_leases_v1","device_wake_v1",
   "render_reference_v1","render_progress_v1","focus_leases_v1","alert_cache_v1",
-  "turn_protocol_v1","leds","led_anim","buttons","button_hold","alert_prefetch","local_wake_chime","ambient_light"],
+  "turn_protocol_v1","leds","led_anim","buttons","button_hold","alert_prefetch","local_wake_chime",
+  "open_rules_v1","ambient_light"],
  "firmware_version":"v3.0.0","boot_id":"<proc boot_id>","protocols":[1],
  "ip":"10.0.0.5","ambient_light_status":{},
  "privacy":{"muted":false,"capture_epoch":"123"},
@@ -116,6 +117,10 @@ is never filled.
 sensor is readable. `ambient_light_status` is the legacy `als.Report()` object.
 `local_wake_chime`: the device plays the wake chime itself at candidate open
 when `config` `wakeSound` is true (§4.4).
+`open_rules_v1`: the device opens candidates on `session.ready`
+`detector.open_rules`, evaluates `detector.shadow_rules` without acting on
+them, names the opening rule in `wake.candidate.rule` and reports shadow
+counters in `wake.stats.shadow` (§4.4; architecture §5.2).
 
 **`session.ready`** C→D
 ```json
@@ -123,9 +128,33 @@ when `config` `wakeSound` is true (§4.4).
  "assets":{"runtime_sha256":"174233cf…","graph_sha256":"4eb74512…","sidecar_sha256":"25da0c65…"},
  "detector":{"thresholds":{"idle":0.90,"playback":0.65,"near_miss":0.17},
    "hop_blocks":2,"smoothing":3,"clear_after_unscored":6,
+   "open_rules":[{"profile":"idle","windows":3,"combine":"mean","threshold":0.90},
+                 {"profile":"playback","windows":3,"combine":"mean","threshold":0.65}],
+   "shadow_rules":[{"profile":"idle","windows":2,"combine":"mean","threshold":0.95}],
    "provisional_duck":{"duck_db":-18.0,"max_per_window":2,"window_ms":5000}},
  "utc_ms":"…"}
 ```
+`open_rules` and `shadow_rules` are sent only to a device announcing
+`open_rules_v1`. A rule is `{profile: "idle"|"playback", windows: 1–3,
+combine: "mean"|"all", threshold: (0, 1]}`: at a scored hop of its profile it
+fires when, over the last `min(windows, n)` raw scores of the scored history
+(`n` < `windows` only right after a reset), their mean (`mean`) or every one
+(`all`) is ≥ `threshold`. `open_rules` is evaluated in list order; the
+controller sends the two baseline rules `{idle,3,mean,thresholds.idle}`,
+`{playback,3,mean,thresholds.playback}` first, then the configured extras
+(`wakeOpenRules`). Absent `open_rules` (older controller) = those two baseline
+rules derived from `thresholds`; absent `shadow_rules` = none. The device
+validates both lists — at most 6 live and 8 shadow rules, every field valid, at
+least one live rule per profile, an explicit empty `open_rules` invalid — and an
+invalid policy leaves the detector unavailable (`wake.stats`
+`wake_unavailable: "load_failed"` with the error as `detail`), like an
+unimplemented `hop_blocks`/`smoothing`. `thresholds.near_miss`, `smoothing`,
+`hop_blocks` and `clear_after_unscored` keep their meaning: the 3-window
+smoothed value still drives candidate extension and close, near misses, peaks
+and `hops` records. A changed policy on an unchanged graph is applied between
+candidates (deferred while one is open, latest wins); the same policy again is
+a no-op.
+
 `capture_permitted: false` = the device keeps capturing and scoring locally but
 the controller refuses every candidate (diagnostics/approval states).
 
@@ -218,8 +247,16 @@ playback plays unless ducked or paused by an alert foreground.
  "producing_sound":false,"chimed":false,"first_crossing_end":"…","support_start":"…",
  "mono_ns":"…",
  "active_alert":{"id":"…","kind":"alarm|timer","name":"…","foreground":true},
- "hops":[{"end_sample":"…","raw":0.93,"smoothed":0.91,"profile":"idle"}]}
+ "hops":[{"end_sample":"…","raw":0.93,"smoothed":0.91,"profile":"idle"}],
+ "rule":{"profile":"idle","windows":3,"combine":"mean","threshold":0.9}}
 ```
+`rule` (`open_rules_v1` only) is the live rule that opened the candidate — the
+first rule of `detector.open_rules`, in list order, to fire at the opening hop
+— and `threshold` is its threshold, latched for the candidate. `support_start`
+is the end of the oldest window the rule used minus 22,400 (one window), so a
+2-window rule opening one hop before the baseline reports the same
+`support_start` the baseline would have. Absent (older firmware) = the
+candidate opened on the baseline rule of its `profile`.
 `hops` holds one record per hop slot from the slot whose window starts at
 `support_start` through the opening hop; `raw`/`smoothed` null for unscored slots.
 `active_alert` is null when nothing is ringing or backgrounded.
@@ -240,9 +277,39 @@ firmware) means false.
  "infer_mean_ms":82.1,"infer_max_ms":131.0,
  "near_misses":[{"mono_ns":"…","peak":0.31}],"candidates_opened":1,
  "peak_smoothed":0.93,"graph_sha256":"…",
- "wake_unavailable":null,"detail":null}
+ "wake_unavailable":null,"detail":null,
+ "shadow":[{"rule":{"profile":"idle","windows":2,"combine":"mean","threshold":0.95},
+   "hops":187,"opens":1,"matched":1,"lead_hist":[0,0,0,0,1,0,0],
+   "unmatched":0,"retried":0,"live_only":0,
+   "events":[{"kind":"unmatched|retried","open_sample":"…","mono_ns":"…",
+              "peak_raw":0.97,"raws":[0.41,0.93,1.0]}],
+   "events_dropped":0}]}
 ```
 `wake_unavailable`: `null|"missing_asset"|"load_failed"|"inference_errors"`.
+
+`shadow` (`open_rules_v1` only; `[]` with no shadow rules) has one entry per
+`detector.shadow_rules` rule, in that order, with counters for this stats
+window only. A shadow **episode** opens when its rule fires on a hop of its
+profile and none is open, extends while the 3-window smoothed value is ≥ 50 %
+of the rule's threshold, and closes on the second consecutive scored hop below
+it; an invalid window, gap, overrun, reset, mute or model/policy change
+abandons it uncounted. `hops`: scored hops of the rule's profile. `opens`:
+episodes opened. `matched`: episodes during which a live candidate was open at
+some scored hop; each adds one to `lead_hist[lead+3]`, `lead` = (live
+`first_crossing_end` − shadow open sample) / 2560 clamped to −3..+3 (positive:
+the shadow rule would have opened earlier). An episode no live candidate
+overlapped is held until 160,000 capture samples after its open: a live
+candidate opening in that time resolves it `retried` (likely a real wake the
+live rules missed and the user repeated), otherwise — or on a capture-epoch
+change — `unmatched` (a would-be false wake); held episodes carry across
+windows. `live_only`: live candidates of the rule's profile that closed with
+no episode of the rule overlapping them (real wakes the rule would have
+missed). Each resolution emits one `events` entry, at most 16 per rule per
+window, the rest counted in `events_dropped`; `open_sample` (capture-epoch
+sample at the opening hop's end) and `mono_ns` are uint64 decimal strings,
+`raws` the last ≤3 raw scores at the open, `peak_raw` the highest raw score
+over the episode. `shadow` absent (older firmware) means no shadow data, never
+zero counts.
 
 ### 4.5 Uplink leases
 

@@ -100,6 +100,11 @@ func defaults() detector.Thresholds {
 
 func newHarness(t *testing.T, results []result, th detector.Thresholds) *harness {
 	t.Helper()
+	return newRulesHarness(t, results, th, detector.Rules{})
+}
+
+func newRulesHarness(t *testing.T, results []result, th detector.Thresholds, rules detector.Rules) *harness {
+	t.Helper()
 	h := &harness{scorer: &scriptedScorer{results: results}}
 	h.profile.Store(detector.ProfileIdle)
 	var mono atomic.Int64
@@ -123,7 +128,7 @@ func newHarness(t *testing.T, results []result, th detector.Thresholds) *harness
 	}
 	h.d = d
 	t.Cleanup(d.Close)
-	if err := d.SetModel(detector.Model{Scorer: h.scorer, GraphSHA256: graphSHA, Thresholds: th}); err != nil {
+	if err := d.SetModel(detector.Model{Scorer: h.scorer, GraphSHA256: graphSHA, Thresholds: th, Rules: rules}); err != nil {
 		t.Fatal(err)
 	}
 	d.SetEpoch(7)
@@ -520,7 +525,7 @@ func TestSetThresholdsKeepsLatchedCandidate(t *testing.T) {
 	h := newHarness(t, scored(0.95, 0.47), defaults())
 	h.feed(18)
 	// Means settle at 0.47: below half of 0.99, above half of the latched 0.90.
-	if err := h.d.SetThresholds(detector.Thresholds{Idle: 0.99, Playback: 0.65, NearMiss: 0.17}); err != nil {
+	if err := h.d.SetPolicy(detector.Thresholds{Idle: 0.99, Playback: 0.65, NearMiss: 0.17}, detector.Rules{}); err != nil {
 		t.Fatal(err)
 	}
 	h.feed(10)

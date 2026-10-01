@@ -85,18 +85,19 @@ func NewActivator(det *detector.Detector, store *assets.Store, load LoadFunc) *A
 	return &Activator{det: det, store: store, load: load}
 }
 
-// Activate makes the detector score with a. While files download the current
-// graph keeps scoring. An asset the controller cannot supply reports
-// wake_unavailable=missing_asset; a file that fails to load reports
-// load_failed. Either way the non-named graph stops. On success the switch is
-// atomic between hops with a new scorer revision, and unreferenced speech
-// files are deleted. A transport or context error that leaves an asset
-// missing also reports missing_asset and is returned.
-func (a *Activator) Activate(ctx context.Context, tr assets.Transport, want Assets, th detector.Thresholds) error {
+// Activate makes the detector score with a under thresholds th and rules.
+// While files download the current graph keeps scoring. An asset the
+// controller cannot supply reports wake_unavailable=missing_asset; a file
+// that fails to load reports load_failed. Either way the non-named graph
+// stops. On success the switch is atomic between hops with a new scorer
+// revision, and unreferenced speech files are deleted. A transport or
+// context error that leaves an asset missing also reports missing_asset and
+// is returned. The same assets again only update the policy.
+func (a *Activator) Activate(ctx context.Context, tr assets.Transport, want Assets, th detector.Thresholds, rules detector.Rules) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.active != nil && *a.active == want {
-		return a.det.SetThresholds(th)
+		return a.det.SetPolicy(th, rules)
 	}
 
 	var p Paths
@@ -121,7 +122,7 @@ func (a *Activator) Activate(ctx context.Context, tr assets.Transport, want Asse
 		a.unavailable(detector.UnavailableLoadFailed, err)
 		return err
 	}
-	if err := a.det.SetModel(detector.Model{Scorer: scorer, GraphSHA256: want.GraphSHA256, Thresholds: th}); err != nil {
+	if err := a.det.SetModel(detector.Model{Scorer: scorer, GraphSHA256: want.GraphSHA256, Thresholds: th, Rules: rules}); err != nil {
 		scorer.Close()
 		a.unavailable(detector.UnavailableLoadFailed, err)
 		return err

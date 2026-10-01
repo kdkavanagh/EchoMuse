@@ -134,6 +134,58 @@ def test_changing_the_selected_wake_model_renegotiates_the_session():
     run(scenario())
 
 
+_EXTRA = {"profile": "idle", "windows": 2, "combine": "mean", "threshold": 0.95}
+_SHADOW = {"profile": "idle", "windows": 1, "combine": "all", "threshold": 0.97}
+_BASELINE = [{"profile": "idle", "windows": 3, "combine": "mean", "threshold": 0.9},
+             {"profile": "playback", "windows": 3, "combine": "mean", "threshold": 0.65}]
+
+
+@pytest.mark.parametrize("capable", [True, False])
+def test_ready_carries_open_and_shadow_rules_only_to_an_open_rules_device(capable):
+    async def scenario():
+        store = FakeStore()
+        store.add("DEV1", approved=True)
+        # An extra equal to the model's baseline adds nothing and is not repeated.
+        store.configs["DEV1"] = {"wakeOpenRules": [_BASELINE[0], _EXTRA], "wakeShadowRules": [_SHADOW]}
+        hub, _, _ = make_hub(store)
+        caps = ALL_V1 + ["open_rules_v1"] if capable else None
+        result = await hub.admit(hello(caps), device_id="DEV1", peer_ip="x", secure=True, token=None)
+        detector = result.ready.wire()["detector"]
+        if capable:
+            assert detector["open_rules"] == [*_BASELINE, _EXTRA]
+            assert detector["shadow_rules"] == [_SHADOW]
+        else:
+            assert "open_rules" not in detector and "shadow_rules" not in detector
+            assert hub.devices["DEV1"].wake_rules is None
+        await hub.devices["DEV1"].close()
+    run(scenario())
+
+
+def test_changing_open_or_shadow_rules_renegotiates_the_session():
+    async def scenario():
+        store = FakeStore()
+        base = {"duckDb": -12.0, "wakeOpenRules": [_EXTRA], "wakeShadowRules": [_SHADOW]}
+        store.configs["DEV1"] = base
+        device, link, *_ = await _online(store, capabilities=ALL_V1 + ["open_rules_v1"])
+        await device.apply_config({**base, "duckDb": -6.0, "wakeArbitrationMs": 300})
+        assert not link.closed
+        await device.apply_config({**base, "wakeShadowRules": [_SHADOW, _EXTRA]})
+        assert link.closed
+        await device.close()
+
+        device, link, *_ = await _online(FakeStore(), capabilities=ALL_V1 + ["open_rules_v1"])
+        await device.apply_config({"duckDb": -12.0, "wakeOpenRules": [_EXTRA]})
+        assert link.closed
+        await device.close()
+
+        # A device that was sent no rules has nothing to renegotiate.
+        device, link, *_ = await _online(FakeStore())
+        await device.apply_config({"duckDb": -12.0, "wakeOpenRules": [_EXTRA]})
+        assert not link.closed
+        await device.close()
+    run(scenario())
+
+
 # ── routing ──────────────────────────────────────────────────────────────
 
 def test_render_messages_are_consumed_before_anything_else():
@@ -175,6 +227,31 @@ def test_wake_stats_are_kept_with_receipt_time_and_persisted():
         await settle()
         assert store.wake == [body]
         assert device.wake_stats["hops_scored"] == 187 and isinstance(device.wake_stats["received_ms"], int)
+        await device.close()
+    run(scenario())
+
+
+def _shadow_entry(**events):
+    return {"rule": _SHADOW, "hops": 180, "opens": 2, "matched": 1, "lead_hist": [0, 0, 0, 0, 1, 0, 0],
+            "unmatched": 1, "retried": 0, "live_only": 0, "events_dropped": 0,
+            "events": [{"kind": "unmatched", "open_sample": "48640", "mono_ns": str(10_000_000_000),
+                        "peak_raw": 0.98, "raws": [0.4, 0.98]}], **events}
+
+
+def test_wake_stats_shadow_is_persisted_with_event_times_and_absence_writes_nothing():
+    async def scenario():
+        device, link, _, store, sink = await _online(capabilities=ALL_V1 + ["open_rules_v1"])
+        sink.on_message(envelope("wake.stats", {"hops_scored": 187, "near_misses": []}))
+        await settle()
+        assert store.shadow == []                       # older firmware: no shadow data, not zeros
+        link.clock = (12_000_000_000, 1_000.0)          # a heartbeat 2 s after the event's open
+        sink.on_message(envelope("wake.stats", {"hops_scored": 187, "near_misses": [],
+                                                "shadow": [_shadow_entry(), {"rule": "bad"}]}))
+        await settle()
+        [(reports, times)] = store.shadow
+        [r] = reports                                   # the malformed entry is dropped
+        assert r.rule.key == "idle:1:all:0.97" and (r.hops, r.unmatched) == (180, 1)
+        assert r.events[0].raws == (0.4, 0.98) and times == {10_000_000_000: 998.0}
         await device.close()
     run(scenario())
 

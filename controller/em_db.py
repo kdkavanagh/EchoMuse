@@ -38,6 +38,7 @@ import em_recordings
 import em_samples
 import em_sounds
 import em_wakeclips
+import em_wake_rules
 
 from em_config_sections import DeviceConfig
 
@@ -207,6 +208,20 @@ DEFAULT_DEVICE_CONFIG: DeviceConfig = {
     # Multi-device wake suppression window (ms): the first claimant answers,
     # others within the window stand down (em_arbiter, §5.3). 0 disables.
     "wakeArbitrationMs": 700,
+    # Extra live wake open rules (em_wake_rules, §5.2), each
+    # {profile, windows, combine, threshold}: a candidate opens when the
+    # model's 3-window baseline OR any of these fires. Empty: today's rule.
+    "wakeOpenRules":    [],
+    # Shadow rules an open_rules_v1 device evaluates without acting on them,
+    # reporting how each would have compared with the live rules. Collecting
+    # from the first deploy changes no behaviour.
+    "wakeShadowRules":  [
+        {"profile": "idle", "windows": 2, "combine": "mean", "threshold": 0.90},
+        {"profile": "idle", "windows": 2, "combine": "mean", "threshold": 0.95},
+        {"profile": "idle", "windows": 2, "combine": "all",  "threshold": 0.90},
+        {"profile": "idle", "windows": 2, "combine": "all",  "threshold": 0.95},
+        {"profile": "idle", "windows": 1, "combine": "mean", "threshold": 0.97},
+    ],
     # DTLN noise suppression on the STT copy only (em_ns, §16.7).
     "nsAsr":            False,
     # Keep recent utterances (the uploaded STT copy) as WAVs. Off by default:
@@ -277,6 +292,9 @@ TRACE_RETENTION = 1_000
 
 # Hourly wake_counters rows older than this are pruned on upsert.
 WAKE_COUNTER_RETENTION_DAYS = 180
+
+# Newest wake_shadow_events rows kept per device (pruned on insert).
+WAKE_SHADOW_EVENT_RETENTION = 2_000
 
 # ─── Migrations ───────────────────────────────────────────────────────────────
 #
@@ -946,6 +964,45 @@ MIGRATIONS: list[str] = [
     ALTER TABLE turns ADD COLUMN first_audio_ms INTEGER;
     ALTER TABLE turns ADD COLUMN decision_trace TEXT;
     UPDATE system_config SET value = '26' WHERE key = 'schema_version';
+    """,
+
+    # ── v27 — wake shadow rules (SPEC §5.2) ──────────────────────────────────
+    #
+    # An `open_rules_v1` device evaluates shadow open rules it never acts on
+    # and reports, per rule and 30 s window, how each would have compared
+    # with the live rules (wake.stats `shadow`). wake_shadow adds those
+    # counters per device-hour and rule (rule_key = OpenRule.key); lead_hist
+    # is a JSON array of 7 counts (lead −3..+3 hops). wake_shadow_events keeps
+    # the newest WAKE_SHADOW_EVENT_RETENTION unmatched/retried episodes per
+    # device; raws is a JSON array. No rows are written for firmware without
+    # the report, so an absent device reads as no data, never zeros.
+    """
+    CREATE TABLE IF NOT EXISTS wake_shadow (
+        device_id      TEXT    NOT NULL,
+        hour_ts        INTEGER NOT NULL,
+        rule_key       TEXT    NOT NULL,
+        hops           INTEGER NOT NULL DEFAULT 0,
+        opens          INTEGER NOT NULL DEFAULT 0,
+        matched        INTEGER NOT NULL DEFAULT 0,
+        lead_hist      TEXT    NOT NULL DEFAULT '[0,0,0,0,0,0,0]',
+        unmatched      INTEGER NOT NULL DEFAULT 0,
+        retried        INTEGER NOT NULL DEFAULT 0,
+        live_only      INTEGER NOT NULL DEFAULT 0,
+        events_dropped INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (device_id, hour_ts, rule_key)
+    );
+    CREATE TABLE IF NOT EXISTS wake_shadow_events (
+        id        INTEGER PRIMARY KEY AUTOINCREMENT,
+        device_id TEXT    NOT NULL,
+        ts        REAL    NOT NULL,
+        rule_key  TEXT    NOT NULL,
+        kind      TEXT    NOT NULL,
+        peak_raw  REAL    NOT NULL,
+        raws      TEXT    NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_wake_shadow_events_device_ts
+        ON wake_shadow_events (device_id, ts DESC);
+    UPDATE system_config SET value = '27' WHERE key = 'schema_version';
     """,
 ]
 
@@ -2222,6 +2279,109 @@ def get_wake_counters(device_id: str, since: float) -> list[WakeCounterRow]:
         "ORDER BY hour_ts",
         (device_id, since),
     )]
+
+
+def _lead_hist(text: object) -> list[int]:
+    """A stored lead_hist JSON array; malformed reads as zeros."""
+    try:
+        values = json.loads(text) if isinstance(text, str) else None
+    except json.JSONDecodeError:
+        values = None
+    if (not isinstance(values, list) or len(values) != em_wake_rules.LEAD_BUCKETS
+            or not all(isinstance(v, int) for v in values)):
+        return [0] * em_wake_rules.LEAD_BUCKETS
+    return values
+
+
+def record_wake_shadow(device_id: str, reports: Sequence[em_wake_rules.ShadowReport],
+                       wall: Callable[[int], float]) -> None:
+    """
+    Add one wake.stats `shadow` report into the current hour's wake_shadow
+    rows (one per rule key; counters and lead_hist add) and insert its events
+    with `wall(event.mono_ns)` as their time, keeping the newest
+    WAKE_SHADOW_EVENT_RETENTION per device. Hourly rows age out with
+    WAKE_COUNTER_RETENTION_DAYS.
+    """
+    hour_ts = int(time.time()) // 3600 * 3600
+    with _tx() as conn:
+        for r in reports:
+            key = r.rule.key
+            row = conn.execute(
+                "SELECT lead_hist FROM wake_shadow WHERE device_id = ? AND hour_ts = ? AND rule_key = ?",
+                (device_id, hour_ts, key),
+            ).fetchone()
+            hist = _lead_hist(row["lead_hist"]) if row is not None else [0] * em_wake_rules.LEAD_BUCKETS
+            hist = [a + b for a, b in zip(hist, r.lead_hist)]
+            conn.execute(
+                """
+                INSERT INTO wake_shadow (device_id, hour_ts, rule_key, hops, opens, matched,
+                                         lead_hist, unmatched, retried, live_only, events_dropped)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (device_id, hour_ts, rule_key) DO UPDATE SET
+                    hops           = hops + excluded.hops,
+                    opens          = opens + excluded.opens,
+                    matched        = matched + excluded.matched,
+                    lead_hist      = excluded.lead_hist,
+                    unmatched      = unmatched + excluded.unmatched,
+                    retried        = retried + excluded.retried,
+                    live_only      = live_only + excluded.live_only,
+                    events_dropped = events_dropped + excluded.events_dropped
+                """,
+                (device_id, hour_ts, key, r.hops, r.opens, r.matched, json.dumps(hist),
+                 r.unmatched, r.retried, r.live_only, r.events_dropped),
+            )
+            for e in r.events:
+                conn.execute(
+                    "INSERT INTO wake_shadow_events (device_id, ts, rule_key, kind, peak_raw, raws) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (device_id, wall(e.mono_ns), key, str(e.kind), e.peak_raw, json.dumps(list(e.raws))),
+                )
+        conn.execute(
+            """
+            DELETE FROM wake_shadow_events WHERE device_id = ? AND id NOT IN (
+                SELECT id FROM wake_shadow_events WHERE device_id = ?
+                ORDER BY ts DESC, id DESC LIMIT ?)
+            """,
+            (device_id, device_id, WAKE_SHADOW_EVENT_RETENTION),
+        )
+        conn.execute("DELETE FROM wake_shadow WHERE hour_ts < ?",
+                     (hour_ts - WAKE_COUNTER_RETENTION_DAYS * 86400,))
+
+
+def get_wake_shadow(device_id: str, since: float) -> list[em_wake_rules.ShadowTotals]:
+    """A device's wake_shadow counters per rule key, summed over the hours from `since`."""
+    totals: dict[str, em_wake_rules.ShadowTotals] = {}
+    for r in _q("SELECT * FROM wake_shadow WHERE device_id = ? AND hour_ts >= ? ORDER BY hour_ts",
+                (device_id, since)):
+        prev = totals.get(r["rule_key"]) or em_wake_rules.ShadowTotals.empty(r["rule_key"])
+        totals[r["rule_key"]] = em_wake_rules.ShadowTotals(
+            rule_key=r["rule_key"],
+            hops=prev.hops + r["hops"],
+            opens=prev.opens + r["opens"],
+            matched=prev.matched + r["matched"],
+            lead_hist=tuple(a + b for a, b in zip(prev.lead_hist, _lead_hist(r["lead_hist"]))),
+            unmatched=prev.unmatched + r["unmatched"],
+            retried=prev.retried + r["retried"],
+            live_only=prev.live_only + r["live_only"],
+            events_dropped=prev.events_dropped + r["events_dropped"],
+        )
+    return list(totals.values())
+
+
+def get_wake_shadow_events(device_id: str, since: float, limit: int) -> list[em_wake_rules.ShadowEventRecord]:
+    """A device's newest shadow events from `since`, newest first."""
+    out: list[em_wake_rules.ShadowEventRecord] = []
+    for r in _q("SELECT ts, rule_key, kind, peak_raw, raws FROM wake_shadow_events "
+                "WHERE device_id = ? AND ts >= ? ORDER BY ts DESC, id DESC LIMIT ?",
+                (device_id, since, limit)):
+        try:
+            raws = json.loads(r["raws"])
+        except json.JSONDecodeError:
+            raws = []
+        out.append(em_wake_rules.ShadowEventRecord(
+            ts=r["ts"], rule_key=r["rule_key"], kind=r["kind"], peak_raw=r["peak_raw"],
+            raws=tuple(float(v) for v in raws if isinstance(v, (int, float))) if isinstance(raws, list) else ()))
+    return out
 
 
 def record_device_stats(device_id: str, stats: Mapping[str, object]) -> None:

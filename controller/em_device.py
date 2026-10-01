@@ -37,6 +37,7 @@ import em_speech_worker
 import em_tap_burst
 import em_volume
 import em_wake_registry
+import em_wake_rules
 from em_device_link import Capability, CloseReason, CommandAck, MessageType, RejectReason
 
 log = logging.getLogger("em_device")
@@ -159,6 +160,8 @@ class Store(Protocol):
             message: str) -> None: ...
     def stats(self, device_id: str, stats: Mapping[str, object]) -> None: ...
     def wake_stats(self, device_id: str, body: Mapping[str, object]) -> None: ...
+    def wake_shadow(self, device_id: str, reports: tuple[em_wake_rules.ShadowReport, ...],
+                    wall: Callable[[int], float]) -> None: ...
 
 
 class WakeModels(Protocol):
@@ -222,6 +225,10 @@ class DbStore:
             dev_max_score=_number(body.get("peak_smoothed")),
             dev_max_infer_ms=_integer(body.get("infer_max_ms")),
         )
+
+    def wake_shadow(self, device_id: str, reports: tuple[em_wake_rules.ShadowReport, ...],
+                    wall: Callable[[int], float]) -> None:
+        em_db.record_wake_shadow(device_id, reports, wall)
 
 
 @dataclass(frozen=True)
@@ -321,6 +328,9 @@ class Device:
         self._led_task: asyncio.Task[None] | None = None
         self._last_led: LedSpec | None = None
         self.wake_model_sha256: str | None = None   # graph named in this session's ready
+        # Extra/shadow rules granted in this session's ready; None when the
+        # device lacks open_rules_v1 (it was sent none).
+        self.wake_rules: em_wake_rules.RuleSet | None = None
         self._cue: em_session.Cue | None = None
         self._timer_fraction: float | None = None
         self.preview_playback: em_render.Playback | None = None
@@ -393,6 +403,10 @@ class Device:
         return Capability.LOCAL_WAKE_CHIME in self.capabilities
 
     @property
+    def open_rules_capable(self) -> bool:
+        return Capability.OPEN_RULES in self.capabilities
+
+    @property
     def capture_permitted(self) -> bool:
         return not self.diagnostic
 
@@ -428,6 +442,16 @@ class Device:
             return "legacy"
         raise em_device_link.LinkClosed(f"{self.device_id} is offline")
 
+    def _device_wall(self, received: float) -> Callable[[int], float]:
+        """Maps a device CLOCK_MONOTONIC ns to controller wall seconds through
+        the session's heartbeat clock; `received` when that is unknown."""
+        link = self.link
+
+        def wall(mono_ns: int) -> float:
+            ts = link.device_wall_s(mono_ns) if link is not None else None
+            return received if ts is None else min(ts, received)
+        return wall
+
     async def apply_config(self, cfg: em_config_sections.DeviceConfig) -> None:
         """Apply effective config and push only retained device-owned keys."""
         self.config = dict(cfg)
@@ -441,10 +465,15 @@ class Device:
                 # Only to firmware that knows the key: it chimes at candidate open (§11.2).
                 body["wakeSound"] = em_config_sections.wake_sound(cfg)
             await self.send(MessageType.CONFIG, body)
-            # The wake graph is named only in session.ready (§16.1): a changed
-            # selection renegotiates the session so device and controller agree.
-            if cfg.get("wakeModel") not in (None, self.wake_model_sha256):
-                log.info("[%s] wake model changed; renegotiating the session", self.device_id)
+            # The wake graph and the open/shadow rules are named only in
+            # session.ready (§16.1): a changed selection renegotiates the
+            # session so device and controller agree.
+            model_changed = cfg.get("wakeModel") not in (None, self.wake_model_sha256)
+            rules_changed = (self.wake_rules is not None
+                             and em_wake_rules.RuleSet.from_config(cfg) != self.wake_rules)
+            if model_changed or rules_changed:
+                log.info("[%s] wake %s changed; renegotiating the session", self.device_id,
+                         "model" if model_changed else "rules")
                 await link.close(CloseReason.CLOSED)
         self._led_event.set()
 
@@ -503,6 +532,10 @@ class Device:
             case MessageType.WAKE_STATS:
                 self.wake_stats = {**body, "received_ms": time.time_ns() // 1_000_000}
                 self._spawn(asyncio.to_thread(self.store.wake_stats, self.device_id, body), "wake stats")
+                shadow = em_wake_rules.parse_shadow(body)
+                if shadow is not None:
+                    self._spawn(asyncio.to_thread(self.store.wake_shadow, self.device_id, shadow,
+                                                  self._device_wall(time.time())), "wake shadow")
                 self._spawn(self.host.push_state(self, {"wake_stats": self.wake_stats}), "wake stats push")
             case MessageType.ALERT_ACK:
                 self._spawn(self.host.alerts.on_alert_ack(self.device_id, body), "alert ack")
@@ -851,6 +884,9 @@ class LinkHub:
         model = self.registry.for_config(device.config)
         device.wake_model_sha256 = model.graph_sha256
         duck_db = _number(device.config.get("duckDb"))
+        rules = (em_wake_rules.RuleSet.from_config(device.config)
+                 if Capability.OPEN_RULES in hello.capabilities else None)
+        device.wake_rules = rules
         ready = em_device_link.ReadyGrant(
             capture_permitted=device.capture_permitted,
             assets=self.assets.speech_assets(model),
@@ -862,6 +898,9 @@ class LinkHub:
                 ),
                 provisional_duck=em_device_link.ProvisionalDuck(
                     duck_db=DEFAULT_DUCK_DB if duck_db is None else duck_db),
+                open_rules=(None if rules is None
+                            else rules.open_rules(model.thresholds.idle, model.thresholds.playback)),
+                shadow_rules=None if rules is None else rules.shadow,
             ),
         )
         return em_device_link.Admitted(ready=ready, sink=_Sink(device))

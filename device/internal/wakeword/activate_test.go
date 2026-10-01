@@ -122,7 +122,7 @@ func TestActivateInstallsSwitchesAndCollects(t *testing.T) {
 		t.Fatal(err)
 	}
 	a := f.activator()
-	if err := a.Activate(context.Background(), f.tr, f.want, th); err != nil {
+	if err := a.Activate(context.Background(), f.tr, f.want, th, detector.Rules{}); err != nil {
 		t.Fatal(err)
 	}
 	st := f.lastStats()
@@ -133,7 +133,7 @@ func TestActivateInstallsSwitchesAndCollects(t *testing.T) {
 		t.Error("unreferenced speech asset kept after a successful switch")
 	}
 	// The same assets again: nothing is fetched or reloaded.
-	if err := a.Activate(context.Background(), f.tr, f.want, detector.Thresholds{Idle: 0.8, Playback: 0.6, NearMiss: 0.2}); err != nil {
+	if err := a.Activate(context.Background(), f.tr, f.want, detector.Thresholds{Idle: 0.8, Playback: 0.6, NearMiss: 0.2}, detector.Rules{}); err != nil {
 		t.Fatal(err)
 	}
 	if f.tr.fetches != 3 || f.loads != 1 {
@@ -144,7 +144,7 @@ func TestActivateInstallsSwitchesAndCollects(t *testing.T) {
 func TestActivateReportsMissingAsset(t *testing.T) {
 	f := newFixture(t)
 	delete(f.tr.files, f.want.GraphSHA256)
-	err := f.activator().Activate(context.Background(), f.tr, f.want, th)
+	err := f.activator().Activate(context.Background(), f.tr, f.want, th, detector.Rules{})
 	if !errors.Is(err, assets.ErrNotFound) {
 		t.Fatalf("error %v", err)
 	}
@@ -160,7 +160,7 @@ func TestActivateReportsMissingAsset(t *testing.T) {
 func TestActivateReportsLoadFailedAndKeepsFiles(t *testing.T) {
 	f := newFixture(t)
 	f.err = errors.New("graph emits 2 outputs, sidecar names 3 labels")
-	if err := f.activator().Activate(context.Background(), f.tr, f.want, th); err == nil {
+	if err := f.activator().Activate(context.Background(), f.tr, f.want, th, detector.Rules{}); err == nil {
 		t.Fatal("no error")
 	}
 	st := f.lastStats()
@@ -174,7 +174,7 @@ func TestActivateRefetchesCorruptInstalledFile(t *testing.T) {
 	if err := os.WriteFile(f.store.Path(f.want.SidecarSHA256, "json"), []byte("corrupt"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.activator().Activate(context.Background(), f.tr, f.want, th); err != nil {
+	if err := f.activator().Activate(context.Background(), f.tr, f.want, th, detector.Rules{}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(f.store.Path(f.want.SidecarSHA256, "json"))

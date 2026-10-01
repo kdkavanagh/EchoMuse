@@ -258,6 +258,17 @@ Based on a review of Office turns 433–476 (`docs/turn-latency-review.md`,
   controller sends it `wakeSound` and skips its own chime when
   `wake.candidate` reports `chimed`. Wakes heard while the Dot is playing
   audio, and older firmware, still chime after acceptance.
+- **Configurable wake open rules, with shadow rules to try them first.**
+  Firmware with the new `open_rules_v1` capability opens a wake on any of a
+  list of rules (last 1–3 scores, average or every one, ≥ a threshold). The
+  model's own 3-score average rules are always in the list, so live behaviour
+  is unchanged until you add a rule (Config → Wake word → Open rules, up to 4).
+  Shadow rules (up to 8; five idle rules by default) are evaluated on the Dot
+  and never acted on: the Status tab's Wake health panel shows, per rule over 7
+  days, how often it would have opened a real wake earlier, its would-be false
+  wakes per hour with a 95% upper bound, likely rescued misses and missed
+  wakes. Saving either list reconnects the Echo. No audio leaves the Dot for
+  shadow rules; older firmware reports no shadow data rather than zeros.
 
 ### Earlier in this release
 

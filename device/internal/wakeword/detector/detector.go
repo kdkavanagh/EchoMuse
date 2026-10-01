@@ -42,7 +42,7 @@ const (
 	controlMute
 	controlModel
 	controlUnavailable
-	controlThresholds
+	controlPolicy
 	controlFlush
 )
 
@@ -50,6 +50,7 @@ type control struct {
 	kind       controlKind
 	model      Model
 	thresholds Thresholds
+	rules      Rules
 	reason     UnavailableReason
 	detail     string
 	ack        chan struct{}
@@ -140,13 +141,18 @@ func (d *Detector) SetModel(m Model) error {
 	return nil
 }
 
-// SetThresholds replaces the profile thresholds between hops without a reset
-// or a new scorer revision. An open candidate keeps its latched threshold.
-func (d *Detector) SetThresholds(th Thresholds) error {
+// SetPolicy replaces the profile thresholds and open/shadow rules without a
+// reset or a new scorer revision. It applies between candidates: while one
+// is open the latest policy waits for it to close. Applying a different
+// policy restarts every shadow episode.
+func (d *Detector) SetPolicy(th Thresholds, rules Rules) error {
 	if err := th.validate(); err != nil {
 		return err
 	}
-	d.enqueueControl(control{kind: controlThresholds, thresholds: th})
+	if err := CheckRules(rules); err != nil {
+		return err
+	}
+	d.enqueueControl(control{kind: controlPolicy, thresholds: th, rules: rules})
 	return nil
 }
 

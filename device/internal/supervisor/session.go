@@ -29,7 +29,7 @@ func (s *Supervisor) Hello() proto.SessionHello {
 		caps = append(caps, proto.CapAlertCache)
 	}
 	caps = append(caps, retainedCapabilities...)
-	caps = append(caps, proto.CapAlertPrefetch, proto.CapLocalWakeChime)
+	caps = append(caps, proto.CapAlertPrefetch, proto.CapLocalWakeChime, proto.CapOpenRules)
 	if s.cfg.AmbientReadable() {
 		caps = append(caps, proto.CapAmbientLight)
 	}

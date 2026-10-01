@@ -37,6 +37,7 @@ import em_db
 import em_recordings
 import em_timers
 import em_wakeclips
+import em_wake_rules
 from echomuse_grammar import (
     AMPM_CHOICES,
     AlarmAction,
@@ -481,6 +482,16 @@ def _config_number(config: Mapping[str, object], key: str, default: float) -> fl
     return default
 
 
+def _opening_rule(raw: object) -> em_wake_rules.OpenRule | None:
+    """`wake.candidate.rule`: None when absent (firmware without open_rules_v1)."""
+    if raw is None:
+        return None
+    try:
+        return em_wake_rules.OpenRule.parse(raw)
+    except em_wake_rules.RuleError as err:
+        raise ValueError(f"rule: {err}") from None
+
+
 @dataclass(frozen=True, slots=True)
 class ActiveAlert:
     """`wake.candidate.active_alert`: the occurrence ringing when the wake was heard (§6.3)."""
@@ -506,6 +517,7 @@ class WakeCandidate:
     profile: object                   # logged with the turn trace
     active_alert: ActiveAlert | None
     chimed: bool                      # the device already played the wake chime (local_wake_chime)
+    rule: em_wake_rules.OpenRule | None  # the live rule that opened it (open_rules_v1), else None
 
     @classmethod
     def parse(cls, body: Mapping[str, object]) -> WakeCandidate:
@@ -542,6 +554,7 @@ class WakeCandidate:
             profile=body.get("profile"),
             active_alert=alert,
             chimed=body.get("chimed") is True,
+            rule=_opening_rule(body.get("rule")),
         )
 
     @property
@@ -2859,6 +2872,7 @@ def _trace(turn: _Turn, row: TurnRow, utterance: UtteranceTrace) -> dict[str, ob
         "profile": wire.profile if wire is not None else None,
         "producing_sound": wire.producing_sound if wire is not None else None,
         "chimed": wire.chimed if wire is not None else None,
+        "rule": wire.rule.wire() if wire is not None and wire.rule is not None else None,
         "hops": [asdict(h) for h in wire.hops] if wire is not None else None,
         "lease_id": turn.runtime.lease_id, "terminal": turn.terminal,
         "utterance": utterance, **{k: v for k, v in row.items() if k != "ts"},

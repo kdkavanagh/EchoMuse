@@ -39,6 +39,7 @@ from websockets.http11 import Request, Response
 
 import em_audio_timeline as tl
 import em_device_assets
+import em_wake_rules
 
 log = logging.getLogger("em_device_link")
 
@@ -143,6 +144,7 @@ class Capability(enum.StrEnum):
     AMBIENT_LIGHT = "ambient_light"
     ALERT_PREFETCH = "alert_prefetch"
     LOCAL_WAKE_CHIME = "local_wake_chime"
+    OPEN_RULES = "open_rules_v1"
 
 
 class RejectReason(enum.StrEnum):
@@ -321,16 +323,19 @@ class ProvisionalDuck:
 
 @dataclass(frozen=True, slots=True)
 class DetectorConfig:
-    """`session.ready.detector` (WIRE §4.1)."""
+    """`session.ready.detector` (WIRE §4.1). The rule lists only for
+    `open_rules_v1` devices: None leaves `open_rules`/`shadow_rules` off the wire."""
 
     thresholds: DetectorThresholds
     provisional_duck: ProvisionalDuck
     hop_blocks: int = 2
     smoothing: int = 3
     clear_after_unscored: int = 6
+    open_rules: tuple[em_wake_rules.OpenRule, ...] | None = None
+    shadow_rules: tuple[em_wake_rules.OpenRule, ...] | None = None
 
     def wire(self) -> dict[str, object]:
-        return {
+        out: dict[str, object] = {
             "thresholds": {
                 "idle": self.thresholds.idle,
                 "playback": self.thresholds.playback,
@@ -345,6 +350,11 @@ class DetectorConfig:
                 "window_ms": self.provisional_duck.window_ms,
             },
         }
+        if self.open_rules is not None:
+            out["open_rules"] = [r.wire() for r in self.open_rules]
+        if self.shadow_rules is not None:
+            out["shadow_rules"] = [r.wire() for r in self.shadow_rules]
+        return out
 
 
 @dataclass(frozen=True, slots=True)
@@ -412,7 +422,9 @@ _U64_PATHS: dict[MessageType, tuple[tuple[str, ...], ...]] = {
     MessageType.WAKE_CANDIDATE: (("capture_epoch",), ("first_crossing_end",), ("support_start",),
                                  ("mono_ns",), ("hops", "*", "end_sample")),
     MessageType.WAKE_CANDIDATE_END: (("support_end",),),
-    MessageType.WAKE_STATS: (("near_misses", "*", "mono_ns"),),
+    MessageType.WAKE_STATS: (("near_misses", "*", "mono_ns"),
+                             ("shadow", "*", "events", "*", "open_sample"),
+                             ("shadow", "*", "events", "*", "mono_ns")),
     MessageType.UPLINK_ENDED: (("last_sample", "*"), ("clipped_start", "*")),
     MessageType.PRIVACY_CHANGED: (("capture_epoch",),),
     MessageType.BUTTON_ACTION: (("mono_ns",), ("capture_epoch",), ("capture_sample",)),
@@ -600,6 +612,16 @@ class DeviceLink:
         self._tasks: list[asyncio.Task[None]] = []           # heartbeat + watchdog
         self._ready_task: asyncio.Task[None] | None = None   # on_ready; never cancelled
         self._last_rx = asyncio.get_running_loop().time()
+        # (device mono_ns, controller wall seconds) of the last heartbeat.
+        self._device_clock: tuple[int, float] | None = None
+
+    def device_wall_s(self, mono_ns: int) -> float | None:
+        """Controller wall time of a device CLOCK_MONOTONIC instant, from the
+        last heartbeat (None before one arrives). Good to network latency."""
+        if self._device_clock is None:
+            return None
+        ref_mono, ref_wall = self._device_clock
+        return ref_wall + (mono_ns - ref_mono) / 1e9
 
     def __repr__(self) -> str:
         return f"<DeviceLink {self.device_id} session={self.session_id}>"
@@ -766,7 +788,12 @@ class DeviceLink:
             return
         self._last_rx = asyncio.get_running_loop().time()
         self.degraded = False
-        if isinstance(env, UnknownEnvelope) or env.type is MessageType.HEARTBEAT:
+        if isinstance(env, UnknownEnvelope):
+            return
+        if env.type is MessageType.HEARTBEAT:
+            mono = env.body.get("mono_ns")
+            if isinstance(mono, str):        # validated as a decimal uint64 by parse_envelope
+                self._device_clock = (int(mono), time.time())
             return
         if env.type is MessageType.CLOCK_REQUEST:
             nonce = env.body.get("nonce")

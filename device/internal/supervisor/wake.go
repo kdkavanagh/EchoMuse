@@ -167,11 +167,17 @@ func (s *Supervisor) activeAlert() *proto.ActiveAlert {
 
 // activate checks the session's detector policy and switches the detector
 // to the named speech assets, fetching missing files over the session's
-// assets socket. A policy this firmware does not implement leaves the
-// detector unavailable rather than scoring under different semantics.
+// assets socket. A policy this firmware does not implement, including an
+// invalid open/shadow rule list, leaves the detector unavailable rather than
+// scoring under different semantics.
 func (s *Supervisor) activate(ctx context.Context, sess Session, r proto.SessionReady) {
 	d := r.Detector
-	if err := detector.CheckPolicy(d.HopBlocks, d.Smoothing, d.ClearAfterUnscored); err != nil {
+	rules := detector.Rules{Open: detectorRules(d.OpenRules), Shadow: detectorRules(d.ShadowRules)}
+	err := detector.CheckPolicy(d.HopBlocks, d.Smoothing, d.ClearAfterUnscored)
+	if err == nil {
+		err = detector.CheckRules(rules)
+	}
+	if err != nil {
 		log.Printf("[wake] %v", err)
 		s.act.Unavailable(detector.UnavailableLoadFailed, err)
 		return
@@ -187,8 +193,24 @@ func (s *Supervisor) activate(ctx context.Context, sess Session, r proto.Session
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		if err := s.act.Activate(ctx, sess.Assets(), want, th); err != nil {
+		if err := s.act.Activate(ctx, sess.Assets(), want, th, rules); err != nil {
 			log.Printf("[wake] activate: %v", err)
 		}
 	}()
+}
+
+// detectorRules converts a session.ready rule list, keeping nil (absent)
+// distinct from empty.
+func detectorRules(in []proto.OpenRule) []detector.OpenRule {
+	if in == nil {
+		return nil
+	}
+	out := make([]detector.OpenRule, len(in))
+	for i, r := range in {
+		out[i] = detector.OpenRule{
+			Profile: detector.Profile(r.Profile), Windows: r.Windows,
+			Combine: detector.RuleCombine(r.Combine), Threshold: r.Threshold,
+		}
+	}
+	return out
 }

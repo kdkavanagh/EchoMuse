@@ -52,6 +52,7 @@ import em_sounds
 import em_device_assets
 import em_device_link
 import em_wake_registry
+import em_wake_rules
 import em_shell
 import em_support
 from em_device_link import MessageType
@@ -443,6 +444,7 @@ async def create_app(services: ControllerServices) -> web.Application:
     app.router.add_get("/api/devices/{id}/logs",          _get_device_logs)
     app.router.add_get("/api/devices/{id}/turns",         _get_device_turns)
     app.router.add_get("/api/devices/{id}/activity",      _get_device_activity)
+    app.router.add_get("/api/devices/{id}/wake_shadow",   _get_device_wake_shadow)
     app.router.add_get("/api/devices/{id}/turns/{turn}/audio", _get_turn_audio)
     # Wake clips — the pre-detection audio that crossed the threshold. The
     # per-turn WAV sits beside the turn's utterance because that is the pair
@@ -1503,6 +1505,27 @@ async def _get_device_activity(request: web.Request) -> web.Response:
                 "metrics": metrics})
 
 
+@auth.require_auth
+async def _get_device_wake_shadow(request: web.Request) -> web.Response:
+    """GET /api/devices/{id}/wake_shadow?days=7 — shadow open rules (§5.2): per
+    rule the would-be opens against the live rules, and the newest events."""
+    device_id = request.match_info["id"]
+    try:
+        days = min(max(int(request.query.get("days", 7)), 1), 180)
+    except ValueError:
+        return _error(ErrorCode.BAD_REQUEST, "days must be an integer", 400)
+    since = time.time() - days * 86400
+    loop = asyncio.get_running_loop()
+    totals, events, config = await asyncio.gather(
+        loop.run_in_executor(None, db.get_wake_shadow, device_id, since),
+        loop.run_in_executor(None, db.get_wake_shadow_events, device_id, since, 50),
+        loop.run_in_executor(None, db.get_effective_device_config, device_id),
+    )
+    configured = em_wake_rules.RuleSet.from_config(config).shadow
+    return _ok({"days": days, "rules": em_wake_rules.summarize(totals, configured),
+                "events": [asdict(e) for e in events]})
+
+
 @auth.require_admin
 async def _patch_device(request: web.Request) -> web.Response:
     """PATCH /api/devices/{id} — update label."""
@@ -1596,6 +1619,18 @@ def _validate_config(values: Mapping[str, object],
                           f"wakeModel is not registered: {value}", 400)
     if "extendedUtterances" in values and not isinstance(values["extendedUtterances"], bool):
         return _error(ErrorCode.INVALID_CONFIG, "extendedUtterances must be boolean", 400)
+    if em_wake_rules.OPEN_RULES_KEY in values or em_wake_rules.SHADOW_RULES_KEY in values:
+        # The baseline of the model this write selects (else the fleet's); a
+        # device's own model may differ, and session.ready drops any extra
+        # rule equal to its baseline.
+        try:
+            model = registry.for_config(values)
+            model_baseline = em_wake_rules.baseline(model.thresholds.idle, model.thresholds.playback)
+        except em_wake_registry.RegistryError:
+            model_baseline = None
+        message = em_wake_rules.validate_config(values, model_baseline)
+        if message is not None:
+            return _error(ErrorCode.INVALID_CONFIG, message, 400)
     for key in em_sounds.SOUND_CONFIG_KEYS:
         if key not in values:
             continue

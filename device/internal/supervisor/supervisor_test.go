@@ -387,16 +387,24 @@ func (h *harness) blocks(n int) {
 	}
 }
 
-func (h *harness) ready() {
+func (h *harness) ready() { h.readyWith(nil) }
+
+// readyWith sends session.ready with the default detector policy, changed
+// by mod when it is non-nil.
+func (h *harness) readyWith(mod func(*proto.DetectorPolicy)) {
 	h.sess = &fakeSession{}
+	pol := proto.DetectorPolicy{
+		Thresholds: proto.Thresholds{Idle: 0.9, Playback: 0.65, NearMiss: 0.17},
+		HopBlocks:  2, Smoothing: 3, ClearAfterUnscored: 6,
+		ProvisionalDuck: proto.ProvisionalDuck{DuckDB: -18, MaxPerWindow: 2, WindowMs: 5000},
+	}
+	if mod != nil {
+		mod(&pol)
+	}
 	h.s.ready(h.sess, proto.SessionReady{
 		Protocol: 1, SessionID: "s1", CapturePermitted: true,
-		Assets: proto.SpeechAssets{RuntimeSHA256: sha1, GraphSHA256: sha1, SidecarSHA256: sha1},
-		Detector: proto.DetectorPolicy{
-			Thresholds: proto.Thresholds{Idle: 0.9, Playback: 0.65, NearMiss: 0.17},
-			HopBlocks:  2, Smoothing: 3, ClearAfterUnscored: 6,
-			ProvisionalDuck: proto.ProvisionalDuck{DuckDB: -18, MaxPerWindow: 2, WindowMs: 5000},
-		},
+		Assets:   proto.SpeechAssets{RuntimeSHA256: sha1, GraphSHA256: sha1, SidecarSHA256: sha1},
+		Detector: pol,
 	})
 }
 
@@ -904,5 +912,47 @@ func TestAlertPrefetchInstallsTheTimerSoundBeforeItRings(t *testing.T) {
 			t.Fatal("prefetched sound never installed")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// An open/shadow rule list the firmware cannot apply leaves the detector
+// unavailable (load_failed) exactly like an unimplemented policy; a valid
+// one proceeds to the assets (here missing: missing_asset).
+func TestInvalidOpenRulesLeaveTheDetectorUnavailable(t *testing.T) {
+	baseline := []proto.OpenRule{
+		{Profile: "idle", Windows: 3, Combine: "mean", Threshold: 0.9},
+		{Profile: "playback", Windows: 3, Combine: "mean", Threshold: 0.65},
+	}
+	for _, tc := range []struct {
+		name   string
+		open   []proto.OpenRule
+		shadow []proto.OpenRule
+		want   detector.UnavailableReason
+	}{
+		{"absent", nil, nil, detector.UnavailableMissingAsset},
+		{"baseline plus shadow", baseline, []proto.OpenRule{{Profile: "idle", Windows: 2, Combine: "all", Threshold: 0.95}}, detector.UnavailableMissingAsset},
+		{"empty open list", []proto.OpenRule{}, nil, detector.UnavailableLoadFailed},
+		{"no playback rule", baseline[:1], nil, detector.UnavailableLoadFailed},
+		{"four windows", append([]proto.OpenRule{{Profile: "idle", Windows: 4, Combine: "mean", Threshold: 0.9}}, baseline...), nil, detector.UnavailableLoadFailed},
+		{"bad shadow combine", baseline, []proto.OpenRule{{Profile: "idle", Windows: 2, Combine: "max", Threshold: 0.9}}, detector.UnavailableLoadFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, opts{})
+			h.readyWith(func(p *proto.DetectorPolicy) { p.OpenRules, p.ShadowRules = tc.open, tc.shadow })
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				h.s.det.FlushStats()
+				st := h.sess.of(proto.TypeWakeStats)
+				if len(st) > 0 {
+					if got, _ := st[len(st)-1].body["wake_unavailable"].(string); got == string(tc.want) {
+						return
+					}
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("wake.stats %v, want wake_unavailable=%s", st, tc.want)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		})
 	}
 }

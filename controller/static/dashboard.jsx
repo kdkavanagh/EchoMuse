@@ -115,6 +115,7 @@ const CAPABILITY = Object.freeze({
   FOCUS_LEASES:    'focus_leases_v1',
   LED_ANIM:        'led_anim',
   BUTTON_HOLD:     'button_hold',
+  OPEN_RULES:      'open_rules_v1',
 });
 
 // deviceState()'s key: what the dashboard shows a device doing. Derived here
@@ -257,6 +258,23 @@ function wakeModelLabel(models, sha) {
   return m ? `${m.wake_phrase} · ${shortSha(sha)}` : shortSha(sha);
 }
 
+// em_wake_rules.RuleProfile / RuleCombine — the fields of a wake open or
+// shadow rule (§5.2): {profile, windows, combine, threshold}.
+const RULE_PROFILE = Object.freeze({ IDLE: 'idle', PLAYBACK: 'playback' });
+const RULE_COMBINE = Object.freeze({ MEAN: 'mean', ALL: 'all' });
+const RULE_COMBINE_LABEL = Object.freeze({
+  [RULE_COMBINE.MEAN]: 'average', [RULE_COMBINE.ALL]: 'every window',
+});
+
+// "idle · 2-window average ≥ 0.95" — a rule as the dashboard names it.
+function wakeRuleText(r) {
+  if (!r) return '—';
+  const t = Number(r.threshold).toFixed(2);
+  return r.combine === RULE_COMBINE.ALL
+    ? `${r.profile} · ${r.windows}-window, every window ≥ ${t}`
+    : `${r.profile} · ${r.windows}-window average ≥ ${t}`;
+}
+
 // A controller catalog read once per consumer: `empty` until it arrives, then
 // the response plus `loaded: true`. `reload` re-reads it after an upload or
 // delete. A failed read (signed out, controller restarting) keeps the last
@@ -303,6 +321,7 @@ const CAPABILITY_REASONS = Object.freeze({
   [CAPABILITY.FOCUS_LEASES]:    'this firmware cannot duck music under a response — update it',
   [CAPABILITY.LED_ANIM]:        'this firmware cannot animate the ring, so it shows the listening colour instead — update it',
   [CAPABILITY.BUTTON_HOLD]:     'this firmware has no action-button event for a tap to fire — update it',
+  [CAPABILITY.OPEN_RULES]:      'this firmware opens a wake only on the model threshold and runs no shadow rules — update it',
 });
 
 // The reason `cap` is missing, or null when the control is available.
@@ -2169,7 +2188,103 @@ function WakeHealth({ device, registry, expected }) {
           <Lcd label="Inference errors" value={w?.inference_errors ?? '—'} color={(w?.inference_errors || 0) > 0 ? 'var(--lcd-amber)' : 'var(--lcd-dim)'} size={14}/>
         </div>
       </div>
+      <WakeShadowTable device={device}/>
     </Panel>
+  );
+}
+
+// wake_shadow_events.kind — how a shadow episode no live candidate overlapped
+// was resolved (§5.2).
+const SHADOW_EVENT = Object.freeze({ UNMATCHED: 'unmatched', RETRIED: 'retried' });
+const SHADOW_EVENT_LABEL = Object.freeze({
+  [SHADOW_EVENT.UNMATCHED]: 'would-be false wake',
+  [SHADOW_EVENT.RETRIED]:   'likely rescued miss',
+});
+
+// A canonical rule key ("idle:2:mean:0.90") back into a rule.
+function wakeRuleFromKey(key) {
+  const [profile, windows, combine, threshold] = String(key || '').split(':');
+  return combine ? { profile, windows: Number(windows), combine, threshold: Number(threshold) } : null;
+}
+
+const SHADOW_COLUMNS = 'minmax(170px,2.2fr) minmax(48px,0.6fr) minmax(110px,1.3fr) minmax(150px,1.7fr) minmax(70px,0.8fr) minmax(70px,0.8fr)';
+
+// What each shadow rule would have done over the last 7 days, from the
+// per-hour counters the Dot reports in wake.stats.shadow (§5.2, §5.4). A rule
+// with no evaluated hours has measured nothing, so every figure is "—".
+function WakeShadowTable({ device }) {
+  const [shadow, setShadow] = useState(null);
+  useEffect(() => {
+    let live = true;
+    const load = () => API.get(`/api/devices/${device.device_id}/wake_shadow?days=7`)
+      .then(r => { if (live) setShadow(r); })
+      .catch(() => {});
+    load();
+    const iv = setInterval(load, 60000);
+    return () => { live = false; clearInterval(iv); };
+  }, [device.device_id]);
+  const gap = capabilityGap(liveCapabilities(device), CAPABILITY.OPEN_RULES);
+  const rules = shadow?.rules || [];
+  const events = shadow?.events || [];
+  const head = { fontFamily:MONO, fontSize:9, color:'var(--muted)', textTransform:'uppercase', letterSpacing:'0.08em', padding:'0 0 6px' };
+  const cell = { fontFamily:MONO, fontSize:10, color:'var(--text2)', padding:'6px 0', borderTop:'1px solid var(--hairline)' };
+  const rate = v => (v != null ? `${v.toFixed(2)}/h` : '—');
+  return (
+    <div style={{ marginTop:16 }}>
+      <SectionLabel>Shadow rules (7 days)</SectionLabel>
+      {gap && <div style={{ fontFamily:MONO, fontSize:9, color:'var(--warn)', marginBottom:8 }}>No new shadow data: {gap}</div>}
+      {!shadow ? (
+        <div style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)' }}>Loading…</div>
+      ) : !rules.length ? (
+        <div style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)' }}>No shadow rules configured and none reported in the last 7 days.</div>
+      ) : (
+        <div style={{ overflowX:'auto' }}>
+          <div style={{ display:'grid', gridTemplateColumns:SHADOW_COLUMNS, columnGap:12, minWidth:680 }}>
+            <span style={head}>Rule</span>
+            <span style={head} title="hours of scored audio in this rule's profile">Hours</span>
+            <span style={head} title="real wakes this rule would have opened earlier / real wakes it also opened · mean lead">Opened earlier</span>
+            <span style={head} title="episodes no real wake followed: count · per hour (95% upper bound)">Would-be false wakes</span>
+            <span style={head} title="episodes a live wake followed within 10 s — likely misses the user repeated">Rescued misses</span>
+            <span style={head} title="real wakes this rule would have missed">Missed wakes</span>
+            {rules.map(r => {
+              const measured = r.hours > 0;
+              const dim = r.active ? {} : { opacity:0.45 };
+              const n = v => (measured && v != null ? String(v) : '—');
+              return (
+                <React.Fragment key={r.key}>
+                  <span style={{ ...cell, ...dim }} title={r.active ? r.key : `${r.key} — no longer configured`}>
+                    {wakeRuleText(r.rule || wakeRuleFromKey(r.key))}{r.active ? '' : ' · inactive'}
+                  </span>
+                  <span style={{ ...cell, ...dim }}>{measured ? r.hours.toFixed(r.hours < 10 ? 1 : 0) : '—'}</span>
+                  <span style={{ ...cell, ...dim }}>
+                    {measured ? `${r.matched_earlier} / ${r.matched}${r.mean_lead_ms != null ? ` · ${Math.round(r.mean_lead_ms)} ms` : ''}` : '—'}
+                  </span>
+                  <span style={{ ...cell, ...dim, color:measured && r.unmatched > 0 ? 'var(--warn)' : cell.color }}>
+                    {measured ? `${r.unmatched} · ${rate(r.unmatched_per_hour)} (≤ ${rate(r.unmatched_per_hour_upper95)})` : '—'}
+                  </span>
+                  <span style={{ ...cell, ...dim }}>{n(r.retried)}</span>
+                  <span style={{ ...cell, ...dim, color:measured && r.live_only > 0 ? 'var(--warn)' : cell.color }}>{n(r.live_only)}</span>
+                </React.Fragment>
+              );
+            })}
+          </div>
+        </div>
+      )}
+      {events.length > 0 && (
+        <div style={{ marginTop:14 }}>
+          <div style={head}>Recent shadow events</div>
+          {events.map((e, i) => (
+            <div key={`${e.ts}-${e.rule_key}-${i}`} style={{ display:'flex', gap:12, padding:'5px 0', borderTop:'1px solid var(--hairline)', fontFamily:MONO, fontSize:10 }}
+              title={Array.isArray(e.raws) ? `last scores ${e.raws.map(x => Number(x).toFixed(3)).join(', ')}` : undefined}>
+              <span style={{ color:'var(--muted)', minWidth:150 }}>{e.ts != null ? new Date(e.ts * 1000).toLocaleString() : '—'}</span>
+              <span style={{ color:'var(--text2)', flex:1, minWidth:0 }}>{wakeRuleText(wakeRuleFromKey(e.rule_key))}</span>
+              <span style={{ color:e.kind === SHADOW_EVENT.UNMATCHED ? 'var(--warn)' : 'var(--text2)', minWidth:130 }}>{SHADOW_EVENT_LABEL[e.kind] || e.kind}</span>
+              <span style={{ color:'var(--text2)', minWidth:70, textAlign:'right' }}>peak {e.peak_raw != null ? e.peak_raw.toFixed(3) : '—'}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -5779,7 +5894,7 @@ function EqSliders({ bands, onChange, disabled }) {
 // be silently wrong.
 const CONFIG_SECTIONS = {
   "playback": ["eqBands", "eqLoudness", "duckDb"],
-  "wakeword": ["wakeModel", "saveWakeClips", "wakeArbitrationMs", "wakeSound"],
+  "wakeword": ["wakeModel", "saveWakeClips", "wakeArbitrationMs", "wakeSound", "wakeOpenRules", "wakeShadowRules"],
   "microphones": ["nsAsr", "saveUtterances", "extendedUtterances"],
   "ring": ["ledScene", "ledListenColor", "ledThinkColor", "meterAttack", "meterDecay", "meterFloor", "meterGamma", "meterRef", "meterCurve"],
   "advanced": ["buttonSingleTapEvent", "buttonMultiTapMs"],
@@ -6020,6 +6135,97 @@ function WakeModelPicker({ value, onChange, disabled }) {
   );
 }
 
+// em_wake_rules limits: extra open rules beside the two baseline rules, and
+// shadow rules. The controller validates every write against the same ones.
+const MAX_EXTRA_OPEN_RULES = 4;
+const MAX_SHADOW_RULES = 8;
+const NEW_WAKE_RULE = Object.freeze({
+  profile: RULE_PROFILE.IDLE, windows: 2, combine: RULE_COMBINE.MEAN, threshold: 0.95,
+});
+
+// An editable list of wake rules ({profile, windows, combine, threshold}),
+// shared by the extra open rules and the shadow rules.
+function WakeRuleRows({ rules, onChange, max, disabled }) {
+  const list = Array.isArray(rules) ? rules : [];
+  const put = (i, patch) => onChange(list.map((r, j) => (j === i ? { ...r, ...patch } : r)));
+  const label = { fontFamily:MONO, fontSize:8, color:'var(--muted)' };
+  const field = { display:'block', width:'100%', marginTop:4, boxSizing:'border-box' };
+  return (
+    <div>
+      {list.map((r, i) => (
+        <div key={i} style={{ display:'grid', gridTemplateColumns:'1fr 0.7fr 1.2fr 0.9fr auto', gap:8, alignItems:'end', marginTop:8 }}>
+          <label style={label}>profile
+            <select value={r.profile} disabled={disabled} onChange={e => put(i, { profile:e.target.value })} style={field}>
+              {Object.values(RULE_PROFILE).map(p => <option key={p} value={p}>{p}</option>)}
+            </select>
+          </label>
+          <label style={label}>windows
+            <select value={r.windows} disabled={disabled} onChange={e => put(i, { windows:Number(e.target.value) })} style={field}>
+              {[1, 2, 3].map(n => <option key={n} value={n}>{n}</option>)}
+            </select>
+          </label>
+          <label style={label}>combine
+            <select value={r.combine} disabled={disabled} onChange={e => put(i, { combine:e.target.value })} style={field}>
+              {Object.values(RULE_COMBINE).map(c => <option key={c} value={c}>{RULE_COMBINE_LABEL[c]}</option>)}
+            </select>
+          </label>
+          <label style={label}>threshold
+            <input type="number" min="0.30" max="0.99" step="0.01" value={r.threshold} disabled={disabled}
+              onChange={e => put(i, { threshold:Math.round(Number(e.target.value) * 100) / 100 })} style={field}/>
+          </label>
+          <button type="button" disabled={disabled} onClick={() => onChange(list.filter((_, j) => j !== i))}
+            title="Remove rule" aria-label={`Remove rule ${wakeRuleText(r)}`}
+            style={{ background:'none', border:'none', color:'var(--muted)', cursor:disabled ? 'default' : 'pointer', paddingBottom:4 }}>×</button>
+        </div>
+      ))}
+      <div style={{ display:'flex', alignItems:'center', gap:10, marginTop:10 }}>
+        <Pill small disabled={disabled || list.length >= max} onClick={() => onChange([...list, { ...NEW_WAKE_RULE }])}>+ Add rule</Pill>
+        <span style={{ fontFamily:MONO, fontSize:9, color:'var(--muted)' }}>{list.length} of {max}</span>
+      </div>
+    </div>
+  );
+}
+
+// Wake open rules (§5.2): the selected model's two baseline rules, always on
+// and read-only, then the extra open rules and the shadow rules the Echo
+// evaluates without acting on. `gap` is why the device in scope cannot take
+// them (no open_rules_v1), shown with both lists disabled.
+function WakeRulesEditor({ config, set, disabled, gap }) {
+  const [registry, reload] = useWakeRegistry();
+  const sha = config.wakeModel || registry.active;
+  const model = registry.models.find(m => m.graph_sha256 === sha);
+  // A model uploaded and selected in the picker after this copy was read.
+  useEffect(() => { if (registry.loaded && sha && !model) reload(); }, [sha]);
+  const thr = p => (model ? model.thresholds[p].toFixed(2) : '—');
+  const off = disabled || !!gap;
+  const title = { fontFamily:MONO, fontSize:11, color:off ? 'var(--muted)' : 'var(--text2)' };
+  const sub = { fontFamily:MONO, fontSize:10, color:'var(--muted)', marginLeft:8 };
+  return (
+    <div className="em-grid2" style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:'0 24px', marginTop:4 }}>
+      <div>
+        <span style={title}>Open rules</span>
+        <span style={sub}>a wake opens when any rule for the current profile fires</span>
+        <div style={{ fontFamily:MONO, fontSize:10, color:'var(--text2)', marginTop:8, paddingBottom:6, borderBottom:'1px solid var(--hairline)' }}>
+          3-window average ≥ {thr(RULE_PROFILE.IDLE)} idle / {thr(RULE_PROFILE.PLAYBACK)} playback
+          <span style={{ color:'var(--muted)' }}> — from the model, always on</span>
+        </div>
+        <WakeRuleRows rules={config.wakeOpenRules} max={MAX_EXTRA_OPEN_RULES} disabled={off}
+          onChange={v => set('wakeOpenRules', v)}/>
+      </div>
+      <div>
+        <span style={title}>Shadow rules</span>
+        <span style={sub}>evaluated on the Echo and scored on Status; they never open a wake</span>
+        <WakeRuleRows rules={config.wakeShadowRules} max={MAX_SHADOW_RULES} disabled={off}
+          onChange={v => set('wakeShadowRules', v)}/>
+      </div>
+      <div style={{ gridColumn:'1 / -1', marginTop:10, fontFamily:MONO, fontSize:9, color:gap ? 'var(--warn)' : 'var(--muted)' }}>
+        {gap ? `Open and shadow rules unavailable: ${gap}`
+          : 'Shadow rules never change behaviour. Saving either list reconnects the Echo for a moment.'}
+      </div>
+    </div>
+  );
+}
+
 // The sound catalog (GET /api/sounds).
 function useSounds() {
   return useCatalog('/api/sounds', SOUND_CATALOG_EMPTY);
@@ -6144,6 +6350,7 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
   const renderGap = capabilityGap(capabilities, CAPABILITY.RENDER_PROGRESS);
   const focusGap = capabilityGap(capabilities, CAPABILITY.FOCUS_LEASES);
   const holdGap = capabilityGap(capabilities, CAPABILITY.BUTTON_HOLD);
+  const rulesGap = capabilityGap(capabilities, CAPABILITY.OPEN_RULES);
   // Without led_anim the controller can only send static LEDs: the thinking
   // spinner and the speaking meter both fall back to the solid listening
   // colour (em_device._send_led), so their settings would do nothing.
@@ -6237,6 +6444,9 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
             sub="the first Echo to claim a wake suppresses the others; 0 disables"
             value={config.wakeArbitrationMs ?? 700} min={0} max={2000} step={50} unit="ms"
             onChange={v => set('wakeArbitrationMs', v)}/>
+        </div>
+        <div style={inputStyle}>
+          <WakeRulesEditor config={config} set={set} disabled={disabled} gap={rulesGap}/>
         </div>
       </Stage>
 

@@ -67,6 +67,10 @@ const (
 	// open when config wakeSound is on, and reports it in wake.candidate's
 	// chimed.
 	CapLocalWakeChime Capability = "local_wake_chime"
+	// CapOpenRules: the device opens candidates on session.ready's
+	// detector.open_rules, evaluates its shadow_rules, credits the opening
+	// rule in wake.candidate and reports shadow counters in wake.stats.
+	CapOpenRules Capability = "open_rules_v1"
 )
 
 // MessageType is an envelope type.
@@ -231,12 +235,24 @@ type ProvisionalDuck struct {
 	WindowMs     int64   `json:"window_ms"`
 }
 
+// OpenRule is one detector.open_rules / shadow_rules entry.
+type OpenRule struct {
+	Profile   string  `json:"profile"`
+	Windows   int     `json:"windows"`
+	Combine   string  `json:"combine"`
+	Threshold float64 `json:"threshold"`
+}
+
 type DetectorPolicy struct {
 	Thresholds         Thresholds      `json:"thresholds"`
 	HopBlocks          int             `json:"hop_blocks"`
 	Smoothing          int             `json:"smoothing"`
 	ClearAfterUnscored int             `json:"clear_after_unscored"`
 	ProvisionalDuck    ProvisionalDuck `json:"provisional_duck"`
+	// OpenRules is nil when absent (an older controller): the baseline rules
+	// derive from Thresholds. ShadowRules absent means none.
+	OpenRules   []OpenRule `json:"open_rules"`
+	ShadowRules []OpenRule `json:"shadow_rules"`
 }
 
 type SessionReady struct {

@@ -6,6 +6,7 @@ package detector
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 )
 
@@ -26,6 +27,14 @@ const (
 	ClearAfterUnscored = 6
 	// StatsPeriod is the wake.stats reporting interval.
 	StatsPeriod = 30 * time.Second
+	// ShadowHoldSamples: a shadow episode no live candidate overlapped waits
+	// 10 s from its open for a live candidate (retried) before it counts as
+	// unmatched.
+	ShadowHoldSamples = 10 * 16000
+	// ShadowEventsPerWindow caps a shadow rule's events per stats window.
+	ShadowEventsPerWindow = 16
+	// LeadBuckets is the lead histogram size: −3..+3 hops.
+	LeadBuckets = 7
 )
 
 // CheckPolicy rejects a session.ready detector policy this detector does not
@@ -63,15 +72,124 @@ func (t Thresholds) validate() error {
 	return nil
 }
 
-func (t Thresholds) forProfile(p Profile) (float64, bool) {
-	switch p {
-	case ProfileIdle:
-		return t.Idle, true
-	case ProfilePlayback:
-		return t.Playback, true
-	default:
+// RuleCombine is how an open rule combines its windows.
+type RuleCombine string
+
+const (
+	// CombineMean fires when the mean of the rule's windows reaches the threshold.
+	CombineMean RuleCombine = "mean"
+	// CombineAll fires when every one of the rule's windows reaches it.
+	CombineAll RuleCombine = "all"
+)
+
+const (
+	// MaxOpenRules and MaxShadowRules bound session.ready's rule lists.
+	MaxOpenRules   = 6
+	MaxShadowRules = 8
+)
+
+// OpenRule is one candidate-open condition (SPEC §5.2): at a scored hop
+// whose profile is Profile, over the last Windows raw scores of the scored
+// history (fewer right after a reset, as the smoothing mean is), the mean
+// or every score reaches Threshold.
+type OpenRule struct {
+	Profile   Profile     `json:"profile"`
+	Windows   int         `json:"windows"`
+	Combine   RuleCombine `json:"combine"`
+	Threshold float64     `json:"threshold"`
+}
+
+func (r OpenRule) validate() error {
+	switch {
+	case r.Profile != ProfileIdle && r.Profile != ProfilePlayback:
+		return fmt.Errorf("detector: rule profile %q", r.Profile)
+	case r.Windows < 1 || r.Windows > SmoothingWindows:
+		return fmt.Errorf("detector: rule windows %d outside 1..%d", r.Windows, SmoothingWindows)
+	case r.Combine != CombineMean && r.Combine != CombineAll:
+		return fmt.Errorf("detector: rule combine %q", r.Combine)
+	case !(r.Threshold > 0 && r.Threshold <= 1):
+		return fmt.Errorf("detector: rule threshold %v outside (0, 1]", r.Threshold)
+	}
+	return nil
+}
+
+// fires evaluates the rule over the scored history, oldest first. It
+// returns the end sample of the oldest window it used.
+func (r OpenRule) fires(scores []scoreEntry) (uint64, bool) {
+	if len(scores) == 0 {
 		return 0, false
 	}
+	used := scores[max(0, len(scores)-r.Windows):]
+	var sum float64
+	for _, s := range used {
+		if r.Combine == CombineAll && s.raw < r.Threshold {
+			return 0, false
+		}
+		sum += s.raw
+	}
+	if r.Combine == CombineMean && sum/float64(len(used)) < r.Threshold {
+		return 0, false
+	}
+	return used[0].end, true
+}
+
+// Rules are session.ready's open_rules and shadow_rules. A nil Open means
+// the field was absent: the two baseline rules derive from the thresholds.
+type Rules struct {
+	Open   []OpenRule
+	Shadow []OpenRule
+}
+
+// baseline is the registry rule set: the 3-window mean at each profile's
+// threshold.
+func baseline(th Thresholds) []OpenRule {
+	return []OpenRule{
+		{Profile: ProfileIdle, Windows: SmoothingWindows, Combine: CombineMean, Threshold: th.Idle},
+		{Profile: ProfilePlayback, Windows: SmoothingWindows, Combine: CombineMean, Threshold: th.Playback},
+	}
+}
+
+// live returns the live rules in effect under th.
+func (r Rules) live(th Thresholds) []OpenRule {
+	if r.Open == nil {
+		return baseline(th)
+	}
+	return r.Open
+}
+
+// CheckRules rejects a rule set this detector cannot apply: at most
+// MaxOpenRules live and MaxShadowRules shadow rules, every field valid, and
+// at least one live rule per profile. Absent live rules are always valid.
+func CheckRules(r Rules) error {
+	if r.Open != nil {
+		if len(r.Open) > MaxOpenRules {
+			return fmt.Errorf("detector: %d open rules, at most %d", len(r.Open), MaxOpenRules)
+		}
+		var idle, playback bool
+		for _, o := range r.Open {
+			if err := o.validate(); err != nil {
+				return err
+			}
+			idle = idle || o.Profile == ProfileIdle
+			playback = playback || o.Profile == ProfilePlayback
+		}
+		if !idle || !playback {
+			return errors.New("detector: open rules need at least one rule per profile")
+		}
+	}
+	if len(r.Shadow) > MaxShadowRules {
+		return fmt.Errorf("detector: %d shadow rules, at most %d", len(r.Shadow), MaxShadowRules)
+	}
+	for _, s := range r.Shadow {
+		if err := s.validate(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r Rules) equal(o Rules) bool {
+	return (r.Open == nil) == (o.Open == nil) && slices.Equal(r.Open, o.Open) && slices.Equal(r.Shadow, o.Shadow)
 }
 
 // Scorer scores one complete int16 PCM window. scored=false means its RMS was
@@ -88,6 +206,7 @@ type Model struct {
 	Scorer      Scorer
 	GraphSHA256 string
 	Thresholds  Thresholds
+	Rules       Rules
 }
 
 func (m Model) validate() error {
@@ -102,7 +221,10 @@ func (m Model) validate() error {
 			return errors.New("detector: graph SHA-256 must be lowercase hexadecimal")
 		}
 	}
-	return m.Thresholds.validate()
+	if err := m.Thresholds.validate(); err != nil {
+		return err
+	}
+	return CheckRules(m.Rules)
 }
 
 // Hop is one wake.candidate hops record. Raw and Smoothed are nil for an
@@ -129,6 +251,8 @@ type Candidate struct {
 	SupportStart     uint64  `json:"support_start,string"`
 	MonoNS           int64   `json:"mono_ns,string"`
 	Hops             []Hop   `json:"hops"`
+	// Rule is the live rule that opened the candidate; Threshold is its.
+	Rule OpenRule `json:"rule"`
 }
 
 // CandidateEnd is the WIRE wake.candidate_end body.
@@ -180,6 +304,47 @@ type Stats struct {
 	GraphSHA256      *string            `json:"graph_sha256"`
 	WakeUnavailable  *UnavailableReason `json:"wake_unavailable"`
 	Detail           *string            `json:"detail"`
+	// Shadow has one entry per shadow rule, in shadow_rules order.
+	Shadow []ShadowStats `json:"shadow"`
+}
+
+// ShadowEventKind is how a shadow episode that no live candidate overlapped
+// resolved.
+type ShadowEventKind string
+
+const (
+	// ShadowUnmatched: no live candidate opened within ShadowHoldSamples of
+	// the episode's open, a would-be false wake.
+	ShadowUnmatched ShadowEventKind = "unmatched"
+	// ShadowRetried: a live candidate opened within that time, likely a real
+	// wake the live rules missed and the user repeated.
+	ShadowRetried ShadowEventKind = "retried"
+)
+
+// ShadowEvent is one resolved non-overlapping shadow episode.
+type ShadowEvent struct {
+	Kind       ShadowEventKind `json:"kind"`
+	OpenSample uint64          `json:"open_sample,string"`
+	MonoNS     int64           `json:"mono_ns,string"`
+	PeakRaw    float64         `json:"peak_raw"`
+	// Raws are the last (up to three) raw scores at the episode's open.
+	Raws []float64 `json:"raws"`
+}
+
+// ShadowStats is one wake.stats shadow entry: counters for this stats window.
+type ShadowStats struct {
+	Rule    OpenRule `json:"rule"`
+	Hops    uint64   `json:"hops"`
+	Opens   uint64   `json:"opens"`
+	Matched uint64   `json:"matched"`
+	// LeadHist counts matched episodes by (live open − shadow open) in hops,
+	// clamped to −3..+3 at index lead+3.
+	LeadHist      [LeadBuckets]uint64 `json:"lead_hist"`
+	Unmatched     uint64              `json:"unmatched"`
+	Retried       uint64              `json:"retried"`
+	LiveOnly      uint64              `json:"live_only"`
+	Events        []ShadowEvent       `json:"events"`
+	EventsDropped uint64              `json:"events_dropped"`
 }
 
 // Callbacks connect the detector to the device. Profile is called on the

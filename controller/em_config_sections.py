@@ -42,8 +42,10 @@ class Section:
 SECTIONS: dict[SectionId, Section] = {
     SectionId.PLAYBACK: Section("Playback", ("eqBands", "eqLoudness", "duckDb")),
     # wakeModel is the active registry graph's SHA-256 (§5.1); its
-    # thresholds belong to the registry entry, not to config.
-    SectionId.WAKEWORD: Section("Wake word", ("wakeModel", "saveWakeClips", "wakeArbitrationMs", "wakeSound")),
+    # thresholds belong to the registry entry, not to config. The open and
+    # shadow rules (em_wake_rules) add to that entry's baseline rule.
+    SectionId.WAKEWORD: Section("Wake word", ("wakeModel", "saveWakeClips", "wakeArbitrationMs", "wakeSound",
+                                              "wakeOpenRules", "wakeShadowRules")),
     # Everything the controller decides about the STT copy. Gain,
     # beamforming, AEC and AGC belong to the native AFE (§4.1).
     SectionId.MICROPHONES: Section("Speech", ("nsAsr", "saveUtterances", "extendedUtterances")),

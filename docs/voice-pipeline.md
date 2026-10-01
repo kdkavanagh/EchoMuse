@@ -107,6 +107,15 @@ because it owns the speaker:
 Scores that come close without crossing are counted as **near misses** and
 shown on the Status tab. No audio goes with them.
 
+That 3-score average is the model's own **open rule** and is always on. On
+firmware with the `open_rules_v1` capability you can add up to four extra
+rules (for example "the average of the last 2 scores ≥ 0.95"), any of which
+also opens a candidate, and up to eight **shadow rules** the Dot evaluates
+without acting on. For each shadow rule the Status tab shows how often it
+would have caught a real wake earlier and how often it would have woken on
+nothing, so a rule can be judged on your own room before it goes live
+([configuration](configuration.md#open-rules)).
+
 Which model runs is chosen in **Config → Wake word**. Models live in the
 controller's registry, each identified by the SHA-256 of its file, with its
 own thresholds and spoken form: thresholds belong to the model, because
@@ -120,7 +129,8 @@ speakers does not add controller load. The same hash-checked model runs on
 every Dot.
 
 **Caveats:** it is a probability, not a certainty. There is no sensitivity
-slider; thresholds come with the model. Only BCResNet audio-in ONNX models
+slider; thresholds come with the model, and extra open rules can only add
+wakes, never remove one the model's rule catches. Only BCResNet audio-in ONNX models
 with their JSON sidecar are accepted. If a Dot cannot load the model, the
 Status tab says so, and the action button still starts turns.
 

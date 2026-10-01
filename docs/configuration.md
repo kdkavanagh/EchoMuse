@@ -129,10 +129,11 @@ and power cuts, red ring and all, whether or not the controller is reachable.
 ## 02 — Wake word
 
 The Echo listens for the wake word itself. It scores the microphone audio
-every 160 ms with a BCResNet model and, when the score crosses the model's
-threshold, tells the controller it may have heard the wake word. The
-controller decides whether to start a turn. When the Dot was silent, the
-threshold is enough. When the Dot was making sound — a response, music, an
+every 160 ms with a BCResNet model and, when the scores meet one of its
+[open rules](#open-rules) — by default the average of the last three scores
+reaching the model's threshold — tells the controller it may have heard the
+wake word. The controller decides whether to start a turn. When the Dot was
+silent, that is enough. When the Dot was making sound — a response, music, an
 alarm — the controller first checks the wake against what the Dot was playing
 at that moment, so the Dot's own sound cannot wake it, and confirms the wake
 word in the recognised speech. Meanwhile the Dot briefly dips its own sound.
@@ -197,7 +198,8 @@ panel shows:
 
 - **Availability** — `ready`, or why wake detection is off: `missing asset`
   (the Dot has not yet fetched the model or runtime from the controller),
-  `load failed`, or `inference errors`.
+  `load failed` (also when the Echo refused its open or shadow rules), or
+  `inference errors`.
 - **Installed graph** — the short hash of the model the Dot is running; amber
   when it differs from the one its config selects.
 - **Last report**, **Max inference** (ms per scoring window), **Overruns**
@@ -206,6 +208,27 @@ panel shows:
   to the controller) and **Inference errors**.
 
 A missing value shows `—`, never a reassuring zero.
+
+Below them, **Shadow rules (7 days)** scores each [shadow rule](#shadow-rules)
+against the wakes that really happened, from the last seven days of the
+Echo's reports. One row per rule; rules no longer in the setting stay listed,
+greyed and marked `inactive`, while they have data in those seven days.
+
+| Column | What it means |
+|---|---|
+| **Rule** | The rule, e.g. `idle · 2-window average ≥ 0.95`. |
+| **Hours** | How long the rule was evaluated: hours of scored audio in its profile (idle or playback). Every other column is measured over these hours. |
+| **Opened earlier** | Real wakes the rule would have opened earlier than the live rules, out of the real wakes it also caught, then the average lead in ms. "Real wakes" are the wakes the Echo actually opened; a few of those may themselves be false. |
+| **Would-be false wakes** | Times the rule would have opened a wake when nothing followed within 10 s: the count, the rate per hour and, in brackets, the 95% upper bound of that rate. Judge a rule by the upper bound: an idle rule is good enough to enable only when it is at or below **0.2/h**, which takes at least 15 hours with no false wakes. |
+| **Rescued misses** | Times the rule fired, the live rules did not, and a real wake followed within 10 s — most likely a wake the Echo missed and you repeated. |
+| **Missed wakes** | Real wakes the rule on its own would not have caught. The model's own rule always stays on, so these cost nothing; they show how many wakes the rule would not speed up. |
+
+A rule with no hours yet shows `—` in every column. Firmware without the
+`open_rules_v1` capability reports no shadow data; the panel says so instead
+of showing zeros. Below the table, **Recent shadow events** lists the newest
+would-be false wakes and rescued misses: time, rule, kind and the highest
+score during the episode (hover a row for the scores at its start).
+`GET /api/devices/{id}/wake_shadow?days=7` returns the same data (1–180 days).
 
 `GET /api/devices/{id}/speech_assets` returns the model and runtime files the
 controller has named for the device, which of them the device reported
@@ -255,6 +278,48 @@ Default **700 ms**; the slider runs from 0 to 2000 ms. The winner does not wait
 out the window, so a single Echo answers just as fast. `0` turns arbitration
 off. It never applies to the action button, and it never blocks an Echo from
 stopping its own ringing alarm.
+
+### Open rules
+
+When the Echo opens a wake. The first two rows are the model's own rules and
+cannot be changed: the average of the last three scores at or above the
+model's **idle** threshold while idle, and at or above its **playback**
+threshold during music or a ring (`3-window average ≥ 0.90 idle / 0.65
+playback` for the built-in model). They are always on, so nothing you add can
+make the Echo miss a wake it hears today.
+
+**+ Add rule** adds up to **4** extra rules, each made of:
+
+| Field | Choices |
+|---|---|
+| **profile** | `idle` (nothing playing, including while the Dot speaks a response) or `playback` (music or a ring) |
+| **windows** | how many of the latest scores (each covers 1.4 s of audio, 160 ms apart) the rule looks at: 1, 2 or 3 |
+| **combine** | `average` — their average reaches the threshold; `every window` — each of them does |
+| **threshold** | 0.30–0.99, two decimals |
+
+A wake opens when any rule for the current profile is met. A rule over fewer
+windows can open a wake a fraction of a second sooner, but it can also open on
+sounds the model's rule would ignore, so try a rule as a
+[shadow rule](#shadow-rules) first and add it here only once its shadow
+results show it is safe. Default: none. A rule identical to one of the model's
+two rows, a duplicate, a fifth rule or a threshold outside the range is
+refused on save.
+
+### Shadow rules
+
+Rules the Echo evaluates on every score and never acts on: they open no wake,
+send no audio and change nothing you hear. The Echo counts what each would
+have done, and the Status tab shows it (see
+[Wake health](#wake-health-status-tab)). Same row editor as open rules, up to
+**8** rules; duplicates are refused. The default measures five idle
+candidates: `2-window average ≥ 0.90`, `2-window average ≥ 0.95`,
+`2-window, every window ≥ 0.90`, `2-window, every window ≥ 0.95` and
+`1-window average ≥ 0.97`.
+
+Both lists go to the Echo when its connection starts, so **saving either one
+reconnects the Echo for a moment** to hand it the new rules.
+On firmware without the `open_rules_v1` capability both editors are shown
+disabled with the reason; update the Echo to use them.
 
 ---
 
@@ -636,6 +701,8 @@ Once the whole fleet shows `wss (TLS)`, set `REQUIRE_DEVICE_TLS=1`.
 | Wake word | Wake chime | `wakeSound` | off |
 | Wake word | Save wake clips | `saveWakeClips` | off |
 | Wake word | Arbitration window | `wakeArbitrationMs` | 700 ms |
+| Wake word | Open rules | `wakeOpenRules` | none (only the model's own rules) |
+| Wake word | Shadow rules | `wakeShadowRules` | five idle rules (see [Shadow rules](#shadow-rules)) |
 | Speech | Noise suppression | `nsAsr` | off |
 | Speech | Save utterances | `saveUtterances` | off |
 | Speech | Extended utterances | `extendedUtterances` | off (15 s) |

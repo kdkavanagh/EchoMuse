@@ -105,6 +105,12 @@ class FakeLink:
         self.closed = False
         self.degraded = False
         self.sent: list[tuple[str, dict]] = []
+        self.clock: tuple[int, float] | None = None   # (device mono_ns, wall s) of a heartbeat
+
+    def device_wall_s(self, mono_ns: int) -> float | None:
+        if self.clock is None:
+            return None
+        return self.clock[1] + (mono_ns - self.clock[0]) / 1e9
 
     async def send(self, msg_type: str, body: dict, *, generation: int = 0) -> str:
         if self.closed:
@@ -214,6 +220,7 @@ class FakeStore:
         self.stored_token = token
         self.configs: dict[str, dict] = {}
         self.wake: list[dict] = []
+        self.shadow: list[tuple] = []           # (reports, {mono_ns: wall s} of their events)
         self.registered: list[str] = []
 
     def add(self, device_id: str, *, approved: bool, label: str = "Office") -> None:
@@ -248,6 +255,9 @@ class FakeStore:
 
     def wake_stats(self, device_id, body):
         self.wake.append(body)
+
+    def wake_shadow(self, device_id, reports, wall):
+        self.shadow.append((reports, {e.mono_ns: wall(e.mono_ns) for r in reports for e in r.events}))
 
 
 class FakeRegistry:
