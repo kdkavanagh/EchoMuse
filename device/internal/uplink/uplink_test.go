@@ -44,16 +44,21 @@ type harness struct {
 	mic   *ring.Ring[int16]
 	ref   *ring.Ring[int16]
 	cells *ring.Ring[ema.Cell]
+	afe   *ring.Ring[ema.AFERecord]
 	sink  *fakeSink
 	sent  []sentMsg
 	e     *Executor
 }
 
-func newHarness(t *testing.T) *harness {
-	h := &harness{t: t, mic: ring.NewMic(), ref: ring.NewReference(), cells: ring.NewCells(), sink: &fakeSink{}}
-	h.e = New(Rings{Mic: h.mic, Ref: h.ref, Cells: h.cells}, h, func() int64 { return h.now })
+func newHarness(t *testing.T) *harness { return newHarnessAFE(t, false) }
+
+// newHarnessAFE attaches a session that did (afe) or did not opt into
+// afe_metadata_v1.
+func newHarnessAFE(t *testing.T, afe bool) *harness {
+	h := &harness{t: t, mic: ring.NewMic(), ref: ring.NewReference(), cells: ring.NewCells(), afe: ring.NewAFE(), sink: &fakeSink{}}
+	h.e = New(Rings{Mic: h.mic, Ref: h.ref, Cells: h.cells, AFE: h.afe}, h, func() int64 { return h.now })
 	h.e.SetEpochs(micEpoch, refEpoch)
-	h.e.Attach(h.sink, h.send)
+	h.e.Attach(h.sink, h.send, afe)
 	return h
 }
 
@@ -65,8 +70,9 @@ func (h *harness) send(typ proto.MessageType, gen uint32, body any) (string, err
 	return "id", nil
 }
 
-// appendMic appends n capture blocks and the cells they complete. Sample
-// values encode their index so tests can check nothing moved.
+// appendMic appends n capture blocks with the cells they complete and their
+// AFE records. Sample values encode their index so tests can check nothing
+// moved; an AFE record's Volume encodes its period number mod 128.
 func (h *harness) appendMic(n int) {
 	for range n {
 		first := h.mic.End()
@@ -74,10 +80,19 @@ func (h *harness) appendMic(n int) {
 		for i := range pcm {
 			pcm[i] = int16((first+uint64(i))%30000 + 1)
 		}
-		must(h.t, h.mic.Append(first, pcm, ring.Meta{MonoNs: int64(first) * sampleNs, Flags: ema.FlagEstimated}))
+		meta := ring.Meta{MonoNs: int64(first) * sampleNs, Flags: ema.FlagEstimated}
+		must(h.t, h.mic.Append(first, pcm, meta))
 		for k := h.cells.End(); k < h.mic.End()/ema.CellSamples; k++ {
 			must(h.t, h.cells.Append(k, []ema.Cell{{E: -1000}}, ring.Meta{MonoNs: int64(k) * 512 * sampleNs}))
 		}
+		k := first / ema.AFESamples
+		switch {
+		case k < h.afe.End(): // the test reset the mic ring for a new epoch
+			h.afe.Reset(k)
+		case k > h.afe.End(): // the test recorded a mic gap
+			h.afe.Missing(k)
+		}
+		must(h.t, h.afe.Append(k, []ema.AFERecord{{Frames: 10, Volume: uint8(k % 128)}}, meta))
 	}
 }
 
@@ -532,7 +547,7 @@ func TestSessionLossDiscardsLeasesAndAudio(t *testing.T) {
 	must(t, h.open("L", 1, map[proto.StreamID]string{"mic": "0"}))
 	h.e.Detach()
 	sink := &fakeSink{}
-	h.e.Attach(sink, h.send)
+	h.e.Attach(sink, h.send, false)
 	h.appendMic(1)
 	h.e.step()
 	if len(sink.frames) != 0 || len(h.ended()) != 0 {
@@ -557,5 +572,123 @@ func TestPacketingDoesNotAllocate(t *testing.T) {
 	})
 	if allocs != 0 {
 		t.Fatalf("%.1f allocations per packet", allocs)
+	}
+}
+
+// afeRecords decodes every kind-5 packet's records, checking each header.
+func afeRecords(t *testing.T, frames [][]byte) (first uint64, recs []ema.AFERecord) {
+	t.Helper()
+	for i, f := range frames {
+		hd, payload, err := ema.DecodeFrame(f)
+		must(t, err)
+		if hd.Kind != ema.KindAFE {
+			continue
+		}
+		if hd.Format != ema.FormatAFEV1 || hd.SampleRate != 16000 || hd.FirstSample%ema.AFESamples != 0 ||
+			len(payload) != int(hd.FrameCount)*ema.AFERecordSize {
+			t.Fatalf("afe packet %d header %+v", i, hd)
+		}
+		if recs == nil {
+			first = hd.FirstSample
+		} else if want := first + uint64(len(recs))*ema.AFESamples; hd.FirstSample != want {
+			t.Fatalf("afe packet %d starts at %d, want %d", i, hd.FirstSample, want)
+		}
+		for j := range int(hd.FrameCount) {
+			r, err := ema.ParseAFE(payload[j*ema.AFERecordSize:])
+			must(t, err)
+			recs = append(recs, r)
+		}
+	}
+	return first, recs
+}
+
+// In an afe_metadata_v1 session a candidate lease wants the afe stream from
+// its reference start on the 1,280-sample grid; backfill order is mic,
+// cells, afe, reference, and live records follow one per packet.
+func TestCandidateLeaseCarriesAFEFromTheReferenceStart(t *testing.T) {
+	h := newHarnessAFE(t, true)
+	h.appendMic(40) // 51,200 samples
+	h.appendRef(51200, 7)
+	h.e.OpenCandidate("C", 48000)
+	h.e.AcceptCandidate("C", true)
+	h.e.step()
+	var kinds []ema.Kind
+	for _, f := range h.sink.frames {
+		if k := ema.Kind(f[4]); len(kinds) == 0 || kinds[len(kinds)-1] != k {
+			kinds = append(kinds, k)
+		}
+	}
+	if len(kinds) != 4 || kinds[0] != ema.KindMic || kinds[1] != ema.KindCells || kinds[2] != ema.KindAFE || kinds[3] != ema.KindReference {
+		t.Fatalf("stream order %v", kinds)
+	}
+	// mic: 48,000 − 4,800 = 43,200 → 43,008; afe: 43,008 − 40,000 = 3,008 → 2,560.
+	first, recs := afeRecords(t, h.sink.frames)
+	if first != 2560 || len(recs) != 38 || recs[0].Volume != 2 || recs[37].Volume != 39 {
+		t.Fatalf("afe backfill from %d: %d records %+v", first, len(recs), recs)
+	}
+	h.sink.frames = nil
+	h.appendMic(1)
+	h.appendRef(block, 7)
+	h.e.step()
+	if first, recs := afeRecords(t, h.sink.frames); first != 51200 || len(recs) != 1 || recs[0].Volume != 40 {
+		t.Fatalf("live afe from %d: %+v", first, recs)
+	}
+	if _, err := h.e.Close(proto.Envelope{Generation: 1}, proto.UplinkClose{LeaseID: "C", Reason: proto.CloseRejected}); err != nil {
+		t.Fatal(err)
+	}
+	b := h.ended()[0].body
+	if b.LastSample["afe"] != u64(52479) || b.ClippedStart["afe"].Valid {
+		t.Fatalf("uplink.ended %+v", b)
+	}
+}
+
+// Without the opt-in nothing of the afe stream exists: candidate leases do
+// not want it, uplink.ended does not name it, and uplink.open may not.
+func TestAFEStreamNeedsTheSessionOptIn(t *testing.T) {
+	h := newHarness(t)
+	h.appendMic(40)
+	h.appendRef(51200, 7)
+	h.e.OpenCandidate("C", 48000)
+	h.e.AcceptCandidate("C", true)
+	h.e.step()
+	if len(byKind(h.frames(), ema.KindAFE)) != 0 {
+		t.Fatal("afe packets without the opt-in")
+	}
+	if _, err := h.e.Close(proto.Envelope{Generation: 1}, proto.UplinkClose{LeaseID: "C", Reason: proto.CloseRejected}); err != nil {
+		t.Fatal(err)
+	}
+	if b := h.ended()[0].body; len(b.LastSample) != 3 {
+		t.Fatalf("uplink.ended keys %+v", b.LastSample)
+	}
+	if err := h.open("L", 1, map[proto.StreamID]string{"mic": "live", "afe": "live"}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("uplink.open naming afe without the opt-in: %v", err)
+	}
+}
+
+// uplink.open starts the afe stream on the 1,280-sample grid, clipped to the
+// 8 s ring, and a missing range in it is skipped with a discontinuity.
+func TestOpenAFERoundsClipsAndSkipsGaps(t *testing.T) {
+	h := newHarnessAFE(t, true)
+	h.appendMic(110) // 140,800 samples: the 8 s afe ring now starts at 12,800
+	must(t, h.open("L", 1, map[proto.StreamID]string{"afe": "5000"}))
+	h.e.step()
+	first, recs := afeRecords(t, h.sink.frames)
+	if first != 12800 || len(recs) != 100 {
+		t.Fatalf("afe backfill from %d: %d records", first, len(recs))
+	}
+	h.sink.frames = nil
+	h.mic.Missing(h.mic.End() + 2*block)
+	h.afe.Missing(h.afe.End() + 2)
+	h.appendMic(1)
+	h.e.step()
+	fs := byKind(h.frames(), ema.KindAFE)
+	if len(fs) != 1 || fs[0].FirstSample != 143360 || fs[0].Flags&ema.FlagDiscontinuity == 0 {
+		t.Fatalf("afe after a gap %+v", fs)
+	}
+	if _, err := h.e.Close(proto.Envelope{Generation: 1}, proto.UplinkClose{LeaseID: "L", Reason: proto.CloseCommitted}); err != nil {
+		t.Fatal(err)
+	}
+	if b := h.ended()[0].body; b.ClippedStart["afe"] != u64(12800) || b.LastSample["afe"] != u64(144639) {
+		t.Fatalf("uplink.ended %+v", b)
 	}
 }

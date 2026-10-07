@@ -280,12 +280,28 @@ def test_v27_adds_the_wake_shadow_tables_to_an_existing_database(tmp_path):
 
     em_db.init(p)
     c = sqlite3.connect(p)
-    assert int(c.execute(VER).fetchone()[0]) == 27 == len(em_db.MIGRATIONS)
+    assert int(c.execute(VER).fetchone()[0]) == len(em_db.MIGRATIONS)
     assert c.execute("SELECT near_misses FROM wake_counters").fetchone() == (2,)     # history kept
     assert c.execute("SELECT COUNT(*) FROM wake_shadow").fetchone() == (0,)           # no data, not zeros
     assert c.execute("SELECT COUNT(*) FROM wake_shadow_events").fetchone() == (0,)
     assert "idx_wake_shadow_events_device_ts" in {
         r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
+
+
+def test_v28_adds_afe_evidence_and_older_turns_read_unavailable(tmp_path):
+    p = str(tmp_path / "v27.db")
+    c = sqlite3.connect(p)
+    for sql in em_db.MIGRATIONS[:27]:
+        c.executescript(sql)
+    c.execute("INSERT INTO turns (device_id, ts, outcome, turn_uuid) VALUES ('D', 1.0, 'ha', 't-1')")
+    c.commit()
+    c.close()
+
+    em_db.init(p)
+    c = sqlite3.connect(p)
+    assert int(c.execute(VER).fetchone()[0]) == 28 == len(em_db.MIGRATIONS)
+    # NULL is "unavailable" (a row predating native AFE evidence), never a zero summary.
+    assert c.execute("SELECT turn_uuid, afe_evidence FROM turns").fetchone() == ("t-1", None)
 
 
 def test_connect_alerts_shares_database_but_not_connection(tmp_path):

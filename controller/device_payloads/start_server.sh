@@ -13,20 +13,141 @@
 MAX_ATTEMPTS=3
 MIN_RUNTIME=15   # seconds below which an exit is treated as a failed start
 
-# ── Wait for echoaudioservice (up to 4 minutes) ──────────────────────────────
+# ── Platform ──────────────────────────────────────────────────────────────────
+# Same test as device/internal/platform.FireOS6() and the echomuse.rc
+# seclabel decision (docs/fireos6-port.md §3 decision 4). Fire OS 5 below
+# must stay byte-for-byte what it is today.
+FIREOS6=0
+if [ "$(getprop ro.build.version.sdk)" -ge 25 ]; then
+    FIREOS6=1
+fi
+
+# ── Fire OS 6 service denylist (docs/fireos6-port.md §4.1) ───────────────────
+# No APKs on Fire OS 6, so there is no `pm hide` counterpart — every entry is
+# a native init service, stopped fresh each boot. Replaces both
+# debloat_packages.txt and echomuse-debloat.sh, which apply only to Fire OS
+# 5's package list. Adding to this list means repeating §4.1's test on
+# hardware first: stop it, then confirm micAsr still delivers audio and
+# playback is still accepted. NEVER add anything from §4.1's keep list
+# (mixer and the AIPC/shm/power transport it needs).
+#
+# sntpd follows wifisvc: it waits on ACE NetMgr (/dev/aipc/1, served by
+# wifisvc), exits, and init restarts it every ~20 s forever; the firmware
+# syncs the clock itself. Never `time_update` — it restores the saved time
+# at boot.
+#
+# This is the only copy of the list: boot applies it below, and the
+# dashboard's Re-apply debloat runs `start_server.sh debloat`.
+FOS6_DENYLIST="puffin puffinmrmd ahe shs dacd smarthomed commsd uxeventd amakit_server tokend credmgrsvc trackerd UdssCampSvc ace_dioded oobed_on_boot provisionerd otad ace_otad factory-reset perfrecoveryd ace_metricd logmgr acedropboxd aceusagestatd ace_coex_metric dha_service ledcontroller acebuttond aceinputmanager ace_sensorsd btmanagerd BTSinkPlayer blemesh_service wifisvc sntpd avahi-daemon"
+
+fos6_debloat() {
+    for svc in $FOS6_DENYLIST; do
+        stop "$svc" 2>/dev/null
+    done
+    # oobed_on_boot spawns its own dnsmasq outside init — `stop` can't reach it.
+    kill $(pidof dnsmasq) 2>/dev/null
+}
+
+# Reads the denylist's state back: STOPPED counts listed services init does
+# not report running or restarting; UP names the rest, plus a surviving
+# dnsmasq, comma-separated (empty when nothing is up).
+fos6_debloat_check() {
+    STOPPED=0
+    UP=""
+    for svc in $FOS6_DENYLIST; do
+        case "$(getprop init.svc.$svc)" in
+            running|restarting) UP="$UP,$svc" ;;
+            *) STOPPED=$((STOPPED + 1)) ;;
+        esac
+    done
+    if pidof dnsmasq >/dev/null 2>&1; then
+        UP="$UP,dnsmasq"
+    fi
+    UP=${UP#,}
+}
+
+# ── `start_server.sh debloat` ─────────────────────────────────────────────────
+# Fire OS 6's Re-apply debloat: stop the denylist now, report, and exit.
+# Nothing else in this script runs — no SELinux move, no tmpfs, no mixer
+# init, no supervisor — so the live server is untouched. The last line is
+# the controller's result:
+#   DEBLOAT_STOPPED:<listed services not running> STILL_RUNNING:<a,b,…>
+# Fire OS 5's debloat is the Magisk service.d script plus `pm hide`, which
+# the controller applies itself, so the mode refuses there.
+if [ "$1" = "debloat" ]; then
+    if [ "$FIREOS6" != "1" ]; then
+        echo "start_server.sh debloat: Fire OS 6 only — Fire OS 5's debloat is echomuse-debloat.sh plus pm hide" >&2
+        exit 2
+    fi
+    fos6_debloat
+    # `stop` only asks init; give it a moment before reading state back.
+    # The WAITING line also keeps a reader that times out on silence alive.
+    sleep 1
+    fos6_debloat_check
+    if [ -n "$UP" ]; then
+        echo "DEBLOAT_WAITING:$UP"
+        sleep 2
+        fos6_debloat_check
+    fi
+    echo "DEBLOAT_STOPPED:$STOPPED STILL_RUNNING:$UP"
+    exit 0
+fi
+
+# Fire OS 6: init refuses to start a service in boot-root's `su` domain, so
+# echomuse.rc starts this script in `adbd`, which boot-root allows to move
+# itself into `su` (`allow adbd su process dyntransition`). The move is made
+# here, in this single-threaded shell, and the server inherits it: in `adbd`
+# wpa_supplicant's replies are denied (`avc: denied { sendto } … scontext=
+# u:r:wpa:s0 tcontext=u:r:adbd:s0`), so the firmware could not drive Wi-Fi.
+# `echo` is a shell builtin, so /proc/self is this shell itself.
+if [ "$FIREOS6" = "1" ]; then
+    echo -n u:r:su:s0 > /proc/self/attr/current
+fi
+
+# Fire OS 6 has no /tmp, and everything below logs there (RAM-backed on
+# Fire OS 5 too). The wizard's install_boot_hook creates the empty mountpoint
+# on the read-only root; a tmpfs goes on it here, before the first write. If
+# the redirect target were missing, `server >> /tmp/server.log` would not run
+# the server at all.
+if [ "$FIREOS6" = "1" ] && ! grep -q " /tmp " /proc/mounts; then
+    mount -t tmpfs -o mode=1777,size=32m tmpfs /tmp
+fi
+
+# ── Wait for the audio service (up to 4 minutes) ─────────────────────────────
+# Fire OS 5: echoaudioservice owns AudioFlinger's HAL. Fire OS 6: Amazon's
+# `mixer` daemon (init service `mixer`) owns the AFE instead — there is no
+# AudioFlinger at all (docs/fireos6-port.md §4 Phase 2).
 i=0
 while [ $i -lt 120 ]; do
-    pid=$(ps | grep echoaudio | grep -v grep)
-    if [ -n "$pid" ]; then
-        sleep 5
-        break
+    if [ "$FIREOS6" = "1" ]; then
+        state=$(getprop init.svc.mixer)
+        if [ "$state" = "running" ]; then
+            sleep 5
+            break
+        fi
+    else
+        pid=$(ps | grep echoaudio | grep -v grep)
+        if [ -n "$pid" ]; then
+            sleep 5
+            break
+        fi
     fi
     sleep 2
     i=$((i + 2))
 done
 
 # ── Hardware init ─────────────────────────────────────────────────────────────
-ip link set p2p0 down
+if [ "$FIREOS6" = "1" ]; then
+    # No `ip` binary on Fire OS 6 (docs/fireos6-port.md §2 evidence).
+    ifconfig p2p0 down
+else
+    ip link set p2p0 down
+fi
+
+# ── Fire OS 6 service denylist (FOS6_DENYLIST, top of this script) ───────────
+if [ "$FIREOS6" = "1" ]; then
+    fos6_debloat
+fi
 
 # Prevent WiFi suspension
 echo "EchoMuse" > /sys/power/wake_lock

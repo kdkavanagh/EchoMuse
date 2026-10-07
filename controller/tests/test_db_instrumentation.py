@@ -265,6 +265,13 @@ def test_only_each_devices_newest_trace_retention_turns_keep_their_trace(fresh_d
     assert _stored_traces("dev2") == ["other"]                                     # per device
 
 
+def test_afe_evidence_is_stored_and_returned_and_null_means_unavailable(fresh_db):
+    evidence = '{"support_start":48000,"pre":null,"wake":null,"playback_onset":null,"utterance":null}'
+    db.insert_turn("dev1", {"ts": 1_800_000_000, "afe_evidence": evidence})
+    db.insert_turn("dev1", {"ts": 1_800_000_001})
+    assert [r["afe_evidence"] for r in db.get_turns("dev1")] == [evidence, None]
+
+
 def test_numpy_scores_are_stored_as_numbers(fresh_db):
     np = pytest.importorskip("numpy")
     db.insert_turn("dev1", {"ts": 1_800_000_000, "wake_score": np.float32(0.9),

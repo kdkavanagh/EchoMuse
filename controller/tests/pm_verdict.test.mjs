@@ -14,6 +14,7 @@
 // retry, which can never help — and the wizard could never be completed (#91).
 
 import { readFileSync } from "fs";
+import { execFileSync } from "child_process";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 
@@ -203,3 +204,135 @@ for (const msg of [
 
 check("a missing message does not throw", _isDisconnectError(undefined) === false);
 check("an error with no message does not throw", _isDisconnectError({}) === false);
+
+// ─── Platform classification (connect_android) ────────────────────────────────
+//
+// Fire OS 5, Fire OS 6 already rooted via boot-root, Fire OS 6 not yet
+// rooted, and anything else — the four outcomes connect_android has to tell
+// apart before it does anything irreversible (reboot to recovery on Fire OS
+// 5, or trust an unrooted shell on Fire OS 6).
+
+const { classifyPlatform, PLATFORM } = await import(
+  "data:text/javascript;base64," + Buffer.from(
+    [liftConst("PLATFORM"), liftFunctionDecl("classifyPlatform"),
+     "export { classifyPlatform, PLATFORM };"].join("\n")
+  ).toString("base64"));
+
+check("Fire OS 5 is classified",
+  classifyPlatform({ release: '5.1', productName: 'csm_biscuit', uid: null }).platform === PLATFORM.FIREOS5);
+
+check("Fire OS 6, rooted, is classified",
+  classifyPlatform({ release: '7.1.2', productName: 'biscuit_puffin', uid: '0' }).platform === PLATFORM.FIREOS6);
+
+{
+  let threw = null;
+  try { classifyPlatform({ release: '7.1.2', productName: 'biscuit_puffin', uid: '2000' }); }
+  catch (e) { threw = e; }
+  check("Fire OS 6 without root is refused, not silently treated as Fire OS 5",
+    threw && /boot-root/i.test(threw.message), threw && threw.message);
+  check("the refusal points at the XDA thread",
+    threw && threw.message.includes('xdaforums.com'), threw && threw.message);
+}
+
+{
+  let threw = null;
+  try { classifyPlatform({ release: '7.1.2', productName: 'something_else', uid: '0' }); }
+  catch (e) { threw = e; }
+  check("a 7.1.x device that isn't biscuit_puffin is refused",
+    threw && /biscuit_puffin/.test(threw.message), threw && threw.message);
+}
+
+{
+  let threw = null;
+  try { classifyPlatform({ release: '6.0.1', productName: 'csm_biscuit', uid: null }); }
+  catch (e) { threw = e; }
+  check("anything else is refused",
+    threw && /Wrong device/.test(threw.message), threw && threw.message);
+}
+
+// ─── rootShell ──────────────────────────────────────────────────────────────
+//
+// Fire OS 5 must send exactly the text it always has (`su -c <cmd>`). On
+// Fire OS 6 the quoted command must still run with its own word splitting:
+// the device's `sh -c` strips the outer quotes, so the result is run here
+// through a host shell the same way.
+
+const { rootShell } = await import(
+  "data:text/javascript;base64," + Buffer.from(
+    [liftConst("PLATFORM"), liftFunctionDecl("rootShell"), "export { rootShell };"].join("\n")
+  ).toString("base64"));
+
+check("Fire OS 5 wraps with su -c, byte-identical to before",
+  rootShell('fireos5', "'pm disable foo' 2>&1") === "su -c 'pm disable foo' 2>&1");
+check("Fire OS 6 runs a quoted multi-word command as words, not one name",
+  execFileSync("sh", ["-c", rootShell('fireos6', "'echo a b; echo c'")]).toString() === "a b\nc\n");
+
+// ─── Fire OS 6 step list ────────────────────────────────────────────────────
+
+const { _WIZARD_STEPS_FIREOS6, _FIREOS6_NOT_APPLICABLE } = await import(
+  "data:text/javascript;base64," + Buffer.from(
+    [liftConst("BOOT_MODE"), liftConst("_WIZARD_STEPS_FIREOS6"), liftConst("_FIREOS6_NOT_APPLICABLE"),
+     "export { _WIZARD_STEPS_FIREOS6, _FIREOS6_NOT_APPLICABLE };"].join("\n")
+  ).toString("base64"));
+
+// The other system slot is written only after a boot from the first one has
+// reached a controller: a bad install must leave a stock fallback slot.
+const at = id => _WIZARD_STEPS_FIREOS6.findIndex(s => s.id === id);
+for (const [before, after] of [['install_boot_hook', 'reboot'], ['install_em', 'reboot'],
+                               ['wifi', 'reboot'], ['reboot', 'verify_service'],
+                               ['verify_service', 'confirm_link'],
+                               ['confirm_link', 'mirror_boot_hook']]) {
+  check(`Fire OS 6 runs ${before} before ${after}`, at(before) >= 0 && at(before) < at(after),
+    _WIZARD_STEPS_FIREOS6.map(s => s.id).join(','));
+}
+check('mirror_boot_hook is the last Fire OS 6 step',
+  at('mirror_boot_hook') === _WIZARD_STEPS_FIREOS6.length - 1);
+
+// Every Fire OS 5-only step must be flagged not-applicable so it is shown,
+// not silently missing, in a Fire OS 6 run — and absent from the Fire OS 6
+// list itself, so runStep can never dispatch to it.
+for (const id of ['connect_twrp', 'patch_boot', 'install_magisk', 'preseed_db',
+                   'verify_root', 'disable_alexa', 'debloat']) {
+  check(`${id} is marked not applicable on Fire OS 6`, _FIREOS6_NOT_APPLICABLE.has(id));
+  check(`${id} is absent from the Fire OS 6 step list`,
+    !_WIZARD_STEPS_FIREOS6.some(s => s.id === id));
+}
+
+// Nothing the Fire OS 6 list runs is itself marked not-applicable — the two
+// sets must be disjoint, or a step could be shown both live and greyed out.
+for (const s of _WIZARD_STEPS_FIREOS6) {
+  check(`${s.id} is not also listed as not applicable`, !_FIREOS6_NOT_APPLICABLE.has(s.id));
+}
+
+// Every step from both platforms needs a label a human reads, same
+// discipline the Fire OS 5 "every step must have a mode" check above uses.
+_WIZARD_STEPS_FIREOS6.forEach(s => check(`${s.id} has a label`, !!s.label));
+
+// ─── Boot hook content + idempotency ───────────────────────────────────────
+
+const { _ECHOMUSE_RC, _rcInstalled } = await import(
+  "data:text/javascript;base64," + Buffer.from(
+    [liftConst("_ECHOMUSE_RC"), liftFunctionDecl("_rcInstalled"),
+     "export { _ECHOMUSE_RC, _rcInstalled };"].join("\n")
+  ).toString("base64"));
+
+check("the rc declares the echomuse service against start_server.sh",
+  _ECHOMUSE_RC.includes('service echomuse /system/bin/sh /data/local/bin/start_server.sh'));
+check("the rc's seclabel is u:r:adbd:s0, not u:r:su:s0 (init refuses that transition)",
+  _ECHOMUSE_RC.includes('seclabel u:r:adbd:s0') && !_ECHOMUSE_RC.includes('u:r:su:s0'));
+check("the rc starts the service on sys.boot_completed",
+  _ECHOMUSE_RC.includes('on property:sys.boot_completed=1') && _ECHOMUSE_RC.includes('start echomuse'));
+
+check("a device already carrying the exact rc is up to date", _rcInstalled(_ECHOMUSE_RC));
+check("a device with no file (empty cat) is not up to date", !_rcInstalled(''));
+check("a device with a stale rc is not up to date", !_rcInstalled('service echomuse /old/path\n'));
+// `cat`'s output reaches here already trimmed by Client.shell() — a
+// trailing-newline-only difference must not look like drift.
+check("trailing-newline-only differences still count as installed",
+  _rcInstalled(_ECHOMUSE_RC.trim()));
+
+if (failures) {
+  console.error(`\n${failures} check(s) failed.`);
+  process.exit(1);
+}
+console.log("pm_verdict (fireos6 additions): all checks passed.");

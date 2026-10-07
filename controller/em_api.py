@@ -33,6 +33,7 @@ import aiohttp
 from aiohttp import web
 from aiohttp.typedefs import Handler
 
+import em_afe
 import em_alerts
 import em_db as db
 import em_auth as auth
@@ -200,13 +201,38 @@ def _v1(device_id: str) -> em_device.Device | None:
     return device if device is not None and device.link is not None else None
 
 
-def _parse_free_mb(df_line: str) -> int | None:
-    """Available MiB from a BusyBox `df -m` row; wrapped device names make
-    numeric field indexes unstable, so anchor on the percentage field."""
-    fields = (df_line or "").split()
+# Free space on /data, in whichever unit the device's df can give. Fire OS 5:
+# busybox's `df -m`, MiB, as it always was (Magisk provides busybox). Fire
+# OS 6: no busybox, and toybox df has no -m but prints 1K blocks by default.
+# The unquoted $(df) folds toybox's header and row onto the one marker line;
+# no `tail`, which toybox may not link.
+FREE_SPACE_PROBE = (
+    'if busybox df -m /data >/dev/null 2>&1; '
+    'then echo "FREE_MB $(busybox df -m /data | busybox tail -1)"; '
+    'else echo FREE_KB $(df /data 2>/dev/null); fi'
+)
+
+
+def _df_available(row: str) -> int | None:
+    """The Available figure of a df row. Wrapped device names make numeric
+    field indexes unstable, so anchor on the Use% field; a header's `Use%`
+    follows a word, never a number, so a folded header is skipped."""
+    fields = row.split()
     for i, field in enumerate(fields):
         if field.endswith("%") and i > 0 and fields[i - 1].isdigit():
             return int(fields[i - 1])
+    return None
+
+
+def _parse_free_mb(probe_out: str) -> int | None:
+    """MiB free on /data from FREE_SPACE_PROBE's output; None when unreadable."""
+    for line in (probe_out or "").splitlines():
+        unit, _, row = line.strip().partition(" ")
+        if unit == "FREE_MB":
+            return _df_available(row)
+        if unit == "FREE_KB":
+            kb = _df_available(row)
+            return None if kb is None else kb // 1024
     return None
 
 # Device-link TLS material directory — set by em_controller.main() once
@@ -590,6 +616,7 @@ class ErrorCode(enum.StrEnum):
     TLS_UNAVAILABLE = "tls_unavailable"
     TOO_LARGE = "too_large"
     UNKNOWN_CONFIG_KEY = "unknown_config_key"
+    UNKNOWN_PLATFORM = "unknown_platform"
     UNKNOWN_WAKE_MODEL = "unknown_wake_model"
     UPDATE_IN_PROGRESS = "update_in_progress"
     UPGRADE_REQUIRED = "upgrade_required"
@@ -817,7 +844,21 @@ async def _get_device_turns(request: web.Request) -> web.Response:
     turns = await loop.run_in_executor(
         None, lambda: db.get_turns(device_id, limit, since)
     )
-    return _ok(turns)
+    return _ok([_turn_json(t) for t in turns])
+
+
+def _turn_json(turn: Mapping[str, object]) -> dict[str, object]:
+    """A turns row for the dashboard, `afe_evidence` parsed from its stored
+    JSON (em_afe.AfeEvidenceJson). Null stays null — unavailable: the device
+    lacked afe_metadata_v1, or the row predates it."""
+    raw = turn.get("afe_evidence")
+    evidence: em_afe.AfeEvidenceJson | None = None
+    if isinstance(raw, str):
+        try:
+            evidence = em_afe.AfeEvidence.loads(raw).wire()
+        except ValueError as exc:
+            log.warning("turn %s: unreadable afe_evidence ignored: %s", turn.get("turn_id"), exc)
+    return {**turn, "afe_evidence": evidence}
 
 
 @auth.require_auth
@@ -2697,13 +2738,8 @@ async def _run_update(shell: em_shell.ShellBroker, device_id: str, target: _Upda
         # never an awk field index — busybox wraps a long filesystem name onto
         # its own line, so $4 is the percentage on these devices.
         need_mb  = (len(binary) * 2) // 1048576 + 8   # binary + .part + slack
-        free_out = await _shell_run(
-            shell, live, 'echo "FREE $(busybox df -m /data | busybox tail -1)"')
-        free_mb = None
-        for line in (free_out or "").splitlines():
-            if line.startswith("FREE"):
-                free_mb = _parse_free_mb(line[5:])
-                break
+        free_out = await _shell_run(shell, live, FREE_SPACE_PROBE)
+        free_mb = _parse_free_mb(free_out)
         if free_mb is not None and free_mb < need_mb:
             await _update_failed(
                 device_id,
@@ -3046,6 +3082,58 @@ def _transfer_failed(stage: TransferStage, extra: str = "") -> TransferResult:
     return TransferResult(False, stage, detail)
 
 
+# One round trip names the device's base64 decoder and md5 tool, each behind
+# a sanity test. busybox first, exactly as before Fire OS 6: Magisk provides
+# it on Fire OS 5. Then the bare names, which on Fire OS 6 (no busybox, no
+# python) are toybox's — the bare base64 must decode the test string back to
+# `test`, not merely exit 0, so an unrelated `base64` on PATH cannot pass.
+# python3/python last. Bare md5sum only where busybox's is missing: Fire OS 5
+# does not reliably have one on PATH.
+TOOL_PROBE_DONE = "__DETECT_DONE__"
+TOOL_PROBE = (
+    "if echo dGVzdA== | busybox base64 -d >/dev/null 2>&1; then echo DECODER:busybox; "
+    "elif [ \"$(echo dGVzdA== | base64 -d 2>/dev/null)\" = test ]; then echo DECODER:plain; "
+    "elif python3 -c 'import base64,sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))' </dev/null >/dev/null 2>&1; then echo DECODER:python3; "
+    "elif python  -c 'import base64,sys; sys.stdout.write(base64.b64decode(sys.stdin.read()))' </dev/null >/dev/null 2>&1; then echo DECODER:python; "
+    "else echo DECODER:none; fi; "
+    "if echo x | busybox md5sum >/dev/null 2>&1; then echo MD5:busybox; "
+    "elif echo x | md5sum >/dev/null 2>&1; then echo MD5:plain; "
+    f"else echo MD5:none; fi; echo {TOOL_PROBE_DONE}"
+)
+
+
+def _probe_decoder(detect_buf: str) -> str | None:
+    """The decode command TOOL_PROBE's output names; None when it names none."""
+    if "DECODER:busybox" in detect_buf:
+        return "busybox base64 -d"
+    if "DECODER:plain" in detect_buf:
+        return "base64 -d"
+    if "DECODER:python3" in detect_buf:
+        return ("python3 -c "
+                "'import sys,base64; "
+                "sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))'")
+    if "DECODER:python" in detect_buf:
+        return ("python -c "
+                "'import sys,base64; "
+                "sys.stdout.write(base64.b64decode(sys.stdin.read()))'")
+    return None
+
+
+def _probe_md5(detect_buf: str) -> str | None:
+    """The md5 command TOOL_PROBE's output names; None when it names none."""
+    if "MD5:busybox" in detect_buf:
+        return "busybox md5sum"
+    if "MD5:plain" in detect_buf:
+        return "md5sum"
+    return None
+
+
+def _md5_of(path: str) -> str:
+    """Shell printing `<md5>  <path>` through busybox (Fire OS 5) or the bare
+    md5sum (toybox's on Fire OS 6), the same order as TOOL_PROBE."""
+    return f"{{ busybox md5sum {path} || md5sum {path}; }} 2>/dev/null"
+
+
 async def _stream_file_to_device(shell: em_shell.ShellBroker, live: em_device.Device,
                                  data: bytes, dest: str,
                                  mode: str = "755",
@@ -3053,8 +3141,9 @@ async def _stream_file_to_device(shell: em_shell.ShellBroker, live: em_device.De
     """
     Transfer a file to `dest` on the device via shell heredoc (default mode 755).
 
-    Detects available base64 decoder (busybox base64, python3, python) before
-    transferring, since 'base64' is not always in PATH on Android/FireOS.
+    Detects available base64 decoder (busybox base64, bare base64 — toybox's
+    on Fire OS 6 — python3, python) before transferring (TOOL_PROBE), since
+    'base64' is not always in PATH on Android/FireOS.
     Uses a heredoc so no intermediate .b64 file is needed.
     The heredoc delimiter contains '_' which is not in the base64 alphabet.
 
@@ -3072,7 +3161,6 @@ async def _stream_file_to_device(shell: em_shell.ShellBroker, live: em_device.De
     """
     device_id     = live.device_id
     DELIM         = "__END_B64_42__"
-    DETECT_MARKER = "__DETECT_DONE__"
 
     session = contextlib.AsyncExitStack()
     try:
@@ -3094,21 +3182,8 @@ async def _stream_file_to_device(shell: em_shell.ShellBroker, live: em_device.De
         # heredoc writes with `>`, which truncates, and a verified transfer
         # arrives by `mv` over whatever was there.
 
-        # ── Detect available base64 decoder ──────────────────────────────────
-        # Try busybox first (Magisk provides it), then python3/python.
-        # We run a round-trip sanity test so we know the decode flag works.
-        # The md5 tool is detected in the SAME round trip, not a second one.
-        # busybox first for the same reason as the decoder (Magisk provides
-        # it); bare md5sum as a fallback since some SKUs have it in PATH.
-        await ws.send(
-            "if echo dGVzdA== | busybox base64 -d >/dev/null 2>&1; then echo DECODER:busybox; "
-            "elif python3 -c 'import base64,sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))' </dev/null >/dev/null 2>&1; then echo DECODER:python3; "
-            "elif python  -c 'import base64,sys; sys.stdout.write(base64.b64decode(sys.stdin.read()))' </dev/null >/dev/null 2>&1; then echo DECODER:python; "
-            "else echo DECODER:none; fi; "
-            "if echo x | busybox md5sum >/dev/null 2>&1; then echo MD5:busybox; "
-            "elif echo x | md5sum >/dev/null 2>&1; then echo MD5:plain; "
-            f"else echo MD5:none; fi; echo {DETECT_MARKER}\n"
-        )
+        # ── Detect available base64 decoder and md5 tool (TOOL_PROBE) ────────
+        await ws.send(TOOL_PROBE + "\n")
 
         detect_buf = ""
         detect_dl  = time.monotonic() + 15
@@ -3117,30 +3192,21 @@ async def _stream_file_to_device(shell: em_shell.ShellBroker, live: em_device.De
                 msg  = await asyncio.wait_for(ws.recv(), timeout=2)
                 text = msg.decode("utf-8", errors="replace") if isinstance(msg, bytes) else msg
                 detect_buf += text
-                if DETECT_MARKER in detect_buf:
+                if TOOL_PROBE_DONE in detect_buf:
                     break
             except asyncio.TimeoutError:
                 continue
 
-        if "DECODER:busybox" in detect_buf:
-            decode_cmd = "busybox base64 -d"
-        elif "DECODER:python3" in detect_buf:
-            decode_cmd = ("python3 -c "
-                          "'import sys,base64; "
-                          "sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))'")
-        elif "DECODER:python" in detect_buf:
-            decode_cmd = ("python -c "
-                          "'import sys,base64; "
-                          "sys.stdout.write(base64.b64decode(sys.stdin.read()))'")
-        else:
-            # Two very different things reach here. DETECT_MARKER present means
+        decode_cmd = _probe_decoder(detect_buf)
+        if decode_cmd is None:
+            # Two very different things reach here. TOOL_PROBE_DONE present means
             # the device answered and genuinely has no decoder — a property of
             # that device, which retrying will not change. Absent means the
             # round trip produced nothing in 15s, i.e. the shell plane is not
             # carrying output, which is a link problem and IS worth retrying.
             # Reporting both as "no base64 decoder" sent #121 looking at the
             # wrong half.
-            if DETECT_MARKER not in detect_buf:
+            if TOOL_PROBE_DONE not in detect_buf:
                 log.error(f"[api] Shell produced no output in 15s while probing "
                           f"{device_id} for a decoder — link problem, not a "
                           f"missing tool. Output so far: {detect_buf!r}")
@@ -3151,12 +3217,8 @@ async def _stream_file_to_device(shell: em_shell.ShellBroker, live: em_device.De
 
         log.info(f"[api] Decoder: {decode_cmd.split()[0]} {decode_cmd.split()[1]}")
 
-        if "MD5:busybox" in detect_buf:
-            md5_cmd = "busybox md5sum"
-        elif "MD5:plain" in detect_buf:
-            md5_cmd = "md5sum"
-        else:
-            md5_cmd = None
+        md5_cmd = _probe_md5(detect_buf)
+        if md5_cmd is None:
             if require_verify:
                 log.error(f"[api] No md5 tool on device — refusing to transfer "
                           f"{dest} unverified. Detection output: {detect_buf!r}")
@@ -3261,8 +3323,14 @@ async def _stream_file_to_device(shell: em_shell.ShellBroker, live: em_device.De
     finally:
         await session.aclose()
 
+
+# Where the provisioning wizard installs the supervisor script; the echomuse
+# init service runs it on both platforms.
+START_SCRIPT_PATH = "/data/local/bin/start_server.sh"
+
+
 async def _sync_start_script(shell: em_shell.ShellBroker, live: em_device.Device,
-                             device_id: str) -> None:
+                             device_id: str) -> bool:
     """
     OTA-time payload sync: heal /data/local/bin/start_server.sh drift.
 
@@ -3276,18 +3344,21 @@ async def _sync_start_script(shell: em_shell.ShellBroker, live: em_device.Device
     reading the OLD inode, so the update only takes effect at the next
     device reboot — safe to do while the script sits in its `wait` loop.
     Best-effort: a sync failure logs but never blocks the firmware update.
+
+    True when the device's script is the canonical one on return — what
+    Fire OS 6's debloat needs before it runs the script's `debloat` mode.
     """
-    path = "/data/local/bin/start_server.sh"
+    path = START_SCRIPT_PATH
     try:
         script = (PAYLOADS_DIR / "start_server.sh").read_bytes()
     except OSError as e:
         log.error(f"[api] start_server.sh payload unreadable — skipping sync: {e}")
-        return
+        return False
     want = hashlib.md5(script).hexdigest()
 
-    out = await _shell_run(shell, live, f"busybox md5sum {path} 2>/dev/null")
+    out = await _shell_run(shell, live, _md5_of(path))
     if want in out:
-        return  # in sync — the common case
+        return True  # in sync — the common case
     await asyncio.sleep(1.0)  # let the md5 shell session close cleanly
 
     await push_log_event(device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
@@ -3296,22 +3367,26 @@ async def _sync_start_script(shell: em_shell.ShellBroker, live: em_device.Device
     pushed = await _stream_file_to_device(shell, live, script, tmp)
     if not pushed:
         await push_log_event(device_id, db.LogLevel.WARN, db.LogSource.CONTROLLER,
-                             f"start_server.sh sync failed: {pushed} — continuing OTA")
-        return
+                             f"start_server.sh sync failed: {pushed}")
+        return False
     await asyncio.sleep(1.0)
 
+    # ${NEW%% *} keeps the hash: md5sum prints "<hash>  <path>", and `cut`
+    # is not on Fire OS 5's PATH without busybox. The expansion needs no tool.
     res = await _shell_run(shell, live,
-        f'NEW=$(busybox md5sum {tmp} | busybox cut -d" " -f1); '
+        f'NEW=$({_md5_of(tmp)}); NEW=${{NEW%% *}}; '
         f'if [ "$NEW" = "{want}" ]; then '
         f'mv {tmp} {path} && chmod 755 {path} && echo SCRIPT_SYNCED; '
         f'else rm -f {tmp}; echo SCRIPT_MD5_MISMATCH:$NEW; fi')
-    if "SCRIPT_SYNCED" in res:
+    synced = "SCRIPT_SYNCED" in res
+    if synced:
         await push_log_event(device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
                              "start_server.sh synced — takes effect on next device reboot")
     else:
         await push_log_event(device_id, db.LogLevel.WARN, db.LogSource.CONTROLLER,
-                             f"start_server.sh sync failed ({res.strip() or 'no output'}) — continuing OTA")
+                             f"start_server.sh sync failed ({res.strip() or 'no output'})")
     await asyncio.sleep(1.0)
+    return synced
 
 
 # Magisk service.d location of the boot-time debloat script. Installed by the
@@ -3338,7 +3413,27 @@ def _debloat_packages() -> list[str]:
 async def _sync_debloat(shell: em_shell.ShellBroker, live: em_device.Device,
                         device_id: str) -> None:
     """
-    Heal debloat drift on a device that is already in the field.
+    Re-apply the device's debloat — from every firmware update and from
+    POST /api/devices/{id}/debloat. Each platform has its own: Fire OS 5's is
+    a Magisk boot script plus a `pm hide` list, Fire OS 6's is start_server.sh's
+    service denylist (it has no Magisk, no `pm` and no APKs). A device whose
+    firmware named a platform this controller does not know gets neither.
+    """
+    match live.platform:
+        case em_device_link.DevicePlatform.FIREOS5:
+            await _sync_debloat_fireos5(shell, live, device_id)
+        case em_device_link.DevicePlatform.FIREOS6:
+            await _debloat_fireos6(shell, live, device_id)
+        case None:
+            await push_log_event(device_id, db.LogLevel.WARN, db.LogSource.CONTROLLER,
+                                 "debloat skipped: the device's firmware named a platform "
+                                 "this controller does not know")
+
+
+async def _sync_debloat_fireos5(shell: em_shell.ShellBroker, live: em_device.Device,
+                                device_id: str) -> None:
+    """
+    Heal Fire OS 5 debloat drift on a device that is already in the field.
 
     The debloat has two halves and neither had an update path. The boot script
     was installed once by the provisioning wizard, and the pm-hide list was
@@ -3470,6 +3565,62 @@ async def _sync_debloat(shell: em_shell.ShellBroker, live: em_device.Device,
         await push_log_event(device_id, db.LogLevel.WARN, db.LogSource.CONTROLLER,
                              f"debloat: {len(still.split())} package(s) could not be "
                              f"hidden and are still active: {still}")
+    await asyncio.sleep(1.0)
+
+
+# `start_server.sh debloat`'s last line: how many listed services init no
+# longer runs, and which (listed services, or dnsmasq) are still up.
+_DENYLIST_RESULT = re.compile(r"DEBLOAT_STOPPED:(\d+) STILL_RUNNING:(\S*)")
+
+
+@dataclass(frozen=True, slots=True)
+class DenylistResult:
+    """What `start_server.sh debloat` reported (Fire OS 6)."""
+
+    stopped: int
+    still_running: tuple[str, ...]
+
+
+def _parse_denylist_result(out: str) -> DenylistResult | None:
+    """The result line in `start_server.sh debloat`'s output; None without one."""
+    m = _DENYLIST_RESULT.search(out)
+    if m is None:
+        return None
+    return DenylistResult(int(m.group(1)), tuple(n for n in m.group(2).split(",") if n))
+
+
+async def _debloat_fireos6(shell: em_shell.ShellBroker, live: em_device.Device,
+                           device_id: str) -> None:
+    """
+    Fire OS 6's debloat, applied now: the service denylist start_server.sh
+    stops at every boot (FOS6_DENYLIST, the list's only copy), run on its own
+    by the script's `debloat` mode. No reboot needed — the services stop now,
+    and every boot stops them again.
+
+    The script is synced first, and the mode runs only when the device's copy
+    is then the canonical one: a script predating the mode ignores its
+    argument and would run in full, starting a second supervisor beside the
+    live one. Never a Magisk path or `pm`: Fire OS 6 has neither.
+    """
+    if not await _sync_start_script(shell, live, device_id):
+        await push_log_event(device_id, db.LogLevel.WARN, db.LogSource.CONTROLLER,
+                             "debloat not applied: start_server.sh could not be brought "
+                             "up to date, and an older copy would start a second server")
+        return
+    out = await _shell_run(shell, live, f"sh {START_SCRIPT_PATH} debloat 2>&1", timeout=60.0)
+    result = _parse_denylist_result(out)
+    if result is None:
+        await push_log_event(device_id, db.LogLevel.WARN, db.LogSource.CONTROLLER,
+                             f"debloat: start_server.sh reported no result "
+                             f"({out.strip() or 'no output'})")
+    elif result.still_running:
+        await push_log_event(device_id, db.LogLevel.WARN, db.LogSource.CONTROLLER,
+                             f"debloat: {result.stopped} Amazon service(s) stopped; still "
+                             f"running: {', '.join(result.still_running)}")
+    else:
+        await push_log_event(device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
+                             f"debloat: Amazon's services stopped ({result.stopped} listed, "
+                             f"none running)")
     await asyncio.sleep(1.0)
 
 
@@ -3839,17 +3990,23 @@ async def _post_debloat(request: web.Request) -> web.Response:
     """
     POST /api/devices/{id}/debloat
 
-    Re-apply the debloat payloads to a live device: sync the boot script and
-    hide any newly-listed packages.
+    Re-apply the device's platform's debloat to a live device (_sync_debloat).
+    Fire OS 5: sync the boot script and hide any newly-listed packages. Fire
+    OS 6: sync start_server.sh and stop its service denylist now.
 
     This exists because the OTA-time sync cannot reach every device. A device
     already running the latest firmware will not be updated again, so it would
     never receive a payload change — which is exactly the situation the first
     device hit (Lounge was current when round 2 landed). Idempotent, so
-    pressing it twice costs a `pm list packages` and nothing else.
+    pressing it twice costs a `pm list packages` (Fire OS 5) or a pass of
+    `stop` calls on already-stopped services (Fire OS 6) and nothing else.
     """
     device_id = request.match_info["id"]
     live = _require_online(device_id, f"Device not connected: {device_id}")
+    if live.platform is None:
+        raise ApiError(ErrorCode.UNKNOWN_PLATFORM,
+                       "The device's firmware named a platform this controller does not "
+                       "know, so neither debloat applies — update the controller", 409)
 
     # No explicit shell release here: _shell_run and _stream_file_to_device
     # each hold a _device_shell session only for their own duration.
@@ -4194,7 +4351,7 @@ async def push_device_update(device_id: str, state: Mapping[str, object]) -> Non
 
 async def push_turn_complete(device_id: str, turn: Mapping[str, object]) -> None:
     """Broadcast a persisted voice turn (a turns row, with its turn_id)."""
-    await _push_event(EventType.TURN_COMPLETE, device_id=device_id, turn=turn)
+    await _push_event(EventType.TURN_COMPLETE, device_id=device_id, turn=_turn_json(turn))
 
 
 async def push_alerts(device_id: str, kind: str, data: Mapping[str, object]) -> None:
@@ -5098,6 +5255,7 @@ class DeviceJson(TypedDict):
     capabilities: list[str]
     missing_capabilities: list[str]
     firmware_version: str | None
+    platform: em_device_link.DevicePlatform | None
     turn_state: ActorState | None
     speaking: bool
     listening: bool
@@ -5108,6 +5266,7 @@ class DeviceJson(TypedDict):
     alert_state: dict[str, object] | None
     ringing: bool | None
     wake_stats: dict[str, object] | None
+    afe_stats: em_afe.AfeStatsJson | None
     diagnostic: bool
     stats: dict[str, object] | None
     collectMode: bool
@@ -5133,7 +5292,8 @@ def _merge_device(row: db.DeviceRow) -> DeviceJson:
 
     Live fields describe the current connection and are null/false/empty while
     the device is offline; `wake_stats` is the last report received (it carries
-    `received_ms`), so it survives a disconnect.
+    `received_ms`), so it survives a disconnect, and `afe_stats` is that
+    report's native AFE decoder counters (null: it carried none).
     """
     device_id = row.device_id
     device = _devices.get(device_id)
@@ -5166,6 +5326,9 @@ def _merge_device(row: db.DeviceRow) -> DeviceJson:
         "capabilities":       sorted(live.capabilities) if live is not None else [],
         "missing_capabilities": sorted(live.missing_capabilities) if live is not None else [],
         "firmware_version":   live.firmware_version if live is not None else None,
+        # The image the session named (WIRE §4.1): picks the debloat Re-apply
+        # runs. Null offline, or when the firmware named one we do not know.
+        "platform":           live.platform if live is not None else None,
         "turn_state":         turn_state,
         "speaking":           phase is VoicePhase.SPEAKING,
         "listening":          phase is VoicePhase.LISTENING,
@@ -5181,6 +5344,8 @@ def _merge_device(row: db.DeviceRow) -> DeviceJson:
         "ringing":            (alert_state.get("active") is not None
                                if alert_state is not None else None),
         "wake_stats":         device.wake_stats if device is not None else None,
+        "afe_stats":          (device.afe_stats.wire()
+                               if device is not None and device.afe_stats is not None else None),
         # A diagnostic uplink lease is held, so the device answers no wake (§4.4).
         "diagnostic":         bool(live is not None and live.diagnostic),
         "stats":              live.stats if live is not None else None,

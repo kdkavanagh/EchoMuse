@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	evdev "github.com/gvalkov/golang-evdev"
+	"github.com/wilbowes/EchoMuse/internal/platform"
 	"github.com/wilbowes/EchoMuse/pkg/buttons"
 	"os/exec"
 	"time"
@@ -30,8 +31,16 @@ func (e *EvDevController) SetMuteCallback(cb func()) {
 }
 
 // Init the button listeners
-// Kills alexa's native button functions
+// Kills alexa's native button functions. Fire OS 5 has one service
+// (acebutton); Fire OS 6 splits it into acebuttond and aceinputmanager
+// (docs/fireos6-port.md §4.1).
 func (e *EvDevController) Init() error {
+	if platform.FireOS6() {
+		if err := exec.Command("stop", "acebuttond").Run(); err != nil {
+			return err
+		}
+		return exec.Command("stop", "aceinputmanager").Run()
+	}
 	cmd := exec.Command("stop", "acebutton")
 	return cmd.Run()
 }

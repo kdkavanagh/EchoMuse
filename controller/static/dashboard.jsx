@@ -116,6 +116,7 @@ const CAPABILITY = Object.freeze({
   LED_ANIM:        'led_anim',
   BUTTON_HOLD:     'button_hold',
   OPEN_RULES:      'open_rules_v1',
+  AFE_METADATA:    'afe_metadata_v1',
 });
 
 // deviceState()'s key: what the dashboard shows a device doing. Derived here
@@ -322,6 +323,7 @@ const CAPABILITY_REASONS = Object.freeze({
   [CAPABILITY.LED_ANIM]:        'this firmware cannot animate the ring, so it shows the listening colour instead — update it',
   [CAPABILITY.BUTTON_HOLD]:     'this firmware has no action-button event for a tap to fire — update it',
   [CAPABILITY.OPEN_RULES]:      'this firmware opens a wake only on the model threshold and runs no shadow rules — update it',
+  [CAPABILITY.AFE_METADATA]:    "needs Fire OS 6 firmware that decodes the native AFE metadata — Fire OS 5's older v2.1 layout is not decoded",
 });
 
 // The reason `cap` is missing, or null when the control is available.
@@ -1202,6 +1204,50 @@ const PLAYBACK_ENDS = Object.freeze({
   [PLAYBACK_END.FENCED]:           'superseded',
 });
 
+// One span of a turn's native AFE evidence (em_afe.AfeSummaryJson), compactly.
+// Evidence only: no wake, attribution or endpoint decision reads it.
+function afeSpanText(s) {
+  const fr = n => `${n} fr`;
+  const parts = [
+    `${s.frames}/${s.frames_expected} frames`,
+    s.periods_received < s.periods_expected && `${s.periods_expected - s.periods_received} of ${s.periods_expected} periods missing`,
+    s.playback_frames ? `playback ${fr(s.playback_frames)}` : 'no playback',
+    s.erle_frames ? `ERLE max ${s.erle_max}, mean ${s.erle_mean.toFixed(1)} over ${fr(s.erle_frames)}` : null,
+    s.dtd_frames ? `DTD max ${s.dtd_max.toFixed(2)} over ${fr(s.dtd_frames)}` : null,
+    s.rms_max_db != null && `RMS max ${s.rms_max_db} dB${s.rms_mean_db != null ? `, mean ${s.rms_mean_db.toFixed(1)} dB` : ''}`,
+    `VAD max ${s.vad_max.toFixed(2)} over ${fr(s.vad_frames)}`,
+    `volume ${s.volume}`,
+  ];
+  const flags = [['output clipped', s.output_clipped], ['mic clipped', s.mic_clipped], ['AEC diverged', s.aec_diverged],
+    ['device muted', s.device_mute], ['gaps', s.gaps], ['syncs', s.syncs], ['lost', s.lost_frames]]
+    .filter(([, n]) => n > 0).map(([label, n]) => `${label} ${n}`);
+  return parts.filter(Boolean).concat(flags).join(' · ');
+}
+
+// A turn's native AFE evidence (turns.afe_evidence): null is unavailable — the
+// Echo did not report it — and a null part inside it is no data, never zeros.
+// A wake shows the second before its support window (the AEC state while only
+// the answer played), the window itself, and how far into playback it began.
+function NativeAfeEvidence({ evidence, wake, utterance }) {
+  const muted = { color: 'var(--muted)' };
+  if (evidence == null) {
+    return <span style={muted}>unavailable — not reported for this turn ({CAPABILITY_REASONS[CAPABILITY.AFE_METADATA]}), or recorded before it existed</span>;
+  }
+  const into = evidence.playback_onset != null && evidence.support_start != null
+    ? `${Math.round((evidence.support_start - evidence.playback_onset) / 16)} ms into playback` : null;
+  const line = (label, s, extra) => (
+    <div>
+      <span style={muted}>{label}: </span>{s ? afeSpanText(s) : <span style={muted}>no data</span>}
+      {extra && <> · {extra}</>}
+    </div>
+  );
+  return <>
+    {wake && line('1 s before wake', evidence.pre)}
+    {wake && line('wake', evidence.wake, into)}
+    {utterance && line('utterance', evidence.utterance)}
+  </>;
+}
+
 // One turn, stage by stage: what woke it, what the controller's streaming
 // recognizer heard and why it stopped listening, what Home Assistant
 // transcribed and what was sent on, who handled it, what was said back, and
@@ -1261,6 +1307,9 @@ function TurnDetail({ turn: t, turns, onSelect }) {
             : <>not committed — {end.label.replace(/_/g, ' ')}</>}
         </div>
       </>)}
+
+      {!legacy && stage('Native AFE', <NativeAfeEvidence evidence={t.afe_evidence}
+        wake={t.trigger === TURN_TRIGGER.WAKE} utterance={!refused}/>)}
 
       {(t.stt_raw != null || (legacy && (t.stt_text || measured(t.stt_ms)))) && stage('Transcribed (HA)', <>
         {quote(t.stt_raw ?? t.stt_text)}
@@ -2156,6 +2205,14 @@ function WakeHealth({ device, registry, expected }) {
   const reason = gap || (w?.wake_unavailable
     ? `${w.wake_unavailable.replace(/_/g, ' ')}${w.detail ? ` — ${w.detail}` : ''}`
     : w ? 'ready' : 'waiting for the first wake report');
+  // Native AFE decoder health (wake.stats.afe): unavailable with the reason on
+  // firmware without afe_metadata_v1; absent stats are no data, never zeros.
+  const afe = device.afe_stats;
+  const afeGap = capabilityGap(liveCapabilities(device), CAPABILITY.AFE_METADATA);
+  const afeTrouble = afe && (afe.frames < afe.frames_expected || afe.invalid || afe.gaps || afe.lost_frames);
+  const afeText = afeGap ? `unavailable — ${afeGap}`
+    : afe ? `${afe.frames}/${afe.frames_expected} frames valid · ${afe.invalid} invalid · ${afe.syncs} syncs · ${afe.gaps} gaps · ${afe.lost_frames} lost`
+    : 'no data yet';
   const near = w?.near_misses || [];
   const nearPeak = near.reduce((n, x) => Math.max(n, Number(x.peak) || 0), 0);
   return (
@@ -2170,6 +2227,13 @@ function WakeHealth({ device, registry, expected }) {
             <span style={{ fontFamily:MONO, fontSize:11, color:'var(--muted)' }}>Installed graph</span>
             <span style={{ fontFamily:MONO, fontSize:11, color:w?.graph_sha256 && expected && w.graph_sha256 !== expected ? 'var(--warn)' : 'var(--text2)' }}>
               {shortSha(w?.graph_sha256)}
+            </span>
+          </div>
+          <div style={{ display:'flex', justifyContent:'space-between', gap:12, padding:'8px 0', borderBottom:'1px solid var(--hairline)' }}>
+            <span style={{ fontFamily:MONO, fontSize:11, color:'var(--muted)', whiteSpace:'nowrap' }}>Native AFE</span>
+            <span style={{ fontFamily:MONO, fontSize:11, textAlign:'right',
+              color:afeGap || !afe ? 'var(--muted)' : afeTrouble ? 'var(--warn)' : 'var(--text2)' }}>
+              {afeText}
             </span>
           </div>
           <div style={{ display:'flex', justifyContent:'space-between', padding:'8px 0' }}>
@@ -2670,17 +2734,45 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
     setTimeout(() => setSecuring(false), 15000);
   }
 
+  // What Re-apply debloat does on this device's platform (session.hello's
+  // `platform`: null while offline, or when the firmware named one this
+  // controller does not know — then the button is disabled with this reason).
+  function debloatDescription() {
+    if (device.platform === PLATFORM.FIREOS6) {
+      return 'Re-apply the debloat: re-sync the start script, whose service denylist is the '
+        + 'Fire OS 6 debloat, and stop Amazon\'s services now — no reboot needed. The same '
+        + 'list is stopped on every boot and with every firmware update; this is for a device '
+        + 'already on the current firmware. Idempotent.';
+    }
+    if (device.platform === PLATFORM.FIREOS5) {
+      return 'Re-apply the debloat payloads: sync the boot script and hide any Amazon package '
+        + 'added to the list since this device was provisioned. Runs automatically with every '
+        + 'firmware update — this is for a device already on the current firmware, which the '
+        + 'automatic path never reaches. Idempotent, and newly hidden packages stop at the next '
+        + 'device restart.';
+    }
+    return device.connected
+      ? 'Unavailable: this device\'s firmware names a platform this controller does not know, '
+        + 'so neither debloat applies. Update the controller.'
+      : 'Re-apply this device\'s debloat. Available while the device is connected.';
+  }
+
   async function doDebloat() {
-    // Re-applies both debloat halves: syncs the boot script and hides any
-    // package added to the list since this device was provisioned. Needed
-    // because the OTA-time sync cannot reach a device already running the
-    // latest firmware. Idempotent, and the daemon stops for PERSISTENT
-    // packages only take hold on the next reboot — hence the wording.
+    // Re-applies this platform's debloat. Fire OS 5: both halves — syncs the
+    // boot script and hides any package added to the list since this device
+    // was provisioned; the daemon stops for PERSISTENT packages only take
+    // hold on the next reboot, hence the wording. Fire OS 6: syncs
+    // start_server.sh and stops its service denylist now. Needed because the
+    // OTA-time sync cannot reach a device already running the latest
+    // firmware. Idempotent.
     setDebloating(true);
     try {
       await API.post(`/api/devices/${device.device_id}/debloat`, {});
-      alert('Debloat re-applied. Newly hidden packages stop at the next device reboot — '
-            + 'watch the device log for details.');
+      alert(device.platform === PLATFORM.FIREOS6
+        ? 'Debloat started: Amazon\'s services are being stopped now, no reboot needed — '
+          + 'watch the device log for the result.'
+        : 'Debloat re-applied. Newly hidden packages stop at the next device reboot — '
+          + 'watch the device log for details.');
     } catch(e) { alert(e.error || 'Debloat failed'); }
     setTimeout(() => setDebloating(false), 8000);
   }
@@ -3357,14 +3449,9 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
               {isAdmin && (
                 <Panel label="Maintenance">
                   <div style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)', lineHeight:1.6, marginBottom:14 }}>
-                    Re-apply the debloat payloads: sync the boot script and hide any
-                    Amazon package added to the list since this device was provisioned.
-                    Runs automatically with every firmware update — this is for a device
-                    already on the current firmware, which the automatic path never
-                    reaches. Idempotent, and newly hidden packages stop at the next
-                    device restart.
+                    {debloatDescription()}
                   </div>
-                  <Pill small disabled={!device.connected || debloating} onClick={doDebloat}>
+                  <Pill small disabled={!device.connected || !device.platform || debloating} onClick={doDebloat}>
                     {debloating ? 'Applying…' : 'Re-apply debloat'}
                   </Pill>
                 </Panel>
@@ -3676,6 +3763,11 @@ const _ALEXA_PKGS = [
 const STEP_STATE = Object.freeze({ PENDING: 'pending', RUNNING: 'running', DONE: 'done', ERROR: 'error' });
 const LOG_TONE = Object.freeze({ INFO: 'info', OK: 'ok', WARN: 'warn', ERROR: 'error', HEAD: 'head' });
 const BOOT_MODE = Object.freeze({ ANDROID: 'android', TWRP: 'twrp', UNKNOWN: 'unknown' });
+// Which FireOS image the Dot is running — decided once in connect_android
+// and carried in wizard state for the rest of the run. Everything that
+// differs between the two images (the step list, rootShell, the wifi/
+// install_em branches) reads this rather than re-deriving it.
+const PLATFORM = Object.freeze({ FIREOS5: 'fireos5', FIREOS6: 'fireos6' });
 // What a `pm disable` / `pm hide` call said (see _pmVerdict).
 const PM_VERDICT = Object.freeze({ DISABLED: 'disabled', ABSENT: 'absent', REJECTED: 'rejected' });
 
@@ -3702,6 +3794,51 @@ function _bannerMode(banner) {
 }
 
 const _MODE_NAME = Object.freeze({ [BOOT_MODE.TWRP]: 'TWRP recovery', [BOOT_MODE.ANDROID]: 'Android' });
+// What connect_android concludes from the device's own properties, before
+// any irreversible action is taken — rebooting to recovery on Fire OS 5, or
+// trusting an unrooted shell on Fire OS 6. Pure and side-effect-free so the
+// four outcomes (Fire OS 5, Fire OS 6 already rooted, Fire OS 6 not yet
+// rooted, anything else) are testable without a device.
+//
+// `uid` is the trimmed stdout of `id -u` — the caller reads it only when
+// `release` already looks like Fire OS 6 (a Fire OS 5 Dot's adb shell is
+// the unrooted uid 2000 shell user before Magisk, and `id -u` there
+// answers a question nobody is asking).
+function classifyPlatform(opts) {
+  const { release, productName, uid } = opts;
+  const rel = release || '';
+  if (rel.startsWith('5.')) return { platform: PLATFORM.FIREOS5 };
+  if (rel.startsWith('7.1')) {
+    if (productName !== 'biscuit_puffin') {
+      throw new Error(
+        `Android ${rel} but product is "${productName || '(unknown)'}", not "biscuit_puffin" `
+        + `— Fire OS 6 on this Dot is always biscuit_puffin. Wrong device?`);
+    }
+    if (uid !== '0') {
+      throw new Error(
+        `This Dot is Fire OS 6 (Android ${rel}, biscuit_puffin) but the adb shell is not root `
+        + `(id -u = "${uid || '(unknown)'}"). Fire OS 6 needs R0rt1z2's boot-root.zip flashed `
+        + `from TWRP first — see https://xdaforums.com/t/unlock-root-twrp-unbrick-amazon-echo-dot-2nd-gen-2016-biscuit.4761416/`);
+    }
+    return { platform: PLATFORM.FIREOS6 };
+  }
+  throw new Error(
+    `Expected FireOS 5 (Android 5.x) or FireOS 6 (Android 7.1.x, biscuit_puffin), `
+    + `got Android ${rel}. Wrong device?`);
+}
+
+// `su -c` on Fire OS 5 — the adb shell is the unrooted uid 2000 shell user,
+// and root comes from Magisk. `sh -c` on Fire OS 6 — boot-root.zip already
+// runs the adb shell as uid 0, and there is no su binary to call.
+//
+// `cmd` is exactly the text that would sit after `su -c ` today, quotes and
+// all (e.g. `'wpa_cli -p /data/misc/wifi/sockets -i wlan0 status'`), so it
+// is ONE shell word once the device's shell has stripped the quotes. `sh -c`
+// takes that word the way `su -c` does; sending it bare would make the
+// device run a command literally named `wpa_cli -p …`.
+function rootShell(platform, cmd) {
+  return `${platform === PLATFORM.FIREOS6 ? 'sh' : 'su'} -c ${cmd}`;
+}
 
 const _INIT_RC_APPEND = `
 service mixer /system/bin/sh
@@ -3714,6 +3851,36 @@ service echomuse /data/local/bin/start_server.sh
     group root system
     class late_start
 `;
+
+// /system/etc/init/echomuse.rc, written byte-for-byte by install_boot_hook
+// (Fire OS 6 only — see docs/fireos6-port.md Phase 3). `seclabel
+// u:r:adbd:s0`, not `u:r:su:s0`: init refuses the transition into `su`
+// while enforcing (confirmed on hardware). `adbd` is only the way in:
+// boot-root lets it move itself into `su`, and start_server.sh does so
+// before starting the server, because wpa_supplicant's replies to `adbd`
+// are denied. The `aipc` primary group is what the mixer requires. The
+// trailing newline is load-bearing: Android 7's init parser acts on a line
+// at its newline and drops an unterminated last line, which would be the
+// `start echomuse` trigger.
+const _ECHOMUSE_RC = `service echomuse /system/bin/sh /data/local/bin/start_server.sh
+    class late_start
+    user root
+    group aipc audio system inet wifi net_admin net_raw bluetooth net_bt_stack wakelock input
+    seclabel u:r:adbd:s0
+    disabled
+
+on property:sys.boot_completed=1
+    start echomuse
+`;
+
+// Whether the file already on device matches what install_boot_hook would
+// write — the remount-write-remount dance is skipped when it does, so a
+// re-run (or a second device provisioned from the same session) doesn't
+// pay for a write that changes nothing. `existing` is `cat`'s output,
+// already trimmed by Client.shell(); _ECHOMUSE_RC is trimmed to match.
+function _rcInstalled(existing) {
+  return (existing || '').trim() === _ECHOMUSE_RC.trim();
+}
 
 // Known-good Magisk release for this device/Android version. Checked
 // against the uploaded file's SHA-256 before flashing — catches wrong-
@@ -3731,6 +3898,17 @@ service echomuse /data/local/bin/start_server.sh
 // be the worse error. Mirrored in docs/rooting.md, pinned by test.
 const _TESTED_FIREOS_BUILD = '272.6.8.0_user_680767620';
 const _TESTED_FIREOS_NAME  = 'Fire OS 5.5.5.4';
+
+// Mirrors _TESTED_FIREOS_BUILD above, for Fire OS 6. "NS6569/6009" is the
+// parenthesised build code inside ro.build.version.name on the device this
+// was ported and tested on ("Fire OS 6.5.6.9 (NS6569/6009)", both slots) —
+// ro.build.version.incremental ("0011980470660" there) is a separate, less
+// legible counter, so the readable code is what's compared and what's shown.
+// A warning, not a refusal, for the same reason as the Fire OS 5 pin: an
+// untested build may well provision fine. Mirrored in docs/rooting.md,
+// pinned by test.
+const _TESTED_FIREOS6_BUILD = 'NS6569/6009';
+const _TESTED_FIREOS6_NAME  = 'Fire OS 6.5.6.9';
 
 // WiFi security labels, used in the network picker and in error messages.
 // Module scope so WifiPanel and the wizard's step runners share one set.
@@ -3793,18 +3971,61 @@ const _WIZARD_STEPS = [
 // position, and a bare number there says nothing about which step it means.
 const STEP = Object.freeze(Object.fromEntries(_WIZARD_STEPS.map((s, i) => [s.id.toUpperCase(), i])));
 
-// Steps that establish an ADB connection rather than needing one. They show
-// "Retry Connection" on error, and they are the only steps runStep will enter
-// without a live handle.
-const CONNECT_STEPS = new Set([STEP.CONNECT_ANDROID, STEP.CONNECT_TWRP, STEP.RECONNECT]);
+// Fire OS 6 steps, in order (see docs/fireos6-port.md Phase 3/4). No TWRP, no
+// boot image, no Magisk: boot-root.zip already has the shell at uid 0, and
+// the only boot-time change EchoMuse makes is the one init .rc written live
+// from this same Android session — so there is no reboot between
+// `connect_android` and `wifi`, unlike the Fire OS 5 list above. `wifi`,
+// `reboot`, `reconnect` and `install_em` reuse the exact same step runners
+// Fire OS 5 uses; those runners branch internally on `platform` where the
+// two images actually differ (see runConfigWifi / runInstallEchoMuse).
+//
+//  connect_android    — connect in Android mode, verify FireOS 6 + root
+//  install_boot_hook  — echomuse.rc + /tmp on the RUNNING slot only    [auto]
+//  install_em         — push binary + startup script                  [file]
+//  wifi               — write wpa_supplicant.conf only, no live join   [inputs]
+//  reboot             — snapshot the controller's row, reboot         [button]
+//  reconnect          — reconnect ADB after reboot                    [button]
+//  verify_service     — confirm init.svc.echomuse / init.svc.mixer    [auto]
+//  confirm_link       — this controller heard the device after boot   [auto]
+//  mirror_boot_hook   — only now, the same hook on the other slot     [auto]
+//
+// The other slot is written last, after a boot from the hooked slot has
+// proven the whole chain (init, start script, Wi-Fi, controller link). A bad
+// install then leaves the other slot stock, which the bootloader falls back
+// to as a known-good boot instead of a second copy of the fault.
+const _WIZARD_STEPS_FIREOS6 = [
+  { id: 'connect_android',   mode: BOOT_MODE.ANDROID, label: 'Connect Device',    desc: 'Connect the Echo Dot via USB. Device should be on and booted into Fire OS 6, rooted via boot-root.zip. Appears as "AEOBC" in the USB picker.' },
+  { id: 'install_boot_hook', mode: BOOT_MODE.ANDROID, label: 'Install Boot Hook', desc: 'Write the echomuse init service to /system/etc/init/ on the system slot the Dot is running. The other slot is left stock until this one is proven.' },
+  { id: 'install_em',        mode: BOOT_MODE.ANDROID, label: 'Install EchoMuse',  desc: 'Push server binary and startup script to device.' },
+  { id: 'wifi',              mode: BOOT_MODE.ANDROID, label: 'Configure WiFi',    desc: "Write the WiFi network into wpa_supplicant.conf — the firmware brings WiFi up itself at boot." },
+  { id: 'reboot',            mode: BOOT_MODE.ANDROID, label: 'Reboot',            desc: 'Reboot device to start the echomuse service.' },
+  { id: 'reconnect',         mode: BOOT_MODE.ANDROID, label: 'Reconnect',         desc: 'Re-connect ADB as soon as the device appears as "AEOBC" in the USB picker.' },
+  { id: 'verify_service',    mode: BOOT_MODE.ANDROID, label: 'Verify Service',    desc: "Confirm the echomuse service and Amazon's mixer are both running." },
+  { id: 'confirm_link',      mode: BOOT_MODE.ANDROID, label: 'Confirm Link',      desc: 'Wait for the device to join WiFi and reach this controller (it shows up pending approval).' },
+  { id: 'mirror_boot_hook',  mode: BOOT_MODE.ANDROID, label: 'Mirror Boot Hook',  desc: 'Now that the hooked slot is proven, write the same hook to the other system slot, so a bootloader fallback still runs EchoMuse.' },
+];
 
-// Steps that need no input: they start themselves once a handle is live.
-const AUTO_STEPS = new Set([STEP.PATCH_BOOT, STEP.PRESEED_DB, STEP.VERIFY_ROOT,
-                            STEP.DISABLE_ALEXA, STEP.DEBLOAT]);
+// Steps named on the Fire OS 5 list (above) that Fire OS 6 has no use for —
+// boot-root, the live .rc and start_server.sh's own denylist already cover
+// their jobs (see docs/fireos6-port.md §4.1, Phase 3/4). Shown in the
+// sidebar as not applicable rather than silently missing, so a Fire OS 6
+// run doesn't read as a wizard that lost steps.
+const _FIREOS6_NOT_APPLICABLE = new Set([
+  'connect_twrp', 'patch_boot', 'install_magisk', 'preseed_db',
+  'verify_root', 'disable_alexa', 'debloat',
+]);
 
-// Steps with their own input panel (file pickers, the WiFi form), which is
-// also their retry path; the generic Retry button is not offered for them.
-const INPUT_STEPS = new Set([STEP.INSTALL_MAGISK, STEP.WIFI, STEP.INSTALL_EM]);
+// Steps that establish an ADB connection rather than needing one, steps
+// that need no input, and steps with their own input panel — by id rather
+// than position, since the same id sits at a different index in each
+// platform's list (e.g. `wifi` is step 10 on Fire OS 5 and step 3 on
+// Fire OS 6).
+const CONNECT_STEPS = new Set(['connect_android', 'connect_twrp', 'reconnect']);
+const AUTO_STEPS = new Set(['patch_boot', 'preseed_db', 'verify_root', 'disable_alexa',
+                            'debloat', 'install_boot_hook', 'verify_service',
+                            'confirm_link', 'mirror_boot_hook']);
+const INPUT_STEPS = new Set(['install_magisk', 'wifi', 'install_em']);
 
 // ── WifiPanel ──
 
@@ -3918,6 +4139,15 @@ function ProvisionWizard({ onClose, knownDevices }) {
   const [adb, setAdbState]      = useState(null);
   const adbRef                  = useRef(null);
   const setAdb = c => { adbRef.current = c; setAdbState(c); };
+  // Decided once, in connect_android, and never reset for the rest of the
+  // run — every later step, and the sidebar itself, reads this rather than
+  // re-deriving which image the Dot is running.
+  const [platform, setPlatform] = useState(null);
+  // The active step list and the current step's id, derived from
+  // `platform`. Before connect_android completes this falls back to the
+  // Fire OS 5 list, matching the wizard's pre-Fire-OS-6 default.
+  const steps  = platform === PLATFORM.FIREOS6 ? _WIZARD_STEPS_FIREOS6 : _WIZARD_STEPS;
+  const stepId = steps[step]?.id;
   const [magiskFile, setMagiskFile] = useState(null);
   const [binaryFile, setBinaryFile] = useState(null);
   const [wifiSsid, setWifiSsid] = useState('');
@@ -3940,6 +4170,9 @@ function ProvisionWizard({ onClose, knownDevices }) {
   // event landed while `running` was still true, and a step that had just
   // worked was marked failed with "the step was abandoned".
   const expectDisconnect = useRef(false);
+  // confirm_link's pre-reboot snapshot ({serial, lastSeen}), taken by the
+  // Fire OS 6 reboot step.
+  const linkBaseline = useRef(null);
 
   // Errors thrown by an in-flight transfer when the device goes away. These
   // race the disconnect event and can arrive first, in which case the catch in
@@ -4050,15 +4283,15 @@ function ProvisionWizard({ onClose, knownDevices }) {
   // without anyone noticing until a file carried an SSID.
   const _PROVISION_PROBES = {
     props:         'getprop',
-    root:          'su -c id 2>&1',
+    root:          rootShell(platform, 'id 2>&1'),
     selinux:       'getenforce 2>&1',
     // The two distinct shapes a too-early `pm` produces, which is what the
     // retry path keys off — worth capturing verbatim rather than as a verdict.
     pm_ready:      'pm path android 2>&1',
     storage:       'df /data 2>&1',
-    wpa_status:    "su -c 'wpa_cli -p /data/misc/wifi/sockets -i wlan0 status' 2>&1",
-    wpa_scan:      "su -c 'wpa_cli -p /data/misc/wifi/sockets -i wlan0 scan_results' 2>&1",
-    wpa_caps:      "su -c 'wpa_cli -p /data/misc/wifi/sockets -i wlan0 get_capability key_mgmt' 2>&1",
+    wpa_status:    rootShell(platform, "'wpa_cli -p /data/misc/wifi/sockets -i wlan0 status' 2>&1"),
+    wpa_scan:      rootShell(platform, "'wpa_cli -p /data/misc/wifi/sockets -i wlan0 scan_results' 2>&1"),
+    wpa_caps:      rootShell(platform, "'wpa_cli -p /data/misc/wifi/sockets -i wlan0 get_capability key_mgmt' 2>&1"),
     services:      'getprop | grep init.svc',
     processes:     "ps | grep -E 'wpa_supplicant|SmartHomeWifid' | grep -v grep",
     // Answers "did the package steps achieve anything", which is the case
@@ -4069,6 +4302,13 @@ function ProvisionWizard({ onClose, knownDevices }) {
     // TWRP steps only, and harmless elsewhere: which partition the boot image
     // write would have gone to.
     boot_target:   'readlink -f /dev/block/other-boot 2>&1',
+    // Fire OS 6 only, and harmless elsewhere: service state, boot hook
+    // content and active slot (docs/fireos6-port.md Phase 4).
+    mixer_service:    'getprop init.svc.mixer',
+    echomuse_service: 'getprop init.svc.echomuse',
+    mixer_streams:    'ls -l /data/mixer_streams 2>&1',
+    echomuse_rc:      'cat /system/etc/init/echomuse.rc 2>&1',
+    slot_suffix:      'getprop ro.boot.slot_suffix',
   };
 
   async function collectProvisionDiagnostics(c, stepIdx, err) {
@@ -4087,7 +4327,7 @@ function ProvisionWizard({ onClose, knownDevices }) {
       }
     }
     return API.post('/api/provision/diagnostics', {
-      step:  _WIZARD_STEPS[stepIdx]?.id || String(stepIdx),
+      step:  steps[stepIdx]?.id || String(stepIdx),
       error: err?.message || '',
       probes,
       transcript: transcriptRef.current.map(l => l.msg),
@@ -4152,13 +4392,22 @@ function ProvisionWizard({ onClose, knownDevices }) {
     const fwName  = await c.shell('getprop ro.build.version.name');
     addLog(`Model: ${model || '(unknown)'}  Build: Android ${release}  Codename: ${name || '(unknown)'}  Serial: ${serial || '(unknown)'}`);
     addLog(`Firmware: ${fwName || '(unknown)'}  ${fwBuild || ''}`);
-    if (!release.startsWith('5.')) {
-      throw new Error(`Expected FireOS 5 (Android 5.x), got Android ${release}. Wrong device?`);
-    }
-    if (fwBuild && fwBuild !== _TESTED_FIREOS_BUILD) {
-      addLog(`Untested firmware — EchoMuse is developed against ${_TESTED_FIREOS_NAME} `
-           + `(${_TESTED_FIREOS_BUILD}). Other FireOS 5 builds may behave differently, `
-           + `particularly around USB and ADB.`, LOG_TONE.WARN);
+    // Only asked on a Fire OS 6-shaped release — a Fire OS 5 Dot's shell is
+    // the unrooted shell user before Magisk, and `id -u` there is not
+    // evidence of anything.
+    const uid = release.startsWith('7.1') ? await c.shell('id -u') : null;
+    const { platform: detected } = classifyPlatform({ release, productName: name, uid });
+    setPlatform(detected);
+
+    if (detected === PLATFORM.FIREOS5) {
+      if (fwBuild && fwBuild !== _TESTED_FIREOS_BUILD) {
+        addLog(`Untested firmware — EchoMuse is developed against ${_TESTED_FIREOS_NAME} `
+             + `(${_TESTED_FIREOS_BUILD}). Other FireOS 5 builds may behave differently, `
+             + `particularly around USB and ADB.`, LOG_TONE.WARN);
+      }
+    } else if (fwName && !fwName.includes(_TESTED_FIREOS6_BUILD)) {
+      addLog(`Untested firmware — EchoMuse is developed against ${_TESTED_FIREOS6_NAME} `
+           + `(${_TESTED_FIREOS6_BUILD}). Other FireOS 6 builds may behave differently.`, LOG_TONE.WARN);
     }
     if (model && !model.toLowerCase().includes('amazon') && !name.toLowerCase().includes('biscuit')) {
       addLog('Warning: device may not be an Echo Dot 2nd gen — proceeding anyway.', LOG_TONE.WARN);
@@ -4195,6 +4444,14 @@ function ProvisionWizard({ onClose, knownDevices }) {
         err.matchedDeviceId = match.device_id;
         throw err;
       }
+    }
+
+    if (detected === PLATFORM.FIREOS6) {
+      // No TWRP on this path — boot-root.zip already has the shell at uid
+      // 0, and the one boot-time change (install_boot_hook) is written
+      // live from this same session. Stay connected.
+      addLog('FireOS 6 confirmed (biscuit_puffin, rooted via boot-root.zip). Continuing…', LOG_TONE.OK);
+      return c;
     }
 
     addLog('FireOS 5 confirmed. Rebooting to TWRP recovery…');
@@ -4489,6 +4746,13 @@ function ProvisionWizard({ onClose, knownDevices }) {
   }
 
   async function runReboot(c) {
+    if (platform === PLATFORM.FIREOS6) {
+      // confirm_link's baseline: this device's controller row as it stands
+      // before the boot whose link it has to prove (absent for a new device).
+      const serial = (await c.shell('getprop ro.serialno')).trim();
+      const row = (await API.get('/api/devices')).find(x => x.device_id === serial);
+      linkBaseline.current = { serial, lastSeen: row ? row.last_seen : null };
+    }
     addLog('Sending reboot command…');
     expectDisconnect.current = true;
     try { await c.shell('reboot'); } catch {}
@@ -4535,7 +4799,7 @@ function ProvisionWizard({ onClose, knownDevices }) {
       // Say so when the device came back in the wrong mode. Without this the
       // reconnect looks like a success and the next Retry runs a TWRP step
       // against Android, or the reverse.
-      const want = _WIZARD_STEPS[step].mode;
+      const want = steps[step].mode;
       const got  = _bannerMode(c.banner);
       if (got !== BOOT_MODE.UNKNOWN && got !== want) {
         addLog(`Reconnected in ${_MODE_NAME[got]}, but this step needs ${_MODE_NAME[want]} `
@@ -4729,7 +4993,7 @@ function ProvisionWizard({ onClose, knownDevices }) {
         () => addLog(`    still waiting on su (${Math.round((Date.now() - callStart) / 1000)}s) — magiskd has not answered yet`),
         15000);
       try {
-        out = await c.shell('su -c id 2>&1');
+        out = await c.shell(rootShell(platform, 'id 2>&1'));
       } finally {
         clearInterval(ticker);
       }
@@ -4753,8 +5017,13 @@ function ProvisionWizard({ onClose, knownDevices }) {
 
   async function scanWifi(c) {
     addLog('Scanning for WiFi networks…');
-    await c.shell("su -c 'svc wifi enable'");
-    await new Promise(r => setTimeout(r, 2000));
+    // Fire OS 6 has no `svc wifi` behind it — Amazon's wifisvc already has
+    // p2p_supplicant running at this same socket path before the wizard
+    // ever connects, so there is nothing to enable first.
+    if (platform !== PLATFORM.FIREOS6) {
+      await c.shell(rootShell(platform, "'svc wifi enable'"));
+      await new Promise(r => setTimeout(r, 2000));
+    }
     // wpa_cli on this build needs BOTH -p (socket dir, since
     // ctrl_interface=/data/misc/wifi/sockets is non-default) AND -i wlan0
     // (interface) explicitly — without -p it sometimes silently works by
@@ -4763,9 +5032,9 @@ function ProvisionWizard({ onClose, knownDevices }) {
     // processes) it mis-selects one of those instead and fails with
     // "Operation not permitted". -i alone without -p fails outright with
     // "Failed to connect to non-global ctrl_ifname". Always pass both.
-    await c.shell("su -c 'wpa_cli -p /data/misc/wifi/sockets -i wlan0 scan'");
+    await c.shell(rootShell(platform, "'wpa_cli -p /data/misc/wifi/sockets -i wlan0 scan'"));
     await new Promise(r => setTimeout(r, 3000));
-    const raw = await c.shell("su -c 'wpa_cli -p /data/misc/wifi/sockets -i wlan0 scan_results'");
+    const raw = await c.shell(rootShell(platform, "'wpa_cli -p /data/misc/wifi/sockets -i wlan0 scan_results'"));
     addLog('Scan complete.');
     return parseScanResults(raw);
   }
@@ -4865,9 +5134,9 @@ function ProvisionWizard({ onClose, knownDevices }) {
   // the password or the AP rather than at us.
   async function reportWhyNoAssociation(c, ssid) {
     try {
-      await c.shell("su -c 'wpa_cli -p /data/misc/wifi/sockets -i wlan0 scan'");
+      await c.shell(rootShell(platform, "'wpa_cli -p /data/misc/wifi/sockets -i wlan0 scan'"));
       await new Promise(r => setTimeout(r, 3000));
-      const raw = await c.shell("su -c 'wpa_cli -p /data/misc/wifi/sockets -i wlan0 scan_results'");
+      const raw = await c.shell(rootShell(platform, "'wpa_cli -p /data/misc/wifi/sockets -i wlan0 scan_results'"));
       const seen = parseScanResults(raw);
       const match = seen.find(n => n.ssid === ssid);
 
@@ -4918,8 +5187,17 @@ function ProvisionWizard({ onClose, knownDevices }) {
       addLog(`"${ssid}" was not in the last scan — configuring it as a hidden network.`, LOG_TONE.WARN);
     }
 
+    // Fire OS 6 has no `svc wifi` behind it (no framework at all) and no
+    // live radio to join during provisioning — the firmware stops Amazon's
+    // wifisvc and brings WiFi up itself from this same conf at its own
+    // next boot (docs/fireos6-port.md §2, §4 Phase 2). So this platform
+    // only ever writes the file.
+    if (platform === PLATFORM.FIREOS6) {
+      return runConfigWifiFireOS6(c, ssid, psk, security, hidden);
+    }
+
     addLog('Enabling WiFi radio…');
-    await c.shell("su -c 'svc wifi enable'");
+    await c.shell(rootShell(platform, "'svc wifi enable'"));
     await new Promise(r => setTimeout(r, 2000));
 
     // Read device identity fields from getprop rather than assuming any
@@ -4987,25 +5265,25 @@ function ProvisionWizard({ onClose, knownDevices }) {
     //     instance, which auto-associates and gets a DHCP lease on its own
     //     with no manual reconnect/dhcpcd needed.
     const b64 = btoa(unescape(encodeURIComponent(confLines)));
-    await c.shell('su -c "chmod 770 /data/misc/wifi"');
-    await c.shell('su -c "rm -f /tmp/wpa_supplicant.conf"');
-    await c.shell(`su -c "echo ${b64} | busybox base64 -d | busybox tee /tmp/wpa_supplicant.conf"`);
+    await c.shell(rootShell(platform, '"chmod 770 /data/misc/wifi"'));
+    await c.shell(rootShell(platform, '"rm -f /tmp/wpa_supplicant.conf"'));
+    await c.shell(rootShell(platform, `"echo ${b64} | busybox base64 -d | busybox tee /tmp/wpa_supplicant.conf"`));
 
     // Verify the staged file actually has the SSID we intended — catches
     // the b64-via-shell-arg path silently mangling content before we ever
     // touch the real config.
-    const staged = await c.shell('su -c "cat /tmp/wpa_supplicant.conf"');
+    const staged = await c.shell(rootShell(platform, '"cat /tmp/wpa_supplicant.conf"'));
     if (!staged.includes(`ssid="${ssid}"`)) {
       throw new Error(`Staged config in /tmp does not contain ssid="${ssid}" — write failed before reaching the device. Staged content:\n${staged}`);
     }
 
-    await c.shell('su -c "cp /tmp/wpa_supplicant.conf /data/misc/wifi/wpa_supplicant.conf"');
-    await c.shell('su -c "chown wifi:wifi /data/misc/wifi/wpa_supplicant.conf"');
-    await c.shell('su -c "chmod 660 /data/misc/wifi/wpa_supplicant.conf"');
+    await c.shell(rootShell(platform, '"cp /tmp/wpa_supplicant.conf /data/misc/wifi/wpa_supplicant.conf"'));
+    await c.shell(rootShell(platform, '"chown wifi:wifi /data/misc/wifi/wpa_supplicant.conf"'));
+    await c.shell(rootShell(platform, '"chmod 660 /data/misc/wifi/wpa_supplicant.conf"'));
 
     // Verify the final on-device file too — catches the cp step itself
     // failing or writing to the wrong place.
-    const onDevice = await c.shell('su -c "cat /data/misc/wifi/wpa_supplicant.conf"');
+    const onDevice = await c.shell(rootShell(platform, '"cat /data/misc/wifi/wpa_supplicant.conf"'));
     if (!onDevice.includes(`ssid="${ssid}"`)) {
       throw new Error(`Config at /data/misc/wifi/wpa_supplicant.conf does not contain ssid="${ssid}" after cp — the write did not take. On-device content:\n${onDevice}`);
     }
@@ -5020,7 +5298,7 @@ function ProvisionWizard({ onClose, knownDevices }) {
     // run where it was present spent 9s cycling DISCONNECTED/SCANNING before
     // associating, against 1s on a clean one. Kill what's there, then say so in
     // words rather than in ps columns.
-    const psOut = await c.shell("su -c 'ps' | grep -iE 'wifiprofilemanager|SmartHomeWifid'");
+    const psOut = await c.shell(rootShell(platform, "'ps'") + " | grep -iE 'wifiprofilemanager|SmartHomeWifid'");
     const found = psOut.split('\n')
       .map(l => l.trim()).filter(Boolean)
       .map(l => { const f = l.split(/\s+/); return { pid: f[1], name: (f[f.length - 1] || '').split('/').pop() }; })
@@ -5036,21 +5314,21 @@ function ProvisionWizard({ onClose, knownDevices }) {
       // service name is not guessed — it is read out of init.svc.* at
       // runtime, which is init's own record of what it is running, so this
       // survives a name differing across SKUs.
-      const svcProps = await c.shell("su -c 'getprop' | grep -iE 'init\\.svc\\.(.*smarthome.*|.*wifiprofile.*)'");
+      const svcProps = await c.shell(rootShell(platform, "'getprop'") + " | grep -iE 'init\\.svc\\.(.*smarthome.*|.*wifiprofile.*)'");
       // getprop prints `[init.svc.SmartHomeWifid]: [running]`.
       const svcNames = svcProps.split('\n').map(l => {
         const m = /^\[init\.svc\.([^\]]+)\]:\s*\[(\w+)\]/.exec(l.trim());
         return m && m[2] === 'running' ? m[1] : null;
       }).filter(Boolean);
       for (const svc of svcNames) {
-        await c.shell(`su -c "stop ${svc}"`);
+        await c.shell(rootShell(platform, `"stop ${svc}"`));
         addLog(`  stopped init service "${svc}"`);
       }
       // Then kill whatever is still up — a service init has been told to stop
       // does not die on its own.
-      for (const p of found) await c.shell(`su -c "kill -9 ${p.pid}"`);
+      for (const p of found) await c.shell(rootShell(platform, `"kill -9 ${p.pid}"`));
 
-      const still = (await c.shell("su -c 'ps' | grep -iE 'wifiprofilemanager|SmartHomeWifid'")).trim();
+      const still = (await c.shell(rootShell(platform, "'ps'") + " | grep -iE 'wifiprofilemanager|SmartHomeWifid'")).trim();
       if (!still) {
         addLog('Interferers stopped.', LOG_TONE.OK);
       } else if (svcNames.length === 0) {
@@ -5084,12 +5362,12 @@ function ProvisionWizard({ onClose, knownDevices }) {
     // manual wpa_cli reconnect / manual dhcpcd here — all proven
     // unnecessary and actively harmful (causes the dual-process conflict)
     // once `svc wifi enable` is already used earlier in this function.
-    await c.shell('su -c "svc wifi disable"');
+    await c.shell(rootShell(platform, '"svc wifi disable"'));
     await new Promise(r => setTimeout(r, 2000));
-    await c.shell('su -c "svc wifi enable"');
+    await c.shell(rootShell(platform, '"svc wifi enable"'));
     await new Promise(r => setTimeout(r, 3000));
 
-    const psCheck = await c.shell("su -c 'ps | grep /system/bin/wpa_supplicant | while read user pid rest; do echo $pid; done'");
+    const psCheck = await c.shell(rootShell(platform, "'ps | grep /system/bin/wpa_supplicant | while read user pid rest; do echo $pid; done'"));
     const pidCount = psCheck.split('\n').map(s => s.trim()).filter(Boolean).length;
     if (pidCount === 0) throw new Error('wpa_supplicant did not start after svc wifi enable — check device logcat.');
     if (pidCount > 1) throw new Error(`Multiple wpa_supplicant processes running (${pidCount}) — the bare init service and the framework instance are both up and will conflict. Check for a stray "start wpa_supplicant" call.`);
@@ -5100,7 +5378,7 @@ function ProvisionWizard({ onClose, knownDevices }) {
     let lastStatus = '';
     for (let i = 0; i < 20; i++) {
       await new Promise(r => setTimeout(r, 1000));
-      lastStatus = await c.shell("su -c 'wpa_cli -p /data/misc/wifi/sockets -i wlan0 status'");
+      lastStatus = await c.shell(rootShell(platform, "'wpa_cli -p /data/misc/wifi/sockets -i wlan0 status'"));
       const stateMatch = lastStatus.match(/wpa_state=(\S+)/);
       addLog(`  [${i+1}s] wpa_state=${stateMatch ? stateMatch[1] : '?'}`);
       if (lastStatus.includes('wpa_state=COMPLETED')) { associated = true; break; }
@@ -5118,13 +5396,69 @@ function ProvisionWizard({ onClose, knownDevices }) {
     addLog('Waiting for IP address (up to 20s)…');
     for (let i = 0; i < 20; i++) {
       await new Promise(r => setTimeout(r, 1000));
-      const ip = await c.shell("su -c 'ip addr show wlan0 | grep \"inet \" | while read proto addr rest; do echo ${addr%/*}; done'");
+      const ip = await c.shell(rootShell(platform, "'ip addr show wlan0 | grep \"inet \" | while read proto addr rest; do echo ${addr%/*}; done'"));
       if (ip && /\d+\.\d+\.\d+\.\d+/.test(ip)) {
         addLog(`Connected! IP: ${ip}`, LOG_TONE.OK);
         return;
       }
     }
     throw new Error(`Associated to "${ssid}" but did not get an IP within 20s. Check device logcat for DHCP issues.`);
+  }
+
+  // Fire OS 6 variant: write the conf and nothing else. There is no `svc
+  // wifi` behind this image to enable the radio or reload the config, and
+  // no live radio to join during provisioning. The ADB session is already
+  // uid 0 (boot-root), so this pushes straight to a temp path and moves it
+  // into place, rather than Fire OS 5's busybox base64/tee dance above —
+  // that dance exists only to get root-owned bytes past an unrooted shell
+  // user, which Fire OS 6 was never going to need.
+  async function runConfigWifiFireOS6(c, ssid, psk, security, hidden) {
+    addLog('Reading device identity…');
+    const deviceName   = await c.shell('getprop ro.product.name')          || 'echomuse';
+    const manufacturer = await c.shell('getprop ro.product.manufacturer')  || 'Amazon';
+    const model        = await c.shell('getprop ro.product.model')        || 'AEOBC';
+    const serial       = await c.shell('getprop ro.serialno')             || await c.shell('getprop ro.boot.serialno') || 'unknown';
+
+    const confLines = [
+      'ctrl_interface=/data/misc/wifi/sockets',
+      'driver_param=use_p2p_group_interface=1',
+      'update_config=1',
+      `device_name=${deviceName}`,
+      `manufacturer=${manufacturer}`,
+      `model_name=${model}`,
+      `model_number=${model}`,
+      `serial_number=${serial}`,
+      'device_type=1-0050F204-9',
+      'os_version=01020300',
+      'config_methods=physical_display virtual_push_button',
+      'p2p_no_group_iface=1',
+      'external_sim=1',
+      'wowlan_triggers=disconnect',
+      'network={',
+      `\tssid="${ssid}"`,
+      ...(security === 'open'
+            ? ['\tkey_mgmt=NONE']
+            : [`\tpsk="${psk}"`, '\tkey_mgmt=WPA-PSK']),
+      ...(hidden ? ['\tscan_ssid=1'] : []),
+      '\tpriority=1',
+      '}',
+      '',
+    ].join('\n');
+
+    addLog(`Writing config for "${ssid}"…`);
+    await c.push('/data/local/tmp/wpa_supplicant.conf.new', new TextEncoder().encode(confLines));
+    await c.shell('chmod 770 /data/misc/wifi');
+    await c.shell('cp /data/local/tmp/wpa_supplicant.conf.new /data/misc/wifi/wpa_supplicant.conf');
+    await c.shell('chown wifi:wifi /data/misc/wifi/wpa_supplicant.conf');
+    await c.shell('chmod 660 /data/misc/wifi/wpa_supplicant.conf');
+    await c.shell('rm -f /data/local/tmp/wpa_supplicant.conf.new');
+
+    const onDevice = await c.shell('cat /data/misc/wifi/wpa_supplicant.conf 2>&1');
+    if (!onDevice.includes(`ssid="${ssid}"`)) {
+      throw new Error(`Config at /data/misc/wifi/wpa_supplicant.conf does not contain ssid="${ssid}" after write. On-device content:\n${onDevice}`);
+    }
+    addLog('Config written and verified on device. The EchoMuse firmware brings WiFi up '
+         + 'itself at boot — not joined live during provisioning.', LOG_TONE.OK);
   }
 
   async function runDisableAlexa(c) {
@@ -5157,17 +5491,17 @@ function ProvisionWizard({ onClose, knownDevices }) {
     // Order matters: mark setup done first, so nothing relaunches it in the
     // gap between force-stop and disable.
     for (const s of ['put global device_provisioned 1', 'put secure user_setup_complete 1']) {
-      await c.shell(`su -c 'settings ${s}' 2>&1`);
+      await c.shell(rootShell(platform, `'settings ${s}' 2>&1`));
     }
-    await c.shell(`su -c 'am force-stop ${OOBE}' 2>&1`);
-    const oobeDisable = (await c.shell(`su -c 'pm disable ${OOBE}' 2>&1`)).trim();
+    await c.shell(rootShell(platform, `'am force-stop ${OOBE}' 2>&1`));
+    const oobeDisable = (await c.shell(rootShell(platform, `'pm disable ${OOBE}' 2>&1`))).trim();
     // force-stop is a no-op against a PERSISTENT app (the same lesson whad
     // taught in the debloat list), so check and kill directly rather than
     // assuming it worked.
-    const oobePids = (await c.shell(`su -c 'ps' | grep -F ${OOBE} | grep -v grep`))
+    const oobePids = (await c.shell(rootShell(platform, "'ps'") + ` | grep -F ${OOBE} | grep -v grep`))
       .split('\n').map(l => l.trim().split(/\s+/)[1]).filter(p => /^\d+$/.test(p || ''));
-    for (const pid of oobePids) await c.shell(`su -c "kill -9 ${pid}"`);
-    const oobeLeft = (await c.shell(`su -c 'ps' | grep -F ${OOBE} | grep -v grep`)).trim();
+    for (const pid of oobePids) await c.shell(rootShell(platform, `"kill -9 ${pid}"`));
+    const oobeLeft = (await c.shell(rootShell(platform, "'ps'") + ` | grep -F ${OOBE} | grep -v grep`)).trim();
     const oobeVerdict = _pmVerdict(oobeDisable);
     addLog(`  → ${oobeVerdict === PM_VERDICT.DISABLED ? 'disabled'
                 : oobeVerdict === PM_VERDICT.ABSENT   ? 'not installed on this build'
@@ -5179,12 +5513,12 @@ function ProvisionWizard({ onClose, knownDevices }) {
     let disabled = 0, absent = 0, rejected = 0;
     for (const pkg of _ALEXA_PKGS) {
       addLog(`Disabling ${pkg}…`);
-      let out = await c.shell(`su -c 'pm disable ${pkg}' 2>&1`);
+      let out = await c.shell(rootShell(platform, `'pm disable ${pkg}' 2>&1`));
       if (_pmNotReady(out)) {
         // Still not ready despite the gate above — give it a moment and retry once.
         addLog('  Package Manager not ready yet, waiting 3s and retrying…', LOG_TONE.WARN);
         await new Promise(r => setTimeout(r, 3000));
-        out = await c.shell(`su -c 'pm disable ${pkg}' 2>&1`);
+        out = await c.shell(rootShell(platform, `'pm disable ${pkg}' 2>&1`));
       }
       const verdict = _pmVerdict(out);
       if (verdict === PM_VERDICT.DISABLED) disabled++;
@@ -5231,17 +5565,17 @@ function ProvisionWizard({ onClose, knownDevices }) {
     // never starts. This is a persist. property so it survives reboots;
     // proven on hardware to durably stop the interference.
     addLog('Clearing wifi migration flag to prevent SmartHomeWifid from starting…');
-    await c.shell('su -c "setprop persist.wifi.migrate.complete 0"');
-    const check = await c.shell('su -c "getprop persist.wifi.migrate.complete"');
+    await c.shell(rootShell(platform, '"setprop persist.wifi.migrate.complete 0"'));
+    const check = await c.shell(rootShell(platform, '"getprop persist.wifi.migrate.complete"'));
     addLog(`  → persist.wifi.migrate.complete=${check.trim()}`);
 
     // SmartHomeWifid may already be running from this boot (started before
     // we cleared the property) — kill it now rather than waiting for next
     // reboot, since the wizard proceeds straight to WiFi config next.
-    const smartHomeWifidPid = (await c.shell("su -c 'ps | grep /system/bin/SmartHomeWifid | while read user pid rest; do echo $pid; done'")).trim();
+    const smartHomeWifidPid = (await c.shell(rootShell(platform, "'ps | grep /system/bin/SmartHomeWifid | while read user pid rest; do echo $pid; done'"))).trim();
     if (smartHomeWifidPid) {
       addLog(`Killing already-running SmartHomeWifid (pid ${smartHomeWifidPid})…`);
-      await c.shell(`su -c "kill -9 ${smartHomeWifidPid}"`);
+      await c.shell(rootShell(platform, `"kill -9 ${smartHomeWifidPid}"`));
     }
 
     addLog('Alexa stack disabled.', LOG_TONE.OK);
@@ -5270,10 +5604,10 @@ function ProvisionWizard({ onClose, knownDevices }) {
     addLog(`Hiding ${packages.length} packages…`);
     let hidden = 0, absentPkgs = 0, rejectedPkgs = 0;
     for (const pkg of packages) {
-      let out = (await c.shell(`su -c 'pm hide ${pkg}' 2>&1`)).trim();
+      let out = (await c.shell(rootShell(platform, `'pm hide ${pkg}' 2>&1`))).trim();
       if (_pmNotReady(out)) {
         await new Promise(r => setTimeout(r, 3000));
-        out = (await c.shell(`su -c 'pm hide ${pkg}' 2>&1`)).trim();
+        out = (await c.shell(rootShell(platform, `'pm hide ${pkg}' 2>&1`))).trim();
       }
       // pm hide prints "Package <pkg> new hidden state: true" on success; a
       // package absent from this build answers `Unknown package`, which is pm
@@ -5308,8 +5642,8 @@ function ProvisionWizard({ onClose, knownDevices }) {
     // script this boot, so push() is safe (no "Text file busy" risk).
     const svcDir = '/sbin/.core/img/.core/service.d';
     await c.push('/sdcard/echomuse-debloat.sh', new TextEncoder().encode(script));
-    await c.shell(`su -c 'mkdir -p ${svcDir} && cp /sdcard/echomuse-debloat.sh ${svcDir}/echomuse-debloat.sh && chmod 755 ${svcDir}/echomuse-debloat.sh'`);
-    const listing = (await c.shell(`su -c 'ls ${svcDir}' 2>&1`)).trim();
+    await c.shell(rootShell(platform, `'mkdir -p ${svcDir} && cp /sdcard/echomuse-debloat.sh ${svcDir}/echomuse-debloat.sh && chmod 755 ${svcDir}/echomuse-debloat.sh'`));
+    const listing = (await c.shell(rootShell(platform, `'ls ${svcDir}' 2>&1`))).trim();
     if (!listing.includes('echomuse-debloat.sh')) {
       throw new Error(`Debloat script install verification failed — ${svcDir} contains: "${listing}". Is Magisk mounted (/sbin/.core present)?`);
     }
@@ -5317,6 +5651,10 @@ function ProvisionWizard({ onClose, knownDevices }) {
   }
 
   async function runInstallEchoMuse(c, file, useLatest) {
+    // Fire OS 6 has no framework to mount emulated storage: /sdcard is a
+    // dangling link to /storage/self/primary there (observed on hardware),
+    // so pushes are staged in /data/local/tmp instead.
+    const stage = platform === PLATFORM.FIREOS6 ? '/data/local/tmp' : '/sdcard';
     let buf;
     if (useLatest) {
       addLog('Fetching latest EchoMuse build from controller…');
@@ -5332,10 +5670,10 @@ function ProvisionWizard({ onClose, knownDevices }) {
       const ver = resp.headers.get('X-Release-Version');
       addLog(`Latest build${ver ? ` (${ver})` : ''}: ${(buf.byteLength/1024/1024).toFixed(1)} MB`);
     } else {
-      addLog(`Pushing ${file.name} to /sdcard/server_new…`);
+      addLog(`Pushing ${file.name} to ${stage}/server_new…`);
       buf = await file.arrayBuffer();
     }
-    await c.push('/sdcard/server_new', new Uint8Array(buf),
+    await c.push(`${stage}/server_new`, new Uint8Array(buf),
       pct => setProgress({ label: 'Uploading binary', pct }));
     setProgress(null);
 
@@ -5349,8 +5687,8 @@ function ProvisionWizard({ onClose, knownDevices }) {
     // place. Each step is checked individually rather than && chained —
     // that's what let the original bug stay silent in the first place.
     addLog('Clearing any pre-existing EchoMuse install…');
-    await c.shell('su -c "mkdir -p /data/local/bin"');
-    const rmOut = (await c.shell('su -c "rm -f /data/local/bin/server /data/local/bin/server_a /data/local/bin/server_b" 2>&1')).trim();
+    await c.shell(rootShell(platform, '"mkdir -p /data/local/bin"'));
+    const rmOut = (await c.shell(rootShell(platform, '"rm -f /data/local/bin/server /data/local/bin/server_a /data/local/bin/server_b" 2>&1'))).trim();
     if (rmOut) addLog(`  → ${rmOut}`);
     // Confirm the symlink itself is gone — readlink is already proven on
     // this device (the OTA pipeline's slot detection relies on it, always
@@ -5359,9 +5697,9 @@ function ProvisionWizard({ onClose, knownDevices }) {
     // empty output, so capturing stderr here would corrupt the "empty
     // means gone" check below. Discard stderr instead, matching the
     // existing proven pattern in em_api.py exactly.
-    const linkAfterClear = (await c.shell('su -c "readlink /data/local/bin/server" 2>/dev/null')).trim();
+    const linkAfterClear = (await c.shell(rootShell(platform, '"readlink /data/local/bin/server" 2>/dev/null'))).trim();
     if (linkAfterClear) {
-      throw new Error(`Failed to clear pre-existing install — /data/local/bin/server still links to "${linkAfterClear}" after rm. Check permissions/mount state with "su -c mount" before retrying.`);
+      throw new Error(`Failed to clear pre-existing install — /data/local/bin/server still links to "${linkAfterClear}" after rm. Check permissions/mount state with "${rootShell(platform, 'mount')}" before retrying.`);
     }
     // Deliberately NOT separately checking that server_a/server_b are
     // gone via `ls`, `test -f`, or c.pull()/cat: readlink above just
@@ -5391,11 +5729,11 @@ function ProvisionWizard({ onClose, knownDevices }) {
     // directory now guaranteed empty above, a partial failure here is
     // unambiguous: if cp fails, server_a simply won't exist, and the
     // verification below catches it precisely rather than guessing.
-    const cpOut = (await c.shell('su -c "cp /sdcard/server_new /data/local/bin/server_a" 2>&1')).trim();
+    const cpOut = (await c.shell(rootShell(platform, `"cp ${stage}/server_new /data/local/bin/server_a" 2>&1`))).trim();
     if (cpOut) addLog(`  → cp: ${cpOut}`);
-    const chmodOut = (await c.shell('su -c "chmod 755 /data/local/bin/server_a" 2>&1')).trim();
+    const chmodOut = (await c.shell(rootShell(platform, '"chmod 755 /data/local/bin/server_a" 2>&1'))).trim();
     if (chmodOut) addLog(`  → chmod: ${chmodOut}`);
-    const lnOut = (await c.shell('su -c "ln -sf server_a /data/local/bin/server" 2>&1')).trim();
+    const lnOut = (await c.shell(rootShell(platform, '"ln -sf server_a /data/local/bin/server" 2>&1'))).trim();
     if (lnOut) addLog(`  → ln: ${lnOut}`);
 
     // Verify the symlink actually points where we just told it to, and
@@ -5408,9 +5746,9 @@ function ProvisionWizard({ onClose, knownDevices }) {
     // verification at all. c.pull() is already proven (it's how every
     // other pull in this wizard works), so reuse it for the size check
     // instead of trusting a new shell command's availability.
-    const linkTarget = (await c.shell('su -c "readlink /data/local/bin/server" 2>/dev/null')).trim();
+    const linkTarget = (await c.shell(rootShell(platform, '"readlink /data/local/bin/server" 2>/dev/null'))).trim();
     if (linkTarget !== 'server_a') {
-      throw new Error(`Install verification failed: /data/local/bin/server points to "${linkTarget || '(empty — symlink missing)'}", expected "server_a". The cp/ln chain likely failed — check the install output above and free space on /data with "su -c df".`);
+      throw new Error(`Install verification failed: /data/local/bin/server points to "${linkTarget || '(empty — symlink missing)'}", expected "server_a". The cp/ln chain likely failed — check the install output above and free space on /data with "${rootShell(platform, 'df')}".`);
     }
     const installedBytes = await c.pull('/data/local/bin/server_a');
     if (installedBytes.length !== buf.byteLength) {
@@ -5424,8 +5762,8 @@ function ProvisionWizard({ onClose, knownDevices }) {
     // Same "Text file busy" risk as wificfg.sh — push + immediate chmod/exec
     // can race with the cat process. start_server.sh isn't executed
     // immediately here (only copied), so push() is safe for this one.
-    await c.push('/sdcard/start_server.sh', new TextEncoder().encode(script));
-    await c.shell("su -c 'cp /sdcard/start_server.sh /data/local/bin/start_server.sh && chmod 755 /data/local/bin/start_server.sh'");
+    await c.push(`${stage}/start_server.sh`, new TextEncoder().encode(script));
+    await c.shell(rootShell(platform, `'cp ${stage}/start_server.sh /data/local/bin/start_server.sh && chmod 755 /data/local/bin/start_server.sh'`));
     addLog('EchoMuse installed.', LOG_TONE.OK);
 
     // Device-link TLS credentials — pushed pre-first-contact so the very
@@ -5446,25 +5784,257 @@ function ProvisionWizard({ onClose, knownDevices }) {
       if (!creds) {
         addLog('Controller has no TLS listener — device will connect over plain ws.', LOG_TONE.WARN);
       } else {
-        await c.push('/sdcard/em-ca.pem', new TextEncoder().encode(creds.ca_pem));
-        await c.push('/sdcard/em-token', new TextEncoder().encode(creds.token));
-        await c.shell(`su -c 'mkdir -p ${creds.dir} && cp /sdcard/em-ca.pem ${creds.dir}/ca.pem && cp /sdcard/em-token ${creds.dir}/token && chmod 644 ${creds.dir}/ca.pem && chmod 600 ${creds.dir}/token && rm -f /sdcard/em-ca.pem /sdcard/em-token'`);
-        const tlsListing = (await c.shell(`su -c 'ls ${creds.dir}' 2>&1`)).trim();
+        await c.push(`${stage}/em-ca.pem`, new TextEncoder().encode(creds.ca_pem));
+        await c.push(`${stage}/em-token`, new TextEncoder().encode(creds.token));
+        await c.shell(rootShell(platform, `'mkdir -p ${creds.dir} && cp ${stage}/em-ca.pem ${creds.dir}/ca.pem && cp ${stage}/em-token ${creds.dir}/token && chmod 644 ${creds.dir}/ca.pem && chmod 600 ${creds.dir}/token && rm -f ${stage}/em-ca.pem ${stage}/em-token'`));
+        const tlsListing = (await c.shell(rootShell(platform, `'ls ${creds.dir}' 2>&1`))).trim();
         if (!tlsListing.includes('ca.pem') || !tlsListing.includes('token')) {
           throw new Error(`TLS credential install verification failed — ${creds.dir} contains: "${tlsListing}".`);
         }
         addLog('TLS credentials installed — device will connect over wss.', LOG_TONE.OK);
       }
     }
+    if (platform === PLATFORM.FIREOS6) {
+      // Fire OS 6's step list reboots separately, after `wifi` — this step
+      // only has to leave the binary and startup script installed and
+      // verified.
+      addLog('EchoMuse installed — WiFi and reboot are separate steps on Fire OS 6.', LOG_TONE.OK);
+      return;
+    }
+
     // Finish provisioning only after the binary, startup payload and TLS
     // credentials are verified. A successful reboot lets the supervisor fetch
     // the content-addressed speech assets named by session.ready (§16.5).
     addLog('Rebooting device to finish provisioning…');
     expectDisconnect.current = true;
-    try { await c.shell('su -c reboot'); } catch {}
+    try { await c.shell(rootShell(platform, 'reboot')); } catch {}
     await c.close();
     setAdb(null);
     addLog('Device rebooting. It will appear in the controller dashboard within ~30s via mDNS.', LOG_TONE.OK);
+  }
+
+  // Fire OS 6 only. echomuse.rc and the empty /tmp mountpoint start_server.sh
+  // puts a tmpfs on (Fire OS 6 ships no /tmp) go onto the system slots from
+  // this live Android session — no TWRP, no boot image write, no Magisk, no
+  // sepolicy change (docs/fireos6-port.md Phase 3). Both slots end up hooked,
+  // because the bootloader falls back to the other slot after failed boots
+  // and an unhooked slot comes up as stock Alexa — but in two stages:
+  // install_boot_hook writes only the running slot, and mirror_boot_hook
+  // writes the other one only after confirm_link has seen a boot from the
+  // first reach this controller. Until then the other slot stays stock, a
+  // known-good fallback if the install is bad. Writing the inactive slot is
+  // safe because verity is off for both: androidboot.veritymode=disabled
+  // comes from the shared (amonet) bootloader, not either boot image, whose
+  // cmdlines are identical (checked on hardware). A slot already carrying
+  // both is skipped, so a retry pays only for what is missing.
+  async function activeSlot(c) {
+    const slot = (await c.shell('getprop ro.boot.slot_suffix')).trim();
+    if (slot !== '_a' && slot !== '_b') {
+      throw new Error(`Unexpected active slot "${slot}" (ro.boot.slot_suffix) — expected _a or _b.`);
+    }
+    return slot;
+  }
+
+  async function withStagedRc(c, fn) {
+    await c.push('/data/local/tmp/echomuse.rc.new', new TextEncoder().encode(_ECHOMUSE_RC));
+    try {
+      await fn();
+    } finally {
+      await c.shell('rm -f /data/local/tmp/echomuse.rc.new');
+    }
+  }
+
+  async function runInstallBootHook(c) {
+    const active = await activeSlot(c);
+    await withStagedRc(c, () => installBootHookActive(c, active));
+    addLog(`The other slot stays stock until a boot from ${active} reaches this controller `
+         + '(Mirror Boot Hook).');
+  }
+
+  // The device-link hello is the only evidence that the whole chain works:
+  // init started the service, start_server.sh ran, the firmware joined WiFi,
+  // found this controller over mDNS and authenticated. A new device is
+  // refused as pending approval, so `connected` stays false — but every
+  // refused attempt refreshes its row's last_seen and ip (em_device.
+  // register_device), and that change against the pre-reboot snapshot is
+  // the signal. Approved (auto-approval) devices show as connected instead.
+  async function runConfirmLink(c) {
+    const serial = (await c.shell('getprop ro.serialno')).trim();
+    const base = linkBaseline.current;
+    if (!serial) throw new Error('Could not read the device serial (ro.serialno).');
+    if (!base || base.serial !== serial) {
+      throw new Error('There is no pre-reboot snapshot of this device to compare against. '
+                    + 'Go back to the Reboot step and run it again.');
+    }
+    addLog(`Waiting for ${serial} to reach this controller…`);
+    const TIMEOUT_MS = 180000;
+    const started = Date.now();
+    let lastNote = -1;
+    while (Date.now() - started < TIMEOUT_MS) {
+      let d = null;
+      try {
+        d = (await API.get('/api/devices')).find(x => x.device_id === serial) || null;
+      } catch (e) {
+        addLog(`  Could not read /api/devices (${e.error || e.message || e}) — retrying.`, LOG_TONE.WARN);
+      }
+      if (d && (d.connected || d.last_seen !== base.lastSeen)) {
+        const state = !d.approved ? 'pending approval' : d.connected ? 'connected' : 'approved';
+        addLog(`${serial} reached this controller from ${d.ip || 'an unknown address'} `
+             + `after ${Math.round((Date.now() - started) / 1000)}s — ${state}.`, LOG_TONE.OK);
+        return;
+      }
+      const elapsed = Math.floor((Date.now() - started) / 1000);
+      if (elapsed - lastNote >= 15) {
+        lastNote = elapsed;
+        addLog(`  [${elapsed}s] not heard from yet.`);
+      }
+      await new Promise(r => setTimeout(r, 3000));
+    }
+    const tail = await c.shell(
+      `grep -E '\\[wifi\\]|\\[clock\\]|mDNS|link|session' /tmp/server.log 2>&1 | tail -n 25`);
+    addLog(`WiFi and link lines from /tmp/server.log:\n${tail || '(none)'}`, LOG_TONE.WARN);
+    throw new Error(`The device did not reach this controller within ${TIMEOUT_MS / 1000}s. `
+                  + 'The other system slot has not been touched, so a fallback boot still '
+                  + 'comes up as stock Alexa. Fix the cause above, then Retry.');
+  }
+
+  async function runMirrorBootHook(c) {
+    const active = await activeSlot(c);
+    // The slot that just proved itself must be the one carrying the hook. If
+    // the bootloader had switched slots, the Dot would be running the
+    // unhooked one, and mirroring "from" it would be guesswork.
+    if (!await bootHookPresent(c, '')) {
+      throw new Error(`The running slot ${active} does not carry the boot hook, so this boot `
+                    + 'did not come from the slot Install Boot Hook wrote. Not touching the other slot.');
+    }
+    await withStagedRc(c, () => installBootHookOther(c, active === '_a' ? '_b' : '_a'));
+    addLog('Both system slots now carry the boot hook.', LOG_TONE.OK);
+  }
+
+  // The write for a system root mounted read-write at `root` ('' for the
+  // running one). /tmp is created already labelled system_file: a plain
+  // mkdir would label it rootfs, which policy refuses on the ext4 system
+  // root even from boot-root's permissive domain (`avc: denied { associate }
+  // … tcontext=u:object_r:labeledfs:s0`, observed on hardware).
+  function bootHookWriteCmd(root) {
+    return `cp /data/local/tmp/echomuse.rc.new ${root}/system/etc/init/echomuse.rc `
+         + `&& chmod 0644 ${root}/system/etc/init/echomuse.rc `
+         + `&& { [ -d ${root}/tmp ] || mkdir -Z u:object_r:system_file:s0 ${root}/tmp; } `
+         + `&& chmod 0755 ${root}/tmp && sync`;
+  }
+
+  async function bootHookPresent(c, root) {
+    const rc = await c.shell(`cat ${root}/system/etc/init/echomuse.rc 2>/dev/null`);
+    const tmp = (await c.shell(`[ -d ${root}/tmp ] && echo yes`)).trim() === 'yes';
+    return _rcInstalled(rc) && tmp;
+  }
+
+  async function installBootHookActive(c, slot) {
+    if (await bootHookPresent(c, '')) {
+      addLog(`Slot ${slot} (active): boot hook already in place.`, LOG_TONE.OK);
+      return;
+    }
+    addLog(`Slot ${slot} (active): remounting / read-write…`);
+    const rw = await c.shell('mount -o rw,remount / 2>&1');
+    if (rw.trim()) addLog(`  → ${rw.trim()}`);
+    try {
+      const out = (await c.shell(`(${bootHookWriteCmd('')}) 2>&1`)).trim();
+      if (out) addLog(`  → ${out}`);
+    } finally {
+      // Always attempt the remount back, even if the write above threw —
+      // leaving / writable is not a state to abandon the device in.
+      const ro = await c.shell('mount -o ro,remount / 2>&1');
+      if (ro.trim()) addLog(`  → ${ro.trim()}`);
+    }
+    if (!await bootHookPresent(c, '')) {
+      throw new Error(`Slot ${slot} (active): echomuse.rc or /tmp did not read back as written.`);
+    }
+    addLog(`Slot ${slot} (active): written and verified.`, LOG_TONE.OK);
+  }
+
+  async function installBootHookOther(c, slot) {
+    const mnt = `/data/local/tmp/em_system${slot}`;
+    const dev = `/dev/block/platform/bootdevice/by-name/system${slot}`;
+    const mountAs = async (mode) => {
+      const out = (await c.shell(`mkdir -p ${mnt} && mount -t ext4 -o ${mode} ${dev} ${mnt} 2>&1`)).trim();
+      if (out) throw new Error(`Slot ${slot} (inactive): could not mount ${dev} ${mode}: ${out}`);
+    };
+    const unmount = async () => (await c.shell(`umount ${mnt} 2>&1; rmdir ${mnt} 2>&1`)).trim();
+
+    await mountAs('ro');
+    let otherBuild, present;
+    try {
+      otherBuild = (await c.shell(`grep '^ro.build.fingerprint=' ${mnt}/system/build.prop`)).trim()
+        .replace('ro.build.fingerprint=', '') || '(unknown)';
+      present = await bootHookPresent(c, mnt);
+    } finally {
+      await unmount();
+    }
+    // The full fingerprint: display.id alone can match across builds.
+    const activeBuild = (await c.shell('getprop ro.build.fingerprint')).trim();
+    addLog(`Slot ${slot} (inactive): ${otherBuild}.`);
+    if (otherBuild !== activeBuild) {
+      addLog(`  Differs from the active slot's ${activeBuild}. EchoMuse is tested on the active build; `
+           + 'this slot only runs if the bootloader falls back to it.', LOG_TONE.WARN);
+    }
+    if (present) {
+      addLog(`Slot ${slot} (inactive): boot hook already in place.`, LOG_TONE.OK);
+      return;
+    }
+
+    await mountAs('rw');
+    try {
+      const out = (await c.shell(`(${bootHookWriteCmd(mnt)}) 2>&1`)).trim();
+      if (out) addLog(`  → ${out}`);
+    } finally {
+      const u = await unmount();
+      if (u) addLog(`  → ${u}`, LOG_TONE.WARN);
+    }
+    // Read back through a fresh read-only mount: what that slot's next boot sees.
+    await mountAs('ro');
+    try {
+      present = await bootHookPresent(c, mnt);
+    } finally {
+      await unmount();
+    }
+    if (!present) {
+      throw new Error(`Slot ${slot} (inactive): echomuse.rc or /tmp did not read back as written.`);
+    }
+    addLog(`Slot ${slot} (inactive): written and verified.`, LOG_TONE.OK);
+  }
+
+  // Fire OS 6 only. The echomuse service starts on `sys.boot_completed=1`
+  // (measured 11.7s after boot on hardware — docs/fireos6-port.md Phase 3),
+  // and the mixer is required for it to have anything to talk to. On
+  // failure, tail the supervisor's own log (/tmp/server.log — same path
+  // start_server.sh writes, see device_payloads/start_server.sh) rather
+  // than just naming the stuck property.
+  async function runVerifyService(c) {
+    addLog('Waiting for echomuse and mixer to start…');
+    const TIMEOUT_MS = 90000;
+    const started = Date.now();
+    let echomuseState = '', mixerState = '', lastNote = -1;
+    while (Date.now() - started < TIMEOUT_MS) {
+      echomuseState = (await c.shell('getprop init.svc.echomuse')).trim();
+      mixerState    = (await c.shell('getprop init.svc.mixer')).trim();
+      if (echomuseState === 'running' && mixerState === 'running') {
+        addLog(`init.svc.echomuse=running, init.svc.mixer=running `
+             + `(after ${Math.round((Date.now() - started) / 1000)}s).`, LOG_TONE.OK);
+        return;
+      }
+      const elapsed = Math.floor((Date.now() - started) / 1000);
+      if (elapsed - lastNote >= 10) {
+        lastNote = elapsed;
+        addLog(`  [${elapsed}s] init.svc.echomuse=${echomuseState || '(unset)'}, `
+             + `init.svc.mixer=${mixerState || '(unset)'}`);
+      }
+      await new Promise(r => setTimeout(r, 2000));
+    }
+    const tail = await c.shell('tail -c 4000 /tmp/server.log 2>&1');
+    addLog(`Tail of /tmp/server.log:\n${tail || '(empty or missing)'}`, LOG_TONE.WARN);
+    throw new Error(`Service did not reach "running" within ${TIMEOUT_MS / 1000}s — `
+                   + `init.svc.echomuse=${echomuseState || '(unset)'}, `
+                   + `init.svc.mixer=${mixerState || '(unset)'}.`);
   }
 
   // ── Step executor ──
@@ -5483,33 +6053,37 @@ function ProvisionWizard({ onClose, knownDevices }) {
     // and people paste it when something goes wrong — without these it is a
     // single 200-line stream with no way to tell which step a message
     // belongs to, or which one a failure happened in.
-    addLog(`── ${stepIdx + 1}/${_WIZARD_STEPS.length}  ${_WIZARD_STEPS[stepIdx].label.toUpperCase()} ──`, LOG_TONE.HEAD);
+    addLog(`── ${stepIdx + 1}/${steps.length}  ${steps[stepIdx].label.toUpperCase()} ──`, LOG_TONE.HEAD);
     let c = adb;
     try {
       // Every step but the three connection steps needs a live handle. Passing
       // a null one through produced an error naming a property of undefined,
       // which says nothing about the cable having been unplugged.
-      if (!CONNECT_STEPS.has(stepIdx) && !c) {
+      if (!CONNECT_STEPS.has(steps[stepIdx].id) && !c) {
         throw new Error('There is no ADB connection. Click Reconnect, pick the '
                       + 'device from the USB picker, then Retry this step.');
       }
-      switch (stepIdx) {
-        case STEP.CONNECT_ANDROID: c = await runConnectAndroid(); break;
-        case STEP.CONNECT_TWRP:    c = await runConnectTwrp(); break;
-        case STEP.PATCH_BOOT:      await runPatchBoot(c); break;
-        case STEP.INSTALL_MAGISK:  await runInstallMagisk(c, magiskFile); break;
-        case STEP.PRESEED_DB:      await runPreseedDb(c); break;
-        case STEP.REBOOT:          await runReboot(c); break;
-        case STEP.RECONNECT:       c = await runReconnect(); break;
-        case STEP.VERIFY_ROOT:     await runVerifyRoot(c); break;
-        case STEP.DISABLE_ALEXA:   await runDisableAlexa(c); break;
-        case STEP.DEBLOAT:         await runDebloat(c); break;
-        case STEP.WIFI:            await runConfigWifi(c, wifiSsid, wifiPsk); break;
-        case STEP.INSTALL_EM:      await runInstallEchoMuse(c, binaryFile, useLatest); break;
+      switch (steps[stepIdx].id) {
+        case 'connect_android':   c = await runConnectAndroid(); break;
+        case 'connect_twrp':      c = await runConnectTwrp(); break;
+        case 'patch_boot':        await runPatchBoot(c); break;
+        case 'install_magisk':    await runInstallMagisk(c, magiskFile); break;
+        case 'preseed_db':        await runPreseedDb(c); break;
+        case 'install_boot_hook': await runInstallBootHook(c); break;
+        case 'reboot':            await runReboot(c); break;
+        case 'reconnect':         c = await runReconnect(); break;
+        case 'verify_root':       await runVerifyRoot(c); break;
+        case 'verify_service':    await runVerifyService(c); break;
+        case 'confirm_link':      await runConfirmLink(c); break;
+        case 'mirror_boot_hook':  await runMirrorBootHook(c); break;
+        case 'disable_alexa':     await runDisableAlexa(c); break;
+        case 'debloat':           await runDebloat(c); break;
+        case 'wifi':              await runConfigWifi(c, wifiSsid, wifiPsk); break;
+        case 'install_em':        await runInstallEchoMuse(c, binaryFile, useLatest); break;
       }
       if (abandoned()) return;
       markStep(stepIdx, STEP_STATE.DONE);
-      if (stepIdx < _WIZARD_STEPS.length - 1) setStep(stepIdx + 1);
+      if (stepIdx < steps.length - 1) setStep(stepIdx + 1);
     } catch (e) {
       // A step abandoned mid-flight may still throw on its way out, once the
       // transport notices. The UI already says what happened; saying it again
@@ -5536,8 +6110,8 @@ function ProvisionWizard({ onClose, knownDevices }) {
       // Clear the file selection on failure — forces a deliberate reselect
       // before retry rather than silently re-flashing whatever was picked
       // last time (which, on a hash-mismatch failure, is the wrong file).
-      if (stepIdx === STEP.INSTALL_MAGISK) setMagiskFile(null);
-      if (stepIdx === STEP.INSTALL_EM) setBinaryFile(null);
+      if (steps[stepIdx]?.id === 'install_magisk') setMagiskFile(null);
+      if (steps[stepIdx]?.id === 'install_em') setBinaryFile(null);
     }
     if (!abandoned()) setRunning(false);
   }
@@ -5546,15 +6120,15 @@ function ProvisionWizard({ onClose, knownDevices }) {
   // Disable Alexa runs before WiFi so Alexa can't phone home; Debloat rides
   // the same connected-and-rooted state.
   useEffect(() => {
-    if (!AUTO_STEPS.has(step) || running || stepState[step] !== STEP_STATE.PENDING) return;
+    if (!AUTO_STEPS.has(stepId) || running || stepState[step] !== STEP_STATE.PENDING) return;
     if (adb) { runStep(step); return; }
-    addLog(`"${_WIZARD_STEPS[step].label}" needs an ADB connection and there isn't one — `
+    addLog(`"${steps[step].label}" needs an ADB connection and there isn't one — `
          + `reconnect the device and click Retry.`, LOG_TONE.ERROR);
     markStep(step, STEP_STATE.ERROR);
   }, [step, running, adb]);
 
-  const cur    = _WIZARD_STEPS[step];
-  const isDone = step === _WIZARD_STEPS.length - 1 && stepState[step] === STEP_STATE.DONE;
+  const cur    = steps[step];
+  const isDone = step === steps.length - 1 && stepState[step] === STEP_STATE.DONE;
 
   // Buttons are shown for manual steps; auto steps start themselves.
 
@@ -5589,7 +6163,7 @@ function ProvisionWizard({ onClose, knownDevices }) {
 
           {/* Step list */}
           <div style={{ width: 176, borderRight: '1px solid var(--border)', background: 'var(--hairline)', padding: '12px 0', overflowY: 'auto', flexShrink: 0 }}>
-            {_WIZARD_STEPS.map((s, i) => {
+            {steps.map((s, i) => {
               const st = stepState[i]; const active = i === step;
               return (
                 <div key={s.id}
@@ -5604,6 +6178,18 @@ function ProvisionWizard({ onClose, knownDevices }) {
                 </div>
               );
             })}
+            {/* Fire OS 5 steps this platform has no use for — boot-root,
+                the live .rc and start_server.sh's own denylist already
+                cover their jobs. Shown, not hidden: a shorter list with no
+                explanation reads as a wizard that lost steps. */}
+            {platform === PLATFORM.FIREOS6 && _WIZARD_STEPS
+              .filter(s => _FIREOS6_NOT_APPLICABLE.has(s.id))
+              .map(s => (
+                <div key={s.id} style={{ padding: '6px 14px', display: 'flex', alignItems: 'center', gap: 7, opacity: 0.35 }}>
+                  <span style={{ fontFamily: MONO, fontSize: 11, color: 'var(--muted)', flexShrink: 0 }}>–</span>
+                  <span style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)', letterSpacing: '0.04em', lineHeight: 1.4 }}>{s.label} (n/a)</span>
+                </div>
+              ))}
           </div>
 
           {/* Content */}
@@ -5618,44 +6204,44 @@ function ProvisionWizard({ onClose, knownDevices }) {
             {/* ── Step-specific controls ── */}
 
             {/* Connect / reconnect buttons */}
-            {CONNECT_STEPS.has(step) && stepState[step] === STEP_STATE.PENDING && !running && (
+            {CONNECT_STEPS.has(stepId) && stepState[step] === STEP_STATE.PENDING && !running && (
               <div style={{ marginBottom: 10 }}>
                 <Pill onClick={() => runStep(step)}>
-                  {step === STEP.CONNECT_ANDROID ? 'Connect Device' : step === STEP.CONNECT_TWRP ? 'Connect to TWRP' : 'Reconnect Device'}
+                  {stepId === 'connect_android' ? 'Connect Device' : stepId === 'connect_twrp' ? 'Connect to TWRP' : 'Reconnect Device'}
                 </Pill>
               </div>
             )}
 
             {/* Reboot button */}
-            {step === STEP.REBOOT && stepState[STEP.REBOOT] === STEP_STATE.PENDING && !running && (
+            {stepId === 'reboot' && stepState[step] === STEP_STATE.PENDING && !running && (
               <div style={{ marginBottom: 10 }}>
-                <Pill onClick={() => runStep(STEP.REBOOT)}>Reboot to Android</Pill>
+                <Pill onClick={() => runStep(step)}>{platform === PLATFORM.FIREOS6 ? 'Reboot' : 'Reboot to Android'}</Pill>
               </div>
             )}
 
             {/* Magisk zip file picker — stays visible through error so a
                 different file can be picked, not just gone after one attempt */}
-            {step === STEP.INSTALL_MAGISK && stepState[STEP.INSTALL_MAGISK] !== STEP_STATE.DONE && !running && (
+            {stepId === 'install_magisk' && stepState[step] !== STEP_STATE.DONE && !running && (
               <div style={{ marginBottom: 12, display: 'flex', flexDirection: 'column', gap: 8 }}>
                 <div style={{ fontFamily: MONO, fontSize: 9, color: 'var(--text2)', letterSpacing: '0.08em' }}>
-                  {stepState[STEP.INSTALL_MAGISK] === STEP_STATE.ERROR ? 'SELECT A DIFFERENT FILE' : 'MAGISK-V17.3.ZIP'}
+                  {stepState[step] === STEP_STATE.ERROR ? 'SELECT A DIFFERENT FILE' : 'MAGISK-V17.3.ZIP'}
                 </div>
                 <input
                   type="file" accept=".zip" aria-label="Magisk zip"
                   onChange={e => setMagiskFile(e.target.files[0])}
                   style={{ fontFamily: MONO, fontSize: 11 }}
                 />
-                {!!magiskFile && <Pill onClick={() => runStep(STEP.INSTALL_MAGISK)}>Flash Magisk</Pill>}
+                {!!magiskFile && <Pill onClick={() => runStep(step)}>Flash Magisk</Pill>}
               </div>
             )}
 
             {/* EchoMuse binary — custom upload or latest from controller.
                 Stays visible through error so a different file/source can be
                 tried instead of being stuck retrying whatever failed. */}
-            {step === STEP.INSTALL_EM && stepState[STEP.INSTALL_EM] !== STEP_STATE.DONE && !running && (
+            {stepId === 'install_em' && stepState[step] !== STEP_STATE.DONE && !running && (
               <div style={{ marginBottom: 12, display: 'flex', flexDirection: 'column', gap: 10 }}>
                 <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-                  <Pill accent onClick={() => runStep(STEP.INSTALL_EM, true)}>Install latest from GitHub</Pill>
+                  <Pill accent onClick={() => runStep(step, true)}>Install latest from GitHub</Pill>
                   <Pill small onClick={doCheckRelease} disabled={checkingRelease}>
                     {checkingRelease ? 'Checking…' : 'Check for newer release'}
                   </Pill>
@@ -5667,28 +6253,28 @@ function ProvisionWizard({ onClose, knownDevices }) {
                 </div>
                 <div style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)', letterSpacing: '0.04em' }}>— or —</div>
                 <div style={{ fontFamily: MONO, fontSize: 9, color: 'var(--text2)', letterSpacing: '0.08em' }}>
-                  {stepState[STEP.INSTALL_EM] === STEP_STATE.ERROR ? 'SELECT A DIFFERENT BUILD (ARMv7)' : 'CUSTOM ECHOMUSE SERVER BINARY (ARMv7)'}
+                  {stepState[step] === STEP_STATE.ERROR ? 'SELECT A DIFFERENT BUILD (ARMv7)' : 'CUSTOM ECHOMUSE SERVER BINARY (ARMv7)'}
                 </div>
                 <input
                   type="file" aria-label="EchoMuse server binary"
                   onChange={e => setBinaryFile(e.target.files[0])}
                   style={{ fontFamily: MONO, fontSize: 11 }}
                 />
-                {!!binaryFile && <Pill onClick={() => runStep(STEP.INSTALL_EM, false)}>Install Custom Build</Pill>}
+                {!!binaryFile && <Pill onClick={() => runStep(step, false)}>Install Custom Build</Pill>}
               </div>
             )}
 
             {/* WiFi configuration */}
-            {step === STEP.WIFI && stepState[STEP.WIFI] !== STEP_STATE.DONE && !running && (
+            {stepId === 'wifi' && stepState[step] !== STEP_STATE.DONE && !running && (
               <WifiPanel
                 adb={adb}
                 wifiSsid={wifiSsid} setWifiSsid={setWifiSsid}
                 wifiPsk={wifiPsk}   setWifiPsk={setWifiPsk}
                 onScan={() => scanWifi(adb).then(nets => setWifiNetworks(nets)).catch(e => addLog(`Scan failed: ${e.message}`, LOG_TONE.ERROR))}
                 networks={wifiNetworks}
-                onConnect={() => { if (wifiSsid) runStep(STEP.WIFI); }}
-                onSkip={() => { markStep(STEP.WIFI, STEP_STATE.DONE); setStep(STEP.INSTALL_EM); }}
-                onAbort={() => { markStep(STEP.WIFI, STEP_STATE.ERROR); addLog('WiFi skipped — provision incomplete.', LOG_TONE.WARN); }}
+                onConnect={() => { if (wifiSsid) runStep(step); }}
+                onSkip={() => { markStep(step, STEP_STATE.DONE); setStep(step + 1); }}
+                onAbort={() => { markStep(step, STEP_STATE.ERROR); addLog('WiFi skipped — provision incomplete.', LOG_TONE.WARN); }}
               />
             )}
 
@@ -5711,14 +6297,14 @@ function ProvisionWizard({ onClose, knownDevices }) {
                 complete retry path with fresh input, so a second generic
                 "Retry" here would just compete with it and, for the file
                 steps, retry with no file selected (since failure clears it). */}
-            {!running && stepState[step] === STEP_STATE.ERROR && !INPUT_STEPS.has(step) && (
+            {!running && stepState[step] === STEP_STATE.ERROR && !INPUT_STEPS.has(stepId) && (
               <div style={{ marginBottom: 10, display: 'flex', gap: 8 }}>
                 <Pill onClick={() => runStep(step)}>Retry</Pill>
                 {/* Reachable from every step, not just the connection ones.
                     Unplugging the cable is a normal reaction to something
                     going wrong, and it used to leave the wizard holding a dead
                     handle with no way to get a live one (#91). */}
-                {!CONNECT_STEPS.has(step) && (
+                {!CONNECT_STEPS.has(stepId) && (
                   <Pill onClick={reconnectAdb}>{adb ? 'Reconnect' : 'Reconnect device'}</Pill>
                 )}
                 {/* Collection is automatic on failure; sharing is deliberate.
@@ -5728,13 +6314,13 @@ function ProvisionWizard({ onClose, knownDevices }) {
                 {diagnostics && (
                   <Pill onClick={downloadDiagnostics}>Download diagnostics</Pill>
                 )}
-                {step === STEP.CONNECT_ANDROID && duplicateDeviceId && (
+                {stepId === 'connect_android' && duplicateDeviceId && (
                   <Pill danger onClick={async () => {
                     try {
                       await API.del(`/api/devices/${duplicateDeviceId}`);
                       addLog(`Deleted "${duplicateDeviceId}" from controller. You can retry now.`, LOG_TONE.OK);
                       setDuplicateDeviceId(null);
-                      markStep(STEP.CONNECT_ANDROID, STEP_STATE.PENDING);
+                      markStep(step, STEP_STATE.PENDING);
                     } catch (e) {
                       addLog(`Delete failed: ${e.error || e.message || 'unknown error'} — check /api/devices/{id} DELETE exists in em_api.py.`, LOG_TONE.ERROR);
                     }
@@ -5747,7 +6333,7 @@ function ProvisionWizard({ onClose, knownDevices }) {
                 from the Retry block, which left them with no way to reconnect
                 either. A dead handle is a dead handle whichever step is
                 showing, and Install EchoMuse pushes 10MB over that handle. */}
-            {!running && stepState[step] === STEP_STATE.ERROR && INPUT_STEPS.has(step) && (
+            {!running && stepState[step] === STEP_STATE.ERROR && INPUT_STEPS.has(stepId) && (
               <div style={{ marginBottom: 10, display: 'flex', gap: 8 }}>
                 <Pill onClick={reconnectAdb}>{adb ? 'Reconnect' : 'Reconnect device'}</Pill>
                 {diagnostics && (

@@ -306,6 +306,9 @@ type Stats struct {
 	Detail           *string            `json:"detail"`
 	// Shadow has one entry per shadow rule, in shadow_rules order.
 	Shadow []ShadowStats `json:"shadow"`
+	// WindowEnd is true when the next stats start a new window (the
+	// periodic report); false for an early report within the window.
+	WindowEnd bool `json:"-"`
 }
 
 // ShadowEventKind is how a shadow episode that no live candidate overlapped

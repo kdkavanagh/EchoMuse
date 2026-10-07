@@ -48,14 +48,16 @@ class FakeActor:
         self.turns: list[dict] = []
         self.cancels: list[str] = []
         self.attached = None
+        self.afe_metadata: bool | None = None
         self.detached: list[str] = []
         self.listeners = []
 
     async def start(self) -> None: ...
     async def close(self) -> None: ...
 
-    def attach(self, link, render) -> None:
+    def attach(self, link, render, *, afe_metadata=False) -> None:
         self.attached = (link, render)
+        self.afe_metadata = afe_metadata
 
     def detach(self, reason: str) -> None:
         self.detached.append(reason)

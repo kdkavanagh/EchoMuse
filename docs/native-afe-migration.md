@@ -208,7 +208,11 @@ It answers, cheaply and on hardware, everything this migration assumed:
    and pryon consumes `BEAMFORMED` / `pre-aec` / `post-aec` channel types, so
    the AFE can plainly emit more than the beam — but `audio_policy.conf`
    advertises only `MONO|STEREO` on the primary input, so mono is the
-   expectation.
+   expectation. *Answered for Fire OS 6 (2026-10-07):* the mixer's
+   `micMultiChAsr` emits the beam, up to 4 post-AEC mics and the far-end
+   reference, but never the individual beams; `micAsr` is the beam alone
+   (`docs/alexa-afe.md`, "Fire OS 6: the mixer's ASR streams"). Fire OS 5
+   is still unmeasured.
 4. End-to-end latency, against the mic pipeline's deadline.
 
 Needs the `echomuse-compiler` image (`cd device && docker build -t

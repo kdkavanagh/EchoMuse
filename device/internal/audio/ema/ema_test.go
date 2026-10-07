@@ -18,7 +18,9 @@ func validHeaders() []Header {
 	render.Generation = 17
 	render.UncertaintyUs = UncertaintyUnknown
 	cells := NewHeader(KindCells, 0, 0xdeadbeef, 2, 512*40, 320)
-	return []Header{mic, ref, refPCM, render, cells}
+	afe := NewHeader(KindAFE, FlagEstimated|FlagDiscontinuity, 0xdeadbeef, 4, 1280*40, 125)
+	afe.MonoNs, afe.UncertaintyUs = 5_000_000_000, 81_000
+	return []Header{mic, ref, refPCM, render, cells, afe}
 }
 
 func TestHeaderRoundTrip(t *testing.T) {
@@ -72,7 +74,7 @@ func TestHeaderValidation(t *testing.T) {
 		want error
 	}{
 		{"kind zero", func() Header { h := base(KindMic); h.Kind = 0; return h }, ErrKind},
-		{"kind five", func() Header { h := base(KindMic); h.Kind = 5; return h }, ErrKind},
+		{"kind six", func() Header { h := base(KindMic); h.Kind = 6; return h }, ErrKind},
 		{"reserved flag", func() Header { h := base(KindMic); h.Flags |= 1 << 5; return h }, ErrFlags},
 		{"silence on mic", func() Header {
 			h := base(KindMic)
@@ -83,6 +85,7 @@ func TestHeaderValidation(t *testing.T) {
 		{"stereo", func() Header { h := base(KindMic); h.Channels = 2; return h }, ErrChannels},
 		{"cells as pcm", func() Header { h := base(KindCells); h.Format = FormatPCM16; return h }, ErrFormat},
 		{"mic as cells", func() Header { h := base(KindMic); h.Format = FormatCellV1; return h }, ErrFormat},
+		{"afe as cells", func() Header { h := base(KindAFE); h.Format = FormatCellV1; return h }, ErrFormat},
 		{"zero epoch", func() Header { h := base(KindMic); h.Epoch = 0; return h }, ErrEpoch},
 		{"mic at 48k", func() Header { h := base(KindMic); h.SampleRate = RateRender; return h }, ErrRate},
 		{"render at 16k", func() Header { h := base(KindRender); h.SampleRate = RateCapture; return h }, ErrRate},
@@ -90,13 +93,18 @@ func TestHeaderValidation(t *testing.T) {
 		{"mic 1281", func() Header { h := base(KindMic); h.FrameCount = 1281; h.PayloadBytes = 2562; return h }, ErrFrameCount},
 		{"render 3841", func() Header { h := base(KindRender); h.FrameCount = 3841; h.PayloadBytes = 7682; return h }, ErrFrameCount},
 		{"cells 321", func() Header { h := base(KindCells); h.FrameCount = 321; h.PayloadBytes = 1284; return h }, ErrFrameCount},
+		{"afe 126", func() Header { h := base(KindAFE); h.FrameCount = 126; h.PayloadBytes = 126 * 14; return h }, ErrFrameCount},
+		{"afe at 48k", func() Header { h := base(KindAFE); h.SampleRate = RateRender; return h }, ErrRate},
 		{"generation on mic", func() Header { h := base(KindMic); h.Generation = 1; return h }, ErrGeneration},
 		{"mask on mic", func() Header { h := base(KindMic); h.SourceMask = 1; return h }, ErrSourceMask},
 		{"unknown source", func() Header { h := base(KindReference); h.SourceMask = 16; return h }, ErrSourceMask},
 		{"unaligned cells", func() Header { h := base(KindCells); h.FirstSample = 513; return h }, ErrCellAlignment},
+		{"unaligned afe", func() Header { h := base(KindAFE); h.FirstSample = 512 * 3; return h }, ErrAFEAlignment},
+		{"afe silence", func() Header { h := base(KindAFE); h.Flags |= FlagDigitalSilence; return h }, ErrFlags},
 		{"pcm payload", func() Header { h := base(KindMic); h.PayloadBytes = 1280; return h }, ErrPayloadLength},
 		{"silence with payload", func() Header { h := base(KindReference); h.PayloadBytes = 2560; return h }, ErrPayloadLength},
 		{"cell payload", func() Header { h := base(KindCells); h.PayloadBytes = 640; return h }, ErrPayloadLength},
+		{"afe payload", func() Header { h := base(KindAFE); h.PayloadBytes = 125 * 12; return h }, ErrPayloadLength},
 	}
 	for _, c := range cases {
 		h := c.mut()
@@ -226,5 +234,47 @@ func TestCellE(t *testing.T) {
 		if got := CellE(db); got != want {
 			t.Errorf("CellE(%v) = %d, want %d", db, got, want)
 		}
+	}
+}
+
+func TestAFERecordRoundTripAndLayout(t *testing.T) {
+	r := AFERecord{Frames: 10, Flags: AFEGap | AFEOutputClipped, Playback: 7, ERLEMax: 26, ERLEMean: 14, ERLEFrames: 6,
+		DTDMax: 31, DTDFrames: 2, RMSMax: 218, RMSMean: 200, VADMax: 3, VADFrames: 4, Volume: 127, Lost: 255}
+	var b [AFERecordSize]byte
+	PutAFE(b[:], r)
+	if b != [AFERecordSize]byte{10, AFEGap | AFEOutputClipped, 7, 26, 14, 6, 31, 2, 218, 200, 3, 4, 127, 255} {
+		t.Fatalf("layout % x", b)
+	}
+	if got, err := ParseAFE(b[:]); err != nil || got != r {
+		t.Fatalf("round trip %+v, %v", got, err)
+	}
+}
+
+func TestAFERecordValidation(t *testing.T) {
+	ok := AFERecord{Frames: 10, Playback: 10, ERLEFrames: 10, DTDFrames: 10, VADFrames: 10, DTDMax: 31, VADMax: 3, Volume: 127}
+	cases := []struct {
+		name string
+		mut  func(*AFERecord)
+		want error
+	}{
+		{"valid", func(*AFERecord) {}, nil},
+		{"11 frames", func(r *AFERecord) { r.Frames = 11 }, ErrAFERecord},
+		{"playback > frames", func(r *AFERecord) { r.Frames = 9 }, ErrAFERecord},
+		{"dtd 32", func(r *AFERecord) { r.DTDMax = 32 }, ErrAFERecord},
+		{"vad 4", func(r *AFERecord) { r.VADMax = 4 }, ErrAFERecord},
+		{"volume 128", func(r *AFERecord) { r.Volume = 128 }, ErrAFERecord},
+		{"reserved flag", func(r *AFERecord) { r.Flags = 1 << 6 }, ErrAFEFlags},
+	}
+	for _, c := range cases {
+		r := ok
+		c.mut(&r)
+		var b [AFERecordSize]byte
+		PutAFE(b[:], r)
+		if _, err := ParseAFE(b[:]); !errors.Is(err, c.want) {
+			t.Errorf("%s: %v, want %v", c.name, err, c.want)
+		}
+	}
+	if _, err := ParseAFE(make([]byte, AFERecordSize-1)); !errors.Is(err, ErrAFEShort) {
+		t.Errorf("short: %v", err)
 	}
 }

@@ -20,7 +20,9 @@ import em_session
 from em_arbiter import WakeArbiter
 from em_audio_timeline import (
     FLAG_DIGITAL_SILENCE,
+    AfeRecord,
     Kind,
+    build_afe,
     build_cells,
     build_packet,
 )
@@ -40,6 +42,7 @@ from em_wake_scorer import ReferenceCandidate
 MIC_EPOCH, REF_EPOCH = 11, 22
 BLOCK = 1_280
 CELL = 512
+PERIOD = 1_280              # one native AFE record (afe_metadata_v1)
 MONO_BASE = 10**12
 SPEECH_DB, QUIET_DB = -30.0, -70.0
 
@@ -324,17 +327,24 @@ class FakeAlerts:
 class Device:
     """Wire-level device: monotonic uplink streams with a shared capture/reference clock."""
 
-    def __init__(self, actor: SessionActor):
+    def __init__(self, actor: SessionActor, afe: bool = False):
         self.actor = actor
         self.seq = {Kind.MIC: 0, Kind.CELLS: 0, Kind.REFERENCE: 0}
         self.pos: dict[Kind, int] = {}
         self.level = lambda s: QUIET_DB
         self.mic_pcm = lambda a, b: np.zeros(b - a, dtype=np.int16)
         self.ref_pcm = None           # None: digital silence
+        self.afe = afe                # the session carries the `afe` stream (afe_metadata_v1)
+        self.send_afe = afe           # False: an opted-in device whose decoder sends nothing
+        self.afe_seq = 0
+        self.afe_pos: int | None = None
+        self.afe_record = lambda start: AfeRecord(start, 10, 0, 0, 0, 0, 0, 0, 0, 216, 210, 1, 2, 70, 0)
 
     def open_streams(self):
-        for stream_id, kind, epoch, fmt in (("mic", 1, MIC_EPOCH, 1), ("cells", 4, MIC_EPOCH, 2),
-                                            ("reference", 2, REF_EPOCH, 1)):
+        streams = [("mic", 1, MIC_EPOCH, 1), ("cells", 4, MIC_EPOCH, 2), ("reference", 2, REF_EPOCH, 1)]
+        if self.afe:
+            streams.append(("afe", 5, MIC_EPOCH, 3))
+        for stream_id, kind, epoch, fmt in streams:
             self.actor.on_message(envelope("stream.open", {
                 "stream_id": stream_id, "epoch": str(epoch), "kind": kind, "sample_rate": 16000,
                 "format": fmt, "reason": "start"}))
@@ -350,11 +360,20 @@ class Device:
         """Send every stream from `start` (or where it stopped) through `until`, 80 ms at a time."""
         for kind in self.seq:
             self.pos.setdefault(kind, start - start % CELL)
+        if self.afe_pos is None:
+            self.afe_pos = start - start % PERIOD
         while self.pos[Kind.MIC] < until:
             a = self.pos[Kind.MIC]
             b = a + BLOCK
             self.actor.on_audio(self._packet(Kind.MIC, a, pcm=self.mic_pcm(a, b)))
             self.pos[Kind.MIC] = b
+            while self.send_afe and self.afe_pos + PERIOD <= b:
+                self.afe_seq += 1
+                self.actor.on_audio(build_packet(
+                    Kind.AFE, epoch=MIC_EPOCH, sequence=self.afe_seq, first_sample=self.afe_pos,
+                    afe=build_afe([self.afe_record(self.afe_pos)]), mono_ns=MONO_BASE + self.afe_pos * 62_500,
+                    uncertainty_us=1_000))
+                self.afe_pos += PERIOD
             c = self.pos[Kind.CELLS]
             n = (b - c) // CELL
             if n:
@@ -375,7 +394,7 @@ class Device:
 
 
 class Harness:
-    def __init__(self, config=None):
+    def __init__(self, config=None, afe=False):
         self.link = FakeLink()
         self.render = FakeRender()
         self.worker = FakeWorker()
@@ -411,11 +430,11 @@ class Harness:
             record_continuation=record_continuation))
         self.worker.actor = self.actor
         self.actor.add_listener(self.events.append)
-        self.device = Device(self.actor)
+        self.device = Device(self.actor, afe)
 
     async def start(self):
         await self.actor.start()
-        self.actor.attach(self.link, self.render)
+        self.actor.attach(self.link, self.render, afe_metadata=self.device.afe)
         self.device.open_streams()
         await self.settle()
 
@@ -664,6 +683,114 @@ def test_a_wake_turn_records_each_stage_what_asr_heard_what_ha_transcribed_and_w
     run(main())
 
 
+# --- native AFE evidence (afe_metadata_v1) --------------------------------------------------
+
+# Turn-row columns that record a decision (or what it acted on), not wall-clock timing or ids.
+DECISION_COLUMNS = ("trigger", "wake_model", "wake_score", "wake_threshold", "outcome", "asr_text", "stt_raw",
+                    "stt_text", "response_text", "response_type", "intent_local", "playback_reason", "audio_ms",
+                    "endpoint_ms", "endpoint_class", "wake_model_sha256", "policy_hash", "wake_attribution",
+                    "reference_coverage", "commit_route", "terminal_reason", "conversation_id", "reply_to",
+                    "continuation")
+
+
+async def wake_question_turn(h: Harness) -> dict:
+    question = (OPEN + 3_200, OPEN + 11_392)
+    h.worker.vad = speech((S, OPEN - 512), question)
+    h.device.level = levels((S, OPEN - 512), question)
+    h.worker.tokens = [("▁OPHELIA", OPEN - 1_800), ("▁WHAT", OPEN + 4_000), ("▁TIME", OPEN + 6_000),
+                       ("▁IS", OPEN + 8_000), ("▁IT", OPEN + 10_000)]
+    h.ha.stt_text = "Ophelia, what time is it?"
+    h.ha.next_run = FakeRun([IntentEnded("It is noon.", "conv-1", False, "query_answer", True),
+                             TtsReady("http://ha/tts/1", False), RunEnded()])
+    await h.start()
+    h.actor.on_message(candidate())
+    await h.settle()
+    await h.feed(S - 4_800 - 20_000, OPEN + 60_000)
+    await h.wait_for(lambda: h.render.streams)
+    h.render.streams[0].finish("drained")
+    await h.wait_for(lambda: h.rows)
+    return h.rows[0]
+
+
+def _decisions(h: Harness, row: dict) -> dict:
+    trace = json.loads(row["decision_trace"])
+    utterance = {k: v for k, v in trace["utterance"].items() if k != "utterance_id"}
+    utterance["endpoint"] = [{k: v for k, v in e.items() if k != "commit_id"} for e in utterance["endpoint"]]
+    return {"row": {k: row.get(k) for k in DECISION_COLUMNS}, "utterance": utterance,
+            "terminals": h.terminals(), "cues": h.cues(), "intents": h.ha.intents, "stt": h.ha.stt_calls,
+            "trace": {k: trace[k] for k in ("trigger", "profile", "producing_sound", "chimed", "rule", "hops",
+                                            "terminal")}}
+
+
+def test_an_opted_in_wake_turn_records_native_afe_evidence_and_decides_exactly_as_without_it():
+    async def main(afe: bool):
+        h = Harness(afe=afe)
+        row = await wake_question_turn(h)
+        await h.actor.close()
+        return h, row
+
+    plain, plain_row = run(main(False))
+    native, native_row = run(main(True))
+    assert _decisions(native, native_row) == _decisions(plain, plain_row)
+
+    # Without the capability the evidence is unavailable: SQL NULL, null in the trace.
+    assert plain_row["afe_evidence"] is None and json.loads(plain_row["decision_trace"])["afe_evidence"] is None
+
+    ev = json.loads(native_row["afe_evidence"])
+    assert json.loads(native_row["decision_trace"])["afe_evidence"] == ev
+    assert ev["support_start"] == S and ev["playback_onset"] is None      # nothing played: no rise
+    pre, wake, utt = ev["pre"], ev["wake"], ev["utterance"]
+    assert (pre["start"], pre["end"]) == (S - 16_000, S)
+    assert (wake["start"], wake["end"]) == (S, OPEN)                      # no candidate_end: the opening hop
+    assert wake["periods_expected"] == wake["periods_received"] == -(-OPEN // PERIOD) - S // PERIOD
+    assert wake["frames"] == wake["frames_expected"] and wake["rms_max_db"] == 216 - 256
+    assert round((utt["end"] - utt["start"]) / 16) == native_row["audio_ms"]   # the committed span
+    assert utt["frames"] > 0 and utt["vad_max"] == 0.25 and utt["volume"] == 70
+
+
+def test_an_opted_in_candidate_lease_mirrors_the_afe_stream_from_its_reference_start():
+    async def main(afe: bool):
+        h = Harness(afe=afe)
+        await h.start()
+        h.actor.on_message(candidate())
+        await h.settle()
+        streams = dict(h.actor.uplink.leases.get("L1").streams)
+        await h.actor.close()
+        return streams
+
+    mic = (S - 4_800) // CELL * CELL
+    assert run(main(True))["afe"] == (mic - 40_000) // PERIOD * PERIOD
+    assert "afe" not in run(main(False))
+
+
+@pytest.mark.parametrize("afe, sends, expected", [
+    (False, False, None),                                 # unavailable: the device lacks the capability
+    (True, False, "no data"),                             # opted in, but nothing arrived
+    (True, True, "summary"),
+])
+def test_a_rejected_candidate_row_carries_its_wake_evidence(afe, sends, expected):
+    async def main():
+        h = Harness(afe=afe)
+        h.device.send_afe = sends
+        h.worker.verification = "fail"
+        assert await producing_sound_case(h) == ["unverified_wake"]
+        await h.wait_for(lambda: h.rows)
+        await h.actor.close()
+        return h.rows[0]
+
+    row = run(main())
+    assert row["terminal_reason"] == "unverified_wake"
+    if expected is None:
+        assert row["afe_evidence"] is None
+        return
+    ev = json.loads(row["afe_evidence"])
+    assert ev["support_start"] == S and ev["utterance"] is None
+    if expected == "no data":
+        assert ev["pre"] is None and ev["wake"] is None and ev["playback_onset"] is None
+    else:
+        assert ev["wake"]["start"] == S and ev["wake"]["frames"] > 0 and ev["pre"]["end"] == S
+
+
 # --- button turns and Home Assistant --------------------------------------------------------------
 
 PRESS = 80_000
@@ -699,6 +826,24 @@ def test_a_button_turn_opens_its_own_lease_from_the_press_minus_300_ms():
         assert h.actor.state == "ARMED" and h.render.local == []
         await h.actor.close()
     run(main())
+
+
+@pytest.mark.parametrize("afe", [False, True])
+def test_a_button_turn_lease_requests_afe_from_its_reference_start_only_when_opted_in(afe):
+    async def main():
+        h = Harness(afe=afe)
+        await h.start()
+        h.actor.button_turn(button())
+        await h.settle()
+        streams = h.link.of("uplink.open")[0][0]["streams"]
+        await h.actor.close()
+        return streams
+
+    streams = run(main())
+    if afe:
+        assert streams["afe"] == str(int(streams["reference"]) // PERIOD * PERIOD)
+    else:
+        assert "afe" not in streams
 
 
 def test_a_timer_cancel_home_assistant_may_have_received_is_never_resent():

@@ -540,7 +540,7 @@ class ProvisionProbe(enum.StrEnum):
     """Probe names the wizard may post. Anything else is dropped."""
 
     PROPS = "props"                  # getprop, filtered to _PROVISION_PROPS
-    ROOT = "root"                    # su -c id
+    ROOT = "root"                    # su -c id (Fire OS 6: already root, id -u)
     SELINUX = "selinux"              # getenforce
     PM_READY = "pm_ready"            # pm path android
     STORAGE = "storage"              # df /data
@@ -552,6 +552,12 @@ class ProvisionProbe(enum.StrEnum):
     PACKAGES = "packages"            # how many of the disable/hide lists are still visible
     DATA_PROPERTY = "data_property"  # filenames only
     BOOT_TARGET = "boot_target"      # what /dev/block/other-boot resolves to (TWRP steps)
+    # Fire OS 6 only (docs/fireos6-port.md Phase 4); harmless elsewhere.
+    MIXER_SERVICE = "mixer_service"        # getprop init.svc.mixer
+    ECHOMUSE_SERVICE = "echomuse_service"  # getprop init.svc.echomuse
+    MIXER_STREAMS = "mixer_streams"        # ls -l /data/mixer_streams
+    ECHOMUSE_RC = "echomuse_rc"            # cat /system/etc/init/echomuse.rc
+    SLOT_SUFFIX = "slot_suffix"            # getprop ro.boot.slot_suffix
 
 
 class WpaScanRow(TypedDict):

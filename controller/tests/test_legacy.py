@@ -61,6 +61,9 @@ def test_old_device_is_acked_marked_upgrade_required_and_ignored():
         assert device.upgrade_required and device.online and device.link is None
         assert device.firmware_version == "v2.9.9"
         assert "alert_cache_v1" in device.missing_capabilities
+        # Pre-v1 firmware predates Fire OS 6: the firmware update and debloat
+        # it can still receive are Fire OS 5's.
+        assert device.platform is em_device.DevicePlatform.FIREOS5
 
         for report in ({"type": "button", "clickType": 138, "down": False},
                        {"type": "volume_state", "level": 10}, {"type": "stats", "cpuPct": 5}):

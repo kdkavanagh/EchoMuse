@@ -11,7 +11,7 @@ pytest.importorskip("websockets")
 import em_audio_timeline as tl  # noqa: E402
 import em_device  # noqa: E402
 from _device_fakes import ALL_V1, FakeLink, FakeStore, hello, hello_body, make_hub, run  # noqa: E402
-from em_device_link import Capability, SessionHello  # noqa: E402
+from em_device_link import Capability, DevicePlatform, SessionHello  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 PROTO_GO = ROOT / "device" / "internal" / "proto" / "proto.go"
@@ -69,6 +69,7 @@ def test_a_malformed_or_unsupported_hello_is_refused(bad):
     ("ambient_light_capable", "ambient_light"),
     ("local_wake_chime_capable", "local_wake_chime"),
     ("open_rules_capable", "open_rules_v1"),
+    ("afe_metadata_capable", "afe_metadata_v1"),
 ])
 def test_ui_capability_properties_follow_the_announced_set(prop, cap):
     async def scenario():
@@ -81,6 +82,76 @@ def test_ui_capability_properties_follow_the_announced_set(prop, cap):
             link = FakeLink(hello(sorted(set(caps)), firmware_version=version))
             await device._ready(link)
             assert getattr(device, prop) is expected
+            device._lost(link, "closed")
+        await device.close()
+    run(scenario())
+
+
+def test_the_controller_knows_exactly_the_platforms_the_firmware_names():
+    go = set(re.findall(r'\bPlatform\w+\s+Platform\s*=\s*"([a-z0-9_]+)"', PROTO_GO.read_text()))
+    assert go and {p.value for p in DevicePlatform} == go
+
+
+@pytest.mark.parametrize("extra, granted", [([], False), (["afe_metadata_v1"], True)])
+def test_session_ready_grants_afe_metadata_only_to_a_device_announcing_it(extra, granted):
+    # An older device must never see the key: it would not know the stream.
+    result = _admit(hello(ALL_V1 + extra))
+    assert isinstance(result, em_device.em_device_link.Admitted)
+    assert result.ready.afe_metadata is granted
+    wire = result.ready.wire()
+    assert ("afe_metadata" in wire) is granted
+    if granted:
+        assert wire["afe_metadata"] is True
+
+
+def test_the_actor_session_carries_the_afe_stream_exactly_when_ready_granted_it():
+    async def scenario():
+        store = FakeStore()
+        store.add("DEV1", approved=True)
+        hub, host, _ = make_hub(store)
+        device = await hub.ensure("DEV1", "Office")
+        for caps, expected in ((ALL_V1, False), (ALL_V1 + ["afe_metadata_v1"], True)):
+            link = FakeLink(hello(sorted(caps)))
+            await device._ready(link)
+            assert host.actors["DEV1"].afe_metadata is expected
+            device._lost(link, "closed")
+        await device.close()
+    run(scenario())
+
+
+@pytest.mark.parametrize("extra, expected", [
+    ({"platform": "fireos6"}, DevicePlatform.FIREOS6),
+    ({"platform": "fireos5"}, DevicePlatform.FIREOS5),
+    # Every firmware predating the field ran only on Fire OS 5.
+    ({}, DevicePlatform.FIREOS5),
+    # Unknown is neither refused (the device must still be updatable) nor
+    # guessed as Fire OS 5 (whose Magisk/pm commands it may not have).
+    ({"platform": "fireos7"}, None),
+    ({"platform": None}, None),
+    ({"platform": 6}, None),
+])
+def test_hello_platform(extra, expected):
+    assert hello(**extra).platform is expected
+
+
+def test_an_unknown_platform_still_admits_the_device():
+    result = _admit(hello(platform="fireos7"))
+    assert isinstance(result, em_device.em_device_link.Admitted)
+
+
+def test_device_platform_follows_the_session():
+    async def scenario():
+        store = FakeStore()
+        store.add("DEV1", approved=True)
+        hub, _, _ = make_hub(store)
+        device = await hub.ensure("DEV1", "Office")
+        assert device.platform is None          # no session has named it yet
+        for body, expected in (({"platform": "fireos6"}, DevicePlatform.FIREOS6),
+                               ({}, DevicePlatform.FIREOS5),
+                               ({"platform": "fireos7"}, None)):
+            link = FakeLink(hello(**body))
+            await device._ready(link)
+            assert device.platform is expected
             device._lost(link, "closed")
         await device.close()
     run(scenario())

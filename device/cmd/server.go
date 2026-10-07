@@ -29,10 +29,13 @@ import (
 	"github.com/wilbowes/EchoMuse/internal/client"
 	"github.com/wilbowes/EchoMuse/internal/config"
 	"github.com/wilbowes/EchoMuse/internal/proto"
+	"github.com/wilbowes/EchoMuse/internal/render"
 	"github.com/wilbowes/EchoMuse/internal/server"
 	"github.com/wilbowes/EchoMuse/internal/supervisor"
+	"github.com/wilbowes/EchoMuse/internal/timesync"
 	"github.com/wilbowes/EchoMuse/internal/wakeword"
 	"github.com/wilbowes/EchoMuse/internal/wifi"
+	pkgmic "github.com/wilbowes/EchoMuse/pkg/mic"
 )
 
 const (
@@ -63,6 +66,12 @@ func run() error {
 	// A Wi-Fi change that never committed is rolled back before anything
 	// uses the network.
 	wifi.RecoverIfPending()
+	// Fire OS 6 only: nothing else joins Wi-Fi once wifisvc is stopped. It can
+	// wait ~45 s for association, so it must not hold up audio and the ring.
+	go wifi.EnsureUp()
+	// Fire OS 6 only: Amazon's sntpd cannot sync with wifisvc stopped, so the
+	// firmware sets the clock once a route exists (internal/timesync).
+	go timesync.Run()
 	// Amazon's Wi-Fi Simple Setup daemon has no use here and was observed
 	// busy-looping; stopping it is idempotent.
 	_ = exec.Command("stop", "smarthomewifid").Run()
@@ -88,15 +97,11 @@ func run() error {
 		}
 	}()
 
-	mic, err := slmic.Open()
+	mic, sink, backend, err := openAudio()
 	if err != nil {
-		return fmt.Errorf("capture: %w", err)
+		return fmt.Errorf("audio: %w", err)
 	}
-	sink, err := slspeaker.New()
-	if err != nil {
-		mic.Close()
-		return fmt.Errorf("render: %w", err)
-	}
+	log.Printf("audio backend: %s", backend)
 	phys.SetHeadphones(jack.Inserted())
 
 	speech, err := assets.Open(wakeword.SpeechDir)
@@ -130,6 +135,7 @@ func run() error {
 		},
 		AmbientReadable: als.Present,
 		Mic:             mic,
+		AFEMetadata:     backend == "mixer", // only the mixer's micAsr is decoded (Block.AFE)
 		Physical:        phys,
 		DeviceConfig:    cfg,
 		SpeechStore:     speech,
@@ -183,6 +189,55 @@ func run() error {
 		log.Printf("amp off: %v", err)
 	}
 	return runErr
+}
+
+// openAudio picks the audio backend: OpenSL ES when libOpenSLES.so
+// resolves (Fire OS 5), else libmixerAPI (Fire OS 6) — see
+// docs/fireos6-port.md §3. EM_AUDIO_BACKEND=opensl|mixer forces one,
+// bypassing the probe, for diagnosis. The chosen backend is logged once by
+// the caller.
+func openAudio() (pkgmic.Microphone, render.Sink, string, error) {
+	switch backend := os.Getenv("EM_AUDIO_BACKEND"); backend {
+	case "opensl":
+		return openOpenSL()
+	case "mixer":
+		return openMixer()
+	case "":
+		mic, sink, name, err := openOpenSL()
+		if err == nil {
+			return mic, sink, name, nil
+		}
+		log.Printf("capture: opensl unavailable (%v), falling back to the mixer backend", err)
+		return openMixer()
+	default:
+		return nil, nil, "", fmt.Errorf("EM_AUDIO_BACKEND=%q: want opensl or mixer", backend)
+	}
+}
+
+func openOpenSL() (pkgmic.Microphone, render.Sink, string, error) {
+	mic, err := slmic.Open()
+	if err != nil {
+		return nil, nil, "", err
+	}
+	sink, err := slspeaker.New()
+	if err != nil {
+		mic.Close()
+		return nil, nil, "", err
+	}
+	return mic, sink, "opensl", nil
+}
+
+func openMixer() (pkgmic.Microphone, render.Sink, string, error) {
+	mic, err := slmic.OpenMixer()
+	if err != nil {
+		return nil, nil, "", err
+	}
+	sink, err := slspeaker.NewMixer()
+	if err != nil {
+		mic.Close()
+		return nil, nil, "", err
+	}
+	return mic, sink, "mixer", nil
 }
 
 // reportStats sends the retained stats body every 30 s and, every ~5 min,

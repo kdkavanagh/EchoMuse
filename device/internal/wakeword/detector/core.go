@@ -617,6 +617,7 @@ func (c *core) emitStats(reset bool) {
 		NearMisses:       append([]NearMiss{}, c.stats.nearMisses...),
 		CandidatesOpened: c.stats.candidates,
 		Shadow:           make([]ShadowStats, len(c.shadow)),
+		WindowEnd:        reset,
 	}
 	for i := range c.shadow {
 		sr := &c.shadow[i]

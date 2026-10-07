@@ -117,9 +117,10 @@ with it.
 
 The short version:
 - Persistent unlock via [amonet-biscuit](https://xdaforums.com/t/unlock-root-twrp-unbrick-amazon-echo-dot-2nd-gen-2016-biscuit.4761416/) (R0rt1z2)
-- FireOS 5 (Android 5.1, API 22)
-- Magisk 17.3
-- Alexa voice stack disabled (the dashboard's debloat step handles this)
+- Either FireOS 5 (Android 5.1, API 22) with Magisk 17.3 (amonet-biscuit v1),
+  or FireOS 6 (Android 7.1.2) with R0rt1z2's boot-root.zip (amonet-biscuit v2)
+- Alexa voice stack disabled (the wizard's debloat step on FireOS 5; the
+  firmware's start script on FireOS 6)
 - Home Assistant with a working Assist pipeline, and an **administrator**
   long-lived access token for the controller (not needed for the add-on)
 

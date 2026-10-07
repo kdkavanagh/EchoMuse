@@ -71,7 +71,7 @@ Some research prose is stronger than the underlying evidence:
 - **Full/short alert selection is stronger evidence than an asset-name inference:** `AssetAudioPlayerManager` selects `shortAlertAsset` outside full mode, and `HeadlessRingingService` maps job states to those modes. The reason the upstream job scheduler chooses a mode is not fully traced.
 - **Native recurrence evidence is narrower than universal RRULE support.** The recovered `originalTime`/ISO path uses local time; an inspected RRULE branch returns null. Our DST policy is specified independently below.
 - **Native command policy is not perfectly uniform.** The alert FSM restricts stop/snooze by type, while the headless service can stop its current item before a secondary policy handler runs. Copying that inconsistency is not a goal.
-- **AFE metadata availability is unresolved, not a prerequisite.** Existing notes contain conflicting interpretations of PCM-LSB fields. No usable, validated per-frame ERLE/DTD contract was established. This design works without it.
+- **AFE metadata is evidence, not a prerequisite.** The notes this design started from contained conflicting interpretations of the PCM-LSB fields, and no validated per-frame ERLE/DTD contract existed, so the design works without it. The Fire OS 6 v3.3 layout has since been validated frame by frame and is carried as evidence only (section 4.5).
 
 The archived files are proprietary reference material. Do not redistribute their binaries, model weights, sounds, or LED assets.
 
@@ -155,6 +155,8 @@ Use the native OpenSL ES/Android capture path with `VOICE_RECOGNITION`, and rend
 
 The implementation retains **16 kHz mono S16 capture in 80 ms/1,280-sample callbacks** and **48 kHz mono S16 render** in 2,048-frame (42.7 ms) OpenSL writes [R1]. Transport forwards an acquired block immediately; acoustic analysis may subdivide it without pretending that subdivision reduces acquisition latency. Changing callback or write size is not part of this cutover. Mixer gain ramps are computed per sample, so ramp length is independent of the write period.
 
+On FireOS 6 (no Android framework, no OpenSL ES) the same rule is realised through Amazon's `mixer` daemon via `libmixerAPI`. Capture opens the mixer's `micAsr` stream, which makes the HAL select the same `VOICE_RECOGNITION` ASP pipeline (`input_source=6`). Render opens a 48 kHz mono `MUSIC` stream, which the mixer loops back into ASP as the far-end reference. The firmware re-frames capture to the same 1,280-sample periods and keeps the same render write size, so nothing above the binding changes. One binary picks OpenSL or the mixer at start (`docs/fireos6-port.md`).
+
 Fork captured audio before any model-specific transform:
 
 - **Canonical PCM:** native-AFE signal, original level, shared by STT and acoustic analysis.
@@ -206,7 +208,7 @@ The supported music path is controller-decoded media delivered to the device's `
 
 Control/physical-stop/focus messages must not queue behind seconds of PCM. Use separate authenticated control and bounded audio channels, carrying a shared generation and monotonic sequence.
 
-**Uplink leases.** Microphone PCM (kind 1), final-mix reference (kind 2), and cell records (kind 4) are uploaded only while a lease covers them. Each lease has an ID, a reason, an owner (the candidate, turn, expectation, or diagnostic mode it serves), a generation, a start sample per stream, and a 3 s TTL that the controller renews every second, like dialog focus leases. `uplink.close`, TTL expiry, privacy mute, a capture-epoch change, or session loss ends it. The device ignores an `uplink.renew` or `uplink.close` whose generation is older than the lease's. Per stream, the device uploads while at least one lease wants that stream. A sample may be sent twice when leases overlap; the controller keeps the first copy of each sample index per epoch.
+**Uplink leases.** Microphone PCM (kind 1), final-mix reference (kind 2), cell records (kind 4), and in `afe_metadata_v1` sessions AFE records (kind 5, section 4.5) are uploaded only while a lease covers them. Each lease has an ID, a reason, an owner (the candidate, turn, expectation, or diagnostic mode it serves), a generation, a start sample per stream, and a 3 s TTL that the controller renews every second, like dialog focus leases. `uplink.close`, TTL expiry, privacy mute, a capture-epoch change, or session loss ends it. The device ignores an `uplink.renew` or `uplink.close` whose generation is older than the lease's. Per stream, the device uploads while at least one lease wants that stream. A sample may be sent twice when leases overlap; the controller keeps the first copy of each sample index per epoch. AFE records, where a session carries them, start with the lease's reference.
 
 | Reason | Opened by | Mic from | Reference from | Cells from | Ends |
 |---|---|---|---|---|---|
@@ -218,7 +220,7 @@ Control/physical-stop/focus messages must not queue behind seconds of PCM. Use s
 Transport rules:
 
 - **Candidate ordering:** the device sends a candidate lease's audio only after the controller's `command.ack(accepted)` for its `wake.candidate`, so audio never arrives for a lease the controller has not seen. Without that acknowledgement within 1 s, the device ends the lease with reason `ttl`. Controller-opened leases need no acknowledgement: `uplink.open` precedes their audio.
-- **Backfill** comes from the rings, in sample order, before live packets of the same stream: mic first, then cells, then reference. Every mic and cell start is rounded down to a cell boundary (a multiple of 512 samples), and every reference start to a multiple of 2,560 reference samples, so VAD cells and reference hops line up with continuous processing. A start older than the ring is clipped to the oldest valid sample on that grid and reported in `uplink.ended`. Backfill is at most 6 s of mic, 8 s of reference, and 16 s of cells. Worst case for a candidate lease: `support_start` up to 3.32 s before the first crossing (section 5.2), plus up to 0.77 s of hop queue and inference before candidate open and up to 1 s waiting for the acknowledgement, puts the mic start at most 5.4 s back, the reference start 7.9 s, and the cell start 15.4 s.
+- **Backfill** comes from the rings, in sample order, before live packets of the same stream: mic first, then cells, then AFE records (`afe_metadata_v1` sessions, section 4.5), then reference. Every mic and cell start is rounded down to a cell boundary (a multiple of 512 samples), every AFE-record start to a capture period (1,280 samples), and every reference start to a multiple of 2,560 reference samples, so VAD cells and reference hops line up with continuous processing. A start older than the ring is clipped to the oldest valid sample on that grid and reported in `uplink.ended`. Backfill is at most 6 s of mic, 8 s of reference and of AFE records, and 16 s of cells. Worst case for a candidate lease: `support_start` up to 3.32 s before the first crossing (section 5.2), plus up to 0.77 s of hop queue and inference before candidate open and up to 1 s waiting for the acknowledgement, puts the mic start at most 5.4 s back, the reference and AFE-record start 7.9 s, and the cell start 15.4 s.
 - **Digital silence:** a reference packet whose samples are all zero carries flag `digital_silence` and no payload (section 16.1), so a quiet room costs no reference bandwidth.
 - **Bounds:** at most 400 ms of queued live audio per stream beyond backfill still being sent. Live audio that waits more than 1,000 ms in the device's send queue ends the lease with reason `overrun`; the controller closes the utterance as `audio_overrun`. On the controller, an active speech job older than 750 ms does the same. Candidate evaluation must finish by the verification deadline (section 16.6) or reject.
 - **Gaps:** a gap inside an open utterance is a missing range; the reducer closes the utterance as `interrupted` (section 16.6). Nothing invents silence or drops words.
@@ -228,13 +230,24 @@ Transport rules:
 
 These are implementation defaults, with qualification gates in section 13.
 
-### 4.5 Native metadata is not an implementation dependency
+### 4.5 Native metadata is evidence, not an implementation dependency
 
-The cutover sends **no ASP Binder commands**, changes no AFE configuration, and implements no guessed LSB decoder. Native ERLE, DTD, direction, and wake-time energy fields are always `unavailable` in this protocol revision. Device-owned playback class, volume, mute, and audio-clock observations are sufficient inputs to the specified baseline.
+The cutover sends **no ASP Binder commands** and changes no AFE configuration. Device-owned playback class, volume, mute, and audio-clock observations are sufficient inputs to the specified baseline.
+
+**Fire OS 6: the AFE's per-frame metadata is carried as evidence, under `afe_metadata_v1`.** This is the measured compatibility change the paragraph at the end of this section asks for. The AFE writes one 128-bit v3.3 frame into bit 0 of every 128 samples (8 ms) of the `micAsr` capture ([alexa-afe.md](alexa-afe.md), "AFE metadata in bit 0 (v3.3)"). Every frame of the captures there validated. On the device, the firmware's decoder validated every frame it received: 3,750 of 3,750 per 30 s window, idle and during playback. Across a forced stream re-open it kept its lock and counted the 72 AFE frames (576 ms) the re-open lost.
+
+- **Device.** The mixer capture binding decodes bit 0 of each 80 ms period without modifying a sample: wake scoring and ASR receive exactly what they did before. A frame counts only with sync `0xA5`, version 3.3, payload size 104, a matching checksum, and a lock confirmed by a second frame with the next `FRAME_COUNTER`. `FRAME_COUNTER` and `AFE_TIMESTAMP` measure lost frames, independently of the capture timeline. Each period becomes one 14-byte record (protocol-v1.md §3) of `PLAYBACK_ACTIVE`, `ERLE_RAW`, `DTD`, `RMS`, `DNN_VAD_PROB`, the clip/diverged/mute flags, `VOLUME` and the decoder's gap and sync evidence. Records are kept in an 8 s ring on the capture timeline.
+- **Transport.** Records ride the audio plane as kind 5 under uplink leases, aligned to capture samples like cells. A candidate lease takes them from its reference start. `wake.stats.afe` carries only decoder health. A controller opts in through `session.ready` `afe_metadata`, because older controllers end the session on an unknown EMA1 kind.
+- **Controller.** It parses records at the boundary and summarises them over a turn's wake support span and utterance span as evidence on the turn record and decision trace. It shows them on the dashboard next to the wake and turn details, with decoder health beside wake health.
+- **Not carried.** Direction (`SSL_*`, `FD_*`) was constant in every capture, and wake-time energy has no field. Both stay `unavailable`.
+
+**Fire OS 5:** its capture carries v2.1 frames (all 1,878,292 frames of 439 saved office-Dot clips passed the checksum), but the layout's field names are unresolved and it has no frame counter or live timestamp. It is not decoded, the capability is never announced, and native ERLE, DTD, direction and wake-time energy stay `unavailable` there. A device without the capability shows them as `unavailable` with the reason.
+
+**No decision uses these values.** Wake acceptance, the self-playback verdicts of section 6.1, attribution, endpointing and every threshold are unchanged and read no AFE field. No measurement yet relates any field to an outcome. `DTD` and `DNN_VAD_PROB` fired on the device's own unconverged echo with nobody talking. `ERLE_RAW` is also low for quiet echo, not only for an unconverged AEC. Behaviour under real near-end speech is unmeasured. Making any field an input to a decision is a further measured change, with its own qualification. [afe-metadata.md](afe-metadata.md) validates each field against the captures, ranks what EchoMuse could build on them, and specifies the experiments that would decide each use.
 
 Telling the ASP that a reply or alarm is playing was tested and **does not help** [D5]. Codes 1 (TTS status) and 9 (alarm status) are what native Alexa sends. Disassembly of `libasp.so`'s command dispatcher shows both reach only the playback-side automatic volume leveller. That leveller is disabled on this device, and its TTS and music tables are identical. None of the handlers touches echo cancellation, beamforming, beam selection, or the false-wake stage, which is keyed only by volume. A reversible live toggle confirmed the flags land in the leveller's state. The command is reachable (`service call audiosignalprocessor 3 i32 <code> i32 4 i32 <0|1> i32 0` as root), but it changes nothing EchoMuse's microphone hears, so it is not sent. The two self-wakes in the live history are not explained by the missing notification.
 
-Any later addition of native notifications or metadata requires its own measured compatibility change. Do not add an empty adapter or a configuration switch that claims it is operational.
+Any further addition of native notifications or metadata, or any decision that reads them, requires its own measured compatibility change. Do not add an empty adapter or a configuration switch that claims it is operational.
 
 ## 5. BCResNet wake detection
 
@@ -361,7 +374,7 @@ Available evidence:
 2. The rendered TTS itself through that reference scorer. HA TTS provides no speech marks, so protocol v1 does not use them; response text is not a timestamp.
 3. Short-time spectral/time similarity between reference and microphone over a delay search around the calibrated acoustic path.
 4. Near-end residual/activity in cells that the reference does not explain.
-5. No native AFE metrics in protocol v1 (section 4.5).
+5. On Fire OS 6 with `afe_metadata_v1`, the native AFE's per-frame metadata (playback activity, ERLE, double-talk, VAD) as recorded evidence only: no verdict below reads it (section 4.5). Elsewhere native AFE metrics are `unavailable`.
 
 Decision policy for a mic candidate while the device is producing sound, in this order. The device decides that fact, because it owns the mix: any source audible in the final mix during the candidate support or the preceding 2 s. It reports it as `producing_sound` in `wake.candidate`.
 
@@ -1098,20 +1111,20 @@ Closing the control socket ends the session: the controller closes the other two
 | Byte offset | Type | Meaning |
 |---:|---|---|
 | 0 | 4 bytes | ASCII `EMA1` |
-| 4 | uint8 | kind: 1 mic, 2 final-mix reference, 3 render-source audio, 4 cell records |
+| 4 | uint8 | kind: 1 mic, 2 final-mix reference, 3 render-source audio, 4 cell records, 5 AFE records (`afe_metadata_v1` sessions only, section 4.5) |
 | 5 | uint8 | flags: bit 0 discontinuity, 1 muted, 2 underrun, 3 estimated timing, 4 digital silence (kind 2 only: every sample is zero and the payload is omitted); other bits zero |
 | 6 | uint8 | channels, exactly 1 |
-| 7 | uint8 | format: 1 = signed PCM16 little-endian for kinds 1–3; 2 = cell record v1 for kind 4 |
+| 7 | uint8 | format: 1 = signed PCM16 little-endian for kinds 1–3; 2 = cell record v1 for kind 4; 3 = AFE record v1 for kind 5 |
 | 8 | uint64 | stream epoch, random nonzero value allocated by its producer |
 | 16 | uint64 | sequence, starts at zero for this epoch |
 | 24 | uint64 | first sample-frame index in this epoch |
 | 32 | uint64 | estimated first-sample device monotonic time in ns; zero for not-yet-rendered downlink |
 | 40 | uint32 | timing uncertainty in microseconds; `0xffffffff` means unknown |
-| 44 | uint32 | sample rate: 16,000 for mic, reference, and cell records; 48,000 for render sources |
-| 48 | uint32 | frame count: samples, 1–1,280 uplink PCM or 1–3,840 downlink; for kind 4, cells, 1–320 |
-| 52 | uint32 | render generation for kind 3. Zero for kinds 1, 2, and 4: a reference packet mixes several sources, which its mask names. Wrapping requires a new stream epoch |
-| 56 | uint32 | active-source mask: content=1, alert=2, dialog=4, earcon=8; zero for mic and cells |
-| 60 | uint32 | payload bytes: frame count × 2 for PCM, 0 with digital silence, frame count × 4 for cell records |
+| 44 | uint32 | sample rate: 16,000 for mic, reference, cell and AFE records; 48,000 for render sources |
+| 48 | uint32 | frame count: samples, 1–1,280 uplink PCM or 1–3,840 downlink; for kind 4, cells, 1–320; for kind 5, records, 1–125 |
+| 52 | uint32 | render generation for kind 3. Zero for kinds 1, 2, 4 and 5: a reference packet mixes several sources, which its mask names. Wrapping requires a new stream epoch |
+| 56 | uint32 | active-source mask: content=1, alert=2, dialog=4, earcon=8; zero for mic, cells and AFE records |
+| 60 | uint32 | payload bytes: frame count × 2 for PCM, 0 with digital silence, frame count × 4 for cell records, frame count × 14 for AFE records |
 
 Mic frames normally contain 1,280 samples. Render-source packets normally contain 3,840 samples, consumed internally in 480-sample mixer blocks.
 
@@ -1133,6 +1146,8 @@ Mic frames normally contain 1,280 samples. Render-source packets normally contai
 | 3 | the final mix's active-source mask during the cell (content=1, alert=2, dialog=4, earcon=8), mapped from render to capture time with the clock fit (section 4.3) |
 
 A gap cell carries `E` = −12,000 and the gap flag.
+
+**AFE records** (kind 5, format 3) exist only in a session whose `session.ready` opted into `afe_metadata_v1` (section 4.5). Like cells they belong to the mic's capture epoch; record `k` summarises the native AFE metadata frames that ended in capture samples [1280k, 1280k + 1280), and the header's first index is the first record's start sample, a multiple of 1,280. The 14-byte layout is in [protocol-v1.md](protocol-v1.md) §3. A capture missing range has no records.
 
 **Uplink packets** exist only under a lease (section 4.4). Backfill packets keep their original sample indices and timestamps and precede live packets of the same stream. The controller rejects packets for a stream that no active lease wants.
 
@@ -1171,7 +1186,7 @@ Required command/event families:
 | `button.action` | device monotonic time, capture sample index at the press, physical-event sequence, current occurrence ID or null |
 | `wake.candidate` | device → controller. Fields: candidate ID and its new `candidate` lease ID, whose generation is always 1 (conversion to `turn` makes it 2); capture epoch; graph SHA-256 and scorer revision; latched profile and threshold; `producing_sound`; `chimed` (the device started the wake chime for this candidate, section 11.2); first-crossing end sample; `support_start`; device monotonic time of open; on `open_rules_v1` firmware `rule`, the open rule that opened it, whose threshold is the latched one (absent: the baseline rule). `hops` holds one record per hop slot from `support_start` to open, `{end_sample, raw, smoothed, profile}`, with `raw` and `smoothed` null for a window not scored |
 | `wake.candidate_end` | device → controller: candidate ID, `support_end`, peak smoothed probability, close reason `below/gap/reset/mute/overrun` |
-| `wake.stats` | device → controller every 30 s: hops scored, hops dropped (`wake_overrun`), inference errors, mean and maximum inference time, near-miss episodes with time and peak, candidates opened, peak smoothed value, graph SHA-256, and `wake_unavailable` as null or a reason (`missing_asset/load_failed/inference_errors`); on `open_rules_v1` firmware `shadow`, one entry per shadow rule with this window's `hops`, `opens`, `matched`, `lead_hist`, `unmatched`, `retried`, `live_only`, events and `events_dropped` (section 5.2; absent from older firmware means no shadow data, not zeros). Also sent immediately whenever `wake_unavailable` changes |
+| `wake.stats` | device → controller every 30 s: hops scored, hops dropped (`wake_overrun`), inference errors, mean and maximum inference time, near-miss episodes with time and peak, candidates opened, peak smoothed value, graph SHA-256, and `wake_unavailable` as null or a reason (`missing_asset/load_failed/inference_errors`); on `open_rules_v1` firmware `shadow`, one entry per shadow rule with this window's `hops`, `opens`, `matched`, `lead_hist`, `unmatched`, `retried`, `live_only`, events and `events_dropped` (section 5.2; absent from older firmware means no shadow data, not zeros); in an `afe_metadata_v1` session `afe`, the AFE metadata decoder's periods, valid and invalid frames, syncs, gaps and lost frames for the window (section 4.5; absent means no data). Also sent immediately whenever `wake_unavailable` changes |
 | `uplink.open` | controller → device: lease ID, owner, generation, reason `turn/reply/diagnostic`, streams, per-stream start sample or `live`, TTL |
 | `uplink.renew` | controller → device: lease ID, owner, generation, TTL. On a `candidate` lease, `reason: turn` with the turn as owner and generation + 1 converts it into the accepted turn's lease |
 | `uplink.close` | controller → device: lease ID, generation, reason `rejected/arbitration_lost/committed/closed`. Closing a candidate lease also releases its provisional duck |
@@ -1787,7 +1802,7 @@ For each, `request_id` is exactly `"{{ context.id }}|<action>|{{ args | tojson }
 | Speaker gating? | None in the initial implementation; speaker takeover is backlog (section 19.1) | Only a two-clip sanity test exists [P1]; published approaches use trained per-frame models |
 | TV-room endpoint? | Grammar-complete background-speech route; background speech ≥10 dB down counts as pause after `needs_more`/`unknown` text; bounded retry | Equal-level voices are not separable from one stream; speech ≥10 dB down is, and a 1,792 ms pause outlasts soft stretches inside a command |
 | Unsolicited follow-up? | Not implemented | No available directedness/NTT model |
-| Native AFE metadata? | Unused and unavailable in protocol v1 | No validated per-frame ERLE/DTD path |
+| Native AFE metadata? | Fire OS 6: decoded on the device and carried as evidence under `afe_metadata_v1`; no decision reads it. Fire OS 5 and direction/wake-time energy: `unavailable` | v3.3 validated per frame on the device (section 4.5); no measurement yet relates a field to an outcome |
 | Presentation timing? | Estimated callback/sample accounting plus 150 ms drain guard | No measured DAC timestamp API; guard is a release gate |
 | HA voice entry? | Stock `assist_pipeline/run`: STT only with `no_vad`, then intent→TTS; the controller removes the wake phrase between them | No custom integration allowed; schema validated in the installed HA [H4][H6] |
 | Custom HA integration? | None. Stock websocket/REST APIs, Local Calendar, scripts, and ESPHome entities only | User decision; every surface verified in the installed HA [H6] |

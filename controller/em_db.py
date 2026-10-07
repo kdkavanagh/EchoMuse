@@ -1004,6 +1004,18 @@ MIGRATIONS: list[str] = [
         ON wake_shadow_events (device_id, ts DESC);
     UPDATE system_config SET value = '27' WHERE key = 'schema_version';
     """,
+
+    # ── v28 — native AFE evidence on the turn row ────────────────────────────
+    #
+    # `afe_evidence` is the turn's em_afe.AfeEvidence JSON from a Dot with
+    # `afe_metadata_v1`: `support_start`, the `pre` (second before the wake),
+    # `wake` and `utterance` span summaries and `playback_onset`; a null part
+    # is no data. SQL NULL is unavailable: the device lacked the capability,
+    # or the row predates this. Evidence only.
+    """
+    ALTER TABLE turns ADD COLUMN afe_evidence TEXT;
+    UPDATE system_config SET value = '28' WHERE key = 'schema_version';
+    """,
 ]
 
 # Post-migration fixups that need Python rather than SQL. Keyed by the schema
@@ -2050,7 +2062,7 @@ def get_device_logs(
 # as trigger_type because TRIGGER is an SQLite keyword. The §11.3 decision
 # trace arrived in schema 22, the per-stage Activity detail in schema 24, the
 # follow-up question detail in schema 25, the stored trace JSON and
-# time-to-first-audio in schema 26.
+# time-to-first-audio in schema 26, native AFE evidence in schema 28.
 _TURN_COLUMNS = {
     "trigger":            "trigger_type",
     "wake_model":         "wake_model",
@@ -2086,6 +2098,7 @@ _TURN_COLUMNS = {
     "continuation":       "continuation",    # fate of the question this turn asked (em_session FOLLOWUP_*)
     "first_audio_ms":     "first_audio_ms",  # endpoint commit → response audible
     "decision_trace":     "decision_trace",  # §11.3 trace JSON; newest TRACE_RETENTION rows only
+    "afe_evidence":       "afe_evidence",    # em_afe.AfeEvidence JSON; NULL = unavailable
 }
 
 # Written but not returned by get_turns (nor pushed as turn_complete): the

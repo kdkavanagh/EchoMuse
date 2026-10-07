@@ -9,6 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/wilbowes/EchoMuse/internal/platform"
 )
 
 const (
@@ -339,8 +341,18 @@ func (s *Scanner) flush() {
 // `pm disable` persists across reboots and is idempotent; run once per
 // process. Android's pm/settings are shebang-less wrappers, so exec via sh
 // (same ENOEXEC constraint as svc in internal/wifi).
+//
+// Fire OS 6 has no framework behind pm/settings (docs/fireos6-port.md §2):
+// there is no Bluedroid to disable, and running them would just log a
+// failure for nothing. /dev/stpbt is freed instead by start_server.sh
+// stopping btmanagerd, BTSinkPlayer and blemesh_service before the scanner
+// ever opens it.
 func (s *Scanner) ensureBluedroidDisabled() {
 	if s.bluedroidDisabled {
+		return
+	}
+	if platform.FireOS6() {
+		s.bluedroidDisabled = true
 		return
 	}
 	pkgs := []string{

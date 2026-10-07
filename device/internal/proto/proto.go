@@ -71,7 +71,31 @@ const (
 	// detector.open_rules, evaluates its shadow_rules, credits the opening
 	// rule in wake.candidate and reports shadow counters in wake.stats.
 	CapOpenRules Capability = "open_rules_v1"
+	// CapAFEMetadata: the capture carries the native AFE's per-frame
+	// metadata (Fire OS 6 micAsr, v3.3) and its decoder is validating
+	// frames. On session.ready's afe_metadata the device announces the afe
+	// stream, serves it under leases and reports wake.stats.afe.
+	CapAFEMetadata Capability = "afe_metadata_v1"
 )
+
+// Platform is session.hello's platform: the system image this firmware runs
+// on (internal/platform). The controller picks each image's maintenance
+// commands from it — Fire OS 5's debloat is Magisk plus `pm`, Fire OS 6 has
+// neither. Firmware predating the field ran only on Fire OS 5.
+type Platform string
+
+const (
+	PlatformFireOS5 Platform = "fireos5"
+	PlatformFireOS6 Platform = "fireos6"
+)
+
+// PlatformOf names the image platform.FireOS6() reports.
+func PlatformOf(fireOS6 bool) Platform {
+	if fireOS6 {
+		return PlatformFireOS6
+	}
+	return PlatformFireOS5
+}
 
 // MessageType is an envelope type.
 type MessageType string
@@ -205,6 +229,7 @@ type Volume struct {
 // Hello); AmbientLightStatus is the retained als.Report() object.
 type SessionHello struct {
 	Capabilities       []Capability       `json:"capabilities"`
+	Platform           Platform           `json:"platform"`
 	FirmwareVersion    string             `json:"firmware_version"`
 	BootID             string             `json:"boot_id"`
 	Protocols          []int              `json:"protocols"`
@@ -263,6 +288,10 @@ type SessionReady struct {
 	Assets           SpeechAssets   `json:"assets"`
 	Detector         DetectorPolicy `json:"detector"`
 	UTCMs            uint64         `json:"utc_ms,string"`
+	// AFEMetadata opts this session into afe_metadata_v1; a controller
+	// sends it only to a device that announced the capability. Absent
+	// (older controllers): nothing of it is sent.
+	AFEMetadata bool `json:"afe_metadata"`
 }
 
 // RejectReason is a session.rejected reason.
@@ -328,6 +357,7 @@ const (
 	StreamMic       StreamID = "mic"
 	StreamReference StreamID = "reference"
 	StreamCells     StreamID = "cells"
+	StreamAFE       StreamID = "afe" // afe_metadata_v1 sessions only
 )
 
 // StreamReason says why a stream epoch opened or ended.
@@ -433,6 +463,18 @@ type ActiveAlert struct {
 	Kind       alerts.Kind `json:"kind"`
 	Name       string      `json:"name"`
 	Foreground bool        `json:"foreground"`
+}
+
+// AFEStats is wake.stats.afe (afe_metadata_v1 sessions only): the AFE
+// metadata decoder's health over the stats window, counted whether or not
+// capture is privacy-muted. Expected frames = Periods × 10.
+type AFEStats struct {
+	Periods    uint64 `json:"periods"`
+	Frames     uint64 `json:"frames"`
+	Invalid    uint64 `json:"invalid"`
+	Syncs      uint64 `json:"syncs"`
+	Gaps       uint64 `json:"gaps"`
+	LostFrames uint64 `json:"lost_frames"`
 }
 
 // ── Uplink leases (WIRE §4.5) ───────────────────────────────────────────────

@@ -21,6 +21,7 @@ from typing import Any, Protocol
 import numpy as np
 from websockets.asyncio.server import ServerConnection
 
+import em_afe
 import em_ambient
 import em_button
 import em_capture
@@ -38,7 +39,7 @@ import em_tap_burst
 import em_volume
 import em_wake_registry
 import em_wake_rules
-from em_device_link import Capability, CloseReason, CommandAck, MessageType, RejectReason
+from em_device_link import Capability, CloseReason, CommandAck, DevicePlatform, MessageType, RejectReason
 
 log = logging.getLogger("em_device")
 
@@ -97,7 +98,8 @@ class Actor(Protocol):
 
     async def start(self) -> None: ...
     async def close(self) -> None: ...
-    def attach(self, link: em_device_link.DeviceLink, render: em_render.RenderClient) -> None: ...
+    def attach(self, link: em_device_link.DeviceLink, render: em_render.RenderClient, *,
+               afe_metadata: bool) -> None: ...
     def detach(self, reason: CloseReason) -> None: ...
     def on_message(self, envelope: em_device_link.Envelope) -> None: ...
     def on_audio(self, frame: bytes) -> None: ...
@@ -296,11 +298,17 @@ class Device:
         self.capabilities: frozenset[str] = frozenset()
         self.missing_capabilities: frozenset[str] = frozenset()
         self.firmware_version: str | None = None
+        # The image the current session named; None before any session, or
+        # when it named one this controller does not know (SessionHello).
+        self.platform: DevicePlatform | None = None
         self.ip: str | None = None
         self.secure = False
         self.upgrade_required = False
         self.stats: dict[str, object] | None = None
         self.wake_stats: dict[str, object] | None = None
+        # wake.stats `afe` of the last report: None when it carried none (no
+        # data, never zeros) or the device lacks afe_metadata_v1.
+        self.afe_stats: em_afe.AfeStats | None = None
         self.alert_state: dict[str, object] | None = None
         self.alerts_wakeup: str | None = None
         self.volume: int | None = None
@@ -407,6 +415,10 @@ class Device:
         return Capability.OPEN_RULES in self.capabilities
 
     @property
+    def afe_metadata_capable(self) -> bool:
+        return Capability.AFE_METADATA in self.capabilities
+
+    @property
     def capture_permitted(self) -> bool:
         return not self.diagnostic
 
@@ -483,6 +495,8 @@ class Device:
         self.legacy_ws = ws
         self.upgrade_required = True
         self.ip, self.firmware_version, self.secure = ip, version, secure
+        # Pre-v1 firmware predates Fire OS 6 support: it only ever ran on Fire OS 5.
+        self.platform = DevicePlatform.FIREOS5
         self.capabilities = frozenset(capabilities)
         self.missing_capabilities = REQUIRED_CAPABILITIES - self.capabilities
         await self.host.connected(self)
@@ -502,13 +516,15 @@ class Device:
         self.capabilities = link.capabilities
         self.missing_capabilities = REQUIRED_CAPABILITIES - self.capabilities
         self.firmware_version = hello.firmware_version
+        self.platform = hello.platform
         self.ip, self.secure = link.peer_ip, link.secure
         self.alerts_wakeup = hello.alerts_wakeup
         self.ambient = hello.ambient_light_status
         self._physical_seq = -1
         self.muted = hello.muted
         self.volume = hello.volume_level
-        self.actor.attach(link, render)
+        # session.ready granted afe_metadata exactly when the hello announced it (LinkHub.admit).
+        self.actor.attach(link, render, afe_metadata=self.afe_metadata_capable)
         await self.host.alerts.on_session_hello(self.device_id, hello.alerts,
                                                 capabilities=self.capabilities)
         await self.apply_config(self.config)
@@ -531,12 +547,20 @@ class Device:
                 self._spawn(self.host.push_state(self, {"muted": self.muted}), "privacy push")
             case MessageType.WAKE_STATS:
                 self.wake_stats = {**body, "received_ms": time.time_ns() // 1_000_000}
+                try:
+                    self.afe_stats = em_afe.parse_stats(body)
+                except ValueError as exc:
+                    log.warning("[%s] wake.stats afe ignored: %s", self.device_id, exc)
+                    self.afe_stats = None
                 self._spawn(asyncio.to_thread(self.store.wake_stats, self.device_id, body), "wake stats")
                 shadow = em_wake_rules.parse_shadow(body)
                 if shadow is not None:
                     self._spawn(asyncio.to_thread(self.store.wake_shadow, self.device_id, shadow,
                                                   self._device_wall(time.time())), "wake shadow")
-                self._spawn(self.host.push_state(self, {"wake_stats": self.wake_stats}), "wake stats push")
+                self._spawn(self.host.push_state(self, {
+                    "wake_stats": self.wake_stats,
+                    "afe_stats": self.afe_stats.wire() if self.afe_stats is not None else None,
+                }), "wake stats push")
             case MessageType.ALERT_ACK:
                 self._spawn(self.host.alerts.on_alert_ack(self.device_id, body), "alert ack")
             case MessageType.ALERT_STATE:
@@ -887,6 +911,7 @@ class LinkHub:
         rules = (em_wake_rules.RuleSet.from_config(device.config)
                  if Capability.OPEN_RULES in hello.capabilities else None)
         device.wake_rules = rules
+        afe_metadata = Capability.AFE_METADATA in hello.capabilities
         ready = em_device_link.ReadyGrant(
             capture_permitted=device.capture_permitted,
             assets=self.assets.speech_assets(model),
@@ -902,6 +927,7 @@ class LinkHub:
                             else rules.open_rules(model.thresholds.idle, model.thresholds.playback)),
                 shadow_rules=None if rules is None else rules.shadow,
             ),
+            afe_metadata=afe_metadata,
         )
         return em_device_link.Admitted(ready=ready, sink=_Sink(device))
 

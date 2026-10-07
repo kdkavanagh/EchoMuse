@@ -35,10 +35,25 @@ def cells(first, e, seq=0, flags=None, mask=None):
     return at.build_packet(Kind.CELLS, epoch=MIC_EPOCH, sequence=seq, first_sample=first, cells=data)
 
 
-def opened_session(now):
-    s = at.UplinkSession(now=lambda: now[0])
-    for sid, kind, epoch, fmt in (("mic", 1, MIC_EPOCH, 1), ("cells", 4, MIC_EPOCH, 2),
-                                  ("reference", 2, REF_EPOCH, 1)):
+def afe_rec(frames=10, **kw):
+    """One afe record v1 (the `start` is the packet's to imply)."""
+    fields = dict(start=0, frames=frames, flags=0, playback=0, erle_max=0, erle_mean=0, erle_frames=0,
+                  dtd_max=0, dtd_frames=0, rms_max=200, rms_mean=195, vad_max=0, vad_frames=0, volume=70, lost=0)
+    fields.update(kw)
+    return at.AfeRecord(**fields)
+
+
+def afe(first, recs, seq=0, flags=0):
+    return at.build_packet(Kind.AFE, epoch=MIC_EPOCH, sequence=seq, first_sample=first,
+                           afe=at.build_afe(recs), flags=flags)
+
+
+def opened_session(now, afe_metadata=False):
+    s = at.UplinkSession(now=lambda: now[0], afe_metadata=afe_metadata)
+    streams = [("mic", 1, MIC_EPOCH, 1), ("cells", 4, MIC_EPOCH, 2), ("reference", 2, REF_EPOCH, 1)]
+    if afe_metadata:
+        streams.append(("afe", 5, MIC_EPOCH, 3))
+    for sid, kind, epoch, fmt in streams:
         s.stream_open({"stream_id": sid, "epoch": str(epoch), "kind": kind,
                        "sample_rate": 16000, "format": fmt, "reason": "start"})
     return s
@@ -119,6 +134,71 @@ def test_invalid_cell_records_are_rejected(e, flags, needle):
         at.parse_cells(rec.tobytes())
 
 
+def test_afe_records_parse_every_field_and_cover_1280_samples_each():
+    recs = [afe_rec(10, flags=at.AFE_FLAG_SYNC | at.AFE_FLAG_MIC_CLIPPED, playback=7, erle_max=26, erle_mean=12,
+                    erle_frames=5, dtd_max=31, dtd_frames=2, rms_max=230, rms_mean=220, vad_max=3,
+                    vad_frames=4, volume=127, lost=255),
+            afe_rec(0, rms_max=0, rms_mean=0, volume=0)]
+    frame = afe(2560, recs, flags=at.FLAG_DISCONTINUITY)
+    assert len(frame) == 64 + 2 * 14
+    p = at.parse_packet(frame)
+    assert p.kind is Kind.AFE and p.frame_count == 2 and p.end_sample == 2560 + 2 * 1280
+    got = p.afe()
+    assert [r.start for r in got] == [2560, 3840]
+    assert got[0] == at.AfeRecord(2560, 10, 0b1010, 7, 26, 12, 5, 31, 2, 230, 220, 3, 4, 127, 255)
+    assert got[0].sync and got[0].mic_clipped and not got[0].gap and not got[0].device_mute
+    assert got[1].frames == 0                         # a period without data, carried as such
+    with pytest.raises(TypeError):
+        p.pcm()
+
+
+def test_afe_packet_off_the_1280_grid_is_rejected():
+    frame = patch(afe(2560, [afe_rec()]), 24, "<Q", 2048)
+    with pytest.raises(ProtocolError, match="period boundary"):
+        at.parse_packet(frame)
+
+
+@pytest.mark.parametrize("field, value, needle", [
+    ("frames", 11, "frames above"),
+    ("flags", 1 << 6, "reserved"), ("flags", 1 << 7, "reserved"),
+    ("playback", 11, "playback above"), ("erle_frames", 11, "erle_frames above"),
+    ("dtd_frames", 11, "dtd_frames above"), ("vad_frames", 11, "vad_frames above"),
+    ("dtd_max", 32, "dtd_max above"), ("vad_max", 4, "vad_max above"), ("volume", 128, "volume above"),
+])
+def test_invalid_afe_records_are_rejected(field, value, needle):
+    rec = np.zeros(1, dtype=at.AFE_RECORD)
+    rec["frames"] = 10
+    rec[field] = value
+    with pytest.raises(ProtocolError, match=needle):
+        at.parse_afe(rec.tobytes())
+
+
+def test_afe_counts_above_a_periods_frames_are_rejected_even_below_ten():
+    rec = np.zeros(1, dtype=at.AFE_RECORD)
+    rec["frames"], rec["vad_frames"] = 3, 4
+    with pytest.raises(ProtocolError, match="vad_frames"):
+        at.parse_afe(rec.tobytes())
+
+
+@pytest.mark.parametrize("mutate, needle", [
+    (lambda f: patch(f, 7, "<B", 2), "format"),
+    (lambda f: patch(f, 48, "<I", 126), "frame count"),
+    (lambda f: patch(f, 60, "<I", 13), "payload"),
+    (lambda f: f[:-1], "bytes"),
+])
+def test_malformed_afe_frames_raise_protocol_error(mutate, needle):
+    with pytest.raises(ProtocolError, match=needle):
+        at.parse_packet(mutate(afe(0, [afe_rec()])))
+
+
+def test_afe_stream_open_must_name_kind_5_format_3():
+    s = at.UplinkSession(afe_metadata=True)
+    assert s.stream_open({"stream_id": "afe", "epoch": "5", "kind": 5, "sample_rate": 16000,
+                          "format": 3, "reason": "start"}) == ("afe", 5)
+    with pytest.raises(ProtocolError, match="parameters"):
+        s.stream_open({"stream_id": "afe", "epoch": "6", "kind": 4, "sample_rate": 16000, "format": 2})
+
+
 # -- stream epochs ---------------------------------------------------------------
 
 def test_packet_for_unopened_or_ended_epoch_is_a_protocol_error():
@@ -171,6 +251,51 @@ def test_candidate_lease_starts_on_the_cell_and_wire_offsets():
     lease = table.open_candidate("L", "C", MIC_EPOCH, support_start=300_000)
     assert lease.streams == {"mic": 294_912, "cells": 134_656, "reference": 254_912}
     assert lease.generation == 1 and lease.ack is at.AckState.PENDING and not lease.active
+
+
+def test_an_opted_in_candidate_lease_wants_afe_from_its_reference_start_on_the_period_grid():
+    table = at.LeaseTable(now=lambda: 0.0)
+    lease = table.open_candidate("L", "C", MIC_EPOCH, support_start=300_000, afe=True)
+    # mic 294,912 − 40,000 = 254,912 → 254,720 on the 1280 grid
+    assert lease.streams == {"mic": 294_912, "cells": 134_656, "reference": 254_912, "afe": 254_720}
+    assert lease.streams["afe"] % 1280 == 0
+    early = table.open_candidate("E", "C2", MIC_EPOCH, support_start=10_000, afe=True)
+    assert early.streams["afe"] == 0
+    s = opened_session([0.0], afe_metadata=True)
+    assert s.candidate("S", "C3", MIC_EPOCH, 300_000).streams["afe"] == 254_720
+    assert "afe" not in opened_session([0.0]).candidate("S", "C3", MIC_EPOCH, 300_000).streams
+
+
+def test_controller_lease_rounds_the_afe_start_down_to_the_period_grid():
+    t = at.LeaseTable(now=lambda: 0.0)
+    lease, msg = t.open("L", "turn", "T", MIC_EPOCH, {"mic": 1000, "afe": 3000})
+    assert lease.streams["afe"] == 2560 and msg.body["streams"]["afe"] == "2560"
+    _, live = t.open("R", "reply", "R", MIC_EPOCH, {"mic": None, "afe": None})
+    assert live.body["streams"]["afe"] == "live"
+
+
+def test_afe_records_land_in_the_leases_of_their_capture_epoch_from_the_lease_start():
+    s = opened_session([0.0], afe_metadata=True)
+    s.open("L", "turn", "t", MIC_EPOCH, {"mic": None, "afe": 3840})
+    got = s.ingest(afe(1280, [afe_rec(10, volume=v) for v in (1, 2, 3, 4)], seq=0))
+    assert [(d.lease_id, d.stream_id, d.ranges) for d in got] == [("L", "afe", ((3840, 6400),))]
+    store = s.timelines["L"].afe
+    assert [(r.start, r.volume) for r in store.read(0, 10_000)] == [(3840, 3), (5120, 4)]
+    # A period nobody sent has no record — never a zero record.
+    s.ingest(afe(8960, [afe_rec(10, volume=9)], seq=1, flags=at.FLAG_DISCONTINUITY))
+    assert [r.start for r in store.read(0, 20_000)] == [3840, 5120, 8960]
+    assert store.read(6400, 8960) == [] and store.read(7000, 7001) == []
+    assert [r.start for r in store.read(6000, 9000)] == [5120, 8960]       # periods overlapping the span
+    s.clear(at.LeaseEnd.MUTE)
+    assert store.read(0, 20_000) == []                 # erased with the lease's audio
+
+
+def test_afe_of_another_capture_epoch_is_not_delivered():
+    s = opened_session([0.0], afe_metadata=True)
+    s.stream_open({"stream_id": "afe", "epoch": "999", "kind": 5, "sample_rate": 16000, "format": 3})
+    s.open("L", "turn", "t", MIC_EPOCH, {"mic": None, "afe": None})
+    frame = at.build_packet(Kind.AFE, epoch=999, sequence=0, first_sample=0, afe=at.build_afe([afe_rec()]))
+    assert s.ingest(frame) == []
 
 
 def test_audio_for_an_unacknowledged_candidate_lease_is_dropped():

@@ -53,6 +53,7 @@ from echomuse_grammar import (
     RelativeDay,
     TimerCancel,
 )
+from em_afe import AfeEvidence, turn_evidence
 from em_alert_wire import RingKind, Weekday
 from em_alerts import ActSource, AlertResult, JournalSource
 from em_attribution import (
@@ -73,6 +74,7 @@ from em_attribution import (
 from em_audio_timeline import (
     CANDIDATE_CELLS_LEAD,
     CANDIDATE_REFERENCE_LEAD,
+    AfeTimeline,
     Delivery,
     LeaseEnd,
     LeaseMessage,
@@ -417,6 +419,7 @@ class TurnRow(TypedDict, total=False):
     continuation: Continuation | None
     first_audio_ms: int | None
     decision_trace: str | None
+    afe_evidence: str | None          # AfeEvidence JSON; None: the device lacks afe_metadata_v1
 
 
 class _AlertAct(TypedDict):
@@ -685,6 +688,10 @@ class _Runtime:
     echo_known: int = 0               # cells labelled with a trusted reference (coverage)
     echo_total: int = 0
     last_mic_end: int | None = None
+    # The lease's native AFE records when it takes the session's `afe` stream
+    # (afe_metadata_v1), else None. Held past the lease's release so the turn or
+    # candidate can summarise them when it ends; evidence only, never a decision input.
+    afe: AfeTimeline | None = None
 
 
 @dataclass
@@ -809,6 +816,7 @@ class _Turn:
     terminal: TerminalReason | None = None
     commit: Commit | None = None
     coverage: float | None = None
+    afe_evidence: AfeEvidence | None = None   # native AFE evidence; None: unavailable (or not yet taken)
     timings: dict[str, int] = field(default_factory=dict)
 
 
@@ -884,9 +892,11 @@ class SessionActor:
         if self._task is not None:
             await self._task
 
-    def attach(self, link: _Link, render: RenderClient) -> None:
-        """Session ready: the new session's link, renderer, and an empty uplink record."""
-        self.link, self.render, self.uplink = link, render, UplinkSession()
+    def attach(self, link: _Link, render: RenderClient, *, afe_metadata: bool = False) -> None:
+        """Session ready: the new session's link, renderer, and an empty uplink record.
+        `afe_metadata`: session.ready granted it, so the session carries the `afe` stream."""
+        self.link, self.render = link, render
+        self.uplink = UplinkSession(afe_metadata=afe_metadata)
         self._post(P_LOSS, _Attach())
 
     def detach(self, reason: CloseReason) -> None:
@@ -920,7 +930,10 @@ class SessionActor:
         """One uplink EMA1 frame. Raises `em_audio_timeline.ProtocolError` for a WIRE violation."""
         if self.uplink is None:
             return
-        deliveries = self.uplink.ingest(frame)
+        # `ingest` has already stored AFE records in their leases' timelines; they are evidence
+        # read only when a turn or candidate ends, so they never reach the queue, the worker,
+        # or a decision.
+        deliveries = [d for d in self.uplink.ingest(frame) if d.stream_id != StreamId.AFE]
         if deliveries:
             gap = any(d.packet.discontinuity or d.packet.muted for d in deliveries)
             self._post(P_GAP if gap else P_SPEECH, _Audio(deliveries))
@@ -1258,11 +1271,12 @@ class SessionActor:
         """Close the candidate lease (also releasing any provisional duck); no turn, focus, or chime
         (a local_wake_chime device may already have chimed an idle candidate; it is not retracted)."""
         self._candidate = None
+        afe = _afe_evidence(candidate.runtime, candidate, None)
         close = LeaseEnd.ARBITRATION_LOST if reason == TerminalReason.ARBITRATION_LOST else LeaseEnd.REJECTED
         await self._close_uplink(candidate.lease_id, close)
         self._release_runtime(candidate.lease_id)
         self._emit(ActorEvent(ActorEventKind.TERMINAL, self.state, reason, self._dialog_active))
-        self._persists.add(self._spawn(self._persist_candidate(candidate, reason)))
+        self._persists.add(self._spawn(self._persist_candidate(candidate, reason, afe)))
 
     async def _accept_candidate(self, candidate: _Candidate) -> None:
         context, target = self._command_context(candidate)
@@ -1329,11 +1343,15 @@ class SessionActor:
         await self._supersede()
         turn_id, lease_id = str(uuid.uuid4()), str(uuid.uuid4())
         mic = max(0, press - PREROLL)
-        await self._lease_message(uplink.open(lease_id, LeaseReason.TURN, turn_id, capture_epoch, {
+        streams: dict[StreamId, int | None] = {
             StreamId.MIC: mic,
             StreamId.CELLS: max(0, mic - CANDIDATE_CELLS_LEAD),
             StreamId.REFERENCE: max(0, mic - CANDIDATE_REFERENCE_LEAD),
-        }))
+        }
+        if uplink.afe_metadata:
+            # From the reference start (the AEC state before the press); the lease rounds it to 1280.
+            streams[StreamId.AFE] = streams[StreamId.REFERENCE]
+        await self._lease_message(uplink.open(lease_id, LeaseReason.TURN, turn_id, capture_epoch, streams))
         model = self.deps.registry.for_config(self._config())
         await self.deps.worker.load_wake_graph(model.graph_sha256)
         self.deps.worker.open_lease(self.device_id, capture_epoch, lease_id, model.graph_sha256)
@@ -1445,7 +1463,9 @@ class SessionActor:
     # --- audio and evidence ---------------------------------------------------------------
 
     def _new_runtime(self, lease_id: str) -> _Runtime:
-        runtime = _Runtime(lease_id, CellAssembler())
+        timeline = self.uplink.timelines.get(lease_id) if self.uplink is not None else None
+        afe = timeline.afe if timeline is not None and StreamId.AFE in timeline.lease.streams else None
+        runtime = _Runtime(lease_id, CellAssembler(), afe=afe)
         self._runtimes[lease_id] = runtime
         return runtime
 
@@ -1790,6 +1810,7 @@ class SessionActor:
         self._set_state(ActorState.COMMITTED)
         pcm = timeline.mic.read(commit.start, commit.end)
         turn.wake_clip = self._wake_clip(turn, timeline)
+        turn.afe_evidence = _afe_evidence(turn.runtime, turn.candidate, _utterance_span(turn))
         turn.timings["audio_ms"] = round((commit.end - commit.start) * 1000 / SAMPLE_RATE)
         await self._close_uplink(turn.runtime.lease_id, LeaseEnd.COMMITTED)
         self._release_runtime(turn.runtime.lease_id)
@@ -2432,9 +2453,10 @@ class SessionActor:
         if epoch is None:
             return
         lease_id = str(uuid.uuid4())
-        await self._lease_message(self.uplink.open(
-            lease_id, LeaseReason.REPLY, exp.owner, epoch,
-            {StreamId.MIC: None, StreamId.CELLS: None, StreamId.REFERENCE: None}))
+        streams: dict[StreamId, int | None] = {StreamId.MIC: None, StreamId.CELLS: None, StreamId.REFERENCE: None}
+        if self.uplink.afe_metadata:
+            streams[StreamId.AFE] = None
+        await self._lease_message(self.uplink.open(lease_id, LeaseReason.REPLY, exp.owner, epoch, streams))
         model = self.deps.registry.for_config(self._config())
         await self.deps.worker.load_wake_graph(model.graph_sha256)
         self.deps.worker.open_lease(self.device_id, epoch, lease_id, model.graph_sha256)
@@ -2651,6 +2673,8 @@ class SessionActor:
             turn.wake_clip = self._wake_clip(turn, timeline)
         if turn.coverage is None and turn.runtime.echo_total:
             turn.coverage = turn.runtime.echo_known / turn.runtime.echo_total
+        if turn.afe_evidence is None:
+            turn.afe_evidence = _afe_evidence(turn.runtime, turn.candidate, _utterance_span(turn))
         await self._close_uplink(turn.runtime.lease_id, LeaseEnd.CLOSED)
         self._release_runtime(turn.runtime.lease_id)
         next_exp = turn.next_expectation
@@ -2755,9 +2779,11 @@ class SessionActor:
             continuation=turn.continuation,
             first_audio_ms=turn.timings.get("first_audio_ms"),
         )
-        trace = json.dumps(_trace(turn, row, turn.utterance.trace()), default=str, separators=(",", ":"))
+        trace = json.dumps(_trace(turn, row, turn.utterance.trace(), turn.afe_evidence), default=str,
+                           separators=(",", ":"))
         log.info("[%s] turn %s trace %s", self.device_id, turn.turn_id, trace)
         row["decision_trace"] = trace
+        row["afe_evidence"] = turn.afe_evidence.dumps() if turn.afe_evidence is not None else None
         try:
             row_id = await self.deps.persist_turn(row)
         except Exception:
@@ -2781,7 +2807,8 @@ class SessionActor:
                 log.exception("[%s] turn %s audio not saved", self.device_id, row_id)
         return row_id
 
-    async def _persist_candidate(self, candidate: _Candidate, reason: TerminalReason) -> None:
+    async def _persist_candidate(self, candidate: _Candidate, reason: TerminalReason,
+                                 afe: AfeEvidence | None) -> None:
         """A rejected candidate is a turn row with its attribution reason and no audio (§11.3)."""
         try:
             await self.deps.persist_turn(TurnRow(
@@ -2791,6 +2818,7 @@ class SessionActor:
                 wake_model_sha256=candidate.model.graph_sha256,
                 policy_hash=self.deps.worker.policy_hash,
                 wake_attribution=reason, terminal_reason=reason,
+                afe_evidence=afe.dumps() if afe is not None else None,
             ))
         except Exception:
             log.exception("[%s] rejected candidate not persisted", self.device_id)
@@ -2862,7 +2890,29 @@ class SessionActor:
                 log.exception("[%s] actor listener failed", self.device_id)
 
 
-def _trace(turn: _Turn, row: TurnRow, utterance: UtteranceTrace) -> dict[str, object]:
+def _utterance_span(turn: _Turn) -> tuple[int, int] | None:
+    """The committed span, else the closed utterance's audio through its evidence frontier."""
+    commit = turn.commit
+    if commit is not None:
+        return commit.start, commit.end
+    start, end = turn.utterance.spec.start, turn.utterance.frontier
+    return (start, end) if end > start else None
+
+
+def _afe_evidence(runtime: _Runtime, candidate: _Candidate | None,
+                  utterance: tuple[int, int] | None) -> AfeEvidence | None:
+    """Native AFE evidence around the candidate's support window (support_start → support_end,
+    else the opening hop's end) and over `utterance`. None — unavailable — when the lease took
+    no `afe` stream (the device lacks afe_metadata_v1); a part without data is None inside it.
+    Read only to record evidence: no decision depends on it."""
+    if runtime.afe is None:
+        return None
+    support = (None if candidate is None
+               else (candidate.support_start, candidate.support_end or candidate.open_sample))
+    return turn_evidence(runtime.afe, support, utterance)
+
+
+def _trace(turn: _Turn, row: TurnRow, utterance: UtteranceTrace, afe: AfeEvidence | None) -> dict[str, object]:
     """The §11.3 decision trace logged and stored with a turn row."""
     candidate = turn.candidate
     wire = candidate.wire if candidate is not None else None
@@ -2875,5 +2925,8 @@ def _trace(turn: _Turn, row: TurnRow, utterance: UtteranceTrace) -> dict[str, ob
         "rule": wire.rule.wire() if wire is not None and wire.rule is not None else None,
         "hops": [asdict(h) for h in wire.hops] if wire is not None else None,
         "lease_id": turn.runtime.lease_id, "terminal": turn.terminal,
-        "utterance": utterance, **{k: v for k, v in row.items() if k != "ts"},
+        "utterance": utterance,
+        # Evidence only (afe_metadata_v1): null when the device does not report it.
+        "afe_evidence": afe.wire() if afe is not None else None,
+        **{k: v for k, v in row.items() if k != "ts"},
     }

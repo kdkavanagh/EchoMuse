@@ -4,8 +4,8 @@
 > outcomes experienced.**
 
 EchoMuse needs an Echo Dot Gen 2 that is already unlocked and running
-FireOS 5. Two separate jobs get you there, and they carry very different
-risk.
+FireOS 5, or FireOS 6 rooted with boot-root (see [FireOS 6](#fireos-6-amonet-biscuit-v2)).
+Two separate jobs get you there, and they carry very different risk.
 
 ## Hardware
 
@@ -13,7 +13,7 @@ risk.
 - Codename: biscuit
 - SoC: MediaTek MT8163, quad-core ARM Cortex-A53 @ 1.5GHz
 - RAM: 512MB
-- OS: FireOS 5 (Android 5.1, API 22) or FireOS 6 (Android 7.2)
+- OS: FireOS 5 (Android 5.1, API 22) or FireOS 6 (Android 7.1.2, API 25)
 - MicroUSB cable required
 
 ## What you need
@@ -73,11 +73,14 @@ device you cannot afford to lose.
 
 ## Where EchoMuse picks up
 
-Everything below assumes you already have:
+Everything below assumes you already have, for FireOS 5:
 
 - An Echo Dot Gen 2 (**biscuit**) with the persistent unlock applied
 - **TWRP** installed and bootable
 - **FireOS 5** (Android 5.1) sideloaded
+
+or, for FireOS 6, a Dot unlocked with amonet-biscuit v2 and boot-root.zip
+installed (next section).
 
 Once those are done, EchoMuse takes over. The provisioning wizard in the
 dashboard handles the rest — see the [Quickstart](quickstart.md). It starts
@@ -86,6 +89,63 @@ from a device already in that state; it does not run the exploit.
 The steps the wizard performs (the SELinux patch, Magisk, and the root-grant
 database) happen with TWRP already installed, so a failure can usually be
 re-flashed from recovery.
+
+## FireOS 6 (amonet-biscuit v2)
+
+amonet-biscuit **v2.0.0** moves the Dot to FireOS 6 bootloaders, and from then on
+it can only boot FireOS 6. R0rt1z2's thread: *"Starting with version 2.0 of
+amonet, YOU CAN ONLY FLASH FIRE OS 6 FIRMWARE."* Do not try to go back to
+FireOS 5 or to amonet v1.x on such a device. That means writing bootloaders by
+hand, which is how an Echo gets hard-bricked.
+
+A v2 Dot needs one thing from the thread before the wizard: **boot-root.zip**,
+installed from TWRP. It gives the adb shell root (uid 0, no `su` binary) and
+disables OTA updates. EchoMuse is tested against FireOS 6
+`NS6569/6009` (`Fire OS 6.5.6.9`). The wizard warns on any other build.
+
+FireOS 6 on this Dot is Amazon's headless image: no Android framework, no
+apps, and audio is owned by Amazon's `mixer` daemon, which runs the same native
+front end. EchoMuse's firmware talks to it through `libmixerAPI`, so capture
+still passes through the front end and playback is still its echo reference.
+One firmware binary serves both FireOS versions and picks its audio backend at
+start.
+
+What the wizard does on FireOS 6, all from the running system (no TWRP step,
+no partition writes, no Magisk):
+
+1. Writes one file, `/system/etc/init/echomuse.rc`, and creates one empty
+   directory, `/tmp` (FireOS 6 has none; the firmware mounts a RAM disk on
+   it for its log), on the system slot the Dot is **running**, by
+   remounting `/` read-write for the write and read-only after. The other
+   slot is left stock for now.
+2. Installs the firmware under `/data/local/bin`, exactly as on FireOS 5.
+3. Writes the Wi-Fi network into `/data/misc/wifi/wpa_supplicant.conf`.
+4. Reboots and checks that `echomuse` and Amazon's `mixer` are running.
+5. Waits for the device to reach the controller serving the wizard. It
+   arrives pending approval.
+6. Only then writes the same file and directory to the **other** slot, by
+   mounting its `system` partition under `/data/local/tmp`. A bootloader
+   fallback therefore still runs EchoMuse, and a bad install never reaches
+   both slots: until step 5 passes, the other slot stays a stock,
+   known-good fallback. Verity is off for both (the shared amonet bootloader
+   sets `androidboot.veritymode=disabled`). The wizard logs both slots'
+   build fingerprints and warns if they differ, since EchoMuse is tested on
+   the active one.
+
+At every start, `start_server.sh` stops Amazon's Alexa, cloud, setup, OTA and
+telemetry services and the daemons for the hardware the firmware drives. It
+keeps the services the `mixer` depends on. The list and the measurements
+behind it are in [fireos6-port.md](fireos6-port.md#41-service-denylist-measured-2026-10-05).
+Nothing is uninstalled.
+
+**To undo it**, remove both slots' hook and reboot:
+
+```sh
+adb shell 'stop echomuse; umount /tmp; mount -o rw,remount / && rm /system/etc/init/echomuse.rc && rmdir /tmp && mount -o ro,remount /'
+adb shell 'S=$( [ "$(getprop ro.boot.slot_suffix)" = _a ] && echo _b || echo _a ); M=/data/local/tmp/sys; mkdir -p $M && mount -t ext4 /dev/block/platform/bootdevice/by-name/system$S $M && rm $M/system/etc/init/echomuse.rc && rmdir $M/tmp; umount $M; rmdir $M'
+```
+
+The Dot then comes back as stock Alexa.
 
 ## What EchoMuse writes, and what it does not
 
@@ -98,12 +158,13 @@ ever writes the FireOS one. Lowest first:
 | LK (bootloader) | What `lk_build_desc` and `unlock_status` come from. amonet patches this. | No |
 | amonet's unlock payload | Chainloads the real kernel. `mmcblk0p17` / `p18`. | No |
 | TWRP (recovery) | | No, the wizard only runs commands inside it |
-| FireOS kernel and ramdisk | `mmcblk0p10` / `p11`. | **Yes**, one write |
-| `/system`, `/data` | FireOS userspace. | Yes, files only |
+| FireOS kernel and ramdisk | `mmcblk0p10` / `p11`. | **FireOS 5: yes**, one write. FireOS 6: no |
+| `/system`, `/data` | FireOS userspace. | Yes, files only (on FireOS 6, one file in `/system`) |
 
-The single partition write is in the wizard's Patch Boot Image step, and it
-puts the SELinux permissive cmdline and the `service echomuse` init entry into
-the FireOS kernel. TWRP presents that partition as `/dev/block/other-boot`.
+On FireOS 5 the single partition write is in the wizard's Patch Boot Image
+step, and it puts the SELinux permissive cmdline and the `service echomuse`
+init entry into the FireOS kernel. TWRP presents that partition as
+`/dev/block/other-boot`.
 
 **The by-name directory means different things in TWRP and in Android**, which
 is worth knowing before reading any of it as gospel. Measured on hardware:

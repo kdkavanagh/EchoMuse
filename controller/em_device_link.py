@@ -145,6 +145,14 @@ class Capability(enum.StrEnum):
     ALERT_PREFETCH = "alert_prefetch"
     LOCAL_WAKE_CHIME = "local_wake_chime"
     OPEN_RULES = "open_rules_v1"
+    AFE_METADATA = "afe_metadata_v1"
+
+
+class DevicePlatform(enum.StrEnum):
+    """`session.hello.platform` (WIRE §4.1): the system image the firmware runs on."""
+
+    FIREOS5 = "fireos5"   # Android 5.1: Magisk, busybox, `pm`
+    FIREOS6 = "fireos6"   # Android 7.1.2 `biscuit_puffin`: headless, toybox only
 
 
 class RejectReason(enum.StrEnum):
@@ -250,17 +258,31 @@ def _text(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _platform(body: Mapping[str, object]) -> DevicePlatform | None:
+    """`platform`; absent is Fire OS 5, since every firmware predating the
+    field ran only there. A value this controller does not know is None:
+    refusing the session would also lock the device out of the firmware
+    update that fixes the mismatch, and defaulting to Fire OS 5 would send
+    Magisk and `pm` commands to an image known not to be Fire OS 5."""
+    if "platform" not in body:
+        return DevicePlatform.FIREOS5
+    value = body["platform"]
+    return DevicePlatform(value) if isinstance(value, str) and value in DevicePlatform else None
+
+
 @dataclass(frozen=True, slots=True)
 class SessionHello:
     """`session.hello` body (WIRE §4.1), narrowed at the link boundary.
 
     `capabilities` keeps every announced name, known or not; compare against
     `Capability` members. `alerts` is the raw `alerts` object, which the
-    alert engine owns.
+    alert engine owns. `platform` is None when the device names an image this
+    controller does not know (see `_platform`).
     """
 
     protocols: tuple[int, ...]
     capabilities: frozenset[str]
+    platform: DevicePlatform | None = DevicePlatform.FIREOS5
     firmware_version: str | None = None
     boot_id: str | None = None
     ambient_light_status: dict[str, object] | None = None
@@ -289,6 +311,7 @@ class SessionHello:
         return cls(
             protocols=tuple(protocols),
             capabilities=frozenset(capabilities),
+            platform=_platform(body),
             firmware_version=_text(body.get("firmware_version")),
             boot_id=_text(body.get("boot_id")),
             ambient_light_status=_object(body.get("ambient_light_status")),
@@ -360,18 +383,24 @@ class DetectorConfig:
 @dataclass(frozen=True, slots=True)
 class ReadyGrant:
     """The hub's part of `session.ready`; the link adds `protocol`,
-    `session_id`, `server_boot_id` and `utc_ms`."""
+    `session_id`, `server_boot_id` and `utc_ms`. `afe_metadata` only for an
+    `afe_metadata_v1` device: it opts the session in to the `afe` stream, and
+    is left off the wire otherwise (an older device must never see it)."""
 
     capture_permitted: bool
     assets: em_device_assets.SpeechAssets
     detector: DetectorConfig
+    afe_metadata: bool = False
 
     def wire(self) -> dict[str, object]:
-        return {
+        out: dict[str, object] = {
             "capture_permitted": self.capture_permitted,
             "assets": self.assets.wire(),
             "detector": self.detector.wire(),
         }
+        if self.afe_metadata:
+            out["afe_metadata"] = True
+        return out
 
 
 @dataclass(frozen=True)

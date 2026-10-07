@@ -96,8 +96,14 @@ func (s *Supervisor) onCandidateEnd(e detector.CandidateEnd) {
 	s.logSend(proto.TypeWakeCandidateEnd, 1, e)
 }
 
+// onStats reports wake.stats, with the AFE decoder's health in an
+// afe_metadata_v1 session; the AFE window follows the detector's.
 func (s *Supervisor) onStats(st detector.Stats) {
-	s.logSend(proto.TypeWakeStats, 0, st)
+	body := wakeStats{Stats: st}
+	if afe := s.afeStats(st.WindowEnd, st.WindowMS); afe != nil && s.afe.on.Load() {
+		body.AFE = afe
+	}
+	s.logSend(proto.TypeWakeStats, 0, body)
 }
 
 // candidateAcked applies the controller's command.ack for a wake.candidate:

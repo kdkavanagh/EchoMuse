@@ -13,12 +13,14 @@ import (
 
 // Capacities (§4.2, §16.1).
 const (
-	MicSamples       = 96000  // 6 s at 16 kHz
-	ReferenceSamples = 128000 // 8 s at 16 kHz
-	CellRecords      = 500    // 16 s of 32 ms cells
+	MicSamples       = 96000                             // 6 s at 16 kHz
+	ReferenceSamples = 128000                            // 8 s at 16 kHz
+	CellRecords      = 500                               // 16 s of 32 ms cells
+	AFERecords       = ReferenceSamples / ema.AFESamples // 8 s of 80 ms AFE records, the reference's span
 
 	sampleNs = 1_000_000_000 / ema.RateCapture // 62,500 ns per 16 kHz sample
 	cellNs   = sampleNs * ema.CellSamples      // 32 ms per cell
+	afeNs    = sampleNs * ema.AFESamples       // 80 ms per AFE record
 	micBlock = 1280                            // capture callback (§4.1)
 	refBlock = 160                             // one 480-sample mixer block decimated by 3
 	cellBlk  = 2                               // cells completed per capture block, at least
@@ -91,6 +93,12 @@ func NewReference() *Ring[int16] {
 // starts at capture sample 512k).
 func NewCells() *Ring[ema.Cell] {
 	return New[ema.Cell](CellRecords, 2*CellRecords/cellBlk+2, cellNs)
+}
+
+// NewAFE is the 8 s AFE-record ring, indexed by capture period (record k
+// covers capture samples [1280k, 1280k+1280)); one record per append.
+func NewAFE() *Ring[ema.AFERecord] {
+	return New[ema.AFERecord](AFERecords, 2*AFERecords+2, afeNs)
 }
 
 // Capacity is the number of indices the ring retains.

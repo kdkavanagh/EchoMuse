@@ -258,13 +258,13 @@ def test_every_device_payload_has_an_update_path():
 
 def test_debloat_sync_reconciles_both_halves():
     """
-    The debloat is a boot script AND a pm-hide list. Round 2 added a *package*,
-    so a sync that only refreshed the script would have looked like it worked
-    and changed nothing on any device.
+    The Fire OS 5 debloat is a boot script AND a pm-hide list. Round 2 added a
+    *package*, so a sync that only refreshed the script would have looked like
+    it worked and changed nothing on any device.
     """
     from pathlib import Path
     api = (Path(__file__).resolve().parent.parent / "em_api.py").read_text()
-    fn = api[api.index("async def _sync_debloat"):]
+    fn = api[api.index("async def _sync_debloat_fireos5"):]
     fn = fn[:fn.index("\nasync def ", 1)] if "\nasync def " in fn[1:] else fn
 
     assert "echomuse-debloat.sh" in fn, "the boot script half must be synced"
@@ -675,6 +675,25 @@ def test_tested_firmware_build_matches_the_docs():
     assert build in rooting, (
         f"the wizard warns against build {build} but docs/rooting.md never "
         f"names it — a reader has nowhere to go"
+    )
+
+
+def test_tested_firmware_build_matches_the_docs_fireos6():
+    """
+    Same contract as test_tested_firmware_build_matches_the_docs, for the
+    Fire OS 6 pin (_TESTED_FIREOS6_BUILD) added alongside it. docs/rooting.md
+    names the Fire OS 6 build EchoMuse is tested against in its own section;
+    the wizard's warning has to name the same one.
+    """
+    jsx = (CONTROLLER / "static" / "dashboard.jsx").read_text()
+    m = re.search(r"_TESTED_FIREOS6_BUILD\s*=\s*'([^']+)'", jsx)
+    assert m, "dashboard.jsx no longer declares _TESTED_FIREOS6_BUILD"
+    build = m.group(1)
+
+    rooting = (CONTROLLER.parent / "docs" / "rooting.md").read_text()
+    assert build in rooting, (
+        f"the wizard warns against Fire OS 6 build {build} but docs/rooting.md "
+        f"never names it — a reader has nowhere to go"
     )
 
 

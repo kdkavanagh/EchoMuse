@@ -3,10 +3,17 @@
 // CLOCK_MONOTONIC time at which each block completed.
 package mic
 
+import "github.com/wilbowes/EchoMuse/internal/audio/afe"
+
 // Block is one completed capture period.
 type Block struct {
 	PCM    []int16 // 16 kHz mono; borrowed until the next Read
 	MonoNs int64   // CLOCK_MONOTONIC ns when the period completed
+	// AFE is the native AFE metadata decoded from this period's bit 0
+	// (internal/audio/afe), borrowed until the next Read; nil when the
+	// backend carries none (Fire OS 5's OpenSL capture is unmeasured).
+	// PCM is left exactly as captured.
+	AFE *afe.Period
 }
 
 // Microphone delivers capture blocks to its single consumer.

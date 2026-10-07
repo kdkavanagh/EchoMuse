@@ -33,7 +33,10 @@ exploit itself.
 
 The dashboard has a **provisioning wizard** (plug the Dot into your laptop's
 USB port, open the dashboard in Chrome, follow the steps) that automates the
-rest after the initial unlock.
+rest after the initial unlock. It handles both unlock routes: FireOS 5
+(amonet-biscuit v1) and FireOS 6 (amonet-biscuit v2 plus boot-root.zip). It
+detects which one is on the Dot at its first step. FireOS 6 needs no recovery
+mode at all.
 
 If a step fails, the wizard offers a **Download diagnostics** file to attach
 to an issue. It captures the device's state at the moment it failed, which

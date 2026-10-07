@@ -269,6 +269,46 @@ Based on a review of Office turns 433–476 (`docs/turn-latency-review.md`,
   wakes per hour with a 95% upper bound, likely rescued misses and missed
   wakes. Saving either list reconnects the Echo. No audio leaves the Dot for
   shadow rules; older firmware reports no shadow data rather than zeros.
+- **Fire OS 6 Dots (amonet-biscuit v2) are supported.** A Dot unlocked with
+  amonet-biscuit v2.0.0 can only boot Fire OS 6. Once R0rt1z2's boot-root.zip
+  is installed, the provisioning wizard detects it at its first step and runs
+  a separate Fire OS 6 flow. Fire OS 5 provisioning is unchanged. The Fire OS 6
+  flow needs no recovery mode, Magisk or boot-image write:
+  - It writes one init file (`/system/etc/init/echomuse.rc`) plus an empty
+    `/tmp` to the running system slot, installs the firmware and Wi-Fi,
+    reboots, and waits until the Dot reaches this controller.
+  - Only then does it write the same file to the other slot, so a bad install
+    leaves a stock fallback slot.
+
+  One firmware binary serves both platforms. On Fire OS 6 it records and
+  plays through Amazon's `mixer` daemon, so capture still passes through the
+  native AFE and playback is still its echo reference. The firmware also:
+  - powers the Wi-Fi radio itself, runs DHCP, and sets the clock by NTP
+    (Amazon's own Wi-Fi and time services cannot run once Alexa is stopped);
+  - reads the light sensor through the kernel's IIO interface;
+  - keeps Amazon's privacy driver in step with mute.
+
+  Debloat on Fire OS 6 is the start script's service denylist, applied at
+  every boot, by firmware updates, and by **Re-apply debloat**. Dashboard
+  firmware updates fall back to toybox `base64`/`md5sum`/`df` where busybox is
+  absent. The Dot reports its platform in `session.hello` (`platform`;
+  absent means Fire OS 5). Notes and evidence: `docs/fireos6-port.md`; how to
+  get a Dot there: `docs/rooting.md`.
+- **Native AFE metadata from Fire OS 6 Dots, recorded as evidence only.**
+  Firmware with the new `afe_metadata_v1` capability decodes Amazon's
+  per-8 ms AFE metadata and, under the turn and candidate uplink leases,
+  sends one 14-byte record per 80 ms (EMA1 kind 5 `afe`, about 1 kB/s). Each
+  turn row (and refused wake) stores summaries of the second before the wake,
+  the wake's support window and the utterance, plus when the Dot's playback
+  last started (schema v28, `afe_evidence`): frames received, playback, ERLE,
+  double-talk, RMS, DNN VAD, volume, clipping/divergence/mute and decoder
+  gaps. It is also in the decision trace and the turns API. Activity shows it
+  as "Native AFE", and the Status tab's Wake health panel shows the decoder's
+  health from `wake.stats`. Nothing decides on it yet. Older firmware and
+  Fire OS 5 Dots show it as unavailable with the reason; a span without
+  records is "no data", never zeros. What each field can be trusted for, and
+  the experiments that would decide any use beyond evidence:
+  `docs/afe-metadata.md`.
 
 ### Earlier in this release
 

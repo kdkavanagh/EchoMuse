@@ -6,10 +6,15 @@
 // passes through AudioFlinger, so it never reaches it.
 //
 // The library is dlopen'd at RUNTIME (see shim.h), not linked, so a device
-// where libOpenSLES.so cannot be resolved gets a named error from Open rather
-// than a binary that will not start. There is no second audio backend to fall
-// back to: the caller reports the error and main() fatals, which lets the
-// supervisor's A/B slot flip do the recovering.
+// where libOpenSLES.so cannot be resolved gets a named error from Open
+// rather than a binary that will not start. On Fire OS 5 this is the only
+// backend: Open's error is fatal, and the supervisor's A/B slot flip does
+// the recovering. On Fire OS 6, where libOpenSLES.so and AudioFlinger do
+// not exist at all, cmd/server.go falls back to internal/mixerapi (Amazon's
+// `mixer` daemon client library — docs/fireos6-port.md §2-§3) instead of
+// fataling; the two backends share no code below slmic/slspeaker, which
+// pick one at Open time behind the same pkg/mic.Microphone and render.Sink
+// seams.
 //
 // Both Recorder and Player present a BLOCKING API — Read()/Write() — even
 // though OpenSL ES itself is callback-driven (a buffer queue completion fires

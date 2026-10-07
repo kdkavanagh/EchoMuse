@@ -150,6 +150,7 @@ def test_admit_ready_and_reject():
             assert ready["body"]["detector"]["provisional_duck"] == {
                 "duck_db": -18.0, "max_per_window": 2, "window_ms": 5000}
             assert ready["body"]["session_id"] == sink.link.session_id
+            assert "afe_metadata" not in ready["body"]          # only to an afe_metadata_v1 device
             assert ready["body"]["server_boot_id"] == dl.SERVER_BOOT_ID
             tl.parse_u64(ready["body"]["utc_ms"], "utc_ms")
             assert sink.link.hello == dl.SessionHello.parse(hello)

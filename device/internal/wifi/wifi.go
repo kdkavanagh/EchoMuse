@@ -48,6 +48,27 @@
 //     switch never got committed — RecoverIfPending restores the backup
 //     and bounces, so a crash or power cycle mid-switch self-heals back
 //     to the old network (same philosophy as the A/B binary slots).
+//
+// Fire OS 6 has no framework at all — svc wifi and the automatic
+// post-associate DHCP it triggers do not exist, and start_server.sh stops
+// wifisvc before it powers the radio. radioUpFireOS6 powers the WLAN core
+// and starts the supplicant, which reads the conf straight off disk, so
+// reloadConf skips disableWifi/enableWifi entirely there: write the conf,
+// `wpa_cli reconfigure` (+ reassociate if that alone does not force a
+// fresh association), then DHCP through the init service wifisvc itself
+// starts. Its network HAL (libacehal_network.so) does `ctl.start
+// dhcpcd-<iface>`, i.e. dhcpcd-wlan0 (/init.mt8163_amazon.rc:270,
+// `/system/bin/dhcpcd wlan0 -AdLK`). The AOSP-style dhcpcd_wlan0
+// (/init.mt8163.rc:986, `dhcpcd -BK -dd`) carries no interface: AOSP
+// appends one as `ctl.start dhcpcd_wlan0:wlan0`, which this init refuses
+// ("no such service"), and started bare it exits 1 within 60 ms
+// (`control_start: No such file or directory`). dhcpcd-wlan0 leased in
+// under a second and stays running, renewing the lease itself; its hooks
+// set dhcp.wlan0.*, and names resolve through netmgrd's dnsproxyd (all on
+// hardware, 2026-10-07). -K skips carrier watching, so it never notices a
+// new association on its own: runDHCPFireOS6 restarts it on every join.
+// netd is not running on this image, so there is nothing for `ndc` to
+// talk to.
 package wifi
 
 import (
@@ -63,6 +84,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/wilbowes/EchoMuse/internal/platform"
 )
 
 const (
@@ -87,6 +110,25 @@ const (
 	// 5s retry cadence; generous because a false negative reverts a
 	// perfectly good network change.
 	reconnectTimeout = 90 * time.Second
+)
+
+// Fire OS 6 DHCP (package doc). dhcpServiceTimeout bounds init stopping a
+// prior run; the lease itself is bounded by ipTimeout and judged by an IPv4
+// address on wlan0, never by init state: a dhcpcd that exits at once still
+// reads "running" for the moment it lives (57 ms on hardware).
+const (
+	dhcpService        = "dhcpcd-wlan0"
+	dhcpServiceTimeout = 5 * time.Second
+
+	// What wifisvc did before start_server.sh stops it at boot, observed on
+	// hardware: MediaTek's libhardware_legacy wifi_load_driver powers the
+	// WLAN core by writing /dev/wmtWifi (wlan0 appeared within 1 s), then
+	// starts a supplicant. The wlan0-only wpa_supplicant service is used,
+	// not p2p_supplicant: nothing here uses Wi-Fi Direct. Its control
+	// socket answered ~3 s after start.
+	wmtWifiPath       = "/dev/wmtWifi"
+	supplicantService = "wpa_supplicant"
+	radioTimeout      = 10 * time.Second
 )
 
 // Result is the outcome of a change attempt, reported to the controller
@@ -238,6 +280,24 @@ func getprop(key, fallback string) string {
 	return fallback
 }
 
+// setprop sets an Android system property — the Fire OS 6 counterpart of
+// `stop`/`start` in start_server.sh, used here to start and stop the
+// device's own init services (the supplicant, dhcpService) instead of
+// hand-rolled invocations.
+func setprop(key, value string) error {
+	out, err := exec.Command("setprop", key, value).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("setprop %s %s: %v (%s)", key, value, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// svcState reads getprop init.svc.<name> — "running", "stopped",
+// "stopping", or "" if the service was never started this boot.
+func svcState(name string) string {
+	return getprop("init.svc."+name, "")
+}
+
 // composeConf builds the full-replacement wpa_supplicant.conf — the same
 // template the provisioning wizard writes. An empty psk produces an open
 // (key_mgmt=NONE) network block.
@@ -325,13 +385,24 @@ func enableWifi() error {
 	return nil
 }
 
-// reloadConf swaps in a new wpa_supplicant.conf with WiFi DOWN. Order is
-// load-bearing: on disable, WifiStateMachine saves its in-memory network
-// list back to wpa_supplicant.conf — a conf written while WiFi is up gets
-// clobbered by that save, and the device silently rejoins the old network
-// (found on hardware 2026-07-11; provisioning never hit it because a
-// factory device has no framework-known networks to save).
+// reloadConf swaps in a new wpa_supplicant.conf and gets it joined.
+//
+// Fire OS 5: WiFi must be brought down first — on disable, WifiStateMachine
+// saves its in-memory network list back to wpa_supplicant.conf — a conf
+// written while WiFi is up gets clobbered by that save, and the device
+// silently rejoins the old network (found on hardware 2026-07-11;
+// provisioning never hit it because a factory device has no framework-known
+// networks to save).
+//
+// Fire OS 6: there is no framework to race (see the package doc) — the conf
+// is written first and reconfigureFireOS6 does the reload and DHCP.
 func reloadConf(content string) error {
+	if platform.FireOS6() {
+		if err := writeConf(content); err != nil {
+			return err
+		}
+		return reconfigureFireOS6()
+	}
 	if err := disableWifi(); err != nil {
 		return err
 	}
@@ -341,6 +412,85 @@ func reloadConf(content string) error {
 		return err
 	}
 	return enableWifi()
+}
+
+// reconfigureFireOS6 reloads wpa_supplicant's config from disk and runs
+// DHCP — the Fire OS 6 replacement for disableWifi/enableWifi, neither of
+// which has a framework behind it to call (package doc).
+func reconfigureFireOS6() error {
+	if err := radioUpFireOS6(); err != nil {
+		return err
+	}
+	if _, err := wpaCli("reconfigure"); err != nil {
+		return fmt.Errorf("wpa_cli reconfigure: %w", err)
+	}
+	if !waitFor("association after reconfigure", associateTimeout, associated) {
+		// reconfigure does not always force a fresh association cycle by
+		// itself (the conf's one network block may be unchanged from the
+		// supplicant's point of view, e.g. identical SSID/PSK) — nudge it
+		// before giving up.
+		if _, err := wpaCli("reassociate"); err != nil {
+			return fmt.Errorf("wpa_cli reassociate: %w", err)
+		}
+		if !waitFor("association after reassociate", associateTimeout, associated) {
+			return fmt.Errorf("did not associate within %s", associateTimeout)
+		}
+	}
+	_, err := runDHCPFireOS6()
+	return err
+}
+
+// runDHCPFireOS6 (re)starts dhcpService and waits up to ipTimeout for its
+// lease, returning the address. A running copy is stopped first: -K means it
+// would not notice the new association. init stops it with SIGKILL, so the
+// old lease's address and routes stay on wlan0 (hardware); they are flushed
+// before the restart, or a stale address would pass for the new lease.
+func runDHCPFireOS6() (string, error) {
+	if st := svcState(dhcpService); st != "" && st != "stopped" {
+		if err := setprop("ctl.stop", dhcpService); err != nil {
+			return "", err
+		}
+		if !waitFor(dhcpService+" to stop", dhcpServiceTimeout,
+			func() bool { return svcState(dhcpService) == "stopped" }) {
+			return "", fmt.Errorf("%s stuck %q — could not restart it", dhcpService, svcState(dhcpService))
+		}
+	}
+	if currentIPv4() != "" {
+		if out, err := exec.Command("ifconfig", iface, "0.0.0.0").CombinedOutput(); err != nil {
+			return "", fmt.Errorf("flush %s IPv4: %v (%s)", iface, err, strings.TrimSpace(string(out)))
+		}
+	}
+	if err := setprop("ctl.start", dhcpService); err != nil {
+		return "", err
+	}
+	if !waitFor("DHCP lease", ipTimeout, func() bool { return currentIPv4() != "" }) {
+		return "", fmt.Errorf("no IPv4 address on %s within %s (%s is %q)", iface, ipTimeout, dhcpService, svcState(dhcpService))
+	}
+	return currentIPv4(), nil
+}
+
+// radioUpFireOS6 powers the WLAN core and starts the supplicant unless
+// either is already up (wifisvc may have got there first on a later
+// restart of the firmware). Idempotent.
+func radioUpFireOS6() error {
+	present := func() bool { _, err := net.InterfaceByName(iface); return err == nil }
+	if !present() {
+		if err := os.WriteFile(wmtWifiPath, []byte("1"), 0); err != nil {
+			return fmt.Errorf("power on WLAN core (%s): %w", wmtWifiPath, err)
+		}
+		if !waitFor(iface+" to appear", radioTimeout, present) {
+			return fmt.Errorf("%s did not appear after powering the WLAN core", iface)
+		}
+	}
+	if svcState(supplicantService) != "running" && svcState("p2p_supplicant") != "running" {
+		if err := setprop("ctl.start", supplicantService); err != nil {
+			return err
+		}
+	}
+	if !waitFor("supplicant control socket", radioTimeout, func() bool { _, err := wpaCli("status"); return err == nil }) {
+		return fmt.Errorf("%s did not answer on %s", supplicantService, wpaSockDir)
+	}
+	return nil
 }
 
 func waitFor(what string, timeout time.Duration, cond func() bool) bool {
@@ -546,4 +696,40 @@ func RecoverIfPending() {
 	_ = os.Remove(markerPath)
 	_ = os.Remove(backupPath)
 	setResult(Result{OK: false, SSID: m.NewSSID, Error: "device restarted before the change was confirmed — previous network restored"})
+}
+
+// EnsureUp brings WiFi up at boot from the already-saved conf — Fire OS 6
+// only, where nothing else does this once wifisvc is stopped (it was
+// wifisvc's job on every previous boot). The supplicant keeps the saved
+// network blocks from the last successful Change; it may already be
+// associating by the time this runs, but nothing else runs its DHCP. Call
+// once at startup, after RecoverIfPending. No-op on Fire OS 5, where the
+// framework does this itself.
+func EnsureUp() {
+	if !platform.FireOS6() {
+		return
+	}
+	if err := radioUpFireOS6(); err != nil {
+		log.Printf("[wifi] boot radio bring-up failed: %v", err)
+		return
+	}
+	if !associated() {
+		if _, err := wpaCli("reconnect"); err != nil {
+			log.Printf("[wifi] boot reconnect failed: %v", err)
+		}
+		if !waitFor("association at boot", associateTimeout, associated) {
+			log.Println("[wifi] no saved network associated at boot")
+			return
+		}
+	} else if ip := currentIPv4(); ip != "" {
+		// A firmware restart: dhcpService outlives us and keeps the lease.
+		log.Printf("[wifi] already joined to %q with %s", CurrentSSID(), ip)
+		return
+	}
+	ip, err := runDHCPFireOS6()
+	if err != nil {
+		log.Printf("[wifi] boot DHCP failed: %v", err)
+		return
+	}
+	log.Printf("[wifi] joined %q at boot, leased %s", CurrentSSID(), ip)
 }
