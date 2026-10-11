@@ -29,10 +29,13 @@ import (
 	"github.com/wilbowes/EchoMuse/internal/client"
 	"github.com/wilbowes/EchoMuse/internal/config"
 	"github.com/wilbowes/EchoMuse/internal/proto"
+	"github.com/wilbowes/EchoMuse/internal/render"
 	"github.com/wilbowes/EchoMuse/internal/server"
 	"github.com/wilbowes/EchoMuse/internal/supervisor"
+	"github.com/wilbowes/EchoMuse/internal/timesync"
 	"github.com/wilbowes/EchoMuse/internal/wakeword"
 	"github.com/wilbowes/EchoMuse/internal/wifi"
+	pkgmic "github.com/wilbowes/EchoMuse/pkg/mic"
 )
 
 const (
@@ -41,7 +44,12 @@ const (
 	legacyModelDir = "/data/local/share/echomuse/oww"
 
 	statsInterval = 30 * time.Second
-	memLogEvery   = 10 // stats ticks (~5 min) between [mem] log lines
+	// micClockWait bounds how long the mixer microphone waits for the first
+	// NTP sync. A cold boot synced 10–11 s after start on both Fire OS 6
+	// Dots measured (2026-10-11); a Dot with no NTP egress opens it anyway,
+	// and a late step is then survived by the recorder's re-open.
+	micClockWait = 30 * time.Second
+	memLogEvery  = 10 // stats ticks (~5 min) between [mem] log lines
 	// wifiResultRetries × wifiResultInterval bounds at-least-once delivery
 	// of a wifi_result (the dashboard gives up after 4 min).
 	wifiResultRetries  = 30
@@ -63,6 +71,13 @@ func run() error {
 	// A Wi-Fi change that never committed is rolled back before anything
 	// uses the network.
 	wifi.RecoverIfPending()
+	// Fire OS 6 only: nothing else joins Wi-Fi once wifisvc is stopped. It can
+	// wait ~45 s for association, so it must not hold up audio and the ring.
+	go wifi.EnsureUp()
+	// Fire OS 6 only: Amazon's sntpd cannot sync with wifisvc stopped, so the
+	// firmware sets the clock once a route exists (internal/timesync). The
+	// mixer microphone opens only after that first step (openMixer).
+	go timesync.Run()
 	// Amazon's Wi-Fi Simple Setup daemon has no use here and was observed
 	// busy-looping; stopping it is idempotent.
 	_ = exec.Command("stop", "smarthomewifid").Run()
@@ -88,14 +103,9 @@ func run() error {
 		}
 	}()
 
-	mic, err := slmic.Open()
+	mic, sink, err := openAudio()
 	if err != nil {
-		return fmt.Errorf("capture: %w", err)
-	}
-	sink, err := slspeaker.New()
-	if err != nil {
-		mic.Close()
-		return fmt.Errorf("render: %w", err)
+		return fmt.Errorf("audio: %w", err)
 	}
 	phys.SetHeadphones(jack.Inserted())
 
@@ -130,6 +140,7 @@ func run() error {
 		},
 		AmbientReadable: als.Present,
 		Mic:             mic,
+		AFEMetadata:     true, // slmic decodes micAsr's metadata into Block.AFE
 		Physical:        phys,
 		DeviceConfig:    cfg,
 		SpeechStore:     speech,
@@ -183,6 +194,21 @@ func run() error {
 		log.Printf("amp off: %v", err)
 	}
 	return runErr
+}
+
+// openAudio opens the libmixerAPI capture and render streams
+// (docs/fireos6-port.md §3).
+func openAudio() (pkgmic.Microphone, render.Sink, error) {
+	mic, err := slmic.OpenMixer(timesync.SettledWithin(micClockWait))
+	if err != nil {
+		return nil, nil, err
+	}
+	sink, err := slspeaker.NewMixer()
+	if err != nil {
+		mic.Close()
+		return nil, nil, err
+	}
+	return mic, sink, nil
 }
 
 // reportStats sends the retained stats body every 30 s and, every ~5 min,

@@ -37,11 +37,6 @@ word**, **Speech**, **Ring**, **Button**, **Bluetooth**, **Timers &
 alarms**. A control that needs something the device's firmware does not
 announce is shown disabled with the reason.
 
-An Echo still running firmware from before protocol v1 shows an **Upgrade
-required** panel instead of its Config, Activity and Alerts tabs. Until you
-update it from the **Updates** tab it takes no voice turns and rings no timers
-or alarms.
-
 ### Other device tabs
 
 - **Status** — IP, firmware, WiFi network, ESPHome port, `Online` or `Offline
@@ -51,27 +46,37 @@ or alarms.
   and the percentage is a share of the awake ones), RAM, storage, WiFi signal,
   **Latency** (round trip to the device; amber from 200 ms, red from 1 s) and
   **Temp** (amber from 70 °C, red from 85 °C, with a note when the thermal
-  governor is capping cores). **Wake health** is described under
-  [Wake word](#02--wake-word). The Bluetooth proxy panel appears when the proxy
-  is on.
+  governor is capping cores). **Response latency** gives the 50th, 90th, 95th
+  and 99th percentile time from the end of your last word to the first audio
+  of the reply, timed on the Echo, over the last 24 hours, 7 days and 30 days
+  (turns that played no reply are not counted; `GET
+  /api/devices/{id}/response_latency` returns the same). **Wake health** is
+  described under [Wake word](#02--wake-word). The Bluetooth proxy panel
+  appears when the proxy is on.
 - **Activity** — the voice-turn history: what was heard, the transcript, how
   the turn ended, and the audio of each turn when **Save utterances** or
   **Save wake clips** is on. The header names the wake model with its idle and
-  playback thresholds, and a counter shows **Refused wakes**. A turn whose
-  answer asked a follow-up question is marked `?` (colored by what became of
-  it: answered, no reply within 7 s, cut off, no microphone, …) and its reply
-  `↩`; each links to the other, and **Follow-ups answered** counts them. Each
-  turn also shows how its spoken answer ended and the trace id of its
-  controller log line (`turn <id> trace`). History is kept in the
-  controller's database. Daily turn summaries, hourly wake counters and hourly
-  hardware metrics (CPU, memory, WiFi signal) for up to 180 days are available
-  from `/api/devices/{id}/activity?days=N`.
+  playback thresholds, and a counter shows **Refused wakes**. Each turn that
+  played a reply shows its response latency (`↦1.9s`, the same measure as on
+  Status). A turn whose answer asked a follow-up question is marked `?`
+  (colored by what became of it: answered, no reply within 7 s, cut off, no
+  microphone, …) and its reply `↩`; each links to the other, and **Follow-ups
+  answered** counts them. Each turn also shows how its spoken answer ended and
+  the trace id of its controller log line (`turn <id> trace`); its detail's
+  **Pause ASR** lists what Kroko and the pause transcription server heard at
+  each pause, how long each took, and whose words ended the request (`GET
+  /api/devices/{id}/turns/{turn}/trace` returns the turn's whole decision
+  trace, kept for its newest 1,000 turns). History is kept
+  in the controller's database. Daily turn summaries, hourly wake counters and
+  hourly hardware metrics (CPU, memory, WiFi signal) for up to 180 days are
+  available from `/api/devices/{id}/activity?days=N`.
 - **Alerts** — timers and alarms for this Echo; see
   [The Alerts tab](#the-alerts-tab).
 - **Samples** (administrators) — recording tools; see
   [Recording tools](#recording-tools-samples-tab).
-- **Console**, **Updates**, **Logs** — a remote shell, firmware updates and
-  rollback, and the device log.
+- **Console**, **Updates**, **Logs** — a remote shell, installing the
+  firmware bundled with this controller and rolling it back, and the device
+  log.
 
 ---
 
@@ -245,6 +250,11 @@ firmware always chimes after the controller accepts the wake. It does not play
 when the wake word interrupts a ringing timer or alarm or a spoken response —
 the sound stopping is the acknowledgement.
 
+The same chime plays when a follow-up question finishes and the Dot starts
+listening for your answer without the wake word (see [Answers to follow-up
+questions](#answers-to-follow-up-questions)), unless you have already started
+answering.
+
 ### Save wake clips
 
 Keeps the audio of each accepted wake: from 300 ms before the stretch the
@@ -338,8 +348,9 @@ the levers are physical: move it away from walls and the TV and closer to
 where people talk.
 
 When your request has ended is decided by a fixed policy on the controller
-(`post_afe_3`, described in [voice-pipeline.md](voice-pipeline.md)). It has no
-dashboard tuning.
+(`post_afe_6`, described in [voice-pipeline.md](voice-pipeline.md)). It has no
+dashboard tuning; it uses your own Home Assistant sentences to tell when a
+request is complete.
 
 ### Noise suppression
 
@@ -362,10 +373,20 @@ a transcript comes back wrong, this is the recording that can explain it —
 room noise, distance, or a word the denoiser damaged. It is also the way to
 compare **Noise suppression** or a new position on the same phrase.
 
+On a Dot that reports native AFE metadata (Fire OS 6), each turn also gets a
+**turn recording**. It is what the microphone heard from just before the wake
+word, through the spoken answer, to a second after the turn ends (at most
+30 s after the request). Press **Play recording** under the turn's chart in
+**Activity** to hear it while a playhead runs across the chart. To make it,
+the Dot keeps sending microphone audio while it answers, which it otherwise
+stops doing once your request ends. It is the Echo's own processed audio, with
+no gain added, so it plays quieter than the utterance recording.
+
 **Think before switching it on.** This is the setting that stores recognisable
 speech on the controller. It keeps the **last 300 turns per device** as WAV
 files in the `recordings/` folder beside the database (typically 30–60 MB per
-device), oldest replaced first.
+device), and the last 100 turn recordings in `turn_recordings/` (typically
+30–80 MB per device), oldest replaced first.
 Turning it off stops new recordings but keeps the saved ones until newer ones
 replace them or you delete the device. To clear them sooner, delete the files.
 An older turn may show no buttons because its recording has already been
@@ -377,6 +398,59 @@ Sets the longest request the controller accepts: **15 seconds** when off (the
 default), **30 seconds** when on. Turn it on for dictation or long requests.
 A request still going when it reaches the limit is dropped rather than sent
 half-finished; the Activity row shows it ended as too long.
+
+### Answers to follow-up questions
+
+Nothing to set. When a question finishes (Home Assistant's follow-up or
+EchoMuse's own "AM or PM?"), the Dot listens for your answer without the wake
+word exactly as after a button press: the ring shows listening at once, the
+wake chime plays if it is on, and the answer ends the same way any request
+does. If you say nothing for 7 seconds the window closes quietly, with no
+sound or animation. Speech that was already going on before the question
+ended — a television, someone still talking — is not taken as the answer
+until it pauses; an answer you start in the last half second of the question
+counts. Saying the wake word or pressing the button during the window starts
+an ordinary request that still knows the question.
+
+An earlier **Follow-up answers** setting (`replyOnset`) tuned a separate
+detector that this replaced; it is removed from every saved configuration.
+
+### Pause transcription
+
+Whenever you pause for a moment mid-request, the controller transcribes what
+you have said so far and judges whether it is a complete command; that decides
+how long it waits before answering (see
+[voice-pipeline.md](voice-pipeline.md)). Its own streaming model, Kroko,
+always does this. It sometimes mishears, and above all the wake word
+("Fulfiliate, what's the weather in Detroit"), which keeps a request it could
+have ended early waiting the longest pause.
+
+**Wyoming server** also sends the same audio to a Wyoming speech-to-text
+server and judges its words instead. Point it at the one your Home Assistant
+pipeline uses, so the words judged are the ones Home Assistant will hear. The
+controller connects to it directly, not through Home Assistant: the server
+must be reachable from the controller (in Docker, put both on one network).
+
+| Control | Default | Notes |
+|---|---|---|
+| engine | Kroko (local) | **Wyoming server** to use one |
+| host, port | —, 10300 | the server's name or IP address, and port |
+| model | server default | **Check** lists the server's models |
+| language | `en` | empty: the server's default |
+
+**Check** asks the server what it offers and shows whether the controller
+reached it. The controller never waits for the server: at each pause it
+judges Kroko's words at once, and switches to the server's when they arrive,
+typically a quarter of a second later for a request of a few seconds. An
+answer more than 1.5 s late is ignored, so a slow or stopped server only
+loses the benefit. The final transcript is still Home Assistant's own
+speech-to-text, run on the finished request.
+
+To see which transcriber won, open a turn in **Activity**: **Pause ASR** shows,
+for each pause, Kroko's words and the server's, each with its time from the
+pause, when its words were judged, and a ★ on the words the request ended on.
+A server answer still out when the request ended shows as "no answer before
+the turn was decided".
 
 ---
 
@@ -576,7 +650,9 @@ Per device, available once its firmware speaks protocol v1:
   pipeline exists), `calendar` (Local Calendar is available), `scripts` (the
   alarm scripts can be installed and their requests received), `vocabulary`
   (areas, floors and exposed entities can be read), `timers` (the timer
-  integrations are loaded). A failure disables only that feature and shows
+  integrations are loaded), `recognizer` (Home Assistant's sentence matcher
+  answers; without it, requests the controller's own grammar does not know
+  wait the longest pause). A failure disables only that feature and shows
   why.
 - **Journal operations** — alarm changes waiting to reach Home Assistant, and
   those applied in the last 24 hours.
@@ -675,8 +751,8 @@ administrator-only):
 |---|---|---|
 | `device_approval` | `strict` | Approval policy for new devices, as above. |
 | `session_expiry_days` | `30` | How long a dashboard sign-in lasts. |
-| `update_check_interval` | `3600` | Seconds between release checks; see below. |
-| `github_repo` | `wilbowes/EchoMuse` | Repository whose releases the update check reads. |
+| `update_check_interval` | `3600` | Seconds between checks for a newer controller image; see below. |
+| `github_repo` | `wilbowes/EchoMuse` | Repository whose `controller-v*` tags that check reads. |
 
 ### Encrypted device link
 
@@ -706,6 +782,7 @@ Once the whole fleet shows `wss (TLS)`, set `REQUIRE_DEVICE_TLS=1`.
 | Speech | Noise suppression | `nsAsr` | off |
 | Speech | Save utterances | `saveUtterances` | off |
 | Speech | Extended utterances | `extendedUtterances` | off (15 s) |
+| Speech | Pause transcription | `pauseAsr` | `{"engine": "kroko", "host": "", "port": 10300, "model": "", "language": "en"}` |
 | Ring | scene tiles | `ledScene` | `standard` |
 | Ring | Listening | `ledListenColor` | `#00b400` |
 | Ring | Thinking | `ledThinkColor` | `#00c800` |
@@ -734,26 +811,28 @@ use EchoMuse.** Adoption is guessed from GitHub stars and release downloads.
 
 ### Connections the controller makes
 
-- **Release check — `api.github.com`.** About 30 seconds after start, then
-  every `update_check_interval` seconds (default 3600, once an hour), the
-  controller asks GitHub for the newest firmware release and the newest
-  controller version, so the dashboard can offer updates with their notes.
-  **Check now** on the Updates tab asks immediately. These are ordinary
-  unauthenticated API requests with no EchoMuse identifier; like any request
-  they reveal your public IP to GitHub.
-- **Firmware download — `github.com`.** Only when you update a device, deploy
-  to the fleet, or use the provisioning wizard's install-latest step. The
-  controller downloads the release binary and passes it to the device; the
-  Echo itself connects only to the controller.
+- **Controller update check — `api.github.com`.** About 30 seconds after
+  start, then every `update_check_interval` seconds (default 3600, once an
+  hour), the controller asks GitHub for the newest `controller-v*` tag, so
+  the dashboard can tell you a newer controller image exists. These are
+  ordinary unauthenticated API requests with no EchoMuse identifier; like any
+  request they reveal your public IP to GitHub.
+- **No firmware download.** The device firmware is built into the
+  controller image, and that is the only firmware the controller installs:
+  the provisioning wizard, a device update and a fleet deploy all push the
+  bundled binary. The Echo itself connects only to the controller.
 - **Audio Home Assistant asks it to play.** Spoken responses and music reach
   the controller as URLs from Home Assistant; the controller fetches each URL
   to play it. Responses come from your Home Assistant; music comes from
   wherever its stream lives.
+- **The pause transcription server**, only with **Pause transcription** set
+  to a Wyoming server: at each pause in a request, the request's audio so far
+  goes to that server over the Wyoming protocol.
 - **Home Assistant** at `HA_URL` (or through the Supervisor in the add-on).
 
-To make release checks rarer, set `update_check_interval` to a larger number
-of seconds (`86400` is once a day). **Do not set it to `0`**: that does not
-disable checking, it makes the controller check GitHub continuously.
+To make the controller update check rarer, set `update_check_interval` to a
+larger number of seconds (`86400` is once a day). `0` does not disable it;
+the controller falls back to checking hourly.
 
 ### Downloads at install time, not at run time
 
@@ -761,10 +840,13 @@ The speech-recognition models, the voice-activity model, the denoiser models,
 the Android ONNX Runtime and the dashboard's JavaScript and fonts are
 downloaded when the Docker image is **built** — from GitHub, PyPI, Maven
 Central, npm, cdnjs, jsDelivr and Google Fonts — and every model is checked
-against a pinned hash. The published image is built by the project's release
-workflow, so installing it contacts only the image registry (`ghcr.io`). A
-bare-metal install downloads the same files when you run the fetch tool. The
-running controller downloads none of them.
+against a pinned hash. The device firmware is compiled in the same build, in
+a digest-pinned toolchain image from `ghcr.io` with Go modules from the Go
+module proxy (checked against `device/go.sum`). The published image is built
+by the project's release workflow, so installing it contacts only the image
+registry (`ghcr.io`). A bare-metal install downloads the same files when you
+run the fetch tool and `device/compile.sh`. The running controller downloads
+none of them.
 
 ### From your browser
 
@@ -777,14 +859,18 @@ browser the first time you connect a Dot over USB.
 - **Voice audio and transcripts.** Wake detection runs on the Echo, which
   sends the controller audio only around a possible wake word and for the
   request that follows, with a copy of what it was playing at those moments
-  (plus the recording tools, when you start them). The controller sends the
+  (plus the recording tools, when you start them, and the microphone through
+  the spoken answer while **Save utterances** keeps turn recordings). The controller sends the
   request audio to your Home Assistant for its speech-to-text step, then the
-  transcript to its conversation agent — all over your LAN. What happens next
+  transcript to its conversation agent — all over your LAN. While you speak,
+  the controller's running transcript also goes to Home Assistant's own
+  sentence matcher, which only compares it with your local sentences and
+  runs nothing. What happens next
   is up to your Assist pipeline: if it uses a cloud speech-to-text engine or
   conversation agent, Home Assistant sends the audio or text there. EchoMuse
   itself sends it nowhere else.
-- **Saved recordings** — utterances (`saveUtterances`), wake clips
-  (`saveWakeClips`), samples and ambient recordings stay on disk beside the
+- **Saved recordings** — utterances and turn recordings (`saveUtterances`),
+  wake clips (`saveWakeClips`), samples and ambient recordings stay on disk beside the
   database. Nothing uploads them; downloading an archive is your decision.
 - **Device serials, WiFi credentials, network names and your fleet's
   configuration** stay in the controller's database.

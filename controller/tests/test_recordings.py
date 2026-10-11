@@ -161,6 +161,24 @@ def test_resolve_missing_file_is_none(tmp_path):
     assert rec.resolve("dev1", "dev1_3.wav", _db(tmp_path)) is None
 
 
+# ─── kinds ───────────────────────────────────────────────────────────────────
+
+def test_a_turns_utterance_and_turn_recording_are_kept_apart(tmp_path):
+    # Same turn, same filename: each kind has its own directory, retention and
+    # resolve, so neither overwrites nor prunes the other.
+    db = _db(tmp_path)
+    turn = rec.RecordingKind.TURN
+    rec.save("dev1", 1, _pcm(20), db_path=db)
+    for t in range(1, 4):
+        rec.save("dev1", t, _pcm(40), db_path=db, keep=2, kind=turn)
+    assert rec.list_for("dev1", db) == ["dev1_1.wav"]
+    assert rec.list_for("dev1", db, kind=turn) == ["dev1_3.wav", "dev1_2.wav"]
+    with wave.open(str(rec.resolve("dev1", "dev1_1.wav", db)), "rb") as w:
+        assert w.getnframes() == rec.SAMPLE_RATE // 50
+    assert rec.resolve("dev1", "dev1_2.wav", db) is None
+    assert rec.resolve("dev1", "dev1_2.wav", db, kind=turn) == tmp_path / "turn_recordings" / "dev1_2.wav"
+
+
 # ─── deletion ────────────────────────────────────────────────────────────────
 
 def test_delete_device_removes_only_its_own(tmp_path):
@@ -168,6 +186,7 @@ def test_delete_device_removes_only_its_own(tmp_path):
     for turn in range(1, 4):
         rec.save("dev1", turn, _pcm(20), db_path=db)
         rec.save("dev2", turn, _pcm(20), db_path=db)
-    assert rec.delete_device("dev1", db) == 3
-    assert rec.list_for("dev1", db) == []
+    rec.save("dev1", 1, _pcm(20), db_path=db, kind=rec.RecordingKind.TURN)
+    assert rec.delete_device("dev1", db) == 4      # both kinds
+    assert rec.list_for("dev1", db) == [] and rec.list_for("dev1", db, kind=rec.RecordingKind.TURN) == []
     assert len(rec.list_for("dev2", db)) == 3

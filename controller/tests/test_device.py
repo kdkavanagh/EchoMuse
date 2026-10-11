@@ -231,6 +231,24 @@ def test_wake_stats_are_kept_with_receipt_time_and_persisted():
     run(scenario())
 
 
+def test_wake_stats_afe_is_parsed_at_the_boundary_and_absent_or_malformed_is_no_data():
+    async def scenario():
+        device, _, host, _, sink = await _online(capabilities=ALL_V1 + ["afe_metadata_v1"])
+        pushed = lambda: [p["afe_stats"] for p in host.pushed if "afe_stats" in p]   # noqa: E731
+        afe = {"periods": 375, "frames": 3750, "invalid": 0, "syncs": 1, "gaps": 0, "lost_frames": 0}
+        sink.on_message(envelope("wake.stats", {"hops_scored": 187, "near_misses": [], "afe": afe}))
+        await settle()
+        assert device.afe_stats == em_device.em_afe.AfeStats(375, 3750, 0, 1, 0, 0)
+        assert pushed() == [{**afe, "frames_expected": 3750}]
+        for body in ({"hops_scored": 187, "near_misses": []},                      # absent: no data
+                     {"hops_scored": 187, "near_misses": [], "afe": {"periods": "375"}}):   # malformed
+            sink.on_message(envelope("wake.stats", body))
+            await settle()
+            assert device.afe_stats is None and pushed()[-1] is None
+        await device.close()
+    run(scenario())
+
+
 def _shadow_entry(**events):
     return {"rule": _SHADOW, "hops": 180, "opens": 2, "matched": 1, "lead_hist": [0, 0, 0, 0, 1, 0, 0],
             "unmatched": 1, "retried": 0, "live_only": 0, "events_dropped": 0,
@@ -334,8 +352,8 @@ def test_send_while_offline_raises_link_closed():
 
 # ── LED projection (§11.2) ───────────────────────────────────────────────
 
-@pytest.mark.parametrize("state, key", [(ActorState.LISTENING, "listening_anim"),
-                                        (ActorState.EXPECT_REPLY, "listening_anim"),
+@pytest.mark.parametrize("state, key", [(ActorState.ARMED, "listening_anim"),
+                                        (ActorState.LISTENING, "listening_anim"),
                                         (ActorState.THINKING, "spin_anim")])
 def test_led_projection_follows_actor_state(state, key):
     async def scenario():

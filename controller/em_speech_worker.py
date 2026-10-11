@@ -6,7 +6,9 @@ The asyncio thread owns every per-lease record and submits jobs; one
 its reference scoring, or one verification) run strictly in order and never
 concurrently with each other, so per-lane state (Silero recurrent state and
 context, the utterance's decoder stream, BCResNet smoothing) needs no locks.
-Model sessions are loaded once and shared read-only.
+Model sessions are loaded once and shared read-only. A remote pause
+transcription (`em_pause_asr`) runs on its own small pool while the lane's
+Kroko decode runs, bounded so the lane keeps its deadline.
 
 The worker only produces evidence (`Observation`s); it never opens, commits,
 or closes a turn.
@@ -21,18 +23,20 @@ import inspect
 import json
 import math
 import time
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field, replace
 from typing import Callable
 
 import numpy as np
 
+import em_pause_asr
 from echomuse_grammar import Result as GrammarResult
 from em_attribution import SPEECH_POSITIVE_VAD, EchoResult, WakeHop
 from em_audio_timeline import (
     FLAG_DISCONTINUITY, FLAG_MUTED, REFERENCE_HOP, ReferenceView, SampleTimeline, StreamId, ceil_to,
 )
 from em_endpoint_policy import TextStability
+from em_pause_asr import PauseDecode, WyomingServer
 from em_speech_bundle import Recognizer, RecognizerStream, SpeechBundle, create_recognizer, verify_bundle
 from em_wake_phrase import StreamingTranscript, verify_wake
 from em_wake_registry import WakeRegistry
@@ -55,6 +59,11 @@ VERIFICATION_LOOKAHEAD = 7_680        # candidate open + 480 ms
 # chunk edge needs up to 141 frames (1.41 s) of padding before it is decoded.
 ASR_FLUSH = 24_000                    # 1.5 s
 FINALIZE_PAUSE = 5_120                # 10 VAD cells (320 ms) past the last speech-positive cell
+# A remote pause transcription never holds the lane: Kroko's result is reported
+# at once and the server's words replace its text when they arrive. An answer
+# later than this could no longer shorten even the 1,792 ms pause.
+PAUSE_REMOTE_TIMEOUT_S = 1.5
+SPAN_REMOTE_TIMEOUT_S = 2.0           # route B / fallback re-decode, off the lanes
 BLANK_FRAME_SAMPLES = 640             # one trailing blank frame = 40 ms
 JOB_DEADLINE_S = 0.750                # §4.4
 ERROR_WINDOW_S = 60.0                 # §8.1: three errors within 60 s
@@ -62,7 +71,7 @@ ERRORS_UNAVAILABLE = 3
 PROBE_INTERVAL_S = 10.0
 PROBE_DEADLINE_S = 1.0
 PROBES_TO_RECOVER = 2
-POLICY_REVISION = "post_afe_3"
+POLICY_REVISION = "post_afe_7"
 
 
 class ObservationSource(enum.StrEnum):
@@ -143,12 +152,19 @@ class AsrPayload:
     """`text` is the raw streaming text; `stable_prefix` and `grammar_result`
     are judged on the utterance's transformed (wake-cut) text.
 
-    `finalized` marks a result made at a pause by a fresh decode of the whole
-    utterance flushed with zeros (§16.6). While the live stream's tokens are a
-    prefix of it, later results repeat it with `finalized` false. Whenever that
-    result is reported, `trailing_blank_frames` counts real audio since the end
-    of the last speech-positive VAD cell, never the flush: Kroko emits the last
-    word and punctuation late, often inside the flush."""
+    `finalize_ms` marks a result made at a pause by a fresh decode of the whole
+    utterance flushed with zeros (§16.6), and is that decode's wall-clock time. While the
+    live stream's tokens are a prefix of it, later results repeat it without
+    `finalize_ms`. Whenever that result is reported, `trailing_blank_frames` counts real
+    audio since the end of the last speech-positive VAD cell, never the flush: Kroko
+    emits the last word and punctuation late, often inside the flush.
+
+    `pause_text` is a Wyoming server's transcript of the same audio (config
+    `pauseAsr`), wake word included. The finalized result is reported at once
+    without it; from the first result after the server answers, every result
+    that repeats the finalized one carries it. It stands in for the text, never
+    for the tokens, which stay Kroko's. `pause_decode` reports the request on
+    the result where it was answered or dropped, including one that gave no text."""
 
     tokens: tuple[str, ...]
     token_emission_sample: tuple[int, ...]
@@ -156,7 +172,13 @@ class AsrPayload:
     stable_prefix: str | None
     trailing_blank_frames: int
     grammar_result: GrammarResult | None
-    finalized: bool
+    finalize_ms: int | None
+    pause_text: str | None = None
+    pause_decode: PauseDecode | None = None
+
+    @property
+    def finalized(self) -> bool:
+        return self.finalize_ms is not None
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +217,35 @@ class Observation:
 
 class SpeechWorkerError(Exception):
     pass
+
+
+def _pause_transcribe(server: WyomingServer, pcm: np.ndarray, through: int, sent: float) -> PauseDecode:
+    """The remote pause transcription, on the remote pool. It is optional evidence: any
+    failure is reported, and Kroko's result stands alone. Its time counts from `sent`, when
+    the pause submitted it, as Kroko's decode of the same pause does, so a wait for the pool
+    counts against the server."""
+    text: str | None = None
+    error: str | None = None
+    try:
+        text = em_pause_asr.transcribe(server, pcm, timeout=PAUSE_REMOTE_TIMEOUT_S).strip()
+    except TimeoutError:
+        error = "timeout"
+    except Exception as exc:     # network, protocol, or server error
+        error = f"{type(exc).__name__}: {exc}"
+    return PauseDecode(through, text, round((time.monotonic() - sent) * 1000), error)
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingPause:
+    """A pause server request still out: its answer, the audio it covers, when it was sent."""
+
+    answer: Future[PauseDecode]
+    through: int
+    sent: float
+
+    def drop(self, reason: str) -> PauseDecode:
+        self.answer.cancel()      # never sent if it was still queued
+        return PauseDecode(self.through, None, round((time.monotonic() - self.sent) * 1000), reason)
 
 
 @dataclass(frozen=True, slots=True)
@@ -348,11 +399,13 @@ class _VadState:
 
 @dataclass(frozen=True, slots=True)
 class _Finalized:
-    """A finalize decode's result, emissions as capture-epoch samples."""
+    """A finalize decode's result, emissions as capture-epoch samples; `pause_text`
+    is the Wyoming server's transcript of the same audio, once it answered."""
 
     tokens: tuple[str, ...]
     emissions: tuple[int, ...]
     text: str
+    pause_text: str | None = None
 
 
 @dataclass
@@ -368,6 +421,8 @@ class _Utterance:
     speech_end: int | None = None        # end of the last speech-positive VAD cell since open
     finalized_end: int | None = None     # the speech end a finalize decode already covered
     finalized: _Finalized | None = None  # reported instead of the live result until the live one adds to it
+    pause_server: WyomingServer | None = None   # also transcribes at each pause (config `pauseAsr`)
+    pause: _PendingPause | None = None          # the latest finalize's request, until answered or dropped
 
 
 @dataclass
@@ -449,6 +504,8 @@ class SpeechWorker:
         self._probe_task: asyncio.Task[None] | None = None
         self._callbacks: set[asyncio.Future[object]] = set()   # awaitables on_availability returned
         self._closed = False
+        # Remote pause transcriptions (§16.6): network waits, never model work.
+        self._remote = ThreadPoolExecutor(max_workers=2, thread_name_prefix="pause-asr")
 
     # -- startup / shutdown ------------------------------------------------
 
@@ -496,6 +553,7 @@ class SpeechWorker:
         if self._executor is not None:
             self._executor.shutdown(wait=True, cancel_futures=True)
             self._executor = None
+        self._remote.shutdown(wait=False, cancel_futures=True)
 
     # -- leases -------------------------------------------------------------
 
@@ -545,13 +603,15 @@ class SpeechWorker:
         *,
         text_transform: Callable[[StreamingTranscript], str] | None = None,
         grammar: Callable[[str], GrammarResult] | None = None,
+        pause_server: WyomingServer | None = None,
     ) -> None:
         """Open the utterance's ASR stream at `start_sample` (the pre-roll
         start) and catch it up on the canonical mic already submitted.
 
         `text_transform` maps the streaming transcript to the text stability
         and grammar judge (the §16.6 wake-phrase cut for wake turns);
-        `grammar(text)` supplies `grammar_result`."""
+        `grammar(text)` supplies `grammar_result`; `pause_server` also
+        transcribes the utterance at each pause."""
         lease = self._lease(lease_id)
         models = self._require_started()
         through = lease.mic_through if lease.mic_through is not None else start_sample
@@ -562,7 +622,7 @@ class SpeechWorker:
             preroll = evidence_copy(mic.read(start_sample, through))
         stream = models.recognizer.create_stream()
         utterance = _Utterance(utterance_id, start_sample, stream, TextStability(trigger_sample),
-                               text_transform, grammar, start_sample)
+                               text_transform, grammar, start_sample, pause_server=pause_server)
 
         def run() -> tuple[Observation, ...]:
             lease.utterance = utterance
@@ -581,6 +641,8 @@ class SpeechWorker:
         lease = self._lease(lease_id)
 
         def run() -> tuple[Observation, ...]:
+            if lease.utterance is not None and lease.utterance.pause is not None:
+                lease.utterance.pause.answer.cancel()
             lease.utterance = None
             return ()
         self._submit(_Job(f"mic:{lease_id}", ObservationKind.ASR, self._now(), run, lease, StreamId.MIC, 0, None,
@@ -666,21 +728,49 @@ class SpeechWorker:
         trailing-blank count stops at its last chunk edge. The first live result
         that adds or changes a token replaces it. While it stands, its trailing
         blanks are the real audio since the last speech-positive cell, so new
-        speech drops them before the live stream has new tokens."""
+        speech drops them before the live stream has new tokens.
+
+        With a `pause_server`, the same audio also goes to that Wyoming server
+        when Kroko decodes, but the result is reported without waiting for it.
+        Its transcript is the judged text from the first block after it
+        arrives, for as long as Kroko's finalized result stands. A request is
+        dropped when new speech replaces that result or a later pause sends
+        another."""
         analyzed = lease.vad.next_sample
         finalize = (u.speech_end is not None and u.speech_end != u.finalized_end
                     and analyzed is not None and analyzed - u.speech_end >= FINALIZE_PAUSE)
         live: AsrResult | None = None
+        decode: PauseDecode | None = None
+        finalize_ms: int | None = None
         if finalize:
-            shadow = models.decode_fresh(np.concatenate(u.evidence))
+            evidence = np.concatenate(u.evidence)
+            if u.pause is not None:
+                decode = u.pause.drop("superseded")
+                u.pause = None
+            sent = time.monotonic()
+            if u.pause_server is not None:
+                u.pause = _PendingPause(self._remote.submit(_pause_transcribe, u.pause_server, evidence,
+                                                            u.fed_through, sent), u.fed_through, sent)
+            shadow = models.decode_fresh(evidence)
+            finalize_ms = round((time.monotonic() - sent) * 1000)
             u.finalized = _Finalized(shadow.tokens, self._emissions(u, shadow), shadow.text)
             u.finalized_end = u.speech_end
         elif u.finalized is not None:
             live = models.result(u.stream)
             if live.tokens != u.finalized.tokens[:len(live.tokens)]:
                 u.finalized = None
+                if u.pause is not None:    # its words would describe audio the speaker has added to
+                    decode = u.pause.drop("superseded")
+                    u.pause = None
+        if decode is None and u.pause is not None and u.pause.answer.done():
+            decode = u.pause.answer.result()
+            u.pause = None
+            if decode.text and u.finalized is not None:
+                u.finalized = replace(u.finalized, pause_text=decode.text)
+        pause_text: str | None = None
         if u.finalized is not None:
             tokens, emissions, raw_text = u.finalized.tokens, u.finalized.emissions, u.finalized.text
+            pause_text = u.finalized.pause_text
             # Real audio since the latest speech-positive cell; token emissions
             # can fall late, even inside the flush, and the flush never counts.
             speech_end = u.speech_end if u.speech_end is not None else u.start_sample
@@ -689,11 +779,16 @@ class SpeechWorker:
             result = live if live is not None else models.result(u.stream)
             tokens, emissions, raw_text = result.tokens, self._emissions(u, result), result.text
             blanks = result.trailing_blanks
-        text = raw_text if u.text_transform is None else u.text_transform(
-            StreamingTranscript.from_tokens(tokens, emissions))
+        if pause_text is not None:
+            text = pause_text        # no word timings: the time-based transform cannot apply
+        elif u.text_transform is not None:
+            text = u.text_transform(StreamingTranscript.from_tokens(tokens, emissions))
+        else:
+            text = raw_text
         stable = u.stability.push(text, u.fed_through, blanks)
         payload = AsrPayload(tokens, emissions, raw_text, stable.prefix if stable.prefix_sample is not None else None,
-                             blanks, None if u.grammar is None else u.grammar(text), finalize)
+                             blanks, None if u.grammar is None else u.grammar(text), finalize_ms,
+                             pause_text=pause_text, pause_decode=decode)
         return self._observe(lease, StreamId.MIC, ObservationKind.ASR, u.fed_through, payload, u.utterance_id)
 
     @staticmethod
@@ -815,6 +910,17 @@ class SpeechWorker:
         except Exception as exc:
             self._record_error()
             raise SpeechWorkerError(f"span re-decode failed: {type(exc).__name__}: {exc}") from exc
+
+    async def transcribe_span(self, canonical_pcm: np.ndarray, server: WyomingServer) -> str:
+        """The Wyoming server's transcript of a committed span's evidence copy, for
+        the route B / fallback re-decode of text that came from it (§16.6). The
+        local models are not involved, so a failure only raises SpeechWorkerError."""
+        evidence = evidence_copy(canonical_pcm)
+        try:
+            return await asyncio.get_running_loop().run_in_executor(
+                self._remote, lambda: em_pause_asr.transcribe(server, evidence, timeout=SPAN_REMOTE_TIMEOUT_S))
+        except (OSError, em_pause_asr.WyomingError) as exc:
+            raise SpeechWorkerError(f"span transcription failed: {type(exc).__name__}: {exc}") from exc
 
     # -- lanes, deadlines, errors, availability --------------------------------
 

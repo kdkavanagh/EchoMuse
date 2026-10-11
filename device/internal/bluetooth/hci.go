@@ -4,8 +4,8 @@
 // The MT8163's combo chip is exposed by the WMT driver stack as a char
 // device speaking H4-style framing (packet-type byte + HCI packet); opening
 // it triggers BT function-on and firmware patch download. The device is
-// effectively single-owner, so the Android Bluetooth stack (Bluedroid) must
-// be disabled before use — see ensureBluedroidDisabled. Hardware-validated
+// effectively single-owner: start_server.sh stops btmanagerd, BTSinkPlayer
+// and blemesh_service before the scanner ever opens it. Hardware-validated
 // 2026-07-12 on Office: HCI Reset → LE Set Scan Parameters → LE Set Scan
 // Enable produced a stream of LE Advertising Reports from raw land with the
 // chip's default event masks (no Set Event Mask needed — the vendor patches

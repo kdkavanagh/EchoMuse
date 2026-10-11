@@ -114,6 +114,10 @@ class Playback:
         self.finished: asyncio.Future[RenderFinished] = loop.create_future()
         self.last_progress: Mapping[str, object] | None = None
         self.completed_frames = 0
+        # Device CLOCK_MONOTONIC ns its first frame played: the first progress reporting completed
+        # frames, less their duration. The device times render by buffer completion (§4.3), as it
+        # times the reference. None until such a progress arrives.
+        self.first_frame_ns: int | None = None
         self.sent_frames = 0          # frames of a network source sent to the device
         self._client = client
         self._start_sent = False
@@ -198,8 +202,11 @@ class Playback:
         completed = body.get("completed_frames")
         if completed is not None:
             try:
-                self.completed_frames = max(self.completed_frames,
-                                            tl.parse_u64(completed, "completed_frames"))
+                frames = tl.parse_u64(completed, "completed_frames")
+                self.completed_frames = max(self.completed_frames, frames)
+                if self.first_frame_ns is None and frames > 0 and "mono_ns" in body:
+                    mono = tl.parse_u64(body["mono_ns"], "mono_ns")
+                    self.first_frame_ns = mono - frames * 1_000_000_000 // tl.RENDER_RATE
             except tl.ProtocolError as err:
                 log.warning(f"{self}: bad progress: {err}")
         self.last_progress = body

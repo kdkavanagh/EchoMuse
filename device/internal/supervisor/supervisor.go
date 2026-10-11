@@ -47,7 +47,7 @@ const (
 
 // Uplink is the lease executor (internal/uplink).
 type Uplink interface {
-	Attach(client.AudioSink, uplink.SendFunc)
+	Attach(sink client.AudioSink, send uplink.SendFunc, afe bool)
 	Detach()
 	SetEpochs(mic, reference uint64)
 	Mute()
@@ -93,7 +93,11 @@ type Config struct {
 	AmbientStatus   func() *als.Status
 	AmbientReadable func() bool
 
-	Mic          pkgmic.Microphone
+	Mic pkgmic.Microphone
+	// AFEMetadata: Mic's blocks carry decoded native AFE metadata
+	// (Block.AFE; slmic's micAsr decode). Only then may a hello
+	// announce afe_metadata_v1.
+	AFEMetadata  bool
 	Physical     *server.Server
 	DeviceConfig *config.Device
 	SpeechStore  *assets.Store // /data/local/share/echomuse/speech
@@ -140,14 +144,17 @@ type Supervisor struct {
 	micRing   *ring.Ring[int16]
 	refRing   *ring.Ring[int16]
 	cellRing  *ring.Ring[ema.Cell]
+	afeRing   *ring.Ring[ema.AFERecord]
 	masks     *cells.MaskHistory
 	renderFit *clockfit.Fit
+	afe       afeState
 
 	// Capture pipeline, guarded by capMu.
 	capMu    sync.Mutex
 	timeline *capture.Timeline
 	acc      *cells.Accumulator
 	cellMeta ring.Meta
+	afeRec   [1]ema.AFERecord
 	muted    bool
 
 	// Mixer-goroutine state (tap, anchor and epoch hooks).
@@ -211,7 +218,8 @@ func Assemble(cfg Config, d Deps) (*Supervisor, error) {
 	}
 	s := &Supervisor{
 		cfg: cfg, now: cfg.NowMonoNS,
-		micRing: ring.NewMic(), refRing: ring.NewReference(), cellRing: ring.NewCells(),
+		micRing: ring.NewMic(), refRing: ring.NewReference(), cellRing: ring.NewCells(), afeRing: ring.NewAFE(),
+		afe:        afeState{first: make(chan struct{})},
 		timeline:   capture.NewTimeline(),
 		renderFit:  clockfit.New(render.SampleRate, int64(render.SinkFrames)*int64(time.Second)/render.SampleRate),
 		candidates: map[string]candidateState{}, candidateAck: map[string]string{},
@@ -259,7 +267,7 @@ func Assemble(cfg Config, d Deps) (*Supervisor, error) {
 	}
 	s.det = det
 	s.act = wakeword.NewActivator(det, cfg.SpeechStore, d.LoadModel)
-	rings := uplink.Rings{Mic: s.micRing, Ref: s.refRing, Cells: s.cellRing}
+	rings := uplink.Rings{Mic: s.micRing, Ref: s.refRing, Cells: s.cellRing, AFE: s.afeRing}
 	if d.NewUplink != nil {
 		s.up = d.NewUplink(rings, s, cfg.NowMonoNS)
 	} else {

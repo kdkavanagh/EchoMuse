@@ -217,7 +217,7 @@ after you, counts as your command.
 
 ## Stage 7 — Deciding you've finished
 
-The **endpoint reducer** (`em_endpoint_policy`, fixed policy `post_afe_3`)
+The **endpoint reducer** (`em_endpoint_policy`, fixed policy `post_afe_6`)
 decides when your utterance ends, measured in audio time, never wall-clock
 time, so a slow network cannot shorten or lengthen a pause. It ends a turn in
 one of these ways:
@@ -228,28 +228,57 @@ one of these ways:
   the whole utterance at once to get your last word without waiting for it.
   How long it waits depends on whether your words already form a complete
   command: 608 ms for a complete one
-  ("turn off the kitchen lights", "stop"), 1,216 ms when a longer name could
-  follow ("turn off the kitchen…"), 1,792 ms otherwise, including every
-  free-form question. For those 1,792 ms waits, speech clearly quieter than
-  you (a TV across the room) counts as silence, so a question asked with the
-  TV on ends as it would in a quiet room.
+  ("turn off the kitchen lights", "stop", "what time is it"), 1,216 ms when
+  more words could follow ("turn off the kitchen…", "what's the weather…"),
+  1,792 ms otherwise, including free-form questions. For those 1,792 ms waits,
+  speech clearly quieter than you (a TV across the room) counts as silence, so
+  a question asked with the TV on ends as it would in a quiet room.
 - **Complete command under background speech.** A recognised, complete
   command followed only by quieter speech that does not add to it ends
   without waiting for silence. This is the TV-room path, and it only covers
-  commands the controller's grammar knows (timers, alarms, on/off of exposed
-  entities, local commands).
+  commands known to be complete.
 - **Bounded failure.** No speech within 5 seconds of the wake word ends
   quietly with the no-speech animation. Speaking for 15 seconds without a
   real pause ends with "That was too long. Try a shorter request." (30 seconds
   with **Extended utterances**). Three seconds without the transcript making
   progress ends with "Sorry, I didn't catch that." and a chance to repeat,
-  unless what was heard is already a complete command. A dropout in the audio
+  unless what was heard is already a complete command. Those three seconds
+  count from when you start the request, not from the wake word, so a pause
+  after "Ophelia" doesn't cut you off. A dropout in the audio
   ends the turn with the error animation rather than guessing.
+
+Whether your words are complete comes from two places. The controller's own
+grammar knows timers, alarms, on/off of exposed entities and the local stop
+commands. Anything it does not know is asked of Home Assistant's own sentence
+matcher each time the transcript changes: your built-in, custom and
+automation-trigger sentences. A full match counts as complete. When the same
+words plus one more would still match, because a sentence ends in a
+wildcard ("what's the weather {when}", "play {query}"), it counts as "more
+could follow". Home Assistant only recognizes the text; nothing runs. It
+answers in well under a tenth of a second, and when it does not answer in
+time, or the transcriber misheard you, the longer pause applies as before. So
+that the first answer is quick even after a long idle, the controller sends
+Home Assistant one throwaway sentence as soon as the Echo hears the wake
+word.
+
+The words judged at a pause can come from a better transcriber than the
+streaming one. With **Pause transcription** set to a Wyoming server (Config →
+Speech), each pause also sends the request so far to that server, typically
+the speech-to-text Home Assistant itself uses, and its words are judged
+instead, wake word cut off. The streaming model mishears the wake word more
+often ("Fulfiliate, what's the weather in Detroit"), and a misheard wake word
+keeps a request from being recognized at all. The controller does not wait
+for the server: it judges the streaming model's words at once and switches to
+the server's when they arrive, typically a quarter of a second later. Each
+turn's **Pause ASR** detail in Activity shows both transcripts at every pause,
+how long each took, and whose words the request ended on.
 
 A tentative end is held for 192 ms. If you carry on talking, it is revoked
 and listening continues; otherwise the audio from the start of the pre-roll
 to 192 ms after your last word is frozen, and nothing after that can change
-the request.
+the request. Home Assistant receives it followed by half a second of silence:
+a quiet last word often runs right up to the cut, and its speech-to-text drops
+a word with no silence after it ("what time is it" became "what time is").
 
 **Benefit:** short commands finish quickly, questions get time for a
 thinking pause, and failure modes are named rather than guessed. See
@@ -360,8 +389,10 @@ the controller sets up a **reply expectation** instead of an open mic. You
 can answer without the wake word:
 
 - The window opens when the question has finished playing and lasts
-  7 seconds. An answer that starts in the last moments of the question is
-  still caught, because the audio was kept.
+  7 seconds. With **Wake chime** on, the wake chime plays as it opens, so you
+  know the Dot is listening without the wake word. An answer that starts in
+  the last moments of the question is still caught, because the audio was
+  kept, and gets no chime over it.
 - You can talk over the question only if you are clearly louder than the
   room and the Dot's own playback does not explain it; otherwise it plays out
   and your answer is taken from the retained audio.
@@ -530,7 +561,7 @@ where it goes. For everything EchoMuse itself connects to, see
 | Home Assistant | Alarms ring from the Dot; "Ophelia, stop" and the button stop them. No other voice requests. Creating an alarm fails with the error cue rather than pretending to succeed. |
 | Controller | Alarms already on the Dot ring; the button stops them. No voice at all. |
 | Speech worker (three failures within a minute) | Wake word and button give the error animation instead of a turn until it recovers; it retries every 10 seconds. Alarms, mute, and button stop are unaffected. |
-| Old firmware | The Dot connects in upgrade-only mode: the dashboard can upgrade it, and voice and alarms are unavailable until it does. |
+| Old firmware or Fire OS 5 | Nothing: the controller refuses the Dot at connect. Move it to Fire OS 6 and provision it with the wizard ([rooting.md](rooting.md)); a known Dot is re-adopted with **Continue**. |
 
 ---
 

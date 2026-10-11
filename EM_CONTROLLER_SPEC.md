@@ -9,7 +9,9 @@
 > current: "Open Questions / Known Gaps" lists the browser-based provisioner
 > and the PTY shell as not implemented, and both shipped (v2.4.5 and v2.7.1
 > respectively); the OTA section describes an `update.sh` pushed to the device
-> that no longer exists. For how the controller actually works today, read
+> that no longer exists; the `/control` and `/data` device planes are gone,
+> replaced by [`docs/protocol-v1.md`](docs/protocol-v1.md), and the Dots it
+> describes ran Fire OS 5, which EchoMuse no longer supports. For how the controller actually works today, read
 > **`CLAUDE.md`** (current architecture and the invariants behind it) and
 > **[`JOURNAL.md`](JOURNAL.md)** (why each thing is the way it is). For using it,
 > **`docs/quickstart.md`**.

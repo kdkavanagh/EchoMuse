@@ -254,6 +254,32 @@ def test_v23_strips_microphone_processing_keys_the_api_would_reject(tmp_path):
     assert set(dead) <= em_db.REMOVED_CONFIG_KEYS
 
 
+def test_v31_strips_the_reply_onset_setting_from_fleet_and_device_configs(tmp_path):
+    onset = {"speechVad": 0.85, "speechCells": 8, "quietVad": 0.35, "quietCells": 10}
+    p = str(tmp_path / "v30.db")
+    c = sqlite3.connect(p)
+    for sql in em_db.MIGRATIONS[:30]:
+        c.executescript(sql)
+    c.execute("UPDATE system_config SET value=? WHERE key='global_device_config'",
+              (json.dumps({"replyOnset": onset, "nsAsr": True}),))
+    c.execute("INSERT INTO devices (device_id,label,approved,config) VALUES ('D','Kitchen',1,?)",
+              (json.dumps({"replyOnset": {**onset, "speechVad": 0.7}, "extendedUtterances": True}),))
+    c.execute("INSERT INTO devices (device_id,label,approved,config) VALUES ('E','Office',1,?)",
+              (json.dumps({"saveUtterances": True}),))
+    c.commit()
+    c.close()
+
+    em_db.init(p)
+    c = sqlite3.connect(p)
+    assert int(c.execute(VER).fetchone()[0]) == len(em_db.MIGRATIONS)
+    fleet = json.loads(c.execute(
+        "SELECT value FROM system_config WHERE key='global_device_config'").fetchone()[0])
+    configs = {r[0]: json.loads(r[1]) for r in c.execute("SELECT device_id, config FROM devices")}
+    assert fleet == {"nsAsr": True}
+    assert configs == {"D": {"extendedUtterances": True}, "E": {"saveUtterances": True}}
+    assert "replyOnset" in em_db.REMOVED_CONFIG_KEYS and "replyOnset" not in em_db.DEFAULT_DEVICE_CONFIG
+
+
 def test_v26_adds_first_audio_and_trace_columns_to_existing_turns(tmp_path):
     p = str(tmp_path / "v25.db")
     c = sqlite3.connect(p)
@@ -280,12 +306,45 @@ def test_v27_adds_the_wake_shadow_tables_to_an_existing_database(tmp_path):
 
     em_db.init(p)
     c = sqlite3.connect(p)
-    assert int(c.execute(VER).fetchone()[0]) == 27 == len(em_db.MIGRATIONS)
+    assert int(c.execute(VER).fetchone()[0]) == len(em_db.MIGRATIONS)
     assert c.execute("SELECT near_misses FROM wake_counters").fetchone() == (2,)     # history kept
     assert c.execute("SELECT COUNT(*) FROM wake_shadow").fetchone() == (0,)           # no data, not zeros
     assert c.execute("SELECT COUNT(*) FROM wake_shadow_events").fetchone() == (0,)
     assert "idx_wake_shadow_events_device_ts" in {
         r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
+
+
+def test_v28_v29_add_the_afe_columns_and_older_turns_read_unavailable(tmp_path):
+    p = str(tmp_path / "v27.db")
+    c = sqlite3.connect(p)
+    for sql in em_db.MIGRATIONS[:27]:
+        c.executescript(sql)
+    c.execute("INSERT INTO turns (device_id, ts, outcome, turn_uuid) VALUES ('D', 1.0, 'ha', 't-1')")
+    c.commit()
+    c.close()
+
+    em_db.init(p)
+    c = sqlite3.connect(p)
+    assert int(c.execute(VER).fetchone()[0]) == len(em_db.MIGRATIONS)
+    # NULL is "unavailable" (a row predating native AFE evidence), never a zero summary or series.
+    assert c.execute("SELECT turn_uuid, afe_evidence, afe_series FROM turns").fetchone() == ("t-1", None, None)
+
+
+def test_v30_adds_response_latency_and_older_turns_read_unmeasured(tmp_path):
+    p = str(tmp_path / "v29.db")
+    c = sqlite3.connect(p)
+    for sql in em_db.MIGRATIONS[:29]:
+        c.executescript(sql)
+    c.execute("INSERT INTO turns (device_id, ts, outcome, turn_uuid, first_audio_ms) "
+              "VALUES ('D', 1.0, 'ha', 't-1', 900)")
+    c.commit()
+    c.close()
+
+    em_db.init(p)
+    c = sqlite3.connect(p)
+    assert int(c.execute(VER).fetchone()[0]) == len(em_db.MIGRATIONS)
+    # History kept; a row from before the measurement is unmeasured (NULL), never a zero latency.
+    assert c.execute("SELECT turn_uuid, first_audio_ms, response_latency_ms FROM turns").fetchone() == ("t-1", 900, None)
 
 
 def test_connect_alerts_shares_database_but_not_connection(tmp_path):

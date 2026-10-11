@@ -36,7 +36,8 @@ class CellClass(enum.StrEnum):
 
 
 class Rule(enum.StrEnum):
-    """Deciding rules recorded in the decision trace (§8.2); gap cells record why they are gaps."""
+    """Deciding rules recorded in the decision trace (§8.2); gap cells record why they are gaps.
+    `under_way`: a reply's speech that had begun before its window (§16.6)."""
 
     GAP = "gap"
     MUTE = "mute"
@@ -44,6 +45,7 @@ class Rule(enum.StrEnum):
     VAD = "vad"
     LEVEL = "level"
     HYSTERESIS = "hysteresis"
+    UNDER_WAY = "under_way"
 
 
 class EchoResult(enum.StrEnum):
@@ -103,15 +105,15 @@ ECHO_WINDOW_CELLS = 6
 LAG_ESTIMATE_CELLS = -(-SAMPLE_RATE // CELL)  # 1 s, whole cells
 LAG_REESTIMATE = SAMPLE_RATE
 
-# §16.6 early answer and reply onset.
+# §16.6 early answer.
 EARLY_ANSWER_CELLS = 15
 EARLY_ANSWER_VAD = 0.85
 EARLY_ANSWER_MARGIN_DB = 12.0
-ONSET_CELLS = 8
-ONSET_VAD = 0.85
-ONSET_QUIET_CELLS = 10
-ONSET_SCAN_BACK = SAMPLE_RATE  # scan from drain − 1,000 ms
-ONSET_EARLIEST_BACK = 7_680  # run starts no earlier than drain − 480 ms
+
+# §16.6 reply window: an answer may start this far before the reply's trigger (480 ms over the
+# question's end); a run open at the trigger that opened earlier is speech already under way.
+REPLY_OVERLAP = 7_680
+
 
 _EPS = 1e-12
 
@@ -246,17 +248,34 @@ class Attributor:
     candidate's `support_start` for a wake turn and None for button and reply
     turns. Each cell is classified with the `F` in force before it; earlier
     cells are never relabelled.
+
+    `reply`: a no-wake reply, whose trigger is where its window opened. A run
+    open at the trigger that opened more than REPLY_OVERLAP before it is speech
+    already under way, not the answer: its cells after the trigger are
+    `background_speech` (rule `under_way`) until the run closes.
     """
 
-    def __init__(self, *, trigger_sample: int, seed_start: int | None = None) -> None:
+    def __init__(self, *, trigger_sample: int, seed_start: int | None = None, reply: bool = False) -> None:
         self._trigger = trigger_sample
         self._seed_start = seed_start
+        self._reply = reply
         self._seed: list[float] | None = [] if seed_start is not None else None
         self._foreground: list[float] = []
         self._f: float | None = None
         self._in_run = False
+        self._run_start = 0                # the open run's first cell, while `_in_run`
         self._next: int | None = None
         self._trace: list[TraceSegment] = []
+
+    @property
+    def answer_start(self) -> int | None:
+        """Where the command-speech run open at the newest cell began; None outside a run, and
+        for a reply's speech under way."""
+        return self._run_start if self._in_run and not self._under_way_run else None
+
+    @property
+    def _under_way_run(self) -> bool:
+        return self._reply and self._run_start < self._trigger - REPLY_OVERLAP
 
     @property
     def foreground(self) -> float | None:
@@ -342,18 +361,17 @@ class Attributor:
             self._in_run = False
             return CellClass.BACKGROUND_SPEECH, Rule.LEVEL
         if self._in_run:
+            if self._under_way_run and cell.end > self._trigger:
+                return CellClass.BACKGROUND_SPEECH, Rule.UNDER_WAY
             return CellClass.COMMAND_SPEECH, Rule.HYSTERESIS
         if vad >= RUN_OPEN_VAD:
             r = None
             if background is not None and f is not None:
                 r = (level - background) / max(f - background, R_MIN_SPAN_DB)
-            if r is None:
-                self._in_run = True
-                return CellClass.COMMAND_SPEECH, Rule.VAD
-            if r >= RUN_OPEN_R:
-                self._in_run = True
-                return CellClass.COMMAND_SPEECH, Rule.LEVEL
-            return CellClass.UNKNOWN, Rule.LEVEL
+            if r is not None and r < RUN_OPEN_R:
+                return CellClass.UNKNOWN, Rule.LEVEL
+            self._in_run, self._run_start = True, cell.start
+            return CellClass.COMMAND_SPEECH, Rule.VAD if r is None else Rule.LEVEL
         return CellClass.UNKNOWN, Rule.VAD
 
 
@@ -690,53 +708,4 @@ class EarlyAnswerDetector:
         if self._run >= EARLY_ANSWER_CELLS:
             self.onset = self._run_start
             return self.onset
-        return None
-
-
-class ReplyOnsetScanner:
-    """§16.6 reply onset after the guarded drain (or expectation start without prompt audio).
-
-    Push retained cells in order; cells starting before drain − 1,000 ms are
-    ignored. The onset is the first run of 8 consecutive cells with VAD ≥0.85
-    that are not `self_output`, starting no earlier than drain − 480 ms, and
-    immediately preceded by ≥10 `non_speech`/`self_output` cells.
-    """
-
-    def __init__(self, drain_sample: int) -> None:
-        self._scan_from = drain_sample - ONSET_SCAN_BACK
-        self._earliest = drain_sample - ONSET_EARLIEST_BACK
-        self._next: int | None = None
-        self._quiet = 0
-        self._speech = 0
-        self._speech_start = 0
-        self._quiet_before = 0
-        self.onset: int | None = None
-
-    def push(self, cell: Cell) -> int | None:
-        if self.onset is not None or cell.start < self._scan_from:
-            return None
-        if self._next is not None and cell.start != self._next:
-            self._quiet = self._speech = 0
-        self._next = cell.end
-        own_echo = cell.echo == EchoResult.ECHO_ONLY
-        speech = cell.valid and not own_echo and cell.vad is not None and cell.vad >= ONSET_VAD
-        quiet = cell.valid and (own_echo or (cell.vad is not None and cell.vad <= NON_SPEECH_MAX_VAD))
-        if speech:
-            if self._speech == 0:
-                self._speech_start = cell.start
-                self._quiet_before = self._quiet
-            self._speech += 1
-            self._quiet = 0
-            if (
-                self._speech == ONSET_CELLS
-                and self._speech_start >= self._earliest
-                and self._quiet_before >= ONSET_QUIET_CELLS
-            ):
-                self.onset = self._speech_start
-                return self.onset
-        elif quiet:
-            self._quiet += 1
-            self._speech = 0
-        else:
-            self._quiet = self._speech = 0
         return None

@@ -2,16 +2,17 @@
 
 Scope: the Office Dot (`G090LF10728426PR`). This covers the "ophelia next" / "ophelia stop" episode from 18:40–18:42 (turns 470–474) and the ordinary spoken-command history, both before and after the post-AFE cutover.
 
-**Status (2026-09-29, policy `post_afe_3`, schema v26):**
+**Status (2026-10-08, policy `post_afe_4`):**
 - **Implemented:**
   - P1: STT container recreated with its swap limit.
   - P4 items 1–3; the start limit was then raised to 10 s (2026-09-30).
-  - P7: `turns.decision_trace` and `first_audio_ms`.
-  - The P2 mechanism (finalize at the pause), without the P3 oracle.
+  - P7: `turns.decision_trace` and `first_audio_ms`; "speech end → first audio" as `response_latency_ms` (on the Dot's clock), per turn on Activity and as percentiles on Status (2026-10-09).
+  - The P2 mechanism (finalize at the pause).
   - The 240 ms text-stability rule removed.
   - The 1.5 s ASR flush for wake verification and span re-decode.
   - `saveUtterances` now keeps 300 recordings per device.
-- **Not implemented:** P3, P4 item 4 (the upstream HA report), P5, P6.
+  - P3 (`post_afe_4`), with two changes from the proposal below. A literal-template match is not enough for `complete`: the text plus a probe word (`zqxj`) is asked in the same request, and if that also matches, a wildcard can take more words and the class is `extendable`. This keeps "what's the weather … tomorrow" and "play …" from being cut after 608 ms. A throwaway query when a wake candidate opens pages HA's matcher back in after idle. On the 38 `unknown` turns of `post_afe_3`, HA answers 8 `complete` and 12 `extendable` (the proposal's 22/9 was without the probe and on 39 earlier turns).
+- **Not implemented:** P4 item 4 (the upstream HA report), P5, P6.
 
 ## Summary
 
@@ -244,7 +245,7 @@ These are the correctness fixes from the episode:
   - Rejected candidates would chime: 2 `unverified_wake` out of 44 post-AFE candidates.
   - Needs a protocol and firmware change for a device-initiated earcon.
   - The chime is the user's preference (`wakeSound: true`), so the change must stay optional.
-- **Status (2026-09-30):** the earlier half is implemented as firmware capability `local_wake_chime`: with `wakeSound` on, the Dot plays the existing chime at idle candidate open, and the controller skips its own. A rejected candidate keeps its chime rather than being cancelled (a cancel cannot retract the ~200 ms already queued in the OpenSL sink). Wakes heard during playback still chime after acceptance. The chime is not shortened.
+- **Status (2026-09-30):** the earlier half is implemented as firmware capability `local_wake_chime`: with `wakeSound` on, the Dot plays the existing chime at idle candidate open, and the controller skips its own. A rejected candidate keeps its chime rather than being cancelled (a cancel cannot retract the ~200 ms already queued in the render sink). Wakes heard during playback still chime after acceptance. The chime is not shortened.
 
 ### P7. Persist traces and the time to first audio
 

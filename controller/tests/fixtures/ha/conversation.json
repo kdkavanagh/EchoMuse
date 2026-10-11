@@ -1,0 +1,273 @@
+{
+  "source": [
+    "homeassistant/components/conversation/http.py (websocket_hass_agent_debug: sentences, language, device_id; results in sentence order)",
+    "homeassistant/components/conversation/default_agent.py (async_debug_recognize: a sentence trigger match is reported without firing it; an intent result carries match, unmatched_slots and sentence_template; None when nothing is recognized)",
+    "Captured from the live HA 2026.8.1 on 2026-10-08 with the Office satellite device; each request is what em_session sends for one stable prefix (the text, then the text and em_endpoint_policy.RECOGNIZER_PROBE), or the warm-up sentence"
+  ],
+  "complete": {
+    "request": {
+      "type": "conversation/agent/homeassistant/debug",
+      "sentences": [
+        "what time is it",
+        "what time is it zqxj"
+      ],
+      "device_id": "b285ec5e94b98f4c1cbeabf926be4b77"
+    },
+    "result": {
+      "results": [
+        {
+          "match": true,
+          "source": "trigger",
+          "sentence_template": "what time is it"
+        },
+        {
+          "intent": {
+            "name": "HassGetState"
+          },
+          "slots": {
+            "domain": "cover"
+          },
+          "details": {
+            "domain": {
+              "name": "domain",
+              "value": "cover",
+              "text": ""
+            }
+          },
+          "targets": {},
+          "match": false,
+          "sentence_template": "<which> {cover_classes:device_class} <is> {cover_states:state}",
+          "unmatched_slots": {
+            "device_class": "time ",
+            "state": "it zqxj"
+          },
+          "source": "builtin"
+        }
+      ]
+    }
+  },
+  "extendable": {
+    "request": {
+      "type": "conversation/agent/homeassistant/debug",
+      "sentences": [
+        "what's the weather",
+        "what's the weather zqxj"
+      ],
+      "device_id": "b285ec5e94b98f4c1cbeabf926be4b77"
+    },
+    "result": {
+      "results": [
+        {
+          "match": true,
+          "source": "trigger",
+          "sentence_template": "[what is|what's|whats|how is|how's|hows|tell me] the (weather|forecast) [like]"
+        },
+        {
+          "match": true,
+          "source": "trigger",
+          "sentence_template": "[what is|what's|whats|how is|how's|hows|tell me] the (weather|forecast) [like] {when}"
+        }
+      ]
+    }
+  },
+  "extendable_short": {
+    "request": {
+      "type": "conversation/agent/homeassistant/debug",
+      "sentences": [
+        "play",
+        "play zqxj"
+      ],
+      "device_id": "b285ec5e94b98f4c1cbeabf926be4b77"
+    },
+    "result": {
+      "results": [
+        {
+          "intent": {
+            "name": "HassMediaUnpause"
+          },
+          "slots": {
+            "area": "Living Room"
+          },
+          "details": {
+            "area": {
+              "name": "area",
+              "value": "Living Room",
+              "text": "Living Room"
+            }
+          },
+          "targets": {
+            "light.living_room_lights": {
+              "matched": true
+            },
+            "light.living_room_led_strip": {
+              "matched": true
+            },
+            "light.wine_wall_led_strip": {
+              "matched": true
+            },
+            "sensor.ecobee_main_floor_temperature": {
+              "matched": true
+            },
+            "sensor.ecobee_main_floor_humidity": {
+              "matched": true
+            },
+            "media_player.hifi_2": {
+              "matched": true
+            },
+            "fan.winix_living_room": {
+              "matched": true
+            },
+            "fan.blinds_controller_esp32_living_room_ceiling_fan": {
+              "matched": true
+            },
+            "cover.esphome_web_ca72b0_somfy_cover": {
+              "matched": true
+            },
+            "cover.esphome_web_ca72b0_somfy_cover2": {
+              "matched": true
+            },
+            "cover.esphome_web_ca72b0_somfy_cover3": {
+              "matched": true
+            },
+            "cover.esphome_web_ca72b0_somfy_cover4": {
+              "matched": true
+            },
+            "light.living_room_table_lamp": {
+              "matched": true
+            },
+            "light.arc_lamp": {
+              "matched": true
+            },
+            "light.2nd_floor_hall_lights": {
+              "matched": true
+            },
+            "light.living_room_ceiling_lights": {
+              "matched": true
+            },
+            "light.dining_room_chandelier": {
+              "matched": true
+            },
+            "climate.main_floor": {
+              "matched": true
+            },
+            "switch.remote_watch_apple_tv": {
+              "matched": true
+            },
+            "switch.remote_listen_to_music": {
+              "matched": true
+            },
+            "switch.remote_play_xbox": {
+              "matched": true
+            }
+          },
+          "match": true,
+          "sentence_template": "play",
+          "unmatched_slots": {},
+          "source": "custom",
+          "file": "en/media_controls.yaml"
+        },
+        {
+          "match": true,
+          "source": "trigger",
+          "sentence_template": "(play|played|plays) {query}"
+        }
+      ]
+    }
+  },
+  "needs_more": {
+    "request": {
+      "type": "conversation/agent/homeassistant/debug",
+      "sentences": [
+        "set a timer for five",
+        "set a timer for five zqxj"
+      ],
+      "device_id": "b285ec5e94b98f4c1cbeabf926be4b77"
+    },
+    "result": {
+      "results": [
+        {
+          "intent": {
+            "name": "HassStartTimer"
+          },
+          "slots": {},
+          "details": {},
+          "targets": {},
+          "match": false,
+          "sentence_template": "set [a|an] timer for <tmr_dur>",
+          "unmatched_slots": {
+            "minutes": "five"
+          },
+          "source": "custom",
+          "file": "en/timers.yaml"
+        },
+        {
+          "intent": {
+            "name": "HassStartTimer"
+          },
+          "slots": {},
+          "details": {},
+          "targets": {},
+          "match": false,
+          "sentence_template": "set [a|an] timer for <tmr_dur>",
+          "unmatched_slots": {
+            "minutes": "five zqxj"
+          },
+          "source": "custom",
+          "file": "en/timers.yaml"
+        }
+      ]
+    }
+  },
+  "unknown": {
+    "request": {
+      "type": "conversation/agent/homeassistant/debug",
+      "sentences": [
+        "what time is",
+        "what time is zqxj"
+      ],
+      "device_id": "b285ec5e94b98f4c1cbeabf926be4b77"
+    },
+    "result": {
+      "results": [
+        null,
+        {
+          "intent": {
+            "name": "HassGetState"
+          },
+          "slots": {
+            "domain": "cover"
+          },
+          "details": {
+            "domain": {
+              "name": "domain",
+              "value": "cover",
+              "text": ""
+            }
+          },
+          "targets": {},
+          "match": false,
+          "sentence_template": "<which> {cover_classes:device_class} <is> {cover_states:state}",
+          "unmatched_slots": {
+            "device_class": "time ",
+            "state": "zqxj"
+          },
+          "source": "builtin"
+        }
+      ]
+    }
+  },
+  "warm_up": {
+    "request": {
+      "type": "conversation/agent/homeassistant/debug",
+      "sentences": [
+        "echomuse warm up 5f0c2a7e9b6d4e1fa3c8b2d7e6f1a9c4"
+      ],
+      "device_id": "b285ec5e94b98f4c1cbeabf926be4b77"
+    },
+    "result": {
+      "results": [
+        null
+      ]
+    }
+  }
+}

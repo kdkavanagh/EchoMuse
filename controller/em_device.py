@@ -8,9 +8,7 @@ projection of actor state onto the controller LED layer.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import enum
-import json
 import logging
 import math
 import time
@@ -19,8 +17,8 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 import numpy as np
-from websockets.asyncio.server import ServerConnection
 
+import em_afe
 import em_ambient
 import em_button
 import em_capture
@@ -38,7 +36,7 @@ import em_tap_burst
 import em_volume
 import em_wake_registry
 import em_wake_rules
-from em_device_link import Capability, CloseReason, CommandAck, MessageType, RejectReason
+from em_device_link import Capability, CloseReason, CommandAck, DevicePlatform, MessageType, RejectReason
 
 log = logging.getLogger("em_device")
 
@@ -97,7 +95,8 @@ class Actor(Protocol):
 
     async def start(self) -> None: ...
     async def close(self) -> None: ...
-    def attach(self, link: em_device_link.DeviceLink, render: em_render.RenderClient) -> None: ...
+    def attach(self, link: em_device_link.DeviceLink, render: em_render.RenderClient, *,
+               afe_metadata: bool) -> None: ...
     def detach(self, reason: CloseReason) -> None: ...
     def on_message(self, envelope: em_device_link.Envelope) -> None: ...
     def on_audio(self, frame: bytes) -> None: ...
@@ -151,9 +150,11 @@ class Store(Protocol):
     def device(self, device_id: str) -> em_db.DeviceRow | None: ...
     def token(self, device_id: str) -> str | None: ...
     def approval_mode(self, default: ApprovalMode) -> ApprovalMode: ...
-    def register(self, device_id: str, ip: str, version: str | None) -> None: ...
+    def register(self, device_id: str, ip: str, version: str | None,
+                 os_version: str | None) -> None: ...
     def approve(self, device_id: str, label: str) -> None: ...
-    def seen(self, device_id: str, ip: str, version: str | None) -> None: ...
+    def seen(self, device_id: str, ip: str, version: str | None,
+             os_version: str | None) -> None: ...
     def config(self, device_id: str) -> em_config_sections.DeviceConfig: ...
     def set_config(self, device_id: str, config: em_config_sections.DeviceConfig) -> None: ...
     def log(self, device_id: str, level: em_db.LogLevel, source: em_db.LogSource,
@@ -187,14 +188,16 @@ class DbStore:
             return default
         return ApprovalMode.AUTO if stored == ApprovalMode.AUTO else ApprovalMode.STRICT
 
-    def register(self, device_id: str, ip: str, version: str | None) -> None:
-        em_db.register_new_device(device_id, ip, version)
+    def register(self, device_id: str, ip: str, version: str | None,
+                 os_version: str | None) -> None:
+        em_db.register_new_device(device_id, ip, version, os_version)
 
     def approve(self, device_id: str, label: str) -> None:
         em_db.approve_device(device_id, label, None)
 
-    def seen(self, device_id: str, ip: str, version: str | None) -> None:
-        em_db.upsert_device_seen(device_id, ip, version)
+    def seen(self, device_id: str, ip: str, version: str | None,
+             os_version: str | None) -> None:
+        em_db.upsert_device_seen(device_id, ip, version, os_version)
 
     def config(self, device_id: str) -> em_config_sections.DeviceConfig:
         return em_db.get_effective_device_config(device_id)
@@ -246,12 +249,16 @@ async def register_device(
     device_id: str,
     ip: str,
     version: str | None,
+    os_version: str | None,
     secure: bool,
     token: str | None,
     require_tls: bool,
     approval_default: ApprovalMode,
 ) -> Registration:
-    """Authenticate and apply the retained registration/approval policy."""
+    """Authenticate and apply the retained registration/approval policy.
+
+    `version` is the EchoMuse firmware and `os_version` the Fire OS build the
+    hello reported; both are recorded on every attempt, approved or not."""
     expected = await asyncio.to_thread(store.token, device_id)
     verdict = em_linkauth.decide(
         presented=token, expected=expected, secure=secure, require_tls=require_tls)
@@ -264,7 +271,7 @@ async def register_device(
     row = await asyncio.to_thread(store.device, device_id)
     approval = await asyncio.to_thread(store.approval_mode, approval_default)
     if row is None:
-        await asyncio.to_thread(store.register, device_id, ip, version)
+        await asyncio.to_thread(store.register, device_id, ip, version, os_version)
         if approval is not ApprovalMode.AUTO:
             await host.pending(device_id, ip)
             return Registration(RejectReason.PENDING_APPROVAL, None)
@@ -272,11 +279,11 @@ async def register_device(
         await asyncio.to_thread(store.approve, device_id, label)
         row = await asyncio.to_thread(store.device, device_id)
     if row is None or not row.approved:
-        await asyncio.to_thread(store.seen, device_id, ip, version)
+        await asyncio.to_thread(store.seen, device_id, ip, version, os_version)
         await host.pending(device_id, ip)
         return Registration(RejectReason.PENDING_APPROVAL, None)
 
-    await asyncio.to_thread(store.seen, device_id, ip, version)
+    await asyncio.to_thread(store.seen, device_id, ip, version, os_version)
     return Registration(None, row.label or f"EchoMuse {device_id[-8:]}")
 
 
@@ -292,15 +299,15 @@ class Device:
         self.store = store or DbStore()
         self.link: em_device_link.DeviceLink | None = None
         self.render: em_render.RenderClient | None = None
-        self.legacy_ws: ServerConnection | None = None
         self.capabilities: frozenset[str] = frozenset()
-        self.missing_capabilities: frozenset[str] = frozenset()
         self.firmware_version: str | None = None
         self.ip: str | None = None
         self.secure = False
-        self.upgrade_required = False
         self.stats: dict[str, object] | None = None
         self.wake_stats: dict[str, object] | None = None
+        # wake.stats `afe` of the last report: None when it carried none (no
+        # data, never zeros) or the device lacks afe_metadata_v1.
+        self.afe_stats: em_afe.AfeStats | None = None
         self.alert_state: dict[str, object] | None = None
         self.alerts_wakeup: str | None = None
         self.volume: int | None = None
@@ -370,7 +377,7 @@ class Device:
 
     @property
     def online(self) -> bool:
-        return ((self.link is not None and not self.link.closed) or self.legacy_ws is not None)
+        return self.link is not None and not self.link.closed
 
     @property
     def diagnostic(self) -> bool:
@@ -407,6 +414,10 @@ class Device:
         return Capability.OPEN_RULES in self.capabilities
 
     @property
+    def afe_metadata_capable(self) -> bool:
+        return Capability.AFE_METADATA in self.capabilities
+
+    @property
     def capture_permitted(self) -> bool:
         return not self.diagnostic
 
@@ -425,21 +436,15 @@ class Device:
         await self.actor.close()
 
     async def disconnect(self, reason: CloseReason = CloseReason.CLOSED) -> None:
-        link, legacy = self.link, self.legacy_ws
+        link = self.link
         if link is not None:
             await link.close(reason)
-        if legacy is not None:
-            with contextlib.suppress(Exception):
-                await legacy.close()
 
     async def send(self, msg_type: MessageType, body: Mapping[str, object], *,
                    generation: int = 0) -> str:
         link = self.link
         if link is not None and not link.closed:
             return await link.send(msg_type, body, generation=generation)
-        if self.legacy_ws is not None and msg_type in {MessageType.SHELL_OPEN, MessageType.SHELL_CLOSE}:
-            await self.legacy_ws.send(json.dumps({"type": msg_type, **body}))
-            return "legacy"
         raise em_device_link.LinkClosed(f"{self.device_id} is offline")
 
     def _device_wall(self, received: float) -> Callable[[int], float]:
@@ -477,30 +482,11 @@ class Device:
                 await link.close(CloseReason.CLOSED)
         self._led_event.set()
 
-    async def attach_legacy(self, ws: ServerConnection, *, ip: str, version: str | None,
-                            capabilities: Iterable[str], secure: bool) -> None:
-        await self.disconnect(CloseReason.CLOSED)
-        self.legacy_ws = ws
-        self.upgrade_required = True
-        self.ip, self.firmware_version, self.secure = ip, version, secure
-        self.capabilities = frozenset(capabilities)
-        self.missing_capabilities = REQUIRED_CAPABILITIES - self.capabilities
-        await self.host.connected(self)
-
-    async def detach_legacy(self, ws: ServerConnection) -> None:
-        if self.legacy_ws is not ws:
-            return
-        self.legacy_ws = None
-        await self.host.disconnected(self)
-
     async def _ready(self, link: em_device_link.DeviceLink) -> None:
         hello = link.hello
         self.link = link
         render = self.render = self.host.make_render(self, link)
-        self.legacy_ws = None
-        self.upgrade_required = False
         self.capabilities = link.capabilities
-        self.missing_capabilities = REQUIRED_CAPABILITIES - self.capabilities
         self.firmware_version = hello.firmware_version
         self.ip, self.secure = link.peer_ip, link.secure
         self.alerts_wakeup = hello.alerts_wakeup
@@ -508,7 +494,8 @@ class Device:
         self._physical_seq = -1
         self.muted = hello.muted
         self.volume = hello.volume_level
-        self.actor.attach(link, render)
+        # session.ready granted afe_metadata exactly when the hello announced it (LinkHub.admit).
+        self.actor.attach(link, render, afe_metadata=self.afe_metadata_capable)
         await self.host.alerts.on_session_hello(self.device_id, hello.alerts,
                                                 capabilities=self.capabilities)
         await self.apply_config(self.config)
@@ -531,12 +518,20 @@ class Device:
                 self._spawn(self.host.push_state(self, {"muted": self.muted}), "privacy push")
             case MessageType.WAKE_STATS:
                 self.wake_stats = {**body, "received_ms": time.time_ns() // 1_000_000}
+                try:
+                    self.afe_stats = em_afe.parse_stats(body)
+                except ValueError as exc:
+                    log.warning("[%s] wake.stats afe ignored: %s", self.device_id, exc)
+                    self.afe_stats = None
                 self._spawn(asyncio.to_thread(self.store.wake_stats, self.device_id, body), "wake stats")
                 shadow = em_wake_rules.parse_shadow(body)
                 if shadow is not None:
                     self._spawn(asyncio.to_thread(self.store.wake_shadow, self.device_id, shadow,
                                                   self._device_wall(time.time())), "wake shadow")
-                self._spawn(self.host.push_state(self, {"wake_stats": self.wake_stats}), "wake stats push")
+                self._spawn(self.host.push_state(self, {
+                    "wake_stats": self.wake_stats,
+                    "afe_stats": self.afe_stats.wire() if self.afe_stats is not None else None,
+                }), "wake stats push")
             case MessageType.ALERT_ACK:
                 self._spawn(self.host.alerts.on_alert_ack(self.device_id, body), "alert ack")
             case MessageType.ALERT_STATE:
@@ -873,9 +868,15 @@ class LinkHub:
         if missing:
             log.warning("[%s] missing v1 capabilities: %s", device_id, sorted(missing))
             return em_device_link.Rejected(RejectReason.PROTOCOL)
+        if hello.platform is not DevicePlatform.FIREOS6:
+            # Firmware built from this tree runs audio only on Fire OS 6:
+            # admitting another image would only offer it an update that breaks it.
+            log.warning("[%s] unsupported platform: %s", device_id, hello.platform_sent)
+            return em_device_link.Rejected(RejectReason.PROTOCOL)
         registration = await register_device(
             self.store, self.host, device_id=device_id, ip=peer_ip,
-            version=hello.firmware_version, secure=secure, token=token,
+            version=hello.firmware_version, os_version=hello.os_version,
+            secure=secure, token=token,
             require_tls=self.require_tls, approval_default=self.approval_default)
         if registration.rejected is not None:
             return em_device_link.Rejected(registration.rejected)
@@ -887,6 +888,7 @@ class LinkHub:
         rules = (em_wake_rules.RuleSet.from_config(device.config)
                  if Capability.OPEN_RULES in hello.capabilities else None)
         device.wake_rules = rules
+        afe_metadata = Capability.AFE_METADATA in hello.capabilities
         ready = em_device_link.ReadyGrant(
             capture_permitted=device.capture_permitted,
             assets=self.assets.speech_assets(model),
@@ -902,15 +904,9 @@ class LinkHub:
                             else rules.open_rules(model.thresholds.idle, model.thresholds.playback)),
                 shadow_rules=None if rules is None else rules.shadow,
             ),
+            afe_metadata=afe_metadata,
         )
         return em_device_link.Admitted(ready=ready, sink=_Sink(device))
-
-    async def admit_legacy(self, *, device_id: str, ip: str, version: str | None,
-                           secure: bool, token: str | None) -> Registration:
-        return await register_device(
-            self.store, self.host, device_id=device_id, ip=ip, version=version,
-            secure=secure, token=token, require_tls=self.require_tls,
-            approval_default=self.approval_default)
 
 
 def _needs_renewal(spec: LedSpec) -> bool:

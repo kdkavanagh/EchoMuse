@@ -1,16 +1,23 @@
 # Native AFE — the device's audio path
 
-**Status:** done and exclusive. EchoMuse captures and plays through Android's
-audio HAL via OpenSL ES, which puts the microphone stream through Amazon's ASP
-front end. There is no second backend: the tinyalsa mic/speaker bindings, the
-Go-side beamformer, the speexdsp echo canceller and the AGC were deleted when
-this became the only path, along with the opt-in marker, the capability pair
-and the dashboard switch that chose between them.
+**Superseded: Fire OS 5 history.** EchoMuse now runs only on Fire OS 6, which
+has no OpenSL ES. Capture and playback go through Amazon's `mixer` daemon via
+`libmixerAPI` (`internal/mixerapi`, [fireos6-port.md](fireos6-port.md)), which
+keeps this document's one rule: both directions through the native path, so
+the AFE has its far-end reference
+([post-afe-audio-architecture.md](post-afe-audio-architecture.md) §4.1). The
+OpenSL ES backend, `internal/opensl` and `device/tools/afe_probe` were removed
+with Fire OS 5 support. Everything below is the Fire OS 5 record as it stood.
 
-The measurement that was supposed to justify it (Phase 0, below) has **still
-not been run on hardware**. That is the honest state of this: the path is the
-one in service, and the numbers that would tell you whether it is better than
-what it replaced do not exist yet.
+**Status then:** done and exclusive. EchoMuse captured and played through
+Android's audio HAL via OpenSL ES, which put the microphone stream through
+Amazon's ASP front end. There was no second backend: the tinyalsa mic/speaker
+bindings, the Go-side beamformer, the speexdsp echo canceller and the AGC were
+deleted when this became the only path, along with the opt-in marker, the
+capability pair and the dashboard switch that chose between them.
+
+The measurement that was supposed to justify it (Phase 0, below) was **never
+run on hardware** before Fire OS 5 support was removed.
 
 **Background:** [alexa-afe.md](alexa-afe.md) — read that first, especially
 "5. Open the AFE through the standard Android capture API".
@@ -187,15 +194,15 @@ There is no echo tap. The HAL takes the reference itself.
 
 ## What was never measured
 
-### Phase 0 — the spike, still unrun
+### Phase 0 — the spike, never run
 
-`device/tools/afe_probe` exists, builds and links (verified via
-`echomuse-compiler`, real ARM binary produced) and **has never been run on a
-device**. It records N seconds via OpenSL ES and writes WAVs, at each of
-`VOICE_RECOGNITION`, `VOICE_COMMUNICATION` and `MIC`, optionally while playing
-a known signal through an OpenSL player.
+`device/tools/afe_probe` (removed with Fire OS 5 support) built and linked
+(verified via `echomuse-compiler`, real ARM binary produced) and **was never
+run on a device**. It recorded N seconds via OpenSL ES and wrote WAVs, at each
+of `VOICE_RECOGNITION`, `VOICE_COMMUNICATION` and `MIC`, optionally while
+playing a known signal through an OpenSL player.
 
-It answers, cheaply and on hardware, everything this migration assumed:
+It would have answered, cheaply and on hardware, everything this migration assumed:
 
 1. Does `VOICE_RECOGNITION` actually instantiate ASP pipeline 0? (`MIC` is
    configured with an empty algorithm list, so it is a built-in control: any
@@ -208,11 +215,15 @@ It answers, cheaply and on hardware, everything this migration assumed:
    and pryon consumes `BEAMFORMED` / `pre-aec` / `post-aec` channel types, so
    the AFE can plainly emit more than the beam — but `audio_policy.conf`
    advertises only `MONO|STEREO` on the primary input, so mono is the
-   expectation.
+   expectation. *Answered for Fire OS 6 (2026-10-07):* the mixer's
+   `micMultiChAsr` emits the beam, up to 4 post-AEC mics and the far-end
+   reference, but never the individual beams; `micAsr` is the beam alone
+   (`docs/alexa-afe.md`, "Fire OS 6: the mixer's ASR streams"). Fire OS 5
+   was never measured.
 4. End-to-end latency, against the mic pipeline's deadline.
 
-Needs the `echomuse-compiler` image (`cd device && docker build -t
-echomuse-compiler compiler/`).
+Needs the `echomuse-compiler` image, the toolchain stage of
+`controller/Dockerfile` (`device/tools/build_tools.sh` builds it).
 
 ### Phase 3 — field comparison, not done
 

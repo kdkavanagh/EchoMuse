@@ -210,3 +210,29 @@ def test_source_failure_and_session_loss_finish_failed():
         assert client.playbacks == ()
 
     asyncio.run(run())
+
+
+def test_first_frame_time_is_the_first_completion_less_the_frames_it_completed():
+    async def run():
+        link = FakeLink(auto_start=False)
+        client = link.client = em_render.RenderClient(link)
+        playback = await client.play_local("earcon", "builtin:wake_chime", generation=5)
+        for _ in range(20):
+            if link.starts:
+                break
+            await asyncio.sleep(0)
+
+        def progress(event, completed, mono):
+            client.on_message(envelope("render.progress", {
+                "playback_id": playback.playback_id, "event": event, "submitted_frames": "9600",
+                "completed_frames": str(completed), "mono_ns": str(mono)}, 5))
+
+        progress("start", 0, 5_000_000_000)          # mixed, nothing completed yet: no timing
+        await playback.started
+        assert playback.first_frame_ns is None
+        progress("progress", 4_800, 5_200_000_000)   # 100 ms of it completed by then
+        assert playback.first_frame_ns == 5_100_000_000
+        progress("progress", 9_600, 5_400_000_000)   # a later stall must not move the start
+        assert playback.first_frame_ns == 5_100_000_000
+
+    asyncio.run(run())

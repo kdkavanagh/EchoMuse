@@ -1,0 +1,7 @@
+# lm.raw channel 0 frames [900,940): one line per 1280-sample period, decoded with the v3.3 table of docs/alexa-afe.md
+# frame 0 only confirms the lock, so period 0 holds frames 1-9 and the sync flag
+# frames flags playback erle_max erle_mean erle_frames dtd_max dtd_frames rms_max rms_mean vad_max vad_frames volume lost
+9 2 0 0 0 0 0 0 178 177 0 0 70 0
+10 0 5 0 0 0 0 0 179 178 0 0 70 0
+10 4 10 6 5 9 0 0 194 189 3 8 70 0
+10 4 10 8 7 10 0 0 197 193 1 6 70 0

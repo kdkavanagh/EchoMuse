@@ -69,8 +69,10 @@ jadx output in `dex/out*/`) — outside the repo deliberately. These are
 Amazon's proprietary binaries, models and tuning; they are reference material
 for reading, not redistributable, and must not be committed.
 
-Re-probing is cheap and does not need the 21 MB transferred — `busybox
-strings` on the device and grep there:
+Re-probing was cheap and did not need the 21 MB transferred — `busybox
+strings` on the device and grep there. That was the Fire OS 5 image, which
+EchoMuse no longer supports; Fire OS 6 has no busybox and not these binaries,
+so the archive above is now the reference. The recipe as it ran:
 
 ```bash
 adb connect 192.168.3.71:5555
@@ -1990,8 +1992,8 @@ a measurement exercise rather than a shipping dependency.
 
 ### The genuinely reusable thing is not code, it is a channel — and it is closed
 
-We already use the AFE — that is what the OpenSL/`VOICE_RECOGNITION` capture
-path is. What we do not have is the **metadata** it produces: the per-frame
+We already use the AFE — that is what the `VOICE_RECOGNITION` capture
+path is (OpenSL ES on Fire OS 5 then; the mixer's `micAsr` on Fire OS 6 now). What we do not have is the **metadata** it produces: the per-frame
 ERLE flag, the sub-base double-talk flag and the playback status that every
 suppression decision in Pryon is built on. That is the one piece whose absence
 changes EchoMuse's behaviour today, and unlike a model it needs no licence —
@@ -2169,7 +2171,7 @@ nothing about an unprivileged caller — `dump()` is a different code path from
   carries genuine per-frame playback metadata (`meta_inTTS.wav`,
   `meta_inPlayback.wav`, `meta_playbackVolume.wav` …) though not ERLE or DTD.
 - **ERLE on this hardware has never been measured.** CLAUDE.md already flags
-  this: `device/tools/afe_probe` exists and has never been run, and every
+  this: `device/tools/afe_probe` existed (removed with Fire OS 5 support) and was never run, and every
   barge-in figure in the repo predates the move to the native AFE.
 - **`ASPState`** is a tracked stream state whose meaning is unclear — the AFE
   signalling its own activity is the obvious reading, but unconfirmed.

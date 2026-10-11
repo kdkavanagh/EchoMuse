@@ -33,15 +33,17 @@ exploit itself.
 
 The dashboard has a **provisioning wizard** (plug the Dot into your laptop's
 USB port, open the dashboard in Chrome, follow the steps) that automates the
-rest after the initial unlock.
+rest after the initial unlock. EchoMuse runs on Fire OS 6 only (amonet-biscuit
+v2 plus boot-root.zip), and that route needs no recovery mode at all. A Dot
+still on Fire OS 5 is refused at the wizard's first step; [rooting](rooting.md)
+explains how to move it to Fire OS 6.
 
 If a step fails, the wizard offers a **Download diagnostics** file to attach
 to an issue. It captures the device's state at the moment it failed, which
 saves a round trip of being asked to run things by hand. If you unplug the
 device at any point you can carry on, because **Reconnect** is on every step.
 The cable is the Dot's only power, so unplugging reboots it and it comes back
-in Android. The wizard will say so if the step you are on needed recovery
-mode.
+in Android.
 
 You only do this once per device. Everything afterwards — updates,
 configuration, even a remote terminal — happens over WiFi from the dashboard.
@@ -145,9 +147,10 @@ network without you saying so.)
 Once approved, the Dot connects fully: you'll see it as **online**, with its
 volume, settings, and a live status.
 
-A Dot running firmware from before protocol v1 shows **Upgrade required**
-instead. Open it and click **Update firmware**; until then it takes no voice
-turns, rings no timers or alarms and plays nothing.
+A Dot that never appears as pending was refused: the controller admits only
+Dots running Fire OS 6 with protocol v1 firmware. Run the wizard on it (after
+moving it to Fire OS 6, if needed); a Dot the controller already knows is
+re-adopted with **Continue**, keeping its name and settings.
 
 ## Step 6 — Connect it to Home Assistant
 
@@ -211,13 +214,16 @@ The LED ring tells you what's happening (full list in
 
 ## Everyday things
 
-- **Updates**: when a new EchoMuse release is out, the dashboard shows an
-  update badge — one click updates the device over WiFi. The release notes
-  appear alongside it, so you can read what changed before deciding. If an
+- **Updates**: the device firmware ships inside the controller image. After
+  you update the controller, any Dot running different firmware shows an
+  update badge — one click installs the bundled firmware over WiFi. If an
   update ever goes wrong, the device automatically rolls back to its
   previous version. **Deploy all** updates the whole fleet at once; it runs
   in the background, so you can close the dialog and reopen it from the
-  header pill to check progress.
+  header pill to check progress. A Dot that is offline can't update then:
+  click **Install when it reconnects** (in that dialog or on the Dot's
+  Updates tab) and it installs the bundled firmware the next time it
+  connects. You can cancel that until it does.
 - **Settings**: everything tunable lives in the dashboard, either fleet-wide
   (the gear icon) or per device. See [configuration.md](configuration.md).
 - **Terminal**: each device page has a full remote terminal (for the
@@ -235,8 +241,7 @@ The LED ring tells you what's happening (full list in
 
 ## When something doesn't work
 
-1. Is the device **online** in the dashboard, and not marked **Upgrade
-   required**?
+1. Is the device **online** in the dashboard?
 2. Is Home Assistant connected? The device's **Alerts** tab lists each Home
    Assistant feature the controller depends on as ready or failed, with the
    reason.

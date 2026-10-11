@@ -4,6 +4,7 @@ import pytest
 from em_attribution import (
     CELL,
     MAX_LAG,
+    REPLY_OVERLAP,
     Attributor,
     BackgroundTracker,
     Cell,
@@ -13,7 +14,7 @@ from em_attribution import (
     EchoResult,
     EchoTracker,
     PlaybackVerdict,
-    ReplyOnsetScanner,
+    Rule,
     WakeHop,
     compare_reference,
     estimate_lag,
@@ -257,12 +258,53 @@ def test_early_answer_needs_fifteen_qualifying_consecutive_cells():
         assert broken.push(Cell(i * CELL, -35.0, 0.9, EchoResult.NO_REFERENCE), -50.0) is None
 
 
-def test_reply_onset_after_drain_accepts_tail_answer_and_requires_quiet_prefix():
-    drain = 20 * CELL
-    scanner = ReplyOnsetScanner(drain)
-    # 10 quiet cells; answer starts 4 cells before drain, within the retained-tail bound.
-    for i in range(6, 16):
-        scanner.push(Cell(i * CELL, -60.0, 0.1, EchoResult.NO_REFERENCE))
-    for i in range(16, 23):
-        assert scanner.push(Cell(i * CELL, -30.0, 0.9, EchoResult.NEAR_END_PRESENT)) is None
-    assert scanner.push(Cell(23 * CELL, -30.0, 0.9, EchoResult.NEAR_END_PRESENT)) == 16 * CELL
+def _vads(attributor, vads, first=0):
+    """Classify one cell per VAD value from cell `first` (no level evidence against F)."""
+    return classify(attributor, [(-40.0, v, EchoResult.NO_REFERENCE) for v in vads], start=first * CELL)
+
+
+# Turn 617 (Kitchen, 2026-10-09), cell VAD from the device link after the reply chime: the
+# answer's first word holds 0.85 for 6 cells, then dips. The onset gate never fired on it.
+TURN_617_PAUSE = [0.04] * 12
+TURN_617_ANSWER = [0.53, 0.80, 0.86, 0.90, 0.91, 0.90, 0.88, 0.86, 0.72, 0.73, 0.81, 0.77, 0.86, 0.98, 0.72,
+                   0.37, 0.43, 0.51, 0.51, 0.99, 0.99, 0.99, 0.97, 0.84, 0.98, 0.99, 0.99, 0.99, 0.99, 0.99,
+                   0.99, 0.93, 0.98]
+
+
+def test_turn_617s_answer_is_command_speech_from_its_second_cell():
+    attr = Attributor(trigger_sample=4 * CELL, reply=True)
+    cells = _vads(attr, TURN_617_PAUSE + TURN_617_ANSWER)
+    answer = cells[len(TURN_617_PAUSE):]
+    assert answer[0].cls == CellClass.UNKNOWN                           # 0.53: below a run's opening
+    assert all(c.cls == CellClass.COMMAND_SPEECH and c.command for c in answer[1:])
+    assert attr.answer_start == (len(TURN_617_PAUSE) + 1) * CELL
+
+
+@pytest.mark.parametrize("reply", [True, False])
+def test_reply_speech_under_way_before_its_window_is_background_until_it_pauses(reply):
+    trigger = 40 * CELL
+    attr = Attributor(trigger_sample=trigger, reply=reply)
+    under_way = _vads(attr, [0.9] * 50)                                 # from 40 cells before the trigger
+    assert all(c.cls == CellClass.COMMAND_SPEECH and not c.command for c in under_way[:40])
+    if reply:
+        assert all(c.cls == CellClass.BACKGROUND_SPEECH and c.rule == Rule.UNDER_WAY and not c.command
+                   for c in under_way[40:])
+        assert attr.answer_start is None
+    else:                                                               # wake and button: unaffected
+        assert all(c.cls == CellClass.COMMAND_SPEECH and c.command for c in under_way[40:])
+    _vads(attr, [0.1] * 4, first=50)
+    answer = _vads(attr, [0.9] * 10, first=54)
+    assert all(c.cls == CellClass.COMMAND_SPEECH and c.command for c in answer)
+    assert attr.answer_start == 54 * CELL
+
+
+@pytest.mark.parametrize("lead, taken", [(REPLY_OVERLAP, True), (REPLY_OVERLAP + CELL, False)])
+def test_an_answer_may_start_up_to_480_ms_before_the_reply_window(lead, taken):
+    trigger = 40 * CELL
+    attr = Attributor(trigger_sample=trigger, reply=True)
+    first = (trigger - lead) // CELL
+    _vads(attr, [0.05] * first)
+    cells = _vads(attr, [0.9] * 30, first=first)
+    after = [c for c in cells if c.end > trigger]
+    assert all(c.command for c in after) is taken and any(c.command for c in after) is taken
+    assert attr.answer_start == (first * CELL if taken else None)

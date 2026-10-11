@@ -6,9 +6,10 @@ name: Controller Release (Docker image)
 #   ghcr.io/<owner>/echomuse-controller:X.Y.Z
 #   ghcr.io/<owner>/echomuse-controller:latest
 #
-# Deliberately no GitHub Release is created here: the controller's OTA
-# system polls the repo's releases for device firmware (v* tags with a
-# `server` asset), and controller releases must not appear there.
+# The image carries the device firmware too: controller/Dockerfile compiles
+# it in its `firmware` stage, and the controller installs only that binary.
+# There is no separate firmware release. No GitHub Release is created either;
+# the controller-update advisory reads the controller-v* tags themselves.
 #
 # The image is CPU-only (onnxruntime). GPU users build locally with
 # --build-arg GPU=1 (see controller/docker-compose.yml).
@@ -20,7 +21,8 @@ name: Controller Release (Docker image)
 # Every Python dependency resolves to a prebuilt aarch64 wheel on this base
 # image, including onnxruntime and sherpa-onnx, so the arm64 build compiles
 # nothing; it is emulated with QEMU, which costs time on the runner and
-# nothing at run time.
+# nothing at run time. The firmware stage is pinned to linux/amd64 (the NDK
+# is x86-64 only), so it compiles once, natively, for both platforms.
 
 on:
   push:
@@ -147,9 +149,8 @@ jobs:
           output: sbom-controller-${{ steps.version.outputs.version }}.cdx.json
 
       # Attached to the workflow run rather than to a Release, because
-      # controller tags deliberately create no GitHub Release — the OTA
-      # poller reads the releases list looking for device firmware, and a
-      # controller release appearing there would be offered to devices.
+      # controller tags deliberately create no GitHub Release (see the top of
+      # this file).
       # Retention is long: the useful question is "what was in the version I
       # am running", which is asked months after the release, not days.
       #

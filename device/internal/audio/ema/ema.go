@@ -1,6 +1,7 @@
 // Package ema encodes and validates EMA1 audio frames (WIRE §3, SPEC §16.1):
-// a fixed 64-byte little-endian header followed by PCM16 samples or cell
-// records. Encode and Decode work in caller buffers and never allocate.
+// a fixed 64-byte little-endian header followed by PCM16 samples, cell
+// records or AFE records. Encode and Decode work in caller buffers and never
+// allocate.
 package ema
 
 import (
@@ -23,6 +24,7 @@ const (
 	KindReference Kind = 2 // 16 kHz decimated final mix
 	KindRender    Kind = 3 // downlink render-source PCM
 	KindCells     Kind = 4 // cell records v1
+	KindAFE       Kind = 5 // AFE records v1 (afe_metadata_v1 sessions only)
 )
 
 // Format is the payload encoding (§16.1 offset 7).
@@ -31,6 +33,7 @@ type Format uint8
 const (
 	FormatPCM16  Format = 1 // signed PCM16 little-endian, kinds 1–3
 	FormatCellV1 Format = 2 // 4-byte cell records, kind 4
+	FormatAFEV1  Format = 3 // 14-byte AFE records, kind 5
 )
 
 // Header flag bits (§16.1 offset 5).
@@ -57,15 +60,17 @@ const UncertaintyUnknown uint32 = 0xffffffff
 
 // Sample rates and frame-count bounds per kind (§16.1).
 const (
-	RateCapture = 16000 // mic, reference, cells
+	RateCapture = 16000 // mic, reference, cells, afe
 	RateRender  = 48000 // render sources
 
 	MaxUplinkPCMFrames = 1280 // kinds 1 and 2
 	MaxRenderFrames    = 3840 // kind 3
 	MaxCells           = 320  // kind 4
+	MaxAFERecords      = 125  // kind 5
 
-	CellSamples    = 512 // mic samples per cell (§16.6)
-	CellRecordSize = 4   // bytes per cell record
+	CellSamples    = 512  // mic samples per cell (§16.6)
+	CellRecordSize = 4    // bytes per cell record
+	AFESamples     = 1280 // mic samples per AFE record: one capture period
 	pcmSampleSize  = 2
 )
 
@@ -83,6 +88,7 @@ var (
 	ErrGeneration    = errors.New("ema: generation must be zero for this kind")
 	ErrSourceMask    = errors.New("ema: invalid active-source mask")
 	ErrCellAlignment = errors.New("ema: cell first sample not a multiple of 512")
+	ErrAFEAlignment  = errors.New("ema: afe first sample not a multiple of 1280")
 	ErrPayloadLength = errors.New("ema: payload length mismatch")
 )
 
@@ -95,11 +101,11 @@ type Header struct {
 	Format        Format
 	Epoch         uint64
 	Sequence      uint64
-	FirstSample   uint64 // kind 4: start sample of the first cell
+	FirstSample   uint64 // kind 4: start sample of the first cell; kind 5: of the first record
 	MonoNs        uint64 // first-sample CLOCK_MONOTONIC ns; 0 for downlink
 	UncertaintyUs uint32
 	SampleRate    uint32
-	FrameCount    uint32 // samples, or cells for kind 4
+	FrameCount    uint32 // samples, or cells for kind 4, or records for kind 5
 	Generation    uint32 // kind 3 only
 	SourceMask    uint32 // kind 2 only
 	PayloadBytes  uint32
@@ -107,10 +113,14 @@ type Header struct {
 
 // FormatFor returns the only valid format for kind.
 func FormatFor(k Kind) Format {
-	if k == KindCells {
+	switch k {
+	case KindCells:
 		return FormatCellV1
+	case KindAFE:
+		return FormatAFEV1
+	default:
+		return FormatPCM16
 	}
-	return FormatPCM16
 }
 
 // RateFor returns the only valid sample rate for kind.
@@ -128,17 +138,22 @@ func MaxFrames(k Kind) uint32 {
 		return MaxRenderFrames
 	case KindCells:
 		return MaxCells
+	case KindAFE:
+		return MaxAFERecords
 	default:
 		return MaxUplinkPCMFrames
 	}
 }
 
 // PayloadLen is the exact payload length for a frame of kind with flags and
-// frames: frames×2 for PCM, 0 with digital silence, frames×4 for cells.
+// frames: frames×2 for PCM, 0 with digital silence, frames×4 for cells,
+// frames×14 for AFE records.
 func PayloadLen(k Kind, flags uint8, frames uint32) uint32 {
 	switch {
 	case k == KindCells:
 		return frames * CellRecordSize
+	case k == KindAFE:
+		return frames * AFERecordSize
 	case flags&FlagDigitalSilence != 0:
 		return 0
 	default:
@@ -165,7 +180,7 @@ func NewHeader(k Kind, flags uint8, epoch, seq, first uint64, frames uint32) Hea
 
 // Validate checks every WIRE §3 rule that a single header can violate.
 func (h *Header) Validate() error {
-	if h.Kind < KindMic || h.Kind > KindCells {
+	if h.Kind < KindMic || h.Kind > KindAFE {
 		return ErrKind
 	}
 	if h.Flags&^flagsKnown != 0 || (h.Flags&FlagDigitalSilence != 0 && h.Kind != KindReference) {
@@ -194,6 +209,9 @@ func (h *Header) Validate() error {
 	}
 	if h.Kind == KindCells && h.FirstSample%CellSamples != 0 {
 		return ErrCellAlignment
+	}
+	if h.Kind == KindAFE && h.FirstSample%AFESamples != 0 {
+		return ErrAFEAlignment
 	}
 	if h.PayloadBytes != PayloadLen(h.Kind, h.Flags, h.FrameCount) {
 		return ErrPayloadLength

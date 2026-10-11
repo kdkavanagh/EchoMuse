@@ -17,7 +17,9 @@ import numpy as np
 import pytest
 
 import em_speech_worker as sw
+from _wyoming_fake import FakeWyoming
 from em_audio_timeline import ReferenceTimeline, SampleTimeline, StreamId
+from em_pause_asr import WyomingServer
 
 ROOT = Path(__file__).resolve().parents[2]
 CONTROLLER = ROOT / "controller"
@@ -217,6 +219,70 @@ def test_finalize_at_each_pause_carries_the_last_word_before_the_live_chunk(bund
     assert resumed.through_sample < pauses[1]
     assert resumed.payload.tokens[:len(first.payload.tokens)] == first.payload.tokens
     assert len(resumed.payload.tokens) > len(first.payload.tokens)
+
+
+def two_pauses(registry, bundle_dir, speech, server):
+    """[1 s zeros, clip, 1 s zeros, clip, 3 s zeros] through a worker with a pause server,
+    fed at twice real time so a server's answer lands blocks after the pause."""
+    async def main():
+        w = sw.SpeechWorker(registry, bundle_dir=str(bundle_dir), job_deadline_s=60.0)
+        await w.start()
+        try:
+            silence = np.zeros(16_000, np.int16)
+            audio = np.concatenate([silence, speech, silence, speech, silence, silence, silence])
+            audio = audio[: audio.size // 1280 * 1280]
+            w.open_lease("dev", 7, "L", registry.active().graph_sha256)
+            w.open_utterance("L", "U", 0, 0, SampleTimeline(), pause_server=server)
+            for k in range(0, audio.size, 1280):
+                w.submit_mic_block("L", k, audio[k:k + 1280])
+                await asyncio.sleep(0.04)
+            return await drain(w, lambda got: any(o.kind == "asr" and o.through_sample == audio.size for o in got))
+        finally:
+            await w.close()
+    return run(main())
+
+
+def test_the_pause_servers_words_follow_kroko_without_holding_it(bundle_dir, registry, speech):
+    """Each pause sends the evidence copy so far to the server. Kroko's finalized result is
+    reported without waiting for it (an answer already in by then rides it); the server's
+    transcript rides the results from its answer on, while the tokens stay Kroko's, until
+    new speech replaces the finalized result."""
+    words = "Ask not what your country can do for you."
+    with FakeWyoming(words, delay=0.2) as fake:
+        obs = two_pauses(registry, bundle_dir, speech, WyomingServer(fake.host, fake.port, "", "en"))
+    assert not [o for o in obs if o.kind == "error"]
+    asr = [o for o in obs if o.kind == "asr"]
+    finals = [i for i, o in enumerate(asr) if o.payload.finalized]
+    answers = [i for i, o in enumerate(asr) if o.payload.pause_decode is not None]
+    assert len(finals) == 2 and len(answers) == 2 and len(fake.requests) == 2
+    for final, answer, request in zip(finals, answers, fake.requests):
+        assert asr[final].payload.text.lower().endswith("your country")      # Kroko's own result
+        decode = asr[answer].payload.pause_decode
+        assert answer >= final and decode.through == asr[final].through_sample
+        assert (decode.text, decode.error) == (words, None) and decode.ms >= 200
+        sent = b"".join(payload for kind, _, payload in request if kind == "audio-chunk")
+        assert len(sent) == 2 * decode.through                               # [0, through) of the utterance
+        held = [o for o in asr[answer:] if o.payload.tokens == asr[final].payload.tokens]
+        assert held and all(o.payload.pause_text == words for o in held)
+    resumed = next(o for o in asr[answers[0]:] if o.payload.tokens != asr[finals[0]].payload.tokens)
+    assert resumed.payload.pause_text is None                               # new speech: Kroko's text again
+
+
+def test_a_silent_pause_server_never_holds_kroko(bundle_dir, registry, speech, monkeypatch):
+    monkeypatch.setattr(sw, "PAUSE_REMOTE_TIMEOUT_S", 1.0)
+    with FakeWyoming(hang=True) as fake:
+        obs = two_pauses(registry, bundle_dir, speech, WyomingServer(fake.host, fake.port, "", "en"))
+    assert not [o for o in obs if o.kind == "error"]
+    asr = [o for o in obs if o.kind == "asr"]
+    finals = [i for i, o in enumerate(asr) if o.payload.finalized]
+    assert len(finals) == 2
+    for i in finals:
+        assert asr[i].payload.text.lower().endswith("your country")
+        assert asr[i].computed_at_ms - asr[i - 1].computed_at_ms < 600        # not the 1 s timeout
+    assert all(o.payload.pause_text is None for o in asr)
+    decodes = [o.payload.pause_decode for o in asr if o.payload.pause_decode is not None]
+    assert decodes and all(d.text is None and d.error in ("timeout", "superseded") for d in decodes)
+    assert decodes[-1].error == "timeout" and decodes[-1].ms >= 1_000
 
 
 def test_the_flush_reaches_speech_just_past_a_chunk_edge(bundle_dir, registry, speech):

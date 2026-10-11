@@ -22,7 +22,7 @@ import logging
 import time
 import uuid
 from collections.abc import AsyncGenerator, Mapping
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from typing import (TYPE_CHECKING, AsyncIterator, Awaitable, Callable, Coroutine, Protocol, TypedDict,
                     assert_never, runtime_checkable)
@@ -53,12 +53,14 @@ from echomuse_grammar import (
     RelativeDay,
     TimerCancel,
 )
+from em_afe import AfeEvidence, AfeSeries, TurnStage, series_range, turn_evidence, turn_series
 from em_alert_wire import RingKind, Weekday
 from em_alerts import ActSource, AlertResult, JournalSource
 from em_attribution import (
     CELL,
     ECHO_WINDOW_CELLS,
     MAX_LAG,
+    REPLY_OVERLAP,
     Coverage,
     EchoResult,
     EchoTracker,
@@ -71,8 +73,10 @@ from em_attribution import (
     wake_trigger_sample,
 )
 from em_audio_timeline import (
+    AFE_PERIOD_SAMPLES,
     CANDIDATE_CELLS_LEAD,
     CANDIDATE_REFERENCE_LEAD,
+    AfeTimeline,
     Delivery,
     LeaseEnd,
     LeaseMessage,
@@ -84,7 +88,7 @@ from em_audio_timeline import (
     parse_u64,
 )
 from em_device_link import AckStatus, CloseReason, CommandAck, Envelope, MessageType
-from em_endpoint_policy import Route, redecode_differs
+from em_endpoint_policy import Route, recognized_completeness, recognizer_sentences, redecode_differs
 from em_ha_client import (
     HaError,
     HaTimer,
@@ -98,6 +102,7 @@ from em_ha_client import (
     SttEnded,
     TtsReady,
 )
+from em_pause_asr import PAUSE_ASR_KEY, WyomingServer, parse_pause_asr
 from em_render import FinishReason, SourceClass
 from em_speech_worker import (
     VERIFICATION_LOOKAHEAD,
@@ -113,9 +118,10 @@ from em_speech_worker import (
     VerificationPayload,
     VerificationResult,
 )
-from em_stt_copy import asr_gain_for, stt_copy
+from em_stt_copy import STT_TAIL_SILENCE, asr_gain_for, stt_copy
 from em_utterance import (
     PREROLL,
+    REPLY_KINDS,
     CellAssembler,
     Close,
     Commit,
@@ -123,10 +129,12 @@ from em_utterance import (
     Pending,
     ReplyWatch,
     Revoked,
+    TextSource,
     Utterance,
     UtteranceKind,
     UtteranceTrace,
     UtteranceSpec,
+    pause_command,
     redecoded_command,
 )
 from em_wake_phrase import final_command_text
@@ -152,7 +160,12 @@ HA_TIMEOUT_S = 30.0              # intent run sent → intent-end
 RESPONSE_START_S = 10.0          # intent-end → response audio start
 RESPONSE_STALL_S = 2.0           # no output progress
 RESPONSE_TOTAL_S = 120.0         # one spoken response
-REPLY_S = 7.0                    # reply window after guarded drain
+# A reply turn opened at the drain starts this long before its trigger: the 480 ms an answer
+# may overlap the question's end, plus the pre-roll (§16.6).
+REPLY_LEAD = REPLY_OVERLAP + PREROLL
+# Wall-clock bound on a reply window without command speech (§16.2): the 7 s window is sample
+# time, so a lease that delivers no mic, or stops, would otherwise leave the Dot listening.
+REPLY_WALL_S = 10.0
 REPLY_CHAIN_MAX = 5              # no-wake replies per chain
 REPLY_CHAIN_S = 60.0
 ACTOR_TICK_S = 0.050
@@ -160,6 +173,16 @@ LOCAL_ACT_TIMEOUT_S = 2.0
 PERSIST_SHUTDOWN_S = 2.0         # shutdown waits this long for pending turn rows (§11.3)
 WAKE_ARBITRATION_MS = 700.0      # default `wakeArbitrationMs`
 PLAYBACK_POLL_S = 0.05           # dialog output start/progress check while it waits or plays
+# HA's sentence matcher on a stable prefix (§16.6): an answer later than this could no longer
+# shorten any pause, so the query stops waiting for it.
+RECOGNIZE_TIMEOUT_S = 2.0
+
+# A committed turn's response lease (§4.4) carries its AFE records, and while `saveUtterances` is on
+# its mic, on through the response: at most this long after the commit, and this long past the
+# turn's end, for the AEC settling after the last of the response and the audio still in flight
+# when it drained.
+RESPONSE_LEASE_MAX_S = 30.0
+RESPONSE_LEASE_TAIL_S = 1.0
 
 # Sample-time bounds on evidence the actor waits for.
 ECHO_WAIT = SAMPLE_RATE          # reference for a cell's echo label: wait ≤1 s of mic time
@@ -190,7 +213,6 @@ class ActorState(enum.StrEnum):
     COMMITTED = "COMMITTED"
     THINKING = "THINKING"
     SPEAKING = "SPEAKING"
-    EXPECT_REPLY = "EXPECT_REPLY"
     CLOSING = "CLOSING"
 
     @property
@@ -198,8 +220,7 @@ class ActorState(enum.StrEnum):
         match self:
             case ActorState.IDLE | ActorState.CLOSING:
                 return VoicePhase.IDLE
-            case (ActorState.ARMED | ActorState.LISTENING | ActorState.END_PENDING
-                  | ActorState.EXPECT_REPLY):
+            case ActorState.ARMED | ActorState.LISTENING | ActorState.END_PENDING:
                 return VoicePhase.LISTENING
             case ActorState.COMMITTED | ActorState.THINKING:
                 return VoicePhase.THINKING
@@ -416,7 +437,10 @@ class TurnRow(TypedDict, total=False):
     reply_to: str | None
     continuation: Continuation | None
     first_audio_ms: int | None
+    response_latency_ms: int | None
     decision_trace: str | None
+    afe_evidence: str | None          # AfeEvidence JSON; None: the device lacks afe_metadata_v1
+    afe_series: str | None            # AfeSeries JSON; None: unavailable or no data
 
 
 class _AlertAct(TypedDict):
@@ -437,6 +461,7 @@ class ActorDeps:
     arbiter: WakeArbiter
     config: Callable[[], Mapping[str, object]]
     ha_device_id: Callable[[], str | None]
+    recognizer: Callable[[], bool]      # HA's sentence matcher answers (connected, probe passed; §16.6)
     pipeline_id: Callable[[], Awaitable[str]]
     vocabulary: Callable[[], Vocabulary | None]
     esphome_reply: Callable[[bytes], AsyncIterator[RunEvent]]
@@ -663,6 +688,17 @@ class _Close:
     pass
 
 
+@dataclass(frozen=True, slots=True)
+class _Recognized:
+    """HA's sentence matcher on one stable prefix of an utterance (§16.6); `klass` None: no answer."""
+
+    utterance_id: str
+    text: str
+    klass: GrammarClass | None
+    ms: int
+    error: str | None
+
+
 @dataclass
 class _Focus:
     lease_id: str
@@ -685,6 +721,10 @@ class _Runtime:
     echo_known: int = 0               # cells labelled with a trusted reference (coverage)
     echo_total: int = 0
     last_mic_end: int | None = None
+    # The lease's native AFE records when it takes the session's `afe` stream
+    # (afe_metadata_v1), else None. Held past the lease's release so the turn or
+    # candidate can summarise them when it ends; evidence only, never a decision input.
+    afe: AfeTimeline | None = None
 
 
 @dataclass
@@ -732,6 +772,35 @@ class _Candidate:
 
 
 @dataclass(frozen=True, slots=True)
+class _Clip:
+    """Canonical PCM read off a lease's mic timeline, starting at capture sample `start`."""
+
+    start: int
+    pcm: bytes
+
+    @property
+    def span(self) -> tuple[int, int]:
+        return self.start, self.end
+
+    @property
+    def end(self) -> int:
+        return self.start + len(self.pcm) // 2
+
+
+@dataclass
+class _ResponseLease:
+    """A committed turn's response `turn` lease (§4.4) and what it received: `afe` always, `mic`
+    when the turn recording is made. It closes at `close_at`: RESPONSE_LEASE_MAX_S after the
+    commit, or RESPONSE_LEASE_TAIL_S after the turn ends, whichever is first; `done` resolves once
+    it has ended, however it ended."""
+
+    lease_id: str
+    timeline: LeaseTimeline
+    close_at: float
+    done: asyncio.Future[None]
+
+
+@dataclass(frozen=True, slots=True)
 class _AmPmPending:
     """"AM or PM?": the alarm waiting for its half of the day, and the turn that asked."""
 
@@ -769,8 +838,8 @@ class _Expectation:
     runtime: _Runtime | None = None
     watch: ReplyWatch = field(default_factory=ReplyWatch)
     prompt: Playback | None = None
-    deadline: float | None = None
-    drain_pending: bool = False
+    awaiting_audio: bool = False      # the window opened before the lease had any mic: open at its first cell
+    window_opened: float | None = None   # loop time the reply window opened (drain, or an early answer)
     origin: _Turn | None = None       # the turn that asked; its row records what became of the question
 
 
@@ -794,12 +863,15 @@ class _Turn:
     playback: Playback | None = None
     playback_reason: PlaybackEnd | None = None   # how the spoken response ended (render.finished reason, or a limit)
     committed_at: float | None = None         # monotonic time the endpoint commit was handled
+    commit_frontier: int | None = None        # the newest mic sample received by then: places `stages`
+    utterance_end_ns: float | None = None     # device CLOCK_MONOTONIC of commit.boundary; None: no mic clock fit
     audible_at: float | None = None           # monotonic time the response became audible
     continuation: Continuation | None = None  # fate of the follow-up this turn asked for; None: it asked none
     persisted: asyncio.Task[int | None] | None = None   # the row write; its result is the row id
     wake_db: float | None = None
-    wake_clip: bytes | None = None
-    stt_copy: bytes | None = None
+    wake_clip: _Clip | None = None
+    capture: _Clip | None = None              # the committed lease's mic for the turn recording; None: not made
+    stt_copy: bytes | None = None             # the committed span as sent to STT, sample for sample
     stt_raw: str | None = None                # HA's transcript before wake-phrase removal
     stt_text: str | None = None               # what was routed: stripped HA transcript or local command
     response_text: str | None = None          # the spoken answer, from whichever handler took the request
@@ -809,7 +881,12 @@ class _Turn:
     terminal: TerminalReason | None = None
     commit: Commit | None = None
     coverage: float | None = None
+    afe_evidence: AfeEvidence | None = None   # native AFE evidence; None: unavailable (or not yet taken)
+    afe_series: AfeSeries | None = None       # the per-period records behind it; None: unavailable or no data
+    response_lease: _ResponseLease | None = None   # the lease after the commit; None: none opened
+    stages: dict[TurnStage, tuple[float, float]] = field(default_factory=dict)   # monotonic [start, end]
     timings: dict[str, int] = field(default_factory=dict)
+    reopened: list[UtteranceTrace] = field(default_factory=list)   # a reply's utterances before a gap
 
 
 @dataclass
@@ -820,8 +897,8 @@ class _Announcement:
     future: asyncio.Future[None]
 
 
-_Event = (_Attach | _Detach | _MicEpoch | Envelope | _Audio | Observation | _Button | _Cancel | _Diagnostic
-          | _Announcement | _Close)
+_Event = (_Attach | _Detach | _MicEpoch | Envelope | _Audio | Observation | _Recognized | _Button | _Cancel
+          | _Diagnostic | _Announcement | _Close)
 
 
 class SessionActor:
@@ -856,6 +933,7 @@ class SessionActor:
         self._persists: set[asyncio.Task[object]] = set()
         self._listener_futures: set[asyncio.Future[object]] = set()   # awaitables listeners returned
         self._dialog_active = False
+        self._response_leases: dict[str, _ResponseLease] = {}   # by lease id, until each has ended
 
     # --- public surface -------------------------------------------------------
 
@@ -884,9 +962,11 @@ class SessionActor:
         if self._task is not None:
             await self._task
 
-    def attach(self, link: _Link, render: RenderClient) -> None:
-        """Session ready: the new session's link, renderer, and an empty uplink record."""
-        self.link, self.render, self.uplink = link, render, UplinkSession()
+    def attach(self, link: _Link, render: RenderClient, *, afe_metadata: bool = False) -> None:
+        """Session ready: the new session's link, renderer, and an empty uplink record.
+        `afe_metadata`: session.ready granted it, so the session carries the `afe` stream."""
+        self.link, self.render = link, render
+        self.uplink = UplinkSession(afe_metadata=afe_metadata)
         self._post(P_LOSS, _Attach())
 
     def detach(self, reason: CloseReason) -> None:
@@ -920,7 +1000,11 @@ class SessionActor:
         """One uplink EMA1 frame. Raises `em_audio_timeline.ProtocolError` for a WIRE violation."""
         if self.uplink is None:
             return
-        deliveries = self.uplink.ingest(frame)
+        # `ingest` has already stored AFE records, and a response lease's mic, in their leases'
+        # timelines; they are read only when a turn or candidate ends, so they never reach the
+        # queue, the worker, or a decision.
+        deliveries = [d for d in self.uplink.ingest(frame)
+                      if d.stream_id != StreamId.AFE and d.lease_id not in self._response_leases]
         if deliveries:
             gap = any(d.packet.discontinuity or d.packet.muted for d in deliveries)
             self._post(P_GAP if gap else P_SPEECH, _Audio(deliveries))
@@ -1009,6 +1093,8 @@ class SessionActor:
                 await self._audio(deliveries)
             case Observation():
                 await self._observation(event)
+            case _Recognized():
+                self._recognized(event)
             case _Button(body):
                 await self._button(body)
             case _Cancel(reason):
@@ -1041,6 +1127,8 @@ class SessionActor:
                 await self._lease_message(self.uplink.leases.renew(lease.lease_id))
             for lease in self.uplink.leases.expire():
                 await self._lease_ended(lease.lease_id, lease.ended or LeaseEnd.TTL)
+        for response in [r for r in self._response_leases.values() if now >= r.close_at]:
+            await self._end_response_lease(response)
         for focus in list(self._focus.values()):
             if now - focus.renewed >= RENEW_S:
                 focus.renewed = now
@@ -1049,14 +1137,30 @@ class SessionActor:
         candidate = self._candidate
         if candidate is not None and now - candidate.received >= WAKE_VERIFY_S:
             await self._decide_candidate(candidate, deadline=True)
-        exp = self._expectation
-        if exp is not None and exp.deadline is not None and now >= exp.deadline and self._turn is None:
-            await self._end_expectation(TerminalReason.REPLY_TIMEOUT)
+        await self._reply_wall_clock(now)
+
+    async def _reply_wall_clock(self, now: float) -> None:
+        """§16.2 backstop: a reply window without command speech REPLY_WALL_S after it opened
+        closes `no_input` as silently as its sample-time end, whatever the mic did."""
+        turn = self._turn
+        exp = turn.expectation if turn is not None and turn.trigger in REPLY_KINDS else None
+        if (turn is not None and exp is not None and turn.commit is None and turn.terminal is None
+                and not turn.utterance.has_command_speech and exp.window_opened is not None
+                and now - exp.window_opened >= REPLY_WALL_S):
+            log.warning("[%s] reply turn %s: no answer %.0f s after its window opened; closing",
+                        self.device_id, turn.turn_id, REPLY_WALL_S)
+            await self._finish_turn(turn, TerminalReason.NO_INPUT)
+        waiting = self._expectation
+        if (waiting is not None and waiting.awaiting_audio and waiting.window_opened is not None
+                and now - waiting.window_opened >= REPLY_WALL_S):
+            log.warning("[%s] reply window got no microphone in %.0f s; closing", self.device_id, REPLY_WALL_S)
+            await self._end_expectation(TerminalReason.NO_INPUT, outcome=TerminalReason.REPLY_TIMEOUT)
 
     async def _shutdown(self) -> None:
         if self._turn is not None:
             await self._finish_turn(self._turn, TerminalReason.SESSION_LOST, feedback=False)
         await self._drop_expectation(TerminalReason.SESSION_LOST)
+        await self._end_all_response_leases(close=True)   # the rows wait for none of them
         if self._persists:
             await asyncio.wait(list(self._persists), timeout=PERSIST_SHUTDOWN_S)
         for task in list(self._tasks):
@@ -1071,6 +1175,7 @@ class SessionActor:
         if uplink is not None:
             for lease in uplink.clear(LeaseEnd.SESSION):
                 self.deps.worker.close_lease(lease.lease_id)
+        await self._end_all_response_leases(close=False)
         self._candidate = None
         if self._turn is not None:
             await self._finish_turn(self._turn, TerminalReason.SESSION_LOST)
@@ -1092,6 +1197,7 @@ class SessionActor:
         if self.uplink is not None:
             for lease in self.uplink.clear(LeaseEnd.MUTE):
                 self.deps.worker.close_lease(lease.lease_id)
+        await self._end_all_response_leases(close=False)
         self._candidate = None
         self._diagnostic_lease = None
         if self._turn is not None:
@@ -1116,6 +1222,10 @@ class SessionActor:
         runtime = self._runtimes.pop(lease_id, None)
         if runtime is not None:
             self.deps.worker.close_lease(lease_id)
+        response = self._response_leases.get(lease_id)
+        if response is not None:
+            await self._end_response_lease(response, close=False)
+            return
         if lease_id == self._diagnostic_lease:
             self._diagnostic_lease = None
             if reason not in (LeaseEnd.TTL, LeaseEnd.CLOSED):   # 30 min cap and explicit closes stay closed
@@ -1201,6 +1311,10 @@ class SessionActor:
         runtime = self._new_runtime(lease_id)
         candidate = _Candidate(wire, model, runtime, asyncio.get_running_loop().time(), wire.peak)
         self._candidate = candidate
+        if self.deps.recognizer():
+            # The command's prefixes are asked about in a second or two (§16.6): make sure
+            # HA's sentence matcher is resident by then, not paged out after idle.
+            self._spawn(self._warm_recognizer())
         if not candidate.producing_sound:
             # Idle profile: the BCResNet threshold alone accepts (§6.1).
             await self._accept_candidate(candidate)
@@ -1258,11 +1372,12 @@ class SessionActor:
         """Close the candidate lease (also releasing any provisional duck); no turn, focus, or chime
         (a local_wake_chime device may already have chimed an idle candidate; it is not retracted)."""
         self._candidate = None
+        afe, series = _afe_snapshot(candidate.runtime, candidate, None)
         close = LeaseEnd.ARBITRATION_LOST if reason == TerminalReason.ARBITRATION_LOST else LeaseEnd.REJECTED
         await self._close_uplink(candidate.lease_id, close)
         self._release_runtime(candidate.lease_id)
         self._emit(ActorEvent(ActorEventKind.TERMINAL, self.state, reason, self._dialog_active))
-        self._persists.add(self._spawn(self._persist_candidate(candidate, reason)))
+        self._persists.add(self._spawn(self._persist_candidate(candidate, reason, afe, series)))
 
     async def _accept_candidate(self, candidate: _Candidate) -> None:
         context, target = self._command_context(candidate)
@@ -1329,11 +1444,15 @@ class SessionActor:
         await self._supersede()
         turn_id, lease_id = str(uuid.uuid4()), str(uuid.uuid4())
         mic = max(0, press - PREROLL)
-        await self._lease_message(uplink.open(lease_id, LeaseReason.TURN, turn_id, capture_epoch, {
+        streams: dict[StreamId, int | None] = {
             StreamId.MIC: mic,
             StreamId.CELLS: max(0, mic - CANDIDATE_CELLS_LEAD),
             StreamId.REFERENCE: max(0, mic - CANDIDATE_REFERENCE_LEAD),
-        }))
+        }
+        if uplink.afe_metadata:
+            # From the reference start (the AEC state before the press); the lease rounds it to 1280.
+            streams[StreamId.AFE] = streams[StreamId.REFERENCE]
+        await self._lease_message(uplink.open(lease_id, LeaseReason.TURN, turn_id, capture_epoch, streams))
         model = self.deps.registry.for_config(self._config())
         await self.deps.worker.load_wake_graph(model.graph_sha256)
         self.deps.worker.open_lease(self.device_id, capture_epoch, lease_id, model.graph_sha256)
@@ -1350,20 +1469,25 @@ class SessionActor:
         await self._open_utterance(turn)
 
     async def _cancel(self, reason: TerminalReason) -> None:
-        if self._turn is not None:
-            await self._finish_turn(self._turn, reason)
+        turn = self._turn
+        if turn is not None:
+            # A reply window dismissed before anyone spoke ends quietly, as an expectation does.
+            silent = turn.trigger in REPLY_KINDS and not turn.utterance.has_command_speech
+            await self._finish_turn(turn, reason, feedback=not silent)
         elif self._expectation is not None:
             await self._end_expectation(reason)
         elif self._dialog_playback is not None and not self._dialog_playback.done:
             await self._dialog_playback.cancel(reason)
 
     def _take_expectation(self) -> _Expectation | None:
-        """A still-valid question survives an explicit wake/button as context (§9.1)."""
+        """A still-valid question survives an explicit wake/button as context (§9.1): the live
+        expectation, or the one an uncommitted reply turn listens for. Valid: within the chain's
+        REPLY_CHAIN_S (a reply turn without command speech is inside its window by construction)."""
         exp = self._expectation
-        if exp is None:
-            return None
-        now = asyncio.get_running_loop().time()
-        if (exp.deadline is not None and now >= exp.deadline) or now - exp.chain_started >= REPLY_CHAIN_S:
+        turn = self._turn
+        if exp is None and turn is not None and turn.trigger in REPLY_KINDS and turn.commit is None:
+            exp = turn.expectation
+        if exp is None or asyncio.get_running_loop().time() - exp.chain_started >= REPLY_CHAIN_S:
             return None
         self._settle(exp, FollowUp.WAKE)
         return exp
@@ -1382,7 +1506,7 @@ class SessionActor:
 
     def _spec(self, kind: UtteranceKind, start: int, trigger: int, inherited: _Expectation | None = None, *,
               seed_start: int | None = None, wake_open: int | None = None, wake_phrase: str | None = None,
-              context: CommandContext | None = None) -> UtteranceSpec:
+              context: CommandContext | None = None, no_input_at: int | None = None) -> UtteranceSpec:
         vocab = self.deps.vocabulary()
         return UtteranceSpec(
             utterance_id=str(uuid.uuid4()), kind=kind, start=start, trigger=trigger,
@@ -1391,6 +1515,9 @@ class SessionActor:
             choices=inherited.choices if inherited is not None else None,
             context=context,
             extended=bool(self._config().get("extendedUtterances")),
+            # Route R (the ESPHome reply) reads no completeness: nothing to transcribe at its pauses.
+            pause_server=None if kind == UtteranceKind.HA_REPLY else self._pause_server(),
+            no_input_at=no_input_at,
         )
 
     async def _open_utterance(self, turn: _Turn) -> None:
@@ -1403,7 +1530,7 @@ class SessionActor:
         timeline.set_utterance_start(spec.start)
         try:
             self.deps.worker.open_utterance(runtime.lease_id, spec.utterance_id, spec.start, spec.trigger,
-                                            timeline.mic)
+                                            timeline.mic, pause_server=spec.pause_server)
         except SpeechWorkerError as exc:
             log.warning("[%s] utterance ASR failed to open: %s", self.device_id, exc)
             await self._finish_turn(turn, TerminalReason.INTERRUPTED)
@@ -1416,36 +1543,55 @@ class SessionActor:
             turn.utterance.push_cell(ev)
         await self._pump(runtime)
 
-    async def _start_reply(self, exp: _Expectation, onset: int) -> None:
-        """The qualifying reply starts at onset − 300 ms under the expectation's context (§16.6)."""
+    async def _open_reply(self, exp: _Expectation, trigger: int, *, early: bool = False) -> None:
+        """The reply turn (id = exp.owner) under the expectation's context (§9.1, §16.6), opened
+        like a button turn: at the guarded drain with its trigger there, or at an early answer's
+        onset. The normal reducer then decides what is the answer; a silent window closes
+        `no_input`. The utterance starts REPLY_LEAD before a drain trigger (300 ms before an
+        early answer's onset), never before the lease's first retained sample. Unless an answer
+        is already under way, the drain is cued with the wake chime (§11.2)."""
         runtime = exp.runtime
         timeline = self._timeline(runtime) if runtime is not None else None
         if exp is not self._expectation or runtime is None or timeline is None:
             return
+        exp.awaiting_audio = False
+        if exp.window_opened is None:                 # an early answer opens its window here
+            exp.window_opened = asyncio.get_running_loop().time()
         # §16.2: the generation increases before prior output is cancelled.
         self._generation += 1
         if exp.prompt is not None and not exp.prompt.done:
             await exp.prompt.cancel("early_answer")
-        self._settle(exp, FollowUp.ANSWERED)
-        # The reply turn (id = exp.owner) holds input focus before the asking turn releases its own.
+        # The reply turn holds input focus before the asking turn releases its own.
         await self._acquire_focus(exp.owner, Focus.DIALOG_INPUT, self._generation)
         if self._turn is not None:
             await self._finish_turn(self._turn, TerminalReason.COMPLETED, feedback=False)
         self._expectation = None
-        first = timeline.mic.first_sample if timeline.mic.first_sample is not None else onset
-        start = min(onset, max(onset - PREROLL, first))
+        first = timeline.mic.first_sample if timeline.mic.first_sample is not None else trigger
+        start = min(trigger, max(trigger - (PREROLL if early else REPLY_LEAD), first))
         kind = UtteranceKind.HA_REPLY if exp.source == UtteranceKind.HA_REPLY else UtteranceKind.REPLY
         turn = _Turn(exp.owner, self._generation, kind, asyncio.get_running_loop().time(),
-                     Utterance(self._spec(kind, start, onset, exp)), runtime,
+                     Utterance(self._spec(kind, start, trigger, exp)), runtime,
                      conversation_id=exp.conversation_id, expectation=exp)
         self._turn = turn
         self._set_state(ActorState.ARMED)
+        log.info("[%s] reply turn %s open for %s at %d%s", self.device_id, turn.turn_id,
+                 exp.origin.turn_id if exp.origin is not None else exp.source, trigger,
+                 " (early answer)" if early else "")
         await self._open_utterance(turn)
+        if (early or not self._current(turn) or turn.utterance.answer_under_way
+                or not em_config_sections.wake_sound(self._config()) or self.render is None):
+            return
+        try:
+            await self.render.play_local(SourceClass.EARCON, WAKE_CHIME, generation=turn.generation)
+        except Exception:
+            log.warning("[%s] reply chime failed", self.device_id, exc_info=True)
 
     # --- audio and evidence ---------------------------------------------------------------
 
     def _new_runtime(self, lease_id: str) -> _Runtime:
-        runtime = _Runtime(lease_id, CellAssembler())
+        timeline = self.uplink.timelines.get(lease_id) if self.uplink is not None else None
+        afe = timeline.afe if timeline is not None and StreamId.AFE in timeline.lease.streams else None
+        runtime = _Runtime(lease_id, CellAssembler(), afe=afe)
         self._runtimes[lease_id] = runtime
         return runtime
 
@@ -1511,7 +1657,8 @@ class SessionActor:
                 if runtime.utterance is not None and obs.utterance_id == runtime.utterance.utterance_id:
                     runtime.utterance.push_asr(asr.tokens, asr.token_emission_sample,
                                                asr.trailing_blank_frames, obs.through_sample,
-                                               finalized=asr.finalized)
+                                               finalize_ms=asr.finalize_ms, pause_text=asr.pause_text,
+                                               pause_decode=asr.pause_decode)
             case EchoPayload() as echo:
                 if obs.utterance_id and obs.utterance_id.startswith(CANDIDATE_TAG):
                     if candidate is not None:
@@ -1570,17 +1717,16 @@ class SessionActor:
         released = runtime.assembler.release()
         exp = self._expectation
         if exp is not None and exp.runtime is runtime and runtime.utterance is None:
-            if exp.drain_pending and runtime.assembler.frontier is not None:
-                exp.drain_pending = False
-                onset = exp.watch.drained(runtime.assembler.history[0].start, runtime.assembler.history)
-                if onset is not None:
-                    await self._start_reply(exp, onset)
+            if exp.awaiting_audio:
+                if runtime.assembler.history:
+                    await self._open_reply(exp, runtime.assembler.history[0].start)
                     return
-            for ev in released:
-                onset = exp.watch.push(ev)
-                if onset is not None:
-                    await self._start_reply(exp, onset)
-                    return
+            else:
+                for ev in released:
+                    onset = exp.watch.push(ev)
+                    if onset is not None:
+                        await self._open_reply(exp, onset, early=True)
+                        return
         utterance = runtime.utterance
         if utterance is None:
             await self._schedule_candidate_comparison(runtime, timeline)
@@ -1590,18 +1736,67 @@ class SessionActor:
         turn = self._turn
         if turn is None or turn.utterance is not utterance or utterance.done:
             return
+        reopen = utterance.reopen_at
+        if reopen is not None:
+            await self._reopen_reply(turn, reopen)
+            return
         self._measure_wake(turn, runtime)
         mic_end = timeline.mic.frontier or utterance.spec.start
         for decision in utterance.advance(mic_end):
             await self._decision(turn, decision)
             if turn.terminal is not None or utterance.done:
                 return
+        if self.deps.recognizer():
+            text = utterance.recognizer_query()
+            if text is not None:
+                self._spawn(self._recognize(utterance.utterance_id, text))
         if self.state == ActorState.ARMED and utterance.has_command_speech:
             self._set_state(ActorState.LISTENING)
         if mic_end - utterance.asr_through > ASR_STALL:
             log.warning("[%s] utterance ASR stopped at %d with mic at %d", self.device_id,
                         utterance.asr_through, mic_end)
             await self._finish_turn(turn, TerminalReason.INTERRUPTED)
+
+    async def _reopen_reply(self, turn: _Turn, at: int) -> None:
+        """A gap before any answer does not end a reply window (§16.6): the reply listens on with
+        a fresh utterance from the gap's end, its trigger no earlier than the window's, closing
+        `no_input` at the window's original end. The trace keeps the utterance it replaces."""
+        old = turn.utterance
+        log.info("[%s] reply turn %s: gap before any answer, listening on from %d", self.device_id,
+                 turn.turn_id, at)
+        turn.reopened.append(old.trace())
+        self.deps.worker.close_utterance(turn.runtime.lease_id)
+        turn.utterance = Utterance(self._spec(old.spec.kind, at, max(old.spec.trigger, at), turn.expectation,
+                                              no_input_at=old.no_input_at))
+        await self._open_utterance(turn)
+
+    async def _recognize(self, utterance_id: str, text: str) -> None:
+        """Ask HA's sentence matcher about a stable prefix (§16.6). The answer joins the speech
+        evidence in arrival order: at a lower priority, blocks already queued behind a pause's
+        re-decode would be judged before it."""
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        klass: GrammarClass | None = None
+        error: str | None = None
+        try:
+            said, probe = await self.deps.ha.recognize(recognizer_sentences(text), self.deps.ha_device_id(),
+                                                       timeout=RECOGNIZE_TIMEOUT_S)
+            klass = recognized_completeness(said, probe)
+        except (HaError, HaUnavailable) as err:
+            error = str(err)
+        self._post(P_SPEECH, _Recognized(utterance_id, text, klass, round((loop.time() - started) * 1000), error))
+
+    def _recognized(self, answer: _Recognized) -> None:
+        turn = self._turn
+        if turn is None or turn.utterance.utterance_id != answer.utterance_id:
+            return
+        turn.utterance.recognized(answer.text, answer.klass, ms=answer.ms, error=answer.error)
+
+    async def _warm_recognizer(self) -> None:
+        try:
+            await self.deps.ha.warm_recognizer(self.deps.ha_device_id(), timeout=RECOGNIZE_TIMEOUT_S)
+        except (HaError, HaUnavailable) as err:
+            log.debug("[%s] HA sentence matcher warm-up failed: %s", self.device_id, err)
 
     def _measure_wake(self, turn: _Turn, runtime: _Runtime) -> None:
         """Peak cell level over the accepted candidate's support: the STT copy's gain anchor."""
@@ -1785,12 +1980,21 @@ class SessionActor:
             await self._finish_turn(turn, TerminalReason.INTERRUPTED)
             return
         turn.commit = commit
+        if turn.trigger in REPLY_KINDS and turn.expectation is not None:
+            self._settle(turn.expectation, FollowUp.ANSWERED)   # only a committed reply answers (§9.1)
         turn.committed_at = time.monotonic()
+        turn.commit_frontier = timeline.mic.frontier
+        fit = self.uplink.clock_fit(StreamId.MIC, timeline.lease.capture_epoch) if self.uplink is not None else None
+        turn.utterance_end_ns = fit.to_mono(commit.boundary) if fit is not None else None
         turn.coverage = (turn.runtime.echo_known / turn.runtime.echo_total) if turn.runtime.echo_total else None
         self._set_state(ActorState.COMMITTED)
         pcm = timeline.mic.read(commit.start, commit.end)
         turn.wake_clip = self._wake_clip(turn, timeline)
+        turn.afe_evidence, turn.afe_series = _afe_snapshot(turn.runtime, turn.candidate, _utterance_span(turn))
         turn.timings["audio_ms"] = round((commit.end - commit.start) * 1000 / SAMPLE_RATE)
+        if turn.runtime.afe is not None and self._config().get("saveUtterances"):
+            turn.capture = self._capture(turn, timeline)
+        await self._open_response_lease(turn, commit)
         await self._close_uplink(turn.runtime.lease_id, LeaseEnd.COMMITTED)
         self._release_runtime(turn.runtime.lease_id)
         turn.task = self._spawn(self._run_committed(turn, commit, pcm))
@@ -1801,15 +2005,22 @@ class SessionActor:
     async def _run_committed(self, turn: _Turn, commit: Commit, pcm: np.ndarray) -> None:
         """§16.7 voice turn order after commit: local command, STT, route, intent→TTS. Never resubmits."""
         if commit.redecode_required:
+            spec = turn.utterance.spec
             try:
-                tokens, seconds = await self.deps.worker.decode_span(pcm)
+                if commit.source == TextSource.SERVER and spec.pause_server is not None:
+                    # The committed text is the pause server's words: re-decode with the same server.
+                    text = await self.deps.worker.transcribe_span(pcm, spec.pause_server)
+                    redecoded = pause_command(spec, text, commit.wake_window)
+                else:
+                    tokens, seconds = await self.deps.worker.decode_span(pcm)
+                    redecoded = redecoded_command(spec, tokens, seconds)
             except SpeechWorkerError:
                 if self._current(turn):
                     await self._finish_turn(turn, TerminalReason.INTERRUPTED)
                 return
             if not self._current(turn):
                 return
-            if redecode_differs(commit.text, redecoded_command(turn.utterance.spec, tokens, seconds)):
+            if redecode_differs(commit.text, redecoded):
                 await self._finish_turn(turn, TerminalReason.RETRY)
                 return
         if commit.local_action is not None:
@@ -1822,14 +2033,15 @@ class SessionActor:
         turn.stt_copy = audio
         if not self._current(turn):
             return
+        heard = audio + STT_TAIL_SILENCE   # a last word with no silence after it is dropped
         if turn.trigger == UtteranceKind.HA_REPLY:
             turn.outcome = TurnOutcome.HA
-            await self._consume_run(turn, self.deps.esphome_reply(audio))
+            await self._consume_run(turn, self.deps.esphome_reply(heard))
             return
         try:
             pipeline = await self.deps.pipeline_id()
             started = time.monotonic()
-            final = await self.deps.ha.run_stt(pipeline, self.deps.ha_device_id(), audio)
+            final = await self.deps.ha.run_stt(pipeline, self.deps.ha_device_id(), heard)
         except (HaUnavailable, HaError) as exc:
             log.warning("[%s] HA STT failed: %s", self.device_id, exc)
             if self._current(turn):
@@ -1838,6 +2050,7 @@ class SessionActor:
         if not self._current(turn):
             return
         turn.timings["stt_ms"] = round((time.monotonic() - started) * 1000)
+        _mark(turn, TurnStage.STT, started)
         turn.stt_raw = final
         text = final_command_text(
             final, wake_initiated=turn.trigger == UtteranceKind.WAKE, streaming_window=commit.wake_window,
@@ -1907,12 +2120,13 @@ class SessionActor:
                         # ESPHome reply path: HA ran STT inside this run.
                         turn.stt_raw = turn.stt_text = event.text
                         turn.timings["stt_ms"] = round((time.monotonic() - sent) * 1000)
+                        _mark(turn, TurnStage.STT, sent)
                         sent = time.monotonic()
                     elif isinstance(event, IntentEnded):
                         intent = event
                     elif isinstance(event, TtsReady):
                         tts = event
-                        turn.timings["tts_url_ms"] = round((time.monotonic() - sent) * 1000)
+                        _tts_ready(turn, sent)
                         if event.streamed and playback is None:
                             playback = self._spawn(self._play_response(turn, event.url, start_by))
                     elif isinstance(event, RunLost):
@@ -1933,6 +2147,7 @@ class SessionActor:
         self.awaiting_intent = False
         intent_at = time.monotonic()
         turn.timings["intent_ms"] = round((time.monotonic() - sent) * 1000)
+        _mark(turn, TurnStage.INTENT, sent, intent_at)
         turn.response_text = intent.speech or None
         turn.response_type = intent.response_type
         turn.intent_local = intent.processed_locally
@@ -1952,7 +2167,7 @@ class SessionActor:
                         event = await iterator.__anext__()
                         if isinstance(event, TtsReady):
                             tts = event
-                            turn.timings["tts_url_ms"] = round((time.monotonic() - sent) * 1000)
+                            _tts_ready(turn, sent)
                         elif isinstance(event, RunLost):
                             if self._current(turn):
                                 await self._finish_turn(turn, TerminalReason.OUTCOME_UNKNOWN)
@@ -2010,6 +2225,8 @@ class SessionActor:
             turn.audible_at = time.monotonic()
             if turn.committed_at is not None:
                 turn.timings["first_audio_ms"] = round((turn.audible_at - turn.committed_at) * 1000)
+            if TurnStage.TTS in turn.stages:
+                _mark(turn, TurnStage.TTS, turn.audible_at, turn.audible_at)
             self._set_state(ActorState.SPEAKING)
             await self._watch_reply(turn)
 
@@ -2021,6 +2238,7 @@ class SessionActor:
         turn.playback_reason = reason
         if turn.audible_at is not None:
             turn.timings["playback_ms"] = round((time.monotonic() - turn.audible_at) * 1000)
+            _mark(turn, TurnStage.REPLY, turn.audible_at)
         return reason
 
     async def _watch_reply(self, turn: _Turn) -> None:
@@ -2057,22 +2275,22 @@ class SessionActor:
             await self._acquire_focus(exp.owner, Focus.DIALOG_INPUT, exp.generation)
 
     async def _begin_window(self, exp: _Expectation) -> None:
-        """After the guarded drain (or without prompt audio): 7 s window and onset scan (§16.2, §16.6)."""
+        """After the guarded drain (or without prompt audio) the reply turn opens at once, its
+        trigger at the mic frontier (§9.1, §16.6); before the lease has any mic, at its first
+        released cell."""
         if exp is not self._expectation or exp.runtime is None:
             return
         await self._hold_reply_focus(exp)
-        exp.deadline = asyncio.get_running_loop().time() + REPLY_S
-        self._set_state(ActorState.EXPECT_REPLY)
-        log.info("[%s] reply window open for %s", self.device_id,
-                 exp.origin.turn_id if exp.origin is not None else exp.source)
+        self._set_state(ActorState.ARMED)
+        exp.window_opened = asyncio.get_running_loop().time()
         timeline = self._timeline(exp.runtime)
         drain = timeline.mic.frontier if timeline is not None else None
         if drain is None:
-            exp.drain_pending = True
+            exp.awaiting_audio = True
+            log.info("[%s] reply window for %s waits for the microphone", self.device_id,
+                     exp.origin.turn_id if exp.origin is not None else exp.source)
             return
-        onset = exp.watch.drained(drain, exp.runtime.assembler.history)
-        if onset is not None:
-            await self._start_reply(exp, onset)
+        await self._open_reply(exp, drain)
 
     # --- local commands, alarms, clarifications ------------------------------------------------
 
@@ -2199,6 +2417,7 @@ class SessionActor:
             log.warning("[%s] HassTimerStatus failed: %s", self.device_id, exc)
             return None
         turn.timings["intent_ms"] = round((time.monotonic() - started) * 1000)
+        _mark(turn, TurnStage.INTENT, started)
         turn.response_type = response.get("response_type")
         slots = response.get("speech_slots") or {}
         every = list(slots.get("timers") or [])
@@ -2280,6 +2499,7 @@ class SessionActor:
         """Run one cancel intent: True done, False refused (HA no longer finds the timer, it
         just finished), None once the turn has ended. A cancel whose request may have
         reached HA without an answer is never resent: the turn ends `outcome_unknown`."""
+        started = time.monotonic()
         try:
             await self.deps.ha.handle_intent(intent, slots, self.deps.ha_device_id())
         except HaUnavailable as exc:
@@ -2289,7 +2509,9 @@ class SessionActor:
             return None
         except HaError as exc:
             log.warning("[%s] %s %s refused: %s", self.device_id, intent, slots, exc)
+            _mark(turn, TurnStage.INTENT, started)
             return False if self._current(turn) else None
+        _mark(turn, TurnStage.INTENT, started)
         return True if self._current(turn) else None
 
     async def _answer(self, turn: _Turn, line: str) -> None:
@@ -2305,6 +2527,7 @@ class SessionActor:
             self._cue(Cue.ERROR_ANIM)
         else:
             turn.timings["tts_url_ms"] = round((time.monotonic() - started) * 1000)
+            _mark(turn, TurnStage.TTS, started)
             reason = await self._play_response(turn, url)
             if not self._current(turn):
                 return
@@ -2379,7 +2602,7 @@ class SessionActor:
 
     def _chain_parent(self, turn: _Turn) -> _Expectation | None:
         """Only no-wake replies count toward the chain (§9.1); a wake or button starts a new chain."""
-        return turn.expectation if turn.trigger in (UtteranceKind.REPLY, UtteranceKind.HA_REPLY) else None
+        return turn.expectation if turn.trigger in REPLY_KINDS else None
 
     def _chain_allowed(self, turn: _Turn) -> bool:
         parent = self._chain_parent(turn)
@@ -2401,6 +2624,18 @@ class SessionActor:
             chain_count=previous.chain_count + 1 if previous is not None else 1,
             choices=choices, pending_operation=pending, origin=origin,
         )
+
+    def _pause_server(self) -> WyomingServer | None:
+        """§16.6 pause server from config `pauseAsr`, else Kroko alone. The API validates
+        every write, so a bad stored value means the database was edited by hand."""
+        raw = self._config().get(PAUSE_ASR_KEY)
+        if raw is None:
+            return None
+        try:
+            return parse_pause_asr(raw)
+        except ValueError as err:
+            log.warning("[%s] %s: %s; using Kroko alone", self.device_id, PAUSE_ASR_KEY, err)
+            return None
 
     def _settle(self, exp: _Expectation, outcome: Continuation) -> None:
         """Record what became of `exp` on the asking turn's row. The first final outcome wins."""
@@ -2432,9 +2667,10 @@ class SessionActor:
         if epoch is None:
             return
         lease_id = str(uuid.uuid4())
-        await self._lease_message(self.uplink.open(
-            lease_id, LeaseReason.REPLY, exp.owner, epoch,
-            {StreamId.MIC: None, StreamId.CELLS: None, StreamId.REFERENCE: None}))
+        streams: dict[StreamId, int | None] = {StreamId.MIC: None, StreamId.CELLS: None, StreamId.REFERENCE: None}
+        if self.uplink.afe_metadata:
+            streams[StreamId.AFE] = None
+        await self._lease_message(self.uplink.open(lease_id, LeaseReason.REPLY, exp.owner, epoch, streams))
         model = self.deps.registry.for_config(self._config())
         await self.deps.worker.load_wake_graph(model.graph_sha256)
         self.deps.worker.open_lease(self.device_id, epoch, lease_id, model.graph_sha256)
@@ -2477,7 +2713,7 @@ class SessionActor:
             return
         await self._begin_window(exp)
 
-    async def _end_expectation(self, reason: TerminalReason, *, outcome: FollowUp | None = None) -> None:
+    async def _end_expectation(self, reason: TerminalReason, *, outcome: Continuation | None = None) -> None:
         """Close the live expectation without a turn; a silent window never dispatches (§9.1)."""
         if self._expectation is None:
             return
@@ -2640,6 +2876,11 @@ class SessionActor:
         if turn.terminal is not None:
             return
         turn.terminal = reason
+        if turn.trigger in REPLY_KINDS and turn.expectation is not None and turn.commit is None:
+            # A reply that never committed did not answer its question: a silent window is the
+            # question's `reply_timeout`, any other end its own reason (§9.1).
+            self._settle(turn.expectation, TerminalReason.REPLY_TIMEOUT if reason == TerminalReason.NO_INPUT
+                         else reason)
         if turn.run is not None:
             turn.run.abandon()
         if turn.task is not None and turn.task is not asyncio.current_task() and not turn.task.done():
@@ -2651,8 +2892,13 @@ class SessionActor:
             turn.wake_clip = self._wake_clip(turn, timeline)
         if turn.coverage is None and turn.runtime.echo_total:
             turn.coverage = turn.runtime.echo_known / turn.runtime.echo_total
+        if turn.afe_evidence is None:
+            turn.afe_evidence, turn.afe_series = _afe_snapshot(turn.runtime, turn.candidate, _utterance_span(turn))
         await self._close_uplink(turn.runtime.lease_id, LeaseEnd.CLOSED)
         self._release_runtime(turn.runtime.lease_id)
+        if turn.response_lease is not None:
+            turn.response_lease.close_at = min(turn.response_lease.close_at,
+                                               asyncio.get_running_loop().time() + RESPONSE_LEASE_TAIL_S)
         next_exp = turn.next_expectation
         if next_exp is not None and reason != TerminalReason.COMPLETED:
             # A question that was never fully asked invalidates its expectation (§9.1).
@@ -2679,12 +2925,13 @@ class SessionActor:
         if feedback:
             self._feedback(turn, reason)
         if self._turn is None:
-            self._set_state(ActorState.EXPECT_REPLY if self._expectation is not None else ActorState.IDLE)
+            self._set_state(ActorState.ARMED if self._expectation is not None else ActorState.IDLE)
 
     def _feedback(self, turn: _Turn, reason: TerminalReason) -> None:
-        """Exactly the §7 terminal feedback table."""
+        """Exactly the §7 terminal feedback table; a reply window nobody answered ends without a cue."""
         if reason == TerminalReason.NO_INPUT:
-            self._cue(Cue.NOSPEECH_ANIM)
+            if turn.trigger not in REPLY_KINDS:
+                self._cue(Cue.NOSPEECH_ANIM)
         elif reason in ERROR_CUE_REASONS:
             self._cue(Cue.ERROR_ANIM)
         elif reason in ERROR_LINE_REASONS:
@@ -2702,7 +2949,7 @@ class SessionActor:
             else:
                 self._spawn(self._speak(LINE_SORRY, turn.turn_id, turn.generation))
 
-    def _wake_clip(self, turn: _Turn, timeline: LeaseTimeline) -> bytes | None:
+    def _wake_clip(self, turn: _Turn, timeline: LeaseTimeline) -> _Clip | None:
         """Accepted candidate support −300 ms … support_end, canonical PCM."""
         candidate = turn.candidate
         if candidate is None:
@@ -2711,10 +2958,23 @@ class SessionActor:
         b = candidate.support_end or candidate.open_sample
         if b <= a or not timeline.mic.covers(a, b):
             return None
-        return timeline.mic.read(a, b).tobytes()
+        return _Clip(a, timeline.mic.read(a, b).tobytes())
+
+    def _capture(self, turn: _Turn, timeline: LeaseTimeline) -> _Clip | None:
+        """The committed lease's canonical mic for the turn recording: from where the turn's chart
+        starts (or the lease's first contiguous sample, if later) through the newest contiguous
+        sample. The response lease takes the mic on from its end."""
+        assert turn.commit is not None
+        run = timeline.mic.known.containing(turn.commit.start)
+        chart = series_range(_support(turn.candidate), _utterance_span(turn))
+        if run is None or chart is None:
+            return None
+        a = max(run[0], chart[0])
+        return _Clip(a, timeline.mic.read(a, run[1]).tobytes())
 
     async def _persist(self, turn: _Turn) -> int | None:
-        """The turn row with its §11.3 decision trace; utterance WAV and wake clip when enabled.
+        """The turn row with its §11.3 decision trace; utterance WAV, wake clip and turn recording
+        when enabled.
         Returns the row id (None when the row was not written)."""
         candidate, commit = turn.candidate, turn.commit
         now = asyncio.get_running_loop().time()
@@ -2742,7 +3002,9 @@ class SessionActor:
                          if commit is not None else None),
             endpoint_class=commit.completeness if commit is not None else None,
             wake_model_sha256=turn.model.graph_sha256 if turn.model is not None else None,
-            policy_hash=self.deps.worker.policy_hash,
+            # A decision on the pause server's words is a different policy (§16.6).
+            policy_hash=self.deps.worker.policy_hash + (
+                turn.utterance.spec.pause_server.policy_suffix if turn.utterance.spec.pause_server else ""),
             wake_attribution=(None if candidate is None else
                               WakeAttribution.VERIFIED if candidate.producing_sound else WakeAttribution.IDLE),
             reference_coverage=turn.coverage,
@@ -2754,34 +3016,57 @@ class SessionActor:
             reply_to=turn.expectation.originating_turn_id if turn.expectation is not None else None,
             continuation=turn.continuation,
             first_audio_ms=turn.timings.get("first_audio_ms"),
+            response_latency_ms=_response_latency_ms(turn),
         )
-        trace = json.dumps(_trace(turn, row, turn.utterance.trace()), default=str, separators=(",", ":"))
+        trace = json.dumps(_trace(turn, row, turn.utterance.trace(), turn.afe_evidence), default=str,
+                           separators=(",", ":"))
         log.info("[%s] turn %s trace %s", self.device_id, turn.turn_id, trace)
         row["decision_trace"] = trace
+        row["afe_evidence"] = turn.afe_evidence.dumps() if turn.afe_evidence is not None else None
+        series = turn.afe_series
+        response = turn.response_lease
+        if response is not None:
+            # The row waits for the response lease, until RESPONSE_LEASE_TAIL_S past the turn's end.
+            await response.done
+            series = _afe_series(turn, response.timeline.afe) or series
+        cfg = self._config()
+        # The turn recording is played against the chart, so only a turn with one keeps it.
+        recording = _turn_recording(turn) if series is not None and cfg.get("saveUtterances") else None
+        if series is not None:
+            # Where the recordings and the processing sit on the chart's timeline.
+            audio = (_Clip(commit.start, turn.stt_copy) if commit is not None and turn.stt_copy else None)
+            series = replace(series, wake_clip=turn.wake_clip.span if turn.wake_clip else None,
+                             audio_clip=audio.span if audio else None,
+                             recording=recording.span if recording else None, stages=_stage_spans(turn))
+            row["afe_series"] = series.dumps()
+        else:
+            row["afe_series"] = None
         try:
             row_id = await self.deps.persist_turn(row)
         except Exception:
             log.exception("[%s] turn row not persisted", self.device_id)
             return None
-        cfg = self._config()
         loop = asyncio.get_running_loop()
-        saves: tuple[tuple[object, bytes | None, Callable[[str, int, bytes], str | None],
-                           Callable[[int, str | None], None]], ...] = (
-            (cfg.get("saveUtterances"), turn.stt_copy, em_recordings.save, em_db.set_turn_audio),
-            (cfg.get("saveWakeClips"), turn.wake_clip, em_wakeclips.save, em_db.set_turn_wake),
+        saves: tuple[tuple[bytes | None, Callable[[str, int, bytes], str | None],
+                           Callable[[int, str | None], None] | None], ...] = (
+            (turn.stt_copy if cfg.get("saveUtterances") else None, em_recordings.save, em_db.set_turn_audio),
+            (turn.wake_clip.pcm if turn.wake_clip and cfg.get("saveWakeClips") else None, em_wakeclips.save,
+             em_db.set_turn_wake),
+            (recording.pcm if recording else None, _save_turn_recording, None),   # placed by the series
         )
-        for enabled, pcm, save, attach in saves:
-            if not enabled or not pcm:
+        for pcm, save, attach in saves:
+            if not pcm:
                 continue
             try:
                 name = await loop.run_in_executor(None, save, self.device_id, row_id, pcm)
-                if name:
+                if name and attach is not None:
                     await loop.run_in_executor(None, attach, row_id, name)
             except Exception:
                 log.exception("[%s] turn %s audio not saved", self.device_id, row_id)
         return row_id
 
-    async def _persist_candidate(self, candidate: _Candidate, reason: TerminalReason) -> None:
+    async def _persist_candidate(self, candidate: _Candidate, reason: TerminalReason,
+                                 afe: AfeEvidence | None, series: AfeSeries | None) -> None:
         """A rejected candidate is a turn row with its attribution reason and no audio (§11.3)."""
         try:
             await self.deps.persist_turn(TurnRow(
@@ -2791,6 +3076,8 @@ class SessionActor:
                 wake_model_sha256=candidate.model.graph_sha256,
                 policy_hash=self.deps.worker.policy_hash,
                 wake_attribution=reason, terminal_reason=reason,
+                afe_evidence=afe.dumps() if afe is not None else None,
+                afe_series=series.dumps() if series is not None else None,
             ))
         except Exception:
             log.exception("[%s] rejected candidate not persisted", self.device_id)
@@ -2816,6 +3103,46 @@ class SessionActor:
         lease = self.uplink.leases.get(lease_id)
         if lease is not None and lease.ended is None:
             await self._lease_message(self.uplink.leases.close(lease_id, reason))
+
+    async def _open_response_lease(self, turn: _Turn, commit: Commit) -> None:
+        """Carry a committed turn's AFE records, and while `saveUtterances` is on its mic, on through
+        its response (§4.4): a `turn` lease taking `afe` from where the committed lease's records
+        reached (the commit's end before any arrived) and `mic` from the end of `turn.capture`,
+        opened before the committed lease closes so both run on unbroken. Only after a lease that
+        took `afe`. Evidence for the turn's chart and recording; nothing reads it to decide."""
+        uplink, store = self.uplink, turn.runtime.afe
+        lease = uplink.leases.get(turn.runtime.lease_id) if uplink is not None else None
+        if uplink is None or store is None or lease is None:
+            return
+        streams: dict[StreamId, int | None] = {
+            StreamId.AFE: store.frontier * AFE_PERIOD_SAMPLES if store.frontier is not None else commit.end}
+        if turn.capture is not None:
+            streams[StreamId.MIC] = turn.capture.end
+        lease_id = str(uuid.uuid4())
+        await self._lease_message(uplink.open(lease_id, LeaseReason.TURN, turn.turn_id, lease.capture_epoch,
+                                              streams))
+        timeline = uplink.timelines[lease_id]
+        if turn.capture is not None:
+            timeline.set_utterance_start(turn.capture.end)   # retention anchor: the whole response is kept
+        loop = asyncio.get_running_loop()
+        response = _ResponseLease(lease_id, timeline, loop.time() + RESPONSE_LEASE_MAX_S, loop.create_future())
+        self._response_leases[lease_id] = response
+        turn.response_lease = response
+
+    async def _end_response_lease(self, response: _ResponseLease, *, close: bool = True) -> None:
+        """End a response lease, sending `uplink.close` when `close` (not for one that has already
+        ended on the device). What it received stays with the turn for the row."""
+        if self._response_leases.pop(response.lease_id, None) is None:
+            return
+        if close:
+            await self._close_uplink(response.lease_id, LeaseEnd.CLOSED)
+        if self.uplink is not None:
+            self.uplink.release(response.lease_id)
+        response.done.set_result(None)
+
+    async def _end_all_response_leases(self, *, close: bool) -> None:
+        for response in list(self._response_leases.values()):
+            await self._end_response_lease(response, close=close)
 
     async def _acquire_focus(self, owner: str, focus: Focus, generation: int) -> None:
         if any(f.owner == owner and f.focus == focus for f in self._focus.values()):
@@ -2862,7 +3189,97 @@ class SessionActor:
                 log.exception("[%s] actor listener failed", self.device_id)
 
 
-def _trace(turn: _Turn, row: TurnRow, utterance: UtteranceTrace) -> dict[str, object]:
+def _utterance_span(turn: _Turn) -> tuple[int, int] | None:
+    """The committed span, else the closed utterance's audio through its evidence frontier."""
+    commit = turn.commit
+    if commit is not None:
+        return commit.start, commit.end
+    start, end = turn.utterance.spec.start, turn.utterance.frontier
+    return (start, end) if end > start else None
+
+
+def _afe_snapshot(runtime: _Runtime, candidate: _Candidate | None,
+                  utterance: tuple[int, int] | None) -> tuple[AfeEvidence | None, AfeSeries | None]:
+    """Native AFE evidence around the candidate's support window (support_start → support_end,
+    else the opening hop's end) and over `utterance`, and the per-period series behind it.
+    (None, None) — unavailable — when the lease took no `afe` stream (the device lacks
+    afe_metadata_v1); a part without data is None inside the evidence, and a series without
+    any record is None. Read only to record evidence: no decision depends on it."""
+    if runtime.afe is None:
+        return None, None
+    support = _support(candidate)
+    return turn_evidence(runtime.afe, support, utterance), turn_series(runtime.afe, support, utterance)
+
+
+def _afe_series(turn: _Turn, response: AfeTimeline) -> AfeSeries | None:
+    """The turn's AfeSeries carried on through its response lease's records."""
+    if turn.runtime.afe is None:
+        return None
+    return turn_series(turn.runtime.afe, _support(turn.candidate), _utterance_span(turn), response=response)
+
+
+def _turn_recording(turn: _Turn) -> _Clip | None:
+    """The turn recording: `turn.capture`, and the response lease's mic contiguous from its end.
+    Mute and session loss erase the response's mic (UplinkSession.clear), leaving the capture."""
+    capture = turn.capture
+    if capture is None:
+        return None
+    response = turn.response_lease
+    run = response.timeline.mic.known.containing(capture.end) if response is not None else None
+    if response is None or run is None:
+        return capture
+    return _Clip(capture.start, capture.pcm + response.timeline.mic.read(capture.end, run[1]).tobytes())
+
+
+def _save_turn_recording(device_id: str, turn_id: int, pcm: bytes) -> str | None:
+    return em_recordings.save(device_id, turn_id, pcm, kind=em_recordings.RecordingKind.TURN)
+
+
+def _mark(turn: _Turn, stage: TurnStage, start: float, end: float | None = None) -> None:
+    """Extend `stage` to cover monotonic [start, end] (end: now); a stage run twice spans both."""
+    end = time.monotonic() if end is None else end
+    was = turn.stages.get(stage)
+    turn.stages[stage] = (start, end) if was is None else (min(was[0], start), max(was[1], end))
+
+
+def _tts_ready(turn: _Turn, sent: float) -> None:
+    """HA's TTS URL arrived: the reply's audio can be fetched from now until it is audible."""
+    now = time.monotonic()
+    turn.timings["tts_url_ms"] = round((now - sent) * 1000)
+    _mark(turn, TurnStage.TTS, now, now)
+
+
+def _stage_spans(turn: _Turn) -> dict[TurnStage, tuple[int, int]]:
+    """The turn's stages on the capture timeline: the endpoint wait in sample time; the rest
+    mapped from the monotonic clock through the newest mic sample received at the commit. That
+    sample is already the uplink's latency old, so they sit early by it; the reply's start also by
+    the Dot's output latency (~0.3 s on turn 549, against the AFE playback rise)."""
+    commit, at, frontier = turn.commit, turn.committed_at, turn.commit_frontier
+    if commit is None:
+        return {}
+    spans = {TurnStage.ENDPOINT: (commit.boundary, commit.decided_at)}
+    if at is not None and frontier is not None:
+        spans.update({stage: (frontier + round((a - at) * SAMPLE_RATE), frontier + round((b - at) * SAMPLE_RATE))
+                      for stage, (a, b) in turn.stages.items()})
+    return spans
+
+
+def _response_latency_ms(turn: _Turn) -> int | None:
+    """The end of the user's last word (the commit boundary) → the response's first frame played,
+    both on the device's CLOCK_MONOTONIC, so neither end carries transport latency (§4.2). None: no
+    response played, or either end lacks device timing."""
+    end, playback = turn.utterance_end_ns, turn.playback
+    if end is None or playback is None or playback.first_frame_ns is None:
+        return None
+    return round((playback.first_frame_ns - end) / 1e6)
+
+
+def _support(candidate: _Candidate | None) -> tuple[int, int] | None:
+    """The candidate's support window: support_start → support_end, else the opening hop's end."""
+    return None if candidate is None else (candidate.support_start, candidate.support_end or candidate.open_sample)
+
+
+def _trace(turn: _Turn, row: TurnRow, utterance: UtteranceTrace, afe: AfeEvidence | None) -> dict[str, object]:
     """The §11.3 decision trace logged and stored with a turn row."""
     candidate = turn.candidate
     wire = candidate.wire if candidate is not None else None
@@ -2875,5 +3292,10 @@ def _trace(turn: _Turn, row: TurnRow, utterance: UtteranceTrace) -> dict[str, ob
         "rule": wire.rule.wire() if wire is not None and wire.rule is not None else None,
         "hops": [asdict(h) for h in wire.hops] if wire is not None else None,
         "lease_id": turn.runtime.lease_id, "terminal": turn.terminal,
-        "utterance": utterance, **{k: v for k, v in row.items() if k != "ts"},
+        "utterance": utterance,
+        # A reply that met a gap before any answer listened on with a fresh utterance (§16.6).
+        **({"reopened": turn.reopened} if turn.reopened else {}),
+        # Evidence only (afe_metadata_v1): null when the device does not report it.
+        "afe_evidence": afe.wire() if afe is not None else None,
+        **{k: v for k, v in row.items() if k != "ts"},
     }

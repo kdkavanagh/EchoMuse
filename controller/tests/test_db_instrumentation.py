@@ -24,7 +24,7 @@ def _cols(table: str) -> set:
 
 
 def test_record_device_stats_accumulates_link_metrics(fresh_db):
-    db.register_new_device("dev1", "1.2.3.4", "v2.9.6")
+    db.register_new_device("dev1", "1.2.3.4", "v2.9.6", None)
     db.record_device_stats("dev1", {
         "cpuPct": 20.0, "memUsedMb": 180, "wifiRssi": -55,
         "linkSpeedMbps": 135, "wifiFreqMhz": 5805, "wifiBssid": "aa:bb",
@@ -54,7 +54,7 @@ def test_record_device_stats_accumulates_link_metrics(fresh_db):
 def test_link_speed_absent_does_not_poison_minimum(fresh_db):
     """linkSpeedMbps is omitempty and refreshed on a slower cadence, so a
     tick without it must not record a 0 Mbps minimum."""
-    db.register_new_device("dev1", "1.2.3.4", "v2.9.6")
+    db.register_new_device("dev1", "1.2.3.4", "v2.9.6", None)
     db.record_device_stats("dev1", {"cpuPct": 5.0, "memUsedMb": 100,
                                     "linkSpeedMbps": 150})
     db.record_device_stats("dev1", {"cpuPct": 5.0, "memUsedMb": 100})
@@ -71,7 +71,7 @@ def test_migrates_to_head(fresh_db):
 
 
 def test_rtt_accumulates_and_keeps_extremes(fresh_db):
-    db.register_new_device("dev1", "10.0.0.9", "vtest")
+    db.register_new_device("dev1", "10.0.0.9", "vtest", None)
     db.record_device_stats("dev1", {
         "cpuPct": 5.0, "memUsedMb": 100,
         "rttSumMs": 300, "rttSamples": 6, "rttMinMs": 30, "rttMaxMs": 90,
@@ -97,7 +97,7 @@ def test_window_without_rtt_samples_does_not_poison_the_minimum(fresh_db):
     not reset the running minimum to 0 — the same class of bug as
     link_speed's absent-means-not-sampled.
     """
-    db.register_new_device("dev1", "10.0.0.9", "vtest")
+    db.register_new_device("dev1", "10.0.0.9", "vtest", None)
     db.record_device_stats("dev1", {
         "cpuPct": 5.0, "memUsedMb": 100,
         "rttSumMs": 120, "rttSamples": 3, "rttMinMs": 35, "rttMaxMs": 50,
@@ -115,7 +115,7 @@ def test_driver_dead_counters_are_not_surfaced(fresh_db):
     quality, so they must not appear in the read API where a zero would be
     mistaken for health.
     """
-    db.register_new_device("dev1", "10.0.0.9", "vtest")
+    db.register_new_device("dev1", "10.0.0.9", "vtest", None)
     db.record_device_stats("dev1", {"cpuPct": 5.0, "memUsedMb": 100})
     m = db.get_device_metrics("dev1", 0)[-1]
     for dead in ("tx_errors", "tx_dropped", "rx_crc"):
@@ -129,7 +129,7 @@ def test_excursion_rate_not_raw_count_is_the_discriminator(fresh_db):
     life outside a turn. The read API must expose per-state RATES so the
     comparison is meaningful.
     """
-    db.register_new_device("dev1", "10.0.0.9", "vtest")
+    db.register_new_device("dev1", "10.0.0.9", "vtest", None)
     # 100 samples: 90 idle with 9 excursions (10%), 10 busy with 5 (50%).
     db.record_device_stats("dev1", {
         "cpuPct": 5.0, "memUsedMb": 100,
@@ -144,7 +144,7 @@ def test_excursion_rate_not_raw_count_is_the_discriminator(fresh_db):
 def test_excursion_rates_are_none_without_samples_in_that_state(fresh_db):
     """No busy samples must read None, not 0% — absence of data is not
     evidence of a clean state."""
-    db.register_new_device("dev1", "10.0.0.9", "vtest")
+    db.register_new_device("dev1", "10.0.0.9", "vtest", None)
     db.record_device_stats("dev1", {
         "cpuPct": 5.0, "memUsedMb": 100,
         "rttSumMs": 500, "rttSamples": 10, "rttMinMs": 5, "rttMaxMs": 90,
@@ -238,31 +238,74 @@ def test_trace_is_null_when_unrecorded_and_history_columns_are_not_written(fresh
     assert rec["dev_wake_score"] is None and rec["delivery_ms"] is None
 
 
-def _stored_traces(device_id: str) -> list:
+def _stored(device_id: str, column: str = "decision_trace") -> list:
     return [r[0] for r in db._conn.execute(
-        "SELECT decision_trace FROM turns WHERE device_id = ? ORDER BY ts", (device_id,))]
+        f"SELECT {column} FROM turns WHERE device_id = ? ORDER BY ts", (device_id,))]
 
 
-def test_the_decision_trace_is_stored_with_the_row_but_not_returned_by_get_turns(fresh_db):
-    """The trace JSON is for sqlite analysis; the Activity list gets
-    first_audio_ms but never the 3–6 KB trace."""
-    db.insert_turn("dev1", {"ts": 1_800_000_000, "first_audio_ms": 1_430,
-                            "decision_trace": '{"turn_id":"t-1"}'})
-    rec = db.get_turns("dev1")[-1]
+def test_the_decision_trace_is_read_one_turn_at_a_time_never_by_get_turns(fresh_db):
+    """The Activity list gets first_audio_ms but never the 3–6 KB trace; the
+    turn detail reads one turn's, and only for its own device."""
+    turn = db.insert_turn("dev1", {"ts": 1_800_000_000, "first_audio_ms": 1_430,
+                                   "decision_trace": '{"turn_id":"t-1"}'})
+    bare = db.insert_turn("dev1", {"ts": 1_800_000_001})
+    rec = db.get_turns("dev1")[0]
     assert rec["first_audio_ms"] == 1_430
     assert "decision_trace" not in rec
-    assert _stored_traces("dev1") == ['{"turn_id":"t-1"}']
+    assert db.get_turn_decision_trace("dev1", turn) == '{"turn_id":"t-1"}'
+    assert db.get_turn_decision_trace("dev2", turn) is None          # another device's turn id
+    assert db.get_turn_decision_trace("dev1", bare) is None
 
 
-def test_only_each_devices_newest_trace_retention_turns_keep_their_trace(fresh_db, monkeypatch):
+def test_response_latency_percentiles_cover_each_window_of_one_devices_measured_turns(fresh_db):
+    """The Status tab's percentiles: an unmeasured turn (NULL: nothing played)
+    is left out rather than counted as zero, and another device never counts."""
+    em_api = pytest.importorskip("em_api")
+    now = 1_800_000_000.0
+    for ms in (900, 1_100, 1_300, 1_500, 2_000):
+        db.insert_turn("dev1", {"ts": now - 600, "response_latency_ms": ms})
+    db.insert_turn("dev1", {"ts": now - 300})                                         # nothing played
+    db.insert_turn("dev1", {"ts": now - 3 * 86_400, "response_latency_ms": 4_000})    # this week only
+    db.insert_turn("dev1", {"ts": now - 40 * 86_400, "response_latency_ms": 9_000})   # outside every window
+    db.insert_turn("dev2", {"ts": now - 600, "response_latency_ms": 50})
+
+    oldest = now - max(em_api.RESPONSE_LATENCY_WINDOWS_H) * 3600
+    day, week, month = em_api._latency_windows(db.get_response_latencies("dev1", oldest), now)
+    assert day == {"hours": 24, "turns": 5, "p50": 1_300, "p90": 2_000, "p95": 2_000, "p99": 2_000}
+    assert (week["hours"], week["turns"], week["p50"], week["p95"]) == (168, 6, 1_500, 4_000)
+    assert (month["hours"], month["turns"], month["p99"]) == (720, 6, 4_000)
+    # A device with no measured turn has no percentiles, not zeros.
+    assert em_api._latency_windows(db.get_response_latencies("dev3", oldest), now)[0] == {
+        "hours": 24, "turns": 0, "p50": None, "p90": None, "p95": None, "p99": None}
+
+
+def test_only_each_devices_newest_trace_retention_turns_keep_their_trace_and_afe_series(fresh_db, monkeypatch):
     monkeypatch.setattr(db, "TRACE_RETENTION", 3)
-    db.insert_turn("dev2", {"ts": 1_700_000_000, "decision_trace": "other"})
+    db.insert_turn("dev2", {"ts": 1_700_000_000, "decision_trace": "other", "afe_series": "other"})
     for i in range(5):
+        # Even rows are refused wakes: an AFE series but no trace.
         db.insert_turn("dev1", {"ts": 1_800_000_000 + i, "first_audio_ms": i,
-                                "decision_trace": f"t{i}"})
-    assert _stored_traces("dev1") == [None, None, "t2", "t3", "t4"]
+                                "decision_trace": f"t{i}" if i % 2 else None, "afe_series": f"s{i}"})
+    assert _stored("dev1") == [None, None, None, "t3", None]
+    assert _stored("dev1", "afe_series") == [None, None, "s2", "s3", "s4"]
     assert [r["first_audio_ms"] for r in db.get_turns("dev1")] == [0, 1, 2, 3, 4]   # rows kept
-    assert _stored_traces("dev2") == ["other"]                                     # per device
+    assert _stored("dev2") == _stored("dev2", "afe_series") == ["other"]           # per device
+
+
+def test_the_afe_series_is_read_one_turn_at_a_time_and_only_for_its_device(fresh_db):
+    turn = db.insert_turn("dev1", {"ts": 1_800_000_000, "afe_series": '{"start":0}'})
+    bare = db.insert_turn("dev1", {"ts": 1_800_000_001})
+    assert all("afe_series" not in r for r in db.get_turns("dev1"))
+    assert db.get_turn_afe_series("dev1", turn) == '{"start":0}'
+    assert db.get_turn_afe_series("dev2", turn) is None              # another device's turn id
+    assert db.get_turn_afe_series("dev1", bare) is None
+
+
+def test_afe_evidence_is_stored_and_returned_and_null_means_unavailable(fresh_db):
+    evidence = '{"support_start":48000,"pre":null,"wake":null,"playback_onset":null,"utterance":null}'
+    db.insert_turn("dev1", {"ts": 1_800_000_000, "afe_evidence": evidence})
+    db.insert_turn("dev1", {"ts": 1_800_000_001})
+    assert [r["afe_evidence"] for r in db.get_turns("dev1")] == [evidence, None]
 
 
 def test_numpy_scores_are_stored_as_numbers(fresh_db):

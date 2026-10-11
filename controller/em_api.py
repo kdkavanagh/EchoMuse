@@ -18,12 +18,10 @@ import os
 import platform
 import re
 import shutil
-import sqlite3 as _sqlite3
 import tempfile
 import time
-import uuid
 import zipfile
-from collections.abc import AsyncIterator, Callable, Coroutine, Mapping
+from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import date
 from pathlib import Path
@@ -33,6 +31,7 @@ import aiohttp
 from aiohttp import web
 from aiohttp.typedefs import Handler
 
+import em_afe
 import em_alerts
 import em_db as db
 import em_auth as auth
@@ -47,10 +46,12 @@ import em_capture
 import em_samples
 import em_wakeclips
 import em_ambient
+import em_pause_asr
 import em_volume
 import em_sounds
 import em_device_assets
 import em_device_link
+import em_firmware
 import em_wake_registry
 import em_wake_rules
 import em_shell
@@ -109,12 +110,6 @@ INGRESS_ONLY = os.environ.get("ECHOMUSE_HOME_ASSISTANT_INGRESS") == "true"
 # Home Assistant Supervisor's ingress reverse proxy always calls in from this
 # fixed address on the internal hassio Docker network.
 INGRESS_GATEWAY_IP = "172.30.32.2"
-# List endpoint, not /releases/latest: device firmware releases (v* tags with
-# a `server` asset) share the repo with controller releases (controller-v*
-# tags, GHCR image only). /releases/latest returns whichever was published
-# most recently — _fetch_latest_release filters the list for the newest
-# release that is actually a device firmware release.
-GITHUB_API_URL = "https://api.github.com/repos/{repo}/releases?per_page=10"
 
 T = TypeVar("T")
 
@@ -137,16 +132,6 @@ class _Cached(Generic[T]):
         return value
 
 
-class ReleaseInfo(TypedDict):
-    """The newest device firmware release, as /api/releases/latest serves it."""
-
-    version: str
-    url: str
-    notes: str
-    release_url: str
-    published_at: str
-
-
 class ControllerRelease(TypedDict):
     """/api/releases/controller. Without any known release only version (None),
     current, status and available are present."""
@@ -160,53 +145,55 @@ class ControllerRelease(TypedDict):
     available: bool
 
 
-# How long to cache GitHub release info in memory (seconds).
-# DB is the persistent cache; this avoids hitting the DB on every
-# /api/releases/latest request.
-_release_cache: _Cached[ReleaseInfo] = _Cached()
-RELEASE_CACHE_TTL = 60  # seconds
-
 # Controller releases are `controller-v*` TAGS with no GitHub Release behind
 # them — controller-release.yml publishes a GHCR image and nothing else (see
 # "Versioning / releases" in CLAUDE.md). So the notes come from the tag's own
 # annotation: matching-refs lists the tags, and an annotated tag's object
 # carries the message.
-#
-# Deliberately NOT solved by publishing GitHub Releases for controller tags.
-# The releases list is the DEVICE firmware's update feed and
-# _fetch_latest_release scans it for the newest v* tag carrying a `server`
-# asset; adding controller rows puts non-firmware entries in front of that
-# scan for no gain, when the annotation we already write says the same thing.
 GITHUB_TAGS_URL = (
     "https://api.github.com/repos/{repo}/git/matching-refs/tags/controller-v"
 )
 GITHUB_TAG_OBJECT_URL = "https://api.github.com/repos/{repo}/git/tags/{sha}"
 
+# A controller release lookup is served from memory this long (seconds); the
+# DB holds the last one for when GitHub cannot be reached.
 _controller_cache: _Cached[ControllerRelease] = _Cached()
+RELEASE_CACHE_TTL = 60
 
 # Reference to the live devices dict from em_controller — set by init().
 _devices: dict[str, em_device.Device] = {}
 
 
 def _online(device_id: str) -> em_device.Device | None:
-    """The connected Device (v1 or upgrade-only legacy), otherwise None."""
+    """The connected Device, otherwise None."""
     device = _devices.get(device_id)
     return device if device is not None and device.online else None
 
 
-def _v1(device_id: str) -> em_device.Device | None:
-    """A connected v1 Device, otherwise None; diagnostics/alerts need v1."""
-    device = _online(device_id)
-    return device if device is not None and device.link is not None else None
+# Free space on /data. toybox df has no -m but prints 1K blocks by default.
+# The unquoted $(df) folds the header and row onto the one marker line; no
+# `tail`, which toybox may not link.
+FREE_SPACE_PROBE = 'echo FREE_KB $(df /data 2>/dev/null)'
 
 
-def _parse_free_mb(df_line: str) -> int | None:
-    """Available MiB from a BusyBox `df -m` row; wrapped device names make
-    numeric field indexes unstable, so anchor on the percentage field."""
-    fields = (df_line or "").split()
+def _df_available(row: str) -> int | None:
+    """The Available figure of a df row. Wrapped device names make numeric
+    field indexes unstable, so anchor on the Use% field; a header's `Use%`
+    follows a word, never a number, so a folded header is skipped."""
+    fields = row.split()
     for i, field in enumerate(fields):
         if field.endswith("%") and i > 0 and fields[i - 1].isdigit():
             return int(fields[i - 1])
+    return None
+
+
+def _parse_free_mb(probe_out: str) -> int | None:
+    """MiB free on /data from FREE_SPACE_PROBE's output; None when unreadable."""
+    for line in (probe_out or "").splitlines():
+        unit, _, row = line.strip().partition(" ")
+        if unit == "FREE_KB":
+            kb = _df_available(row)
+            return None if kb is None else kb // 1024
     return None
 
 # Device-link TLS material directory — set by em_controller.main() once
@@ -258,9 +245,6 @@ def _task_done(task: asyncio.Task[None]) -> None:
 # controller restart clears stale errors along with the update tasks
 # themselves.
 _update_errors: dict[str, str] = {}
-
-# Pending local binary uploads — keyed by UUID token, expire after 10 minutes.
-_pending_uploads: dict[str, bytes] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -371,6 +355,7 @@ class ControllerServices(Protocol):
     def alerts(self) -> em_alerts.AlertEngine: ...
     def registry(self) -> em_wake_registry.WakeRegistry: ...
     def device_assets(self) -> em_device_assets.DeviceAssets: ...
+    def firmware(self) -> em_firmware.BundledFirmware: ...
     def ha_status(self) -> dict[em_ha_client.HaFeature, FeatureStatusWire]: ...
     def speech_worker_status(self) -> SpeechWorkerStatus: ...
     def loop_lag_peak_ms(self) -> float: ...
@@ -445,7 +430,11 @@ async def create_app(services: ControllerServices) -> web.Application:
     app.router.add_get("/api/devices/{id}/turns",         _get_device_turns)
     app.router.add_get("/api/devices/{id}/activity",      _get_device_activity)
     app.router.add_get("/api/devices/{id}/wake_shadow",   _get_device_wake_shadow)
+    app.router.add_get("/api/devices/{id}/response_latency", _get_device_response_latency)
     app.router.add_get("/api/devices/{id}/turns/{turn}/audio", _get_turn_audio)
+    app.router.add_get("/api/devices/{id}/turns/{turn}/recording", _get_turn_recording)
+    app.router.add_get("/api/devices/{id}/turns/{turn}/afe",   _get_turn_afe_series)
+    app.router.add_get("/api/devices/{id}/turns/{turn}/trace", _get_turn_decision_trace)
     # Wake clips — the pre-detection audio that crossed the threshold. The
     # per-turn WAV sits beside the turn's utterance because that is the pair
     # you look at together; the archive and the purge are device-wide.
@@ -481,8 +470,10 @@ async def create_app(services: ControllerServices) -> web.Application:
     app.router.add_post("/api/devices/{id}/wifi",         _post_device_wifi)
     app.router.add_post("/api/devices/{id}/wifi/scan",    _post_device_wifi_scan)
     app.router.add_post("/api/devices/{id}/update",       _post_device_update)
+    # A firmware install queued for the device's next connect (offline now).
+    app.router.add_post("/api/devices/{id}/update/queue",   _post_device_update_queue)
+    app.router.add_delete("/api/devices/{id}/update/queue", _delete_device_update_queue)
     app.router.add_post("/api/devices/{id}/rollback",     _post_device_rollback)
-    app.router.add_post("/api/releases/upload",           _post_upload_binary)
 
     # Content-addressed BCResNet registry and per-device named speech assets.
     app.router.add_get("/api/wake_models",             _get_wake_models)
@@ -501,11 +492,10 @@ async def create_app(services: ControllerServices) -> web.Application:
     app.router.add_post("/api/devices/{id}/alarms/cancel", _post_alarm_cancel)
     app.router.add_get("/api/devices/{id}/shell",         _ws_shell)
 
-    # Releases
-    app.router.add_get("/api/releases/latest",   _get_latest_release)
+    # Bundled device firmware, and the controller release advisory
+    app.router.add_get("/api/firmware",            _get_firmware)
+    app.router.add_post("/api/firmware/deploy",    _post_deploy_firmware)
     app.router.add_get("/api/releases/controller", _get_controller_release)
-    app.router.add_post("/api/releases/check",   _post_check_release)
-    app.router.add_post("/api/releases/deploy",  _post_deploy_all)
 
     # Global device config
     app.router.add_get("/api/global/config",   _get_global_config)
@@ -517,13 +507,11 @@ async def create_app(services: ControllerServices) -> web.Application:
     app.router.add_get("/api/system/config",    _get_system_config)
     app.router.add_patch("/api/system/config",  _patch_system_config)
     app.router.add_get("/api/ha/status",        _get_ha_status)
+    app.router.add_get("/api/speech/wyoming",   _get_wyoming_info)
 
     # Provisioning
     app.router.add_get("/api/provision/start_script", _get_provision_start_script)
-    app.router.add_get("/api/provision/debloat_script",   _get_provision_debloat_script)
-    app.router.add_get("/api/provision/debloat_packages", _get_provision_debloat_packages)
-    app.router.add_get("/api/provision/magisk_db",    _get_provision_magisk_db)
-    app.router.add_get("/api/provision/latest_binary", _get_provision_latest_binary)
+    app.router.add_get("/api/provision/firmware",     _get_provision_firmware)
     app.router.add_post("/api/provision/tls_credentials", _post_provision_tls_credentials)
     app.router.add_post("/api/provision/diagnostics",     _post_provision_diagnostics)
     app.router.add_post("/api/devices/{id}/secure_link",  _post_secure_link)
@@ -549,6 +537,7 @@ class ErrorCode(enum.StrEnum):
     """The `code` of an API error body, `{"error": message, "code": code}`."""
 
     ALREADY_APPROVED = "already_approved"
+    ALREADY_CURRENT = "already_current"
     BAD_REQUEST = "bad_request"
     BAD_WEBHOOK = "bad_webhook"
     COLLECTING = "collecting"
@@ -556,7 +545,6 @@ class ErrorCode(enum.StrEnum):
     DEVICE_NOT_FOUND = "device_not_found"
     DEVICE_OFFLINE = "device_offline"
     EMPTY_UPLOAD = "empty_upload"
-    FETCH_FAILED = "fetch_failed"
     INTERNAL_ERROR = "internal_error"
     INVALID_CONFIG = "invalid_config"
     INVALID_CREDENTIALS = "invalid_credentials"
@@ -566,12 +554,12 @@ class ErrorCode(enum.StrEnum):
     INVALID_JSON = "invalid_json"
     INVALID_MODEL = "invalid_model"
     INVALID_PARAM = "invalid_param"
-    INVALID_TOKEN = "invalid_token"
     INVALID_UPLOAD = "invalid_upload"
     MISSING_FIELD = "missing_field"
     MODEL_IN_USE = "model_in_use"
+    NO_AFE_SERIES = "no_afe_series"
+    NO_DECISION_TRACE = "no_decision_trace"
     NO_RECORDING = "no_recording"
-    NO_RELEASE = "no_release"
     NO_ROLLBACK_AVAILABLE = "no_rollback_available"
     NO_SAMPLE = "no_sample"
     NO_SAMPLES = "no_samples"
@@ -586,14 +574,13 @@ class ErrorCode(enum.StrEnum):
     SCAN_FAILED = "scan_failed"
     SCAN_IN_PROGRESS = "scan_in_progress"
     SCAN_TIMEOUT = "scan_timeout"
+    SERVER_UNREACHABLE = "server_unreachable"
     SOUND_IN_USE = "sound_in_use"
     TLS_UNAVAILABLE = "tls_unavailable"
     TOO_LARGE = "too_large"
     UNKNOWN_CONFIG_KEY = "unknown_config_key"
     UNKNOWN_WAKE_MODEL = "unknown_wake_model"
     UPDATE_IN_PROGRESS = "update_in_progress"
-    UPGRADE_REQUIRED = "upgrade_required"
-    UPLOAD_FAILED = "upload_failed"
     USER_NOT_FOUND = "user_not_found"
     WIFI_CHANGE_IN_PROGRESS = "wifi_change_in_progress"
     WOULD_DROP_KEYS = "would_drop_keys"
@@ -817,18 +804,97 @@ async def _get_device_turns(request: web.Request) -> web.Response:
     turns = await loop.run_in_executor(
         None, lambda: db.get_turns(device_id, limit, since)
     )
-    return _ok(turns)
+    return _ok([_turn_json(t) for t in turns])
+
+
+def _turn_json(turn: Mapping[str, object]) -> dict[str, object]:
+    """A turns row for the dashboard, `afe_evidence` parsed from its stored
+    JSON (em_afe.AfeEvidenceJson). Null stays null — unavailable: the device
+    lacked afe_metadata_v1, or the row predates it."""
+    raw = turn.get("afe_evidence")
+    evidence: em_afe.AfeEvidenceJson | None = None
+    if isinstance(raw, str):
+        try:
+            evidence = em_afe.AfeEvidence.loads(raw).wire()
+        except ValueError as exc:
+            log.warning("turn %s: unreadable afe_evidence ignored: %s", turn.get("turn_id"), exc)
+    return {**turn, "afe_evidence": evidence}
+
+
+@auth.require_auth
+async def _get_turn_afe_series(request: web.Request) -> web.Response:
+    """GET /api/devices/{id}/turns/{turn}/afe — one turn's native AFE series
+    (em_afe.AfeSeriesJson): every 80 ms period's record from the second
+    before the wake through the utterance and the spoken answer, with the
+    turn's recordings and processing stages placed on it, for the Activity
+    tab's chart.
+
+    A 404 is ordinary: the device lacked afe_metadata_v1, no record arrived,
+    the row is older than the newest em_db.TRACE_RETENTION, or it predates
+    schema 29. The stored JSON is the controller's own, served as written."""
+    device_id = request.match_info["id"]
+    try:
+        turn_id = int(request.match_info["turn"])
+    except ValueError:
+        return _error(ErrorCode.BAD_REQUEST, "turn must be an integer", 400)
+    await _device_row(device_id)
+    series = await asyncio.get_running_loop().run_in_executor(
+        None, db.get_turn_afe_series, device_id, turn_id)
+    if series is None:
+        return _error(ErrorCode.NO_AFE_SERIES, "No native AFE series for this turn", 404)
+    return web.Response(content_type="application/json", text=series)
+
+
+@auth.require_auth
+async def _get_turn_decision_trace(request: web.Request) -> web.Response:
+    """GET /api/devices/{id}/turns/{turn}/trace — one turn's §11.3 decision
+    trace: wake, attribution, endpoint and, per pause, each transcriber's
+    words and time (`utterance.pauses`) and whose words were committed (the
+    `commit` event's `source`), for the Activity tab's turn detail.
+
+    A 404 is ordinary: the row is older than the newest em_db.TRACE_RETENTION
+    or predates schema 26. The stored JSON is the controller's own, served as
+    written."""
+    device_id = request.match_info["id"]
+    try:
+        turn_id = int(request.match_info["turn"])
+    except ValueError:
+        return _error(ErrorCode.BAD_REQUEST, "turn must be an integer", 400)
+    await _device_row(device_id)
+    trace = await asyncio.get_running_loop().run_in_executor(
+        None, db.get_turn_decision_trace, device_id, turn_id)
+    if trace is None:
+        return _error(ErrorCode.NO_DECISION_TRACE, "No decision trace for this turn", 404)
+    return web.Response(content_type="application/json", text=trace)
 
 
 @auth.require_auth
 async def _get_turn_audio(request: web.Request) -> web.StreamResponse:
-    """GET /api/devices/{id}/turns/{turn}/audio — the saved mic audio for
-    one voice turn, as a downloadable WAV.
+    """GET /api/devices/{id}/turns/{turn}/audio — the saved utterance (the
+    STT copy) for one voice turn, as a downloadable WAV.
 
     Only turns captured while saveUtterances was on have one, and only the
     newest em_recordings.KEEP_PER_DEVICE per device survive — a turn row
     older than that window still carries the filename but the file is gone,
-    so a 404 here is an ordinary outcome, not an error state.
+    so a 404 here is an ordinary outcome, not an error state."""
+    return await _turn_recording_response(request, em_recordings.RecordingKind.UTTERANCE, "")
+
+
+@auth.require_auth
+async def _get_turn_recording(request: web.Request) -> web.StreamResponse:
+    """GET /api/devices/{id}/turns/{turn}/recording — the turn recording: the
+    whole turn's canonical mic, through the spoken answer, as a WAV placed by
+    the turn's AFE series (`recording`).
+
+    Only turns with an AFE chart captured while saveUtterances was on have
+    one, and only the newest em_recordings.KEEP_TURN_PER_DEVICE per device
+    survive, so a 404 here is an ordinary outcome, not an error state."""
+    return await _turn_recording_response(request, em_recordings.RecordingKind.TURN, "-recording")
+
+
+async def _turn_recording_response(request: web.Request, kind: em_recordings.RecordingKind,
+                                   suffix: str) -> web.StreamResponse:
+    """One turn's saved recording of `kind` as a WAV attachment.
 
     The filename is derived from (device, turn) rather than taken from the
     row: em_recordings.resolve then re-checks that the file belongs to the
@@ -843,7 +909,7 @@ async def _get_turn_audio(request: web.Request) -> web.StreamResponse:
     row = await _device_row(device_id)
 
     name = em_recordings.filename(device_id, turn_id)
-    path = em_recordings.resolve(device_id, name) if name else None
+    path = em_recordings.resolve(device_id, name, kind=kind) if name else None
     if path is None:
         return _error(ErrorCode.NO_RECORDING,
                       "No saved audio for this turn", 404)
@@ -853,7 +919,7 @@ async def _get_turn_audio(request: web.Request) -> web.StreamResponse:
         path,
         headers={
             "Content-Type":        "audio/wav",
-            "Content-Disposition": f'attachment; filename="{label}-turn{turn_id}.wav"',
+            "Content-Disposition": f'attachment; filename="{label}-turn{turn_id}{suffix}.wav"',
             # Recordings are immutable once written and their names are
             # unique per turn, but the retention window means a name can
             # stop resolving — so cache privately and briefly, never shared.
@@ -909,12 +975,9 @@ async def _post_device_collect(request: web.Request) -> web.Response:
         return _error(ErrorCode.RECORDING_AMBIENT,
                       "Stop ambient recording on this device first", 409)
 
-    connected = _online(device_id)
-    if enabled and connected is not None and connected.link is None:
-        return _error(ErrorCode.UPGRADE_REQUIRED, "Device firmware must be upgraded", 409)
+    live = _online(device_id)
     await loop.run_in_executor(None, db.set_collect_mode, device_id, enabled)
 
-    live = connected if connected is not None and connected.link is not None else None
     if live is not None:
         # The controller writes the device log line itself, since it is the
         # thing that knows the mode actually took effect (and how many clips
@@ -1240,12 +1303,9 @@ async def _post_device_ambient(request: web.Request) -> web.Response:
                       "Stop wake-word sample collection on this device first",
                       409)
 
-    connected = _online(device_id)
-    if enabled and connected is not None and connected.link is None:
-        return _error(ErrorCode.UPGRADE_REQUIRED, "Device firmware must be upgraded", 409)
+    live = _online(device_id)
     await loop.run_in_executor(None, db.set_ambient_mode, device_id, enabled)
 
-    live = connected if connected is not None and connected.link is not None else None
     if live is not None:
         # The controller writes the device log line itself: it is the thing
         # that knows whether a file was opened, and which one was kept on the
@@ -1369,7 +1429,7 @@ def _number(value: object) -> int | float | None:
     return None
 
 
-def _pct(sorted_values: list[int | float], p: float) -> int | float | None:
+def _pct(sorted_values: Sequence[int | float], p: float) -> int | float | None:
     if not sorted_values:
         return None
     return sorted_values[min(len(sorted_values) - 1, int(len(sorted_values) * p))]
@@ -1526,6 +1586,44 @@ async def _get_device_wake_shadow(request: web.Request) -> web.Response:
                 "events": [asdict(e) for e in events]})
 
 
+# The windows, in hours, of the Status tab's response-latency percentiles.
+RESPONSE_LATENCY_WINDOWS_H = (24, 7 * 24, 30 * 24)
+
+
+class _LatencyWindow(TypedDict):
+    hours: int
+    turns: int                  # turns that measured a response latency
+    p50: int | float | None     # None: no turn in the window measured one
+    p90: int | float | None
+    p95: int | float | None
+    p99: int | float | None
+
+
+def _latency_windows(samples: Sequence[tuple[float, int]], now: float) -> list[_LatencyWindow]:
+    """Percentiles of `samples` ((ts, response_latency_ms)) per RESPONSE_LATENCY_WINDOWS_H."""
+    out: list[_LatencyWindow] = []
+    for hours in RESPONSE_LATENCY_WINDOWS_H:
+        since = now - hours * 3600
+        values = sorted(ms for ts, ms in samples if ts >= since)
+        out.append({"hours": hours, "turns": len(values), "p50": _pct(values, 0.50),
+                    "p90": _pct(values, 0.90), "p95": _pct(values, 0.95), "p99": _pct(values, 0.99)})
+    return out
+
+
+@auth.require_auth
+async def _get_device_response_latency(request: web.Request) -> web.Response:
+    """GET /api/devices/{id}/response_latency — percentiles of the end of the
+    user's last word → the response's first frame played (turns.response_latency_ms,
+    the Dot's clock) over each RESPONSE_LATENCY_WINDOWS_H window. Turns that
+    measured none are left out, never counted as zero."""
+    device_id = request.match_info["id"]
+    await _device_row(device_id)
+    now = time.time()
+    samples = await asyncio.get_running_loop().run_in_executor(
+        None, db.get_response_latencies, device_id, now - max(RESPONSE_LATENCY_WINDOWS_H) * 3600)
+    return _ok({"windows": _latency_windows(samples, now)})
+
+
 @auth.require_admin
 async def _patch_device(request: web.Request) -> web.Response:
     """PATCH /api/devices/{id} — update label."""
@@ -1619,6 +1717,11 @@ def _validate_config(values: Mapping[str, object],
                           f"wakeModel is not registered: {value}", 400)
     if "extendedUtterances" in values and not isinstance(values["extendedUtterances"], bool):
         return _error(ErrorCode.INVALID_CONFIG, "extendedUtterances must be boolean", 400)
+    if em_pause_asr.PAUSE_ASR_KEY in values:
+        try:
+            em_pause_asr.parse_pause_asr(values[em_pause_asr.PAUSE_ASR_KEY])
+        except ValueError as err:
+            return _error(ErrorCode.INVALID_CONFIG, f"{em_pause_asr.PAUSE_ASR_KEY}: {err}", 400)
     if em_wake_rules.OPEN_RULES_KEY in values or em_wake_rules.SHADOW_RULES_KEY in values:
         # The baseline of the model this write selects (else the fleet's); a
         # device's own model may differ, and session.ready drops any extra
@@ -1753,7 +1856,7 @@ async def _post_device_wifi(request: web.Request) -> web.Response:
         return _error(ErrorCode.INVALID_CREDENTIALS,
                       f"WPA passphrase must be 8–63 characters (got {len(psk)})", 400)
 
-    live = _require_v1(device_id)
+    live = _require_online(device_id)
     st = _wifi_change(device_id)
     if st.pending is not None:
         return _error(ErrorCode.WIFI_CHANGE_IN_PROGRESS,
@@ -1788,7 +1891,7 @@ async def _post_device_wifi_scan(request: web.Request) -> web.Response:
     takes ~5s).
     """
     device_id = request.match_info["id"]
-    live = _require_v1(device_id)
+    live = _require_online(device_id)
     if live.wifi_scan_future is not None:
         return _error(ErrorCode.SCAN_IN_PROGRESS, "A scan is already running", 409)
 
@@ -1885,7 +1988,7 @@ async def _post_device_capture(request: web.Request) -> web.Response:
 
     row = await _device_row(device_id)
 
-    live = _v1(device_id)
+    live = _online(device_id)
     services = request.app[SERVICES]
 
     if not enabled:
@@ -1897,8 +2000,6 @@ async def _post_device_capture(request: web.Request) -> web.Response:
         return _error(ErrorCode.NOT_APPROVED,
                       "Approve this device before capturing from it", 409)
     if live is None:
-        if _online(device_id) is not None:
-            return _error(ErrorCode.UPGRADE_REQUIRED, "Device firmware must be upgraded", 409)
         return _error(ErrorCode.NOT_CONNECTED,
                       "Capture mode needs a connected device — it is not "
                       "persisted and cannot be armed in advance", 409)
@@ -1936,7 +2037,7 @@ async def _post_capture_window(request: web.Request) -> web.Response:
     device_id = request.match_info["id"]
     body = await _optional_json_body(request)
 
-    live = _v1(device_id)
+    live = _online(device_id)
     if live is None:
         return _error(ErrorCode.NOT_CONNECTED, f"Device not connected: {device_id}", 409)
     if not live.capture_mode:
@@ -1969,7 +2070,7 @@ async def _post_capture_window_stop(request: web.Request) -> web.Response:
     body = await _optional_json_body(request)
     session = body.get("session")
 
-    live = _v1(device_id)
+    live = _online(device_id)
     if live is None:
         return _error(ErrorCode.NOT_CONNECTED, f"Device not connected: {device_id}", 409)
 
@@ -1999,7 +2100,7 @@ async def _get_capture_recording(request: web.Request) -> web.Response:
     error — the driver decides whether to retry or record the cell as failed.
     """
     device_id = request.match_info["id"]
-    live = _v1(device_id)
+    live = _online(device_id)
     if live is None:
         return _error(ErrorCode.NOT_CONNECTED, f"Device not connected: {device_id}", 409)
     if not live.capture_mode:
@@ -2028,7 +2129,7 @@ async def _get_device_capture(request: web.Request) -> web.Response:
     Everything here is per-connection, so an offline device reports the mode
     off rather than a stale sink."""
     device_id = request.match_info["id"]
-    return _ok(request.app[SERVICES].capture_state(_v1(device_id)))
+    return _ok(request.app[SERVICES].capture_state(_online(device_id)))
 
 
 # ─── OTA: update + rollback ───────────────────────────────────────────────────
@@ -2038,39 +2139,161 @@ async def _post_device_update(request: web.Request) -> web.Response:
     """
     POST /api/devices/{id}/update
 
-    Deploys a new binary to the device using A/B slots.
-    Accepts an optional JSON body with {"upload_token": "..."} to deploy a
-    locally uploaded binary instead of the latest GitHub release.
+    Installs the bundled firmware on the device using A/B slots.
 
     Returns 202 Accepted — update runs in the background.
     """
     device_id = request.match_info["id"]
-    body = await _optional_json_body(request)
-    upload_token = body.get("upload_token")
 
     await _device_row(device_id)
     _require_online(device_id)
     if device_id in _updates_in_progress:
         return _error(ErrorCode.UPDATE_IN_PROGRESS, "An update is already in progress", 409)
 
-    binary_override: bytes | None = None
-    if upload_token:
-        # Taken only once the device can accept it: a refused request must
-        # leave the upload usable for the retry.
-        binary_override = _pending_uploads.pop(str(upload_token), None)
-        if binary_override is None:
-            return _error(ErrorCode.INVALID_TOKEN, "Upload token not found or expired", 404)
-        target = _upload_target(binary_override)
-    else:
-        release = await _get_cached_release()
-        if release is None:
-            return _error(ErrorCode.NO_RELEASE, "No release information available", 409)
-        target = _UpdateTarget(version=release["version"], url=release["url"])
+    services = request.app[SERVICES]
+    firmware = services.firmware()
+    await _start_install(services.shell, device_id, firmware)
+    return _ok({"status": UpdateQueueStatus.STARTED, "version": firmware.version}, status=202)
 
-    _begin_ota(device_id, _run_update(request.app[SERVICES].shell, device_id, target,
-                                      binary_override))
-    return _ok({"status": "started", "version": target.version}, status=202)
 
+class UpdateQueueStatus(enum.StrEnum):
+    """What asking for the bundled firmware did (`status` of the 202)."""
+
+    STARTED = "started"   # the install is running now
+    QUEUED = "queued"     # it runs when the device next connects
+
+
+def _firmware_behind(row: db.DeviceRow, firmware: em_firmware.BundledFirmware) -> bool:
+    """
+    Whether the device is not on the bundled firmware: the last version it
+    reported — kept on the row, so this holds offline too — differs, or was
+    never reported.
+    """
+    return row.firmware_ver != firmware.version
+
+
+async def _start_install(shell: em_shell.ShellBroker, device_id: str,
+                         firmware: em_firmware.BundledFirmware) -> None:
+    """
+    Start the bundled-firmware install on a connected device, claiming its OTA
+    slot synchronously (see _begin_ota). An install queued for its next
+    connect is satisfied by this one, so it is cleared: left queued, a failed
+    install would retry on the reconnect that follows its auto-rollback.
+    """
+    _begin_ota(device_id, _run_update(shell, device_id, firmware))
+    await _clear_update_queue(device_id)
+
+
+async def _clear_update_queue(device_id: str) -> int | None:
+    """Clear the device's queued install; returns when it was queued, None
+    when nothing was. Tells the dashboard only when something changed."""
+    queued_at = await asyncio.get_running_loop().run_in_executor(
+        None, db.take_update_queue, device_id)
+    if queued_at is not None:
+        await _push_event(EventType.DEVICE_UPDATE_QUEUE, device_id=device_id, queued_at=None)
+    return queued_at
+
+
+@auth.require_admin
+async def _post_device_update_queue(request: web.Request) -> web.Response:
+    """
+    POST /api/devices/{id}/update/queue
+
+    Bring an approved device that is not on the bundled firmware onto it.
+    Offline, the request is persisted and runs when the device next connects
+    (see _reconcile_update_queue). It names no version: what installs is
+    whatever this controller bundles at that connect. A device that is online
+    by the time the request lands is installed now, as /update would.
+
+    202 `{"status": "queued"|"started", "version", "queued_at"}`;
+    409 not_approved / already_current / update_in_progress.
+    """
+    device_id = request.match_info["id"]
+    row = await _device_row(device_id)
+    if not row.approved:
+        return _error(ErrorCode.NOT_APPROVED, "Device is not approved", 409)
+    services = request.app[SERVICES]
+    firmware = services.firmware()
+    if not _firmware_behind(row, firmware):
+        return _error(ErrorCode.ALREADY_CURRENT,
+                      f"Device already runs the bundled firmware {firmware.version}", 409)
+    if device_id in _updates_in_progress:
+        return _error(ErrorCode.UPDATE_IN_PROGRESS, "An update is already in progress", 409)
+
+    queued_at = int(time.time())
+    await asyncio.get_running_loop().run_in_executor(
+        None, db.set_update_queued, device_id, queued_at)
+    await _push_event(EventType.DEVICE_UPDATE_QUEUE, device_id=device_id, queued_at=queued_at)
+    await push_log_event(device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
+                         "Firmware install queued for the next connect "
+                         f"(bundled now: {firmware.version})")
+
+    if await _reconcile_update_queue(services.shell, device_id, firmware) \
+            is QueuedUpdateOutcome.STARTED:
+        return _ok({"status": UpdateQueueStatus.STARTED, "version": firmware.version,
+                    "queued_at": None}, status=202)
+    return _ok({"status": UpdateQueueStatus.QUEUED, "version": firmware.version,
+                "queued_at": queued_at}, status=202)
+
+
+@auth.require_admin
+async def _delete_device_update_queue(request: web.Request) -> web.Response:
+    """DELETE /api/devices/{id}/update/queue — cancel a queued install.
+    Idempotent: `{"cancelled": false}` when nothing was queued."""
+    device_id = request.match_info["id"]
+    await _device_row(device_id)
+    cancelled = await _clear_update_queue(device_id) is not None
+    if cancelled:
+        await push_log_event(device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
+                             "Queued firmware install cancelled")
+    return _ok({"cancelled": cancelled})
+
+
+class QueuedUpdateOutcome(enum.StrEnum):
+    """What _reconcile_update_queue did with a device's queued install."""
+
+    NONE = "none"          # nothing queued
+    WAITING = "waiting"    # stays queued: offline, not approved, or an OTA is running
+    CURRENT = "current"    # already on the bundled firmware — cleared, nothing installed
+    STARTED = "started"    # install started — cleared
+
+
+async def _reconcile_update_queue(shell: em_shell.ShellBroker, device_id: str,
+                                  firmware: em_firmware.BundledFirmware) -> QueuedUpdateOutcome:
+    """
+    Act on the device's queued install, if any, against the firmware bundled
+    NOW (the queue is "bring this device current", not a pinned version).
+    Run on every connect (notify_device_connected) and when a request queues
+    one for a device that is already online.
+    """
+    loop = asyncio.get_running_loop()
+    row = await loop.run_in_executor(None, db.get_device, device_id)
+    if row is None or row.update_queued_at is None:
+        return QueuedUpdateOutcome.NONE
+    live = _online(device_id)
+    if live is None or not row.approved or device_id in _updates_in_progress:
+        return QueuedUpdateOutcome.WAITING
+    if live.firmware_version == firmware.version:
+        if await _clear_update_queue(device_id) is not None:
+            await push_log_event(device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
+                                 f"Queued firmware install cleared: device already runs "
+                                 f"{firmware.version}")
+        return QueuedUpdateOutcome.CURRENT
+
+    queued_at = await loop.run_in_executor(None, db.take_update_queue, device_id)
+    if queued_at is None:
+        return QueuedUpdateOutcome.NONE        # cancelled meanwhile
+    # The take awaited: re-check what it may have changed before claiming the
+    # OTA slot, synchronously with the claim. Put the entry back if the device
+    # is no longer installable — the request outlives a flapping connection.
+    if _online(device_id) is None or device_id in _updates_in_progress:
+        await loop.run_in_executor(None, db.set_update_queued, device_id, queued_at)
+        return QueuedUpdateOutcome.WAITING
+    _begin_ota(device_id, _run_update(shell, device_id, firmware))
+    await _push_event(EventType.DEVICE_UPDATE_QUEUE, device_id=device_id, queued_at=None)
+    await push_log_event(device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
+                         f"Running queued firmware install → {firmware.version}")
+    return QueuedUpdateOutcome.STARTED
 
 @auth.require_admin
 async def _post_device_rollback(request: web.Request) -> web.Response:
@@ -2096,42 +2319,6 @@ async def _post_device_rollback(request: web.Request) -> web.Response:
 
     _begin_ota(device_id, _run_rollback(request.app[SERVICES].shell, device_id, previous))
     return _ok({"status": "started", "rolling_back_to": previous}, status=202)
-
-
-# How long an uploaded binary waits for a deploy before it is dropped.
-UPLOAD_TTL_S = 600
-MAX_UPLOAD_BYTES = 50 * 1024 * 1024
-
-
-@auth.require_admin
-async def _post_upload_binary(request: web.Request) -> web.Response:
-    """
-    POST /api/releases/upload (multipart: field name "binary")
-
-    Upload a local binary for deployment. Returns an upload_token valid for
-    10 minutes. Pass the token to /api/devices/{id}/update or
-    /api/releases/deploy to deploy it.
-    """
-    try:
-        reader = await request.multipart()
-        field  = await reader.next()
-        if not isinstance(field, aiohttp.BodyPartReader) or field.name != "binary":
-            return _error(ErrorCode.INVALID_UPLOAD, "Expected multipart field 'binary'", 400)
-        binary = await _read_part(field, MAX_UPLOAD_BYTES)
-        if binary is None:
-            return _error(ErrorCode.TOO_LARGE, "Binary exceeds 50 MB limit", 413)
-        if not binary:
-            return _error(ErrorCode.EMPTY_UPLOAD, "Uploaded binary is empty", 400)
-
-        token = str(uuid.uuid4())
-        _pending_uploads[token] = binary
-        log.info(f"[api] Binary uploaded: {len(binary):,} bytes token={token[:8]}…")
-        asyncio.get_running_loop().call_later(UPLOAD_TTL_S, _pending_uploads.pop, token, None)
-
-        return _ok({"upload_token": token, "size": len(binary)})
-    except Exception as e:
-        log.error(f"[api] Upload error: {e}")
-        return _error(ErrorCode.UPLOAD_FAILED, str(e), 500)
 
 
 # ─── Wake model registry ─────────────────────────────────────────────────────
@@ -2455,7 +2642,7 @@ async def _post_sound_preview(request: web.Request) -> web.Response:
     sound_id = _require_str(body, "sound_id")
     if em_sounds.safe_sound_id(sound_id) is None:
         return _error(ErrorCode.INVALID_ID, "Bad sound id", 400)
-    device = _require_v1(request.match_info["id"])
+    device = _require_online(request.match_info["id"])
     result = await request.app[SERVICES].preview_sound(device, sound_id)
     if result.get("error") == "offline":
         return _error(ErrorCode.DEVICE_OFFLINE, "Device disconnected", 409)
@@ -2465,7 +2652,7 @@ async def _post_sound_preview(request: web.Request) -> web.Response:
 @auth.require_auth
 async def _post_sound_stop(request: web.Request) -> web.Response:
     """POST /api/devices/{id}/sounds/stop — stop the current preview."""
-    device = _require_v1(request.match_info["id"])
+    device = _require_online(request.match_info["id"])
     await request.app[SERVICES].stop_preview(device)
     return _ok({"stopped": True})
 
@@ -2539,15 +2726,6 @@ async def _post_alarm_cancel(request: web.Request) -> web.Response:
 
 # ─── OTA background tasks ─────────────────────────────────────────────────────
 
-@dataclass(frozen=True, slots=True)
-class _UpdateTarget:
-    """What an OTA installs: a release's version, and where to fetch its
-    binary (None for an uploaded binary, which is passed in whole)."""
-
-    version: str
-    url: str | None
-
-
 def _begin_ota(device_id: str, job: Coroutine[object, object, None]) -> None:
     """
     Claim the device's OTA slot and run `job` in the background.
@@ -2583,17 +2761,6 @@ def _parse_active_slot(detect_output: str) -> _Slot | None:
     return None
 
 
-def _extract_binary_version(binary: bytes) -> str | None:
-    """
-    Scan a compiled Go binary for its embedded EchoMuse version string.
-    The version is compiled in via -ldflags "-X ...Version=YYYYMMDD-HHMM-suffix".
-    Pattern matches e.g. 20260614-1152-dev, 20260614-0513-release, etc.
-    Falls back to None if not found, caller generates a local-YYYYMMDD-HHMM label.
-    """
-    match = re.search(rb'20\d{6}-\d{4}-[a-z][a-z0-9]*', binary)
-    return match.group(0).decode("ascii") if match else None
-
-
 async def _update_failed(device_id: str, reason: str) -> None:
     """
     Record and broadcast an OTA failure: device log line, in-memory
@@ -2607,37 +2774,29 @@ async def _update_failed(device_id: str, reason: str) -> None:
     await _push_event(EventType.DEVICE_UPDATE_FAILED, device_id=device_id, error=reason)
 
 
-async def _run_update(shell: em_shell.ShellBroker, device_id: str, target: _UpdateTarget,
-                      binary_override: bytes | None = None) -> None:
+async def _run_update(shell: em_shell.ShellBroker, device_id: str,
+                      firmware: em_firmware.BundledFirmware) -> None:
     """
-    Background task (started by _begin_ota): A/B slot update.
+    Background task (started by _begin_ota): A/B slot update to the bundled
+    firmware.
 
-    1. Fetch binary (GitHub or pre-uploaded).
+    1. Read the bundled binary (checked against its startup hash).
     2. Detect active slot via readlink; migrate legacy layout if needed.
     3. Stream binary to inactive slot.
     4. Flip symlink atomically.
-    5. Restart service and monitor reconnect.
+    5. Restart service and confirm it reconnects on the bundled version.
     6. Detect auto-rollback (start_server.sh retry exhausted).
     """
     loop = asyncio.get_running_loop()
-    version = target.version
+    version = firmware.version
 
     try:
         await push_log_event(device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
                              f"OTA update starting → {version}")
 
-        # Fetch binary
-        if binary_override is not None:
-            binary = binary_override
-            await push_log_event(device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
-                                 f"Using uploaded binary ({len(binary):,} bytes)")
-        else:
-            fetched = await _fetch_binary(target.url) if target.url else None
-            if fetched is None:
-                await _update_failed(device_id,
-                                     "Failed to fetch binary from GitHub")
-                return
-            binary = fetched
+        binary = await loop.run_in_executor(None, firmware.read)
+        await push_log_event(device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
+                             f"Installing bundled firmware ({len(binary):,} bytes)")
 
         # Record current version as previous before anything changes
         row = await loop.run_in_executor(None, db.get_device, device_id)
@@ -2685,8 +2844,8 @@ async def _run_update(shell: em_shell.ShellBroker, device_id: str, target: _Upda
         # Sync the startup script while we're here — OTA is the only update
         # path existing devices have for it (see _sync_start_script).
         await _sync_start_script(shell, live, device_id)
-        # Payload drift is not limited to the start script — the debloat
-        # halves had no update path at all until 2026-07-30.
+        # Payload drift is not limited to the start script: re-apply the
+        # debloat it carries.
         await _sync_debloat(shell, live, device_id)
 
         inactive_slot = active_slot.other
@@ -2694,16 +2853,11 @@ async def _run_update(shell: em_shell.ShellBroker, device_id: str, target: _Upda
         # Free space, checked BEFORE writing anything. The transfer needs room
         # for the new binary alongside its .part, and running /data out of
         # space mid-write is a bad way to find out. Read with parse_free_mb,
-        # never an awk field index — busybox wraps a long filesystem name onto
-        # its own line, so $4 is the percentage on these devices.
+        # never an awk field index — a long filesystem name can wrap onto
+        # its own line, making $4 the percentage.
         need_mb  = (len(binary) * 2) // 1048576 + 8   # binary + .part + slack
-        free_out = await _shell_run(
-            shell, live, 'echo "FREE $(busybox df -m /data | busybox tail -1)"')
-        free_mb = None
-        for line in (free_out or "").splitlines():
-            if line.startswith("FREE"):
-                free_mb = _parse_free_mb(line[5:])
-                break
+        free_out = await _shell_run(shell, live, FREE_SPACE_PROBE)
+        free_mb = _parse_free_mb(free_out)
         if free_mb is not None and free_mb < need_mb:
             await _update_failed(
                 device_id,
@@ -2747,7 +2901,7 @@ async def _run_update(shell: em_shell.ShellBroker, device_id: str, target: _Upda
         # _monitor_reconnect below detects whether the restart succeeded.
 
         # Wait for device to come back
-        confirmed = await _monitor_reconnect(device_id, version, previous_version=current_ver, timeout=90)
+        confirmed = await _monitor_reconnect(device_id, version, timeout=90)
 
         if confirmed:
             _update_errors.pop(device_id, None)
@@ -2866,13 +3020,13 @@ async def _monitor_reconnect(
     timeout: int = 90,
 ) -> bool:
     """
-    Poll until the device reconnects on a new version, or timeout elapses.
+    Poll until the device reconnects on the expected version, or timeout elapses.
 
-    Accepts success if the device reports expected_version exactly (GitHub
-    releases where the tag matches the binary's embedded version), OR any
-    version that differs from previous_version (local uploads where the
-    binary reports its own version string, not the controller's local-YYYYMMDD
-    tracking string).
+    Accepts success if the device reports expected_version exactly. A
+    rollback also passes previous_version, since its target is only the
+    label recorded before the last update: any version other than the one
+    it flipped away from counts. An update passes none — the bundled
+    version is the exact string compiled into the binary it installed.
     """
     loop     = asyncio.get_running_loop()
     deadline = time.monotonic() + timeout
@@ -3046,6 +3200,33 @@ def _transfer_failed(stage: TransferStage, extra: str = "") -> TransferResult:
     return TransferResult(False, stage, detail)
 
 
+# One round trip names whether the device has toybox's base64 decoder and
+# md5sum. The decoder must decode the test string back to `test`, not merely
+# exit 0, so an unrelated `base64` on PATH cannot pass.
+TOOL_PROBE_DONE = "__DETECT_DONE__"
+TOOL_PROBE = (
+    "if [ \"$(echo dGVzdA== | base64 -d 2>/dev/null)\" = test ]; then echo DECODER:base64; "
+    "else echo DECODER:none; fi; "
+    "if echo x | md5sum >/dev/null 2>&1; then echo MD5:md5sum; "
+    f"else echo MD5:none; fi; echo {TOOL_PROBE_DONE}"
+)
+
+
+def _probe_decoder(detect_buf: str) -> str | None:
+    """The decode command TOOL_PROBE's output names; None when it names none."""
+    return "base64 -d" if "DECODER:base64" in detect_buf else None
+
+
+def _probe_md5(detect_buf: str) -> str | None:
+    """The md5 command TOOL_PROBE's output names; None when it names none."""
+    return "md5sum" if "MD5:md5sum" in detect_buf else None
+
+
+def _md5_of(path: str) -> str:
+    """Shell printing `<md5>  <path>` through toybox's md5sum."""
+    return f"md5sum {path} 2>/dev/null"
+
+
 async def _stream_file_to_device(shell: em_shell.ShellBroker, live: em_device.Device,
                                  data: bytes, dest: str,
                                  mode: str = "755",
@@ -3053,8 +3234,7 @@ async def _stream_file_to_device(shell: em_shell.ShellBroker, live: em_device.De
     """
     Transfer a file to `dest` on the device via shell heredoc (default mode 755).
 
-    Detects available base64 decoder (busybox base64, python3, python) before
-    transferring, since 'base64' is not always in PATH on Android/FireOS.
+    Detects the base64 decoder and md5 tool before transferring (TOOL_PROBE).
     Uses a heredoc so no intermediate .b64 file is needed.
     The heredoc delimiter contains '_' which is not in the base64 alphabet.
 
@@ -3066,13 +3246,11 @@ async def _stream_file_to_device(shell: em_shell.ShellBroker, live: em_device.De
     the transfer, so it costs a round trip on an open socket, not a new session.
 
     `require_verify` decides what happens when the device has no md5 tool at
-    all. Callers default to False, which warns and accepts — the same behaviour
-    they had before this existed, and the base64 detection below already treats
-    a busybox-less device as a contemplated state. Firmware passes True.
+    all. Callers default to False, which warns and accepts. Firmware passes
+    True.
     """
     device_id     = live.device_id
     DELIM         = "__END_B64_42__"
-    DETECT_MARKER = "__DETECT_DONE__"
 
     session = contextlib.AsyncExitStack()
     try:
@@ -3094,21 +3272,8 @@ async def _stream_file_to_device(shell: em_shell.ShellBroker, live: em_device.De
         # heredoc writes with `>`, which truncates, and a verified transfer
         # arrives by `mv` over whatever was there.
 
-        # ── Detect available base64 decoder ──────────────────────────────────
-        # Try busybox first (Magisk provides it), then python3/python.
-        # We run a round-trip sanity test so we know the decode flag works.
-        # The md5 tool is detected in the SAME round trip, not a second one.
-        # busybox first for the same reason as the decoder (Magisk provides
-        # it); bare md5sum as a fallback since some SKUs have it in PATH.
-        await ws.send(
-            "if echo dGVzdA== | busybox base64 -d >/dev/null 2>&1; then echo DECODER:busybox; "
-            "elif python3 -c 'import base64,sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))' </dev/null >/dev/null 2>&1; then echo DECODER:python3; "
-            "elif python  -c 'import base64,sys; sys.stdout.write(base64.b64decode(sys.stdin.read()))' </dev/null >/dev/null 2>&1; then echo DECODER:python; "
-            "else echo DECODER:none; fi; "
-            "if echo x | busybox md5sum >/dev/null 2>&1; then echo MD5:busybox; "
-            "elif echo x | md5sum >/dev/null 2>&1; then echo MD5:plain; "
-            f"else echo MD5:none; fi; echo {DETECT_MARKER}\n"
-        )
+        # ── Detect available base64 decoder and md5 tool (TOOL_PROBE) ────────
+        await ws.send(TOOL_PROBE + "\n")
 
         detect_buf = ""
         detect_dl  = time.monotonic() + 15
@@ -3117,30 +3282,21 @@ async def _stream_file_to_device(shell: em_shell.ShellBroker, live: em_device.De
                 msg  = await asyncio.wait_for(ws.recv(), timeout=2)
                 text = msg.decode("utf-8", errors="replace") if isinstance(msg, bytes) else msg
                 detect_buf += text
-                if DETECT_MARKER in detect_buf:
+                if TOOL_PROBE_DONE in detect_buf:
                     break
             except asyncio.TimeoutError:
                 continue
 
-        if "DECODER:busybox" in detect_buf:
-            decode_cmd = "busybox base64 -d"
-        elif "DECODER:python3" in detect_buf:
-            decode_cmd = ("python3 -c "
-                          "'import sys,base64; "
-                          "sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))'")
-        elif "DECODER:python" in detect_buf:
-            decode_cmd = ("python -c "
-                          "'import sys,base64; "
-                          "sys.stdout.write(base64.b64decode(sys.stdin.read()))'")
-        else:
-            # Two very different things reach here. DETECT_MARKER present means
+        decode_cmd = _probe_decoder(detect_buf)
+        if decode_cmd is None:
+            # Two very different things reach here. TOOL_PROBE_DONE present means
             # the device answered and genuinely has no decoder — a property of
             # that device, which retrying will not change. Absent means the
             # round trip produced nothing in 15s, i.e. the shell plane is not
             # carrying output, which is a link problem and IS worth retrying.
             # Reporting both as "no base64 decoder" sent #121 looking at the
             # wrong half.
-            if DETECT_MARKER not in detect_buf:
+            if TOOL_PROBE_DONE not in detect_buf:
                 log.error(f"[api] Shell produced no output in 15s while probing "
                           f"{device_id} for a decoder — link problem, not a "
                           f"missing tool. Output so far: {detect_buf!r}")
@@ -3149,14 +3305,10 @@ async def _stream_file_to_device(shell: em_shell.ShellBroker, live: em_device.De
                       f"Detection output: {detect_buf!r}")
             return _transfer_failed(TransferStage.DECODER)
 
-        log.info(f"[api] Decoder: {decode_cmd.split()[0]} {decode_cmd.split()[1]}")
+        log.info(f"[api] Decoder: {decode_cmd}")
 
-        if "MD5:busybox" in detect_buf:
-            md5_cmd = "busybox md5sum"
-        elif "MD5:plain" in detect_buf:
-            md5_cmd = "md5sum"
-        else:
-            md5_cmd = None
+        md5_cmd = _probe_md5(detect_buf)
+        if md5_cmd is None:
             if require_verify:
                 log.error(f"[api] No md5 tool on device — refusing to transfer "
                           f"{dest} unverified. Detection output: {detect_buf!r}")
@@ -3220,9 +3372,8 @@ async def _stream_file_to_device(shell: em_shell.ShellBroker, live: em_device.De
         # than a new session. A mismatch removes the .part and leaves dest as
         # it was — for firmware that means the rollback slot keeps its previous
         # binary instead of being replaced by a broken one.
-        # No `cut`: md5sum prints "<hash>  <path>", and the busybox-less branch
-        # is exactly where `busybox cut` would not be there either. A case glob
-        # needs no external tool at all.
+        # No `cut`: md5sum prints "<hash>  <path>", and a case glob needs no
+        # external tool at all.
         want = hashlib.md5(data).hexdigest()
         await ws.send(
             f'GOT=$({md5_cmd} {landing} 2>/dev/null); '
@@ -3261,8 +3412,14 @@ async def _stream_file_to_device(shell: em_shell.ShellBroker, live: em_device.De
     finally:
         await session.aclose()
 
+
+# Where the provisioning wizard installs the supervisor script; the echomuse
+# init service runs it.
+START_SCRIPT_PATH = "/data/local/bin/start_server.sh"
+
+
 async def _sync_start_script(shell: em_shell.ShellBroker, live: em_device.Device,
-                             device_id: str) -> None:
+                             device_id: str) -> bool:
     """
     OTA-time payload sync: heal /data/local/bin/start_server.sh drift.
 
@@ -3276,18 +3433,21 @@ async def _sync_start_script(shell: em_shell.ShellBroker, live: em_device.Device
     reading the OLD inode, so the update only takes effect at the next
     device reboot — safe to do while the script sits in its `wait` loop.
     Best-effort: a sync failure logs but never blocks the firmware update.
+
+    True when the device's script is the canonical one on return — what
+    Fire OS 6's debloat needs before it runs the script's `debloat` mode.
     """
-    path = "/data/local/bin/start_server.sh"
+    path = START_SCRIPT_PATH
     try:
         script = (PAYLOADS_DIR / "start_server.sh").read_bytes()
     except OSError as e:
         log.error(f"[api] start_server.sh payload unreadable — skipping sync: {e}")
-        return
+        return False
     want = hashlib.md5(script).hexdigest()
 
-    out = await _shell_run(shell, live, f"busybox md5sum {path} 2>/dev/null")
+    out = await _shell_run(shell, live, _md5_of(path))
     if want in out:
-        return  # in sync — the common case
+        return True  # in sync — the common case
     await asyncio.sleep(1.0)  # let the md5 shell session close cleanly
 
     await push_log_event(device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
@@ -3296,180 +3456,82 @@ async def _sync_start_script(shell: em_shell.ShellBroker, live: em_device.Device
     pushed = await _stream_file_to_device(shell, live, script, tmp)
     if not pushed:
         await push_log_event(device_id, db.LogLevel.WARN, db.LogSource.CONTROLLER,
-                             f"start_server.sh sync failed: {pushed} — continuing OTA")
-        return
+                             f"start_server.sh sync failed: {pushed}")
+        return False
     await asyncio.sleep(1.0)
 
+    # ${NEW%% *} keeps the hash: md5sum prints "<hash>  <path>". The
+    # expansion needs no tool.
     res = await _shell_run(shell, live,
-        f'NEW=$(busybox md5sum {tmp} | busybox cut -d" " -f1); '
+        f'NEW=$({_md5_of(tmp)}); NEW=${{NEW%% *}}; '
         f'if [ "$NEW" = "{want}" ]; then '
         f'mv {tmp} {path} && chmod 755 {path} && echo SCRIPT_SYNCED; '
         f'else rm -f {tmp}; echo SCRIPT_MD5_MISMATCH:$NEW; fi')
-    if "SCRIPT_SYNCED" in res:
+    synced = "SCRIPT_SYNCED" in res
+    if synced:
         await push_log_event(device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
                              "start_server.sh synced — takes effect on next device reboot")
     else:
         await push_log_event(device_id, db.LogLevel.WARN, db.LogSource.CONTROLLER,
-                             f"start_server.sh sync failed ({res.strip() or 'no output'}) — continuing OTA")
+                             f"start_server.sh sync failed ({res.strip() or 'no output'})")
     await asyncio.sleep(1.0)
+    return synced
 
 
-# Magisk service.d location of the boot-time debloat script. Installed by the
-# provisioning wizard; synced from here afterwards.
-DEBLOAT_SCRIPT_PATH = "/sbin/.core/img/.core/service.d/echomuse-debloat.sh"
+# `start_server.sh debloat`'s last line: how many listed services init no
+# longer runs, and which (listed services, or dnsmasq) are still up.
+_DENYLIST_RESULT = re.compile(r"DEBLOAT_STOPPED:(\d+) STILL_RUNNING:(\S*)")
 
 
-def _package_list(text: str) -> list[str]:
-    """debloat_packages.txt's package names: comments and blank lines dropped."""
-    return [ln.strip() for ln in text.splitlines()
-            if ln.strip() and not ln.lstrip().startswith("#")]
+@dataclass(frozen=True, slots=True)
+class DenylistResult:
+    """What `start_server.sh debloat` reported."""
+
+    stopped: int
+    still_running: tuple[str, ...]
 
 
-def _debloat_packages() -> list[str]:
-    """The pm-hide list from the canonical payload, comments stripped."""
-    try:
-        raw = (PAYLOADS_DIR / "debloat_packages.txt").read_text()
-    except OSError as e:
-        log.error(f"[api] debloat_packages.txt unreadable: {e}")
-        return []
-    return _package_list(raw)
+def _parse_denylist_result(out: str) -> DenylistResult | None:
+    """The result line in `start_server.sh debloat`'s output; None without one."""
+    m = _DENYLIST_RESULT.search(out)
+    if m is None:
+        return None
+    return DenylistResult(int(m.group(1)), tuple(n for n in m.group(2).split(",") if n))
 
 
 async def _sync_debloat(shell: em_shell.ShellBroker, live: em_device.Device,
                         device_id: str) -> None:
     """
-    Heal debloat drift on a device that is already in the field.
+    Re-apply the debloat — from every firmware update and from
+    POST /api/devices/{id}/debloat: the service denylist start_server.sh
+    stops at every boot (FOS6_DENYLIST, the list's only copy), run on its own
+    by the script's `debloat` mode. No reboot needed — the services stop now,
+    and every boot stops them again.
 
-    The debloat has two halves and neither had an update path. The boot script
-    was installed once by the provisioning wizard, and the pm-hide list was
-    applied once at the same time — so a device provisioned before a list grew
-    never receives the addition. Found 2026-07-30 when round 2 added
-    com.amazon.whad and every existing device needed a manual push.
-
-    Both halves are reconciled here, idempotently, so this is safe to run as
-    often as you like:
-
-      * the script by md5 against the canonical payload, replaced by rename so
-        the running shell keeps reading the old inode (same reasoning as
-        _sync_start_script — it takes effect on the next device reboot);
-      * the hide list by asking the device which of those packages are still
-        VISIBLE and hiding only those. One `pm list packages` costs about a
-        second; `pm hide` is slow enough per call that hiding all 32
-        unconditionally would add half a minute for nothing.
-
-    Best-effort throughout: a failure logs and returns, and never blocks the
-    firmware update this normally rides along with.
-
-    Note what hiding does NOT do: com.amazon.whad is PERSISTENT, so hiding it
-    leaves the running instance alive until the next reboot (am force-stop is a
-    no-op on it — measured). That matches the rest of the debloat's semantics
-    rather than being a shortcoming of this function, and it is why the log
-    line says "next reboot".
+    The script is synced first, and the mode runs only when the device's copy
+    is then the canonical one: a script predating the mode ignores its
+    argument and would run in full, starting a second supervisor beside the
+    live one.
     """
-    # ── half 1: the boot script ──────────────────────────────────────────────
-    try:
-        script = (PAYLOADS_DIR / "echomuse-debloat.sh").read_bytes()
-    except OSError as e:
-        log.error(f"[api] echomuse-debloat.sh payload unreadable — skipping sync: {e}")
-        script = None
-
-    if script is not None:
-        want = hashlib.md5(script).hexdigest()
-        out = await _shell_run(shell, live, f"busybox md5sum {DEBLOAT_SCRIPT_PATH} 2>/dev/null")
-        if want not in out:
-            # An empty result also lands here — a device provisioned before the
-            # script existed has no file at all, and installing it is right.
-            await asyncio.sleep(1.0)
-            await push_log_event(device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
-                                 "debloat script out of date — syncing canonical version")
-            tmp = DEBLOAT_SCRIPT_PATH + ".new"
-            pushed = await _stream_file_to_device(shell, live, script, tmp)
-            if pushed:
-                await asyncio.sleep(1.0)
-                res = await _shell_run(shell, live,
-                    f'NEW=$(busybox md5sum {tmp} | busybox cut -d" " -f1); '
-                    f'if [ "$NEW" = "{want}" ]; then '
-                    f'mv {tmp} {DEBLOAT_SCRIPT_PATH} && chmod 755 {DEBLOAT_SCRIPT_PATH} '
-                    f'&& echo DEBLOAT_SYNCED; '
-                    f'else rm -f {tmp}; echo DEBLOAT_MD5_MISMATCH:$NEW; fi')
-                synced = "DEBLOAT_SYNCED" in res
-                await push_log_event(
-                    device_id,
-                    db.LogLevel.INFO if synced else db.LogLevel.WARN, db.LogSource.CONTROLLER,
-                    "debloat script synced — daemon stops take effect on next device reboot"
-                    if synced else
-                    f"debloat script sync failed ({res.strip() or 'no output'})")
-            else:
-                await push_log_event(device_id, db.LogLevel.WARN, db.LogSource.CONTROLLER,
-                                     f"debloat script sync failed: {pushed}")
-            await asyncio.sleep(1.0)
-
-    # ── half 2: the pm-hide list ─────────────────────────────────────────────
-    pkgs = _debloat_packages()
-    if not pkgs:
-        return
-    # Built as a file rather than a long inline list: 30-odd package names is
-    # over a kilobyte of command line, and a shell command that is *usually*
-    # short enough is the kind of thing that breaks on the day someone adds the
-    # thirty-third package.
-    listing = ("\n".join(pkgs) + "\n").encode()
-    remote_list = "/data/local/tmp/em_debloat_pkgs.txt"
-    pushed = await _stream_file_to_device(shell, live, listing, remote_list, mode="644")
-    if not pushed:
+    if not await _sync_start_script(shell, live, device_id):
         await push_log_event(device_id, db.LogLevel.WARN, db.LogSource.CONTROLLER,
-                             f"debloat hide-list sync failed: {pushed}")
+                             "debloat not applied: start_server.sh could not be brought "
+                             "up to date, and an older copy would start a second server")
         return
-    await asyncio.sleep(1.0)
-
-    # Two details here were learned by getting them wrong (2026-07-30).
-    #
-    # The list is iterated with `for` over a variable, NOT `while read < file`:
-    # `pm` is a wrapper that starts app_process, and a command inside a read
-    # loop can consume the loop's own stdin, silently ending it early. `pm hide`
-    # also gets </dev/null for the same reason.
-    #
-    # And the end state is VERIFIED by re-listing rather than trusting the
-    # return code of each hide, so a partial failure cannot read as success.
-    #
-    # The match is `grep -qx`, ANCHORED to the whole line, and that is the
-    # important part. A shell `case "$VIS" in *"package:$p"*)` looks equivalent
-    # and is not: `package:com.amazon.tcomm` is also a substring of
-    # `package:com.amazon.tcomm.client`, so three packages appeared un-hidden
-    # because a *different*, longer-named package was visible. That produced a
-    # confident warning about a FireOS limitation that did not exist — `pm hide`
-    # had worked, and dumpsys said hidden=true throughout.
-    res = await _shell_run(shell, live,
-        f'PKGS=$(cat {remote_list}); VIS=$(pm list packages); N=0; '
-        f'for p in $PKGS; do '
-        f'if echo "$VIS" | busybox grep -qx "package:$p"; then '
-        f'pm hide "$p" >/dev/null 2>&1 </dev/null && N=$((N+1)); fi; '
-        f'done; '
-        f'VIS2=$(pm list packages); LEFT=""; '
-        f'for p in $PKGS; do '
-        f'if echo "$VIS2" | busybox grep -qx "package:$p"; then LEFT="$LEFT $p"; fi; '
-        f'done; '
-        f'rm -f {remote_list}; '
-        f'echo HIDDEN_APPLIED:$N; echo STILL_VISIBLE:$LEFT', timeout=180.0)
-
-    applied = 0
-    for tok in res.split():
-        if tok.startswith("HIDDEN_APPLIED:"):
-            try:
-                applied = int(tok.split(":", 1)[1])
-            except ValueError:
-                pass
-    still = ""
-    for line in res.splitlines():
-        if line.strip().startswith("STILL_VISIBLE:"):
-            still = line.split(":", 1)[1].strip()
-    if applied:
+    out = await _shell_run(shell, live, f"sh {START_SCRIPT_PATH} debloat 2>&1", timeout=60.0)
+    result = _parse_denylist_result(out)
+    if result is None:
+        await push_log_event(device_id, db.LogLevel.WARN, db.LogSource.CONTROLLER,
+                             f"debloat: start_server.sh reported no result "
+                             f"({out.strip() or 'no output'})")
+    elif result.still_running:
+        await push_log_event(device_id, db.LogLevel.WARN, db.LogSource.CONTROLLER,
+                             f"debloat: {result.stopped} Amazon service(s) stopped; still "
+                             f"running: {', '.join(result.still_running)}")
+    else:
         await push_log_event(device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
-                             f"debloat: hid {applied} newly-listed package(s) — "
-                             f"persistent ones stop at the next device reboot")
-    if still:
-        await push_log_event(device_id, db.LogLevel.WARN, db.LogSource.CONTROLLER,
-                             f"debloat: {len(still.split())} package(s) could not be "
-                             f"hidden and are still active: {still}")
+                             f"debloat: Amazon's services stopped ({result.stopped} listed, "
+                             f"none running)")
     await asyncio.sleep(1.0)
 
 
@@ -3519,9 +3581,9 @@ async def _ws_shell(request: web.Request) -> web.WebSocketResponse:
 
     try:
         # pty:true — interactive terminal wants a real PTY (mksh prompt,
-        # line editing, top/vi, resize). Old firmware ignores the field and
-        # opens the legacy pipe; handle_shell reports the established mode
-        # to the dashboard via shell_meta. Programmatic sessions
+        # line editing, top/vi, resize). The firmware falls back to a pipe
+        # when PTY allocation fails; handle_shell reports the established
+        # mode to the dashboard via shell_meta. Programmatic sessions
         # (_device_shell) deliberately do not set it.
         await live.send(MessageType.SHELL_OPEN, {"pty": True})
         await req.wait()
@@ -3538,24 +3600,14 @@ async def _ws_shell(request: web.Request) -> web.WebSocketResponse:
     return ws
 
 
-# ─── Releases ─────────────────────────────────────────────────────────────────
+# ─── Bundled firmware ─────────────────────────────────────────────────────────
 
 @auth.require_auth
-async def _get_latest_release(request: web.Request) -> web.Response:
-    """GET /api/releases/latest — latest GitHub release, from cache."""
-    release = await _get_cached_release()
-    if release is None:
-        return _error(ErrorCode.NO_RELEASE, "No release information available", 404)
-    return _ok(release)
-
-
-@auth.require_admin
-async def _post_check_release(request: web.Request) -> web.Response:
-    """POST /api/releases/check — force re-poll GitHub."""
-    release = await _fetch_latest_release(force=True)
-    if release is None:
-        return _error(ErrorCode.NO_RELEASE, "Could not fetch release from GitHub", 502)
-    return _ok(release)
+async def _get_firmware(request: web.Request) -> web.Response:
+    """GET /api/firmware — the firmware build this controller installs."""
+    firmware = request.app[SERVICES].firmware()
+    return _ok({"version": firmware.version, "size": firmware.size,
+                "sha256": firmware.sha256})
 
 
 class DeploySkipReason(enum.StrEnum):
@@ -3567,63 +3619,47 @@ class DeploySkipReason(enum.StrEnum):
     UPDATE_IN_PROGRESS = "update_in_progress"
 
 
-def _upload_target(binary: bytes) -> _UpdateTarget:
-    """An uploaded binary's version: the one compiled into it, else a
-    local-YYYYMMDD-HHMM label."""
-    version = _extract_binary_version(binary) or f"local-{time.strftime('%Y%m%d-%H%M')}"
-    return _UpdateTarget(version=version, url=None)
-
-
 @auth.require_admin
-async def _post_deploy_all(request: web.Request) -> web.Response:
+async def _post_deploy_firmware(request: web.Request) -> web.Response:
     """
-    POST /api/releases/deploy
+    POST /api/firmware/deploy
 
-    Deploy to all connected, approved, non-current devices.
-    Accepts optional {"upload_token": "..."} to deploy a local binary
-    to the whole fleet instead of the latest GitHub release.
+    Install the bundled firmware on every connected, approved device not
+    already on it.
+
+    Walks every registered device, not only the ones connected since this
+    controller started: an approved device that is offline and behind is
+    reported `offline`, so the dashboard can offer to queue its install for
+    its next connect (POST /api/devices/{id}/update/queue).
     """
-    body = await _optional_json_body(request)
-    upload_token = body.get("upload_token")
-    binary_override: bytes | None = None
-
-    if upload_token:
-        binary_override = _pending_uploads.pop(str(upload_token), None)
-        if binary_override is None:
-            return _error(ErrorCode.INVALID_TOKEN, "Upload token not found or expired", 404)
-        target = _upload_target(binary_override)
-    else:
-        release = await _get_cached_release()
-        if release is None:
-            return _error(ErrorCode.NO_RELEASE, "No release information available", 409)
-        target = _UpdateTarget(version=release["version"], url=release["url"])
-
+    services = request.app[SERVICES]
+    firmware = services.firmware()
     started: list[str] = []
     skipped: list[dict[str, str]] = []
     loop = asyncio.get_running_loop()
 
-    for device_id, device in list(_devices.items()):
-        if not device.online:
-            skipped.append({"device_id": device_id, "reason": DeploySkipReason.OFFLINE})
-            continue
-        row = await loop.run_in_executor(None, db.get_device, device_id)
-        if row is None or not row.approved:
+    for row in await loop.run_in_executor(None, db.get_all_devices):
+        device_id = row.device_id
+        live = _online(device_id)
+        if not row.approved:
             skipped.append({"device_id": device_id, "reason": DeploySkipReason.NOT_APPROVED})
             continue
-        if not upload_token and row.firmware_ver == target.version:
+        if not _firmware_behind(row, firmware):
             skipped.append({"device_id": device_id, "reason": DeploySkipReason.ALREADY_CURRENT})
+            continue
+        if live is None:
+            skipped.append({"device_id": device_id, "reason": DeploySkipReason.OFFLINE})
             continue
         if device_id in _updates_in_progress:
             skipped.append({"device_id": device_id,
                             "reason": DeploySkipReason.UPDATE_IN_PROGRESS})
             continue
 
-        _begin_ota(device_id, _run_update(request.app[SERVICES].shell, device_id, target,
-                                          binary_override))
+        await _start_install(services.shell, device_id, firmware)
         started.append(device_id)
 
     return _ok({
-        "version": target.version,
+        "version": firmware.version,
         "started": started,
         "skipped": skipped,
     }, status=202)
@@ -3658,118 +3694,26 @@ async def _get_provision_start_script(request: web.Request) -> web.Response:
 
 
 @auth.require_admin
-async def _get_provision_debloat_script(request: web.Request) -> web.Response:
-    """GET /api/provision/debloat_script — the Magisk service.d boot script
-    that re-stops init-launched daemons each boot (Debloat wizard step)."""
-    return web.Response(
-        text=_read_payload("echomuse-debloat.sh"),
-        content_type='text/plain',
-        headers={'Content-Disposition': 'attachment; filename="echomuse-debloat.sh"'},
-    )
-
-
-@auth.require_admin
-async def _get_provision_debloat_packages(request: web.Request) -> web.Response:
-    """GET /api/provision/debloat_packages — the pm-hide package list as JSON.
-
-    Parsed server-side (comments/blank lines stripped) so the wizard never
-    has to understand the file format and list edits ship without a
-    dashboard rebuild.
+async def _get_provision_firmware(request: web.Request) -> web.Response:
     """
-    return _ok({"packages": _package_list(_read_payload("debloat_packages.txt"))})
+    GET /api/provision/firmware — the bytes of the bundled firmware, for the
+    provisioning wizard's install step.
 
-
-@auth.require_admin
-async def _get_provision_latest_binary(request: web.Request) -> web.Response:
+    A freshly-flashed device isn't registered in _devices yet and can't go
+    through the /api/devices/{id}/update OTA path (that requires a live
+    session), so the wizard takes the binary from here instead. Either way it
+    is the same build: the one bundled with this controller.
     """
-    GET /api/provision/latest_binary — serves the bytes of the latest
-    GitHub release binary, for the provisioning wizard's "Install latest
-    from GitHub" step.
-
-    Distinct from /api/releases/latest (metadata only: {version, url}) —
-    this route does the actual download from GitHub on the server side
-    and streams the binary back, since a freshly-flashed device isn't
-    registered in _devices yet and can't go through the
-    /api/devices/{id}/update fleet-OTA path (that requires a live
-    WebSocket session). Reuses the same cache/fetch machinery as OTA.
-    """
-    release = await _get_cached_release()
-    if release is None:
-        return _error(ErrorCode.NO_RELEASE, "No release information available", 404)
-
-    binary = await _fetch_binary(release["url"])
-    if binary is None:
-        return _error(ErrorCode.FETCH_FAILED, "Could not download binary from GitHub", 502)
-
+    firmware = request.app[SERVICES].firmware()
+    binary = await asyncio.get_running_loop().run_in_executor(None, firmware.read)
     return web.Response(
         body=binary,
         content_type='application/octet-stream',
         headers={
             'Content-Disposition': 'attachment; filename="server"',
-            'X-Release-Version': release["version"],
+            'X-Firmware-Version': firmware.version,
+            'X-Firmware-Sha256': firmware.sha256,
         },
-    )
-
-
-@auth.require_admin
-async def _get_provision_magisk_db(request: web.Request) -> web.Response:
-    """GET /api/provision/magisk_db — generates a pre-seeded Magisk grant DB.
-
-    Grants uid 2000 (adb shell) and uid 0 (root) unconditional su access so
-    the screenless Echo Dot never shows a grant dialog.
-    """
-    def _build_db() -> bytes:
-        fd, path = tempfile.mkstemp(suffix='.db')
-        os.close(fd)
-        try:
-            with contextlib.closing(_sqlite3.connect(path)) as con:
-                # Schema confirmed against a real Magisk v17.3 device dump
-                # (sqlite> .schema on a working /data/adb/magisk.db) — NOT
-                # guessed. magiskd queries settings and strings on every su
-                # request regardless of whether anything's stored in them;
-                # the previous version of this function only created
-                # `policies` (and with the wrong columns — no package_name in
-                # the real schema, PRIMARY KEY is uid alone). Missing
-                # settings/strings meant every single su call hit
-                # "sqlite3_exec: no such table" on each of those two tables
-                # and got hard-rejected — which looked like a hang from the
-                # wizard side because su was taking up to ~60s per rejection
-                # cycle, far longer than the wizard's retry loop accounted for.
-                con.execute(
-                    "CREATE TABLE policies ("
-                    "  uid INT,"
-                    "  policy INT,"
-                    "  until INT,"
-                    "  logging INT,"
-                    "  notification INT,"
-                    "  PRIMARY KEY(uid)"
-                    ")"
-                )
-                con.execute(
-                    "CREATE TABLE settings (key TEXT, value INT, PRIMARY KEY(key))"
-                )
-                con.execute(
-                    "CREATE TABLE strings (key TEXT, value TEXT, PRIMARY KEY(key))"
-                )
-                con.execute(
-                    "CREATE TABLE denylist (package_name TEXT, process TEXT, "
-                    "PRIMARY KEY(package_name, process))"
-                )
-                # policy=2 → always grant. Matches the confirmed real schema:
-                # uid, policy, until, logging, notification — no package_name.
-                con.execute("INSERT INTO policies (uid, policy, until, logging, notification) VALUES (2000, 2, 0, 1, 1)")
-                con.execute("INSERT INTO policies (uid, policy, until, logging, notification) VALUES (0, 2, 0, 1, 1)")
-                con.commit()
-            return Path(path).read_bytes()
-        finally:
-            os.unlink(path)
-
-    loop = asyncio.get_running_loop()
-    data = await loop.run_in_executor(None, _build_db)
-    return web.Response(
-        body=data,
-        content_type='application/octet-stream',
-        headers={'Content-Disposition': 'attachment; filename="magisk.db"'},
     )
 
 
@@ -3839,14 +3783,13 @@ async def _post_debloat(request: web.Request) -> web.Response:
     """
     POST /api/devices/{id}/debloat
 
-    Re-apply the debloat payloads to a live device: sync the boot script and
-    hide any newly-listed packages.
+    Re-apply the debloat to a live device (_sync_debloat): sync
+    start_server.sh and stop its service denylist now.
 
     This exists because the OTA-time sync cannot reach every device. A device
     already running the latest firmware will not be updated again, so it would
-    never receive a payload change — which is exactly the situation the first
-    device hit (Lounge was current when round 2 landed). Idempotent, so
-    pressing it twice costs a `pm list packages` and nothing else.
+    never receive a payload change. Idempotent, so pressing it twice costs a
+    pass of `stop` calls on already-stopped services and nothing else.
     """
     device_id = request.match_info["id"]
     live = _require_online(device_id, f"Device not connected: {device_id}")
@@ -3900,11 +3843,11 @@ async def _get_system_status(request: web.Request) -> web.Response:
     """GET /api/system/status"""
     loop = asyncio.get_running_loop()
     all_rows = await loop.run_in_executor(None, db.get_all_devices)
-    release = await _get_cached_release()
     approval_mode = await loop.run_in_executor(
         None, db.get_config, db.SystemConfigKey.DEVICE_APPROVAL, "strict")
 
     services = request.app[SERVICES]
+    firmware = services.firmware()
 
     controller = _controller_cache.value
     return _ok({
@@ -3923,7 +3866,7 @@ async def _get_system_status(request: web.Request) -> web.Response:
         "total_devices":  len(all_rows),
         "pending":        sum(1 for r in all_rows if not r.approved),
         "approval_mode":  approval_mode,
-        "latest_release": release["version"] if release else None,
+        "firmware_version": firmware.version,
         # Controller update, surfaced alongside the firmware one so the header
         # can badge it without a second round trip. Read-only by design: the
         # controller runs as a container the user owns, and updating it is a
@@ -3933,8 +3876,7 @@ async def _get_system_status(request: web.Request) -> web.Response:
                               if controller is not None and controller["available"] else None),
         "updates_available": sum(
             1 for r in all_rows
-            if r.firmware_ver and release
-            and r.firmware_ver != release["version"]
+            if r.firmware_ver and r.firmware_ver != firmware.version
         ),
         "speech": services.speech_worker_status(),
     })
@@ -3955,6 +3897,29 @@ async def _get_ha_status(request: web.Request) -> web.Response:
     disables only the dependent feature) and where HA's calendar UI lives."""
     return _ok({"features": request.app[SERVICES].ha_status(),
                 "calendar_url": _ha_calendar_url()})
+
+
+@auth.require_admin
+async def _get_wyoming_info(request: web.Request) -> web.Response:
+    """GET /api/speech/wyoming?host=&port= — the ASR programs and models a Wyoming
+    server offers, for the `pauseAsr` setting (§16.6). Admin only: it connects to
+    the address it is given."""
+    try:
+        server = em_pause_asr.parse_pause_asr({
+            "engine": em_pause_asr.PauseAsrEngine.WYOMING, "host": request.query.get("host", ""),
+            "port": int(request.query.get("port", em_pause_asr.DEFAULT_WYOMING_PORT)),
+            "model": "", "language": ""})
+    except ValueError as err:
+        return _error(ErrorCode.INVALID_PARAM, str(err), 400)
+    if server is None:      # unreachable: the engine above is a server
+        return _error(ErrorCode.INVALID_PARAM, "host is required", 400)
+    loop = asyncio.get_running_loop()
+    try:
+        programs = await loop.run_in_executor(None, em_pause_asr.describe, server.host, server.port)
+    except (OSError, em_pause_asr.WyomingError) as err:
+        return _error(ErrorCode.SERVER_UNREACHABLE,
+                      f"{server.host}:{server.port}: {str(err) or type(err).__name__}", 502)
+    return _ok({"programs": [asdict(program) for program in programs]})
 
 
 @auth.require_admin
@@ -4139,7 +4104,9 @@ class EventType(enum.StrEnum):
     DEVICE_UPDATE_FAILED = "device_update_failed"
     DEVICE_AUTO_ROLLED_BACK = "device_auto_rolled_back"
     DEVICE_ROLLED_BACK = "device_rolled_back"
-    RELEASE_UPDATE = "release_update"
+    # A firmware install queued for the next connect was set or cleared:
+    # `queued_at` is the unix time it was queued, null once cleared.
+    DEVICE_UPDATE_QUEUE = "device_update_queue"
     CONTROLLER_UPDATE = "controller_update"
     TURN_COMPLETE = "turn_complete"
     ALERTS = "alerts"
@@ -4194,7 +4161,7 @@ async def push_device_update(device_id: str, state: Mapping[str, object]) -> Non
 
 async def push_turn_complete(device_id: str, turn: Mapping[str, object]) -> None:
     """Broadcast a persisted voice turn (a turns row, with its turn_id)."""
-    await _push_event(EventType.TURN_COMPLETE, device_id=device_id, turn=turn)
+    await _push_event(EventType.TURN_COMPLETE, device_id=device_id, turn=_turn_json(turn))
 
 
 async def push_alerts(device_id: str, kind: str, data: Mapping[str, object]) -> None:
@@ -4207,7 +4174,7 @@ async def push_ha_status(features: object) -> None:
     await _push_event(EventType.HA_STATUS, features=features)
 
 
-# ─── GitHub release fetching ──────────────────────────────────────────────────
+# ─── Controller release advisory ──────────────────────────────────────────────
 
 # Fallback poll interval (s) when the stored update_check_interval is unusable.
 DEFAULT_UPDATE_CHECK_INTERVAL = 3600
@@ -4215,9 +4182,9 @@ DEFAULT_GITHUB_REPO = "wilbowes/EchoMuse"
 
 
 def _update_check_interval() -> int:
-    """The configured release poll interval. Blocking (DB). A value that is
-    not a positive integer — it is a free-text PATCH — falls back to the
-    default rather than crashing the poll loop or spinning it."""
+    """The configured controller release poll interval. Blocking (DB). A
+    value that is not a positive integer — it is a free-text PATCH — falls
+    back to the default rather than crashing the poll loop or spinning it."""
     raw = db.get_config(db.SystemConfigKey.UPDATE_CHECK_INTERVAL,
                         str(DEFAULT_UPDATE_CHECK_INTERVAL))
     try:
@@ -4235,173 +4202,6 @@ def _github_repo() -> str:
 def _json_str(value: object) -> str:
     """A string field from GitHub's JSON, or "" when absent or not a string."""
     return value if isinstance(value, str) else ""
-
-
-def _stored_release() -> tuple[ReleaseInfo | None, bool]:
-    """
-    The release the DB last cached, and whether that cache has aged past the
-    check interval. Blocking (DB).
-    """
-    K = db.SystemConfigKey
-    version = db.get_config(K.LATEST_VERSION)
-    url     = db.get_config(K.LATEST_BINARY_URL)
-    if not version or not url:
-        return None, True
-    release: ReleaseInfo = {
-        "version":      version,
-        "url":          url,
-        "notes":        db.get_config(K.LATEST_NOTES, "") or "",
-        "release_url":  db.get_config(K.LATEST_RELEASE_URL, "") or "",
-        "published_at": db.get_config(K.LATEST_PUBLISHED_AT, "") or "",
-    }
-    try:
-        last_check = float(db.get_config(K.LAST_UPDATE_CHECK) or 0.0)
-    except ValueError:
-        last_check = 0.0
-    stale = not last_check or (time.time() - last_check) > _update_check_interval()
-    return release, stale
-
-
-async def _get_cached_release() -> ReleaseInfo | None:
-    """
-    Return the latest release info, using the in-memory cache if fresh.
-    Falls back to the DB cache if the in-memory cache is cold.
-    Triggers a background fetch if the DB cache is stale.
-    """
-    # In-memory cache hit
-    cached = _release_cache.fresh(RELEASE_CACHE_TTL)
-    if cached is not None:
-        return cached
-
-    # Load from DB cache
-    stored, stale = await asyncio.get_running_loop().run_in_executor(None, _stored_release)
-    if stored is not None:
-        _release_cache.put(stored)
-
-        # If the DB cache has aged out, AWAIT the refresh rather than firing it
-        # into the background and returning the stale value.
-        #
-        # Returning stale here is why "there's an update" showed up
-        # inconsistently and why an OTA could push the previous release: the
-        # caller — dashboard or update endpoint — got the old version and the
-        # fresh one only landed in the cache afterwards, for whoever asked
-        # next. It cost one wrong OTA (v2.9.9 pushed while v2.9.10 was
-        # current, 2026-07-30).
-        #
-        # The cost is a single GitHub round trip, bounded by the 10s timeout in
-        # _fetch_latest_release, and only on the first request after the
-        # interval lapses — release_poll_loop normally refreshes ahead of any
-        # caller. A failed refresh falls through to the stale cache, which is
-        # better than no answer.
-        if stale:
-            fresh = await _fetch_latest_release()
-            if fresh:
-                return fresh
-
-        return stored
-
-    # No cache at all — fetch synchronously
-    return await _fetch_latest_release()
-
-
-def _firmware_release(releases: object) -> tuple[str, str, dict[str, object]] | None:
-    """
-    (tag, binary URL, release) of the newest device firmware release in
-    GitHub's newest-first releases list: a plain v* tag (controller releases
-    use controller-v* and ship no binary), published, with the compiled
-    `server` asset attached.
-    """
-    if not isinstance(releases, list):
-        return None
-    for data in releases:
-        if not isinstance(data, dict) or data.get("draft") or data.get("prerelease"):
-            continue
-        tag = _json_str(data.get("tag_name"))
-        if not tag.startswith("v"):
-            continue
-        assets = data.get("assets")
-        binary = next((a for a in assets if isinstance(a, dict) and a.get("name") == "server"),
-                      None) if isinstance(assets, list) else None
-        if binary is None:
-            continue
-        url = binary.get("browser_download_url")
-        return (tag, url, data) if isinstance(url, str) else None
-    return None
-
-
-def _store_release(release: ReleaseInfo) -> str | None:
-    """Persist the release cache; returns the version it replaces. Blocking (DB)."""
-    K = db.SystemConfigKey
-    previous = db.get_config(K.LATEST_VERSION)
-    db.set_config(K.LATEST_VERSION,      release["version"])
-    db.set_config(K.LATEST_BINARY_URL,   release["url"])
-    db.set_config(K.LATEST_NOTES,        release["notes"])
-    db.set_config(K.LATEST_RELEASE_URL,  release["release_url"])
-    db.set_config(K.LATEST_PUBLISHED_AT, release["published_at"])
-    db.set_config(K.LAST_UPDATE_CHECK,   str(time.time()))
-    return previous
-
-
-async def _fetch_latest_release(force: bool = False) -> ReleaseInfo | None:
-    """
-    Poll the GitHub releases API and update the DB cache.
-
-    Returns the release dict or None on failure.
-    """
-    loop = asyncio.get_running_loop()
-    repo = await loop.run_in_executor(None, _github_repo)
-    url  = GITHUB_API_URL.format(repo=repo)
-
-    log.info(f"[api] Polling GitHub releases: {url}")
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                url,
-                headers={"Accept": "application/vnd.github.v3+json"},
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                if resp.status != 200:
-                    log.warning(f"[api] GitHub API returned {resp.status}")
-                    return None
-                releases = await resp.json()
-
-        found = _firmware_release(releases)
-        if found is None:
-            log.warning("[api] No device firmware release with a 'server' asset found")
-            return None
-        tag, download_url, data = found
-
-        # Release notes, so the dashboard can show WHAT an update changes
-        # rather than only that one exists. Deciding whether to push firmware
-        # to a device you rely on, from a version number alone, is not a
-        # decision — it is a guess. The body comes from the annotated tag (see
-        # .github/workflows/release.yml), which is why tags are annotated.
-        release: ReleaseInfo = {
-            "version":      tag,
-            "url":          download_url,
-            "notes":        _json_str(data.get("body")).strip(),
-            "release_url":  _json_str(data.get("html_url")),
-            "published_at": _json_str(data.get("published_at")),
-        }
-        previous_tag = await loop.run_in_executor(None, _store_release, release)
-        _release_cache.put(release)
-
-        log.info(f"[api] Latest release: {tag}")
-        if tag != previous_tag:
-            # Tell any open dashboard, so a tab that is already showing the
-            # Updates panel does not sit on the old version until someone
-            # reloads or presses Check now.
-            log.info(f"[api] Release changed {previous_tag or '(none)'} -> {tag}")
-            await _push_event(EventType.RELEASE_UPDATE,
-                              version=tag,
-                              notes=release["notes"],
-                              release_url=release["release_url"],
-                              published_at=release["published_at"])
-        return release
-
-    except Exception as e:
-        log.error(f"[api] GitHub release fetch failed: {e}")
-        return None
 
 
 def _store_controller_release(version: str, notes: str, published_at: str) -> str | None:
@@ -4504,8 +4304,8 @@ async def _fetch_controller_release(force: bool = False) -> ControllerRelease | 
         log.info(f"[api] Latest controller release: {version} "
                  f"(running {CONTROLLER_VERSION}, {check['status']})")
         if version != previous:
-            # Same live-push as device releases: a dashboard left open should
-            # not sit on stale information until someone reloads.
+            # Live-push: a dashboard left open should not sit on stale
+            # information until someone reloads.
             await _push_event(EventType.CONTROLLER_UPDATE,
                               version=version, notes=notes, published_at=published_at,
                               status=check["status"], available=check["available"])
@@ -4659,8 +4459,10 @@ def _controller_stats(loop_lag_peak_ms: float) -> dict[str, object]:
     except OSError:
         pass
     try:
-        rec_dir = em_recordings.recordings_dir()
-        total = sum(f.stat().st_size for f in rec_dir.iterdir() if f.is_file())
+        # Both kinds: the utterances and the turn recordings.
+        total = sum(f.stat().st_size for kind in em_recordings.RecordingKind
+                    if (rec_dir := em_recordings.recordings_dir(kind=kind)).is_dir()
+                    for f in rec_dir.iterdir() if f.is_file())
         stats["recordings_mb"] = round(total / 1048576.0, 1)
     except OSError:
         pass
@@ -4747,7 +4549,6 @@ async def _get_support_bundle(request: web.Request) -> web.Response:
         hello = live.link.hello if live is not None and live.link is not None else None
         live_state[did] = {
             "connected":        live is not None,
-            "upgrade_required": bool(live is not None and live.upgrade_required),
             # Capabilities decide which HA entities and controls exist.
             "capabilities":     sorted(live.capabilities) if live is not None else [],
             # Why ambient_light is absent: no_chip, no_attribute, or ok (#90).
@@ -4811,29 +4612,11 @@ async def _get_support_bundle(request: web.Request) -> web.Response:
     )
 
 
-async def _fetch_binary(download_url: str) -> bytes | None:
-    """Download the binary from a GitHub release asset URL."""
-    log.info(f"[api] Fetching binary: {download_url}")
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                download_url,
-                timeout=aiohttp.ClientTimeout(total=120),
-            ) as resp:
-                if resp.status != 200:
-                    log.error(f"[api] Binary download failed: HTTP {resp.status}")
-                    return None
-                return await resp.read()
-    except Exception as e:
-        log.error(f"[api] Binary download exception: {e}")
-        return None
-
-
 # ─── Periodic background tasks ────────────────────────────────────────────────
 
-async def release_poll_loop() -> None:
+async def controller_release_poll_loop() -> None:
     """
-    Periodically poll GitHub for new releases.
+    Periodically poll GitHub for a newer controller release (advisory only).
 
     Runs as an asyncio task started from em_controller.main().
     Interval is read from system_config each iteration so it can be
@@ -4843,13 +4626,6 @@ async def release_poll_loop() -> None:
     await asyncio.sleep(30)
 
     while True:
-        try:
-            await _fetch_latest_release()
-        except Exception as e:
-            log.error(f"[api] Release poll loop error: {e}")
-
-        # Same cadence, separate failure domain: a GitHub hiccup on one must
-        # not cost the other its poll.
         try:
             await _fetch_controller_release(force=True)
         except Exception as e:
@@ -4900,8 +4676,15 @@ async def _collect_supervisor_log(shell: em_shell.ShellBroker, device_id: str) -
     live = _online(device_id)
     if live is None:
         return
-    out = await _shell_run(shell, live, f"busybox tail -c 4096 {SUPERVISOR_LOG}", timeout=30.0)
-    text = (out or "").strip()
+    # Shell builtins only (toybox may not link `tail`); the script caps the
+    # file at SUP_MAX, and the last 4 KiB are kept here. The -f guard keeps a
+    # missing file's redirect error out of the output.
+    out = await _shell_run(
+        shell, live,
+        f'[ -f {SUPERVISOR_LOG} ] && while IFS= read -r l || [ -n "$l" ]; '
+        f'do echo "$l"; done < {SUPERVISOR_LOG}',
+        timeout=30.0)
+    text = (out or "").strip()[-4096:]
     if not text:
         await push_log_event(device_id, db.LogLevel.WARN, db.LogSource.CONTROLLER,
             "Update failed, and the device has no supervisor log — firmware "
@@ -4913,7 +4696,8 @@ async def _collect_supervisor_log(shell: em_shell.ShellBroker, device_id: str) -
 
 
 async def notify_device_connected(shell: em_shell.ShellBroker, device_id: str,
-                                  version: str | None = None) -> None:
+                                  version: str | None = None, *,
+                                  firmware: em_firmware.BundledFirmware) -> None:
     """
     Called by em_controller when a device successfully registers.
 
@@ -4937,21 +4721,26 @@ async def notify_device_connected(shell: em_shell.ShellBroker, device_id: str,
 
     # Owed an explanation from a failed update? Collect it now the device is
     # reachable again. Removed from the set on the way in, so a flapping
-    # device cannot queue repeated fetches, and scheduled rather than awaited
-    # so a slow shell never delays the connect path.
-    if device_id in _supervisor_log_wanted:
-        _supervisor_log_wanted.discard(device_id)
-        _spawn(_collect_supervisor_log_soon(shell, device_id), f"supervisor-log:{device_id}")
+    # device cannot queue repeated fetches. Then act on any install queued
+    # for this connect. One task, scheduled rather than awaited so a slow
+    # shell never delays the connect path, and sequential so the log fetch
+    # and the install never compete for the device's shell.
+    collect_log = device_id in _supervisor_log_wanted
+    _supervisor_log_wanted.discard(device_id)
+    _spawn(_after_connect(shell, device_id, firmware, collect_log), f"after-connect:{device_id}")
 
 
-async def _collect_supervisor_log_soon(shell: em_shell.ShellBroker, device_id: str) -> None:
+async def _after_connect(shell: em_shell.ShellBroker, device_id: str,
+                         firmware: em_firmware.BundledFirmware, collect_log: bool) -> None:
     # The device has just registered; give its shell plane a moment
     # before demanding a session on it.
     await asyncio.sleep(3.0)
-    try:
-        await _collect_supervisor_log(shell, device_id)
-    except Exception as e:
-        log.warning(f"[api] supervisor log fetch failed for {device_id}: {e}")
+    if collect_log:
+        try:
+            await _collect_supervisor_log(shell, device_id)
+        except Exception as e:
+            log.warning(f"[api] supervisor log fetch failed for {device_id}: {e}")
+    await _reconcile_update_queue(shell, device_id, firmware)
 
 
 async def notify_device_disconnected(device_id: str) -> None:
@@ -5027,18 +4816,10 @@ async def _device_row(device_id: str) -> db.DeviceRow:
 
 
 def _require_online(device_id: str, message: str = "Device is not connected") -> em_device.Device:
-    """The connected Device (v1 or legacy); 409 device_offline otherwise."""
+    """The connected Device; 409 device_offline otherwise."""
     device = _online(device_id)
     if device is None:
         raise ApiError(ErrorCode.DEVICE_OFFLINE, message, 409)
-    return device
-
-
-def _require_v1(device_id: str) -> em_device.Device:
-    """The connected v1 Device; 409 device_offline / upgrade_required otherwise."""
-    device = _require_online(device_id)
-    if device.link is None:
-        raise ApiError(ErrorCode.UPGRADE_REQUIRED, "Device firmware must be upgraded", 409)
     return device
 
 
@@ -5085,6 +4866,7 @@ class DeviceJson(TypedDict):
     ip: str | None
     firmware_ver: str | None
     firmware_previous: str | None
+    os_version: str | None
     first_seen: int | None
     last_seen: int | None
     config: dict[str, object]
@@ -5094,9 +4876,7 @@ class DeviceJson(TypedDict):
     ble_proxy_port: int | None
     # Live connection
     connected: bool
-    upgrade_required: bool
     capabilities: list[str]
-    missing_capabilities: list[str]
     firmware_version: str | None
     turn_state: ActorState | None
     speaking: bool
@@ -5108,6 +4888,7 @@ class DeviceJson(TypedDict):
     alert_state: dict[str, object] | None
     ringing: bool | None
     wake_stats: dict[str, object] | None
+    afe_stats: em_afe.AfeStatsJson | None
     diagnostic: bool
     stats: dict[str, object] | None
     collectMode: bool
@@ -5124,6 +4905,7 @@ class DeviceJson(TypedDict):
     linkTls: bool
     wifi: dict[str, object]
     update_in_progress: bool
+    update_queued_at: int | None
     update_error: str | None
 
 
@@ -5133,7 +4915,8 @@ def _merge_device(row: db.DeviceRow) -> DeviceJson:
 
     Live fields describe the current connection and are null/false/empty while
     the device is offline; `wake_stats` is the last report received (it carries
-    `received_ms`), so it survives a disconnect.
+    `received_ms`), so it survives a disconnect, and `afe_stats` is that
+    report's native AFE decoder counters (null: it carried none).
     """
     device_id = row.device_id
     device = _devices.get(device_id)
@@ -5151,6 +4934,9 @@ def _merge_device(row: db.DeviceRow) -> DeviceJson:
         "ip":                 row.ip,
         "firmware_ver":       row.firmware_ver,
         "firmware_previous":  row.firmware_previous,
+        # The Fire OS build the device last reported, beside firmware_ver,
+        # the EchoMuse binary. Null: never reported (firmware predating it).
+        "os_version":         row.os_version,
         "first_seen":         row.first_seen,
         "last_seen":          row.last_seen,
         "config":             json.loads(row.config or "{}"),
@@ -5160,11 +4946,9 @@ def _merge_device(row: db.DeviceRow) -> DeviceJson:
         "ble_proxy_port":     row.ble_proxy_port,
         # Live connection
         "connected":          live is not None,
-        "upgrade_required":   bool(live is not None and live.upgrade_required),
         # Capability names (SPEC §11.1): a control whose capability is absent
         # is shown disabled with the reason, never as a silent no-op.
         "capabilities":       sorted(live.capabilities) if live is not None else [],
-        "missing_capabilities": sorted(live.missing_capabilities) if live is not None else [],
         "firmware_version":   live.firmware_version if live is not None else None,
         "turn_state":         turn_state,
         "speaking":           phase is VoicePhase.SPEAKING,
@@ -5181,6 +4965,8 @@ def _merge_device(row: db.DeviceRow) -> DeviceJson:
         "ringing":            (alert_state.get("active") is not None
                                if alert_state is not None else None),
         "wake_stats":         device.wake_stats if device is not None else None,
+        "afe_stats":          (device.afe_stats.wire()
+                               if device is not None and device.afe_stats is not None else None),
         # A diagnostic uplink lease is held, so the device answers no wake (§4.4).
         "diagnostic":         bool(live is not None and live.diagnostic),
         "stats":              live.stats if live is not None else None,
@@ -5203,6 +4989,9 @@ def _merge_device(row: db.DeviceRow) -> DeviceJson:
         "linkTls":            bool(live is not None and live.secure),
         "wifi":               _wifi_change(device_id).wire(),
         "update_in_progress": device_id in _updates_in_progress,
+        # Unix time an install of the bundled firmware was queued for the
+        # device's next connect; None when nothing is queued.
+        "update_queued_at":   row.update_queued_at,
         # Last OTA/rollback failure; None when the last attempt succeeded.
         "update_error":       _update_errors.get(device_id),
     }

@@ -1,43 +1,20 @@
 // Package wifi implements safe WiFi network changes with automatic
 // rollback, plus scan/status queries for the dashboard Connectivity tab.
 //
-// The mechanics mirror the provisioning wizard's runConfigWifi
-// (controller/static/dashboard.jsx), which was hard-won on real hardware:
-//
-//   - The ONLY safe reload path is `svc wifi disable` + `svc wifi enable`.
-//     The framework-managed wpa_supplicant instance auto-associates and
-//     gets a DHCP lease on its own. Never use raw `start wpa_supplicant`,
-//     kill -9, manual wpa_cli reconnect, or manual dhcpcd — a second bare
-//     supplicant instance fights the framework one over wlan0 and the
-//     interface dies (INTERFACE_DISABLED, never recovers).
 //   - The config is a FULL replacement of wpa_supplicant.conf with a
 //     single network block — no ambiguity about which AP it joins.
 //   - wpa_cli needs BOTH -p /data/misc/wifi/sockets (non-default socket
 //     dir) and -i wlan0.
 //
-// Two further lessons found on hardware 2026-07-11, AFTER the wizard:
-//
-//   - /system/bin/svc is a shebang-less shell script: execve (and hence
-//     Go's exec.Command("svc", ...)) fails ENOEXEC. It must be run via
-//     /system/bin/sh, and the disable must be VERIFIED to have dropped
-//     association — a silent no-op bounce makes every gate below pass
-//     against the old network and falsely commits the new conf.
-//   - The conf must be written while WiFi is DOWN: on `svc wifi disable`,
-//     WifiStateMachine saves its in-memory network list back over
-//     wpa_supplicant.conf, clobbering anything written beforehand (the
-//     wizard got away with write-then-bounce only because a factory
-//     device has no framework-known networks to save). See reloadConf.
-//
-// Unlike the wizard (ADB shell), this package runs inside the root Go
-// binary, so file writes use plain os.WriteFile — none of the mksh
-// redirect quirks apply. Ownership must still be restored to wifi:wifi
-// (AID_WIFI=1010) mode 0660 or the framework can't read the config.
+// This package runs inside the root Go binary, so file writes use plain
+// os.WriteFile. Ownership must still be restored to wifi:wifi
+// (AID_WIFI=1010) mode 0660 or the supplicant can't read the config.
 //
 // Safety model (the connection to the controller dies mid-change, so the
 // device owns the whole sequence):
 //
 //  1. Back up the current conf and drop a pending marker file.
-//  2. Disable wifi (verified), write the new conf, enable wifi.
+//  2. Write the new conf and reload it into the supplicant (reloadConf).
 //  3. Gates: associate to the TARGET SSID ≤45s → IPv4 on wlan0 ≤20s →
 //     control WebSocket re-registered ≤90s. Any failure → restore the
 //     backup the same way and report the failure once the connection
@@ -46,8 +23,27 @@
 //     marker + backup. Until then the change is provisional.
 //  5. Crash safety: if the marker exists at process start, a previous
 //     switch never got committed — RecoverIfPending restores the backup
-//     and bounces, so a crash or power cycle mid-switch self-heals back
+//     and reloads it, so a crash or power cycle mid-switch self-heals back
 //     to the old network (same philosophy as the A/B binary slots).
+//
+// Fire OS 6 has no Android framework, and start_server.sh stops wifisvc
+// before it powers the radio. radioUp powers the WLAN core and starts the
+// supplicant, which reads the conf straight off disk, so reloadConf writes
+// the conf, runs `wpa_cli reconfigure` (+ reassociate if that alone does
+// not force a fresh association), then DHCP through the init service
+// wifisvc itself starts. Its network HAL (libacehal_network.so) does
+// `ctl.start dhcpcd-<iface>`, i.e. dhcpcd-wlan0 (/init.mt8163_amazon.rc:270,
+// `/system/bin/dhcpcd wlan0 -AdLK`). The AOSP-style dhcpcd_wlan0
+// (/init.mt8163.rc:986, `dhcpcd -BK -dd`) carries no interface: AOSP
+// appends one as `ctl.start dhcpcd_wlan0:wlan0`, which this init refuses
+// ("no such service"), and started bare it exits 1 within 60 ms
+// (`control_start: No such file or directory`). dhcpcd-wlan0 leased in
+// under a second and stays running, renewing the lease itself; its hooks
+// set dhcp.wlan0.*, and names resolve through netmgrd's dnsproxyd (all on
+// hardware, 2026-10-07). -K skips carrier watching, so it never notices a
+// new association on its own: runDHCP restarts it on every join.
+// netd is not running on this image, so there is nothing for `ndc` to
+// talk to.
 package wifi
 
 import (
@@ -73,20 +69,39 @@ const (
 	wpaSockDir = "/data/misc/wifi/sockets"
 	iface      = "wlan0"
 
-	// AID_WIFI — fixed uid/gid on Android; the framework reads the conf
+	// AID_WIFI — fixed uid/gid on Android; the supplicant reads the conf
 	// as this user.
 	aidWifi = 1010
 
-	// 20s (the provisioning wizard's window) proved too tight on hardware
-	// for a network the framework hasn't joined before — autojoin's scan
-	// cycle alone can eat most of it. Reverts re-associate to a known
-	// network well inside 20s, so only first-join pays the longer wait.
+	// 20s proved too tight on hardware for a network the supplicant
+	// hasn't joined before — its scan cycle alone can eat most of it.
+	// Reverts re-associate to a known network well inside 20s, so only
+	// first-join pays the longer wait.
 	associateTimeout = 45 * time.Second
 	ipTimeout        = 20 * time.Second
 	// The reconnect gate covers mDNS rediscovery plus the control client's
 	// 5s retry cadence; generous because a false negative reverts a
 	// perfectly good network change.
 	reconnectTimeout = 90 * time.Second
+)
+
+// DHCP (package doc). dhcpServiceTimeout bounds init stopping a
+// prior run; the lease itself is bounded by ipTimeout and judged by an IPv4
+// address on wlan0, never by init state: a dhcpcd that exits at once still
+// reads "running" for the moment it lives (57 ms on hardware).
+const (
+	dhcpService        = "dhcpcd-wlan0"
+	dhcpServiceTimeout = 5 * time.Second
+
+	// What wifisvc did before start_server.sh stops it at boot, observed on
+	// hardware: MediaTek's libhardware_legacy wifi_load_driver powers the
+	// WLAN core by writing /dev/wmtWifi (wlan0 appeared within 1 s), then
+	// starts a supplicant. The wlan0-only wpa_supplicant service is used,
+	// not p2p_supplicant: nothing here uses Wi-Fi Direct. Its control
+	// socket answered ~3 s after start.
+	wmtWifiPath       = "/dev/wmtWifi"
+	supplicantService = "wpa_supplicant"
+	radioTimeout      = 10 * time.Second
 )
 
 // Result is the outcome of a change attempt, reported to the controller
@@ -238,6 +253,24 @@ func getprop(key, fallback string) string {
 	return fallback
 }
 
+// setprop sets an Android system property — the counterpart of
+// `stop`/`start` in start_server.sh, used here to start and stop the
+// device's own init services (the supplicant, dhcpService) instead of
+// hand-rolled invocations.
+func setprop(key, value string) error {
+	out, err := exec.Command("setprop", key, value).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("setprop %s %s: %v (%s)", key, value, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// svcState reads getprop init.svc.<name> — "running", "stopped",
+// "stopping", or "" if the service was never started this boot.
+func svcState(name string) string {
+	return getprop("init.svc."+name, "")
+}
+
 // composeConf builds the full-replacement wpa_supplicant.conf — the same
 // template the provisioning wizard writes. An empty psk produces an open
 // (key_mgmt=NONE) network block.
@@ -289,58 +322,91 @@ func writeConf(content string) error {
 	return os.Chmod(confPath, 0o660)
 }
 
-// svcWifi toggles the framework WiFi service. /system/bin/svc is a
-// shebang-less shell script — execve returns ENOEXEC on it, so it must be
-// run through sh explicitly (exec.Command("svc", ...) silently no-ops).
-func svcWifi(state string) error {
-	out, err := exec.Command("/system/bin/sh", "/system/bin/svc", "wifi", state).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("svc wifi %s: %v (%s)", state, err, strings.TrimSpace(string(out)))
-	}
-	return nil
-}
-
-// disableWifi brings the framework WiFi down and verifies it actually
-// dropped. A no-op disable leaves wpa_supplicant running against its old
-// in-memory config, and every downstream gate then passes vacuously
-// against the old network — a false success that commits an untried conf.
-func disableWifi() error {
-	log.Println("[wifi] svc wifi disable")
-	if err := svcWifi("disable"); err != nil {
-		return err
-	}
-	if !waitFor("disassociation after disable", 10*time.Second, func() bool { return !associated() }) {
-		_ = svcWifi("enable")
-		return fmt.Errorf("wifi did not go down after 'svc wifi disable'")
-	}
-	return nil
-}
-
-func enableWifi() error {
-	log.Println("[wifi] svc wifi enable")
-	if err := svcWifi("enable"); err != nil {
-		return err
-	}
-	time.Sleep(3 * time.Second)
-	return nil
-}
-
-// reloadConf swaps in a new wpa_supplicant.conf with WiFi DOWN. Order is
-// load-bearing: on disable, WifiStateMachine saves its in-memory network
-// list back to wpa_supplicant.conf — a conf written while WiFi is up gets
-// clobbered by that save, and the device silently rejoins the old network
-// (found on hardware 2026-07-11; provisioning never hit it because a
-// factory device has no framework-known networks to save).
+// reloadConf swaps in a new wpa_supplicant.conf and gets it joined: there
+// is no framework to race (see the package doc), so the conf is written
+// first and reconfigure does the reload and DHCP.
 func reloadConf(content string) error {
-	if err := disableWifi(); err != nil {
-		return err
-	}
 	if err := writeConf(content); err != nil {
-		// Leave WiFi usable rather than down next to a bad conf.
-		_ = enableWifi()
 		return err
 	}
-	return enableWifi()
+	return reconfigure()
+}
+
+// reconfigure reloads wpa_supplicant's config from disk and runs DHCP.
+func reconfigure() error {
+	if err := radioUp(); err != nil {
+		return err
+	}
+	if _, err := wpaCli("reconfigure"); err != nil {
+		return fmt.Errorf("wpa_cli reconfigure: %w", err)
+	}
+	if !waitFor("association after reconfigure", associateTimeout, associated) {
+		// reconfigure does not always force a fresh association cycle by
+		// itself (the conf's one network block may be unchanged from the
+		// supplicant's point of view, e.g. identical SSID/PSK) — nudge it
+		// before giving up.
+		if _, err := wpaCli("reassociate"); err != nil {
+			return fmt.Errorf("wpa_cli reassociate: %w", err)
+		}
+		if !waitFor("association after reassociate", associateTimeout, associated) {
+			return fmt.Errorf("did not associate within %s", associateTimeout)
+		}
+	}
+	_, err := runDHCP()
+	return err
+}
+
+// runDHCP (re)starts dhcpService and waits up to ipTimeout for its
+// lease, returning the address. A running copy is stopped first: -K means it
+// would not notice the new association. init stops it with SIGKILL, so the
+// old lease's address and routes stay on wlan0 (hardware); they are flushed
+// before the restart, or a stale address would pass for the new lease.
+func runDHCP() (string, error) {
+	if st := svcState(dhcpService); st != "" && st != "stopped" {
+		if err := setprop("ctl.stop", dhcpService); err != nil {
+			return "", err
+		}
+		if !waitFor(dhcpService+" to stop", dhcpServiceTimeout,
+			func() bool { return svcState(dhcpService) == "stopped" }) {
+			return "", fmt.Errorf("%s stuck %q — could not restart it", dhcpService, svcState(dhcpService))
+		}
+	}
+	if currentIPv4() != "" {
+		if out, err := exec.Command("ifconfig", iface, "0.0.0.0").CombinedOutput(); err != nil {
+			return "", fmt.Errorf("flush %s IPv4: %v (%s)", iface, err, strings.TrimSpace(string(out)))
+		}
+	}
+	if err := setprop("ctl.start", dhcpService); err != nil {
+		return "", err
+	}
+	if !waitFor("DHCP lease", ipTimeout, func() bool { return currentIPv4() != "" }) {
+		return "", fmt.Errorf("no IPv4 address on %s within %s (%s is %q)", iface, ipTimeout, dhcpService, svcState(dhcpService))
+	}
+	return currentIPv4(), nil
+}
+
+// radioUp powers the WLAN core and starts the supplicant unless
+// either is already up (wifisvc may have got there first on a later
+// restart of the firmware). Idempotent.
+func radioUp() error {
+	present := func() bool { _, err := net.InterfaceByName(iface); return err == nil }
+	if !present() {
+		if err := os.WriteFile(wmtWifiPath, []byte("1"), 0); err != nil {
+			return fmt.Errorf("power on WLAN core (%s): %w", wmtWifiPath, err)
+		}
+		if !waitFor(iface+" to appear", radioTimeout, present) {
+			return fmt.Errorf("%s did not appear after powering the WLAN core", iface)
+		}
+	}
+	if svcState(supplicantService) != "running" && svcState("p2p_supplicant") != "running" {
+		if err := setprop("ctl.start", supplicantService); err != nil {
+			return err
+		}
+	}
+	if !waitFor("supplicant control socket", radioTimeout, func() bool { _, err := wpaCli("status"); return err == nil }) {
+		return fmt.Errorf("%s did not answer on %s", supplicantService, wpaSockDir)
+	}
+	return nil
 }
 
 func waitFor(what string, timeout time.Duration, cond func() bool) bool {
@@ -369,7 +435,7 @@ func associatedTo(ssid string) bool {
 
 // waitForAssociation polls for association to ssid, logging the raw
 // supplicant state every 5s so a timeout in the field says what the
-// framework was doing (SCANNING vs 4WAY_HANDSHAKE vs INTERFACE_DISABLED).
+// supplicant was doing (SCANNING vs 4WAY_HANDSHAKE vs INTERFACE_DISABLED).
 func waitForAssociation(ssid string, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	lastDiag := time.Now()
@@ -475,7 +541,7 @@ func Change(ssid, psk string, connected func() bool) {
 
 	revert := func(reason string) {
 		log.Printf("[wifi] change to %q failed (%s) — reverting", ssid, reason)
-		// Restore with WiFi down (see reloadConf) — but if the restore
+		// Restore the same way (see reloadConf) — but if the restore
 		// write fails, conf is beyond self-healing: leave the marker so
 		// RecoverIfPending retries on next start.
 		restoreErr := reloadConf(string(old))
@@ -546,4 +612,36 @@ func RecoverIfPending() {
 	_ = os.Remove(markerPath)
 	_ = os.Remove(backupPath)
 	setResult(Result{OK: false, SSID: m.NewSSID, Error: "device restarted before the change was confirmed — previous network restored"})
+}
+
+// EnsureUp brings WiFi up at boot from the already-saved conf: nothing else
+// does this once wifisvc is stopped (it was wifisvc's job on every previous
+// boot). The supplicant keeps the saved network blocks from the last
+// successful Change; it may already be associating by the time this runs,
+// but nothing else runs its DHCP. Call once at startup, after
+// RecoverIfPending.
+func EnsureUp() {
+	if err := radioUp(); err != nil {
+		log.Printf("[wifi] boot radio bring-up failed: %v", err)
+		return
+	}
+	if !associated() {
+		if _, err := wpaCli("reconnect"); err != nil {
+			log.Printf("[wifi] boot reconnect failed: %v", err)
+		}
+		if !waitFor("association at boot", associateTimeout, associated) {
+			log.Println("[wifi] no saved network associated at boot")
+			return
+		}
+	} else if ip := currentIPv4(); ip != "" {
+		// A firmware restart: dhcpService outlives us and keeps the lease.
+		log.Printf("[wifi] already joined to %q with %s", CurrentSSID(), ip)
+		return
+	}
+	ip, err := runDHCP()
+	if err != nil {
+		log.Printf("[wifi] boot DHCP failed: %v", err)
+		return
+	}
+	log.Printf("[wifi] joined %q at boot, leased %s", CurrentSSID(), ip)
 }

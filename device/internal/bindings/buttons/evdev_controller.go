@@ -30,10 +30,13 @@ func (e *EvDevController) SetMuteCallback(cb func()) {
 }
 
 // Init the button listeners
-// Kills alexa's native button functions
+// Kills alexa's native button functions: acebuttond and aceinputmanager
+// (docs/fireos6-port.md §4.1).
 func (e *EvDevController) Init() error {
-	cmd := exec.Command("stop", "acebutton")
-	return cmd.Run()
+	if err := exec.Command("stop", "acebuttond").Run(); err != nil {
+		return err
+	}
+	return exec.Command("stop", "aceinputmanager").Run()
 }
 
 func (e *EvDevController) SubscribeToButton(callback buttons.ButtonClickCallback) (*buttons.EventSubscription, error) {

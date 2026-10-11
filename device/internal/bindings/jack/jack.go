@@ -1,8 +1,8 @@
 // Package jack reads the Echo Dot's 3.5mm headphone jack detect switch.
 //
 // The Dot carries a mediatek,mt8163-accdet block wired to the jack's detect
-// contacts. Like the ambient light sensor, Android does not surface it: there
-// is no headset state in any framework service on a debloated device. It is
+// contacts. Like the ambient light sensor, Android does not surface it: Fire
+// OS 6 has no framework to report headset state. It is
 // visible on the raw switch class, and on the ACCDET input node which reports
 // nothing useful (EV=3, KEY=0).
 //

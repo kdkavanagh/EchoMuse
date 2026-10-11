@@ -110,10 +110,15 @@ def test_dropped_keys_is_a_plain_helper_not_a_route_handler():
 @pytest.mark.parametrize("handler", [
     "_post_global_config",
     "_post_device_config",
-    "_post_upload_binary",
+    "_post_device_update",
+    "_post_device_update_queue",
+    "_delete_device_update_queue",
+    "_post_deploy_firmware",
+    "_get_provision_firmware",
 ])
 def test_mutating_handlers_still_require_admin(handler):
-    """Any config/binary write must keep its auth decorator."""
+    """Config writes, firmware installs and the firmware download keep their
+    admin decorator."""
     assert "require_admin" in _decorators_of(handler), (
         f"{handler} lost its @auth.require_admin — anyone could call it"
     )

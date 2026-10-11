@@ -9,7 +9,7 @@ import (
 )
 
 // openPty allocates a pseudo-terminal pair via /dev/ptmx and returns the
-// master and slave ends. FireOS 5 mounts devpts at /dev/pts (adbd relies on
+// master and slave ends. Fire OS 6 mounts devpts at /dev/pts (adbd relies on
 // it), so no fallback discovery is needed.
 func openPty() (master, slave *os.File, err error) {
 	m, err := os.OpenFile("/dev/ptmx", os.O_RDWR, 0)

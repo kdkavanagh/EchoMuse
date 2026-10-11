@@ -15,7 +15,7 @@ type Hardware interface {
 	SetDAC(level int) error      // tinymix control 61, stereo
 	SetADCMute(muted bool) error // all four codec ADC pairs
 	SetSpeakerAmp(on bool) error // tinymix control 5
-	SetMuteLED(on bool) error    // discrete gpio444 LED
+	SetMuteLED(on bool) error    // mute-button LED, via the privacy driver
 }
 
 type systemHardware struct{}

@@ -5,12 +5,12 @@
     docker exec echomuse-controller python /tmp/push_file.py \
         <device_id> /tmp/oww_probe /data/local/tmp/oww_probe [--chmod 755]
 
-Why this exists rather than `ota.py`: that pushes the firmware binary through
-the update endpoint, which writes one specific place. This puts an arbitrary
+Why this exists: firmware goes only through the controller's update endpoint,
+which installs the bundled build into one specific place. This puts an arbitrary
 file anywhere, which is what the on-device wake word work needs (a 12.3MB
 libonnxruntime.so, three .onnx models, a test fixture).
 
-Five device-specific traps are baked in, each of which produced a convincing
+Four device-specific traps are baked in, each of which produced a convincing
 wrong answer first:
 
   * The shell is a PTY in canonical mode, so a single command line longer than
@@ -29,9 +29,6 @@ wrong answer first:
     happens to be there, and then report success while the device runs stale
     bytes. So the default is to delete the destination first; --resume is
     opt-in, and even then the md5 check at the end is what decides.
-
-  * `busybox truncate` silently no-ops on this build. Trimming a partial tail
-    uses `dd` + `mv` instead.
 
   * The PTY echoes each command back, so a completion marker sent as a literal
     string matches its OWN echo — that is how an empty file once reported
@@ -127,7 +124,7 @@ class Shell:
         command version of this write nothing at all while looking fine.
         """
         self.buf.clear()
-        await self.send(f"busybox base64 -d << '{DELIM}' >> {dest}\n")
+        await self.send(f"base64 -d << '{DELIM}' >> {dest}\n")
         for line in base64.encodebytes(blk).decode("ascii").splitlines(keepends=True):
             await self.send(line)
         await self.send(f"{DELIM}\n")
@@ -142,7 +139,7 @@ async def connect(device: str, tok: str) -> tuple[ClientConnection, Shell]:
     await sh.read_until(b"# ")
     # Suppress echo where the device supports it; the code never relies on
     # that working, only benefits from the smaller reads.
-    await sh.cmd("busybox stty -echo 2>/dev/null", timeout=10)
+    await sh.cmd("stty -echo 2>/dev/null", timeout=10)
     return ws, sh
 
 
@@ -156,22 +153,22 @@ async def close_quietly(ws: ClientConnection) -> None:
 async def trim_to(sh: Shell, path: str, size: int) -> None:
     """Cut path back to exactly `size` bytes.
 
-    Uses dd + mv because `busybox truncate` silently does nothing on this
-    build — a no-op there would leave the partial tail in place and corrupt
-    everything appended after it, while every step still reported success.
+    Uses dd + mv, then checks the size: a trim that silently did nothing
+    would leave the partial tail in place and corrupt everything appended
+    after it, while every step still reported success.
     """
     if size == 0:
         await sh.cmd(f"rm -f {path}")
         return
-    await sh.cmd(f"busybox dd if={path} of={path}.t bs={size} count=1 2>/dev/null && "
-                 f"busybox mv {path}.t {path}")
+    await sh.cmd(f"dd if={path} of={path}.t bs={size} count=1 2>/dev/null && "
+                 f"mv {path}.t {path}")
     got = await remote_size(sh, path)
     if got != size:
         raise RuntimeError(f"trim to {size} left {got} bytes")
 
 
 async def remote_size(sh: Shell, path: str) -> int:
-    out = await sh.cmd(f"busybox wc -c < {path} 2>/dev/null || echo 0")
+    out = await sh.cmd(f"wc -c < {path} 2>/dev/null || echo 0")
     for tok in reversed(out.split()):
         if tok.isdigit():
             return int(tok)
@@ -181,11 +178,14 @@ async def remote_size(sh: Shell, path: str) -> int:
 async def remote_md5(sh: Shell, path: str) -> str:
     # Split marker: the PTY echoes this command back, and an unsplit marker
     # would match its own echo.
-    out = await sh.cmd(f"echo M'D'5:$(busybox md5sum {path} | busybox cut -d' ' -f1)", timeout=120)
+    # md5sum prints "<hash>  <path>"; the hash is the first 32 characters.
+    out = await sh.cmd(f"echo M'D'5:$(md5sum {path} 2>/dev/null)", timeout=120)
     for line in out.splitlines():
         line = line.strip()
-        if line.startswith("MD5:") and len(line) == 4 + 32:
-            return line[4:]
+        digest = line[4:36]
+        if line.startswith("MD5:") and len(digest) == 32 and all(
+                c in "0123456789abcdef" for c in digest):
+            return digest
     raise RuntimeError(f"could not read md5 of {path}; got: {out[-200:]!r}")
 
 

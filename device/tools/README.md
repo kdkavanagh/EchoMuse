@@ -13,7 +13,15 @@ by playing a tone from known angles.
 
 ## Build
 
-Inside the `echomuse-compiler` Docker container:
+`device/tools/build_tools.sh` (run from `device/`) builds every tool. By hand,
+inside the `echomuse-compiler` image, which is the firmware toolchain stage of
+`controller/Dockerfile`:
+
+```bash
+docker build -f ../../controller/Dockerfile --target compiler -t echomuse-compiler ../..
+```
+
+then:
 
 ```bash
 docker run --rm \
@@ -25,17 +33,21 @@ docker run --rm \
 
 ## Deploy
 
+The Fire OS 6 adb shell is already root:
+
 ```bash
-adb push capture_mics /sdcard/capture_mics
-adb shell "su -c 'cp /sdcard/capture_mics /data/local/bin/capture_mics && chmod 755 /data/local/bin/capture_mics'"
+adb push capture_mics /data/local/bin/capture_mics
+adb shell chmod 755 /data/local/bin/capture_mics
 ```
 
-**Note:** Stop EchoMuse first — both tools need exclusive access to ALSA device 24:
+**Note:** Stop EchoMuse first — both tools need exclusive access to ALSA device 24,
+and they stop Amazon's `mixer` daemon to get it, so start it again afterwards:
 
 ```bash
-adb shell "su -c 'stop echomuse'"
+adb shell stop echomuse
 # ... run capture ...
-adb shell "su -c 'start echomuse'"
+adb shell start mixer
+adb shell start echomuse
 ```
 
 ## Test procedure
@@ -48,7 +60,7 @@ For each of the 6 positions (0°, 60°, 120°, 180°, 240°, 300°):
 1. Place tone source ~50cm directly in front of the device at the current angle
 2. Capture:
    ```bash
-   adb shell "su -c '/data/local/bin/capture_mics 5'"
+   adb shell /data/local/bin/capture_mics 5
    adb pull /data/local/tmp/capture.raw capture_0deg.raw   # adjust name per angle
    ```
 3. Analyse:

@@ -46,9 +46,10 @@ SECTIONS: dict[SectionId, Section] = {
     # shadow rules (em_wake_rules) add to that entry's baseline rule.
     SectionId.WAKEWORD: Section("Wake word", ("wakeModel", "saveWakeClips", "wakeArbitrationMs", "wakeSound",
                                               "wakeOpenRules", "wakeShadowRules")),
-    # Everything the controller decides about the STT copy. Gain,
-    # beamforming, AEC and AGC belong to the native AFE (§4.1).
-    SectionId.MICROPHONES: Section("Speech", ("nsAsr", "saveUtterances", "extendedUtterances")),
+    # Everything the controller decides about the STT copy and who transcribes
+    # the utterance at a pause (§16.6). Gain, beamforming, AEC and AGC belong
+    # to the native AFE (§4.1).
+    SectionId.MICROPHONES: Section("Speech", ("nsAsr", "saveUtterances", "extendedUtterances", "pauseAsr")),
     SectionId.RING: Section("Ring", (
         "ledScene", "ledListenColor", "ledThinkColor",
         "meterAttack", "meterDecay", "meterFloor",

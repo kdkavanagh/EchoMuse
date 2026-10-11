@@ -191,6 +191,23 @@ def test_three_second_no_progress_fallback_retries_unknown_text():
     assert got.close.reason == "retry"
 
 
+def test_no_progress_counts_from_the_command_not_a_pause_after_the_wake_word():
+    """Turn 588: the speaker waited 1 s after the wake word and was still talking 3 s after
+    it, before the streaming text had any word. The clock starts at the command's speech."""
+    trigger = 256                                                            # inside the wake word's last cell
+    r = EndpointReducer(utterance_start=0, trigger_sample=trigger, completeness=complete)
+    r.observe([classified(0, CellClass.COMMAND_SPEECH)])                    # the wake word's tail
+    r.observe([classified(i, CellClass.NON_SPEECH) for i in range(1, 32)])  # ~1 s pause
+    r.observe([classified(i, CellClass.COMMAND_SPEECH) for i in range(32, 100)])
+    at = trigger + 48_000                                                    # 3 s after the trigger
+    s = stable(prefix="", prefix_sample=None, progress_sample=trigger, through_sample=at, blanks=0)
+    assert r.step(frontier=at, valid_audio_end=at, stable=s).close is None
+    later = 32 * CELL + 48_000                                               # 3 s after the command began
+    r.observe([classified(i, CellClass.NON_SPEECH) for i in range(100, later // CELL)])
+    s = stable(prefix="", prefix_sample=None, progress_sample=trigger, through_sample=later, blanks=0)
+    assert r.step(frontier=later, valid_audio_end=later, stable=s).close.reason == "retry"
+
+
 def test_no_input_uses_frontier_not_number_or_wall_time_of_calls():
     r = reducer()
     s = stable(prefix="", prefix_sample=None, progress_sample=0, through_sample=0, blanks=0)

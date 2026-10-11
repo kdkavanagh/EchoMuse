@@ -72,9 +72,6 @@ func (s *Server) InitLEDs() error {
 	if err != nil {
 		return err
 	}
-	if err := internalled.InitMuteButtonLED(); err != nil {
-		log.Printf("[ring] mute button LED init: %v", err)
-	}
 	s.ring.SetController(c)
 	if s.mute.isMuted() {
 		_ = s.hw.SetMuteLED(true)

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass
-from typing import Callable, Sequence
+from typing import Callable, Protocol, Sequence
 
 from echomuse_grammar import GrammarClass
 from em_attribution import CellClass, ClassifiedCell
@@ -19,6 +19,8 @@ SAMPLE_RATE = 16_000
 
 # §16.6 endpoint values.
 NO_INPUT = 5 * SAMPLE_RATE
+NO_INPUT_REPLY = 7 * SAMPLE_RATE  # a reply window: from where it opened (§9.1)
+REPLY_SPAN_PREROLL = 4_800  # a reply's committed span: 300 ms before its answer's run
 TOO_LONG = 15 * SAMPLE_RATE
 TOO_LONG_EXTENDED = 30 * SAMPLE_RATE
 LOOKAHEAD = 3_072  # 192 ms
@@ -51,6 +53,42 @@ LOCAL_PRE_ROLL = 7_680  # 480 ms
 LOCAL_STABLE = 3_840  # 240 ms without newer text before the commit
 
 CompletenessFn = Callable[[str], GrammarClass]   # `echomuse_grammar.classify(...).klass` of a text
+
+# §16.6 completeness from Home Assistant's own sentence matcher (policy post_afe_4). The probe
+# word is appended to ask whether a wildcard slot can take more words. It must never be an
+# entity, area or list value, and it stays fixed so HA's recognition cache (keyed by text)
+# answers a command said before.
+RECOGNIZER_PROBE = "zqxj"
+
+
+class Recognized(Protocol):
+    """HA's recognition of one sentence (`em_ha_client.SentenceRecognition`)."""
+
+    @property
+    def match(self) -> bool: ...            # a sentence trigger, or an intent with every slot filled
+
+    @property
+    def unfilled_slots(self) -> bool: ...   # the closest intent left slots unmatched
+
+
+def recognizer_sentences(text: str) -> tuple[str, str]:
+    """What HA's recognizer is asked about a stable prefix: the text, then the text and the probe word."""
+    return text, f"{text} {RECOGNIZER_PROBE}"
+
+
+def recognized_completeness(text: Recognized | None, probe: Recognized | None) -> GrammarClass:
+    """§16.6: HA's answer for a stable prefix as a completeness class.
+
+    A full match is `complete`, unless the text plus a word nobody says also
+    matches: then a wildcard (`(play) {query}`, `the weather [like] {when}`)
+    can take more words and it is `extendable`. No match with slots left
+    unfilled is `needs_more`; nothing recognized is `unknown`.
+    """
+    if text is None:
+        return GrammarClass.UNKNOWN
+    if text.match:
+        return GrammarClass.EXTENDABLE if probe is not None and probe.match else GrammarClass.COMPLETE
+    return GrammarClass.NEEDS_MORE if text.unfilled_slots else GrammarClass.UNKNOWN
 
 
 class EndpointState(enum.StrEnum):
@@ -197,7 +235,15 @@ class EndpointReducer:
         completeness: CompletenessFn,
         extended_utterances: bool = False,
         esphome_reply: bool = False,
+        reply: bool = False,
+        no_input_at: int | None = None,
     ) -> None:
+        """`reply`: a no-wake reply whose trigger is where its window opened (§9.1). It
+        closes `no_input` NO_INPUT_REPLY after the trigger, counts `too_long` from its first
+        command speech, and commits a span from REPLY_SPAN_PREROLL before the run holding
+        that speech (never before `utterance_start`), not the chime and the wait before it.
+        `no_input_at` overrides where `no_input` falls: a reply reopened after a gap keeps
+        its window's original end."""
         if utterance_start > trigger_sample:
             raise ValueError("utterance_start must not follow the trigger")
         self.utterance_start = utterance_start
@@ -205,10 +251,15 @@ class EndpointReducer:
         self.completeness = completeness
         self.extended_utterances = extended_utterances
         self.esphome_reply = esphome_reply
+        self.reply = reply
+        self.no_input_at = (no_input_at if no_input_at is not None
+                            else trigger_sample + (NO_INPUT_REPLY if reply else NO_INPUT))
         self.state = EndpointState.LISTENING
         self.pending: Pending | None = None
         self._cells: list[ClassifiedCell] = []
         self._command_ends: list[int] = []
+        self._command_start: int | None = None   # first command_speech cell starting at/after the trigger
+        self._answer_run: int | None = None      # first cell of the run holding the first command speech
         self._frontier = utterance_start
         self._commit: Commit | None = None
         self._close: Close | None = None
@@ -226,9 +277,19 @@ class EndpointReducer:
         for cell in cells:
             if self._cells and cell.start <= self._cells[-1].start:
                 raise ValueError("cells must be observed once in sample order")
+            if cell.command and self._answer_run is None:
+                # A run is the contiguous command_speech cells before it (§8.2 hysteresis).
+                run = cell.start
+                for prev in reversed(self._cells):
+                    if prev.cls != CellClass.COMMAND_SPEECH or prev.end != run:
+                        break
+                    run = prev.start
+                self._answer_run = run
             self._cells.append(cell)
             if cell.command:
                 self._command_ends.append(cell.end)
+                if self._command_start is None and cell.start >= self.trigger_sample:
+                    self._command_start = cell.start
 
     def _close_once(self, reason: CloseReason) -> Decision:
         self._close = Close(reason)
@@ -250,8 +311,11 @@ class EndpointReducer:
             raise RuntimeError("closed utterance cannot commit")
         if not self.utterance_start <= boundary <= valid_audio_end:
             raise ValueError("boundary is outside valid acquired audio")
+        start = self.utterance_start
+        if self.reply and self._answer_run is not None:
+            start = max(start, self._answer_run - REPLY_SPAN_PREROLL)
         self._commit = Commit(
-            start=self.utterance_start,
+            start=start,
             boundary=boundary,
             end=min(boundary + LOOKAHEAD, valid_audio_end),
             route=route,
@@ -336,10 +400,11 @@ class EndpointReducer:
             return self._close_once(CloseReason.INTERRUPTED)
         if overrun:
             return self._close_once(CloseReason.AUDIO_OVERRUN)
-        if not self._command_ends and frontier - self.trigger_sample >= NO_INPUT:
+        if not self._command_ends and frontier >= self.no_input_at:
             return self._close_once(CloseReason.NO_INPUT)
         maximum = TOO_LONG_EXTENDED if self.extended_utterances else TOO_LONG
-        if frontier - self.trigger_sample >= maximum:
+        since = self._command_start if self.reply else self.trigger_sample
+        if since is not None and frontier - since >= maximum:
             return self._close_once(CloseReason.TOO_LONG)
 
         if self.pending is not None:
@@ -367,7 +432,11 @@ class EndpointReducer:
             self.state = EndpointState.END_PENDING
             return Decision(self.state, pending=found)
 
-        if self._command_ends and frontier - stable.progress_sample >= NO_PROGRESS:
+        # The no-progress clock starts no earlier than the command's first speech: a speaker who
+        # waits after the wake word is still talking while the streaming text catches up (§16.6).
+        progress = (stable.progress_sample if self._command_start is None
+                    else max(stable.progress_sample, self._command_start))
+        if self._command_ends and frontier - progress >= NO_PROGRESS:
             boundary = self._command_boundary_at(stable.prefix_sample) if stable.prefix_sample is not None else None
             if stable.prefix and self.completeness(stable.prefix) == GrammarClass.COMPLETE and boundary is not None:
                 commit = self.finalize_once(

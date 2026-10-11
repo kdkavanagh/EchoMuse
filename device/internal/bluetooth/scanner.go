@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -80,8 +78,6 @@ type Scanner struct {
 	bdAddr      string
 	uniqueMu    sync.Mutex
 	unique      map[string]time.Time
-
-	bluedroidDisabled bool
 }
 
 func NewScanner(onBatch BatchCallback) *Scanner {
@@ -181,8 +177,6 @@ func (s *Scanner) run(stopCh, doneCh chan struct{}) {
 // session runs one full scan lifecycle; returns when stopCh closes (nil)
 // or on transport/watchdog error.
 func (s *Scanner) session(stopCh chan struct{}) error {
-	s.ensureBluedroidDisabled()
-
 	// Opening triggers WMT BT function-on + firmware patch download.
 	f, err := os.OpenFile(devPath, os.O_RDWR, 0)
 	if err != nil {
@@ -332,35 +326,6 @@ func (s *Scanner) flush() {
 	if s.onBatch != nil {
 		s.onBatch(batch)
 	}
-}
-
-// ensureBluedroidDisabled durably disables the Android Bluetooth stack —
-// /dev/stpbt is single-owner and Bluedroid holds it whenever enabled.
-// `pm disable` persists across reboots and is idempotent; run once per
-// process. Android's pm/settings are shebang-less wrappers, so exec via sh
-// (same ENOEXEC constraint as svc in internal/wifi).
-func (s *Scanner) ensureBluedroidDisabled() {
-	if s.bluedroidDisabled {
-		return
-	}
-	pkgs := []string{
-		"com.android.bluetooth",
-		"com.amazon.device.csmbluetooth.service",
-		"com.amazon.device.csmbluetooth.headlessUxController",
-		"com.amazon.device.bluetoothdfu",
-	}
-	for _, pkg := range pkgs {
-		out, err := exec.Command("/system/bin/sh", "-c", "pm disable "+pkg).CombinedOutput()
-		if err != nil {
-			log.Printf("[ble] pm disable %s: %v — %s", pkg, err, strings.TrimSpace(string(out)))
-		}
-	}
-	if out, err := exec.Command("/system/bin/sh", "-c",
-		"settings put global bluetooth_on 0").CombinedOutput(); err != nil {
-		log.Printf("[ble] settings bluetooth_on=0: %v — %s", err, strings.TrimSpace(string(out)))
-	}
-	s.bluedroidDisabled = true
-	log.Println("[ble] Android Bluetooth stack disabled (persistent)")
 }
 
 func envIntDefault(key string, def int) int {

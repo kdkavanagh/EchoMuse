@@ -95,10 +95,14 @@ func fakeBus(t *testing.T, devices map[string]bool) {
 	status = Status{Code: StatusUnknown}
 	mu.Unlock()
 
-	old := i2cGlob
+	oldI2C, oldIIO := i2cGlob, iioGlob
 	i2cGlob = filepath.Join(root, "*", "name")
+	// No IIO fixture in this helper — point it at an empty root so a stray
+	// real IIO device on the host (or a leftover test fixture) can never
+	// make the i2c-only fixtures match through the fallback.
+	iioGlob = filepath.Join(t.TempDir(), "*", "name")
 	t.Cleanup(func() {
-		i2cGlob = old
+		i2cGlob, iioGlob = oldI2C, oldIIO
 		mu.Lock()
 		path, lastScan, reported = "", time.Time{}, false
 		status = Status{Code: StatusUnknown}
@@ -195,5 +199,95 @@ func TestStatusRefreshesAcrossScans(t *testing.T) {
 	mu.Unlock()
 	if got := Report(); got.Code != StatusNoChip {
 		t.Fatalf("second scan: code = %q, want %q", got.Code, StatusNoChip)
+	}
+}
+
+// ── IIO fallback (the fitted tsl2584tsv is bound over IIO, not on the raw
+// i2c bus — docs/fireos6-port.md §2) ─────────────────────────────────────────
+
+// A tsl2540 bound on i2c: the IIO bus must never be consulted — even when
+// something there would match — so i2c wins outright.
+func TestStatusOKFromI2CNeverConsultsIIO(t *testing.T) {
+	fakeBus(t, map[string]bool{"tsl2540": true})
+	iioRoot := t.TempDir()
+	dir := filepath.Join(iioRoot, "tsl2584tsv")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "name"), []byte("tsl2584tsv\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "illuminance0_input"), []byte("999\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	iioGlob = filepath.Join(iioRoot, "*", "name")
+
+	got := Report()
+	if got.Code != StatusOK {
+		t.Fatalf("code = %q, want %q", got.Code, StatusOK)
+	}
+	if len(got.Seen) != 1 {
+		t.Fatalf("Seen = %v, want only the i2c bus (iio must not be consulted)", got.Seen)
+	}
+	if lux := Lux(); lux == nil || *lux != 42 {
+		t.Fatalf("Lux() = %v, want the i2c reading (42), not the iio one", lux)
+	}
+}
+
+// The Fire OS 6 shape: the i2c bus lists tsl2540 as board data only (nothing
+// answers at 0x39, so no als_lux), and the fitted tsl2584tsv is bound over
+// IIO instead. The fallback must find it, and Seen must carry both buses.
+func TestStatusOKFromIIOWhenI2CUnbound(t *testing.T) {
+	fakeBus(t, map[string]bool{"tsl2540": false})
+	iioRoot := t.TempDir()
+	dir := filepath.Join(iioRoot, "tsl2584tsv")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "name"), []byte("tsl2584tsv\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "illuminance0_input"), []byte("21\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	iioGlob = filepath.Join(iioRoot, "*", "name")
+
+	got := Report()
+	if got.Code != StatusOK {
+		t.Fatalf("code = %q, want %q (detail %q)", got.Code, StatusOK, got.Detail)
+	}
+	if len(got.Seen) != 2 {
+		t.Fatalf("Seen = %v, want the i2c tsl2540 entry plus the iio tsl2584tsv entry", got.Seen)
+	}
+	if !Present() {
+		t.Fatal("Present() must be true with a readable IIO sensor")
+	}
+	if lux := Lux(); lux == nil || *lux != 21 {
+		t.Fatalf("Lux() = %v, want 21", lux)
+	}
+}
+
+// Named on the IIO bus but unbound — the IIO counterpart of
+// TestStatusNoAttribute. Degenerate (IIO only registers a device once a
+// driver's probe succeeds), but the attribute is what Lux() actually reads,
+// so a missing one must still report no_attribute rather than crash.
+func TestStatusNoAttributeFromIIO(t *testing.T) {
+	fakeBus(t, nil)
+	iioRoot := t.TempDir()
+	dir := filepath.Join(iioRoot, "tsl2584tsv")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "name"), []byte("tsl2584tsv\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	iioGlob = filepath.Join(iioRoot, "*", "name")
+
+	got := Report()
+	if got.Code != StatusNoAttribute {
+		t.Fatalf("code = %q, want %q", got.Code, StatusNoAttribute)
+	}
+	if Present() {
+		t.Fatal("Present() must be false with no readable illuminance0_input")
 	}
 }

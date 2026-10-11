@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/wilbowes/EchoMuse/internal/alerts"
 	"github.com/wilbowes/EchoMuse/internal/assets"
+	"github.com/wilbowes/EchoMuse/internal/audio/afe"
 	"github.com/wilbowes/EchoMuse/internal/audio/ema"
 	"github.com/wilbowes/EchoMuse/internal/client"
 	"github.com/wilbowes/EchoMuse/internal/config"
@@ -180,12 +182,17 @@ type fakeUplink struct {
 	gens       map[string]uint32
 	mutes      int
 	diagnostic bool
+	afe        bool // the last Attach's afe opt-in
 }
 
-func (f *fakeUplink) Attach(client.AudioSink, uplink.SendFunc) {}
-func (f *fakeUplink) Detach()                                  {}
-func (f *fakeUplink) Notify()                                  {}
-func (f *fakeUplink) Run(context.Context)                      {}
+func (f *fakeUplink) Attach(_ client.AudioSink, _ uplink.SendFunc, afe bool) {
+	f.mu.Lock()
+	f.afe = afe
+	f.mu.Unlock()
+}
+func (f *fakeUplink) Detach()             {}
+func (f *fakeUplink) Notify()             {}
+func (f *fakeUplink) Run(context.Context) {}
 func (f *fakeUplink) DiagnosticLive() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -295,11 +302,14 @@ type harness struct {
 	mixg sync.WaitGroup // the mixer goroutine, once mix runs it
 	now  atomic.Int64
 	pcm  []int16
+	// afeOptIn is the next session.ready's afe_metadata.
+	afeOptIn bool
 }
 
 type opts struct {
 	noWakeLock bool
 	ambient    bool
+	afe        bool // the mic decodes AFE metadata (Config.AFEMetadata)
 }
 
 func newHarness(t *testing.T, o opts) *harness {
@@ -329,6 +339,7 @@ func newHarness(t *testing.T, o opts) *harness {
 		DeviceID: "dev", FirmwareVersion: "v3.0.0-test", BootID: "boot",
 		AmbientReadable: func() bool { return o.ambient },
 		Mic:             &fakeMic{closed: make(chan struct{})},
+		AFEMetadata:     o.afe,
 		Physical:        h.phys, DeviceConfig: config.New(),
 		SpeechStore: speech, AlertStore: sounds,
 		NowMonoNS: h.now.Load,
@@ -380,6 +391,11 @@ func (h *harness) mix() uint8 {
 // block delivers one 80 ms capture callback completing at doneNs.
 func (h *harness) block(doneNs int64) { h.s.captureBlock(pkgmic.Block{PCM: h.pcm, MonoNs: doneNs}) }
 
+// afeBlock delivers one contiguous callback carrying AFE metadata p.
+func (h *harness) afeBlock(p afe.Period) {
+	h.s.captureBlock(pkgmic.Block{PCM: h.pcm, MonoNs: h.now.Add(periodNs), AFE: &p})
+}
+
 // blocks delivers n contiguous callbacks.
 func (h *harness) blocks(n int) {
 	for range n {
@@ -404,7 +420,7 @@ func (h *harness) readyWith(mod func(*proto.DetectorPolicy)) {
 	h.s.ready(h.sess, proto.SessionReady{
 		Protocol: 1, SessionID: "s1", CapturePermitted: true,
 		Assets:   proto.SpeechAssets{RuntimeSHA256: sha1, GraphSHA256: sha1, SidecarSHA256: sha1},
-		Detector: pol,
+		Detector: pol, AFEMetadata: h.afeOptIn,
 	})
 }
 
@@ -857,6 +873,9 @@ func TestHelloCapabilities(t *testing.T) {
 	if a := hello.Alerts; a.Wakeup != "ok" {
 		t.Errorf("alerts %+v", a)
 	}
+	if hello.Platform != proto.PlatformFireOS6 {
+		t.Errorf("platform %q", hello.Platform)
+	}
 
 	h2 := newHarness(t, opts{noWakeLock: true, ambient: true})
 	hello = h2.s.Hello()
@@ -868,6 +887,80 @@ func TestHelloCapabilities(t *testing.T) {
 	}
 	if !has(hello.Capabilities, "ambient_light") {
 		t.Error("ambient_light missing with a readable sensor")
+	}
+}
+
+// afe_metadata_v1 (WIRE §4.1): announced only with an AFE capture backend
+// whose decoder validated a frame in the last 2 s; the afe stream, its
+// records and wake.stats.afe exist only in a session whose ready opted in.
+func TestAFEMetadataCapabilityAndOptIn(t *testing.T) {
+	valid := afe.Period{Record: ema.AFERecord{Frames: 10, Playback: 10, ERLEMax: 12, ERLEMean: 9, ERLEFrames: 10,
+		RMSMax: 200, RMSMean: 190, Volume: 70}}
+	announced := func(h *harness) bool { return slices.Contains(h.s.Hello().Capabilities, proto.CapAFEMetadata) }
+
+	if announced(newHarness(t, opts{})) {
+		t.Fatal("afe_metadata_v1 without an AFE backend")
+	}
+	h := newHarness(t, opts{afe: true})
+	h.afeBlock(afe.Period{})
+	if announced(h) {
+		t.Fatal("afe_metadata_v1 before any frame validated")
+	}
+	h.afeBlock(valid)
+	if !announced(h) {
+		t.Fatal("afe_metadata_v1 missing while frames validate")
+	}
+	if n := h.up.rings.AFE.End(); n != 2 {
+		t.Fatalf("afe ring holds %d records", n)
+	}
+
+	streams := func() (ids []any) {
+		for _, m := range h.sess.of(proto.TypeStreamOpen) {
+			ids = append(ids, m.body["stream_id"])
+		}
+		return ids
+	}
+	lastStats := func() map[string]any {
+		h.s.det.FlushStats()
+		st := h.sess.of(proto.TypeWakeStats)
+		return st[len(st)-1].body
+	}
+
+	// An older controller never opts in: nothing of the stream exists.
+	h.ready()
+	if h.up.afe || slices.Contains(streams(), any("afe")) {
+		t.Fatalf("afe without the opt-in: uplink %v, streams %v", h.up.afe, streams())
+	}
+	if _, ok := lastStats()["afe"]; ok {
+		t.Fatal("wake.stats.afe without the opt-in")
+	}
+
+	h.s.endSession()
+	h.afeOptIn = true
+	h.ready()
+	if !h.up.afe || !slices.Contains(streams(), any("afe")) {
+		t.Fatalf("opted in: uplink %v, streams %v", h.up.afe, streams())
+	}
+	for _, m := range h.sess.of(proto.TypeStreamOpen) {
+		if m.body["stream_id"] == "afe" && (m.body["kind"] != float64(5) || m.body["format"] != float64(3) ||
+			m.body["epoch"] != strconv.FormatUint(h.s.micEpoch, 10)) {
+			t.Fatalf("afe stream.open %v", m.body)
+		}
+	}
+	h.afeBlock(valid)
+	var got [1]ema.AFERecord
+	if err := h.up.rings.AFE.Copy(got[:], 2); err != nil || got[0] != valid.Record {
+		t.Fatalf("afe record %+v (%v)", got[0], err)
+	}
+	if a, ok := lastStats()["afe"].(map[string]any); !ok || a["periods"] != float64(3) || a["frames"] != float64(20) || a["invalid"] != float64(0) {
+		t.Fatalf("wake.stats.afe %v", lastStats()["afe"])
+	}
+
+	// Validation lapses: the next hello no longer announces it.
+	h.afeBlock(afe.Period{})
+	h.now.Add(int64(3 * time.Second))
+	if announced(h) {
+		t.Fatal("afe_metadata_v1 after 3 s without a valid frame")
 	}
 }
 

@@ -16,7 +16,7 @@ import (
 	"github.com/wilbowes/EchoMuse/internal/render"
 )
 
-// onTap receives every final-mix block before OpenSL output (§4.3): it
+// onTap receives every final-mix block before sink output (§4.3): it
 // records the active-source mask for cells and producing_sound, decimates
 // into the 16 kHz reference ring (§16.1 FIR; all-zero output marked digital
 // silence), and drives the LED meter level. Mixer goroutine; allocation-free.

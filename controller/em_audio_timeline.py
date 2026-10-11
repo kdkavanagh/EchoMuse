@@ -38,6 +38,7 @@ class Kind(enum.IntEnum):
     REFERENCE = 2
     RENDER = 3
     CELLS = 4
+    AFE = 5               # native AFE period records; only to a session.ready that granted afe_metadata
 
 
 FLAG_DISCONTINUITY = 1 << 0
@@ -49,13 +50,16 @@ _KNOWN_FLAGS = FLAG_DISCONTINUITY | FLAG_MUTED | FLAG_UNDERRUN | FLAG_ESTIMATED 
 
 FORMAT_PCM16 = 1
 FORMAT_CELLS = 2
+FORMAT_AFE = 3
 UNCERTAINTY_UNKNOWN = U32_MAX
 
 UPLINK_RATE = 16_000
 RENDER_RATE = 48_000
-_RATE = {Kind.MIC: UPLINK_RATE, Kind.REFERENCE: UPLINK_RATE, Kind.RENDER: RENDER_RATE, Kind.CELLS: UPLINK_RATE}
-_FORMAT = {Kind.MIC: FORMAT_PCM16, Kind.REFERENCE: FORMAT_PCM16, Kind.RENDER: FORMAT_PCM16, Kind.CELLS: FORMAT_CELLS}
-MAX_FRAMES = {Kind.MIC: 1280, Kind.REFERENCE: 1280, Kind.RENDER: 3840, Kind.CELLS: 320}
+_RATE = {Kind.MIC: UPLINK_RATE, Kind.REFERENCE: UPLINK_RATE, Kind.RENDER: RENDER_RATE, Kind.CELLS: UPLINK_RATE,
+         Kind.AFE: UPLINK_RATE}
+_FORMAT = {Kind.MIC: FORMAT_PCM16, Kind.REFERENCE: FORMAT_PCM16, Kind.RENDER: FORMAT_PCM16, Kind.CELLS: FORMAT_CELLS,
+           Kind.AFE: FORMAT_AFE}
+MAX_FRAMES = {Kind.MIC: 1280, Kind.REFERENCE: 1280, Kind.RENDER: 3840, Kind.CELLS: 320, Kind.AFE: 125}
 
 # Active-source mask bits (§16.1): content=1 alert=2 dialog=4 earcon=8.
 SOURCE_CONTENT = 1
@@ -76,6 +80,33 @@ CELL_FLAG_GAP = 1 << 0
 CELL_FLAG_MUTED = 1 << 1
 _CELL_FLAG_BITS = CELL_FLAG_GAP | CELL_FLAG_MUTED
 
+# -- AFE period records (afe_metadata_v1, WIRE §4.2) --------------------------
+#
+# Fire OS 6's AFE writes one metadata frame per 8 ms of capture; the device
+# summarises each 80 ms capture period in one 14-byte record. Evidence only:
+# no wake, attribution or endpoint decision reads it.
+
+AFE_PERIOD_SAMPLES = 1_280          # one record per capture period
+AFE_PERIOD_FRAMES = 10              # AFE frames per period
+_AFE_FIELDS = ("frames", "flags", "playback", "erle_max", "erle_mean", "erle_frames", "dtd_max", "dtd_frames",
+               "rms_max", "rms_mean", "vad_max", "vad_frames", "volume", "lost")
+AFE_RECORD = np.dtype([(name, "u1") for name in _AFE_FIELDS])
+AFE_RECORD_BYTES = AFE_RECORD.itemsize
+assert AFE_RECORD_BYTES == 14
+AFE_FLAG_GAP = 1 << 0
+AFE_FLAG_SYNC = 1 << 1
+AFE_FLAG_OUTPUT_CLIPPED = 1 << 2
+AFE_FLAG_MIC_CLIPPED = 1 << 3
+AFE_FLAG_AEC_DIVERGED = 1 << 4
+AFE_FLAG_DEVICE_MUTE = 1 << 5
+_AFE_FLAG_BITS = (AFE_FLAG_GAP | AFE_FLAG_SYNC | AFE_FLAG_OUTPUT_CLIPPED | AFE_FLAG_MIC_CLIPPED
+                  | AFE_FLAG_AEC_DIVERGED | AFE_FLAG_DEVICE_MUTE)
+AFE_DTD_MAX = 31
+AFE_VAD_MAX = 3
+AFE_VOLUME_MAX = 127
+# Samples one EMA1 frame stands for, where that is not one sample.
+_FRAME_SAMPLES = {Kind.CELLS: CELL_SAMPLES, Kind.AFE: AFE_PERIOD_SAMPLES}
+
 # -- Leases and retention (§4.4, §8.1) --------------------------------------
 
 REFERENCE_HOP = 2_560               # reference backfill grid, samples (§4.4)
@@ -92,6 +123,9 @@ UTTERANCE_MAX_SAMPLES = 30 * UPLINK_RATE    # longest open utterance (§16.6)
 PCM_CAPACITY = UTTERANCE_MAX_SAMPLES + ROLLING_SAMPLES   # per stream: 1.28 MB of int16
 REFERENCE_EXTRA = 40_000            # reference backfill reaches 2.5 s before mic
 CELL_CAPACITY = (PCM_CAPACITY + ROLLING_SAMPLES) // CELL_SAMPLES
+# AFE records reach as far back as the reference: mic retention plus its 2.5 s
+# lead, plus the period the floor cuts.
+AFE_CAPACITY = -(-(PCM_CAPACITY + REFERENCE_EXTRA) // AFE_PERIOD_SAMPLES) + 1
 LEASE_BYTES_CAP = 2_600_000         # §8.1 per-lease bound
 
 # -- Clock fit (§4.3) -------------------------------------------------------
@@ -156,6 +190,53 @@ class CellRecords:
 
 
 @dataclass(frozen=True, slots=True)
+class AfeRecord:
+    """One capture period's native AFE summary (afe record v1, WIRE §4.2):
+    capture samples `[start, start + 1280)`. Raw device units; `frames` = 0
+    means the period has no data. Evidence only, never a decision input."""
+
+    start: int
+    frames: int             # valid AFE frames that ended in the period, 0–10
+    flags: int              # AFE_FLAG_*
+    playback: int           # frames with PLAYBACK_ACTIVE
+    erle_max: int           # ERLE_RAW max
+    erle_mean: int          # mean of the non-zero ERLE_RAW values; 0 when erle_frames = 0
+    erle_frames: int        # frames with ERLE_RAW > 0
+    dtd_max: int            # DTD max, 0–31 (value = raw / 31)
+    dtd_frames: int         # frames with DTD > 0
+    rms_max: int            # RMS max raw (dB = raw − 256); 0 = no frame computed RMS
+    rms_mean: int           # mean RMS raw over those frames; 0 likewise
+    vad_max: int            # DNN_VAD_PROB max, 0–3 (value = raw × 0.25)
+    vad_frames: int         # frames with DNN_VAD_PROB > 0
+    volume: int             # VOLUME of the period's last valid frame, 0–127
+    lost: int               # AFE frames the counters show missing before the period's frames
+
+    @property
+    def gap(self) -> bool:
+        return bool(self.flags & AFE_FLAG_GAP)
+
+    @property
+    def sync(self) -> bool:
+        return bool(self.flags & AFE_FLAG_SYNC)
+
+    @property
+    def output_clipped(self) -> bool:
+        return bool(self.flags & AFE_FLAG_OUTPUT_CLIPPED)
+
+    @property
+    def mic_clipped(self) -> bool:
+        return bool(self.flags & AFE_FLAG_MIC_CLIPPED)
+
+    @property
+    def aec_diverged(self) -> bool:
+        return bool(self.flags & AFE_FLAG_AEC_DIVERGED)
+
+    @property
+    def device_mute(self) -> bool:
+        return bool(self.flags & AFE_FLAG_DEVICE_MUTE)
+
+
+@dataclass(frozen=True, slots=True)
 class Packet:
     kind: Kind
     flags: int
@@ -192,15 +273,13 @@ class Packet:
 
     @property
     def end_sample(self) -> int:
-        """First sample index after this packet (for cells, in mic samples)."""
-        if self.kind == Kind.CELLS:
-            return self.first_sample + self.frame_count * CELL_SAMPLES
-        return self.first_sample + self.frame_count
+        """First sample index after this packet (for cells and AFE records, in mic samples)."""
+        return self.first_sample + self.frame_count * _FRAME_SAMPLES.get(self.kind, 1)
 
     def pcm(self) -> np.ndarray:
         """int16 samples; zeros for a digital-silence packet."""
-        if self.kind == Kind.CELLS:
-            raise TypeError("cell packets carry no PCM")
+        if self.kind in _FRAME_SAMPLES:
+            raise TypeError("record packets carry no PCM")
         if self.digital_silence:
             return np.zeros(self.frame_count, dtype=np.int16)
         return np.frombuffer(self.payload, dtype="<i2").astype(np.int16, copy=False)
@@ -209,6 +288,11 @@ class Packet:
         if self.kind != Kind.CELLS:
             raise TypeError("not a cell packet")
         return parse_cells(self.payload)
+
+    def afe(self) -> list[AfeRecord]:
+        if self.kind != Kind.AFE:
+            raise TypeError("not an afe packet")
+        return afe_records(parse_afe(self.payload), self.first_sample)
 
 
 def parse_cells(payload: bytes) -> CellRecords:
@@ -242,6 +326,40 @@ def build_cells(e_centi: Iterable[int], flags: Iterable[int], mask: Iterable[int
     rec["mask"] = m
     data = rec.tobytes()
     parse_cells(data)
+    return data
+
+
+def parse_afe(payload: bytes) -> np.ndarray:
+    """Validate a kind-5 payload (afe record v1, WIRE §4.2); returns its
+    AFE_RECORD rows. A record out of bounds is a protocol error."""
+    if len(payload) % AFE_RECORD_BYTES:
+        raise ProtocolError("malformed_frame", f"afe payload of {len(payload)} bytes is not whole records")
+    rec = np.frombuffer(payload, dtype=AFE_RECORD)
+    frames = rec["frames"]
+    if np.any(frames > AFE_PERIOD_FRAMES):
+        raise ProtocolError("malformed_frame", f"afe record frames above {AFE_PERIOD_FRAMES}")
+    if np.any(rec["flags"] & ~np.uint8(_AFE_FLAG_BITS)):
+        raise ProtocolError("malformed_frame", "afe record flags set reserved bits")
+    for name in ("playback", "erle_frames", "dtd_frames", "vad_frames"):
+        if np.any(rec[name] > frames):
+            raise ProtocolError("malformed_frame", f"afe record {name} above its frames")
+    for name, bound in (("dtd_max", AFE_DTD_MAX), ("vad_max", AFE_VAD_MAX), ("volume", AFE_VOLUME_MAX)):
+        if np.any(rec[name] > bound):
+            raise ProtocolError("malformed_frame", f"afe record {name} above {bound}")
+    return rec
+
+
+def afe_records(rec: np.ndarray, first_sample: int) -> list[AfeRecord]:
+    """Typed records of consecutive AFE_RECORD rows, the first at capture sample `first_sample`."""
+    return [AfeRecord(first_sample + i * AFE_PERIOD_SAMPLES, *row) for i, row in enumerate(rec.tolist())]
+
+
+def build_afe(records: Iterable[AfeRecord]) -> bytes:
+    """A kind-5 payload of consecutive records; their `start` is the packet's
+    first sample plus 1280 per record, so it is not encoded."""
+    rows = [tuple(getattr(r, name) for name in _AFE_FIELDS) for r in records]
+    data = np.array(rows, dtype=AFE_RECORD).tobytes()
+    parse_afe(data)
     return data
 
 
@@ -283,6 +401,10 @@ def parse_packet(data: bytes | bytearray | memoryview) -> Packet:
         expected = frames * CELL_RECORD_BYTES
         if first % CELL_SAMPLES:
             raise ProtocolError("malformed_frame", "cell packet first sample is not a cell boundary")
+    elif kind == Kind.AFE:
+        expected = frames * AFE_RECORD_BYTES
+        if first % AFE_PERIOD_SAMPLES:
+            raise ProtocolError("malformed_frame", "afe packet first sample is not a period boundary")
     elif silence:
         expected = 0
     else:
@@ -291,12 +413,14 @@ def parse_packet(data: bytes | bytearray | memoryview) -> Packet:
         raise ProtocolError("malformed_frame", f"payload bytes {payload_bytes}, expected {expected}")
     if len(data) != HEADER_BYTES + payload_bytes:
         raise ProtocolError("malformed_frame", f"frame is {len(data)} bytes, header says {HEADER_BYTES + payload_bytes}")
-    end = first + (frames * CELL_SAMPLES if kind == Kind.CELLS else frames)
+    end = first + frames * _FRAME_SAMPLES.get(kind, 1)
     if end > U64_MAX:
         raise ProtocolError("malformed_frame", "sample index overflows uint64")
     payload = data[HEADER_BYTES:]
     if kind == Kind.CELLS:
         parse_cells(payload)
+    elif kind == Kind.AFE:
+        parse_afe(payload)
     return Packet(kind, flags, epoch, sequence, first, mono_ns,
                   None if unc == UNCERTAINTY_UNKNOWN else unc,
                   rate, frames, generation, mask, payload)
@@ -310,6 +434,7 @@ def build_packet(
     first_sample: int,
     pcm: np.ndarray | None = None,
     cells: bytes | None = None,
+    afe: bytes | None = None,
     frame_count: int | None = None,
     flags: int = 0,
     mono_ns: int = 0,
@@ -320,7 +445,8 @@ def build_packet(
     """Encode one EMA1 frame; the result is re-validated by `parse_packet`.
 
     PCM kinds take `pcm` (int16). A digital-silence reference packet takes
-    `frame_count` and no PCM. Cell packets take `cells` from `build_cells`.
+    `frame_count` and no PCM. Cell packets take `cells` from `build_cells`,
+    AFE packets `afe` from `build_afe`.
     """
     kind = Kind(kind)
     if kind == Kind.CELLS:
@@ -328,6 +454,11 @@ def build_packet(
             raise ValueError("cell packet needs cells")
         payload = bytes(cells)
         frames = len(payload) // CELL_RECORD_BYTES
+    elif kind == Kind.AFE:
+        if afe is None:
+            raise ValueError("afe packet needs afe records")
+        payload = bytes(afe)
+        frames = len(payload) // AFE_RECORD_BYTES
     elif flags & FLAG_DIGITAL_SILENCE:
         if pcm is not None or frame_count is None:
             raise ValueError("digital-silence packet takes frame_count and no PCM")
@@ -377,6 +508,11 @@ class IntervalSet:
     @property
     def highest(self) -> int | None:
         return self._ends[-1] if self._ends else None
+
+    def containing(self, x: int) -> tuple[int, int] | None:
+        """The interval holding `x`, or None."""
+        i = bisect.bisect_right(self._starts, x) - 1
+        return (self._starts[i], self._ends[i]) if i >= 0 and x < self._ends[i] else None
 
     def overlapping(self, a: int, b: int) -> list[tuple[int, int]]:
         """The parts of this set inside `[a, b)`."""
@@ -546,6 +682,14 @@ class SampleTimeline:
         self.muted.trim_before(sample)
         del self.discontinuities[: bisect.bisect_left(self.discontinuities, sample)]
 
+    def clear(self) -> None:
+        """Forget every sample (privacy mute and session loss erase what a holder still has)."""
+        self.known.clear()
+        self.silence.clear()
+        self.muted.clear()
+        self.discontinuities.clear()
+        self.floor, self.frontier = 0, None
+
 
 class CellTimeline:
     """Cell records of one capture epoch, indexed by cell number k (mic
@@ -609,6 +753,69 @@ def _cell_range(a_sample: int, b_sample: int) -> tuple[int, int]:
     if a_sample % CELL_SAMPLES or b_sample % CELL_SAMPLES:
         raise ValueError("cell ranges must be cell-aligned")
     return a_sample // CELL_SAMPLES, b_sample // CELL_SAMPLES
+
+
+class AfeTimeline:
+    """AFE records of one capture epoch, indexed by period number k (capture
+    samples `[1280k, 1280k + 1280)`), first copy wins, ring of `capacity`
+    periods. A period nobody sent has no record — never a zero record."""
+
+    def __init__(self, capacity: int = AFE_CAPACITY):
+        self.capacity = capacity
+        self._rec: np.ndarray | None = None   # AFE_RECORD ring, allocated with the first record
+        self.known = IntervalSet()             # in period numbers
+        self.floor = 0                         # period number
+        self.frontier: int | None = None       # period number
+
+    @property
+    def nbytes(self) -> int:
+        return 0 if self._rec is None else int(self._rec.nbytes)
+
+    def write(self, first_sample: int, records: np.ndarray) -> list[tuple[int, int]]:
+        """Store validated AFE_RECORD rows not yet known, the first at
+        `first_sample`; returns new ranges in capture samples."""
+        k0 = first_sample // AFE_PERIOD_SAMPLES
+        k1 = k0 + int(records.size)
+        if k1 <= self.floor:
+            return []
+        if self.frontier is None or k1 > self.frontier:
+            self.frontier = k1
+        if self.frontier - self.floor > self.capacity:
+            self._trim_before_period(self.frontier - self.capacity)
+        if self._rec is None:
+            self._rec = np.zeros(self.capacity, dtype=AFE_RECORD)
+        new = self.known.missing(max(k0, self.floor), k1)
+        for a, b in new:
+            self._rec[np.arange(a, b) % self.capacity] = records[a - k0:b - k0]
+            self.known.add(a, b)
+        return [(a * AFE_PERIOD_SAMPLES, b * AFE_PERIOD_SAMPLES) for a, b in new]
+
+    def read(self, a_sample: int, b_sample: int) -> list[AfeRecord]:
+        """The retained records whose periods overlap capture samples `[a, b)`,
+        in order. A missing period simply has no record."""
+        if self._rec is None or a_sample >= b_sample:
+            return []
+        a = max(a_sample // AFE_PERIOD_SAMPLES, self.floor)
+        b = -(-b_sample // AFE_PERIOD_SAMPLES)
+        out: list[AfeRecord] = []
+        for lo, hi in self.known.overlapping(a, b):
+            out.extend(afe_records(self._rec[np.arange(lo, hi) % self.capacity], lo * AFE_PERIOD_SAMPLES))
+        return out
+
+    def trim_before(self, sample: int) -> None:
+        """Forget the periods that end at or before capture sample `sample`."""
+        self._trim_before_period(sample // AFE_PERIOD_SAMPLES)
+
+    def _trim_before_period(self, period: int) -> None:
+        if period > self.floor:
+            self.floor = period
+            self.known.trim_before(period)
+
+    def clear(self) -> None:
+        """Erase every record (mute or session loss, with the lease's audio): as if none had come."""
+        self._rec = None
+        self.known.clear()
+        self.floor, self.frontier = 0, None
 
 
 class ReferenceView:
@@ -759,14 +966,17 @@ class ReferenceTimeline:
 # ---------------------------------------------------------------------------
 
 class StreamId(enum.StrEnum):
-    """Uplink stream ids (WIRE §4.2, §4.5)."""
+    """Uplink stream ids (WIRE §4.2, §4.5). `afe` exists only in sessions
+    whose session.ready granted `afe_metadata`; it runs on the capture epoch."""
 
     MIC = "mic"
     REFERENCE = "reference"
     CELLS = "cells"
+    AFE = "afe"
 
 
-_STREAM_KIND = {StreamId.MIC: Kind.MIC, StreamId.REFERENCE: Kind.REFERENCE, StreamId.CELLS: Kind.CELLS}
+_STREAM_KIND = {StreamId.MIC: Kind.MIC, StreamId.REFERENCE: Kind.REFERENCE, StreamId.CELLS: Kind.CELLS,
+                StreamId.AFE: Kind.AFE}
 _KIND_STREAM = {v: k for k, v in _STREAM_KIND.items()}
 
 
@@ -1113,17 +1323,24 @@ class LeaseTable:
         return lease
 
     def open_candidate(self, lease_id: str, candidate_id: str, capture_epoch: int,
-                       support_start: int) -> Lease:
-        """Record the lease the device opened with `wake.candidate` (gen 1)."""
+                       support_start: int, *, afe: bool = False) -> Lease:
+        """Record the lease the device opened with `wake.candidate` (gen 1).
+        `afe`: the session opted in to `afe_metadata_v1`, so the device's
+        candidate lease also wants `afe` from its reference start (the AEC
+        state before the wake), on the period grid (WIRE §4.5)."""
         if lease_id in self._leases:
             raise LeaseError(f"lease {lease_id} already exists")
         mic = _round_down(support_start - CANDIDATE_MIC_PREROLL, CELL_SAMPLES)
+        streams: dict[StreamId, int | None] = {
+            StreamId.MIC: mic,
+            StreamId.CELLS: _round_down(mic - CANDIDATE_CELLS_LEAD, CELL_SAMPLES),
+            StreamId.REFERENCE: max(0, mic - CANDIDATE_REFERENCE_LEAD),
+        }
+        if afe:
+            streams[StreamId.AFE] = _round_down(mic - CANDIDATE_REFERENCE_LEAD, AFE_PERIOD_SAMPLES)
         now = self._now()
         lease = Lease(
-            lease_id, LeaseReason.CANDIDATE, candidate_id, 1, capture_epoch,
-            {StreamId.MIC: mic,
-             StreamId.CELLS: _round_down(mic - CANDIDATE_CELLS_LEAD, CELL_SAMPLES),
-             StreamId.REFERENCE: max(0, mic - CANDIDATE_REFERENCE_LEAD)},
+            lease_id, LeaseReason.CANDIDATE, candidate_id, 1, capture_epoch, streams,
             LEASE_TTL_MS, now, now, ack=AckState.PENDING, candidate_id=candidate_id,
         )
         self._leases[lease_id] = lease
@@ -1157,6 +1374,8 @@ class LeaseTable:
                 starts[sid] = None
             elif sid == StreamId.REFERENCE:
                 starts[sid] = max(0, start)
+            elif sid == StreamId.AFE:
+                starts[sid] = _round_down(start, AFE_PERIOD_SAMPLES)
             else:
                 starts[sid] = _round_down(start, CELL_SAMPLES)
         now = self._now()
@@ -1257,8 +1476,8 @@ class LeaseTable:
         self._leases.pop(lease_id, None)
 
     def wanting(self, stream_id: StreamId, epoch: int) -> list[Lease]:
-        """Active leases that take this packet's stream/epoch. Mic and cells
-        belong to the lease's capture epoch; the reference has its own epochs."""
+        """Active leases that take this packet's stream/epoch. Mic, cells and
+        AFE belong to the lease's capture epoch; the reference has its own epochs."""
         return [l for l in self._leases.values()
                 if l.wants(stream_id) and (stream_id == StreamId.REFERENCE or l.capture_epoch == epoch)]
 
@@ -1268,19 +1487,21 @@ class LeaseTable:
 # ---------------------------------------------------------------------------
 
 class LeaseTimeline:
-    """Mic, reference, and cells a lease received. The open utterance (≤30 s)
-    plus a rolling 10 s before it are kept; the rest ages out (§8.1)."""
+    """Mic, reference, cells and AFE records a lease received. The open
+    utterance (≤30 s) plus a rolling 10 s before it are kept; the rest ages
+    out (§8.1)."""
 
     def __init__(self, lease: Lease):
         self.lease = lease
         self.mic = SampleTimeline(PCM_CAPACITY)
         self.cells = CellTimeline(CELL_CAPACITY)
         self.reference = ReferenceTimeline(PCM_CAPACITY)
+        self.afe = AfeTimeline(AFE_CAPACITY)
         self.utterance_start: int | None = None
 
     @property
     def nbytes(self) -> int:
-        return self.mic.nbytes + self.cells.nbytes + self.reference.nbytes
+        return self.mic.nbytes + self.cells.nbytes + self.reference.nbytes + self.afe.nbytes
 
     def set_utterance_start(self, sample: int | None) -> None:
         """Retention anchor: an open utterance's first sample, or None."""
@@ -1288,9 +1509,11 @@ class LeaseTimeline:
         self._retain()
 
     def trim_before(self, sample: int) -> None:
-        """Forget mic and cells before capture sample `sample` (cells keep
-        the 10 s lead that `B` needs) and the reference beyond what remains."""
+        """Forget mic before capture sample `sample`, AFE records before it
+        less the reference's 2.5 s lead, cells before it less the 10 s lead
+        that `B` needs, and the reference beyond what remains."""
         self.mic.trim_before(sample)
+        self.afe.trim_before(max(0, sample - REFERENCE_EXTRA))
         self.cells.trim_before(max(0, sample - ROLLING_SAMPLES))
         if self.mic.frontier is not None:
             span = self.mic.frontier - self.mic.floor
@@ -1330,6 +1553,16 @@ class LeaseTimeline:
                 records = CellRecords(records.e_centi[skip:], records.flags[skip:], records.mask[skip:])
                 first += skip * CELL_SAMPLES
             new = self.cells.write(first, records)
+        elif stream_id == StreamId.AFE:
+            rows = parse_afe(packet.payload)
+            first = packet.first_sample
+            if start is not None and first < start:
+                skip = (start - first + AFE_PERIOD_SAMPLES - 1) // AFE_PERIOD_SAMPLES
+                if skip >= rows.size:
+                    return []
+                rows = rows[skip:]
+                first += skip * AFE_PERIOD_SAMPLES
+            new = self.afe.write(first, rows)
         else:
             reference = None if packet.digital_silence else packet.pcm()
             new = self.reference.write(packet.epoch, packet.first_sample, reference, packet.frame_count,
@@ -1354,9 +1587,12 @@ class Delivery:
 
 
 class UplinkSession:
-    """Everything the controller keeps about one device session's uplink."""
+    """Everything the controller keeps about one device session's uplink.
+    `afe_metadata`: session.ready granted it (the device announced
+    `afe_metadata_v1`), so the session carries the `afe` stream."""
 
-    def __init__(self, now: Callable[[], float] = time.monotonic):
+    def __init__(self, now: Callable[[], float] = time.monotonic, *, afe_metadata: bool = False):
+        self.afe_metadata = afe_metadata
         self.streams = StreamRegistry()
         self.leases = LeaseTable(now)
         self.timelines: dict[str, LeaseTimeline] = {}
@@ -1380,7 +1616,8 @@ class UplinkSession:
             self.streams.grant_backfill(sid, None if sid == StreamId.REFERENCE else lease.capture_epoch)
 
     def candidate(self, lease_id: str, candidate_id: str, capture_epoch: int, support_start: int) -> Lease:
-        return self.leases.open_candidate(lease_id, candidate_id, capture_epoch, support_start)
+        return self.leases.open_candidate(lease_id, candidate_id, capture_epoch, support_start,
+                                          afe=self.afe_metadata)
 
     def acknowledge(self, lease_id: str, accepted: bool) -> Lease:
         lease = self.leases.acknowledge(lease_id, accepted)
@@ -1400,8 +1637,12 @@ class UplinkSession:
         self.leases.forget(lease_id)
 
     def clear(self, reason: LeaseEnd) -> list[Lease]:
-        """Mute or session loss: end every lease and erase buffered audio."""
+        """Mute or session loss: end every lease and erase buffered audio and
+        AFE records (also where the actor still holds a lease's mic or records)."""
         ended = self.leases.end_all(reason)
+        for timeline in self.timelines.values():
+            timeline.mic.clear()
+            timeline.afe.clear()
         self.timelines.clear()
         if reason == LeaseEnd.SESSION:
             self.streams.clear()

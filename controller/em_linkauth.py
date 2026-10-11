@@ -2,7 +2,7 @@
 The device-link auth decision, as a pure function.
 
 Split out of the controller's link-auth check so it can be tested. Its callers
-(`em_device.register_device` for the device link and legacy planes,
+(`em_device.register_device` for the device link,
 `em_controller._shell_auth_ok` for the shell plane) add a websocket header
 read, a DB lookup and a log call; the part worth getting right is the four-way
 decision below, and it was previously unreachable from the test suite because
@@ -11,7 +11,7 @@ em_controller pulls in the whole controller runtime.
 It cost an orphaned device to find out. Deleting a device removed its row, and
 the token is a column on that row, so `expected` became None while the device
 carried on presenting the credential it still had on disk. The rule rejected
-that, on all three planes including the shell plane the controller would
+that, on every plane including the shell plane the controller would
 otherwise have used to push a fresh credential, and the device retried forever
 behind a pulsing orange ring.
 """

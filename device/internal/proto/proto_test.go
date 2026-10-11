@@ -58,3 +58,19 @@ func TestHelloAmbientLightStatus(t *testing.T) {
 		t.Errorf("status %s", got)
 	}
 }
+
+// session.hello names the image as the controller parses it: always
+// "fireos6", always present on the wire.
+func TestHelloPlatform(t *testing.T) {
+	var m map[string]json.RawMessage
+	b, err := json.Marshal(SessionHello{Platform: PlatformFireOS6})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(m["platform"]); got != `"fireos6"` {
+		t.Errorf("platform encodes as %s, want \"fireos6\"", got)
+	}
+}

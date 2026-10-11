@@ -78,8 +78,7 @@ GET    /api/devices/{id}/capture
 ```
 
 Admin-only, and unlike sample collection it **requires a connected, approved
-device running v1 firmware** (a device waiting for its firmware upgrade gets
-`409 upgrade_required`). Arming an offline device is meaningful for
+device** (anything else gets `409 not_connected`). Arming an offline device is meaningful for
 collection (the mode is persisted and re-applied on connect) and meaningless
 here.
 

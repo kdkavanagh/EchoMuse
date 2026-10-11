@@ -13,11 +13,93 @@
 MAX_ATTEMPTS=3
 MIN_RUNTIME=15   # seconds below which an exit is treated as a failed start
 
-# ── Wait for echoaudioservice (up to 4 minutes) ──────────────────────────────
+# ── Service denylist (docs/fireos6-port.md §4.1) ─────────────────────────────
+# No APKs on Fire OS 6: every entry is a native init service, stopped fresh
+# each boot. Adding to this list means repeating §4.1's test on hardware
+# first: stop it, then confirm micAsr still delivers audio and playback is
+# still accepted. NEVER add anything from §4.1's keep list (mixer and the
+# AIPC/shm/power transport it needs).
+#
+# sntpd follows wifisvc: it waits on ACE NetMgr (/dev/aipc/1, served by
+# wifisvc), exits, and init restarts it every ~20 s forever; the firmware
+# syncs the clock itself. Never `time_update` — it restores the saved time
+# at boot.
+#
+# This is the only copy of the list: boot applies it below, and the
+# dashboard's Re-apply debloat runs `start_server.sh debloat`.
+FOS6_DENYLIST="puffin puffinmrmd ahe shs dacd smarthomed commsd uxeventd amakit_server tokend credmgrsvc trackerd UdssCampSvc ace_dioded oobed_on_boot provisionerd otad ace_otad factory-reset perfrecoveryd ace_metricd logmgr acedropboxd aceusagestatd ace_coex_metric dha_service ledcontroller acebuttond aceinputmanager ace_sensorsd btmanagerd BTSinkPlayer blemesh_service wifisvc sntpd avahi-daemon"
+
+fos6_debloat() {
+    for svc in $FOS6_DENYLIST; do
+        stop "$svc" 2>/dev/null
+    done
+    # oobed_on_boot spawns its own dnsmasq outside init — `stop` can't reach it.
+    kill $(pidof dnsmasq) 2>/dev/null
+}
+
+# Reads the denylist's state back: STOPPED counts listed services init does
+# not report running or restarting; UP names the rest, plus a surviving
+# dnsmasq, comma-separated (empty when nothing is up).
+fos6_debloat_check() {
+    STOPPED=0
+    UP=""
+    for svc in $FOS6_DENYLIST; do
+        case "$(getprop init.svc.$svc)" in
+            running|restarting) UP="$UP,$svc" ;;
+            *) STOPPED=$((STOPPED + 1)) ;;
+        esac
+    done
+    if pidof dnsmasq >/dev/null 2>&1; then
+        UP="$UP,dnsmasq"
+    fi
+    UP=${UP#,}
+}
+
+# ── `start_server.sh debloat` ─────────────────────────────────────────────────
+# Re-apply debloat: stop the denylist now, report, and exit. Nothing else in
+# this script runs — no SELinux move, no tmpfs, no mixer wait, no
+# supervisor — so the live server is untouched. The last line is the
+# controller's result:
+#   DEBLOAT_STOPPED:<listed services not running> STILL_RUNNING:<a,b,…>
+if [ "$1" = "debloat" ]; then
+    fos6_debloat
+    # `stop` only asks init; give it a moment before reading state back.
+    # The WAITING line also keeps a reader that times out on silence alive.
+    sleep 1
+    fos6_debloat_check
+    if [ -n "$UP" ]; then
+        echo "DEBLOAT_WAITING:$UP"
+        sleep 2
+        fos6_debloat_check
+    fi
+    echo "DEBLOAT_STOPPED:$STOPPED STILL_RUNNING:$UP"
+    exit 0
+fi
+
+# init refuses to start a service in boot-root's `su` domain, so echomuse.rc
+# starts this script in `adbd`, which boot-root allows to move itself into
+# `su` (`allow adbd su process dyntransition`). The move is made here, in
+# this single-threaded shell, and the server inherits it: in `adbd`
+# wpa_supplicant's replies are denied (`avc: denied { sendto } … scontext=
+# u:r:wpa:s0 tcontext=u:r:adbd:s0`), so the firmware could not drive Wi-Fi.
+# `echo` is a shell builtin, so /proc/self is this shell itself.
+echo -n u:r:su:s0 > /proc/self/attr/current
+
+# Fire OS 6 has no /tmp, and everything below logs there. The wizard's
+# install_boot_hook creates the empty mountpoint on the read-only root; a
+# tmpfs goes on it here, before the first write. If the redirect target were
+# missing, `server >> /tmp/server.log` would not run the server at all.
+if ! grep -q " /tmp " /proc/mounts; then
+    mount -t tmpfs -o mode=1777,size=32m tmpfs /tmp
+fi
+
+# ── Wait for the audio service (up to 4 minutes) ─────────────────────────────
+# Amazon's `mixer` daemon (init service `mixer`) owns the AFE — there is no
+# AudioFlinger at all (docs/fireos6-port.md §4 Phase 2).
 i=0
 while [ $i -lt 120 ]; do
-    pid=$(ps | grep echoaudio | grep -v grep)
-    if [ -n "$pid" ]; then
+    state=$(getprop init.svc.mixer)
+    if [ "$state" = "running" ]; then
         sleep 5
         break
     fi
@@ -26,7 +108,11 @@ while [ $i -lt 120 ]; do
 done
 
 # ── Hardware init ─────────────────────────────────────────────────────────────
-ip link set p2p0 down
+# No `ip` binary on Fire OS 6 (docs/fireos6-port.md §2 evidence).
+ifconfig p2p0 down
+
+# ── Service denylist (FOS6_DENYLIST, top of this script) ─────────────────────
+fos6_debloat
 
 # Prevent WiFi suspension
 echo "EchoMuse" > /sys/power/wake_lock
@@ -39,8 +125,9 @@ tinymix -D 0 61 100 100
 
 # Mic gain — equalised across all four ADCs (A/B/C/D).
 #
-# Kept even though Android's audio HAL owns the mic chain now (its own PGA
-# plus the AFE's output gain — docs/native-afe-migration.md's bypass table).
+# Kept even though the audio HAL, driven by Amazon's mixer daemon, owns the
+# mic chain now (its own PGA plus the AFE's output gain —
+# docs/native-afe-migration.md's bypass table).
 # Whether the HAL rewrites these four pairs when it opens the input, or
 # inherits whatever it finds, is unverified on hardware; if it inherits, this
 # is the only thing equalising the four ADCs, and if it rewrites, this costs
@@ -132,9 +219,9 @@ sup_log "boot slot=$(readlink /data/local/bin/server 2>/dev/null)"
 # idle DAC produces audible hiss for as long as the server is down (between
 # OTA slots was the worst case). This is the ONLY thing that does it: the
 # speaker backend deliberately leaves the amp/mute controls alone on close,
-# because mediaserver owns the PCM and Android's HAL reacts to the same
-# controls (see slspeaker.Close). Idempotent; the server re-enables the amp
-# in its own startup sequence.
+# because the mixer daemon owns the PCM and the HAL reacts to the same
+# controls (see slspeaker.MixerSink.Close). Idempotent; the server re-enables
+# the amp in its own startup sequence.
 amp_off() {
     tinymix -D 0 61 0 0 2>/dev/null
     tinymix -D 0 5 Off 2>/dev/null

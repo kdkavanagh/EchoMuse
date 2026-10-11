@@ -1,9 +1,19 @@
 # The build context is the repository root (for the root bcresnet_audio.*
-# registry seed). Send only what the Dockerfile COPYs.
+# registry seed and the device firmware sources). Send only what the
+# Dockerfile COPYs.
 *
 !bcresnet_audio.onnx
 !bcresnet_audio.json
 !controller/
+!device/go.mod
+!device/go.sum
+!device/cmd/
+!device/internal/
+!device/pkg/
+# Tests are not firmware: kept out so they neither rebuild it nor move its
+# source-hash version.
+device/**/*_test.go
+device/**/testdata
 controller/tests
 controller/data
 controller/echomuse.db*

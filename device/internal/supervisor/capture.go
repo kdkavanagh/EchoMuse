@@ -12,12 +12,16 @@ import (
 
 // captureBlock is the per-block device flow of §8.1: index the callback,
 // append canonical PCM to the mic ring, complete cells into the cell ring,
-// feed the detector, and wake the uplink sender. A missing range is recorded
-// as missing everywhere; nothing invents silence. While privacy-muted the
-// block is discarded (§3.2 invariant 10). Allocation-free.
+// store the period's AFE record, feed the detector, and wake the uplink
+// sender. A missing range is recorded as missing everywhere; nothing invents
+// silence. While privacy-muted the block is discarded (§3.2 invariant 10);
+// only the AFE decoder's health is still counted. Allocation-free.
 func (s *Supervisor) captureBlock(in pkgmic.Block) {
 	s.capMu.Lock()
 	defer s.capMu.Unlock()
+	if in.AFE != nil {
+		s.accountAFE(in.AFE)
+	}
 	if s.muted {
 		return
 	}
@@ -28,6 +32,7 @@ func (s *Supervisor) captureBlock(in pkgmic.Block) {
 	s.cellMeta = ring.Meta{UncertaintyUs: b.UncertaintyUs, Flags: ema.FlagEstimated}
 	if b.HasMissing {
 		s.micRing.Missing(b.Missing.To)
+		s.afeRing.Missing(b.Missing.To / ema.AFESamples)
 		if err := s.acc.Missing(b.Missing.From, b.Missing.To, b.Missing.MonoNs); err != nil {
 			log.Printf("[capture] cells missing: %v", err)
 		}
@@ -35,6 +40,12 @@ func (s *Supervisor) captureBlock(in pkgmic.Block) {
 	meta := ring.Meta{MonoNs: b.MonoNs, UncertaintyUs: b.UncertaintyUs, Flags: b.Flags}
 	if err := s.micRing.Append(b.First, b.PCM, meta); err != nil {
 		log.Printf("[capture] mic ring: %v", err)
+	}
+	if in.AFE != nil {
+		s.afeRec[0] = in.AFE.Record
+		if err := s.afeRing.Append(b.First/ema.AFESamples, s.afeRec[:], meta); err != nil {
+			log.Printf("[capture] afe ring: %v", err)
+		}
 	}
 	if err := s.acc.Push(b.First, b.PCM, b.MonoNs, false); err != nil {
 		log.Printf("[capture] cells: %v", err)
@@ -75,31 +86,41 @@ func (s *Supervisor) startCaptureEpochLocked(epoch uint64, reason proto.StreamRe
 func (s *Supervisor) resetCaptureLocked() {
 	s.micRing.Reset(0)
 	s.cellRing.Reset(0)
+	s.afeRing.Reset(0)
 	s.acc.Reset(0)
 }
 
 // openCaptureStreamsLocked announces the mic and cell streams of the
-// current capture epoch; cells use the mic epoch (§16.1). announceMu held.
+// current capture epoch, and the afe stream in an afe_metadata_v1 session;
+// cells and afe use the mic epoch (§16.1). announceMu held.
 func (s *Supervisor) openCaptureStreamsLocked() {
 	s.logSend(proto.TypeStreamOpen, 0, proto.StreamOpen{StreamID: proto.StreamMic, Epoch: s.micEpoch,
 		Kind: uint8(ema.KindMic), SampleRate: ema.RateCapture, Format: uint8(ema.FormatPCM16), Reason: s.micReason})
 	s.logSend(proto.TypeStreamOpen, 0, proto.StreamOpen{StreamID: proto.StreamCells, Epoch: s.micEpoch,
 		Kind: uint8(ema.KindCells), SampleRate: ema.RateCapture, Format: uint8(ema.FormatCellV1), Reason: s.micReason})
+	if s.afe.on.Load() {
+		s.logSend(proto.TypeStreamOpen, 0, proto.StreamOpen{StreamID: proto.StreamAFE, Epoch: s.micEpoch,
+			Kind: uint8(ema.KindAFE), SampleRate: ema.RateCapture, Format: uint8(ema.FormatAFEV1), Reason: s.micReason})
+	}
 }
 
-// endCaptureStreamsLocked reports the final capture sample of the mic and
-// cell streams (cells in capture samples). announceMu held.
+// endCaptureStreamsLocked reports the final capture sample of the mic, cell
+// and afe streams (cells and afe in capture samples). announceMu held.
 func (s *Supervisor) endCaptureStreamsLocked(reason proto.StreamReason) {
 	s.logSend(proto.TypeStreamEnd, 0, proto.StreamEnd{StreamID: proto.StreamMic, Epoch: s.micEpoch,
 		FinalSample: s.micRing.End(), Reason: reason})
 	s.logSend(proto.TypeStreamEnd, 0, proto.StreamEnd{StreamID: proto.StreamCells, Epoch: s.micEpoch,
 		FinalSample: s.cellRing.End() * ema.CellSamples, Reason: reason})
+	if s.afe.on.Load() {
+		s.logSend(proto.TypeStreamEnd, 0, proto.StreamEnd{StreamID: proto.StreamAFE, Epoch: s.micEpoch,
+			FinalSample: s.afeRing.End() * ema.AFESamples, Reason: reason})
+	}
 }
 
 // setPrivacy applies a physical mute transition (§3.2 invariant 10, §18.2
 // mute.go): muting ends the capture epoch, every uplink lease and the
-// open candidate, and erases the mic and cell rings; unmuting starts a new
-// epoch at once so privacy.changed can name it. Alerts are unaffected.
+// open candidate, and erases the mic, cell and AFE rings; unmuting starts a
+// new epoch at once so privacy.changed can name it. Alerts are unaffected.
 func (s *Supervisor) setPrivacy(muted bool) {
 	seq := s.physicalSeq.Add(1)
 	s.capMu.Lock()

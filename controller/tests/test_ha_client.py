@@ -19,6 +19,8 @@ aiohttp = pytest.importorskip("aiohttp")
 from aiohttp import web
 
 import em_ha_client as ha_mod
+from echomuse_grammar import GrammarClass
+from em_endpoint_policy import recognized_completeness, recognizer_sentences
 from em_ha_client import (
     FeatureStatus,
     HaClient,
@@ -35,6 +37,10 @@ from em_ha_client import (
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "ha"
 FIXTURES = {p.stem: json.loads(p.read_text()) for p in FIXTURE_DIR.glob("*.json")}
+# conversation/agent/homeassistant/debug as recorded, by sentence; HA recognizes nothing else (None).
+RECOGNITIONS = {sentence: result
+                for key, case in FIXTURES["conversation"].items() if key != "source"
+                for sentence, result in zip(case["request"]["sentences"], case["result"]["results"])}
 PIPELINE_ID = "01hnpec9vt52ec4dkkxqa89z46"
 DEVICE_ID = "b285ec5e94b98f4c1cbeabf926be4b77"
 CALENDAR_ID = "calendar.echomuse_office"
@@ -220,6 +226,9 @@ class FakeHA:
             return
         if kind == "config/floor_registry/list":
             await ws.send_json(_result(msg_id, FIXTURES["registries"]["floor_registry_list"]["result"]))
+            return
+        if kind == "conversation/agent/homeassistant/debug":
+            await ws.send_json(_result(msg_id, {"results": [RECOGNITIONS.get(s) for s in msg["sentences"]]}))
             return
         raise AssertionError(f"unhandled websocket request: {msg}")
 
@@ -659,5 +668,35 @@ def test_probe_reports_per_feature_status_without_cascade():
                 "scripts": FeatureStatus(True),
                 "vocabulary": status["vocabulary"],
                 "timers": FeatureStatus(True),
+                "recognizer": FeatureStatus(True),
             }
+    run(scenario())
+
+
+@pytest.mark.parametrize("case, expected", [
+    ("complete", GrammarClass.COMPLETE),              # "what time is it": nothing extends it
+    ("extendable", GrammarClass.EXTENDABLE),          # "what's the weather" [{when}]
+    ("extendable_short", GrammarClass.EXTENDABLE),    # "play" unpauses, but "(play) {query}" takes more
+    ("needs_more", GrammarClass.NEEDS_MORE),          # "set a timer for five": minutes unfilled
+    ("unknown", GrammarClass.UNKNOWN),                # "what time is": nothing recognized
+])
+def test_recognized_completeness_of_recorded_answers(case, expected):
+    async def scenario():
+        async with running() as (fake, client):
+            text = FIXTURES["conversation"][case]["request"]["sentences"][0]
+            said, probe = await client.recognize(recognizer_sentences(text), DEVICE_ID)
+            sent = [r for r in fake.requests if r["type"] == "conversation/agent/homeassistant/debug"]
+            assert _without_id(sent[-1]) == FIXTURES["conversation"][case]["request"]
+            assert recognized_completeness(said, probe) == expected
+    run(scenario())
+
+
+def test_warm_up_sentence_is_new_each_time():
+    """HA caches recognition by text: a repeated warm-up sentence would not run the matcher."""
+    async def scenario():
+        async with running() as (fake, client):
+            await client.warm_recognizer(DEVICE_ID)
+            await client.warm_recognizer(DEVICE_ID)
+            sent = [r["sentences"] for r in fake.requests if r["type"] == "conversation/agent/homeassistant/debug"]
+            assert len(sent) == 2 and sent[0] != sent[1]
     run(scenario())

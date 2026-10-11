@@ -8,8 +8,9 @@ import (
 
 const stepNs = 10_000_000 // one 480-frame block of render time
 
-// fakeSink stands in for OpenSL. With auto set it behaves like a 4-buffer
-// hardware queue: a write beyond four outstanding completes the oldest.
+// fakeSink stands in for the mixer sink. With auto set it behaves like a
+// 4-buffer hardware queue: a write beyond four outstanding completes the
+// oldest.
 type fakeSink struct {
 	now        *int64
 	onComplete func(int64)

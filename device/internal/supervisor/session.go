@@ -7,6 +7,7 @@ import (
 
 	"github.com/wilbowes/EchoMuse/internal/client"
 	"github.com/wilbowes/EchoMuse/internal/config"
+	"github.com/wilbowes/EchoMuse/internal/platform"
 	"github.com/wilbowes/EchoMuse/internal/proto"
 	"github.com/wilbowes/EchoMuse/internal/server"
 	"github.com/wilbowes/EchoMuse/pkg/led"
@@ -33,6 +34,11 @@ func (s *Supervisor) Hello() proto.SessionHello {
 	if s.cfg.AmbientReadable() {
 		caps = append(caps, proto.CapAmbientLight)
 	}
+	afe := s.afeCapable()
+	s.afe.hello.Store(afe)
+	if afe {
+		caps = append(caps, proto.CapAFEMetadata)
+	}
 	installed, err := s.cfg.SpeechStore.List()
 	if err != nil {
 		log.Printf("[session] speech assets: %v", err)
@@ -50,7 +56,9 @@ func (s *Supervisor) Hello() proto.SessionHello {
 	level, seeded := s.cfg.Physical.VolumeState()
 	return proto.SessionHello{
 		Capabilities:       caps,
+		Platform:           proto.PlatformFireOS6,
 		FirmwareVersion:    s.cfg.FirmwareVersion,
+		OSVersion:          platform.OSVersion(),
 		BootID:             s.cfg.BootID,
 		Protocols:          []int{proto.Version},
 		IP:                 s.cfg.IP(),
@@ -70,16 +78,20 @@ func (s *Supervisor) Ready(sess *client.Session, r proto.SessionReady) { s.ready
 // uploads pending local alert operations before anything else alert-related
 // (§10.6 step 5), reports alert.state, and activates the named speech
 // assets. capture_permitted=false changes nothing on the device: the
-// controller refuses candidates itself.
+// controller refuses candidates itself. The session carries the afe stream
+// only when the controller opted in to the afe_metadata_v1 this device's
+// hello announced.
 func (s *Supervisor) ready(sess Session, r proto.SessionReady) {
 	ctx, cancel := context.WithCancel(context.Background())
+	afe := r.AFEMetadata && s.afe.hello.Load()
 	s.capMu.Lock()
 	s.announceMu.Lock()
 	s.mu.Lock()
 	s.session, s.sessCtx, s.sessCancel = sess, ctx, cancel
 	clear(s.unfetchable)
 	s.mu.Unlock()
-	s.up.Attach(sess.Audio(), s.sendUplink)
+	s.afe.on.Store(afe)
+	s.up.Attach(sess.Audio(), s.sendUplink, afe)
 	if s.micEpoch != 0 {
 		s.openCaptureStreamsLocked()
 	}
@@ -129,6 +141,7 @@ func (s *Supervisor) endSession() {
 	clear(s.candidates)
 	clear(s.leases)
 	s.mu.Unlock()
+	s.afe.on.Store(false)
 	s.announceMu.Unlock()
 	if cancel != nil {
 		cancel()

@@ -46,8 +46,7 @@ func main() {
 		durationSecs = n
 	}
 
-	// Must stop the mixer service to release the ALSA capture device —
-	// same requirement as EchoMuse pcm_microphone.go
+	// Must stop the mixer service to release the ALSA capture device.
 	fmt.Println("Stopping mixer service...")
 	// Use exec if available, fall back silently
 	stopMixer()

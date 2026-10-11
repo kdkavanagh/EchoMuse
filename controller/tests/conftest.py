@@ -1,6 +1,6 @@
 """
 Controller tests need pytest, numpy and scipy, plus websockets and aiohttp
-for the device-link, legacy-handler and HA-client tests. Tests that load
+for the device-link and HA-client tests. Tests that load
 real models skip without onnxruntime/sherpa-onnx; nothing needs a live
 Home Assistant or a device. Run from anywhere:
 

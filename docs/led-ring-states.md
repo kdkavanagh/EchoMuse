@@ -164,11 +164,11 @@ row wins:
 | Condition | Ring | Wire |
 |---|---|---|
 | A recording mode is on | Magenta `(180,0,200)` pulse, 2.6 s cycle | `led_anim` pulse, TTL 20 s |
-| `LISTENING`, `END_PENDING`, `EXPECT_REPLY` | Solid listening palette | `led_anim` solid, TTL 30 s |
+| `ARMED`, `LISTENING`, `END_PENDING` | Solid listening palette | `led_anim` solid, TTL 30 s |
 | `COMMITTED`, `THINKING` | Thinking spinner, one LED step per 80 ms | `led_anim` spin/rotate, TTL 135 s |
 | `SPEAKING` | Playback meter in the meter palette | `led_anim` meter, TTL 20 s |
 | A Home Assistant timer is running on this speaker | Timer fraction | `leds` frame |
-| Anything else (`IDLE`, `ARMED`, `CLOSING`) | Dark | `led_anim` off |
+| Anything else (`IDLE`, `CLOSING`) | Dark | `led_anim` off |
 
 ### Voice turns
 
@@ -176,7 +176,7 @@ A typical wake-word turn looks like this:
 
 ```mermaid
 flowchart LR
-  W[Wake word accepted<br/>wake sound, ring dark] --> L[Speech heard<br/>solid listening]
+  W[Wake word accepted<br/>wake sound, solid listening] --> L[Speech heard<br/>solid listening]
   L --> T[End of utterance<br/>spinner]
   T --> S[Response plays<br/>meter]
   S --> I[Done<br/>dark]
@@ -185,8 +185,8 @@ flowchart LR
 ```
 
 - **Accepted, no speech yet (`ARMED`).** The controller has accepted the wake
-  word or button press and plays the wake sound (`wakeSound`), but the ring
-  stays dark until the speech worker hears command speech after the wake word.
+  word or button press and plays the wake sound (`wakeSound`); the ring shows
+  the listening palette from that moment.
 - **Listening (`LISTENING`, `END_PENDING`).** Solid listening palette while you
   speak, including while the endpoint decision is pending.
 - **Thinking (`COMMITTED`, `THINKING`).** Spinner from the end of your utterance
@@ -194,10 +194,13 @@ flowchart LR
   Assistant intent run and fetching the TTS audio.
 - **Speaking (`SPEAKING`).** The playback meter (below) while the Home
   Assistant response or an EchoMuse question plays.
-- **Expected reply (`EXPECT_REPLY`).** Solid listening palette while the
-  microphone stays open for your answer — after a response that continues the
-  conversation, an EchoMuse question such as "Sorry, I didn't catch that." or
-  "AM or PM?", or a Home Assistant announcement sent with `start_conversation`.
+- **Expected reply (a reply turn, `ARMED` then `LISTENING`).** When a response
+  that continues the conversation, an EchoMuse question such as "Sorry, I
+  didn't catch that." or "AM or PM?", or a Home Assistant announcement sent
+  with `start_conversation` finishes, a reply turn opens at once, like a
+  button press: solid listening palette while the microphone stays open for
+  your answer. With `wakeSound` on, the wake sound plays as it opens. If
+  nobody answers within 7 s it ends with the ring dark and no cue.
 
 Short terminal lines ("Something went wrong.", "That was too long. Try a
 shorter request.", "I'm not sure that worked.", and "Sorry, I didn't catch
@@ -213,7 +216,7 @@ ring to the current state:
 
 | Cue | Look | Sent when |
 |---|---|---|
-| No speech | One slow throb (0.9 s pulse) | The turn ended with `no_input` — nothing was said after the wake word or button |
+| No speech | One slow throb (0.9 s pulse) | The turn ended with `no_input` — nothing was said after the wake word or button. A follow-up question nobody answered ends without it |
 | Error | Fast blinking (0.22 s pulse) | The turn ended `interrupted`, `audio_overrun`, `speech_unavailable`, `ha_timeout`, `response_timeout`, `stt_failed` or `ha_error`; a wake word or button press was refused because the speech worker is unavailable or a recording mode is on; a button press was refused while muted (hidden by the red ring); a spoken line or question could not be fetched or played |
 
 The error reasons `speech_unavailable`, `ha_timeout`, `response_timeout`,
@@ -264,8 +267,9 @@ affected by any of this.
 
 Firmware that predates the capabilities in
 [post-afe-audio-architecture.md §11.1](post-afe-audio-architecture.md#111-capability-cutover)
-connects only to the controller's upgrade-only handler. The controller sends it
-no ring commands; upgrade it from the dashboard.
+is refused at connect, as is a Dot not running Fire OS 6, so the controller
+sends it no ring commands. Move the Dot to Fire OS 6 and provision it with the
+wizard ([rooting.md](rooting.md)).
 
 ## Scenes
 

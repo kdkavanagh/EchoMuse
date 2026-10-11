@@ -26,9 +26,9 @@ async def main() -> None:
                     if marker in bytes(buf[-100:]): return True
                 return False
             await drain(b"# ")
-            await ws.send(b"\x00busybox stty -echo 2>/dev/null\n"); await drain(b"# ", 5)
+            await ws.send(b"\x00stty -echo 2>/dev/null\n"); await drain(b"# ", 5)
             buf.clear()
-            await ws.send(b"\x00echo ST\"\"ART; busybox base64 " + SRC.encode() + b"; echo E\"\"ND\n")
+            await ws.send(b"\x00echo ST\"\"ART; base64 " + SRC.encode() + b"; echo E\"\"ND\n")
             ok = await drain(b"\nE" + b"ND", 120)
             text = bytes(buf).decode("utf-8", "replace")
             m = re.search(r"ST" "ART\r?\n(.*?)\r?\nE" "ND", text, re.S)

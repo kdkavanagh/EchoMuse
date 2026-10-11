@@ -42,7 +42,7 @@ on a regular expression.
 |---|---|
 | Controller version, schema version | Almost every "is this fixed?" question starts here. |
 | Device serials | Nothing correlates without them. They identify your hardware to you; they are not otherwise meaningful. |
-| Firmware version, rollback slot, approval state | Tells us whether a fix is even present on that device. |
+| EchoMuse firmware version, rollback slot, device OS version, approval state | Tells us whether a fix is even present on that device, and which Fire OS build it runs on. |
 | **Capabilities** (`device_wake_v1`, `alert_cache_v1`, `ambient_light`…) | Decides which features and Home Assistant entities exist at all. "The light sensor didn't appear" is answered here in one line. |
 | Configuration — thresholds, EQ, LED scenes, wake model | Behaviour, not identity. Keys whose *name* looks credential-shaped are redacted anyway. |
 | Turn metadata — outcome, wake score, stage latencies, underruns | What happened and how long each stage took. No words, just timings and outcomes. |

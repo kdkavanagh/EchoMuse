@@ -157,7 +157,7 @@ def test_v8_backfill_is_lossless(tmp_path, use_global, expected):
     """
     db_path = tmp_path / "t.db"
     em_db.init(str(db_path))
-    em_db.register_new_device("dev1", "10.0.0.9", "vtest")
+    em_db.register_new_device("dev1", "10.0.0.9", "vtest", None)
     with em_db._tx() as conn:
         conn.execute(
             "UPDATE devices SET use_global_config = ?, config = ? WHERE device_id = 'dev1'",
@@ -182,7 +182,7 @@ def test_reverting_a_section_discards_its_values(tmp_path):
     fleet holds no shadow values waiting to reappear months later.
     """
     em_db.init(str(tmp_path / "t.db"))
-    em_db.register_new_device("dev1", "10.0.0.9", "vtest")
+    em_db.register_new_device("dev1", "10.0.0.9", "vtest", None)
     em_db.set_device_config_sections("dev1", ["ring", "microphones"])
     em_db.set_device_config("dev1", {"ledScene": "pride", "nsAsr": True})
 
@@ -203,7 +203,7 @@ def test_state_key_survives_full_revert(tmp_path):
     device come back at the fleet's volume after any scoping change.
     """
     em_db.init(str(tmp_path / "t.db"))
-    em_db.register_new_device("dev1", "10.0.0.9", "vtest")
+    em_db.register_new_device("dev1", "10.0.0.9", "vtest", None)
     em_db.set_device_config_sections("dev1", list(cs.SECTION_IDS))
     em_db.set_device_config("dev1", {"ledScene": "pride", "startupVolume": 40})
     em_db.set_device_config_sections("dev1", [])
@@ -220,7 +220,7 @@ def test_v11_prunes_out_of_scope_values_from_migrated_rows(tmp_path, monkeypatch
     """
     db_path = tmp_path / "t.db"
     em_db.init(str(db_path))
-    em_db.register_new_device("dev1", "10.0.0.9", "vtest")
+    em_db.register_new_device("dev1", "10.0.0.9", "vtest", None)
     # Simulate a v8-migrated row: no sections, but a full stored config.
     with em_db._tx() as conn:
         conn.execute(

@@ -26,6 +26,8 @@ func newMuteController(hw Hardware, r *ring, path string) *muteController {
 		m.muted = st.Muted
 	}
 	m.apply(m.muted)
+	// Amazon's privacy driver boots unmuted whatever we restored.
+	m.reconcilePrivacySoon()
 	return m
 }
 
@@ -41,7 +43,10 @@ func (m *muteController) isMuted() bool {
 	return m.muted
 }
 
-func (m *muteController) toggle() { m.set(!m.isMuted()) }
+func (m *muteController) toggle() {
+	m.set(!m.isMuted())
+	m.reconcilePrivacySoon()
+}
 
 func (m *muteController) set(muted bool) {
 	m.mu.Lock()

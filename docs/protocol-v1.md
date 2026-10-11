@@ -10,7 +10,7 @@ fields are ignored in both directions.
 ## 1. Sockets
 
 All three sockets are WebSockets on the controller's device listener (plain
-`SERVER_PORT` or TLS `SERVER_TLS_PORT`, chosen exactly as the legacy link did).
+`SERVER_PORT` or TLS `SERVER_TLS_PORT`).
 Every upgrade carries `X-EM-Token: <per-device token>` when the device holds one
 (`/data/local/etc/echomuse/token`); the controller applies the existing
 `em_linkauth` policy (`REQUIRE_DEVICE_TLS`). Compression is disabled.
@@ -28,8 +28,8 @@ an audio/assets upgrade whose `X-EM-Session` is not the device's current session
 Closing the control socket ends the session; the controller closes the other
 two.
 
-The `/shell/{device_id}` plane is unchanged. The legacy `/control` path is
-served only by the controller's upgrade-only legacy handler (architecture §12).
+The `/shell/{device_id}` plane is unchanged. There is no other device path:
+the pre-v1 `/control` link is gone, so firmware predating v1 gets no answer.
 
 ## 2. Control envelope
 
@@ -60,28 +60,60 @@ device keeps executing alerts.
 | Off | Type | Field |
 |---:|---|---|
 | 0 | 4 bytes | `EMA1` |
-| 4 | u8 | kind: 1 mic, 2 reference, 3 render source, 4 cells |
+| 4 | u8 | kind: 1 mic, 2 reference, 3 render source, 4 cells, 5 afe (`afe_metadata_v1` sessions only) |
 | 5 | u8 | flags: bit0 discontinuity, bit1 muted, bit2 underrun, bit3 estimated timing, bit4 digital silence (kind 2 only; payload omitted) |
 | 6 | u8 | channels = 1 |
-| 7 | u8 | format: 1 PCM16LE (kinds 1–3), 2 cell record v1 (kind 4) |
+| 7 | u8 | format: 1 PCM16LE (kinds 1–3), 2 cell record v1 (kind 4), 3 afe record v1 (kind 5) |
 | 8 | u64 | stream epoch |
 | 16 | u64 | sequence (0-based per epoch, +1 per packet) |
-| 24 | u64 | first sample-frame index in epoch (kind 4: first cell's start **sample**, a multiple of 512) |
+| 24 | u64 | first sample-frame index in epoch (kind 4: first cell's start **sample**, a multiple of 512; kind 5: first record's start sample, a multiple of 1280) |
 | 32 | u64 | first-sample device CLOCK_MONOTONIC ns (0 for downlink) |
 | 40 | u32 | timing uncertainty µs (`0xffffffff` unknown) |
-| 44 | u32 | sample rate: 16000 kinds 1,2,4; 48000 kind 3 |
-| 48 | u32 | frame count: kinds 1–2 1…1280 samples; kind 3 1…3840; kind 4 1…320 cells |
+| 44 | u32 | sample rate: 16000 kinds 1,2,4,5; 48000 kind 3 |
+| 48 | u32 | frame count: kinds 1–2 1…1280 samples; kind 3 1…3840; kind 4 1…320 cells; kind 5 1…125 records |
 | 52 | u32 | render generation (kind 3); 0 otherwise |
 | 56 | u32 | active-source mask (kind 2): content=1 alert=2 dialog=4 earcon=8; 0 otherwise |
-| 60 | u32 | payload bytes: frames×2 (PCM), 0 (digital silence), cells×4 (kind 4) |
+| 60 | u32 | payload bytes: frames×2 (PCM), 0 (digital silence), cells×4 (kind 4), records×14 (kind 5) |
 
-Uplink (device → controller): kinds 1, 2, 4, only under a lease (§5). Downlink
-(controller → device): kind 3 only.
+Uplink (device → controller): kinds 1, 2, 4, 5, only under a lease (§5).
+Downlink (controller → device): kind 3 only.
 
 Cell record (kind 4, 4 bytes): int16 LE `E` in hundredths of dB clamped to
 [−12000, 0]; u8 flags (bit0 gap, bit1 muted); u8 active-source mask. Cell `k`
 covers mic samples `[512k, 512k+512)` of the capture epoch; the header epoch is
 the mic capture epoch. A gap cell has `E = −12000` and the gap flag.
+
+AFE record (kind 5, 14 bytes, all u8), sent only in a session whose
+`session.ready` carried `afe_metadata` (§4.1): one summary of the native
+AFE's per-frame metadata over capture period `k`, samples `[1280k,
+1280k+1280)` of the capture epoch; the header epoch is the mic capture epoch.
+The Fire OS 6 AFE writes one 128-bit v3.3 frame into bit 0 of every 128
+samples of `micAsr` (8 ms; [alexa-afe.md](alexa-afe.md) "AFE metadata in bit
+0"); a frame belongs to the period in which its last sample arrives, so a
+period holds at most 10. Raw values keep the AFE's scales.
+
+| Off | Field | Meaning |
+|---:|---|---|
+| 0 | `frames` | valid frames that ended in the period, 0–10; **0 = no data** (bytes 1–13 are then 0) |
+| 1 | `flags` | bit0 `gap`: FRAME_COUNTER/AFE_TIMESTAMP show AFE frames missing before a frame of this period, or the frame phase moved; bit1 `sync`: the decoder acquired lock in this period; bit2 `output_clipped`, bit3 `mic_clipped`, bit4 `aec_diverged`, bit5 `device_mute`: any frame; bits 6–7 reserved 0 |
+| 2 | `playback` | frames with PLAYBACK_ACTIVE |
+| 3, 4, 5 | `erle_max`, `erle_mean`, `erle_frames` | ERLE_RAW: max; mean of the non-zero values, rounded; frames with ERLE_RAW > 0 |
+| 6, 7 | `dtd_max`, `dtd_frames` | DTD (value raw/31): max; frames with DTD > 0 |
+| 8, 9 | `rms_max`, `rms_mean` | RMS over frames with COMPUTE_RMS (dB = raw − 256): max; mean of the raw values, rounded; 0 when none |
+| 10, 11 | `vad_max`, `vad_frames` | DNN_VAD_PROB (value raw × 0.25): max; frames with it > 0 |
+| 12 | `volume` | VOLUME of the period's last valid frame, 0–127 |
+| 13 | `lost` | AFE frames the counters show missing before this period's frames, clamped to 255 |
+
+The receiver rejects `frames` > 10, `playback`/`erle_frames`/`dtd_frames`/
+`vad_frames` > `frames`, `dtd_max` > 31, `vad_max` > 3, `volume` > 127 and
+reserved flag bits. A capture missing range has no records (the next packet
+carries the discontinuity flag). Within a period, RMS is the level of the
+samples its frame rides on; PLAYBACK_ACTIVE, ERLE_RAW, DTD and DNN_VAD_PROB
+are computed on the AFE's input timeline and lead the beam audio they ride on
+by about 6 frames (48 ms). ERLE_RAW is 0 in every frame without far-end
+energy, including pauses while PLAYBACK_ACTIVE (which has a 0.5–0.8 s
+hangover) is still 1, so a period carries max, non-zero mean and non-zero
+count rather than a plain mean.
 
 Reference stream: its own epoch (restarted with each render epoch); reference
 sample `k` = FIR output aligned with render sample `3k` (architecture §16.1).
@@ -103,8 +135,10 @@ is never filled.
 {"capabilities":["audio_timeline_v1","uplink_leases_v1","device_wake_v1",
   "render_reference_v1","render_progress_v1","focus_leases_v1","alert_cache_v1",
   "turn_protocol_v1","leds","led_anim","buttons","button_hold","alert_prefetch","local_wake_chime",
-  "open_rules_v1","ambient_light"],
- "firmware_version":"v3.0.0","boot_id":"<proc boot_id>","protocols":[1],
+  "open_rules_v1","ambient_light","afe_metadata_v1"],
+ "platform":"fireos6",
+ "firmware_version":"v3.0.0","os_version":"Fire OS 6.5.6.9 (NS6569/6009)",
+ "boot_id":"<proc boot_id>","protocols":[1],
  "ip":"10.0.0.5","ambient_light_status":{},
  "privacy":{"muted":false,"capture_epoch":"123"},
  "clock":{"trusted":true,"mono_ns":"…","utc_ms":"…"},
@@ -121,6 +155,25 @@ when `config` `wakeSound` is true (§4.4).
 `detector.open_rules`, evaluates `detector.shadow_rules` without acting on
 them, names the opening rule in `wake.candidate.rule` and reports shadow
 counters in `wake.stats.shadow` (§4.4; architecture §5.2).
+`afe_metadata_v1`: the capture carries the native AFE's per-frame metadata
+(the mixer's `micAsr`, format v3.3) and the device's decoder is validating
+it. The firmware announces it only when a frame validated in the 2 s before
+the hello; right after start the hello waits up to 1 s for the first decoded
+capture period. With `session.ready`
+`afe_metadata`, the device serves the `afe` stream (§3, §4.5) and reports
+`wake.stats.afe` (§4.4). The values are evidence: no controller decision uses
+them (architecture §4.5).
+`platform`: the system image the firmware runs on, always `fireos6` (Fire OS
+6, Android 7.1.2 `biscuit_puffin`), the only image EchoMuse supports. It is
+not a capability and selects no protocol behaviour; it is an admission check.
+The controller refuses a hello that omits it or names anything else with
+`session.rejected` reason `protocol`, logging the value sent: firmware built
+from this tree runs audio on no other image, so admitting such a device would
+only offer it an update that breaks it.
+`firmware_version` is the EchoMuse firmware; `os_version` is the system image's
+own build name (`ro.build.version.name`), which the firmware runs on and never
+changes. Empty when the property cannot be read. Descriptive only: the
+controller records and shows it and decides nothing on it.
 
 **`session.ready`** C→D
 ```json
@@ -132,6 +185,7 @@ counters in `wake.stats.shadow` (§4.4; architecture §5.2).
                  {"profile":"playback","windows":3,"combine":"mean","threshold":0.65}],
    "shadow_rules":[{"profile":"idle","windows":2,"combine":"mean","threshold":0.95}],
    "provisional_duck":{"duck_db":-18.0,"max_per_window":2,"window_ms":5000}},
+ "afe_metadata":true,
  "utc_ms":"…"}
 ```
 `open_rules` and `shadow_rules` are sent only to a device announcing
@@ -158,6 +212,15 @@ a no-op.
 `capture_permitted: false` = the device keeps capturing and scoring locally but
 the controller refuses every candidate (diagnostics/approval states).
 
+`afe_metadata: true` is sent only to a device announcing `afe_metadata_v1`;
+absent or false, the device sends nothing of the `afe` stream: no `stream.open`
+or `stream.end` for it, no kind-5 frames, no `afe` key in a candidate lease or
+`uplink.ended`, no `wake.stats.afe`. The opt-in exists because a controller
+predating kind 5 rejects an unknown EMA1 kind as malformed (`protocol.error`,
+and it closes the session); unknown control types and fields, by contrast, it
+ignores. The device honours the flag only if its hello announced the
+capability. There is no configuration switch.
+
 **`session.rejected`** C→D then close: `{"reason":"pending_approval|unauthorized|protocol"}`.
 The device retries after 10 s (white pulse while `pending_approval`).
 
@@ -180,9 +243,12 @@ on an alarm acks `durable` once journaled. The controller acks `wake.candidate`
 
 ### 4.2 Streams and render
 
-**`stream.open`** D→C (uplink epochs): `{"stream_id":"mic|reference|cells","epoch":"…","kind":1,"sample_rate":16000,"format":1,"reason":"start|discontinuity|privacy|clock_reset|render_epoch"}`.
+**`stream.open`** D→C (uplink epochs): `{"stream_id":"mic|reference|cells|afe","epoch":"…","kind":1,"sample_rate":16000,"format":1,"reason":"start|discontinuity|privacy|clock_reset|render_epoch"}`.
 Sent when an epoch starts and, for current epochs, right after `session.ready`.
-**`stream.end`** D→C: `{"stream_id":"…","epoch":"…","final_sample":"…","reason":"…"}`.
+`afe` (kind 5, format 3) only with `session.ready` `afe_metadata`; like `cells`
+it uses the mic capture epoch, opens and ends with it.
+**`stream.end`** D→C: `{"stream_id":"…","epoch":"…","final_sample":"…","reason":"…"}`
+(`cells` and `afe`: in capture samples).
 
 **`render.start`** C→D, gen = playback generation:
 ```json
@@ -283,7 +349,8 @@ firmware) means false.
    "unmatched":0,"retried":0,"live_only":0,
    "events":[{"kind":"unmatched|retried","open_sample":"…","mono_ns":"…",
               "peak_raw":0.97,"raws":[0.41,0.93,1.0]}],
-   "events_dropped":0}]}
+   "events_dropped":0}],
+ "afe":{"periods":375,"frames":3750,"invalid":0,"syncs":0,"gaps":0,"lost_frames":0}}
 ```
 `wake_unavailable`: `null|"missing_asset"|"load_failed"|"inference_errors"`.
 
@@ -311,16 +378,33 @@ sample at the opening hop's end) and `mono_ns` are uint64 decimal strings,
 over the episode. `shadow` absent (older firmware) means no shadow data, never
 zero counts.
 
+`afe` (only with `session.ready` `afe_metadata`) is the AFE metadata decoder's
+health over this stats window, counted whether or not capture is
+privacy-muted: `periods` capture periods decoded (10 frames expected each),
+`frames` valid frames, `invalid` frames that failed validation where the
+locked decoder expected one, `syncs` lock acquisitions, `gaps`
+discontinuities and `lost_frames` the AFE frames they skipped (§3). It carries
+no acoustic values: those leave the device only in kind-5 records under a
+lease. Absent means no data, never zero counts.
+
 ### 4.5 Uplink leases
 
-Stream keys: `mic`, `reference`, `cells`. Starts are **capture-epoch sample
-indices** (decimal strings) or `"live"`; the device maps a reference start to
-the reference epoch through its clock fits, then rounds down (mic/cells to
-512, reference to 2560) and clips to the ring.
+Stream keys: `mic`, `reference`, `cells`, and `afe` in an `afe_metadata`
+session (anywhere else naming it is `rejected` `invalid`). Starts are
+**capture-epoch sample indices** (decimal strings) or `"live"`; the device maps
+a reference start to the reference epoch through its clock fits, then rounds
+down (mic/cells to 512, afe to 1280, reference to 2560) and clips to the ring
+(afe: 8 s, like the reference).
 
 **`uplink.open`** C→D, gen = lease generation (starts at 1):
-`{"lease_id":"uuid","owner":"…","reason":"turn|reply|diagnostic","streams":{"mic":"…|live","reference":"…|live","cells":"…|live"},"ttl_ms":3000}`.
-An omitted stream key is not wanted.
+`{"lease_id":"uuid","owner":"…","reason":"turn|reply|diagnostic","streams":{"mic":"…|live","reference":"…|live","cells":"…|live","afe":"…|live"},"ttl_ms":3000}`.
+An omitted stream key is not wanted. In an `afe_metadata` session the
+controller opens one more `turn` lease when a turn commits, before closing the
+committed lease: same owner, `streams` `{"afe":"…"}` from where the committed
+lease's records reached, plus `"mic":"…"` from the committed lease's last
+contiguous sample while the speaker's `saveUtterances` is on. It carries the
+AEC state, and then the turn recording, through the response and closes 1 s
+after the turn ends, or 30 s after the commit (architecture §4.4).
 
 **`uplink.renew`** C→D, gen = the lease's generation, or +1 to convert:
 `{"lease_id":"…","ttl_ms":3000,"reason":"turn","owner":"turn-uuid"}` (`reason`/`owner`
@@ -339,7 +423,11 @@ clipping to the ring, in that stream's header index domain, or null when unclipp
 A candidate lease (opened by the device with `wake.candidate`, generation 1)
 wants mic from `support_start − 4800`, cells from mic start − 160000, and
 reference from mic start − 40000 (capture samples; a silent mix costs only
-payload-less digital-silence packets).
+payload-less digital-silence packets). In an `afe_metadata` session it also
+wants afe from mic start − 40000, so the AEC state over the playback before a
+wake is there. The afe stream costs 64 + 14 bytes per 80 ms record:
+**975 B/s** while a lease is live (mic: 32.8 kB/s), and at most 1,464 bytes
+for a candidate's 8 s backfill.
 The device uploads nothing for it until the controller's `command.ack`
 `accepted` for the `wake.candidate`; no ack within 1 s ends it with `ttl`.
 
@@ -428,7 +516,7 @@ fields unchanged:
 ## 5. Transport rules
 
 - Audio for a lease is sent only while that lease is open; backfill precedes
-  live audio per stream, in the order mic, cells, reference.
+  live audio per stream, in the order mic, cells, afe, reference.
 - Per stream, the device keeps ≤400 ms of queued live audio beyond backfill;
   live audio older than 1,000 ms in the send queue ends every lease wanting that
   stream with `overrun`.

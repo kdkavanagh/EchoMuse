@@ -16,7 +16,7 @@ Usage:
     db.init("echomuse.db")          # call once at startup
 
     device = db.get_device(device_id)
-    db.upsert_device_seen(device_id, ip, version)
+    db.upsert_device_seen(device_id, ip, version, os_version)
     db.log_device(device_id, db.LogLevel.INFO, db.LogSource.DEVICE, "Connected")
 """
 
@@ -54,12 +54,6 @@ class SystemConfigKey(StrEnum):
     SESSION_EXPIRY_DAYS = "session_expiry_days"
     UPDATE_CHECK_INTERVAL = "update_check_interval"
     GITHUB_REPO = "github_repo"
-    LATEST_VERSION = "latest_version"
-    LATEST_BINARY_URL = "latest_binary_url"
-    LATEST_NOTES = "latest_notes"
-    LATEST_RELEASE_URL = "latest_release_url"
-    LATEST_PUBLISHED_AT = "latest_published_at"
-    LAST_UPDATE_CHECK = "last_update_check"
     LATEST_CONTROLLER_VERSION = "latest_controller_version"
     LATEST_CONTROLLER_NOTES = "latest_controller_notes"
     LATEST_CONTROLLER_PUBLISHED_AT = "latest_controller_published_at"
@@ -107,6 +101,8 @@ class DeviceRow:
     config_sections: str
     collect_mode: int
     ambient_mode: int
+    os_version: Optional[str]
+    update_queued_at: Optional[int]
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Self:
@@ -231,6 +227,10 @@ DEFAULT_DEVICE_CONFIG: DeviceConfig = {
     "saveWakeClips":    False,
     # Utterance cap: false → 15 s, true → 30 s (§16.6).
     "extendedUtterances": False,
+    # Pause transcription (§16.6, em_pause_asr): Kroko re-decodes the utterance
+    # at every pause; "wyoming" also sends it to that Wyoming ASR server and
+    # judges completeness on its words. Empty model/language: the server's.
+    "pauseAsr": {"engine": "kroko", "host": "", "port": 10300, "model": "", "language": "en"},
     # Alert sounds are em_sounds catalog IDs. Empty = the fleet "default"
     # upload if present, else the device's built-in fallback tone (§16.5).
     # timerSound rings HA timers; alarmSound rings alarm events without their
@@ -277,7 +277,10 @@ _V23_REMOVED_KEYS: frozenset[str] = frozenset({
     "micGainDb", "adcDigitalGain", "adcMicpga", "agcEnabled",
     "aecEnabled", "aecDelayMs", "aecTailMs", "beamformingEnabled", "beamAngle",
 })
-REMOVED_CONFIG_KEYS: frozenset[str] = _V22_REMOVED_KEYS | _V23_REMOVED_KEYS
+# v31: the reply onset gate. A reply turn opens at the question's drain and the
+# ordinary endpoint reducer finds the answer (§16.6), so nothing reads it.
+_V31_REMOVED_KEYS: frozenset[str] = frozenset({"replyOnset"})
+REMOVED_CONFIG_KEYS: frozenset[str] = _V22_REMOVED_KEYS | _V23_REMOVED_KEYS | _V31_REMOVED_KEYS
 
 # Maximum log rows retained per device. Older rows are pruned on insert.
 LOG_RETENTION = 10_000
@@ -287,7 +290,8 @@ LOG_RETENTION = 10_000
 TURN_RETENTION = 20_000
 
 # Voice-turn rows per device that keep their §11.3 decision_trace (3–6 KB
-# each); insert_turn NULLs it on older rows in the same transaction.
+# each) and their afe_series (about 0.6 KB per second of turn, at most ~40 KB);
+# insert_turn NULLs both on older rows in the same transaction.
 TRACE_RETENTION = 1_000
 
 # Hourly wake_counters rows older than this are pruned on upsert.
@@ -1004,6 +1008,76 @@ MIGRATIONS: list[str] = [
         ON wake_shadow_events (device_id, ts DESC);
     UPDATE system_config SET value = '27' WHERE key = 'schema_version';
     """,
+
+    # ── v28 — native AFE evidence on the turn row ────────────────────────────
+    #
+    # `afe_evidence` is the turn's em_afe.AfeEvidence JSON from a Dot with
+    # `afe_metadata_v1`: `support_start`, the `pre` (second before the wake),
+    # `wake` and `utterance` span summaries and `playback_onset`; a null part
+    # is no data. SQL NULL is unavailable: the device lacked the capability,
+    # or the row predates this. Evidence only.
+    """
+    ALTER TABLE turns ADD COLUMN afe_evidence TEXT;
+    UPDATE system_config SET value = '28' WHERE key = 'schema_version';
+    """,
+
+    # ── v29 — per-period native AFE series on the turn row ───────────────────
+    #
+    # `afe_series` is the em_afe.AfeSeries JSON behind `afe_evidence`: every
+    # 80 ms period's record from the second before the wake through the
+    # utterance, for the Activity tab's chart. Like decision_trace it is kept
+    # for the newest TRACE_RETENTION rows per device and never returned by
+    # get_turns; the dashboard fetches one turn's at a time. SQL NULL: none —
+    # unavailable, no record arrived, pruned, or the row predates this.
+    """
+    ALTER TABLE turns ADD COLUMN afe_series TEXT;
+    UPDATE system_config SET value = '29' WHERE key = 'schema_version';
+    """,
+
+    # ── v30 — response latency on the turn row ───────────────────────────────
+    #
+    # `response_latency_ms` is the end of the user's last word (the commit
+    # boundary) → the response's first frame played, both on the Dot's
+    # CLOCK_MONOTONIC. NULL: no response played, or either end lacked device
+    # timing (and every row predating this).
+    """
+    ALTER TABLE turns ADD COLUMN response_latency_ms INTEGER;
+    UPDATE system_config SET value = '30' WHERE key = 'schema_version';
+    """,
+
+    # ── v31 — drop the reply onset setting ───────────────────────────────────
+    #
+    # `replyOnset` tuned a separate start detector for follow-up answers. A
+    # reply turn now opens when the question drains and the ordinary endpoint
+    # reducer decides what is the answer, so the key does nothing; the API
+    # rejects it, and the dashboard posts back what it was given.
+    # _fixup_v31 deletes it from fleet and device config.
+    """
+    UPDATE system_config SET value = '31' WHERE key = 'schema_version';
+    """,
+
+    # ── v32 — the device's OS build ──────────────────────────────────────────
+    #
+    # `os_version` is the Fire OS build session.hello reports
+    # (`ro.build.version.name`), kept beside `firmware_ver`, the EchoMuse
+    # binary, so an offline device still shows what it last ran. NULL: never
+    # reported (firmware predating the field, and every row predating this).
+    """
+    ALTER TABLE devices ADD COLUMN os_version TEXT;
+    UPDATE system_config SET value = '32' WHERE key = 'schema_version';
+    """,
+
+    # ── v33 — firmware install queued for a device's next connect ────────────
+    #
+    # `update_queued_at` (unix seconds) marks an admin's request to bring an
+    # offline device onto the bundled firmware when it next connects. It
+    # names no version: the install is whatever the controller bundles at
+    # that connect. Cleared when the install starts, when the device turns
+    # out to be current already, or on cancel. NULL: nothing queued.
+    """
+    ALTER TABLE devices ADD COLUMN update_queued_at INTEGER;
+    UPDATE system_config SET value = '33' WHERE key = 'schema_version';
+    """,
 ]
 
 # Post-migration fixups that need Python rather than SQL. Keyed by the schema
@@ -1174,29 +1248,39 @@ def _fixup_v22(conn: sqlite3.Connection) -> None:
                         f"{em_sounds.ALERT_MAX_SECONDS} s — its alert asset is cut")
 
 
-def _fixup_v23(conn: sqlite3.Connection) -> None:
-    """Delete _V23_REMOVED_KEYS from the fleet config and every device config.
+def _strip_config_keys(conn: sqlite3.Connection, removed: frozenset[str]) -> None:
+    """Delete `removed` from the fleet config and every device config.
     Unreadable JSON is left as is: there is nothing to strip safely."""
     row = conn.execute(
         "SELECT value FROM system_config WHERE key = 'global_device_config'"
     ).fetchone()
     fleet = _json_dict(row["value"] if row is not None else None)
-    if fleet is not None and _V23_REMOVED_KEYS & fleet.keys():
+    if fleet is not None and removed & fleet.keys():
         conn.execute(
             "UPDATE system_config SET value = ? WHERE key = 'global_device_config'",
-            (json.dumps({k: v for k, v in fleet.items() if k not in _V23_REMOVED_KEYS}),),
+            (json.dumps({k: v for k, v in fleet.items() if k not in removed}),),
         )
     for row in conn.execute("SELECT device_id, config FROM devices").fetchall():
         cfg = _json_dict(row["config"])
-        if cfg is not None and _V23_REMOVED_KEYS & cfg.keys():
+        if cfg is not None and removed & cfg.keys():
             conn.execute(
                 "UPDATE devices SET config = ? WHERE device_id = ?",
-                (json.dumps({k: v for k, v in cfg.items() if k not in _V23_REMOVED_KEYS}),
+                (json.dumps({k: v for k, v in cfg.items() if k not in removed}),
                  row["device_id"]),
             )
 
 
-_MIGRATION_FIXUPS: dict[int, Callable[[sqlite3.Connection], None]] = {11: _fixup_v11, 21: _fixup_v21, 22: _fixup_v22, 23: _fixup_v23}
+def _fixup_v23(conn: sqlite3.Connection) -> None:
+    _strip_config_keys(conn, _V23_REMOVED_KEYS)
+
+
+def _fixup_v31(conn: sqlite3.Connection) -> None:
+    _strip_config_keys(conn, _V31_REMOVED_KEYS)
+
+
+_MIGRATION_FIXUPS: dict[int, Callable[[sqlite3.Connection], None]] = {
+    11: _fixup_v11, 21: _fixup_v21, 22: _fixup_v22, 23: _fixup_v23, 31: _fixup_v31,
+}
 
 # ─── Connection management ────────────────────────────────────────────────────
 
@@ -1408,7 +1492,8 @@ def get_pending_devices() -> list[DeviceRow]:
     )]
 
 
-def register_new_device(device_id: str, ip: str, version: Optional[str]) -> None:
+def register_new_device(device_id: str, ip: str, version: Optional[str],
+                        os_version: Optional[str]) -> None:
     """
     Insert a new device row with approved=0 (pending).
 
@@ -1420,13 +1505,15 @@ def register_new_device(device_id: str, ip: str, version: Optional[str]) -> None
         conn.execute(
             """
             INSERT INTO devices
-                (device_id, label, approved, ip, firmware_ver, first_seen, last_seen, config)
-            VALUES (?, NULL, 0, ?, ?, ?, ?, ?)
+                (device_id, label, approved, ip, firmware_ver, os_version,
+                 first_seen, last_seen, config)
+            VALUES (?, NULL, 0, ?, ?, ?, ?, ?, ?)
             """,
             (
                 device_id,
                 ip,
                 version,
+                os_version,
                 now,
                 now,
                 json.dumps(DEFAULT_DEVICE_CONFIG),
@@ -1466,9 +1553,11 @@ def upsert_device_seen(
     device_id: str,
     ip: str,
     version: Optional[str],
+    os_version: Optional[str],
 ) -> None:
     """
-    Update ip, firmware_ver, and last_seen for a known device on each connection.
+    Update ip, firmware_ver, os_version and last_seen for a known device on
+    each connection.
 
     Does not touch approval status, label, or config.
     """
@@ -1478,10 +1567,11 @@ def upsert_device_seen(
             UPDATE devices
             SET ip           = ?,
                 firmware_ver = ?,
+                os_version   = ?,
                 last_seen    = ?
             WHERE device_id = ?
             """,
-            (ip, version, _now(), device_id),
+            (ip, version, os_version, _now(), device_id),
         )
 
 
@@ -1793,6 +1883,33 @@ def set_firmware_previous(device_id: str, version: Optional[str]) -> None:
         )
 
 
+def set_update_queued(device_id: str, queued_at: Optional[int]) -> None:
+    """Queue (unix seconds) or, with None, cancel the device's firmware
+    install for its next connect (see the v33 migration)."""
+    with _tx() as conn:
+        conn.execute(
+            "UPDATE devices SET update_queued_at = ? WHERE device_id = ?",
+            (queued_at, device_id),
+        )
+
+
+def take_update_queue(device_id: str) -> Optional[int]:
+    """Clear the device's queued firmware install and return when it was
+    queued; None when nothing was queued. Read and cleared in one
+    transaction under _db_lock, so a cancel and a connect racing for the same
+    entry cannot both see it."""
+    with _tx() as conn:
+        row = conn.execute(
+            "SELECT update_queued_at FROM devices WHERE device_id = ?", (device_id,)
+        ).fetchone()
+        queued_at: Optional[int] = row["update_queued_at"] if row is not None else None
+        if queued_at is not None:
+            conn.execute(
+                "UPDATE devices SET update_queued_at = NULL WHERE device_id = ?", (device_id,)
+            )
+    return queued_at
+
+
 def delete_device(device_id: str) -> None:
     """
     Remove a device and all its logs from the registry.
@@ -2050,7 +2167,8 @@ def get_device_logs(
 # as trigger_type because TRIGGER is an SQLite keyword. The §11.3 decision
 # trace arrived in schema 22, the per-stage Activity detail in schema 24, the
 # follow-up question detail in schema 25, the stored trace JSON and
-# time-to-first-audio in schema 26.
+# time-to-first-audio in schema 26, native AFE evidence in schema 28, its
+# per-period series in schema 29 and the response latency in schema 30.
 _TURN_COLUMNS = {
     "trigger":            "trigger_type",
     "wake_model":         "wake_model",
@@ -2085,13 +2203,17 @@ _TURN_COLUMNS = {
     "reply_to":           "reply_to",        # turn_uuid of the question this turn answered
     "continuation":       "continuation",    # fate of the question this turn asked (em_session FOLLOWUP_*)
     "first_audio_ms":     "first_audio_ms",  # endpoint commit → response audible
+    "response_latency_ms": "response_latency_ms",  # end of the last word → response's first frame, device clock
     "decision_trace":     "decision_trace",  # §11.3 trace JSON; newest TRACE_RETENTION rows only
+    "afe_evidence":       "afe_evidence",    # em_afe.AfeEvidence JSON; NULL = unavailable
+    "afe_series":         "afe_series",      # em_afe.AfeSeries JSON; newest TRACE_RETENTION rows only
 }
 
-# Written but not returned by get_turns (nor pushed as turn_complete): the
-# Activity list never reads the trace, and at 3–6 KB a row it would dominate
-# every turns response.
-TURN_WRITE_ONLY_COLUMNS = frozenset({"decision_trace"})
+# Written but not returned by get_turns (nor pushed as turn_complete): at
+# 3–6 KB a row the trace would dominate every turns response. Both are
+# fetched per turn when one is opened (get_turn_decision_trace,
+# get_turn_afe_series).
+TURN_WRITE_ONLY_COLUMNS = frozenset({"decision_trace", "afe_series"})
 
 # Columns get_turns returns but nothing writes any more (SPEC §18.4 step 3):
 # the legacy data-plane delivery measurements and the shadow/device-wake
@@ -2118,8 +2240,8 @@ def insert_turn(device_id: str, rec: Mapping[str, object]) -> int:
     Persist one completed voice turn. `rec` keys are those of _TURN_COLUMNS
     plus optional `ts` (epoch s); missing keys are NULL, other keys ignored.
     Returns the rowid (set_turn_audio/set_turn_wake attach files by it).
-    Prunes to TURN_RETENTION rows per device, and NULLs decision_trace on
-    all but the newest TRACE_RETENTION of them.
+    Prunes to TURN_RETENTION rows per device, and NULLs decision_trace and
+    afe_series on all but the newest TRACE_RETENTION of them.
     """
     cols   = ["device_id", "ts"] + list(_TURN_COLUMNS.values())
     values = [device_id, _py(rec.get("ts", time.time()))] + [
@@ -2146,9 +2268,9 @@ def insert_turn(device_id: str, rec: Mapping[str, object]) -> int:
         )
         conn.execute(
             """
-            UPDATE turns SET decision_trace = NULL
+            UPDATE turns SET decision_trace = NULL, afe_series = NULL
             WHERE device_id = ?
-              AND decision_trace IS NOT NULL
+              AND (decision_trace IS NOT NULL OR afe_series IS NOT NULL)
               AND id NOT IN (
                   SELECT id FROM turns
                   WHERE device_id = ?
@@ -2159,6 +2281,21 @@ def insert_turn(device_id: str, rec: Mapping[str, object]) -> int:
             (device_id, device_id, TRACE_RETENTION),
         )
         return _rowid(cur)
+
+
+def get_turn_afe_series(device_id: str, turn_id: int) -> Optional[str]:
+    """The stored em_afe.AfeSeries JSON of one of `device_id`'s turns; None
+    when the turn has none (see the v29 migration) or is not that device's."""
+    row = _q1("SELECT afe_series FROM turns WHERE id = ? AND device_id = ?", (turn_id, device_id))
+    return None if row is None else row["afe_series"]
+
+
+def get_turn_decision_trace(device_id: str, turn_id: int) -> Optional[str]:
+    """The stored §11.3 decision trace JSON of one of `device_id`'s turns; None
+    when the turn has none (older than the newest TRACE_RETENTION, or before
+    schema 26) or is not that device's."""
+    row = _q1("SELECT decision_trace FROM turns WHERE id = ? AND device_id = ?", (turn_id, device_id))
+    return None if row is None else row["decision_trace"]
 
 
 def set_turn_audio(turn_id: int, audio_file: Optional[str]) -> None:
@@ -2220,6 +2357,18 @@ def get_turns(
             rec[col] = row[col]
         out.append(rec)
     return out
+
+
+def get_response_latencies(device_id: str, since: float) -> list[tuple[float, int]]:
+    """(ts, response_latency_ms) of `device_id`'s turns from `since` (epoch s)
+    that measured one, oldest first. NULL rows (nothing played, or no device
+    timing) are left out rather than counted as zero."""
+    rows = _q(
+        "SELECT ts, response_latency_ms FROM turns "
+        "WHERE device_id = ? AND ts >= ? AND response_latency_ms IS NOT NULL ORDER BY ts",
+        (device_id, since),
+    )
+    return [(row["ts"], row["response_latency_ms"]) for row in rows]
 
 
 def bump_wake_counters(

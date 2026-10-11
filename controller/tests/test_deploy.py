@@ -15,11 +15,12 @@ DOCKERFILE = CONTROLLER / "Dockerfile"
 
 
 def _copy_sources() -> list[str]:
-    """Every COPY source in the Dockerfile (root build context, §18.5)."""
+    """Every COPY source in the Dockerfile (root build context, §18.5).
+    `COPY --from=<stage>` reads another stage, not the context."""
     out = []
     for line in DOCKERFILE.read_text().splitlines():
         m = re.match(r"^COPY\s+(.+)\s+\S+$", line)
-        if m:
+        if m and not m.group(1).startswith("--from="):
             out.extend(m.group(1).split())
     return out
 
@@ -217,20 +218,6 @@ def test_addon_image_is_published_not_built_on_the_user_machine():
         )
 
 
-def test_release_workflow_publishes_the_tag_annotation():
-    """
-    The notes shown in the dashboard come from the annotated tag, so the
-    workflow must publish that rather than only GitHub's generated commit
-    list. If this drifts, every future release silently shows a commit dump to
-    whoever is deciding whether to update.
-    """
-    from pathlib import Path
-    wf = (Path(__file__).resolve().parent.parent.parent
-          / ".github" / "workflows" / "release.yml").read_text()
-    assert "body_path:" in wf, "the release must publish notes from a file"
-    assert "%(contents)" in wf, "notes must come from the tag annotation"
-
-
 def test_every_device_payload_has_an_update_path():
     """
     A payload installed only at provisioning drifts forever.
@@ -256,27 +243,6 @@ def test_every_device_payload_has_an_update_path():
         )
 
 
-def test_debloat_sync_reconciles_both_halves():
-    """
-    The debloat is a boot script AND a pm-hide list. Round 2 added a *package*,
-    so a sync that only refreshed the script would have looked like it worked
-    and changed nothing on any device.
-    """
-    from pathlib import Path
-    api = (Path(__file__).resolve().parent.parent / "em_api.py").read_text()
-    fn = api[api.index("async def _sync_debloat"):]
-    fn = fn[:fn.index("\nasync def ", 1)] if "\nasync def " in fn[1:] else fn
-
-    assert "echomuse-debloat.sh" in fn, "the boot script half must be synced"
-    assert "_debloat_packages()" in fn, "the pm-hide half must be reconciled"
-    assert "pm hide" in fn, "drifted packages must actually be hidden"
-    # Rename-based replacement: the running shell keeps the old inode.
-    assert "mv " in fn and ".new" in fn, \
-        "the script must be replaced by rename, not written in place"
-    # md5 both before (skip when in sync) and after (verify the transfer).
-    assert fn.count("md5") >= 2, "sync must md5-compare and md5-verify"
-
-
 def test_debloat_reachable_without_an_ota():
     """
     The OTA-time sync cannot reach a device already on the latest firmware —
@@ -289,27 +255,6 @@ def test_debloat_reachable_without_an_ota():
     assert '"/api/devices/{id}/debloat"' in api, "no manual debloat endpoint registered"
     jsx = (root / "static" / "dashboard.jsx").read_text()
     assert "/debloat`" in jsx, "the dashboard must be able to trigger it"
-
-
-def test_stale_release_cache_is_not_returned_when_it_has_aged_out():
-    """
-    _get_cached_release used to fire a refresh into the background and return
-    the STALE value. Two consequences, both seen on 2026-07-30: the dashboard
-    reported "there's an update" only after someone pressed Check now, and an
-    OTA pushed v2.9.9 while v2.9.10 was the current release.
-
-    The refresh is now awaited when the DB cache has aged past the check
-    interval, falling back to the stale value only if the fetch fails.
-    """
-    from pathlib import Path
-    api = (Path(__file__).resolve().parent.parent / "em_api.py").read_text()
-    fn = api[api.index("async def _get_cached_release"):]
-    fn = fn[:fn.index("\nasync def ", 1)]
-
-    assert "await _fetch_latest_release()" in fn, \
-        "an aged-out cache must be refreshed synchronously, not in the background"
-    assert "asyncio.create_task(_fetch_latest_release())" not in fn, \
-        "fire-and-forget refresh returns the stale value to this caller"
 
 
 def test_controller_update_is_advisory_only():
@@ -348,8 +293,7 @@ def test_controller_notes_come_from_the_tag_annotation():
     """
     controller-v* tags ship a GHCR image and no GitHub Release (CLAUDE.md,
     "Versioning / releases"), so the notes must be read from the annotated
-    tag object. Reading them from the releases list would return the newest
-    DEVICE firmware release instead — right shape, wrong product.
+    tag object.
     """
     from pathlib import Path
     api = (Path(__file__).resolve().parent.parent / "em_api.py").read_text()
@@ -357,8 +301,6 @@ def test_controller_notes_come_from_the_tag_annotation():
     fn = fn[:fn.index("\nasync def ", 1)]
     assert "GITHUB_TAGS_URL" in fn and "GITHUB_TAG_OBJECT_URL" in fn, \
         "controller notes must come from the tag annotation, not /releases"
-    assert "GITHUB_API_URL" not in fn, \
-        "that is the device firmware release feed, not the controller's"
 
 
 def test_every_db_call_in_em_api_exists():
@@ -512,8 +454,9 @@ def test_a_failed_update_asks_for_the_supervisor_log():
         "the supervisor log"
     )
 
+    # The connect path: notify_device_connected and the task it schedules.
     connect = api[api.index("async def notify_device_connected"):]
-    connect = connect[:connect.index("\nasync def ", 1)]
+    connect = connect[:connect.index("\nasync def notify_device_disconnected")]
     assert "_collect_supervisor_log" in connect, \
         "nothing collects the supervisor log when the device comes back"
 
@@ -608,9 +551,9 @@ def test_ota_checks_free_space_before_writing_anything():
     The OTA path had no space check at all, unlike the asset path.
 
     Two traps, both already paid for elsewhere: read the figure with
-    parse_free_mb rather than an awk field index (busybox wraps a long
-    filesystem name onto its own line, so $4 is the PERCENTAGE on these
-    devices), and treat an unreadable df as "carry on" rather than as a full
+    parse_free_mb rather than an awk field index (a long filesystem name can
+    wrap onto its own line, so $4 is the PERCENTAGE), and treat an unreadable
+    df as "carry on" rather than as a full
     disk — refusing on an unparsed reading blocks updates on any device whose
     df we have not seen.
     """
@@ -655,26 +598,23 @@ def test_a_transfer_never_deletes_the_destination_before_sending():
     )
 
 
-def test_tested_firmware_build_matches_the_docs():
+def test_tested_firmware_build_matches_the_docs_fireos6():
     """
-    The wizard warns when a device is on a FireOS build other than the one
-    EchoMuse is developed against, and docs/rooting.md tells people which to
-    flash. Those two have to name the same build: a warning pointing at a
-    version the docs do not mention is worse than no warning, because the
-    person reading it has nowhere to go.
-
-    Verified against the fleet 2026-08-07 — all three connected devices report
-    ro.build.version.incremental = 272.6.8.0_user_680767620.
+    The wizard warns when a device is on a Fire OS 6 build other than the one
+    EchoMuse is tested against (_TESTED_FIREOS6_BUILD), and docs/rooting.md
+    tells people which to flash. Those two have to name the same build: a
+    warning pointing at a version the docs do not mention is worse than no
+    warning, because the person reading it has nowhere to go.
     """
     jsx = (CONTROLLER / "static" / "dashboard.jsx").read_text()
-    m = re.search(r"_TESTED_FIREOS_BUILD\s*=\s*'([^']+)'", jsx)
-    assert m, "dashboard.jsx no longer declares _TESTED_FIREOS_BUILD"
+    m = re.search(r"_TESTED_FIREOS6_BUILD\s*=\s*'([^']+)'", jsx)
+    assert m, "dashboard.jsx no longer declares _TESTED_FIREOS6_BUILD"
     build = m.group(1)
 
     rooting = (CONTROLLER.parent / "docs" / "rooting.md").read_text()
     assert build in rooting, (
-        f"the wizard warns against build {build} but docs/rooting.md never "
-        f"names it — a reader has nowhere to go"
+        f"the wizard warns against Fire OS 6 build {build} but docs/rooting.md "
+        f"never names it — a reader has nowhere to go"
     )
 
 

@@ -196,7 +196,7 @@ Worth evaluating properly rather than dismissing, because the native-AFE path
 removes the objection that killed this last time
 ([alexa-afe.md](alexa-afe.md) route 4 assumed the only audio transport was the
 shared-memory `IAudioStreamService`, whose host `amazon.speech.sim` our
-debloat hides). It is not the only transport.
+Fire OS 5 debloat hid). It is not the only transport.
 
 **The plumbing works, and capturing through the audio HAL makes it easier.** `WakeWordService` has
 a *push* API:
@@ -285,7 +285,7 @@ directory, and hot-swaps the running model (`switchWakeWordModel`). Regioned
 (`DavsRegion`), account-authenticated (`AmazonAccountUtils`).
 
 So the endpointer's tuning is **cloud-vended, per-locale, per-account**, which
-is why it is absent here twice over: EchoMuse's debloat leaves the package
+is why it is absent here twice over: EchoMuse's Fire OS 5 debloat left the package
 `enabled=2` (DISABLED), and the unit was never signed in to an Amazon account
 anyway. Its files directory is empty. Nothing was lost by disabling it — those
 artifacts are wake word models and a contact-ID database for Alexa's own
@@ -774,7 +774,8 @@ dimension (level) that correlates with distance.
 - `ARA` (alexa-afe.md's open question) runs between AEC and ABF and is still
   unexpanded. `setAraReferenceBeam` suggests it is beam-space, which would make
   it relevant to interferer rejection and not only to echo.
-- Whether `libasp`'s own VAD output is reachable at all through the OpenSL ES
-  path. If it is, it is a free non-speech posterior computed on the 7-channel
+- Whether `libasp`'s own VAD output is reachable at all through the capture
+  path (OpenSL ES when this was written; the mixer's `micAsr` on Fire OS 6,
+  whose AFE metadata carries `DNN_VAD_PROB`, [afe-metadata.md](afe-metadata.md)). If it is, it is a free non-speech posterior computed on the 7-channel
   signal, which is strictly better information than the controller can derive
   from one downmixed channel.

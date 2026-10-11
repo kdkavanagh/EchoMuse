@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -82,6 +83,7 @@ class HaFeature(StrEnum):
     SCRIPTS = "scripts"
     VOCABULARY = "vocabulary"
     TIMERS = "timers"
+    RECOGNIZER = "recognizer"
 
 
 class VocabEvent(StrEnum):
@@ -299,6 +301,30 @@ class RunLost:
 
 RunEvent = RunRejected | SttEnded | IntentEnded | TtsReady | RunFailed | RunEnded | RunLost
 _TERMINAL = (RunRejected, RunFailed, RunEnded, RunLost)
+
+
+@dataclass(frozen=True, slots=True)
+class SentenceRecognition:
+    """HA's built-in sentence matcher on one sentence (`conversation/agent/homeassistant/debug`).
+    `match`: a sentence trigger, or an intent with every slot filled; `unfilled_slots`: the
+    closest intent left slots unmatched; `source`: `trigger`, `builtin` or `custom`;
+    `template`: the sentence template that matched, or came closest."""
+    match: bool
+    unfilled_slots: bool
+    source: str | None
+    template: str
+
+
+def _sentence_recognition(value: object) -> SentenceRecognition | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise HaError("bad_response", f"recognition: {value!r}")
+    unmatched = value.get("unmatched_slots")
+    return SentenceRecognition(match=value.get("match") is True,
+                               unfilled_slots=isinstance(unmatched, dict) and bool(unmatched),
+                               source=_opt_str(value.get("source")),
+                               template=str(value.get("sentence_template") or ""))
 
 
 # ── Vocabulary (§16.7) ───────────────────────────────────────────────────────
@@ -1150,6 +1176,25 @@ class HaClient:
             raise HaError(str((response.get("data") or {}).get("code", "failed_to_handle")), str(speech or name))
         return response
 
+    async def recognize(self, sentences: Sequence[str], device_id: str | None, *,
+                        timeout: float = COMMAND_TIMEOUT_S) -> list[SentenceRecognition | None]:
+        """HA's built-in sentence matcher on each sentence, without running anything: the
+        stock `conversation/agent/homeassistant/debug` command behind HA's Assist debugger.
+        A matching sentence trigger is reported, never fired. None: nothing recognized
+        (§16.6 completeness)."""
+        result = await self.command({"type": "conversation/agent/homeassistant/debug",
+                                     "sentences": list(sentences), "device_id": device_id}, timeout=timeout)
+        results = result.get("results") if isinstance(result, dict) else None
+        if not isinstance(results, list) or len(results) != len(sentences):
+            raise HaError("bad_response", f"recognize: {result!r}")
+        return [_sentence_recognition(r) for r in results]
+
+    async def warm_recognizer(self, device_id: str | None, *, timeout: float = COMMAND_TIMEOUT_S) -> None:
+        """Run HA's sentence matcher once so it is resident, not paged out after idle, when a
+        command needs it (§16.7). HA caches recognition by text, so the sentence is new each
+        time; it matches nothing and changes nothing."""
+        await self.recognize([f"echomuse warm up {uuid.uuid4().hex}"], device_id, timeout=timeout)
+
     # ── calendar (§16.4, §10.4) ──
 
     async def calendar_create(self, entity_id: str, event: Mapping[str, object]) -> None:
@@ -1376,9 +1421,14 @@ class HaClient:
             # with a device (§10.8); a status question changes nothing.
             await self.handle_intent("HassTimerStatus", {}, None)
 
+        async def recognizer() -> None:
+            components("conversation")
+            # Recognizes without running anything, so it is harmless (§16.6).
+            await self.recognize(["what time is it"], None)
+
         checks: dict[HaFeature, Callable[[], Awaitable[None]]] = {
             HaFeature.VOICE: voice, HaFeature.CALENDAR: calendar, HaFeature.SCRIPTS: scripts,
-            HaFeature.VOCABULARY: vocabulary, HaFeature.TIMERS: timers}
+            HaFeature.VOCABULARY: vocabulary, HaFeature.TIMERS: timers, HaFeature.RECOGNIZER: recognizer}
         status: dict[HaFeature, FeatureStatus] = {}
         for feature in HaFeature:
             try:

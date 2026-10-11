@@ -1,9 +1,10 @@
 // Package uplink executes the device's uplink leases (SPEC §4.4, WIRE §4.5,
 // §5). Each lease names the streams it wants and where each starts; the
-// executor maps those starts onto the mic, cell and reference rings, uploads
-// backfill and then live audio as EMA1 packets, and ends the lease on close,
-// TTL, mute, capture-epoch change, overrun or session loss with an
-// uplink.ended report.
+// executor maps those starts onto the mic, cell, AFE and reference rings,
+// uploads backfill and then live audio as EMA1 packets, and ends the lease
+// on close, TTL, mute, capture-epoch change, overrun or session loss with an
+// uplink.ended report. The afe stream exists only in sessions whose
+// session.ready opted into afe_metadata_v1.
 //
 // The rings are the send queue: audio waits there, uncopied, until the single
 // sender goroutine (Run) packs it into a reused frame for the audio sink.
@@ -44,15 +45,16 @@ const (
 	tick      = 20 * time.Millisecond
 )
 
-// Candidate lease stream leads in capture samples (WIRE §4.5).
+// Candidate lease stream leads in capture samples (WIRE §4.5). AFE records
+// start with the reference, so the AEC state before the wake word is there.
 const (
 	candidateMicLead   = 4800   // mic from support_start − 300 ms
 	candidateCellsLead = 160000 // cells from mic start − 10 s
 	candidateRefLead   = 40000  // reference from mic start − 2.5 s
 )
 
-// Stream start grids: mic and cells on cell boundaries, reference on
-// reference hops (§4.4).
+// Stream start grids: mic and cells on cell boundaries, AFE records on
+// capture periods, reference on reference hops (§4.4).
 const (
 	micGrid = ema.CellSamples // capture samples
 	refGrid = 2560            // reference samples
@@ -64,13 +66,15 @@ const (
 const (
 	liveMaxSamples = 1280
 	liveMaxCells   = liveMaxSamples / ema.CellSamples // 2
+	liveMaxAFE     = liveMaxSamples / ema.AFESamples  // 1
 )
 
-// Rings are the capture-epoch mic and cell rings and the render-epoch
+// Rings are the capture-epoch mic, cell and AFE rings and the render-epoch
 // reference ring, written by the supervisor.
 type Rings struct {
 	Mic, Ref *ring.Ring[int16]
 	Cells    *ring.Ring[ema.Cell]
+	AFE      *ring.Ring[ema.AFERecord]
 }
 
 // Clock maps capture samples to reference samples of the current reference
@@ -84,15 +88,16 @@ type SendFunc func(typ proto.MessageType, generation uint32, body any) (string, 
 
 type streamID int
 
-// Streams in upload order (WIRE §5: mic, cells, reference).
+// Streams in upload order (WIRE §5: mic, cells, afe, reference).
 const (
 	micStream streamID = iota
 	cellsStream
+	afeStream
 	refStream
 	numStreams
 )
 
-var streamKeys = [numStreams]proto.StreamID{proto.StreamMic, proto.StreamCells, proto.StreamReference}
+var streamKeys = [numStreams]proto.StreamID{proto.StreamMic, proto.StreamCells, proto.StreamAFE, proto.StreamReference}
 
 func streamOf(key proto.StreamID) (streamID, bool) {
 	for id, k := range streamKeys {
@@ -173,6 +178,7 @@ type Executor struct {
 
 	sink client.AudioSink
 	send SendFunc
+	afe  bool // the session opted into afe_metadata_v1
 
 	micEpoch, refEpoch uint64
 	leases             map[string]*lease
@@ -182,6 +188,7 @@ type Executor struct {
 	frame   []byte
 	pcm     []int16
 	cells   []ema.Cell
+	afes    []ema.AFERecord
 	segs    []ring.Segment
 	pending pending
 }
@@ -201,6 +208,7 @@ func New(r Rings, c Clock, now func() int64) *Executor {
 		frame:  make([]byte, ema.HeaderSize+ema.MaxUplinkPCMFrames*2),
 		pcm:    make([]int16, ema.MaxUplinkPCMFrames),
 		cells:  make([]ema.Cell, ema.MaxCells),
+		afes:   make([]ema.AFERecord, ema.MaxAFERecords),
 		// A read of n indices yields at most n segments.
 		segs: make([]ring.Segment, 0, ema.MaxUplinkPCMFrames),
 	}
@@ -210,10 +218,12 @@ func New(r Rings, c Clock, now func() int64) *Executor {
 	return e
 }
 
-// Attach binds a new session's audio sink and control sender.
-func (e *Executor) Attach(sink client.AudioSink, send SendFunc) {
+// Attach binds a new session's audio sink and control sender. afe is true
+// when the session opted into afe_metadata_v1: candidate leases then want
+// the afe stream, and uplink.open may name it.
+func (e *Executor) Attach(sink client.AudioSink, send SendFunc, afe bool) {
 	e.mu.Lock()
-	e.sink, e.send = sink, send
+	e.sink, e.send, e.afe = sink, send, afe
 	e.mu.Unlock()
 	e.Notify()
 }
@@ -223,7 +233,7 @@ func (e *Executor) Attach(sink client.AudioSink, send SendFunc) {
 func (e *Executor) Detach() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.sink, e.send = nil, nil
+	e.sink, e.send, e.afe = nil, nil, false
 	for _, l := range e.leases {
 		e.endLocked(l, proto.EndedSession)
 	}
@@ -244,6 +254,7 @@ func (e *Executor) SetEpochs(mic, ref uint64) {
 		e.micEpoch = mic
 		e.restartLocked(micStream, mic)
 		e.restartLocked(cellsStream, mic)
+		e.restartLocked(afeStream, mic)
 	}
 	if ref != e.refEpoch {
 		e.refEpoch = ref
@@ -276,6 +287,7 @@ func (e *Executor) Mute() {
 	e.micEpoch = 0
 	e.restartLocked(micStream, 0)
 	e.restartLocked(cellsStream, 0)
+	e.restartLocked(afeStream, 0)
 	send := e.send
 	e.mu.Unlock()
 	emit(send, out)
@@ -293,9 +305,10 @@ func (e *Executor) OpenCandidate(leaseID string, supportStart uint64) {
 	}
 	l := &lease{id: leaseID, owner: leaseID, reason: proto.LeaseCandidate, gen: 1,
 		deadline: e.now() + int64(CandidateAckWait)}
-	l.want = [numStreams]bool{true, true, true}
+	l.want = [numStreams]bool{micStream: true, cellsStream: true, afeStream: e.afe, refStream: true}
 	l.req[micStream] = startReq{capture: mic}
 	l.req[cellsStream] = startReq{capture: sub(mic, candidateCellsLead)}
+	l.req[afeStream] = startReq{capture: sub(mic, candidateRefLead)}
 	l.req[refStream] = startReq{capture: sub(mic, candidateRefLead)}
 	e.leases[leaseID] = l
 }
@@ -320,7 +333,8 @@ func (e *Executor) AcceptCandidate(leaseID string, accepted bool) {
 	e.Notify()
 }
 
-// Open applies uplink.open for a turn, reply or diagnostic lease.
+// Open applies uplink.open for a turn, reply or diagnostic lease. The afe
+// stream is a valid key only in a session that opted into it.
 func (e *Executor) Open(env proto.Envelope, b proto.UplinkOpen) error {
 	switch b.Reason {
 	case proto.LeaseTurn, proto.LeaseReply, proto.LeaseDiagnostic:
@@ -349,7 +363,7 @@ func (e *Executor) Open(env proto.Envelope, b proto.UplinkOpen) error {
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.micEpoch == 0 || e.leases[b.LeaseID] != nil {
+	if e.micEpoch == 0 || e.leases[b.LeaseID] != nil || (l.want[afeStream] && !e.afe) {
 		return ErrInvalid
 	}
 	l.deadline = e.now() + ttl(b.TTLMs)
@@ -570,10 +584,10 @@ func (e *Executor) activateLocked(l *lease) {
 }
 
 // resolveLocked maps a requested start to a ring index: capture samples to
-// the stream's domain (cells by cell number, reference through the clock
-// fits), rounded down to the stream grid and clipped to the oldest valid
-// index on that grid. clipped is the header-domain start when a backfill
-// start was clipped.
+// the stream's domain (cells by cell number, AFE records by capture period,
+// reference through the clock fits), rounded down to the stream grid and
+// clipped to the oldest valid index on that grid. clipped is the
+// header-domain start when a backfill start was clipped.
 func (e *Executor) resolveLocked(id streamID, req startReq) (start uint64, clipped proto.NullU64) {
 	mapped := true
 	switch {
@@ -583,6 +597,8 @@ func (e *Executor) resolveLocked(id streamID, req startReq) (start uint64, clipp
 		start = req.capture
 	case id == cellsStream:
 		start = req.capture / ema.CellSamples
+	case id == afeStream:
+		start = req.capture / ema.AFESamples
 	default:
 		start, mapped = e.clock.CaptureToReference(req.capture)
 	}
@@ -780,6 +796,16 @@ func (e *Executor) encodeLocked(id streamID, first, n uint64, m ring.Meta, unc u
 			ema.PutCell(payload[i*ema.CellRecordSize:], c)
 		}
 		size = n * ema.CellRecordSize
+	case afeStream:
+		kind = ema.KindAFE
+		recs := e.afes[:n]
+		if e.rings.AFE.Copy(recs, first) != nil {
+			return nil, false
+		}
+		for i, r := range recs {
+			ema.PutAFE(payload[i*ema.AFERecordSize:], r)
+		}
+		size = n * ema.AFERecordSize
 	}
 	h := ema.NewHeader(kind, flags, s.epoch, s.seq, headerIndex(id, first), uint32(n))
 	h.MonoNs = uint64(max(m.MonoNs, 0))
@@ -799,6 +825,8 @@ func (e *Executor) read(id streamID, from, to uint64) (uint64, []ring.Segment) {
 		return e.rings.Mic.Read(from, to, e.segs[:0])
 	case cellsStream:
 		return e.rings.Cells.Read(from, to, e.segs[:0])
+	case afeStream:
+		return e.rings.AFE.Read(from, to, e.segs[:0])
 	default:
 		return e.rings.Ref.Read(from, to, e.segs[:0])
 	}
@@ -810,6 +838,8 @@ func (e *Executor) ringEnd(id streamID) uint64 {
 		return e.rings.Mic.End()
 	case cellsStream:
 		return e.rings.Cells.End()
+	case afeStream:
+		return e.rings.AFE.End()
 	default:
 		return e.rings.Ref.End()
 	}
@@ -821,6 +851,8 @@ func (e *Executor) oldestValid(id streamID) (uint64, bool) {
 		return e.rings.Mic.OldestValid()
 	case cellsStream:
 		return e.rings.Cells.OldestValid()
+	case afeStream:
+		return e.rings.AFE.OldestValid()
 	default:
 		return e.rings.Ref.OldestValid()
 	}
@@ -831,34 +863,46 @@ func grid(id streamID) uint64 {
 	switch id {
 	case micStream:
 		return micGrid
-	case cellsStream:
-		return 1 // one cell = 512 capture samples
+	case cellsStream, afeStream:
+		return 1 // one cell = 512 capture samples; one AFE record = 1280
 	default:
 		return refGrid
 	}
 }
 
 func maxBackfill(id streamID) uint64 {
-	if id == cellsStream {
+	switch id {
+	case cellsStream:
 		return ema.MaxCells
+	case afeStream:
+		return ema.MaxAFERecords
+	default:
+		return ema.MaxUplinkPCMFrames
 	}
-	return ema.MaxUplinkPCMFrames
 }
 
 func maxLive(id streamID) uint64 {
-	if id == cellsStream {
+	switch id {
+	case cellsStream:
 		return liveMaxCells
+	case afeStream:
+		return liveMaxAFE
+	default:
+		return liveMaxSamples
 	}
-	return liveMaxSamples
 }
 
 // headerIndex converts a ring index to the EMA1/JSON sample domain: cells
-// are reported by their first capture sample.
+// and AFE records are reported by their first capture sample.
 func headerIndex(id streamID, idx uint64) uint64 {
-	if id == cellsStream {
+	switch id {
+	case cellsStream:
 		return idx * ema.CellSamples
+	case afeStream:
+		return idx * ema.AFESamples
+	default:
+		return idx
 	}
-	return idx
 }
 
 func ttl(ms int64) int64 {

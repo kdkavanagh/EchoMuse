@@ -20,12 +20,15 @@ import em_session
 from em_arbiter import WakeArbiter
 from em_audio_timeline import (
     FLAG_DIGITAL_SILENCE,
+    AfeRecord,
     Kind,
+    build_afe,
     build_cells,
     build_packet,
 )
 from em_device_link import AckStatus, CommandAck, Envelope, MessageType
-from em_ha_client import HaUnavailable, IntentEnded, RunEnded, TtsReady
+from em_ha_client import HaUnavailable, IntentEnded, RunEnded, SentenceRecognition, TtsReady
+from em_pause_asr import PauseDecode, WyomingServer
 from em_session import ActorDeps, SessionActor
 from em_speech_worker import (
     AsrPayload,
@@ -40,6 +43,7 @@ from em_wake_scorer import ReferenceCandidate
 MIC_EPOCH, REF_EPOCH = 11, 22
 BLOCK = 1_280
 CELL = 512
+PERIOD = 1_280              # one native AFE record (afe_metadata_v1)
 MONO_BASE = 10**12
 SPEECH_DB, QUIET_DB = -30.0, -70.0
 
@@ -49,7 +53,6 @@ def fast_deadlines(monkeypatch):
     monkeypatch.setattr(em_session, "_stream_url", lambda url: url)
     monkeypatch.setattr(em_session, "RESPONSE_STALL_S", 60.0)
     monkeypatch.setattr(em_session, "WAKE_VERIFY_S", 0.3)
-    monkeypatch.setattr(em_session, "REPLY_S", 0.3)
 
 
 def run(coro):
@@ -102,6 +105,7 @@ class FakePlayback:
         self.finished = loop.create_future()
         self.last_progress = None
         self.completed_frames = 0
+        self.first_frame_ns = None
         self.sent_frames = 0
 
     @property
@@ -183,6 +187,17 @@ class FakeHa:
         self.next_run = FakeRun()
         self.handled: list[tuple[str, dict, str | None]] = []
         self.intent_responses: dict[str, object] = {}   # intent name → response dict or exception
+        self.recognizer = False          # HA's sentence matcher answers (its startup probe passed)
+        self.recognitions: dict[str, SentenceRecognition] = {}   # sentence → answer; absent: None
+        self.recognized: list[tuple[str, ...]] = []
+        self.warmups = 0
+
+    async def recognize(self, sentences, device_id, *, timeout):
+        self.recognized.append(tuple(sentences))
+        return [self.recognitions.get(s) for s in sentences]
+
+    async def warm_recognizer(self, device_id, *, timeout):
+        self.warmups += 1
 
     async def handle_intent(self, name, slots, device_id):
         self.handled.append((name, slots, device_id))
@@ -223,7 +238,10 @@ class FakeRegistry:
 
 
 class FakeWorker:
-    """Scripted evidence: `vad(sample)`, `tokens` [(token, emission sample)], verification result."""
+    """Scripted evidence: `vad(sample)`, `tokens` [(token, emission sample)], verification result.
+    With a pause server, `pause_text` = (sample, text) stands from that sample on: the first
+    result there is Kroko's pause decode with the server's answer already in, as the worker
+    reports a fast server; `span_text` is the server's committed-span transcript."""
 
     policy_hash = "post_afe_1"
 
@@ -237,6 +255,10 @@ class FakeWorker:
         self.leases: dict[str, dict] = {}
         self.closed: list[str] = []
         self.verifications: list[str] = []
+        self.pause_servers: list = []
+        self.pause_text: tuple[int, str] | None = None
+        self.span_text = ""
+        self.span_requests = 0
 
     def post(self, lease_id, kind, through, payload, utterance_id=None, stream="mic"):
         self.actor.on_observation(Observation(
@@ -253,10 +275,11 @@ class FakeWorker:
         if self.leases.pop(lease_id, None) is not None:
             self.closed.append(lease_id)
 
-    def open_utterance(self, lease_id, utterance_id, start, trigger, mic, **_):
+    def open_utterance(self, lease_id, utterance_id, start, trigger, mic, *, pause_server=None, **_):
+        self.pause_servers.append(pause_server)
         lease = self.leases[lease_id]
         fed = max(lease["mic_through"] or start, start)
-        lease["utt"] = [utterance_id, start, fed]
+        lease["utt"] = [utterance_id, start, fed, pause_server, False]
         if fed > start:
             self._asr(lease_id)
 
@@ -265,12 +288,19 @@ class FakeWorker:
             self.leases[lease_id]["utt"] = None
 
     def _asr(self, lease_id):
-        utt_id, start, fed = self.leases[lease_id]["utt"]
+        utt = self.leases[lease_id]["utt"]
+        utt_id, start, fed, server = utt[:4]
         emitted = [(t, s) for t, s in self.tokens if start <= s <= fed]
         last = emitted[-1][1] if emitted else start
+        text = decode = None
+        if server is not None and self.pause_text is not None and fed >= self.pause_text[0]:
+            text = self.pause_text[1]
+            if not utt[4]:
+                utt[4] = True
+                decode = PauseDecode(fed, text, 250, None)
         self.post(lease_id, "asr", fed, AsrPayload(
-            tuple(t for t, _ in emitted), tuple(s for _, s in emitted), "", None, (fed - last) // 640, None, False),
-            utt_id)
+            tuple(t for t, _ in emitted), tuple(s for _, s in emitted), "", None, (fed - last) // 640, None,
+            120 if decode is not None else None, pause_text=text, pause_decode=decode), utt_id)
 
     def submit_mic_block(self, lease_id, first, pcm, *, flags=0):
         lease = self.leases[lease_id]
@@ -306,6 +336,10 @@ class FakeWorker:
     async def decode_span(self, pcm):
         return tuple(t for t, _ in self.tokens), tuple(0.0 for _ in self.tokens)
 
+    async def transcribe_span(self, pcm, server):
+        self.span_requests += 1
+        return self.span_text
+
 
 class FakeAlerts:
     def __init__(self):
@@ -324,17 +358,24 @@ class FakeAlerts:
 class Device:
     """Wire-level device: monotonic uplink streams with a shared capture/reference clock."""
 
-    def __init__(self, actor: SessionActor):
+    def __init__(self, actor: SessionActor, afe: bool = False):
         self.actor = actor
         self.seq = {Kind.MIC: 0, Kind.CELLS: 0, Kind.REFERENCE: 0}
         self.pos: dict[Kind, int] = {}
         self.level = lambda s: QUIET_DB
         self.mic_pcm = lambda a, b: np.zeros(b - a, dtype=np.int16)
         self.ref_pcm = None           # None: digital silence
+        self.afe = afe                # the session carries the `afe` stream (afe_metadata_v1)
+        self.send_afe = afe           # False: an opted-in device whose decoder sends nothing
+        self.afe_seq = 0
+        self.afe_pos: int | None = None
+        self.afe_record = lambda start: AfeRecord(start, 10, 0, 0, 0, 0, 0, 0, 0, 216, 210, 1, 2, 70, 0)
 
     def open_streams(self):
-        for stream_id, kind, epoch, fmt in (("mic", 1, MIC_EPOCH, 1), ("cells", 4, MIC_EPOCH, 2),
-                                            ("reference", 2, REF_EPOCH, 1)):
+        streams = [("mic", 1, MIC_EPOCH, 1), ("cells", 4, MIC_EPOCH, 2), ("reference", 2, REF_EPOCH, 1)]
+        if self.afe:
+            streams.append(("afe", 5, MIC_EPOCH, 3))
+        for stream_id, kind, epoch, fmt in streams:
             self.actor.on_message(envelope("stream.open", {
                 "stream_id": stream_id, "epoch": str(epoch), "kind": kind, "sample_rate": 16000,
                 "format": fmt, "reason": "start"}))
@@ -350,11 +391,20 @@ class Device:
         """Send every stream from `start` (or where it stopped) through `until`, 80 ms at a time."""
         for kind in self.seq:
             self.pos.setdefault(kind, start - start % CELL)
+        if self.afe_pos is None:
+            self.afe_pos = start - start % PERIOD
         while self.pos[Kind.MIC] < until:
             a = self.pos[Kind.MIC]
             b = a + BLOCK
             self.actor.on_audio(self._packet(Kind.MIC, a, pcm=self.mic_pcm(a, b)))
             self.pos[Kind.MIC] = b
+            while self.send_afe and self.afe_pos + PERIOD <= b:
+                self.afe_seq += 1
+                self.actor.on_audio(build_packet(
+                    Kind.AFE, epoch=MIC_EPOCH, sequence=self.afe_seq, first_sample=self.afe_pos,
+                    afe=build_afe([self.afe_record(self.afe_pos)]), mono_ns=MONO_BASE + self.afe_pos * 62_500,
+                    uncertainty_us=1_000))
+                self.afe_pos += PERIOD
             c = self.pos[Kind.CELLS]
             n = (b - c) // CELL
             if n:
@@ -375,7 +425,7 @@ class Device:
 
 
 class Harness:
-    def __init__(self, config=None):
+    def __init__(self, config=None, afe=False):
         self.link = FakeLink()
         self.render = FakeRender()
         self.worker = FakeWorker()
@@ -406,16 +456,17 @@ class Harness:
 
         self.actor = SessionActor("dev1", ActorDeps(
             ha=self.ha, worker=self.worker, registry=FakeRegistry(), alerts=self.alerts, arbiter=self.arbiter,
-            config=lambda: self.config, ha_device_id=lambda: "hadev", pipeline_id=pipeline,
+            config=lambda: self.config, ha_device_id=lambda: "hadev", recognizer=lambda: self.ha.recognizer,
+            pipeline_id=pipeline,
             vocabulary=lambda: None, esphome_reply=esphome_reply, persist_turn=persist,
             record_continuation=record_continuation))
         self.worker.actor = self.actor
         self.actor.add_listener(self.events.append)
-        self.device = Device(self.actor)
+        self.device = Device(self.actor, afe)
 
     async def start(self):
         await self.actor.start()
-        self.actor.attach(self.link, self.render)
+        self.actor.attach(self.link, self.render, afe_metadata=self.device.afe)
         self.device.open_streams()
         await self.settle()
 
@@ -455,15 +506,15 @@ S = 48_000                  # candidate support start
 OPEN = S + 12_800           # opening hop end = trigger
 
 
-def candidate(*, producing_sound=False, active_alert=None, lease="L1", cid="C1", chimed=None):
-    hops = [{"end_sample": str(S + 2_560 * k), "raw": 0.95 if k == 5 else 0.3,
+def candidate(*, producing_sound=False, active_alert=None, lease="L1", cid="C1", chimed=None, start=S):
+    hops = [{"end_sample": str(start + 2_560 * k), "raw": 0.95 if k == 5 else 0.3,
              "smoothed": 0.92 if k == 5 else 0.3, "profile": "playback" if producing_sound else "idle"}
             for k in range(1, 6)]
     body = {
         "candidate_id": cid, "lease_id": lease, "capture_epoch": str(MIC_EPOCH), "graph_sha256": "g" * 64,
         "scorer_revision": 3, "profile": hops[0]["profile"], "threshold": 0.9 if not producing_sound else 0.65,
-        "producing_sound": producing_sound, "first_crossing_end": str(OPEN), "support_start": str(S),
-        "mono_ns": "1", "active_alert": active_alert, "hops": hops}
+        "producing_sound": producing_sound, "first_crossing_end": str(start + 12_800),
+        "support_start": str(start), "mono_ns": "1", "active_alert": active_alert, "hops": hops}
     if chimed is not None:
         body["chimed"] = chimed
     return envelope("wake.candidate", body, message_id=f"msg-{cid}")
@@ -644,6 +695,8 @@ def test_a_wake_turn_records_each_stage_what_asr_heard_what_ha_transcribed_and_w
         await h.settle()
         await h.feed(S - 4_800 - 20_000, OPEN + 60_000)
         await h.wait_for(lambda: h.render.streams)
+        # Its first frame played 60,000 samples past OPEN on the Dot's clock (MONO_BASE + sample × 62.5 µs).
+        h.render.streams[0].first_frame_ns = MONO_BASE + (OPEN + 60_000) * 62_500
         h.render.streams[0].finish("drained")
         await h.wait_for(lambda: h.rows)
         row = h.rows[0]
@@ -660,8 +713,366 @@ def test_a_wake_turn_records_each_stage_what_asr_heard_what_ha_transcribed_and_w
         assert row["first_audio_ms"] is not None and 0 <= row["first_audio_ms"] <= row["total_ms"]
         trace = json.loads(row["decision_trace"])
         assert trace["turn_id"] == row["turn_uuid"] and trace["first_audio_ms"] == row["first_audio_ms"]
+        # End of the last word (the commit boundary) → that first frame, both on the Dot's clock.
+        boundary = next(e["boundary"] for e in trace["utterance"]["endpoint"] if e["event"] == "commit")
+        assert row["response_latency_ms"] == round((OPEN + 60_000 - boundary) / 16)
         await h.actor.close()
     run(main())
+
+
+@pytest.mark.parametrize("recognizer", [True, False])
+def test_text_home_assistant_recognizes_as_complete_ends_after_the_short_pause(recognizer):
+    async def main():
+        h = Harness()
+        h.ha.recognizer = recognizer
+        h.ha.recognitions = {"what time is it": SentenceRecognition(True, False, "trigger", "what time is it")}
+        question = (OPEN + 3_200, OPEN + 11_392)
+        h.worker.vad = speech((S, OPEN - 512), question)
+        h.device.level = levels((S, OPEN - 512), question)
+        h.worker.tokens = [("▁OPHELIA", OPEN - 1_800), ("▁WHAT", OPEN + 4_000), ("▁TIME", OPEN + 6_000),
+                           ("▁IS", OPEN + 8_000), ("▁IT", OPEN + 10_000)]
+        h.ha.stt_text = "Ophelia, what time is it?"
+        h.ha.next_run = FakeRun([IntentEnded("It is noon.", "conv-1", False, "query_answer", True),
+                                 TtsReady("http://ha/tts/1", False), RunEnded()])
+        await h.start()
+        h.actor.on_message(candidate())
+        await h.settle()
+        assert h.ha.warmups == (1 if recognizer else 0)    # warmed as the candidate opened
+        await h.feed(S - 4_800 - 20_000, OPEN + 60_000)
+        await h.wait_for(lambda: h.render.streams)
+        h.render.streams[0].finish("drained")
+        await h.wait_for(lambda: h.rows)
+        row = h.rows[0]
+        answers = json.loads(row["decision_trace"])["utterance"]["recognizer"]
+        if recognizer:
+            # Asked about the wake-cut prefix with the probe word; nothing extends it.
+            assert ("what time is it", "what time is it zqxj") in h.ha.recognized
+            assert answers[-1]["text"] == "what time is it" and answers[-1]["klass"] == "complete"
+            assert row["endpoint_class"] == "complete" and 608 <= row["endpoint_ms"] < 1_792
+        else:
+            assert h.ha.recognized == [] and answers == []
+            assert row["endpoint_class"] == "unknown" and row["endpoint_ms"] >= 1_792
+        await h.actor.close()
+    run(main())
+
+
+PAUSE_SERVER = {"engine": "wyoming", "host": "stt", "port": 10300, "model": "", "language": "en"}
+MISHEARD = [("▁FULL", OPEN - 1_800), ("▁FILLY", OPEN - 1_200), ("▁ATE", OPEN - 600), ("▁WHAT", OPEN + 4_000),
+            ("▁TIME", OPEN + 6_000), ("▁IS", OPEN + 8_000), ("▁IT", OPEN + 10_000)]
+
+
+@pytest.mark.parametrize("engine", ["wyoming", "kroko"])
+def test_the_pause_servers_words_decide_when_kroko_mishears_the_wake_word(engine):
+    """Kroko's "full filly ate what time is it" is unknown to HA; the server's "Ophelia, what
+    time is it?" cuts to "what time is it", which HA recognizes, so the short pause applies."""
+    async def main():
+        h = Harness(config={"pauseAsr": {**PAUSE_SERVER, "engine": engine}})
+        h.ha.recognizer = True
+        h.ha.recognitions = {"what time is it": SentenceRecognition(True, False, "trigger", "what time is it")}
+        question = (OPEN + 3_200, OPEN + 11_392)
+        h.worker.vad = speech((S, OPEN - 512), question)
+        h.device.level = levels((S, OPEN - 512), question)
+        h.worker.tokens = MISHEARD
+        h.worker.pause_text = (question[1] + 10_240, "Ophelia, what time is it?")   # 320 ms after the pause
+        h.ha.next_run = FakeRun([IntentEnded("It is noon.", "conv-1", False, "query_answer", True),
+                                 TtsReady("http://ha/tts/1", False), RunEnded()])
+        await h.start()
+        h.actor.on_message(candidate())
+        await h.feed(S - 4_800 - 20_000, OPEN + 60_000)
+        await h.wait_for(lambda: h.render.streams)
+        h.render.streams[0].finish("drained")
+        await h.wait_for(lambda: h.rows)
+        row = h.rows[0]
+        utterance = json.loads(row["decision_trace"])["utterance"]
+        if engine == "wyoming":
+            assert h.worker.pause_servers == [WyomingServer("stt", 10300, "", "en")]
+            assert utterance["stable_prefix"] == "what time is it"
+            [pause] = utterance["pauses"]
+            assert (pause["server"]["text"], pause["server"]["judged"]) == ("Ophelia, what time is it?",
+                                                                            "what time is it")
+            commit = next(e for e in utterance["endpoint"] if e["event"] == "commit")
+            assert commit["source"] == "server"
+            assert row["endpoint_class"] == "complete" and 608 <= row["endpoint_ms"] < 1_792
+            assert row["policy_hash"] == "post_afe_1+wyoming:default"
+        else:
+            assert h.worker.pause_servers == [None] and utterance["pauses"] == []
+            assert utterance["stable_prefix"] == "full filly ate what time is it"
+            assert row["endpoint_class"] == "unknown" and row["endpoint_ms"] >= 1_792
+            assert row["policy_hash"] == "post_afe_1"
+        await h.actor.close()
+    run(main())
+
+
+@pytest.mark.parametrize("span_text, terminal", [
+    ("Ophelia, what time is it?", "completed"),
+    ("Ophelia, what time is it in Paris?", "retry"),     # the span holds more than the committed text
+])
+def test_a_route_b_commit_on_the_servers_words_is_re_decoded_by_the_server(span_text, terminal):
+    """After the pause the server's words stand; quieter speech (a TV) follows, so route B
+    commits the complete command, and its re-decode must use the same server."""
+    async def main():
+        h = Harness(config={"pauseAsr": PAUSE_SERVER})
+        h.ha.recognizer = True
+        h.ha.recognitions = {"what time is it": SentenceRecognition(True, False, "trigger", "what time is it")}
+        question = (OPEN + 3_200, OPEN + 11_392)
+        tv = (question[1] + 6_400, OPEN + 80_000)
+        h.worker.vad = speech((S, OPEN - 512), question, tv)
+        loud = levels((S, OPEN - 512), question)
+        h.device.level = lambda s: SPEECH_DB - 20 if tv[0] <= s < tv[1] else loud(s)
+        h.worker.tokens = MISHEARD
+        h.worker.pause_text = (question[1] + 10_240, "Ophelia, what time is it?")
+        h.worker.span_text = span_text
+        h.ha.next_run = FakeRun([IntentEnded("It is noon.", "conv-1", False, "query_answer", True),
+                                 TtsReady("http://ha/tts/1", False), RunEnded()])
+        await h.start()
+        h.actor.on_message(candidate())
+        await h.feed(S - 4_800 - 20_000, OPEN + 60_000)
+        if terminal == "completed":
+            await h.wait_for(lambda: h.render.streams)
+            h.render.streams[0].finish("drained")
+        await h.wait_for(lambda: h.rows)
+        row = h.rows[0]
+        assert (row["commit_route"], row["terminal_reason"]) == ("B", terminal)
+        assert h.worker.span_requests == 1
+        await h.actor.close()
+    run(main())
+
+
+# --- native AFE evidence (afe_metadata_v1) --------------------------------------------------
+
+# Turn-row columns that record a decision (or what it acted on), not wall-clock timing or ids.
+DECISION_COLUMNS = ("trigger", "wake_model", "wake_score", "wake_threshold", "outcome", "asr_text", "stt_raw",
+                    "stt_text", "response_text", "response_type", "intent_local", "playback_reason", "audio_ms",
+                    "endpoint_ms", "endpoint_class", "wake_model_sha256", "policy_hash", "wake_attribution",
+                    "reference_coverage", "commit_route", "terminal_reason", "conversation_id", "reply_to",
+                    "continuation")
+
+
+async def wake_question_playing(h: Harness) -> None:
+    """A wake question committed and answered, its response playing for 2.5 s of capture."""
+    question = (OPEN + 3_200, OPEN + 11_392)
+    h.worker.vad = speech((S, OPEN - 512), question)
+    h.device.level = levels((S, OPEN - 512), question)
+    h.worker.tokens = [("▁OPHELIA", OPEN - 1_800), ("▁WHAT", OPEN + 4_000), ("▁TIME", OPEN + 6_000),
+                       ("▁IS", OPEN + 8_000), ("▁IT", OPEN + 10_000)]
+    h.ha.stt_text = "Ophelia, what time is it?"
+    h.ha.next_run = FakeRun([IntentEnded("It is noon.", "conv-1", False, "query_answer", True),
+                             TtsReady("http://ha/tts/1", False), RunEnded()])
+    await h.start()
+    h.actor.on_message(candidate())
+    await h.settle()
+    await h.feed(S - 4_800 - 20_000, OPEN + 60_000)
+    await h.wait_for(lambda: h.render.streams)
+    await h.feed(OPEN + 60_000, OPEN + 100_000)
+
+
+async def wake_question_turn(h: Harness) -> dict:
+    await wake_question_playing(h)
+    h.render.streams[0].finish("drained")
+    await h.wait_for(lambda: h.rows)
+    return h.rows[0]
+
+
+def _decisions(h: Harness, row: dict) -> dict:
+    trace = json.loads(row["decision_trace"])
+    utterance = {k: v for k, v in trace["utterance"].items() if k != "utterance_id"}
+    utterance["endpoint"] = [{k: v for k, v in e.items() if k != "commit_id"} for e in utterance["endpoint"]]
+    return {"row": {k: row.get(k) for k in DECISION_COLUMNS}, "utterance": utterance,
+            "terminals": h.terminals(), "cues": h.cues(), "intents": h.ha.intents, "stt": h.ha.stt_calls,
+            "trace": {k: trace[k] for k in ("trigger", "profile", "producing_sound", "chimed", "rule", "hops",
+                                            "terminal")}}
+
+
+def test_an_opted_in_wake_turn_records_native_afe_evidence_and_decides_exactly_as_without_it():
+    async def main(afe: bool):
+        h = Harness(afe=afe)
+        row = await wake_question_turn(h)
+        await h.actor.close()
+        return h, row
+
+    plain, plain_row = run(main(False))
+    native, native_row = run(main(True))
+    assert _decisions(native, native_row) == _decisions(plain, plain_row)
+
+    # Without the capability the evidence is unavailable: SQL NULL, null in the trace.
+    assert plain_row["afe_evidence"] is None and json.loads(plain_row["decision_trace"])["afe_evidence"] is None
+
+    ev = json.loads(native_row["afe_evidence"])
+    assert json.loads(native_row["decision_trace"])["afe_evidence"] == ev
+    assert ev["support_start"] == S and ev["playback_onset"] is None      # nothing played: no rise
+    pre, wake, utt = ev["pre"], ev["wake"], ev["utterance"]
+    assert (pre["start"], pre["end"]) == (S - 16_000, S)
+    assert (wake["start"], wake["end"]) == (S, OPEN)                      # no candidate_end: the opening hop
+    assert wake["periods_expected"] == wake["periods_received"] == -(-OPEN // PERIOD) - S // PERIOD
+    assert wake["frames"] == wake["frames_expected"] and wake["rms_max_db"] == 216 - 256
+    assert round((utt["end"] - utt["start"]) / 16) == native_row["audio_ms"]   # the committed span
+    assert utt["frames"] > 0 and utt["vad_max"] == 0.25 and utt["volume"] == 70
+
+    # The per-period series behind the summaries: its own column, never the logged trace. It runs
+    # on through the response, to the last record the device sent, on an afe-only `turn` lease
+    # opened at the commit before the committed lease closed (not one period is missing), and
+    # closed once the turn had ended. Without Save utterances no mic follows the commit.
+    assert plain_row["afe_series"] is None and "afe_series" not in json.loads(native_row["decision_trace"])
+    series = json.loads(native_row["afe_series"])
+    assert series["start"] == (S - 16_000) // PERIOD * PERIOD
+    assert series["start"] + len(series["frames"]) * PERIOD == native.device.afe_pos
+    assert None not in series["frames"]
+    assert series["support"] == [S, OPEN] and series["utterance"] == [utt["start"], utt["end"]]
+    uplink = [(t, b) for t, b, _ in native.link.sent if t.startswith("uplink.")]
+    [(opened, body)] = [(i, b) for i, (t, b) in enumerate(uplink) if t == "uplink.open"]
+    assert (body["reason"], body["owner"], list(body["streams"])) == ("turn", native_row["turn_uuid"], ["afe"])
+    assert opened < uplink.index(("uplink.close", {"lease_id": "L1", "reason": "committed"}))
+    assert ("uplink.close", {"lease_id": body["lease_id"], "reason": "closed"}) in uplink
+    assert plain.link.of("uplink.open") == []        # without the capability nothing follows the commit
+    assert series["recording"] is None
+
+    # The processing, in order on the same timeline: the endpoint wait in sample time, then the
+    # controller's stages, the spoken answer's audio ready until audible, then playing.
+    stages = series["stages"]
+    assert set(stages) == {"endpoint", "stt", "intent", "tts", "reply"}
+    assert round((stages["endpoint"][1] - stages["endpoint"][0]) / 16) == native_row["endpoint_ms"]
+    assert stages["endpoint"][0] < utt["end"] <= stages["endpoint"][1]
+    assert stages["endpoint"][1] <= stages["stt"][0] <= stages["stt"][1] <= stages["intent"][0]
+    assert stages["intent"][0] <= stages["intent"][1] and stages["intent"][1] <= stages["tts"][1]
+    assert stages["tts"][1] == stages["reply"][0] <= stages["reply"][1]
+
+
+def test_privacy_mute_during_the_response_ends_its_lease_and_erases_what_it_carried(monkeypatch):
+    saved = {}
+    monkeypatch.setattr(em_session.em_recordings, "save",
+                        lambda device_id, row_id, pcm, kind=em_session.em_recordings.RecordingKind.UTTERANCE:
+                        saved.__setitem__(str(kind), pcm))
+
+    async def main():
+        h = Harness(config={"saveUtterances": True}, afe=True)
+        await wake_question_playing(h)
+        h.actor.on_message(envelope("privacy.changed", {"muted": True, "capture_epoch": None, "physical_seq": 2}))
+        await h.wait_for(lambda: h.rows)
+        await h.actor.close()
+        return h, h.rows[0]
+
+    h, row = run(main())
+    assert row["terminal_reason"] == "muted"
+    # The series and the turn recording keep only what the committed lease carried: the response's
+    # records and mic went with the mute, which ended its lease on the device, so the controller
+    # closed nothing.
+    utt = json.loads(row["afe_evidence"])["utterance"]
+    series = json.loads(row["afe_series"])
+    assert series["start"] + len(series["frames"]) * PERIOD == -(-max(OPEN, utt["end"]) // PERIOD) * PERIOD
+    [body] = [b for b, _ in h.link.of("uplink.open")]
+    assert [b for b, _ in h.link.of("uplink.close") if b["lease_id"] == body["lease_id"]] == []
+    mic = int(body["streams"]["mic"])
+    a, b = series["recording"]
+    assert mic <= b < mic + CELL < h.device.pos[Kind.MIC]      # the capture, up to the response lease's start
+    assert len(saved["turn"]) == 2 * (b - a)
+
+
+def test_a_response_lease_closes_at_its_cap_even_while_the_response_plays(monkeypatch):
+    monkeypatch.setattr(em_session, "RESPONSE_LEASE_MAX_S", 0.2)
+
+    async def main():
+        h = Harness(afe=True)
+        await wake_question_playing(h)
+        await asyncio.sleep(0.3)
+        await h.settle()
+        [lease] = [b["lease_id"] for b, _ in h.link.of("uplink.open")]
+        closed_while_playing = {"lease_id": lease, "reason": "closed"} in [b for b, _ in h.link.of("uplink.close")]
+        h.render.streams[0].finish("drained")
+        await h.wait_for(lambda: h.rows)
+        await h.actor.close()
+        return closed_while_playing, h.rows[0]
+
+    closed_while_playing, row = run(main())
+    assert closed_while_playing and row["terminal_reason"] == "completed"
+    assert json.loads(row["afe_series"])["frames"]
+
+
+def test_the_afe_series_places_each_saved_recording_on_its_timeline_sample_for_sample(monkeypatch):
+    saved = {}
+
+    def save_recording(device_id, row_id, pcm, kind=em_session.em_recordings.RecordingKind.UTTERANCE):
+        saved[str(kind)] = pcm
+        return None                         # no file name: nothing is attached to the row
+
+    def save_wake(device_id, row_id, pcm):
+        saved["wake"] = pcm
+        return None
+
+    monkeypatch.setattr(em_session.em_wakeclips, "save", save_wake)
+    monkeypatch.setattr(em_session.em_recordings, "save", save_recording)
+
+    def ramp(a, b):                         # each sample names its capture index
+        return (np.arange(a, b) % 32_749).astype(np.int16)
+
+    async def main():
+        h = Harness(config={"saveWakeClips": True, "saveUtterances": True}, afe=True)
+        h.device.mic_pcm = ramp
+        row = await wake_question_turn(h)
+        await h.actor.close()
+        return h, row
+
+    h, row = run(main())
+    series = json.loads(row["afe_series"])
+    # The dashboard's playhead: WAV sample k is capture sample clip[0] + k.
+    assert series["wake_clip"] == [S - em_session.PREROLL, OPEN]         # support −300 ms … the opening hop
+    assert series["audio_clip"] == series["utterance"]                   # the committed span, as sent to STT
+    for key, kind in (("wake_clip", "wake"), ("audio_clip", "utterance")):
+        a, b = series[key]
+        assert len(saved[kind]) == 2 * (b - a)
+    # The turn recording: the candidate lease's mic from its start, then the response lease's mic
+    # from where it stopped, through the last sample the device sent — no sample lost or repeated
+    # at the seam. The response lease took the mic because Save utterances is on.
+    [body] = [b for b, _ in h.link.of("uplink.open")]
+    assert sorted(body["streams"]) == ["afe", "mic"]
+    a, b = series["recording"]
+    assert (a, b) == ((S - 4_800) // CELL * CELL, h.device.pos[Kind.MIC])
+    assert saved["turn"] == ramp(a, b).tobytes()
+
+
+def test_an_opted_in_candidate_lease_mirrors_the_afe_stream_from_its_reference_start():
+    async def main(afe: bool):
+        h = Harness(afe=afe)
+        await h.start()
+        h.actor.on_message(candidate())
+        await h.settle()
+        streams = dict(h.actor.uplink.leases.get("L1").streams)
+        await h.actor.close()
+        return streams
+
+    mic = (S - 4_800) // CELL * CELL
+    assert run(main(True))["afe"] == (mic - 40_000) // PERIOD * PERIOD
+    assert "afe" not in run(main(False))
+
+
+@pytest.mark.parametrize("afe, sends, expected", [
+    (False, False, None),                                 # unavailable: the device lacks the capability
+    (True, False, "no data"),                             # opted in, but nothing arrived
+    (True, True, "summary"),
+])
+def test_a_rejected_candidate_row_carries_its_wake_evidence(afe, sends, expected):
+    async def main():
+        h = Harness(afe=afe)
+        h.device.send_afe = sends
+        h.worker.verification = "fail"
+        assert await producing_sound_case(h) == ["unverified_wake"]
+        await h.wait_for(lambda: h.rows)
+        await h.actor.close()
+        return h.rows[0]
+
+    row = run(main())
+    assert row["terminal_reason"] == "unverified_wake"
+    if expected is None:
+        assert row["afe_evidence"] is None and row["afe_series"] is None
+        return
+    ev = json.loads(row["afe_evidence"])
+    assert ev["support_start"] == S and ev["utterance"] is None
+    if expected == "no data":
+        assert ev["pre"] is None and ev["wake"] is None and ev["playback_onset"] is None
+        assert row["afe_series"] is None
+    else:
+        assert ev["wake"]["start"] == S and ev["wake"]["frames"] > 0 and ev["pre"]["end"] == S
+        series = json.loads(row["afe_series"])
+        assert series["support"][0] == S and series["utterance"] is None and 10 in series["frames"]
 
 
 # --- button turns and Home Assistant --------------------------------------------------------------
@@ -699,6 +1110,24 @@ def test_a_button_turn_opens_its_own_lease_from_the_press_minus_300_ms():
         assert h.actor.state == "ARMED" and h.render.local == []
         await h.actor.close()
     run(main())
+
+
+@pytest.mark.parametrize("afe", [False, True])
+def test_a_button_turn_lease_requests_afe_from_its_reference_start_only_when_opted_in(afe):
+    async def main():
+        h = Harness(afe=afe)
+        await h.start()
+        h.actor.button_turn(button())
+        await h.settle()
+        streams = h.link.of("uplink.open")[0][0]["streams"]
+        await h.actor.close()
+        return streams
+
+    streams = run(main())
+    if afe:
+        assert streams["afe"] == str(int(streams["reference"]) // PERIOD * PERIOD)
+    else:
+        assert "afe" not in streams
 
 
 def test_a_timer_cancel_home_assistant_may_have_received_is_never_resent():
@@ -816,7 +1245,7 @@ def test_cancel_the_timer_with_several_running_asks_which_and_the_reply_picks_it
         base = PRESS + 50_000
         await h.feed(base, base + 24_000)
         h.render.streams[0].finish("drained")
-        await h.wait_for(lambda: h.actor.state == "EXPECT_REPLY")
+        await h.wait_for(lambda: h.actor.state == "ARMED")
         answer = (base + 26_112, base + 35_840)
         h.worker.vad = speech(answer)
         h.device.level = levels(answer)
@@ -857,9 +1286,10 @@ def reply_focus(h: Harness, owner: str) -> list[dict]:
     return [b for b, _ in h.link.of("focus.acquire") if b["owner"] == owner and b["focus"] == "dialog_input"]
 
 
-def test_ha_turn_with_continue_conversation_opens_a_reply_window_that_times_out():
+@pytest.mark.parametrize("wake_sound", [True, False])
+def test_ha_turn_with_continue_conversation_opens_a_reply_turn_that_ends_silently_without_input(wake_sound):
     async def main():
-        h = Harness()
+        h = Harness(config={"wakeSound": wake_sound})
         h.ha.next_run = FakeRun([
             IntentEnded("Which TV?", "conv-1", True, "action_done", False),
             TtsReady("http://ha/tts/1", False), RunEnded()])
@@ -874,19 +1304,176 @@ def test_ha_turn_with_continue_conversation_opens_a_reply_window_that_times_out(
         # dialog output, waits for the drain.
         assert not response.done and reply_focus(h, reply_open[0]["owner"]) == []
         response.finish("drained")
-        await h.wait_for(lambda: h.actor.state == "EXPECT_REPLY")
+        # Listening (the ring and HA's Voice state) from the drain on.
+        await h.wait_for(lambda: h.actor.state == "ARMED")
         assert len(reply_focus(h, reply_open[0]["owner"])) == 1
+        base = PRESS + 50_000
+        await h.feed(base, base + 4_000)            # no audio reached the reply lease before the drain
+        # The reply turn opens on the lease's first audio, cued like a wake: no wake word needed.
+        assert h.render.local == ([("earcon", "builtin:wake_chime")] if wake_sound else [])
         await h.wait_for(lambda: h.rows)
         row = h.rows[0]
         assert row["terminal_reason"] == "completed" and row["commit_route"] == "A"
         assert row["continuation"] == "pending" and row["playback_reason"] == "drained"
         assert row["conversation_id"] == "conv-1" and row["reply_to"] is None
-        await h.wait_for(lambda: h.actor.state == "IDLE", timeout=3)
-        assert h.terminals()[-1] == "reply_timeout"
+        await h.feed(base + 4_000, base + 4_000 + 7 * 16_000 + 4_000)
+        await h.wait_for(lambda: h.actor.state == "IDLE")
+        assert h.terminals()[-1] == "no_input" and h.cues() == []    # a silent window has no cue
         closes = [b for b, _ in h.link.of("uplink.close") if b["lease_id"] == reply_open[0]["lease_id"]]
         assert closes == [{"lease_id": reply_open[0]["lease_id"], "reason": "closed"}]
-        assert len(h.ha.intents) == 1                      # a silent window never dispatches
-        await h.wait_for(lambda: h.rows[0]["continuation"] == "reply_timeout")
+        assert len(h.ha.intents) == 1 and len(h.ha.stt_calls) == 1  # a silent window never dispatches
+        await h.wait_for(lambda: len(h.rows) == 2 and h.rows[0]["continuation"] == "reply_timeout")
+        reply = h.rows[1]
+        assert reply["trigger"] == "reply" and reply["terminal_reason"] == "no_input"
+        assert reply["reply_to"] == row["turn_uuid"] and reply["turn_uuid"] == reply_open[0]["owner"]
+        assert json.loads(reply["decision_trace"])["utterance"]["endpoint"][-1]["reason"] == "no_input"
+        await h.actor.close()
+    run(main())
+
+
+async def question_drained(h: Harness) -> int:
+    """Button turn → HA asks "Which TV?" (conv-1); its quiet tail plays, it drains, and the reply
+    turn opens. Returns the reply's trigger (the mic frontier at the drain)."""
+    h.ha.next_run = FakeRun([
+        IntentEnded("Which TV?", "conv-1", True, "action_done", False),
+        TtsReady("http://ha/tts/1", False), RunEnded()])
+    await button_turn(h, PRESS + 50_000)
+    await h.wait_for(lambda: h.render.streams)
+    base = PRESS + 50_000
+    await h.feed(base, base + 24_000)                    # quiet question tail
+    h.render.streams[0].finish("drained")
+    await h.wait_for(lambda: h.actor.state == "ARMED")
+    return h.actor._turn.utterance.spec.trigger
+
+
+def skip_mic(h: Harness, samples: int) -> int:
+    """A capture gap: the next mic (and reference) packet starts `samples` later. Returns where
+    the gap starts."""
+    start = h.device.pos[Kind.MIC]
+    h.device.pos[Kind.MIC] = start + samples
+    h.device.pos[Kind.REFERENCE] += samples
+    return start
+
+
+def test_a_gap_before_the_answer_does_not_end_the_reply_window_and_the_answer_after_it_commits():
+    async def main():
+        h = Harness()
+        drain = await question_drained(h)
+        await h.feed(drain, drain + 16_000)                   # a quiet second of the window
+        gap = skip_mic(h, 2_560)                              # 160 ms of capture lost
+        answer = (drain + 32_256, drain + 41_984)
+        h.worker.vad = speech(answer)
+        h.device.level = levels(answer)
+        h.worker.tokens = [("▁LIVING", answer[0] + 3_000), ("▁ROOM", answer[0] + 6_000)]
+        h.ha.stt_text = "The living room."
+        h.ha.next_run = FakeRun([IntentEnded("Turned off.", "conv-1", False, "action_done", False),
+                                 TtsReady("http://ha/tts/2", False), RunEnded()])
+        await h.feed(gap, drain + 100_000)
+        await h.wait_for(lambda: len(h.render.streams) == 2)
+        assert h.ha.intents[1] == ("The living room.", "conv-1")
+        assert "interrupted" not in h.terminals() and h.cues() == []
+        h.render.streams[1].finish("drained")
+        await h.wait_for(lambda: len(h.rows) == 2)
+        question, reply = h.rows
+        assert question["continuation"] == "answered" and reply["terminal_reason"] == "completed"
+        trace = json.loads(reply["decision_trace"])
+        assert len(trace["reopened"]) == 1                    # the utterance before the gap
+        assert trace["utterance"]["start"] >= gap + 2_560 and trace["utterance"]["trigger"] >= gap + 2_560
+        await h.actor.close()
+    run(main())
+
+
+def test_a_silent_reply_window_with_a_gap_still_closes_no_input_at_its_original_end_without_a_cue():
+    async def main():
+        h = Harness()
+        drain = await question_drained(h)
+        await h.feed(drain, drain + 32_000)
+        gap = skip_mic(h, 2_560)
+        await h.feed(gap, drain + 7 * 16_000 + 8_000)
+        await h.wait_for(lambda: h.actor.state == "IDLE")
+        assert h.terminals()[-1] == "no_input" and "interrupted" not in h.terminals()
+        assert h.cues() == [] and len(h.ha.intents) == 1
+        await h.wait_for(lambda: len(h.rows) == 2 and h.rows[0]["continuation"] == "reply_timeout")
+        trace = json.loads(h.rows[1]["decision_trace"])
+        close = trace["utterance"]["endpoint"][-1]
+        assert close["reason"] == "no_input" and len(trace["reopened"]) == 1
+        # The window's own end (the drain + 7 s), not 7 s after the gap.
+        assert drain + 7 * 16_000 <= close["at"] < drain + 7 * 16_000 + BLOCK
+        await h.actor.close()
+    run(main())
+
+
+def test_a_reply_turn_whose_mic_stops_closes_no_input_by_the_wall_clock(monkeypatch):
+    monkeypatch.setattr(em_session, "REPLY_WALL_S", 0.5)
+
+    async def main():
+        h = Harness()
+        drain = await question_drained(h)
+        await h.feed(drain, drain + 8_000)                    # half a second of the window, then nothing
+        assert h.actor._turn is not None and h.actor._turn.trigger == "reply"
+        await h.wait_for(lambda: h.actor.state == "IDLE", timeout=3)
+        assert h.terminals()[-1] == "no_input" and h.cues() == [] and len(h.ha.intents) == 1
+        await h.wait_for(lambda: len(h.rows) == 2 and h.rows[0]["continuation"] == "reply_timeout")
+        assert h.rows[1]["trigger"] == "reply" and h.rows[1]["terminal_reason"] == "no_input"
+        await h.actor.close()
+    run(main())
+
+
+def test_a_reply_window_that_never_gets_mic_closes_no_input_by_the_wall_clock(monkeypatch):
+    monkeypatch.setattr(em_session, "REPLY_WALL_S", 0.5)
+
+    async def main():
+        h = Harness()
+        await h.start()
+        announce = asyncio.create_task(h.actor.announce("http://ha/announce", preannounce_url=None,
+                                                        start_conversation=True))
+        await h.wait_for(lambda: h.render.streams)
+        reply_open = [b for b, _ in h.link.of("uplink.open") if b["reason"] == "reply"]
+        h.render.streams[0].finish("drained")                 # no mic ever reached the reply lease
+        await asyncio.wait_for(announce, 2)
+        assert h.actor.state == "ARMED" and h.actor._turn is None
+        await h.wait_for(lambda: h.actor.state == "IDLE", timeout=3)
+        assert h.terminals()[-1] == "no_input" and h.cues() == [] and not h.actor.turn_active
+        closes = [b for b, _ in h.link.of("uplink.close") if b["lease_id"] == reply_open[0]["lease_id"]]
+        assert closes == [{"lease_id": reply_open[0]["lease_id"], "reason": "closed"}]
+        await h.actor.close()
+    run(main())
+
+
+def test_a_wake_during_a_silent_reply_window_takes_the_question_over_in_its_conversation():
+    async def main():
+        h = Harness()
+        h.ha.next_run = FakeRun([
+            IntentEnded("Which TV?", "conv-1", True, "action_done", False),
+            TtsReady("http://ha/tts/1", False), RunEnded()])
+        await button_turn(h, PRESS + 50_000)
+        await h.wait_for(lambda: h.render.streams)
+        base = PRESS + 50_000
+        await h.feed(base, base + 24_000)                    # quiet question tail
+        h.render.streams[0].finish("drained")
+        await h.feed(base + 24_000, base + 32_000)           # the reply turn listens
+        assert h.actor.state == "ARMED" and h.actor._turn.trigger == "reply"
+        start = base + 40_000                                 # "Ophelia, what time is it?"
+        open_ = start + 12_800
+        question = (open_ + 3_200, open_ + 11_392)
+        h.worker.vad = speech((start, open_ - 512), question)
+        h.device.level = levels((start, open_ - 512), question)
+        h.worker.tokens = [("▁OPHELIA", open_ - 1_800), ("▁WHAT", open_ + 4_000), ("▁TIME", open_ + 6_000),
+                           ("▁IS", open_ + 8_000), ("▁IT", open_ + 10_000)]
+        h.ha.stt_text = "Ophelia, what time is it?"
+        h.ha.next_run = FakeRun([IntentEnded("It is noon.", "conv-1", False, "query_answer", True),
+                                 TtsReady("http://ha/tts/2", False), RunEnded()])
+        h.actor.on_message(candidate(start=start))
+        await h.settle()
+        await h.feed(base + 32_000, open_ + 60_000)
+        await h.wait_for(lambda: len(h.render.streams) == 2)
+        assert h.ha.intents[1] == ("what time is it?", "conv-1")
+        h.render.streams[1].finish("drained")
+        await h.wait_for(lambda: len(h.rows) == 3 and h.rows[0]["continuation"] == "wake")
+        question_row, reply, wake = h.rows
+        assert reply["trigger"] == "reply" and reply["terminal_reason"] == "superseded"
+        assert wake["trigger"] == "wake" and wake["conversation_id"] == "conv-1"
+        assert wake["reply_to"] == question_row["turn_uuid"]
         await h.actor.close()
     run(main())
 
@@ -902,7 +1489,7 @@ def test_an_answer_to_home_assistants_question_is_sent_on_in_its_conversation_wi
         base = PRESS + 50_000
         await h.feed(base, base + 24_000)                    # quiet question tail
         h.render.streams[0].finish("drained")
-        await h.wait_for(lambda: h.actor.state == "EXPECT_REPLY")
+        await h.wait_for(lambda: h.actor.state == "ARMED")
         answer = (base + 26_112, base + 35_840)
         h.worker.vad = speech(answer)
         h.device.level = levels(answer)
@@ -919,6 +1506,106 @@ def test_an_answer_to_home_assistants_question_is_sent_on_in_its_conversation_wi
         assert question["continuation"] == "answered"
         assert reply["trigger"] == "reply" and reply["reply_to"] == question["turn_uuid"]
         assert reply["conversation_id"] == "conv-1" and reply["continuation"] is None
+        # HA hears the answer from 300 ms before its first cell (156,160), not the chime and
+        # the wait from the utterance start (the drain − 780 ms): 151,360 … boundary + 192 ms.
+        assert reply["audio_ms"] == (165_888 + 3_072 - (156_160 - 4_800)) // 16
+        await h.actor.close()
+    run(main())
+
+
+def test_an_answer_already_underway_when_the_question_drains_gets_no_chime_over_it():
+    async def main():
+        h = Harness()
+        h.ha.next_run = FakeRun([
+            IntentEnded("Which TV?", "conv-1", True, "action_done", False),
+            TtsReady("http://ha/tts/1", False), RunEnded()])
+        await button_turn(h, PRESS + 50_000)
+        await h.wait_for(lambda: h.render.streams)
+        base = PRESS + 50_000
+        answer = (base + 26_112, base + 35_840)
+        h.worker.vad = speech(answer)
+        h.device.level = levels(answer)
+        h.worker.tokens = [("▁LIVING", base + 29_000), ("▁ROOM", base + 32_000)]
+        h.ha.stt_text = "The living room."
+        h.ha.next_run = FakeRun([IntentEnded("Turned off.", "conv-1", False, "action_done", False),
+                                 TtsReady("http://ha/tts/2", False), RunEnded()])
+        # The answer starts over the question's last 368 ms: too short for an early answer,
+        # but its onset is complete in the retained audio by the drain.
+        await h.feed(base, base + 32_000)
+        assert h.actor.state == "SPEAKING"
+        h.render.streams[0].finish("drained")
+        await h.feed(base + 32_000, base + 80_000)
+        await h.wait_for(lambda: len(h.render.streams) == 2)
+        assert h.ha.intents[1] == ("The living room.", "conv-1")
+        assert h.render.local == []
+        await h.actor.close()
+    run(main())
+
+
+def test_an_answer_whose_speech_score_never_reaches_085_is_taken():
+    async def main():
+        h = Harness()
+        h.ha.next_run = FakeRun([
+            IntentEnded("Which TV?", "conv-1", True, "action_done", False),
+            TtsReady("http://ha/tts/1", False), RunEnded()])
+        await button_turn(h, PRESS + 50_000)
+        await h.wait_for(lambda: h.render.streams)
+        base = PRESS + 50_000
+        await h.feed(base, base + 24_000)
+        h.render.streams[0].finish("drained")
+        await h.wait_for(lambda: h.actor.state == "ARMED")
+        answer = (base + 26_112, base + 35_840)
+        # Turn 532's answer peaked at 0.80: the reducer's run opens at 0.65.
+        h.worker.vad = lambda s: 0.8 if answer[0] <= s < answer[1] else 0.05
+        h.device.level = levels(answer)
+        h.worker.tokens = [("▁LIVING", base + 29_000), ("▁ROOM", base + 32_000)]
+        h.ha.stt_text = "The living room."
+        h.ha.next_run = FakeRun([IntentEnded("Turned off.", "conv-1", False, "action_done", False),
+                                 TtsReady("http://ha/tts/2", False), RunEnded()])
+        await h.feed(base + 24_000, base + 80_000)
+        await h.wait_for(lambda: len(h.render.streams) == 2)
+        assert h.ha.intents[1] == ("The living room.", "conv-1")
+        await h.actor.close()
+    run(main())
+
+
+def test_speech_under_way_long_before_the_drain_is_not_the_answer_but_the_next_run_is():
+    async def main():
+        h = Harness()
+        h.ha.next_run = FakeRun([
+            IntentEnded("Which TV?", "conv-1", True, "action_done", False),
+            TtsReady("http://ha/tts/1", False), RunEnded()])
+        await button_turn(h, PRESS + 50_000)
+        await h.wait_for(lambda: h.render.streams)
+        base = PRESS + 50_000
+        drain = base + 24_000
+        # Someone talks from 601 ms before the drain to 742 ms after it (at 0.75: no early
+        # answer), pauses 608 ms, then answers.
+        talk, answer = (144_384, 165_888), (175_616, 186_368)
+        h.worker.vad = lambda s: (0.75 if talk[0] <= s < talk[1] else 0.95 if answer[0] <= s < answer[1]
+                                  else 0.05)
+        h.device.level = levels(talk, answer)
+        h.worker.tokens = [("▁THE", 177_000), ("▁LIVING", 180_000), ("▁ROOM", 184_000)]
+        h.ha.stt_text = "The living room."
+        h.ha.next_run = FakeRun([IntentEnded("Turned off.", "conv-1", False, "action_done", False),
+                                 TtsReady("http://ha/tts/2", False), RunEnded()])
+        await h.feed(base, drain)
+        assert h.actor.state == "SPEAKING"
+        h.render.streams[0].finish("drained")
+        await h.wait_for(lambda: h.actor.state == "ARMED")
+        await h.feed(drain, base + 120_000)
+        await h.wait_for(lambda: len(h.render.streams) == 2)
+        assert h.ha.intents[1] == ("The living room.", "conv-1")
+        assert h.render.local == [("earcon", "builtin:wake_chime")]   # talk under way is no answer
+        h.render.streams[1].finish("drained")
+        await h.wait_for(lambda: len(h.rows) == 2)
+        reply = h.rows[1]
+        assert reply["audio_ms"] == (answer[1] + 3_072 - (answer[0] - 4_800)) // 16
+        utterance = json.loads(reply["decision_trace"])["utterance"]
+        trigger = utterance["trigger"]                      # the drain: the mic frontier then
+        assert drain <= trigger < drain + 1_280
+        # From the cell holding the trigger until the talk pauses: not the answer.
+        assert ["background_speech", "under_way", trigger - trigger % 512, talk[1]] in utterance["segments"]
         await h.actor.close()
     run(main())
 
@@ -937,7 +1624,7 @@ def test_a_streamed_answer_that_ends_in_a_question_watches_for_a_reply_while_it_
         response = h.render.streams[0]
         assert not response.done
         response.finish("drained")
-        await h.wait_for(lambda: h.actor.state == "EXPECT_REPLY")
+        await h.wait_for(lambda: h.actor.state == "ARMED")
         await h.actor.close()
     run(main())
 
@@ -965,6 +1652,7 @@ def test_a_streamed_reply_whose_audio_never_starts_times_out_response_start_s_af
         await h.wait_for(lambda: h.rows)
         row = h.rows[0]
         assert row["playback_reason"] == "response_timeout" and row["first_audio_ms"] is None
+        assert row["response_latency_ms"] is None          # nothing played: unmeasured, never zero
         await h.actor.close()
     run(main())
 

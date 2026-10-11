@@ -1,7 +1,7 @@
 // Package render is the device's single final mixer (SPEC §4.1, §4.3, §6.2):
 // every audible source is summed here, per-sample gain ramps apply focus, the
 // final mix is tapped for the reference stream, and 2,048-frame buffers are
-// handed to the OpenSL sink with completion-timed frame accounting.
+// handed to the mixer sink with completion-timed frame accounting.
 package render
 
 import "errors"
@@ -10,7 +10,7 @@ import "errors"
 const (
 	SampleRate  = 48000 // Hz, mono S16
 	BlockFrames = 480   // internal mixer block, 10 ms
-	SinkFrames  = 2048  // one OpenSL write, 42.7 ms
+	SinkFrames  = 2048  // one sink write, 42.7 ms
 
 	NetworkWrites = 128 // network source FIFO depth, in sink writes (~5.5 s)
 	PrimeWrites   = 24  // network source prime before start, in sink writes (~1.0 s)

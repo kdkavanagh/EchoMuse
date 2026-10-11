@@ -59,17 +59,17 @@ hear the answer through the Dot's speaker.
 - **Headphones** — plug into the 3.5mm jack and audio moves there, unplug and
   it comes back, no reboot needed.
 - **Fleet dashboard** — provisioning wizard, per-device or fleet config
-  pushed live (EQ, LED ring scenes, alert sounds), A/B-slot OTA updates with
-  automatic fallback, root shell, logs, and per-turn activity (wake model and
-  score, how the utterance ended, latencies). Optionally keep the last few
-  turns' audio, or the wake word that triggered each turn, to play back.
+  pushed live (EQ, LED ring scenes, alert sounds), A/B-slot firmware updates
+  with automatic fallback, root shell, logs, and per-turn activity (wake
+  model and score, how the utterance ended, latencies). Optionally keep the
+  last few turns' audio, or the wake word that triggered each turn, to play
+  back.
 - **Encrypted device link** — TLS with a controller-generated CA plus
   per-device tokens; the wizard installs credentials automatically.
 - **No phone-home** — there is no telemetry, no analytics and no install
   counter. Outside your network the running controller contacts only GitHub
-  (an hourly check for a newer release, and firmware downloads when you
-  update) and whatever media URLs Home Assistant asks it to play; every
-  connection is listed in
+  (an hourly check for a newer controller image) and whatever media URLs
+  Home Assistant asks it to play; every connection is listed in
   [docs/configuration.md](docs/configuration.md#what-leaves-your-network).
 
 The LED ring, buttons and speaker are driven natively: device-local LED
@@ -116,10 +116,12 @@ guided path from zero to talking to your Dot, and it sends you to the
 with it.
 
 The short version:
-- Persistent unlock via [amonet-biscuit](https://xdaforums.com/t/unlock-root-twrp-unbrick-amazon-echo-dot-2nd-gen-2016-biscuit.4761416/) (R0rt1z2)
-- FireOS 5 (Android 5.1, API 22)
-- Magisk 17.3
-- Alexa voice stack disabled (the dashboard's debloat step handles this)
+- Persistent unlock via [amonet-biscuit](https://xdaforums.com/t/unlock-root-twrp-unbrick-amazon-echo-dot-2nd-gen-2016-biscuit.4761416/) v2 (R0rt1z2)
+- Fire OS 6 (Android 7.1.2) with R0rt1z2's boot-root.zip. Fire OS 5 is not
+  supported: a Dot still on it moves to Fire OS 6 first (the
+  [rooting guide](docs/rooting.md) covers both)
+- Nothing to disable by hand: the firmware's start script stops the Alexa
+  voice stack at every boot
 - Home Assistant with a working Assist pipeline, and an **administrator**
   long-lived access token for the controller (not needed for the add-on)
 
@@ -153,8 +155,8 @@ Supervisor's).
 
 Open the dashboard — `http://<SERVER_IP>:8768` for the Docker install, or the
 add-on's **Open Web UI** button / sidebar panel for the add-on install. From
-there the **provisioning wizard** takes a stock Dot the rest of the way over
-USB: root, debloat, WiFi, firmware and TLS credentials. It ends by rebooting
+there the **provisioning wizard** takes a rooted Dot the rest of the way over
+USB: boot hook, firmware, TLS credentials and WiFi. It ends by rebooting
 the Dot, which then finds the controller itself and appears as pending for
 you to approve. Home Assistant discovers each approved device via its
 built-in ESPHome integration.
@@ -164,34 +166,40 @@ See the [quickstart](docs/quickstart.md) for the full walkthrough and
 language.
 
 Images are published to `ghcr.io/wilbowes/echomuse-controller` from
-`controller-v*` tags; device firmware binaries are released from plain
-`v*` tags (see Releases).
+`controller-v*` tags. Each image carries the device firmware built from the
+same tree, and that is the only firmware the controller installs: the wizard
+puts it on new Dots, and a Dot running anything else is offered it as an
+update.
 
 ### Upgrading from firmware older than protocol v1
 
-A Dot running older firmware still connects, but only to be updated: the
-dashboard marks it **Upgrade required**, and until you update it from the
-device page it takes no voice turns, rings no timers or alarms and plays
-nothing. What else changed is in
-[controller/CHANGELOG.md](controller/CHANGELOG.md).
+Firmware older than protocol v1 only ever ran on Fire OS 5, which is no
+longer supported, and the controller no longer answers it. Move the Dot to
+Fire OS 6 ([rooting guide](docs/rooting.md)) and provision it with the
+wizard; a Dot the controller already knows is re-adopted with **Continue**,
+keeping its name, settings, Home Assistant device and alarms. What else
+changed is in [controller/CHANGELOG.md](controller/CHANGELOG.md).
 
 ---
 
 ## Building from source
 
-The Echo Dot runs FireOS 5 (API 22). A custom Docker build environment is
+The Echo Dot runs Fire OS 6 (API 25); the firmware is built for API 22, which
+runs there unchanged. A custom Docker build environment is
 required — standard Go cross-compilation won't produce a compatible binary.
+The controller image builds the firmware itself (the `compiler` and
+`firmware` stages of `controller/Dockerfile`, on an x86-64 builder), so
+`docker compose up --build` is the whole build:
 
 ```bash
 git submodule update --init          # GoTinyAlsa (wilbowes fork; used by the capture tools)
-cd device
-docker build -t echomuse-compiler compiler/
-./compile.sh                         # output: build/server
+cd controller && docker compose up --build   # build context is the repository root
 ```
 
-Controller from source: `cd controller && docker compose up --build` (the
-build context is the repository root). Bare metal (Python 3.12) also needs
-the speech bundle — see [CLAUDE.md](CLAUDE.md#running-the-controller).
+`device/compile.sh` runs the same firmware stage and writes
+`device/build/server` and `device/build/version`. A bare-metal (Python 3.12)
+controller points `FIRMWARE_DIR` there, and also needs the speech bundle —
+see [CLAUDE.md](CLAUDE.md#running-the-controller).
 
 Tests run on the host and in CI on every push: `go test ./...` under
 `device/` (pure-Go logic) and `python -m pytest tests/` under `controller/`.
@@ -200,9 +208,9 @@ Tests run on the host and in CI on every push: `go test ./...` under
 
 ## Compatibility
 
-Device firmware (`v*` tags) and the controller (`controller-v*` tags) are
-released independently, so at any moment you may be running new firmware
-against an older controller or the reverse. Two rules keep that safe:
+The controller and the firmware it carries are built together, but a Dot
+keeps the firmware it has until you update it, so at any moment you may be
+running a newer controller against older firmware. Two rules keep that safe:
 
 **Features are negotiated by capability, not version.** On connect, a device
 announces what it implements: the eight protocol capabilities
@@ -213,7 +221,8 @@ announces what it implements: the eight protocol capabilities
 readable). The controller asks "does this device say it can?" rather than
 "is its version at least X" — the latter means encoding release history into
 the controller, and it gets a dev build wrong immediately. A device missing
-any of the eight is offered only the firmware update. A control that depends
+any of the eight, or not announcing Fire OS 6 as its platform, is refused at
+connect. A control that depends
 on a hardware capability the device lacks is shown disabled with the reason,
 never as a control that silently does nothing. A test asserts the capability
 strings match across the Go and Python sources and the architecture document.

@@ -1,4 +1,4 @@
-"""Fakes for em_device / em_legacy tests: link, actor, render, host, store."""
+"""Fakes for em_device tests: link, actor, render, host, store."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ def hello_body(capabilities=None, **extra) -> dict:
         "firmware_version": "v3.0.0",
         "boot_id": "boot-1",
         "protocols": [1],
+        "platform": "fireos6",
         "privacy": {"muted": False, "capture_epoch": "7"},
         "alerts": {"delivery_epoch": None, "acked_sequence": 0, "wakeup": "ok"},
         "assets": [],
@@ -48,14 +49,16 @@ class FakeActor:
         self.turns: list[dict] = []
         self.cancels: list[str] = []
         self.attached = None
+        self.afe_metadata: bool | None = None
         self.detached: list[str] = []
         self.listeners = []
 
     async def start(self) -> None: ...
     async def close(self) -> None: ...
 
-    def attach(self, link, render) -> None:
+    def attach(self, link, render, *, afe_metadata=False) -> None:
         self.attached = (link, render)
+        self.afe_metadata = afe_metadata
 
     def detach(self, reason: str) -> None:
         self.detached.append(reason)
@@ -208,7 +211,8 @@ def device_row(device_id: str, *, approved: bool, label: str | None) -> em_db.De
         device_id=device_id, label=label, approved=int(approved), ip=None,
         firmware_ver=None, firmware_previous=None, first_seen=None, last_seen=None,
         config="{}", esphome_api_port=None, esphome_noise_psk=None, use_global_config=1,
-        ble_proxy_port=None, token=None, config_sections="[]", collect_mode=0, ambient_mode=0)
+        ble_proxy_port=None, token=None, config_sections="[]", collect_mode=0, ambient_mode=0,
+        os_version=None, update_queued_at=None)
 
 
 class FakeStore:
@@ -235,14 +239,14 @@ class FakeStore:
     def approval_mode(self, default):
         return em_device.ApprovalMode(self.approval)
 
-    def register(self, device_id, ip, version):
+    def register(self, device_id, ip, version, os_version):
         self.registered.append(device_id)
         self.rows.setdefault(device_id, device_row(device_id, approved=False, label=None))
 
     def approve(self, device_id, label):
         self.rows[device_id] = device_row(device_id, approved=True, label=label)
 
-    def seen(self, device_id, ip, version): ...
+    def seen(self, device_id, ip, version, os_version): ...
 
     def config(self, device_id):
         return dict(self.configs.get(device_id, {"duckDb": -12.0}))

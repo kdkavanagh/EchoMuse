@@ -10,11 +10,12 @@ the device wire protocol is [docs/protocol-v1.md](../docs/protocol-v1.md).
 
 **Before you upgrade**
 
-- **Every Dot needs new firmware.** Upgrade the controller first. A Dot
-  still on older firmware connects only to an upgrade-only handler: the
-  dashboard marks it **Upgrade required**, and until you click **Update
-  firmware** on its device page it takes no voice turns, rings no timers or
-  alarms and plays nothing. Nothing it reports changes controller state.
+- **Fire OS 5 is no longer supported, and every Dot needs new firmware.**
+  Upgrade the controller first. Every Dot must be on Fire OS 6
+  ([docs/rooting.md](../docs/rooting.md)) and provisioned with the wizard. A
+  reflashed Dot is re-adopted with **Continue**, which keeps its name,
+  settings, Home Assistant device and alarms. A Fire OS 5 Dot, or one on
+  firmware predating this release, is refused at connect.
 - **A Home Assistant administrator token is required.** Docker and bare-metal
   installs must set `HA_URL` and `HA_TOKEN` (a long-lived access token from an
   admin user) in `.env`; the controller refuses to start without them. The
@@ -115,6 +116,17 @@ the device wire protocol is [docs/protocol-v1.md](../docs/protocol-v1.md).
   cut off, …) and the trace id its controller log line carries. Schema v25
   adds `turn_uuid`, `conversation_id`, `reply_to`, `continuation` and
   `playback_reason`; `playback_ms` now measures audible time.
+- **Firmware install for an offline Dot, on reconnect.** A Dot that is
+  offline and not on the bundled firmware (for instance one that missed
+  **Deploy all**) gets **Install when it reconnects** on its Updates tab and
+  in the Deploy all dialog. The request survives a controller restart, shows
+  as queued on the device card and page, can be cancelled, and runs when the
+  Dot next connects — installing whatever firmware the controller bundles
+  then, not a pinned version; a Dot that comes back already current just has
+  it cleared. Deploy all now lists every approved device, including ones
+  offline since the controller started. Device cards mark firmware that is
+  behind. API: `POST`/`DELETE /api/devices/{id}/update/queue`; devices carry
+  `update_queued_at`. Schema v33 adds that column.
 - **Controller image:** removed `openwakeword`, `speexdsp-ns`, `tqdm`,
   `scikit-learn`, `requests`; added `sherpa-onnx` and the speech bundle (with
   the Kroko model's CC-BY-SA attribution). The image is built from the
@@ -177,6 +189,14 @@ the device wire protocol is [docs/protocol-v1.md](../docs/protocol-v1.md).
   closing the update's shell on that dead session raised — skipping the
   reconnect check and leaving the device's shell lock held, so the next
   update could not open a shell until the controller restarted.
+- **A Fire OS 6 Dot could lose its microphone for good right after boot**,
+  so it never woke and button turns carried no audio. When the Dot booted
+  with its clock wrong, the firmware's first NTP sync stepped it forward
+  under the open `micAsr` stream; on Fire OS 6574.1 the stream then
+  returned status 14 on every read, which the firmware logged in a hot loop
+  (15 MB in 4 minutes) instead of re-opening. The firmware now opens the
+  microphone only after the first sync (waiting at most 30 s), and re-opens
+  the stream on any unexpected status (`docs/fireos6-port.md` §6).
 
 ### Code review fixes
 
@@ -244,6 +264,59 @@ Based on a review of Office turns 433–476 (`docs/turn-latency-review.md`,
   - The 240 ms text-stability wait is removed; it checked nothing.
   - For text taken from that re-decode, route A's trailing-silence check uses
     VAD silence after the last speech.
+- **Requests Home Assistant already knows end sooner (policy `post_afe_4`).**
+  The controller's own grammar only covers timers, alarms, on/off and stop, so
+  "what time is it", the weather or "next" waited the full 1,792 ms pause.
+  Now, whenever the streaming text changes into something that grammar does
+  not know, the controller asks Home Assistant's own sentence matcher (the
+  stock `conversation/agent/homeassistant/debug` command, which recognizes
+  without running anything) whether your sentences and automation triggers
+  match it. A full match waits 608 ms; a match that a wildcard could still
+  extend ("what's the weather … tomorrow", "play …") waits 1,216 ms. The
+  controller's grammar still decides everything it covers, and without an
+  answer the old pause applies. On the last 38 such requests, 8 would have
+  waited 608 ms and 12 1,216 ms. The decision trace records each answer
+  (`utterance.recognizer`), and a new **recognizer** line in the Home
+  Assistant status shows whether the command is available.
+- **HA's sentence matcher is woken with the wake word.** When a wake candidate
+  opens, the controller sends HA one throwaway sentence, so a matcher paged out
+  after idle is back in memory before the command needs it.
+- **Pause transcription can use Home Assistant's speech-to-text model
+  (policy `post_afe_5`).** Config → Speech → **Pause transcription**
+  (`pauseAsr`) chooses who transcribes a request at its pauses: Kroko
+  (default, unchanged) or a Wyoming speech-to-text server, typically the one
+  your Home Assistant pipeline uses. With a server, each pause also sends it
+  the request so far, and whether the request is complete is judged on its
+  words: a misheard wake word ("Fulfiliate, what's the weather in Detroit") no
+  longer hides a request Home Assistant knows. The controller connects to the
+  server directly and never waits for it: Kroko's words are judged at once,
+  and the server's replace them when they arrive (up to 1.5 s later), so a
+  request Kroko heard right ends as soon as without a server. **Check** lists
+  the server's models. Turns judged on a server's words record the policy
+  with `+wyoming:<model>` appended, and the decision trace records each
+  pause (`utterance.pauses`).
+- **See which transcriber won each pause.** Activity's turn detail has a
+  **Pause ASR** row: for each pause, Kroko's words and the Wyoming server's,
+  each with its time from the pause (Kroko's decode; the server's round trip,
+  counted from when the pause sent it), when its words were judged, why a
+  request gave none (dropped as speech went on, timed out, failed, or still
+  out when the request ended), and a ★ on the words the request ended on.
+  The decision trace carries the same (`utterance.pauses`, and `source` on
+  the commit event: `server`, `kroko` or `streaming`), and
+  `GET /api/devices/{id}/turns/{turn}/trace` returns a turn's whole trace
+  (newest 1,000 turns per speaker).
+- **Home Assistant no longer drops the last word of a request.** The audio
+  sent for speech-to-text ends 192 ms after the last loud speech, often while
+  a quieter last word is still sounding, and the model dropped it: "what time
+  is it" arrived as "what time is" in 10 of the last 60 saved requests. The
+  audio now ends with 0.5 s of silence, which fixed all 10 and changed no
+  other request's words. Saved recordings still hold the span alone.
+- **A pause after the wake word no longer cuts you off (policy
+  `post_afe_6`).** If no words were recognised 3 s after the wake word, the
+  request ended with "Sorry, I didn't catch that", even while you were still
+  talking: the streaming model's text lags speech by up to 1.4 s. The 3 s now
+  count from when you start the request, so "Ophelia… what's the weather in
+  Detroit" with a second's pause after the wake word is heard out.
 - **Wake verification and span re-decode decode the end of their window.**
   Their zero flush is 1.5 s (was 0.5 s), which reaches the model's next chunk
   edge. Replayed wake clips that returned empty text now transcribe.
@@ -251,6 +324,14 @@ Based on a review of Office turns 433–476 (`docs/turn-latency-review.md`,
   kept for the newest 1,000 turns per device, and `first_audio_ms`, the time
   from the endpoint to the reply becoming audible. Activity shows it as "first
   audio … after endpoint".
+- **Response latency, per turn and per speaker** (schema v30). Each turn
+  records `response_latency_ms`: from the end of your last word to the first
+  audio of the reply, both timed on the Dot's own clock, so network delay to
+  and from the controller does not enter it. Activity shows it on every turn
+  (`↦3.4s`) and in the turn detail ("first audio … after speech ended");
+  Status shows its p50/p90/p95/p99 over the last 24 hours, 7 days and 30
+  days (`GET /api/devices/{id}/response_latency`). Turns that played no reply
+  are left out of the percentiles, and earlier turns have no value.
 - **Save utterances keeps the last 300 turns per device** (was 10).
 - **The Dot starts the wake chime itself, without a controller round trip.** Firmware
   with the new `local_wake_chime` capability chimes on its own when it opens
@@ -258,6 +339,29 @@ Based on a review of Office turns 433–476 (`docs/turn-latency-review.md`,
   controller sends it `wakeSound` and skips its own chime when
   `wake.candidate` reports `chimed`. Wakes heard while the Dot is playing
   audio, and older firmware, still chime after acceptance.
+- **Follow-up questions chime when they start listening.** With Wake chime
+  on, the wake chime now also plays when a follow-up question has finished
+  and the reply window opens, since the answer needs no wake word. It is
+  skipped when you have already started answering over the question's end.
+- **Answers to follow-up questions are heard like a button press (policy
+  `post_afe_7`).** When a follow-up question finishes, the Dot now starts
+  listening at once, exactly as after a button press: the ring shows
+  listening from that moment, and the ordinary end-of-request logic decides
+  what the answer is. A separate start detector used to have to find the
+  answer first and missed answers it should have taken — the Kitchen's
+  "I demand that you ask me a question" (turn 617) reached the controller
+  intact but its first word was too short for it. An answer begun in the
+  last half second of the question still counts; speech already going on
+  before the question ended (a TV, someone talking) is not taken until it
+  pauses. If nobody answers within 7 s the window closes quietly, with no
+  "heard nothing" animation, and its row is kept on the Activity page; a
+  brief microphone dropout before you answer no longer ends it, and if the
+  microphone stops altogether it still closes after 10 s. A
+  wake word or button press during a silent window takes the question over.
+  Home Assistant hears the answer from just before it starts, not the chime
+  and the wait. The Config → Speech → **Follow-up answers** setting
+  (`replyOnset`) is gone; schema v31 removes it from saved configurations,
+  and the API rejects it.
 - **Configurable wake open rules, with shadow rules to try them first.**
   Firmware with the new `open_rules_v1` capability opens a wake on any of a
   list of rules (last 1–3 scores, average or every one, ≥ a threshold). The
@@ -269,6 +373,123 @@ Based on a review of Office turns 433–476 (`docs/turn-latency-review.md`,
   wakes per hour with a 95% upper bound, likely rescued misses and missed
   wakes. Saving either list reconnects the Echo. No audio leaves the Dot for
   shadow rules; older firmware reports no shadow data rather than zeros.
+- **Fire OS 6 Dots (amonet-biscuit v2) are supported.** A Dot unlocked with
+  amonet-biscuit v2.0.0 can only boot Fire OS 6. Once R0rt1z2's boot-root.zip
+  is installed, the provisioning wizard runs the Fire OS 6 flow. It needs no
+  recovery mode, Magisk or boot-image write:
+  - It writes one init file (`/system/etc/init/echomuse.rc`) plus an empty
+    `/tmp` to the running system slot, installs the firmware and Wi-Fi,
+    reboots, and waits until the Dot reaches this controller.
+  - Only then does it write the same file to the other slot, so a bad install
+    leaves a stock fallback slot.
+
+  On Fire OS 6 the firmware records and
+  plays through Amazon's `mixer` daemon, so capture still passes through the
+  native AFE and playback is still its echo reference. The firmware also:
+  - powers the Wi-Fi radio itself, runs DHCP, and sets the clock by NTP
+    (Amazon's own Wi-Fi and time services cannot run once Alexa is stopped);
+  - reads the light sensor through the kernel's IIO interface;
+  - keeps Amazon's privacy driver in step with mute.
+
+  Debloat on Fire OS 6 is the start script's service denylist, applied at
+  every boot, by firmware updates, and by **Re-apply debloat**. Dashboard
+  firmware updates use toybox `base64`/`md5sum`/`df`. The Dot reports its
+  platform in `session.hello` (`platform: fireos6`), and the controller
+  admits no other. Notes and evidence: `docs/fireos6-port.md`; how to
+  get a Dot there: `docs/rooting.md`.
+- **Fire OS 5 support is removed.** Firmware built from this tree runs audio
+  only on Fire OS 6, so everything that served Fire OS 5 Dots is gone: the
+  wizard's Fire OS 5 provisioning (TWRP, boot patch, Magisk, its database
+  preseed and the debloat steps; an Android 5.x Dot is now refused at the
+  first step), the Magisk debloat boot script and its `pm hide` package list,
+  the firmware's OpenSL ES audio backend, the upgrade-only handler for
+  pre-v1 firmware on `/control`, the `platform` and `upgrade_required` device
+  API fields, and the `/api/provision/debloat_script`,
+  `/api/provision/debloat_packages` and `/api/provision/magisk_db`
+  endpoints. A `session.hello` without `platform: fireos6` is refused with
+  `protocol`.
+- **Reflashed Dots can be re-adopted from the provisioning wizard.** A Dot
+  whose serial is already registered (one reflashed from Fire OS 5 to 6, say)
+  used to be refused at the first step until you deleted it, which took its
+  name, settings, Home Assistant device and alarms with it. The wizard now
+  shows which device the serial belongs to and asks: **Continue** reinstalls
+  EchoMuse and keeps that device, so the Dot rejoins with everything it had;
+  **Abort** stops before anything is written to the Dot. Deleting the device
+  and retrying still provisions it as new.
+- **The controller image carries the device firmware, and installs nothing
+  else.** `controller/Dockerfile` compiles the firmware from the same tree
+  (the digest-pinned toolchain moved there from `device/compiler/`), and the
+  provisioning wizard, a device update and **Deploy all** push exactly that
+  binary. The wizard's Install EchoMuse step no longer asks anything; the
+  GitHub firmware releases, **Check now**, release notes, the binary upload
+  (**Local Build**, the wizard's custom build, `tools/ota.py`) and the device
+  release workflow are gone. The firmware version is `fw-` plus a hash of its
+  sources, so it changes only when the firmware does: a Dot is offered an
+  update when its version differs from the bundled one, never because the
+  controller alone changed. The hourly GitHub check now looks only for a
+  newer controller image. A bare-metal controller needs `FIRMWARE_DIR` (fill
+  it with `device/compile.sh`) and refuses to start without it.
+- **Each Dot's OS is shown, apart from its EchoMuse firmware.** The firmware
+  now reports the Fire OS build it runs (`ro.build.version.name`, e.g. "Fire
+  OS 6.5.6.9 (NS6569/6009)") in `session.hello` as `os_version`, and the
+  controller keeps it with the device (schema v32), so an offline Dot still
+  shows what it last ran. Device cards, the device page and its Status tab
+  show it as **OS**; the firmware version is labelled **EchoMuse firmware**
+  everywhere, and the Updates tab says that updating it never changes the
+  OS. A Dot shows its OS once it runs this firmware. The provisioning wizard
+  calls the Fire OS build the OS too, where it used to say "Firmware".
+- **Native AFE metadata from Fire OS 6 Dots, recorded as evidence only.**
+  Firmware with the new `afe_metadata_v1` capability decodes Amazon's
+  per-8 ms AFE metadata and, under the turn and candidate uplink leases,
+  sends one 14-byte record per 80 ms (EMA1 kind 5 `afe`, about 1 kB/s). Each
+  turn row (and refused wake) stores summaries of the second before the wake,
+  the wake's support window and the utterance, plus when the Dot's playback
+  last started (schema v28, `afe_evidence`): frames received, playback, ERLE,
+  double-talk, RMS, DNN VAD, volume, clipping/divergence/mute and decoder
+  gaps. It is in the decision trace and the turns API; Activity charts it
+  per turn (below), and the Status tab's Wake health panel shows the decoder's
+  health from `wake.stats`. Nothing decides on it yet. Older firmware shows
+  it as unavailable with the reason; a span without
+  records is "no data", never zeros. What each field can be trusted for, and
+  the experiments that would decide any use beyond evidence:
+  `docs/afe-metadata.md`.
+- **Native AFE chart per turn.** Under "Native AFE", Activity charts the
+  turn's 80 ms AFE records from the second before the wake through the
+  utterance and the spoken answer: DNN VAD, double-talk, ERLE, RMS and
+  playback, each on a fixed scale. Bars above the lanes show the wake
+  window, the utterance and the turn's processing, each with its duration:
+  the endpoint's wait for the end of speech, Home Assistant speech-to-text,
+  intent handling, the spoken answer's audio until it was audible, and the
+  answer playing. The processing bars are timed on the controller's clock, so
+  they can run about 0.3 s ahead of the audio; the playback lane is the Echo's
+  own record of when the answer played. Missing or short periods and flags are marked,
+  and hovering reads out one period and the bars it falls in. The
+  per-span text summaries are gone from the page (they stay in the decision
+  trace and the turns API). The records are stored per turn (schema v29,
+  `afe_series`) for the newest 1,000 turns per device, like the decision
+  trace, with where each recording sits (`wake_clip`, `audio_clip`,
+  `recording`: capture-sample spans, WAV sample k = span start + k) and the
+  processing (`stages`). They are never in the turns list;
+  `GET /api/devices/{id}/turns/{turn}/afe` serves one turn's. Older turns show
+  no chart, or no processing bars.
+- **The AFE chart runs on through the response.** When a turn commits, the
+  controller opens one more `turn` lease for the `afe` stream before it closes
+  the committed one, so the native AFE records continue without a gap. The
+  lease stays open through the thinking time and the spoken answer, until 1 s
+  after the turn ends or 30 s after the commit, whichever is first. Needs
+  `afe_metadata_v1`, and no firmware update is needed. Such a turn's row
+  is written about a second after the turn ends.
+- **Play the whole turn against its chart.** With **Save utterances** on, that
+  lease also carries the microphone, and the controller keeps a turn
+  recording: the Echo's own processed audio from just before the wake word
+  through the spoken answer, joined sample for sample across the commit.
+  "Play recording" under the chart plays it with a playhead moving across the
+  chart and the readout following it; a row's wake clip and utterance buttons
+  drive the same playhead. The last 100 per device are kept in
+  `turn_recordings/` beside the database
+  (`GET /api/devices/{id}/turns/{turn}/recording`). Mute or a disconnect
+  during the answer erases the answer's part. With **Save utterances** off,
+  no microphone audio leaves the Dot after the request, as before.
 
 ### Earlier in this release
 

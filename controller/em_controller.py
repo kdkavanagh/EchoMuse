@@ -1,11 +1,10 @@
-"""EchoMuse controller entry point (SPEC §3, §12, §16.7, §18.1).
+"""EchoMuse controller entry point (SPEC §3, §16.7, §18.1).
 
 Wires the stock Home Assistant client, speech worker, wake registry, speech
 assets, alert engine and per-device session actors, and serves the device
 listener:
 
 - ``/device/v1/control|audio|assets`` → ``em_device_link`` (WIRE §1)
-- ``/control``                         → ``em_legacy`` (upgrade-only, §12)
 - ``/shell/{device_id}``               → the retained shell plane
 
 Recording modes (sample collection, ambient recording, script-driven capture)
@@ -54,8 +53,8 @@ import em_device_assets
 import em_device_link
 import em_eq
 import em_esphome as esphome
+import em_firmware
 import em_ha_client
-import em_legacy
 import em_linkauth
 import em_pki
 import em_player
@@ -134,6 +133,7 @@ _ha: em_ha_client.HaClient | None = None
 _alerts: em_alerts.AlertEngine | None = None
 _registry: em_wake_registry.WakeRegistry | None = None
 _assets: em_device_assets.DeviceAssets | None = None
+_firmware: em_firmware.BundledFirmware | None = None
 _worker: em_speech_worker.SpeechWorker | None = None
 _links = em_device_link.LinkRegistry()
 _arbiter = em_arbiter.WakeArbiter()
@@ -191,6 +191,12 @@ def device_assets() -> em_device_assets.DeviceAssets:
     if _assets is None:
         raise NotStarted("controller not started")
     return _assets
+
+
+def firmware() -> em_firmware.BundledFirmware:
+    if _firmware is None:
+        raise NotStarted("controller not started")
+    return _firmware
 
 
 def _ha_client() -> em_ha_client.HaClient:
@@ -420,6 +426,7 @@ class _Host:
             ha=ha, worker=_worker, registry=registry(), alerts=alerts(), arbiter=_arbiter,
             config=lambda: _effective_config(device_id),
             ha_device_id=ha_device_id,
+            recognizer=lambda: ha.connected and _feature_ok(em_ha_client.HaFeature.RECOGNIZER),
             pipeline_id=lambda: _pipeline_id(device_id),
             vocabulary=lambda: ha.vocabulary,
             esphome_reply=lambda pcm: esphome.esphome_reply(device_id, pcm),
@@ -439,11 +446,8 @@ class _Host:
     async def connected(self, device: em_device.Device) -> None:
         did = device.device_id
         await _log_device(did, db.LogLevel.INFO, db.LogSource.CONTROLLER,
-                          f"Connected from {device.ip} version={device.firmware_version}"
-                          + (" (upgrade required)" if device.upgrade_required else ""))
-        await api.notify_device_connected(_shell, did, device.firmware_version)
-        if device.upgrade_required:
-            return
+                          f"Connected from {device.ip} version={device.firmware_version}")
+        await api.notify_device_connected(_shell, did, device.firmware_version, firmware=firmware())
         await esphome.device_connected(
             did, label=device.label, capabilities=device.capabilities,
             hooks=esphome.Hooks(
@@ -550,7 +554,7 @@ async def preview_sound(device: em_device.Device, sound_id: str) -> dict[str, ob
     global _preview_generation
     render = device.render
     if render is None or device.link is None or device.link.closed:
-        return {"ok": False, "error": "upgrade_required" if device.upgrade_required else "offline"}
+        return {"ok": False, "error": "offline"}
     await stop_preview(device)
     sha = await asyncio.to_thread(em_sounds.preview_asset, sound_id)
     _preview_generation = (_preview_generation + 1) & 0xFFFFFFFF or 1
@@ -1058,7 +1062,6 @@ async def handle_shell(ws: ServerConnection, path: str, secure: bool) -> None:
 
 # ─── Router ───────────────────────────────────────────────────────────────────
 
-LEGACY_CONTROL_PATH = "/control"
 SHELL_PATH_PREFIX = "/shell/"
 
 
@@ -1071,8 +1074,6 @@ async def _route(ws: ServerConnection, *, secure: bool, hub: em_device.LinkHub,
         await em_device_link.serve_audio(ws, secure=secure, links=_links)
     elif path == em_device_link.ASSETS_PATH:
         await em_device_link.serve_assets(ws, secure=secure, links=_links, assets=assets)
-    elif path == LEGACY_CONTROL_PATH:
-        await em_legacy.serve_control(ws, secure=secure, hub=hub)
     elif path.startswith(SHELL_PATH_PREFIX):
         await handle_shell(ws, path, secure)
     else:
@@ -1163,6 +1164,9 @@ class Services:
     def device_assets(self) -> em_device_assets.DeviceAssets:
         return device_assets()
 
+    def firmware(self) -> em_firmware.BundledFirmware:
+        return firmware()
+
     def ha_status(self) -> dict[em_ha_client.HaFeature, api.FeatureStatusWire]:
         return ha_status()
 
@@ -1236,7 +1240,7 @@ def _route_observation(obs: em_speech_worker.Observation) -> None:
 
 
 async def main() -> None:
-    global _ha, _alerts, _registry, _assets, _worker
+    global _ha, _alerts, _registry, _assets, _firmware, _worker
     log.info("EchoMuse Controller %s", api.CONTROLLER_VERSION)
     db.init(DB_PATH)
     auth.maybe_generate_bootstrap_token()
@@ -1247,6 +1251,15 @@ async def main() -> None:
                          "(or run as the add-on with homeassistant_api: true)")
     ha = _ha = em_ha_client.HaClient(endpoint)
     advertised_ip = _advertised_ip()
+
+    try:
+        bundled = _firmware = em_firmware.load()
+    except (em_firmware.FirmwareError, OSError) as err:
+        raise SystemExit(f"bundled device firmware unavailable: {err} — the image carries it in "
+                         f"/app/firmware; bare metal sets {em_firmware.FIRMWARE_ENV} to the "
+                         f"directory device/compile.sh fills (device/build)") from err
+    log.info("bundled device firmware %s (%d bytes, sha256 %s)",
+             bundled.version, bundled.size, bundled.sha256[:12])
 
     wake_registry = _registry = _open_registry()
     assets = _assets = em_device_assets.DeviceAssets(wake_registry, alert_lookup=em_sounds.asset_path)
@@ -1279,7 +1292,7 @@ async def main() -> None:
     await engine.start()
     background: list[asyncio.Task[None]] = [
         _spawn(engine.run(), "alerts"),
-        _spawn(api.release_poll_loop(), "release-poll"),
+        _spawn(api.controller_release_poll_loop(), "controller-release-poll"),
         _spawn(api.session_prune_loop(), "session-prune"),
         _spawn(event_loop_lag_monitor(), "loop-lag"),
     ]

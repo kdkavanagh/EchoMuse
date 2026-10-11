@@ -62,7 +62,7 @@ T = TypeVar("T")
 # Device columns safe to publish. Names are listed rather than filtered so a
 # future column is excluded by default.
 _DEVICE_FIELDS = (
-    "device_id", "approved", "firmware_ver", "firmware_previous",
+    "device_id", "approved", "firmware_ver", "firmware_previous", "os_version",
     "first_seen", "last_seen", "config_sections", "use_global_config",
     "esphome_port", "ble_proxy_port", "ble_proxy_enabled",
     # A device in sample-collection or ambient-recording mode answers nothing
@@ -90,6 +90,8 @@ _TURN_FIELDS = (
     "endpoint_class", "endpoint_ms", "intent_ms", "intent_local", "response_type",
     # endpoint commit → response audible (schema 26)
     "first_audio_ms",
+    # end of the last word → the response's first frame, device clock (schema 30)
+    "response_latency_ms",
 )
 
 # Hourly device metrics, named as `db.get_device_metrics` RETURNS them, not as
@@ -504,9 +506,9 @@ def to_json(bundle: Mapping[str, object]) -> str:
 # denylist here gets it wrong once, publicly, and cannot be taken back.
 
 # Properties worth having, chosen against failures actually seen. Build
-# identity dominates because firmware defaults differ between the six FireOS 5
-# builds in circulation in ways that reach USB and ADB behaviour (#79), and
-# "which build" was the first question on every provisioning issue so far.
+# identity dominates because firmware defaults have differed between builds in
+# ways that reach USB and ADB behaviour (#79), and "which build" was the first
+# question on every provisioning issue so far.
 _PROVISION_PROPS = (
     "ro.product.model",
     "ro.product.name",
@@ -540,18 +542,20 @@ class ProvisionProbe(enum.StrEnum):
     """Probe names the wizard may post. Anything else is dropped."""
 
     PROPS = "props"                  # getprop, filtered to _PROVISION_PROPS
-    ROOT = "root"                    # su -c id
+    ROOT = "root"                    # id (Fire OS 6 shell is already uid 0)
     SELINUX = "selinux"              # getenforce
-    PM_READY = "pm_ready"            # pm path android
     STORAGE = "storage"              # df /data
     WPA_STATUS = "wpa_status"        # wpa_cli status
     WPA_SCAN = "wpa_scan"            # wpa_cli scan_results
     WPA_CAPS = "wpa_caps"            # wpa_cli get_capability key_mgmt
     SERVICES = "services"            # getprop | grep init.svc
     PROCESSES = "processes"          # wpa_supplicant / SmartHomeWifid counts
-    PACKAGES = "packages"            # how many of the disable/hide lists are still visible
     DATA_PROPERTY = "data_property"  # filenames only
-    BOOT_TARGET = "boot_target"      # what /dev/block/other-boot resolves to (TWRP steps)
+    MIXER_SERVICE = "mixer_service"        # getprop init.svc.mixer
+    ECHOMUSE_SERVICE = "echomuse_service"  # getprop init.svc.echomuse
+    MIXER_STREAMS = "mixer_streams"        # ls -l /data/mixer_streams
+    ECHOMUSE_RC = "echomuse_rc"            # cat /system/etc/init/echomuse.rc
+    SLOT_SUFFIX = "slot_suffix"            # getprop ro.boot.slot_suffix
 
 
 class WpaScanRow(TypedDict):

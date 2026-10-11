@@ -8,6 +8,13 @@ Why a gain at all: native-AFE speech sits near −40 dBFS, where the deployed
 faster-whisper silently drops quiet leading words ("How many ounces are in a
 cup?" arrives as "ounces are in a cup."). +20 dB fixed that on every measured
 turn; +25 dB made two of ten clips worse, so the nominal value stays at 20.
+
+Why silence after it: the span ends 192 ms after the last loud command speech,
+often while a quieter last word is still sounding, and HA's speech-to-text
+drops a word with no silence after it ("what time is it" arrives as "what time
+is"). Over 60 saved copies, 10 lost their last word as sent and none did with
+0.2 s or 0.5 s of silence appended (2026-10-09). The silence is added only to
+what HA receives; the copy itself, and a saved recording of it, stay the span.
 """
 
 from __future__ import annotations
@@ -21,6 +28,9 @@ import em_ns
 log = logging.getLogger("echomuse.stt_copy")
 
 ASR_GAIN_NOMINAL_DB = 20.0
+
+# Appended to the STT copy as HA receives it: 0.5 s of 16 kHz S16 silence.
+STT_TAIL_SILENCE = bytes(2 * 8_000)
 
 # The wake word is spoken at the command's level on average (mean offset
 # −0.3 dB over eight measured turns) but with ±5 dB scatter uncorrelated with

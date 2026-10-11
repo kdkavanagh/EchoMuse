@@ -65,6 +65,18 @@ const RetryInterval = 30 * time.Second
 // point it at a fixture directory — nothing reassigns it at runtime.
 var i2cGlob = "/sys/bus/i2c/devices/*/name"
 
+// iioDriverName is the IIO `name` attribute of the second-sourced ALS that a
+// Fire OS 6 kernel binds instead of the tsl2540 — the tsl258x driver sets
+// indio_dev->name from the i2c client name (upstream tsl2583.c), which is
+// the same "tsl2584tsv" board string already seen at i2c 0-0029 (never
+// bound there: -6/ENXIO, see above). docs/fireos6-port.md §2.
+const iioDriverName = "tsl2584tsv"
+
+// iioGlob is where the IIO bus is enumerated — one `name` file per
+// iio:deviceN, same shape as i2cGlob. A variable only so tests can point it
+// at a fixture directory.
+var iioGlob = "/sys/bus/iio/devices/iio:device*/name"
+
 // StatusCode is why the sensor is or is not available. Stable identifiers,
 // because the controller and dashboard key off them; the human-readable
 // part rides in Status.Detail.
@@ -134,6 +146,12 @@ var (
 // with nothing in the log to say the answer had been frozen. Absence must
 // stay re-checkable; a device that gains the sensor picks it up on the next
 // scan and declares the capability at its next registration.
+//
+// On the Fire OS 6 Dots measured the tsl2540 is never bound (board data
+// lists it; nothing answers at 0x39 — see the package doc). They bind the
+// second-sourced tsl2584tsv over IIO instead of the raw i2c bus, through the
+// tsl258x driver. So the i2c scan runs first — it matches a Dot whose
+// tsl2540 answers — and the IIO bus is tried only once it comes up empty.
 func resolve() string {
 	mu.Lock()
 	defer mu.Unlock()
@@ -145,45 +163,16 @@ func resolve() string {
 	}
 	lastScan = time.Now()
 
-	names, err := filepath.Glob(i2cGlob)
+	seen, nameMatched, found, err := scanBus(i2cGlob, driverName, "als_lux")
 	if err != nil {
 		status = Status{Code: StatusUnknown, Detail: "could not enumerate the i2c bus"}
 		return ""
 	}
-	// Record what IS on the bus, so an absence can be diagnosed remotely
-	// from a log line instead of a round trip asking someone to run i2c
-	// commands on a device they just flashed.
-	//
-	// The WHOLE bus is enumerated before matching, rather than stopping at
-	// the sensor. Returning early left `Seen` truncated at whatever happened
-	// to sort before tsl2540 — and comparing a working device's bus against
-	// a broken one's is the entire point of the field, so a partial list from
-	// the healthy side defeats it. Caught on hardware; the fixtures could not
-	// see it because none of them had devices sorting after the match.
-	seen := make([]string, 0, len(names))
-	nameMatched := false
-	found := ""
-	for _, n := range names {
-		b, err := os.ReadFile(n)
-		if err != nil {
-			continue
-		}
-		got := strings.TrimSpace(string(b))
-		seen = append(seen, got)
-		if got != driverName {
-			continue
-		}
-		nameMatched = true
-		p := filepath.Join(filepath.Dir(n), "als_lux")
-		// A matching name is not enough: the name is board-file data and
-		// is present whether or not the chip is, so als_lux existing is
-		// what separates a fitted sensor from a declared one.
-		if _, err := os.Stat(p); err != nil {
-			continue
-		}
-		if found == "" {
-			found = p
-		}
+	if found == "" {
+		iioSeen, iioMatched, iioFound, _ := scanBus(iioGlob, iioDriverName, "illuminance0_input")
+		seen = append(seen, iioSeen...)
+		nameMatched = nameMatched || iioMatched
+		found = iioFound
 	}
 	if found != "" {
 		path = found
@@ -197,30 +186,72 @@ func resolve() string {
 	if nameMatched {
 		status = Status{
 			Code:   StatusNoAttribute,
-			Detail: driverName + " is on the i2c bus but exposes no als_lux attribute — the driver has not bound",
+			Detail: "a known ALS name (" + driverName + " i2c / " + iioDriverName + " iio) is on the bus but exposes no readable lux attribute — the driver has not bound",
 			Seen:   seen,
 		}
 	} else {
 		status = Status{
 			Code:   StatusNoChip,
-			Detail: "no " + driverName + " on the i2c bus — this hardware revision appears not to have the sensor fitted",
+			Detail: "no " + driverName + " on the i2c bus or " + iioDriverName + " on the iio bus — this hardware revision appears not to have the sensor fitted",
 			Seen:   seen,
 		}
 	}
 	if !reported {
 		reported = true
 		// The two failures need opposite fixes and look identical from the
-		// controller, so name which one it is: no chip on the bus at all,
-		// versus the chip present with no driver attribute bound to it.
+		// controller, so name which one it is: no chip on either bus at
+		// all, versus a chip present with no driver attribute bound to it.
 		if nameMatched {
-			log.Printf("[als] %s found but no als_lux attribute — driver not bound; "+
-				"ambient light unavailable", driverName)
+			log.Printf("[als] a known ALS name found but no readable lux attribute — driver not bound; " +
+				"ambient light unavailable")
 		} else {
-			log.Printf("[als] no %s on i2c (saw: %s) — ambient light unavailable, "+
-				"rechecking every %s", driverName, strings.Join(seen, ","), RetryInterval)
+			log.Printf("[als] no %s (i2c) or %s (iio) found (saw: %s) — ambient light unavailable, "+
+				"rechecking every %s", driverName, iioDriverName, strings.Join(seen, ","), RetryInterval)
 		}
 	}
 	return ""
+}
+
+// scanBus enumerates a sysfs bus of one `name` file per device (glob) and
+// reports whether wantName was among them and, when its sibling attrFile
+// exists too, where to read the sensor from.
+//
+// The WHOLE bus is enumerated before matching, rather than stopping at the
+// sensor: Seen exists so a no_chip answer is verifiable against what IS on
+// the bus, and comparing a healthy device's bus against a broken one's is
+// the entire point — a list truncated at the match defeats it (caught on
+// hardware; the original i2c-only fixtures could not see it, since none had
+// a device sorting after tsl2540).
+//
+// A matching name with no attrFile means the identifier is present (board
+// data on i2c, board-registered on IIO) but no driver actually bound to the
+// part — see the package doc.
+func scanBus(glob, wantName, attrFile string) (seen []string, nameMatched bool, foundPath string, err error) {
+	names, err := filepath.Glob(glob)
+	if err != nil {
+		return nil, false, "", err
+	}
+	seen = make([]string, 0, len(names))
+	for _, n := range names {
+		b, err := os.ReadFile(n)
+		if err != nil {
+			continue
+		}
+		got := strings.TrimSpace(string(b))
+		seen = append(seen, got)
+		if got != wantName {
+			continue
+		}
+		nameMatched = true
+		p := filepath.Join(filepath.Dir(n), attrFile)
+		if _, err := os.Stat(p); err != nil {
+			continue
+		}
+		if foundPath == "" {
+			foundPath = p
+		}
+	}
+	return seen, nameMatched, foundPath, nil
 }
 
 // Present reports whether this device has a readable ambient light sensor.
