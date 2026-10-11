@@ -55,6 +55,7 @@ from em_wake_phrase import (
     final_command_text,
     locate_streaming,
     normalize_command,
+    words_after,
 )
 
 SAMPLE_RATE = 16_000
@@ -259,7 +260,8 @@ class Commit:
     turns), `source` whose words it is (the pause server's when it equals any text judged
     on them, else Kroko's pause decode's, else the live stream's);
     `wake_window` locates the wake phrase in the streaming transcript for
-    the final-transcript strip; `local_action` is the §6.3 local command, if any.
+    the final-transcript strip, and `wake_tail` counts that transcript's words after
+    it (all of them without one); `local_action` is the §6.3 local command, if any.
     `decided_at` is the evidence frontier (sample) the reducer committed at, so
     `decided_at − boundary` is the silence it waited; `completeness` is the
     grammar class of `text` at that moment.
@@ -273,6 +275,7 @@ class Commit:
     text: str
     redecode_required: bool
     wake_window: Window | None
+    wake_tail: int
     local_action: LocalAction | None
     decided_at: int
     completeness: GrammarClass
@@ -416,12 +419,15 @@ def streaming_command(spec: UtteranceSpec, transcript: StreamingTranscript) -> t
     return cut.text, None, cut.first_token_sample
 
 
-def pause_command(spec: UtteranceSpec, text: str, window: Window | None) -> str:
+def pause_command(spec: UtteranceSpec, text: str, window: Window | None, tail: int) -> str:
     """The judged text of a pause server's transcript, which has no word timings: the
     wake phrase is cut as from HA's final transcript, near where the streaming
-    transcript placed it (§16.6 step 3), then normalized like the streaming text."""
+    transcript placed it (§16.6 step 3), then normalized like the streaming text.
+    `tail` is the streaming transcript's word count after `window` (`words_after`)."""
     if spec.kind == UtteranceKind.WAKE and spec.wake_phrase and spec.wake_open is not None:
-        text = final_command_text(text, wake_initiated=True, streaming_window=window, wake_phrase=spec.wake_phrase)
+        text = final_command_text(
+            text, wake_initiated=True, streaming_window=window, streaming_tail=tail, wake_phrase=spec.wake_phrase
+        )
     return normalize_command(text)
 
 
@@ -491,6 +497,7 @@ class Utterance:
         self._text = ""
         self._heard = ""
         self._window: Window | None = None
+        self._wake_tail = 0
         self._first_token: int | None = None
         self._events: list[EndpointEvent] = []
         self._pauses: list[PauseTrace] = []
@@ -678,6 +685,7 @@ class Utterance:
 
     def _push_text(self, result: _AsrResult) -> None:
         text, window, first = streaming_command(self.spec, result.transcript)
+        tail = words_after(result.transcript, window)
         heard = result.transcript.text.strip()
         # The pause these words belong to: a finalized result opens it, and the server's
         # transcript rides only the latest finalize's results.
@@ -687,12 +695,12 @@ class Utterance:
             self._kroko_texts.add(text)
         if result.pause_text is not None:
             # Words from the pause server; Kroko still places the wake phrase and the command's start.
-            text, heard = pause_command(self.spec, result.pause_text, window), result.pause_text.strip()
+            text, heard = pause_command(self.spec, result.pause_text, window, tail), result.pause_text.strip()
             self._server_texts.add(text)
             server = pause["server"] if pause is not None else None
             if server is not None and server["at"] is None:
                 server["judged"], server["at"] = text, result.through
-        self._text, self._window, self._first_token, self._heard = text, window, first, heard
+        self._text, self._window, self._wake_tail, self._first_token, self._heard = text, window, tail, first, heard
         self._stability.push(text, result.through, result.blanks)
 
     def _source(self, text: str) -> TextSource:
@@ -721,6 +729,7 @@ class Utterance:
             text=commit.text,
             redecode_required=commit.redecode_required,
             wake_window=self._window,
+            wake_tail=self._wake_tail,
             local_action=action,
             decided_at=decided_at,
             completeness=self._completeness(commit.text),

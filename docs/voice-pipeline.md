@@ -326,9 +326,13 @@ transcript shows where it was said, and everything up to and including the
 closest match to "Ophelia" near that position in HA's transcript is removed.
 "Ophelia, what does Ophelia mean?" becomes "what does Ophelia mean?". The live
 recognizer can miss a quiet wake word entirely; then the match is sought at
-the start of HA's transcript instead. A leftover "Ophelia," would stop Home
-Assistant's built-in sentences from matching and hand the request to your
-conversation agent.
+the start of HA's transcript instead. It can also drop words said before the
+wake word that HA's transcript keeps ("I gotta go faster. Ophelia what time is
+it?"); when no match lies near the live transcript's position, a match
+elsewhere is still removed if about as many words follow it as followed the
+wake word in the live transcript (within two). A leftover "Ophelia," would
+stop Home Assistant's built-in sentences from matching and hand the request to
+your conversation agent.
 
 Then the request goes to one of four places:
 

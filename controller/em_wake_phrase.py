@@ -16,6 +16,9 @@ MATCH_DISTANCE = 0.45
 MAX_WINDOW_WORDS = 3
 # §16.6: the streaming window must end by candidate open + the verification lookahead.
 LOOKAHEAD_SAMPLES = 7_680  # 480 ms at 16 kHz
+# §16.6 step 3 fallback: words after a final-transcript window may differ from the
+# streaming transcript's words after its window by at most this many.
+TAIL_TOLERANCE = 2
 # §16.6 wake verification.
 VERIFY_DISTANCE = 0.40
 
@@ -194,27 +197,50 @@ def locate_streaming(transcript: StreamingTranscript, wake_phrase: str, deadline
     return min(candidates, key=lambda w: (w.distance, w.start))
 
 
-def strip_final(final_text: str, streaming_start: int, wake_phrase: str) -> str:
-    """Step 3: remove the matching window near `streaming_start` and everything before it."""
+def words_after(transcript: StreamingTranscript, window: Window | None) -> int:
+    """`nk`: words of the streaming transcript after step 2's window (all of them without one)."""
+    return len(transcript.words) - (window.stop if window is not None else 0)
+
+
+def strip_final(final_text: str, streaming_start: int, streaming_tail: int, wake_phrase: str) -> str:
+    """Step 3: remove the matching window near `streaming_start` and everything before it.
+
+    With no window there, fall back to the window whose following word count is closest
+    to `streaming_tail`, if within TAIL_TOLERANCE: the STT kept speech said before the
+    wake word that the streaming transcript dropped.
+    """
     ws = words(final_text)
-    candidates = [w for w in minimal_windows(ws, wake_phrase) if w.start <= streaming_start + 1]
-    if not candidates:
+    windows = minimal_windows(ws, wake_phrase)
+    candidates = [w for w in windows if w.start <= streaming_start + 1]
+    if candidates:
+        best = min(candidates, key=lambda w: (w.distance, abs(w.start - streaming_start), w.start))
+    elif windows:
+        best = min(windows, key=lambda w: (abs(len(ws) - w.stop - streaming_tail), w.start, w.distance))
+        if abs(len(ws) - best.stop - streaming_tail) > TAIL_TOLERANCE:
+            return final_text
+    else:
         return final_text
-    best = min(candidates, key=lambda w: (w.distance, abs(w.start - streaming_start), w.start))
     return final_text[_cut_through(final_text, ws[best.stop - 1].end):]
 
 
 def final_command_text(
-    final_text: str, *, wake_initiated: bool, streaming_window: Window | None, wake_phrase: str
+    final_text: str,
+    *,
+    wake_initiated: bool,
+    streaming_window: Window | None,
+    streaming_tail: int,
+    wake_phrase: str,
 ) -> str:
     """Steps 1–3: the HA transcript routed onward. Only wake-initiated turns strip anything.
 
     When the streaming transcript has no window (Kroko can drop a quiet wake word),
     step 3 runs with `s` = 0: the wake word is assumed to open the utterance.
+    `streaming_tail` is `words_after()` of the transcript `streaming_window` came from.
     """
     if not wake_initiated:
         return final_text
-    return strip_final(final_text, streaming_window.start if streaming_window is not None else 0, wake_phrase)
+    start = streaming_window.start if streaming_window is not None else 0
+    return strip_final(final_text, start, streaming_tail, wake_phrase)
 
 
 def command_text(transcript: StreamingTranscript, window: Window | None) -> CommandText:

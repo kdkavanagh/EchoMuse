@@ -7,6 +7,7 @@ from em_wake_phrase import (
     locate_streaming,
     verify_wake,
     words,
+    words_after,
 )
 
 
@@ -18,6 +19,18 @@ def stream(text_tokens, samples=None):
 def located(tokens, wake="ophelia", deadline=10_000):
     transcript = stream(tokens)
     return transcript, locate_streaming(transcript, wake, deadline)
+
+
+def strip(final, tokens, *, wake_initiated=True):
+    """Steps 2–3: locate the wake phrase in the streaming `tokens`, then strip `final`."""
+    transcript, found = located(tokens)
+    return final_command_text(
+        final,
+        wake_initiated=wake_initiated,
+        streaming_window=found,
+        streaming_tail=words_after(transcript, found),
+        wake_phrase="ophelia",
+    )
 
 
 def test_words_keep_original_character_spans():
@@ -41,42 +54,60 @@ def test_streaming_location_uses_deadline_lowest_distance_then_earliest():
     assert found is not None and found.start == 1
 
 
+def test_words_after_counts_the_streaming_tail():
+    transcript, found = located(["Sure.", " Pophilia.", " What", " time", " is", " it?"])
+    assert found is not None and found.start == 1
+    assert words_after(transcript, found) == 4
+    assert words_after(transcript, None) == 6
+
+
 def test_preamble_and_first_wake_are_removed_verbatim():
-    transcript, found = located(
-        ["Damn", " it.", " Oh", " hell", " yeah,", " Ophelia.", " Turn", " off", " the", " lights."]
-    )
+    tokens = ["Damn", " it.", " Oh", " hell", " yeah,", " Ophelia.", " Turn", " off", " the", " lights."]
+    transcript, found = located(tokens)
     assert found is not None and found.start == 5
-    final = "Damn it. Oh hell yeah, Ophelia. Turn off the lights."
-    assert final_command_text(final, wake_initiated=True, streaming_window=found, wake_phrase="ophelia") == (
-        "Turn off the lights."
-    )
+    assert strip("Damn it. Oh hell yeah, Ophelia. Turn off the lights.", tokens) == "Turn off the lights."
     cmd = command_text(transcript, found)
     assert cmd.text == "turn off the lights"
     assert cmd.first_token_sample == 6 * 640
 
 
-def test_later_mention_is_never_removed():
-    transcript, found = located(["Ophelia,", " what", " does", " Ophelia", " mean?"])
-    assert found is not None and found.start == 0
-    assert final_command_text(
-        "Ophelia, what does Ophelia mean?",
-        wake_initiated=True,
-        streaming_window=found,
-        wake_phrase="ophelia",
-    ) == "what does Ophelia mean?"
+@pytest.mark.parametrize(
+    ("final", "tokens", "expected"),
+    [
+        ("Ophelia, what does Ophelia mean?", ["Ophelia,", " what", " does", " Ophelia", " mean?"],
+         "what does Ophelia mean?"),
+        ("Yeah. Ophelia. What was the score of the White Sox game?",
+         ["Sure.", " Pophilia.", " What", " was", " the", " score", " of", " the", " White", " socks", " game?"],
+         "What was the score of the White Sox game?"),
+    ],
+)
+def test_wake_near_the_streaming_match_is_removed(final, tokens, expected):
+    assert strip(final, tokens) == expected
 
 
-def test_dropped_leading_wake_word_does_not_strip_later_mention():
-    _, found = located(["Ophelia,", " what", " does", " Ophelia", " mean?"])
-    assert found is not None and found.start == 0
-    final = "what does Ophelia mean?"
-    assert final_command_text(final, wake_initiated=True, streaming_window=found, wake_phrase="ophelia") == final
+def test_speech_before_the_wake_word_dropped_by_streaming_is_removed():
+    # Turn 552: the STT kept "I gotta go faster." that Kroko dropped, so the final
+    # match sits at index 4 > s + 1; the four words after it match Kroko's four.
+    final = "I gotta go faster. Ophelia What time is it?"
+    assert strip(final, ["Ophilia.", " What", " time", " is", " it?"]) == "What time is it?"
+
+
+@pytest.mark.parametrize(
+    ("final", "tokens"),
+    [
+        # STT dropped the leading wake word: one word follows the mention, Kroko heard four.
+        ("what does Ophelia mean?", ["Ophelia,", " what", " does", " Ophelia", " mean?"]),
+        ("what does Ophelia mean", ["Ophelia", " what", " does", " Ophelia", " mean"]),
+        # "opera" matches the wake phrase, but one word follows it, not four.
+        ("play some opera music", ["Ophelia", " play", " some", " opera", " music"]),
+    ],
+)
+def test_later_mention_is_never_removed(final, tokens):
+    assert strip(final, tokens) == final
 
 
 def test_dropped_wake_word_leaves_plain_command_unchanged():
-    _, found = located(["Ophelia", " turn", " off", " the", " lights"])
-    final = "Turn off the lights."
-    assert final_command_text(final, wake_initiated=True, streaming_window=found, wake_phrase="ophelia") == final
+    assert strip("Turn off the lights.", ["Ophelia", " turn", " off", " the", " lights"]) == "Turn off the lights."
 
 
 @pytest.mark.parametrize(
@@ -87,31 +118,29 @@ def test_dropped_wake_word_leaves_plain_command_unchanged():
     ],
 )
 def test_final_fuzzy_spellings_strip(final, expected):
-    _, found = located(["Ophelia", " turn", " off", " the", " lights"])
-    assert final_command_text(final, wake_initiated=True, streaming_window=found, wake_phrase="ophelia") == expected
+    assert strip(final, ["Ophelia", " turn", " off", " the", " lights"]) == expected
 
 
 def test_button_and_reply_turns_never_strip():
-    _, found = located(["Ophelia", " stop"])
-    text = "Ophelia, stop."
-    assert final_command_text(text, wake_initiated=False, streaming_window=found, wake_phrase="ophelia") == text
+    assert strip("Ophelia, stop.", ["Ophelia", " stop"], wake_initiated=False) == "Ophelia, stop."
 
 
 @pytest.mark.parametrize(
-    "final,expected",
+    ("final", "tokens", "expected"),
     [
-        ("Ophelia, what's the weather?", "what's the weather?"),
-        ("Okay Ophelia, what's the weather?", "what's the weather?"),
-        ("what does Ophelia mean?", "what does Ophelia mean?"),
-        ("Damn it, Ophelia, turn off the lights.", "Damn it, Ophelia, turn off the lights."),
+        ("Ophelia, what's the weather?", ["What's", " the", " weather?"], "what's the weather?"),
+        ("Okay Ophelia, what's the weather?", ["What's", " the", " weather?"], "what's the weather?"),
+        # A longer preamble: stripped when the words after the match agree with Kroko's.
+        ("Damn it, Ophelia, turn off the lights.", ["Turn", " off", " the", " lights."], "turn off the lights."),
+        ("Damn it, Ophelia, turn off the lights.",
+         ["Damn", " it,", " oh,", " feel", " ya,", " turn", " off", " the", " lights."],
+         "Damn it, Ophelia, turn off the lights."),
     ],
 )
-def test_missing_streaming_match_strips_only_at_utterance_start(final, expected):
+def test_missing_streaming_match(final, tokens, expected):
     # Kroko dropped the quiet wake word (turn 433): no streaming window, so s = 0.
-    transcript = stream(["What's", " the", " weather?"])
-    found = locate_streaming(transcript, "ophelia", 10_000)
-    assert found is None
-    assert final_command_text(final, wake_initiated=True, streaming_window=found, wake_phrase="ophelia") == expected
+    assert locate_streaming(stream(tokens), "ophelia", 10_000) is None
+    assert strip(final, tokens) == expected
 
 
 def test_oh_feel_ya_is_not_a_wake_match():

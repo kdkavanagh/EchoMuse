@@ -554,6 +554,17 @@ Based on a review of Office turns 433–476 (`docs/turn-latency-review.md`,
   `GET /api/devices/{id}/samples/{name}/afe` and `…/ambient/{name}/afe` serve
   one. Needs `afe_metadata_v1`, and no firmware update; recordings made
   before this, or without the capability, have no chart.
+- **Speech before the wake word no longer reaches Home Assistant.** When
+  Home Assistant's speech-to-text keeps words said before "Ophelia" that the
+  streaming recognizer dropped, the wake word sat too far into HA's
+  transcript to be found, and the whole sentence went on unchanged: turn 552,
+  transcribed without the STT server's VAD clip, would have sent "I gotta go
+  faster. Ophelia What time is it?" to intent. A wake word found elsewhere in
+  HA's transcript is now removed, with everything before it, when the number
+  of words after it is within two of the number the streaming recognizer
+  heard after its own wake word, so that turn sends "What time is it?". A
+  later mention ("what does Ophelia mean" with the wake word dropped) still
+  has too few words after it and is kept.
 
 ### Earlier in this release
 

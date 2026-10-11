@@ -2067,7 +2067,7 @@ class SessionActor:
                 if commit.source == TextSource.SERVER and spec.pause_server is not None:
                     # The committed text is the pause server's words: re-decode with the same server.
                     text = await self.deps.worker.transcribe_span(pcm, spec.pause_server)
-                    redecoded = pause_command(spec, text, commit.wake_window)
+                    redecoded = pause_command(spec, text, commit.wake_window, commit.wake_tail)
                 else:
                     tokens, seconds = await self.deps.worker.decode_span(pcm)
                     redecoded = redecoded_command(spec, tokens, seconds)
@@ -2111,6 +2111,7 @@ class SessionActor:
         turn.stt_raw = final
         text = final_command_text(
             final, wake_initiated=turn.trigger == UtteranceKind.WAKE, streaming_window=commit.wake_window,
+            streaming_tail=commit.wake_tail,
             wake_phrase=turn.model.wake_phrase if turn.model is not None else "",
         ).strip()
         turn.stt_text = text
