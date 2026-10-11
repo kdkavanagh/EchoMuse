@@ -383,6 +383,19 @@ Based on a review of Office turns 433–476 (`docs/turn-latency-review.md`,
   and the wait. The Config → Speech → **Follow-up answers** setting
   (`replyOnset`) is gone; schema v31 removes it from saved configurations,
   and the API rejects it.
+- **"Ophelia, stop" pauses what the Dot is playing (policy `post_afe_8`).**
+  A wake while the Dot's own media player plays — the news, a radio stream,
+  anything Home Assistant or Music Assistant sent to its `media_player` —
+  takes "stop" or "pause" as a local command: the controller pauses it
+  without Home Assistant, as HA's pause button would, and HA shows it paused
+  at once. "Resume" stays Home Assistant's. Before, the request went to Home
+  Assistant, whose "stop" pauses only exposed players, and the Dots' own
+  players are usually unexposed; the Kitchen's newscast played on through two
+  "Okay."s. Another Dot that hears the same wake first still answers anything
+  else, but no longer swallows the stop: the playing Dot keeps listening for
+  it, silently (turn 654, where the idle Living Room Dot won and heard
+  nothing). "Cancel" and "stop the music" still go to Home Assistant. A bare
+  "pause" now ends after the short pause, like "stop".
 - **Configurable wake open rules, with shadow rules to try them first.**
   Firmware with the new `open_rules_v1` capability opens a wake on any of a
   list of rules (last 1–3 scores, average or every one, ≥ a threshold). The

@@ -28,7 +28,8 @@ hear the answer through the Dot's speaker.
   Training models happens outside this repository.
 - **Barge-in and "stop"** — say the wake word while the Dot is talking to cut
   it off. "Ophelia, stop" and "Ophelia, snooze" work while a timer or alarm
-  rings; so does a tap on the action button.
+  rings; so does a tap on the action button. "Ophelia, stop" (or "pause")
+  pauses what the Dot itself is playing, without Home Assistant.
 - **Timers the Home Assistant way** — timers are HA's native satellite timers
   (set by voice or by an LLM agent); when one finishes, the Dot rings. The
   LED ring shows the time remaining.

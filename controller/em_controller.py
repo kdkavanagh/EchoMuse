@@ -433,6 +433,8 @@ class _Host:
             persist_turn=lambda rec: _persist_turn(device_id, rec),
             record_continuation=lambda row_id, outcome: asyncio.to_thread(
                 db.set_turn_continuation, row_id, outcome),
+            media_playing=lambda: em_player.is_playing(device_id),
+            pause_media=lambda: em_player.pause(device_id),
         )
         return em_session.SessionActor(device_id, deps)
 

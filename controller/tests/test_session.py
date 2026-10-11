@@ -439,6 +439,8 @@ class Harness:
         self.config = {"wakeSound": True, "wakeArbitrationMs": 700, **(config or {})}
         self.link.render = self.render
         self.no_input_chime = no_input_chime   # the device announces no_input_chime
+        self.media_playing = False              # the Dot's own content player
+        self.media_pauses = 0
 
         async def persist(row):
             self.rows.append(row)
@@ -450,6 +452,9 @@ class Harness:
         async def pipeline():
             return "p1"
 
+        async def pause_media():
+            self.media_pauses += 1
+
         async def esphome_reply(pcm):
             self.replies.append(pcm)
             for e in self.reply_events:
@@ -460,7 +465,8 @@ class Harness:
             config=lambda: self.config, ha_device_id=lambda: "hadev", recognizer=lambda: self.ha.recognizer,
             pipeline_id=pipeline,
             vocabulary=lambda: None, esphome_reply=esphome_reply, persist_turn=persist,
-            record_continuation=record_continuation))
+            record_continuation=record_continuation, media_playing=lambda: self.media_playing,
+            pause_media=pause_media))
         self.worker.actor = self.actor
         self.actor.add_listener(self.events.append)
         self.device = Device(self.actor, afe)
@@ -703,6 +709,67 @@ def test_wake_then_stop_with_a_ringing_alarm_dismisses_it_locally_without_home_a
         row = h.rows[0]
         assert row["outcome"] == "local_command" and row["terminal_reason"] == "completed"
         assert row["commit_route"] == "A" and row["stt_text"] == "stop"
+        await h.actor.close()
+    run(main())
+
+
+@pytest.mark.parametrize("word, local", [("STOP", True), ("PAUSE", True), ("CANCEL", False)])
+def test_stop_or_pause_while_the_dot_plays_content_pauses_it_without_home_assistant(word, local):
+    async def main():
+        h = Harness()
+        h.media_playing = True
+        said = (OPEN + 3_200, OPEN + 7_296)
+        h.worker.vad = speech((S, OPEN - 512), said)
+        h.device.level = levels((S, OPEN - 512), said)
+        h.worker.tokens = [("▁OPHELIA", OPEN - 1_800), (f"▁{word}", OPEN + 5_200)]
+        h.ha.stt_text = f"Ophelia, {word.lower()}."
+        h.ha.next_run = FakeRun([IntentEnded("", None, False, "action_done", True), RunEnded()])
+        await h.start()
+        h.actor.on_message(candidate())
+        await h.settle()
+        assert h.render.local == [("earcon", "builtin:wake_chime")]   # content only ducks: the wake still chimes
+        await h.feed(S - 4_800 - 20_000, OPEN + 40_000)
+        await h.wait_for(lambda: h.rows)
+        row = h.rows[0]
+        if local:
+            assert row["outcome"] == "local_command" and row["stt_text"] == word.lower()
+            assert h.media_pauses == 1 and h.ha.stt_calls == [] and h.ha.intents == []
+        else:                                   # "cancel" stops alerts and replies, never content
+            assert row["outcome"] == "ha" and len(h.ha.intents) == 1 and h.media_pauses == 0
+        await h.actor.close()
+    run(main())
+
+
+# Turn 654 (2026-10-11 12:17, Kitchen): "Ophelia, stop" over the Kitchen Dot's newscast lost
+# arbitration to the idle Living Room Dot, which answered nothing; the newscast played on.
+@pytest.mark.parametrize("words, local", [(["▁STOP"], True),
+                                          (["▁WHAT", "▁TIME", "▁IS", "▁IT"], False)])
+def test_a_wake_over_the_dots_content_that_lost_arbitration_acts_only_on_a_local_command(words, local):
+    async def main():
+        h = Harness()
+        h.media_playing = True
+        said = (OPEN + 3_200, OPEN + 11_392)
+        h.worker.vad = speech((S, OPEN - 512), said)
+        h.device.level = levels((S, OPEN - 512), said)
+        h.worker.tokens = [("▁OPHELIA", OPEN - 1_800)] + [(w, OPEN + 4_000 + 2_000 * i)
+                                                         for i, w in enumerate(words)]
+        await h.start()
+        h.arbiter.claim("living_room", 0.7)
+        h.actor.on_message(candidate())
+        await h.settle()
+        assert h.link.of("focus.acquire") and h.render.local == []   # it listens; the winner chimes
+        await h.feed(S - 4_800 - 20_000, OPEN + 80_000)
+        await h.wait_for(lambda: h.rows)
+        row = h.rows[0]
+        assert h.ha.stt_calls == [] and h.ha.intents == []
+        assert h.cues() == [] and h.render.local == []
+        assert json.loads(row["decision_trace"])["local_only"] is True
+        if local:
+            assert row["outcome"] == "local_command" and row["terminal_reason"] == "completed"
+            assert h.media_pauses == 1
+        else:
+            assert row["outcome"] is None and row["terminal_reason"] == "arbitration_lost"
+            assert h.media_pauses == 0
         await h.actor.close()
     run(main())
 

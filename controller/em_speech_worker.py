@@ -71,7 +71,7 @@ ERRORS_UNAVAILABLE = 3
 PROBE_INTERVAL_S = 10.0
 PROBE_DEADLINE_S = 1.0
 PROBES_TO_RECOVER = 2
-POLICY_REVISION = "post_afe_7"
+POLICY_REVISION = "post_afe_8"
 
 
 class ObservationSource(enum.StrEnum):

@@ -159,6 +159,7 @@ def test_parse_alarm_query(text: str, parse: AlarmQuery | None) -> None:
 PASTA_TIMER = CommandContext("alert", "timer", "pasta")
 WAKE_ALARM = CommandContext("alert", "alarm", "wake up")
 DIALOG = CommandContext("dialog")
+MEDIA = CommandContext("media")
 
 
 @pytest.mark.parametrize(
@@ -182,6 +183,15 @@ DIALOG = CommandContext("dialog")
         ("don't stop", PASTA_TIMER, None),
         ("stop the music", PASTA_TIMER, None),
         ("snooze for", WAKE_ALARM, None),
+        ("stop", MEDIA, "pause"),
+        ("pause please", MEDIA, "pause"),
+        ("cancel", MEDIA, None),
+        ("snooze", MEDIA, None),
+        ("stop the timer", MEDIA, None),
+        ("stop the music", MEDIA, None),
+        ("pause", DIALOG, None),
+        ("pause", WAKE_ALARM, None),
+        ("pause", None, None),
     ],
 )
 def test_match_local_command(text: str, context: CommandContext | None, command: str | None) -> None:

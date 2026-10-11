@@ -41674,6 +41674,11 @@ please cancel	local	complete
 cancel please	local	complete
 please snooze	local	complete
 snooze please	local	complete
+pause	local	complete
+please pause	local	complete
+pause please	local	complete
+pause the music	local	unknown
+pause the timer	local	unknown
 stop the timer	local	complete
 cancel timer	local	complete
 turn off the timer	local	complete

@@ -468,6 +468,8 @@ class ActorDeps:
     esphome_reply: Callable[[bytes], AsyncIterator[RunEvent]]
     persist_turn: Callable[[TurnRow], Awaitable[int]]
     record_continuation: Callable[[int, str], Awaitable[None]]   # (row id, final follow-up outcome)
+    media_playing: Callable[[], bool]               # the device's own content player is playing (§6.3)
+    pause_media: Callable[[], Awaitable[None]]      # pause it; applied when dialog focus ends (§18.1)
 
 
 @dataclass(frozen=True)
@@ -888,6 +890,7 @@ class _Turn:
     stages: dict[TurnStage, tuple[float, float]] = field(default_factory=dict)   # monotonic [start, end]
     timings: dict[str, int] = field(default_factory=dict)
     reopened: list[UtteranceTrace] = field(default_factory=list)   # a reply's utterances before a gap
+    local_only: bool = False                  # a media-context wake that lost arbitration: acts on a local command only
 
 
 @dataclass
@@ -1386,11 +1389,15 @@ class SessionActor:
 
     async def _accept_candidate(self, candidate: _Candidate) -> None:
         context, target = self._command_context(candidate)
-        if context is None:
+        local_only = False
+        if context is None or context.kind == ContextKind.MEDIA:
             window = _config_number(self._config(), "wakeArbitrationMs", WAKE_ARBITRATION_MS) / 1000.0
             if self.deps.arbiter.claim(self.device_id, window) != self.device_id:
-                await self._reject_candidate(candidate, TerminalReason.ARBITRATION_LOST)
-                return
+                if context is None:
+                    await self._reject_candidate(candidate, TerminalReason.ARBITRATION_LOST)
+                    return
+                # The Dot playing the content still hears out a "stop" meant for it (§6.3 step 1).
+                local_only = True
         self._candidate = None
         inherited = self._take_expectation()
         await self._supersede()
@@ -1408,12 +1415,14 @@ class SessionActor:
                           wake_phrase=candidate.model.wake_phrase, context=context)
         turn = _Turn(turn_id, self._generation, UtteranceKind.WAKE, asyncio.get_running_loop().time(),
                      Utterance(spec), candidate.runtime, candidate.model, candidate, context, target,
-                     inherited.conversation_id if inherited else None, inherited)
+                     inherited.conversation_id if inherited else None, inherited, local_only=local_only)
         self._turn = turn
         await self._acquire_focus(turn_id, Focus.DIALOG_INPUT, turn.generation)
-        # No chime when the command context is non-empty: the ring/reply stopping is the acknowledgement (§16.2);
-        # none when the device already chimed at candidate open (idle wakes on local_wake_chime firmware, §11.2).
-        if (context is None and em_config_sections.wake_sound(self._config()) and self.render is not None
+        # No chime when the wake stops an alert or cancels a reply: the stopping is the acknowledgement
+        # (§16.2). Content only ducks, so a media-context wake chimes, unless it lost arbitration: the
+        # winner chimes. None when the device already chimed at candidate open (local_wake_chime, §11.2).
+        chime = context is None or (context.kind == ContextKind.MEDIA and not local_only)
+        if (chime and em_config_sections.wake_sound(self._config()) and self.render is not None
                 and not candidate.wire.chimed):
             try:
                 await self.render.play_local(SourceClass.EARCON, WAKE_CHIME, generation=turn.generation)
@@ -1426,13 +1435,15 @@ class SessionActor:
         """§6.3 step 1: the alert occurrence, else the dialog output this wake cancels —
         only a reply the user can hear: one whose audio has not started is not yet a context
         (`started` fails only together with `finished`, so an undone playback that has
-        started is audible)."""
+        started is audible) — else the device's own content, while it plays."""
         active = candidate.wire.active_alert
         if active is not None:
             return CommandContext(ContextKind.ALERT, active.kind, active.name), active.id
         playback = self._dialog_playback
         if playback is not None and not playback.done and playback.started.done():
             return CommandContext(ContextKind.DIALOG), playback.playback_id
+        if self.deps.media_playing():
+            return CommandContext(ContextKind.MEDIA), None
         return None, None
 
     # --- button, cancel, replies --------------------------------------------------------
@@ -2009,6 +2020,10 @@ class SessionActor:
 
     async def _run_committed(self, turn: _Turn, commit: Commit, pcm: np.ndarray) -> None:
         """§16.7 voice turn order after commit: local command, STT, route, intent→TTS. Never resubmits."""
+        if turn.local_only and commit.local_action is None:
+            # Lost arbitration: the winning Dot answers anything but a local command (§6.3 step 1).
+            await self._finish_turn(turn, TerminalReason.ARBITRATION_LOST, feedback=False)
+            return
         if commit.redecode_required:
             spec = turn.utterance.spec
             try:
@@ -2304,6 +2319,10 @@ class SessionActor:
         turn.outcome = TurnOutcome.LOCAL_COMMAND
         turn.stt_text = commit.text
         if action == LocalAction.STOP:        # dialog context: the wake already cancelled the output
+            await self._finish_turn(turn, TerminalReason.COMPLETED, feedback=False)
+            return
+        if action == LocalAction.PAUSE:       # media context: applied as the turn's dialog focus ends
+            await self.deps.pause_media()
             await self._finish_turn(turn, TerminalReason.COMPLETED, feedback=False)
             return
         link = self.link
@@ -2933,7 +2952,10 @@ class SessionActor:
             self._set_state(ActorState.ARMED if self._expectation is not None else ActorState.IDLE)
 
     def _feedback(self, turn: _Turn, reason: TerminalReason) -> None:
-        """Exactly the §7 terminal feedback table; a reply window nobody answered ends without a cue."""
+        """Exactly the §7 terminal feedback table; a reply window nobody answered ends without a cue,
+        and so does a turn that lost arbitration: the winning Dot gives the feedback."""
+        if turn.local_only:
+            return
         if reason == TerminalReason.NO_INPUT:
             if turn.trigger not in REPLY_KINDS:
                 self._cue(Cue.NOSPEECH_ANIM)
@@ -3313,6 +3335,7 @@ def _trace(turn: _Turn, row: TurnRow, utterance: UtteranceTrace, afe: AfeEvidenc
         "utterance": utterance,
         # A reply that met a gap before any answer listened on with a fresh utterance (§16.6).
         **({"reopened": turn.reopened} if turn.reopened else {}),
+        **({"local_only": True} if turn.local_only else {}),
         # Evidence only (afe_metadata_v1): null when the device does not report it.
         "afe_evidence": afe.wire() if afe is not None else None,
         **{k: v for k, v in row.items() if k != "ts"},

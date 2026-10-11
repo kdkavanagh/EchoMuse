@@ -68,6 +68,7 @@ class LocalVerb(StrEnum):
     STOP = "stop"
     CANCEL = "cancel"
     SNOOZE = "snooze"
+    PAUSE = "pause"
     TURN_OFF = "turn off"
     DISMISS = "dismiss"
 
@@ -76,6 +77,7 @@ class ContextKind(StrEnum):
     """What the wake interrupted (§6.3 step 1)."""
     ALERT = "alert"
     DIALOG = "dialog"
+    MEDIA = "media"
 
 
 class LocalAction(StrEnum):
@@ -83,6 +85,7 @@ class LocalAction(StrEnum):
     DISMISS = "dismiss"
     SNOOZE = "snooze"
     STOP = "stop"
+    PAUSE = "pause"
 
 
 _TERMINAL = frozenset({"a", "an", "the", "for", "to", "in", "on", "at", "and", "or", "with"})
@@ -488,7 +491,7 @@ def _local_syntax(text: str) -> Result:
 
     words = tokens(text)
     bare = words[1:] if words[:1] == ("please",) else words[:-1] if words[-1:] == ("please",) else words
-    if bare in (("stop",), ("cancel",), ("snooze",)):
+    if bare in (("stop",), ("cancel",), ("snooze",), ("pause",)):
         return Result(GrammarClass.COMPLETE, GrammarFamily.LOCAL, LocalParse(LocalVerb(bare[0])))
     if bare[:2] == ("snooze", "for"):
         # "snooze for" (and a number awaiting its unit) needs more; any snooze
@@ -516,8 +519,10 @@ def match_local_command(text: str, context: CommandContext | None) -> LocalActio
     """Return the §6.3 local action for ``text`` under ``context``, else None.
 
     ``"dismiss"`` (alert context: stop/cancel, or a noun form naming the
-    ringing kind and, if spoken, its exact name), ``"snooze"`` (alarm only), or
-    ``"stop"`` (dialog context: close the turn). Anything else is an HA turn.
+    ringing kind and, if spoken, its exact name), ``"snooze"`` (alarm only),
+    ``"stop"`` (dialog context: stop/cancel closes the turn), or ``"pause"``
+    (media context: stop/pause pauses the device's own content). Anything else
+    is an HA turn.
     """
 
     if context is None:
@@ -525,6 +530,10 @@ def match_local_command(text: str, context: CommandContext | None) -> LocalActio
     result = _local_syntax(text)
     parsed = result.parse
     if result.klass != GrammarClass.COMPLETE or not isinstance(parsed, LocalParse):
+        return None
+    if context.kind == ContextKind.MEDIA:
+        if parsed.kind is None and parsed.action in {LocalVerb.STOP, LocalVerb.PAUSE}:
+            return LocalAction.PAUSE
         return None
     alert = context.kind == ContextKind.ALERT
     if parsed.kind is None:

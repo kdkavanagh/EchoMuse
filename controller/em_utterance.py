@@ -434,7 +434,7 @@ def local_action(
     cells: Sequence[ClassifiedCell],
     context: CommandContext | None,
 ) -> LocalAction | None:
-    """§16.2/§6.3: the local action (`dismiss`/`snooze`/`stop`) for a committed wake utterance, or None."""
+    """§16.2/§6.3: the local action (`dismiss`/`snooze`/`stop`/`pause`) for a committed wake utterance, or None."""
     if context is None:
         return None
     if not local_command_preconditions(
