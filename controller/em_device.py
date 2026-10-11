@@ -106,7 +106,7 @@ class Actor(Protocol):
     def add_listener(self, cb: Callable[[em_session.ActorEvent], object]) -> Callable[[], None]: ...
     async def announce(self, url: str, *, preannounce_url: str | None,
                        start_conversation: bool) -> None: ...
-    async def open_diagnostic(self, on_mic: Callable[[int, np.ndarray], None]) -> None: ...
+    async def open_diagnostic(self, tap: em_session.DiagnosticTap) -> None: ...
     async def close_diagnostic(self) -> None: ...
 
 
@@ -343,8 +343,10 @@ class Device:
         self.preview_playback: em_render.Playback | None = None
         self._diagnostic = False
         # Recording modes (§18.1); em_controller drives them over the
-        # diagnostic lease, whose mic blocks feed `diag_queue`.
-        self.diag_queue: asyncio.Queue[np.ndarray] | None = None
+        # diagnostic lease, whose mic blocks feed `diag_queue` with their
+        # position on `diag_track`, which also takes the lease's AFE records.
+        self.diag_queue: asyncio.Queue[tuple[int, np.ndarray]] | None = None
+        self.diag_track: em_afe.AfeTrack | None = None
         self.diag_task: asyncio.Task[None] | None = None
         self.collect_mode = False
         self.collect_seg: em_samples.Segmenter | None = None

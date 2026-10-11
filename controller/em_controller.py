@@ -37,6 +37,7 @@ from websockets.asyncio.server import serve as WsServe
 from zeroconf import ServiceInfo
 from zeroconf.asyncio import AsyncZeroconf
 
+import em_afe
 import em_alert_wire
 import em_alerts
 import em_ambient
@@ -66,6 +67,7 @@ import em_sounds
 import em_speech_worker
 import em_volume
 import em_wake_registry
+from em_audio_timeline import AFE_PERIOD_SAMPLES, AfeRecord
 from em_device_link import MessageType
 
 _LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s — %(message)s"
@@ -102,6 +104,9 @@ DEPLOYED_GRAPH_NAME = "bcresnet_audio.onnx"
 DEPLOYED_SIDECAR_NAME = "bcresnet_audio.json"
 PREVIEW_GAIN_DB = 0.0
 DIAGNOSTIC_QUEUE_BLOCKS = 256            # ~20 s of 80 ms blocks
+# AFE periods of the recording tap kept (em_afe.AfeTrack): the longest ambient recording, plus a minute.
+DIAGNOSTIC_TRACK_PERIODS = ((em_ambient.MAX_RECORDING_MS + 60_000) * em_samples.SAMPLE_RATE // 1000
+                            // AFE_PERIOD_SAMPLES)
 
 # Script-driven capture delivery (em_capture).
 CAPTURE_QUEUE_MAX = 4
@@ -596,12 +601,15 @@ async def _sync_diagnostic(device: em_device.Device) -> None:
         queue = device.diag_queue
         if queue is None:
             queue = device.diag_queue = asyncio.Queue(DIAGNOSTIC_QUEUE_BLOCKS)
+        if device.diag_track is None:
+            device.diag_track = em_afe.AfeTrack(DIAGNOSTIC_TRACK_PERIODS)
         task = device.diag_task
         if task is None or task.done():
             device.diag_task = _spawn(_diagnostic_tap(device, queue),
                                       f"diagnostic:{device.device_id}")
         device.diagnostic = True
-        await device.actor.open_diagnostic(lambda _first, pcm: _diagnostic_block(device, pcm))
+        await device.actor.open_diagnostic(em_session.DiagnosticTap(
+            functools.partial(_diagnostic_block, device), functools.partial(_diagnostic_afe, device)))
     elif not want and device.diagnostic:
         device.diagnostic = False
         await device.actor.close_diagnostic()
@@ -609,30 +617,48 @@ async def _sync_diagnostic(device: em_device.Device) -> None:
         if task is not None:
             task.cancel()
         device.diag_queue = None
+        device.diag_track = None
 
 
-def _diagnostic_block(device: em_device.Device, pcm: np.ndarray) -> None:
-    queue = device.diag_queue
-    if queue is None:
+def _diagnostic_block(device: em_device.Device, lease_id: str, start: int, pcm: np.ndarray) -> None:
+    """A mic block of the diagnostic lease: queued for the modes at its tap position, which
+    only a queued block takes, so the tap stream is exactly what the modes are fed."""
+    queue, track = device.diag_queue, device.diag_track
+    if queue is None or track is None:
         return
     try:
-        queue.put_nowait(pcm)
+        queue.put_nowait((track.samples, pcm))
     except asyncio.QueueFull:
         log.warning("[%s] recording tap fell behind; block dropped", device.device_id)
+        return
+    track.mic(lease_id, start, pcm.size)
 
 
-async def _diagnostic_tap(device: em_device.Device, queue: asyncio.Queue[np.ndarray]) -> None:
+def _diagnostic_afe(device: em_device.Device, lease_id: str, records: list[AfeRecord]) -> None:
+    if device.diag_track is not None:
+        device.diag_track.afe(lease_id, records)
+
+
+def _recording_series(device: em_device.Device, origin: int | None, samples: int) -> em_afe.AfeSeries | None:
+    """The AFE series of a recording, tap samples `[origin, origin + samples)`; None: no data."""
+    track = device.diag_track
+    if track is None or origin is None:
+        return None
+    return track.series(origin, origin + samples)
+
+
+async def _diagnostic_tap(device: em_device.Device, queue: asyncio.Queue[tuple[int, np.ndarray]]) -> None:
     while True:
-        pcm = await queue.get()
+        at, pcm = await queue.get()
         frame = np.asarray(pcm, dtype="<i2").tobytes()
         samples = np.asarray(pcm, dtype=np.float32) / 32768.0
         rms = float(np.sqrt(np.mean(samples * samples))) if samples.size else 0.0
         if device.collect_seg is not None:
-            clip = device.collect_seg.push(frame, rms)
+            clip = device.collect_seg.push(frame, rms, at)
             if clip is not None:
                 await _write_clip(device, clip)
         if device.ambient_rec is not None:
-            await _ambient_frame(device, frame)
+            await _ambient_frame(device, frame, at)
         if device.capture_window is not None and device.capture_window.push(frame, rms):
             await close_capture_window(device)
 
@@ -668,8 +694,10 @@ async def _diagnostic_teardown(device: em_device.Device) -> None:
 
 
 async def _write_clip(device: em_device.Device, clip: em_samples.Clip) -> None:
+    series = _recording_series(device, clip.start, len(clip.pcm) // em_samples.SAMPLE_WIDTH)
     try:
-        name = await asyncio.to_thread(em_samples.save_clip, device.device_id, clip)
+        name = await asyncio.to_thread(em_samples.save_clip, device.device_id, clip,
+                                       afe=series.dumps() if series is not None else None)
     except Exception as err:
         log.warning("[%s] sample write failed: %s", device.device_id, err)
         return
@@ -720,9 +748,10 @@ async def _ambient_close(device: em_device.Device) -> str | None:
     rec, device.ambient_rec = device.ambient_rec, None
     if rec is None:
         return None
+    series = _recording_series(device, rec.origin, rec.data_bytes // em_samples.SAMPLE_WIDTH)
 
     def _finish() -> str | None:
-        kept = rec.close()
+        kept = rec.close(afe=series.dumps() if series is not None else None)
         em_ambient.prune(device.device_id)
         return kept
     try:
@@ -735,11 +764,11 @@ async def _ambient_close(device: em_device.Device) -> str | None:
     return name
 
 
-async def _ambient_frame(device: em_device.Device, frame: bytes) -> None:
+async def _ambient_frame(device: em_device.Device, frame: bytes, at: int) -> None:
     rec = device.ambient_rec
     if rec is None:
         return
-    if rec.push(frame):
+    if rec.push(frame, at):
         try:
             await asyncio.to_thread(rec.flush)
         except Exception as err:

@@ -5,7 +5,9 @@ the device decodes it and uplinks one record per 80 ms capture period (EMA1
 kind 5, `em_audio_timeline.AfeRecord`) and its decoder counters in
 `wake.stats.afe` (docs/protocol-v1.md). This module turns both into typed
 evidence for turn rows, the decision trace and the dashboard (the summaries),
-and the dashboard's per-turn chart (the series).
+and the dashboard's per-turn and per-recording charts (the series): a turn's
+from its leases, a sample clip's or ambient recording's from the diagnostic
+lease its recording mode holds (`AfeTrack`).
 
 Evidence only: no wake acceptance, attribution verdict, endpoint or threshold
 reads anything here — nothing has yet related these fields to outcomes.
@@ -21,7 +23,9 @@ without a shift.
 
 from __future__ import annotations
 
+import collections
 import enum
+import itertools
 import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -328,17 +332,21 @@ class TurnStage(enum.StrEnum):
 
 
 class AfeSeriesJson(TypedDict):
-    """`AfeSeries` on the wire (`turns.afe_series`, GET /api/devices/{id}/turns/{turn}/afe).
-    Every list has one entry per period, entry i covering capture samples
-    `[start + i·period, start + (i + 1)·period)`. `frames` and `lost` are null
+    """`AfeSeries` on the wire (`turns.afe_series`, GET /api/devices/{id}/turns/{turn}/afe;
+    a recording's `.afe.json`, GET /api/devices/{id}/samples|ambient/{name}/afe).
+    Every list has one entry per period, entry i covering samples
+    `[start + i·period, start + (i + 1)·period)` — capture samples for a turn,
+    the recording's own for a sample clip or ambient recording (AfeTrack).
+    `frames` and `lost` are null
     where no record arrived; the other lists are null also where the record
     carried no frame, and the ERLE and RMS lists where that value was not
     computed. Units as AfeSummary. `flags` maps a flag to the indices of the
     periods that set it; an absent flag was set by none. `wake_clip`,
     `audio_clip` and `recording` place the turn's recordings on the same
-    capture timeline: sample k of the WAV is capture sample `clip[0] + k`.
+    timeline: sample k of the WAV is sample `clip[0] + k`.
     Whether the wake clip and utterance were saved is the turn row's wake_file /
-    audio_file; `recording` is set only when the turn recording is saved.
+    audio_file; `recording` is set only when the turn recording is saved, and
+    for a sample clip or ambient recording is `[0, its length)`.
     `stages` places each TurnStage that ran; an absent stage did not run. Rows
     written before a key existed lack it."""
 
@@ -382,7 +390,11 @@ class AfeSeries:
     `recording` is the saved turn recording's (em_recordings.RecordingKind.TURN).
     `stages` places the turn's processing on the same capture timeline.
     turn_series cannot know any of them; em_session attaches them when it
-    persists the turn, so the dashboard can play a recording against the chart."""
+    persists the turn, so the dashboard can play a recording against the chart.
+
+    A sample clip's or ambient recording's series (AfeTrack.series) is on the
+    recording's own timeline instead, with no support window, utterance or
+    stages, and `recording` its whole WAV."""
 
     start: int
     support: tuple[int, int] | None
@@ -465,6 +477,85 @@ def turn_series(store: AfeTimeline, support: tuple[int, int] | None,
 
 def _column(records: Sequence[AfeRecord | None], value: Callable[[AfeRecord], _T | None]) -> list[_T | None]:
     return [None if r is None else value(r) for r in records]
+
+
+# --- recordings from the diagnostic tap --------------------------------------------------
+
+
+TRACK_WAIT_PERIODS = 250    # 20 s: how long a period waits for its record, or a record for its period
+_HALF_PERIOD = AFE_PERIOD_SAMPLES // 2
+
+
+class AfeTrack:
+    """The diagnostic lease's mic as em_controller's recording modes take it —
+    every block the tap took, end to end (the tap stream) — and the native AFE
+    record of each of that stream's periods, so a recording cut from it (a
+    sample clip, an ambient file) gets an AfeSeries on its own timeline.
+
+    Tap period j is tap samples `[1280j, 1280j + 1280)`. Its record is the one
+    whose capture period holds the tap period's middle sample, from the lease
+    that delivered that sample: while blocks are contiguous and on the period
+    grid (the device's 80 ms blocks are) that is the capture period itself, and
+    across a gap or a new lease nothing after it shifts. Blocks and records
+    arrive in either order; a period waits TRACK_WAIT_PERIODS for its record and
+    an early record as long for its period, and one that never comes is no
+    record. The newest `capacity` periods are kept. Evidence only."""
+
+    def __init__(self, capacity: int):
+        self.capacity = capacity
+        self.samples = 0                                            # tap samples taken
+        self._floor = 0                                             # tap period of _periods[0]
+        self._periods: collections.deque[AfeRecord | None] = collections.deque()
+        self._waiting: dict[tuple[str, int], int] = {}              # (lease, capture period) → tap period
+        self._early: dict[tuple[str, int], AfeRecord] = {}          # records no tap period claimed yet
+
+    def mic(self, lease_id: str, start: int, n: int) -> None:
+        """The tap took `lease_id`'s capture samples `[start, start + n)` as tap
+        samples `[samples, samples + n)`."""
+        t = self.samples
+        self.samples += n
+        # The tap periods whose middle sample this block holds; they follow the last one taken.
+        for j in range(-(-(t - _HALF_PERIOD) // AFE_PERIOD_SAMPLES),
+                       -(-(t + n - _HALF_PERIOD) // AFE_PERIOD_SAMPLES)):
+            key = (lease_id, (start + j * AFE_PERIOD_SAMPLES + _HALF_PERIOD - t) // AFE_PERIOD_SAMPLES)
+            record = self._early.pop(key, None)
+            if record is None:
+                self._waiting[key] = j
+            self._periods.append(record)
+        while len(self._periods) > self.capacity:
+            self._periods.popleft()
+            self._floor += 1
+        limit = self._floor + len(self._periods) - TRACK_WAIT_PERIODS
+        while self._waiting:
+            key, j = next(iter(self._waiting.items()))
+            if j >= limit:
+                break
+            del self._waiting[key]
+
+    def afe(self, lease_id: str, records: Sequence[AfeRecord]) -> None:
+        """`lease_id`'s records, each new to it."""
+        for r in records:
+            key = (lease_id, r.start // AFE_PERIOD_SAMPLES)
+            j = self._waiting.pop(key, None)
+            if j is None:
+                self._early[key] = r
+                if len(self._early) > TRACK_WAIT_PERIODS:
+                    del self._early[next(iter(self._early))]
+            elif j >= self._floor:
+                self._periods[j - self._floor] = r
+
+    def series(self, a: int, b: int) -> AfeSeries | None:
+        """Tap samples `[a, b)` — one recording — as an AfeSeries on the
+        recording's own timeline: its sample 0 is tap sample `a`, and
+        `recording` is `[0, b − a)`. None (no data) when no period in it has a record."""
+        first, last = a // AFE_PERIOD_SAMPLES, -(-b // AFE_PERIOD_SAMPLES)
+        lo = min(max(first, self._floor), last)
+        hi = max(min(last, self._floor + len(self._periods)), lo)
+        kept = itertools.islice(self._periods, lo - self._floor, hi - self._floor)
+        records = (None,) * (lo - first) + tuple(kept) + (None,) * (last - hi)
+        if not any(records):
+            return None
+        return AfeSeries(first * AFE_PERIOD_SAMPLES - a, None, None, records, recording=(0, b - a))
 
 
 # --- wake.stats.afe ----------------------------------------------------------------------

@@ -695,7 +695,10 @@ magenta.
   are kept in the `ambient/` folder.
 
 Both are stored beside the database and can be played, downloaded and deleted
-from the tab.
+from the tab. On a Dot with native AFE metadata (`afe_metadata_v1`), each clip
+and recording also keeps the Echo's own VAD, double-talk, ERLE and RMS for
+every 80 ms (`<name>.afe.json` beside the WAV): **Chart** on its row shows
+them, with a playhead while it plays.
 
 ---
 

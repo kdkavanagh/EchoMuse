@@ -451,6 +451,7 @@ async def create_app(services: ControllerServices) -> web.Application:
     app.router.add_get("/api/devices/{id}/samples",       _get_samples)
     app.router.add_delete("/api/devices/{id}/samples",    _delete_samples)
     app.router.add_get("/api/devices/{id}/samples/{name}", _get_sample_audio)
+    app.router.add_get("/api/devices/{id}/samples/{name}/afe", _get_sample_afe_series)
     app.router.add_delete("/api/devices/{id}/samples/{name}", _delete_sample)
     # Ambient recording — the mic held open, one file per session. `/ambient`
     # before `/ambient/{name}` for the same ordering reason as above.
@@ -458,6 +459,7 @@ async def create_app(services: ControllerServices) -> web.Application:
     app.router.add_get("/api/devices/{id}/ambient",           _get_ambient)
     app.router.add_delete("/api/devices/{id}/ambient",        _delete_ambient_all)
     app.router.add_get("/api/devices/{id}/ambient/{name}",    _get_ambient_audio)
+    app.router.add_get("/api/devices/{id}/ambient/{name}/afe", _get_ambient_afe_series)
     app.router.add_delete("/api/devices/{id}/ambient/{name}", _delete_ambient)
     # Script-driven capture. The mode, then windows inside it — see em_capture.
     # /window/stop before /window: aiohttp matches in registration order and
@@ -1072,6 +1074,25 @@ async def _get_sample_audio(request: web.Request) -> web.StreamResponse:
     )
 
 
+async def _recording_afe_series(path: Path | None, what: str) -> web.Response:
+    """A sample clip's or ambient recording's native AFE series (em_afe.AfeSeriesJson,
+    on the recording's own timeline), for the Samples tab's chart. A 404 is ordinary:
+    the device lacked afe_metadata_v1, no record arrived, or the recording predates
+    the charts. The stored JSON is the controller's own, served as written."""
+    series = None if path is None else await asyncio.get_running_loop().run_in_executor(
+        None, em_samples.read_afe, path)
+    if series is None:
+        return _error(ErrorCode.NO_AFE_SERIES, f"No native AFE series for this {what}", 404)
+    return web.Response(content_type="application/json", text=series)
+
+
+@auth.require_auth
+async def _get_sample_afe_series(request: web.Request) -> web.Response:
+    """GET /api/devices/{id}/samples/{name}/afe — one clip's AFE series."""
+    path = em_samples.resolve(request.match_info["id"], request.match_info["name"])
+    return await _recording_afe_series(path, "sample")
+
+
 @auth.require_auth
 async def _get_samples_zip(request: web.Request) -> web.Response:
     """
@@ -1116,7 +1137,7 @@ async def _delete_sample(request: web.Request) -> web.Response:
     if path is None:
         return _error(ErrorCode.NO_SAMPLE, "No such sample", 404)
     loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, path.unlink)
+    await loop.run_in_executor(None, em_samples.remove, path)
     return _ok({"deleted": name})
 
 
@@ -1388,6 +1409,13 @@ async def _get_ambient_audio(request: web.Request) -> web.StreamResponse:
     )
 
 
+@auth.require_auth
+async def _get_ambient_afe_series(request: web.Request) -> web.Response:
+    """GET /api/devices/{id}/ambient/{name}/afe — one recording's AFE series."""
+    path = em_ambient.resolve(request.match_info["id"], request.match_info["name"])
+    return await _recording_afe_series(path, "recording")
+
+
 @auth.require_admin
 async def _delete_ambient(request: web.Request) -> web.Response:
     """DELETE /api/devices/{id}/ambient/{name} — drop one recording.
@@ -1401,7 +1429,7 @@ async def _delete_ambient(request: web.Request) -> web.Response:
     if path is None:
         return _error(ErrorCode.NO_RECORDING, "No such recording", 404)
     loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, path.unlink)
+    await loop.run_in_executor(None, em_samples.remove, path)
     return _ok({"deleted": name})
 
 

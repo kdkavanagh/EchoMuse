@@ -19,6 +19,7 @@ import wave
 from pathlib import Path
 
 import em_ambient as amb
+import em_samples as smp
 import pytest
 
 CONTROLLER_DIR = Path(__file__).resolve().parents[1]
@@ -246,6 +247,21 @@ def test_listing_reports_duration_from_the_file_size(tmp_path):
     assert item["name"]  == name
     assert item["bytes"] == len(pushed) + amb.HEADER_BYTES
     assert item["ms"]    == pytest.approx(12 * FRAME_MS, abs=1)
+
+
+def test_a_recording_knows_its_place_in_the_fed_stream_and_keeps_its_series(tmp_path):
+    """`origin` cuts the recording's AFE series from the tap; the series sits
+    beside the WAV until the WAV goes."""
+    rec = amb.start(DEV, db_path=_db(tmp_path))
+    rec.push(_frame(1), at=5120)
+    rec.push(_frame(2), at=6400)
+    assert rec.origin == 5120
+    name = rec.close(afe='{"start":0}')
+    [item] = amb.list_for(DEV, db_path=_db(tmp_path))
+    assert (item["name"], item["afe"]) == (name, True)
+    assert smp.read_afe(amb.resolve(DEV, name, db_path=_db(tmp_path))) == '{"start":0}'
+    amb.prune(DEV, db_path=_db(tmp_path), keep=0)
+    assert list(amb.device_dir(DEV, db_path=_db(tmp_path)).iterdir()) == []
 
 
 @pytest.mark.parametrize("name", [

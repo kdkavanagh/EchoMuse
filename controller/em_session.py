@@ -76,6 +76,7 @@ from em_audio_timeline import (
     AFE_PERIOD_SAMPLES,
     CANDIDATE_CELLS_LEAD,
     CANDIDATE_REFERENCE_LEAD,
+    AfeRecord,
     AfeTimeline,
     Delivery,
     LeaseEnd,
@@ -521,6 +522,18 @@ def _opening_rule(raw: object) -> em_wake_rules.OpenRule | None:
 
 
 @dataclass(frozen=True, slots=True)
+class DiagnosticTap:
+    """What a diagnostic lease feeds (em_controller's recording modes): each new
+    mic block, capture samples `[start, start + len(pcm))`, and in an
+    `afe_metadata` session each batch of new AFE records, both with the lease
+    they came from (every reconnect opens another). Evidence for the recordings'
+    charts; nothing decides on them."""
+
+    on_mic: Callable[[str, int, np.ndarray], None]
+    on_afe: Callable[[str, list[AfeRecord]], None]
+
+
+@dataclass(frozen=True, slots=True)
 class ActiveAlert:
     """`wake.candidate.active_alert`: the occurrence ringing when the wake was heard (§6.3)."""
 
@@ -931,7 +944,7 @@ class SessionActor:
         self._listeners: list[Callable[[ActorEvent], object]] = []
         self._muted = False
         self._alert_foreground: bool | None = None
-        self._diagnostic: Callable[[int, np.ndarray], None] | None = None
+        self._diagnostic: DiagnosticTap | None = None
         self._diagnostic_lease: str | None = None
         self._announcements = asyncio.Lock()
         self._tasks: set[asyncio.Task[object]] = set()
@@ -1010,9 +1023,10 @@ class SessionActor:
             return
         # `ingest` has already stored AFE records, and a response lease's mic, in their leases'
         # timelines; they are read only when a turn or candidate ends, so they never reach the
-        # queue, the worker, or a decision.
+        # queue, the worker, or a decision. The diagnostic lease's records go to its tap.
         deliveries = [d for d in self.uplink.ingest(frame)
-                      if d.stream_id != StreamId.AFE and d.lease_id not in self._response_leases]
+                      if (d.stream_id != StreamId.AFE or d.lease_id == self._diagnostic_lease)
+                      and d.lease_id not in self._response_leases]
         if deliveries:
             gap = any(d.packet.discontinuity or d.packet.muted for d in deliveries)
             self._post(P_GAP if gap else P_SPEECH, _Audio(deliveries))
@@ -1032,9 +1046,9 @@ class SessionActor:
         self._post(P_RESULT, _Announcement(url, preannounce_url, start_conversation, future))
         await future
 
-    async def open_diagnostic(self, on_mic: Callable[[int, np.ndarray], None]) -> None:
+    async def open_diagnostic(self, tap: DiagnosticTap) -> None:
         """Hold a live-mic diagnostic lease (re-opened after every reconnect); wakes are refused meanwhile."""
-        self._diagnostic = on_mic
+        self._diagnostic = tap
         self._post(P_INTERRUPT, _Diagnostic())
 
     async def close_diagnostic(self) -> None:
@@ -1266,9 +1280,13 @@ class SessionActor:
         epoch = self.uplink.streams.current(StreamId.MIC)
         if epoch is None:
             return
+        # In an afe_metadata session the lease also takes the AFE records, for the recordings' charts.
+        streams: dict[StreamId, int | None] = {StreamId.MIC: None}
+        if self.uplink.afe_metadata:
+            streams[StreamId.AFE] = None
         lease_id = str(uuid.uuid4())
         await self._lease_message(self.uplink.open(
-            lease_id, LeaseReason.DIAGNOSTIC, f"diagnostic:{self.device_id}", epoch, {StreamId.MIC: None}))
+            lease_id, LeaseReason.DIAGNOSTIC, f"diagnostic:{self.device_id}", epoch, streams))
         self._diagnostic_lease = lease_id
 
     # --- wake candidates -----------------------------------------------------------------
@@ -1641,7 +1659,7 @@ class SessionActor:
                     pcm = timeline.mic.read(start, end)
                     if d.lease_id == self._diagnostic_lease and self._diagnostic is not None:
                         try:
-                            self._diagnostic(start, pcm)
+                            self._diagnostic.on_mic(d.lease_id, start, pcm)
                         except Exception:
                             log.exception("[%s] diagnostic consumer failed", self.device_id)
                     if runtime is None:
@@ -1651,6 +1669,12 @@ class SessionActor:
                         runtime.assembler.mark_gap(runtime.last_mic_end, start)
                     runtime.last_mic_end = max(runtime.last_mic_end or end, end)
                     self.deps.worker.submit_mic_block(d.lease_id, start, pcm, flags=d.packet.flags)
+            elif d.stream_id == StreamId.AFE:
+                if d.lease_id == self._diagnostic_lease and self._diagnostic is not None:
+                    try:
+                        self._diagnostic.on_afe(d.lease_id, [r for a, b in d.ranges for r in timeline.afe.read(a, b)])
+                    except Exception:
+                        log.exception("[%s] diagnostic consumer failed", self.device_id)
             elif runtime is not None and d.stream_id == StreamId.CELLS:
                 for start, end in d.ranges:
                     records = timeline.cells.read(start, end)

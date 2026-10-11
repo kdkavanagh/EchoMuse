@@ -69,14 +69,17 @@ import struct
 import time
 from pathlib import Path
 
-from em_samples import (          # one definition of the wire format
+from em_samples import (          # one definition of the wire format and of the AFE sidecar
     CHANNELS,
     SAMPLE_RATE,
     SAMPLE_WIDTH,
     ClipEntry,
     StoreUsage,
+    afe_path,
     duration_ms,
+    remove,
     safe_device_id,
+    write_afe,
 )
 
 log = logging.getLogger("echomuse.ambient")
@@ -218,6 +221,9 @@ class Recorder:
     flush is due — the caller owns the executor hop, because it is the only
     thing that knows it is on an event loop. `close` patches the header and
     renames the `.part` into place, so nothing incomplete is ever listed.
+    `origin` is the first frame's position in the caller's stream (`push`'s
+    `at`), None before one: the recording is that stream's `[origin, origin
+    + samples)`, which is how the caller cuts its AFE series.
     """
 
     def __init__(self, path: Path, started_ms: int,
@@ -229,6 +235,7 @@ class Recorder:
         self.flush_bytes = int(flush_bytes)
         self.max_ms      = int(max_ms)
         self.written     = 0                 # payload bytes on disk
+        self.origin: int | None = None
         self._pending: list[bytes] = []
         self._pending_bytes = 0
         self._closed = False
@@ -263,10 +270,12 @@ class Recorder:
         return self._pending_bytes >= self.flush_bytes
 
     # ── audio ──
-    def push(self, frame: bytes) -> bool:
-        """Take one frame. No I/O; True when `flush` is due."""
+    def push(self, frame: bytes, at: int = 0) -> bool:
+        """Take one frame, at stream position `at`. No I/O; True when `flush` is due."""
         if self._closed or not frame:
             return False
+        if self.origin is None:
+            self.origin = at
         self._pending.append(frame)
         self._pending_bytes += len(frame)
         return self.flush_due
@@ -292,9 +301,10 @@ class Recorder:
         self.written += len(blob)
         return len(blob)
 
-    def close(self) -> str | None:
+    def close(self, afe: str | None = None) -> str | None:
         """
-        Flush, patch the header, and put the file in place.
+        Flush, patch the header, and put the file in place, with `afe` (its
+        AFE series JSON) beside it.
 
         Returns the final filename, or None if the recording held no audio
         (the mode switched on and straight off again) — in which case the
@@ -313,6 +323,8 @@ class Recorder:
             self.part.unlink(missing_ok=True)
             return None
         path = _free_name(self.path)
+        if afe is not None:
+            write_afe(path, afe)
         self.part.replace(path)
         self.path = path
         return path.name
@@ -386,8 +398,9 @@ def recover(device_id: str, db_path: str | None = None) -> list[str]:
 
 def list_for(device_id: str, db_path: str | None = None) -> list[ClipEntry]:
     """
-    This device's recordings, newest first: name, epoch seconds, bytes and
-    duration. Only closed ones — a `.part` is not a file anyone can play.
+    This device's recordings, newest first: name, epoch seconds, bytes,
+    duration and whether it has an AFE series. Only closed ones — a `.part`
+    is not a file anyone can play.
 
     Duration comes from the file size rather than the WAV header, as in
     em_samples: every file here was written by this module, and the header
@@ -397,7 +410,9 @@ def list_for(device_id: str, db_path: str | None = None) -> list[ClipEntry]:
     if directory is None or not directory.is_dir():
         return []
     out: list[ClipEntry] = []
-    for child in directory.iterdir():
+    children = list(directory.iterdir())
+    names = {child.name for child in children}
+    for child in children:
         ts = parse_filename(child.name)
         if ts is None:
             continue
@@ -410,6 +425,7 @@ def list_for(device_id: str, db_path: str | None = None) -> list[ClipEntry]:
             "ts":    ts / 1000.0,
             "bytes": size,
             "ms":    max(0, duration_ms(size - HEADER_BYTES)),
+            "afe":   afe_path(child).name in names,
         })
     out.sort(key=lambda r: r["ts"], reverse=True)
     return out
@@ -437,7 +453,7 @@ def prune(device_id: str, db_path: str | None = None,
     removed: list[str] = []
     for item in list_for(device_id, db_path)[max(keep, 0):]:
         try:
-            (directory / item["name"]).unlink()
+            remove(directory / item["name"])
             removed.append(item["name"])
         except OSError as e:
             log.warning(f"[ambient] Could not prune {item['name']}: {e}")

@@ -1,4 +1,4 @@
-const { useState, useEffect, useRef, useCallback } = React;
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
 
 // ─── Ingress ──────────────────────────────────────────────────────────────────
 
@@ -1277,45 +1277,108 @@ const AFE_STAGE_ROWS = [
   { key: 'reply',    label: 'Reply',    color: 'var(--text2)' },
 ];
 
-// One turn's native AFE series (em_afe.AfeSeriesJson), fetched when the turn
-// is opened: each 80 ms period from the second before the wake through the
-// utterance and on through the spoken answer (a committed turn keeps a
-// response lease until a second after it ends, at most 30 s past the commit),
-// one lane per value on a fixed scale so turns compare by eye. Bars above the
-// lanes place the wake, the utterance and the controller's processing, each
-// with its duration. Evidence only. Hovering reads one period out. The turn
-// recording (or a row's wake clip or utterance) draws a playhead over the
-// span it covers, and the readout follows it while nothing is hovered.
-function AfeChart({ deviceId, turnId, onset, playback }) {
-  const [load, setLoad] = useState({ turnId: null });
+// One AfeSeriesJson fetched from `url`: null while it loads, then { series },
+// or { series: null, error } — a 404 is "no chart" and leaves error null.
+function useAfeSeries(url) {
+  const [load, setLoad] = useState({ url: null });
+  useEffect(() => {
+    let live = true;
+    API.get(url)
+      .then(series => { if (live) setLoad({ url, series }); })
+      .catch(e => { if (live) setLoad({ url, series: null, error: e.status === 404 ? null : (e.error || e.message || 'request failed') }); });
+    return () => { live = false; };
+  }, [url]);
+  return load.url === url ? load : null;
+}
+
+// What an AFE chart draws: a recording's the four native values, a turn's
+// also its Playback lane and its Frames and Flags strips.
+const AFE_LANES = Object.freeze({
+  RECORDING: Object.freeze(['vad', 'dtd', 'erle', 'rms']),
+  TURN:      Object.freeze(['vad', 'dtd', 'erle', 'rms', 'playback', 'frames', 'flags']),
+});
+
+// One AFE_LANES row of series `s`: a value lane (traces as step paths, each
+// on a fixed scale so charts compare by eye) or a strip; null when it has
+// nothing to draw. `read(i)` is the row's part of period i's readout.
+function afeLaneRow(s, key) {
+  const scaled = (k, f) => s[k].map(v => (v == null ? null : f(v)));
+  const fr = k => `${k} fr`;
+  const valued = i => s.frames[i] > 0;    // a record with frames carries values
+  const lane = (label, scale, color, traces, read) => ({
+    label, scale, color, read, traces: traces.map(tr => ({ ...tr, paths: afeStepPaths(tr.ys) })),
+  });
+  switch (key) {
+    case 'vad':
+      return lane('VAD', '0–0.75', 'var(--ok)', [{ ys: scaled('vad_max', v => v / 0.75), fill: true }],
+        i => valued(i) && `VAD max ${s.vad_max[i].toFixed(2)} over ${fr(s.vad_frames[i])}`);
+    case 'dtd':
+      return lane('DTD', '0–1', 'var(--warn)', [{ ys: scaled('dtd_max', v => v), fill: true }],
+        i => valued(i) && `DTD max ${s.dtd_max[i].toFixed(2)} over ${fr(s.dtd_frames[i])}`);
+    case 'erle': {
+      const top = s.erle_max.reduce((m, v) => (v != null && v > m ? v : m), 30);
+      return lane('ERLE', `0–${top}`, 'var(--accent)', [{ ys: scaled('erle_max', v => v / top), fill: true }],
+        i => valued(i) && (s.erle_max[i] != null
+          ? `ERLE max ${s.erle_max[i]}, mean ${s.erle_mean[i]} over ${fr(s.erle_frames[i])}` : 'no ERLE'));
+    }
+    case 'rms':
+      return lane('RMS dB', '−90…−10', 'var(--text2)', [
+        { ys: scaled('rms_max_db', v => (v + 90) / 80), faint: true },
+        { ys: scaled('rms_mean_db', v => (v + 90) / 80) },
+      ], i => s.rms_max_db[i] != null
+        && `RMS max ${s.rms_max_db[i]} dB${s.rms_mean_db[i] != null ? `, mean ${s.rms_mean_db[i]} dB` : ''}`);
+    case 'playback':
+      return lane('Playback', '0–100%', 'var(--muted)',
+        [{ ys: s.playback.map((v, i) => (v == null ? null : v / s.frames[i])), fill: true }],
+        i => valued(i) && [s.playback[i] ? `playback ${fr(s.playback[i])}` : 'no playback', `volume ${s.volume[i]}`]);
+    case 'frames':
+      return { label: 'Frames', frames: true,
+        read: i => [valued(i) && `frames ${s.frames[i]}/${AFE_PERIOD_FRAMES}`, s.lost[i] ? `lost ${s.lost[i]}` : null] };
+    case 'flags': {
+      const flagged = Object.entries(s.flags);
+      if (!flagged.length) return null;
+      return { label: 'Flags', flags: true, hit: [...new Set(flagged.flatMap(([, idx]) => idx))],
+        read: i => flagged.filter(([, idx]) => idx.includes(i)).map(([name]) => name.replace(/_/g, ' ')) };
+    }
+    default:
+      return null;
+  }
+}
+
+// Axis steps in seconds: the first whose span covers what is shown.
+const AFE_TICK_STEPS = [[3, 0.5], [8, 1], [20, 2], [50, 5], [100, 10], [240, 30], [600, 60], [1200, 120], [Infinity, 300]];
+
+// The per-period chart of one AfeSeriesJson, for a turn (AfeChart) and a
+// sample clip or ambient recording (RecordingAfeChart): the `lanes` rows
+// (AFE_LANES) under `bars` ({ label, span, color }, each with its duration)
+// and across `guides` ({ at, border }), on the series' timeline, the axis in
+// seconds from `anchor` (`anchorLabel`). Evidence only. Hovering reads one
+// period out. While the recording covering `playSpan` plays, a playhead
+// follows `elapsed()` (its seconds, null when silent), and the readout
+// follows it while nothing is hovered. `children` sit under the chart, and
+// `legend` is the readout's line while nothing is read.
+function AfeLanes({ series: s, lanes, bars = [], guides = [], anchor, anchorLabel, playSpan, elapsed, label, legend, children }) {
   const [hover, setHover] = useState(null);   // period index under the pointer
   const [playAt, setPlayAt] = useState(null); // period index under the playhead
   const cursorRef = useRef(null);
-  useEffect(() => {
-    let live = true;
-    setLoad({ turnId: null });
-    setHover(null);
-    API.get(`/api/devices/${deviceId}/turns/${turnId}/afe`)
-      .then(series => { if (live) setLoad({ turnId, series }); })
-      .catch(e => { if (live) setLoad({ turnId, error: e.status === 404 ? null : (e.error || e.message || 'request failed') }); });
-    return () => { live = false; };
-  }, [deviceId, turnId]);
+  const elapsedRef = useRef(elapsed);
+  elapsedRef.current = elapsed;
+  // Paths once per series, not per hover: an ambient recording runs to 22,500 periods.
+  const laneRows = useMemo(() => lanes.map(key => afeLaneRow(s, key)).filter(Boolean), [s, lanes]);
+  useEffect(() => { setHover(null); }, [s]);
 
   // The playhead moves every frame by writing its own style, not through
   // state: the chart re-renders only when it crosses into another period.
-  // WAV sample k is capture sample span[0] + k (AfeSeriesJson).
-  const playingKind = playback.playing;
+  // WAV sample k is sample span[0] + k (AfeSeriesJson).
   useEffect(() => {
     setPlayAt(null);
-    const s = load.series;
-    const span = s && playingKind ? s[AFE_CLIP_SPANS[playingKind]] : null;
-    if (!span) return undefined;
+    if (!playSpan) return undefined;
     const n = s.frames.length;
     let raf = 0, last = null;
     const tick = () => {
-      const t = playback.elapsed();
+      const t = elapsedRef.current();
       if (t != null) {
-        const x = Math.max(0, Math.min(n, (Math.min(span[1], span[0] + t * CAPTURE_RATE) - s.start) / s.period));
+        const x = Math.max(0, Math.min(n, (Math.min(playSpan[1], playSpan[0] + t * CAPTURE_RATE) - s.start) / s.period));
         if (cursorRef.current) cursorRef.current.style.left = `${x / n * 100}%`;
         const i = Math.max(0, Math.min(n - 1, Math.floor(x)));
         if (i !== last) { last = i; setPlayAt(i); }
@@ -1324,56 +1387,15 @@ function AfeChart({ deviceId, turnId, onset, playback }) {
     };
     tick();
     return () => cancelAnimationFrame(raf);
-  }, [load, playingKind]);
-
-  const muted = { color: 'var(--muted)' };
-  if (load.turnId !== turnId) return <div style={muted}>loading the per-period chart…</div>;
-  const s = load.series;
-  if (!s) {
-    return load.error
-      ? <div style={{ color: 'var(--warn)' }}>per-period chart unavailable: {load.error}</div>
-      : <div style={muted}>no per-period chart for this turn: no AFE record arrived, the turn is older than the newest 1000, or it was recorded before the chart existed</div>;
-  }
+  }, [s, playSpan]);
 
   const n = s.frames.length;
-  const playSpan = playingKind ? s[AFE_CLIP_SPANS[playingKind]] : null;
-  const anchor = s.support ? s.support[0] : s.utterance ? s.utterance[0] : s.start;
   const at = sample => (sample - s.start) / s.period;               // period units
   const secs = sample => (sample - anchor) / CAPTURE_RATE;
-  const scaled = (key, f) => s[key].map(v => (v == null ? null : f(v)));
-  const erleTop = Math.max(30, ...s.erle_max.filter(v => v != null));
-  const flagged = Object.entries(s.flags);
-  const stages = s.stages || {};      // absent: written before the chart placed them
-  const bars = [
-    s.support && { label: 'Wake', span: s.support, color: 'var(--lcd-amber)' },
-    s.utterance && { label: 'Utterance', span: s.utterance, color: 'var(--accent-hi)' },
-    ...AFE_STAGE_ROWS.filter(r => stages[r.key]).map(r => ({ label: r.label, span: stages[r.key], color: r.color })),
-  ].filter(Boolean);
-  const lanes = [
-    { label: 'VAD', scale: '0–0.75', color: 'var(--ok)', traces: [{ ys: scaled('vad_max', v => v / 0.75), fill: true }] },
-    { label: 'DTD', scale: '0–1', color: 'var(--warn)', traces: [{ ys: scaled('dtd_max', v => v), fill: true }] },
-    { label: 'ERLE', scale: `0–${erleTop}`, color: 'var(--accent)', traces: [{ ys: scaled('erle_max', v => v / erleTop), fill: true }] },
-    { label: 'RMS dB', scale: '−90…−10', color: 'var(--text2)', traces: [
-      { ys: scaled('rms_max_db', v => (v + 90) / 80), faint: true },
-      { ys: scaled('rms_mean_db', v => (v + 90) / 80) },
-    ] },
-    { label: 'Playback', scale: '0–100%', color: 'var(--muted)',
-      traces: [{ ys: s.playback.map((v, i) => (v == null ? null : v / s.frames[i])), fill: true }] },
-  ];
-  const rows = [
-    ...bars,
-    ...lanes,
-    { label: 'Frames', frames: true },
-    flagged.length > 0 && { label: 'Flags', flags: true },
-  ].filter(Boolean);
+  const rows = [...bars, ...laneRows];
   const height = r => (r.traces ? 22 : r.span ? 10 : 8);
   const end = s.start + n * s.period;
-  const inRange = sample => sample != null && sample >= s.start && sample <= end;
-  const guides = [
-    s.support && { at: s.support[0], border: '1px solid var(--muted)' },
-    s.support && { at: s.support[1], border: '1px dashed var(--muted)' },
-    { at: onset, border: '1px dotted var(--lcd-amber)' },
-  ].filter(g => g && inRange(g.at));
+  const shownGuides = guides.filter(g => g.at != null && g.at >= s.start && g.at <= end);
   const clip = x => Math.max(0, Math.min(n, x));
   const pct = sample => `${clip(at(sample)) / n * 100}%`;
   const fmtDur = span => `${((span[1] - span[0]) / CAPTURE_RATE).toFixed(2)} s`;
@@ -1406,28 +1428,24 @@ function AfeChart({ deviceId, turnId, onset, playback }) {
       )));
     }
     if (r.flags) {
-      const hit = [...new Set(flagged.flatMap(([, idx]) => idx))];
-      return plot(r, hit.map(i => <rect key={i} x={i} y={0} width={1} height={1} fill="var(--error)"/>));
+      return plot(r, r.hit.map(i => <rect key={i} x={i} y={0} width={1} height={1} fill="var(--error)"/>));
     }
-    return plot(r, r.traces.map((tr, k) => {
-      const p = afeStepPaths(tr.ys);
-      return (
-        <React.Fragment key={k}>
-          {tr.fill && <path d={p.area} fill={r.color} fillOpacity={0.22}/>}
-          <path d={p.line} fill="none" stroke={r.color} strokeWidth={1.25} strokeOpacity={tr.faint ? 0.45 : 1}
-            vectorEffect="non-scaling-stroke"/>
-        </React.Fragment>
-      );
-    }));
+    return plot(r, r.traces.map((tr, k) => (
+      <React.Fragment key={k}>
+        {tr.fill && <path d={tr.paths.area} fill={r.color} fillOpacity={0.22}/>}
+        <path d={tr.paths.line} fill="none" stroke={r.color} strokeWidth={1.25} strokeOpacity={tr.faint ? 0.45 : 1}
+          vectorEffect="non-scaling-stroke"/>
+      </React.Fragment>
+    )));
   };
 
-  // Axis: seconds from the wake window's start (the utterance's, without a wake).
   const t0 = secs(s.start), t1 = secs(end);
-  const shown = t1 - t0;
-  const step = shown <= 3 ? 0.5 : shown <= 8 ? 1 : shown <= 20 ? 2 : 5;
+  const step = AFE_TICK_STEPS.find(([most]) => t1 - t0 <= most)[1];
   const ticks = [];
   for (let k = Math.ceil(t0 / step); k * step <= t1; k++) ticks.push(k * step);
-  const fmtT = (t, digits) => (Math.abs(t) < 1e-9 ? '0' : `${t < 0 ? '−' : '+'}${Math.abs(t).toFixed(digits)}`);
+  const sign = t => (t < 0 ? '−' : '+');
+  const fmtT = (t, digits) => (Math.abs(t) < 1e-9 ? '0' : `${sign(t)}${Math.abs(t).toFixed(digits)}`);
+  const fmtTick = t => (step >= 60 && Math.abs(t) >= 1e-9 ? `${sign(t)}${Math.abs(t) / 60}m` : fmtT(t, step < 1 ? 1 : 0));
 
   const pick = e => {
     const box = e.currentTarget.getBoundingClientRect();
@@ -1437,38 +1455,15 @@ function AfeChart({ deviceId, turnId, onset, playback }) {
     const a = s.start + i * s.period;
     const within = bars.filter(r => r.span[0] < a + s.period && r.span[1] > a).map(r => r.label);
     const head = [`${fmtT(secs(a), 2)} s`, within.length > 0 && within.join(', ')].filter(Boolean).join(' · ');
-    const flags = flagged.filter(([, idx]) => idx.includes(i)).map(([name]) => name.replace(/_/g, ' '));
-    const lost = s.lost[i] ? `lost ${s.lost[i]}` : null;
     if (s.frames[i] == null) return [head, 'no record'].join(' · ');
-    if (!s.frames[i]) return [head, 'no frames', lost, ...flags].filter(Boolean).join(' · ');
-    const fr = k => `${k} fr`;
-    return [
-      head,
-      `frames ${s.frames[i]}/${AFE_PERIOD_FRAMES}`,
-      `VAD max ${s.vad_max[i].toFixed(2)} over ${fr(s.vad_frames[i])}`,
-      `DTD max ${s.dtd_max[i].toFixed(2)} over ${fr(s.dtd_frames[i])}`,
-      s.erle_max[i] != null ? `ERLE max ${s.erle_max[i]}, mean ${s.erle_mean[i]} over ${fr(s.erle_frames[i])}` : 'no ERLE',
-      s.rms_max_db[i] != null && `RMS max ${s.rms_max_db[i]} dB${s.rms_mean_db[i] != null ? `, mean ${s.rms_mean_db[i]} dB` : ''}`,
-      s.playback[i] ? `playback ${fr(s.playback[i])}` : 'no playback',
-      `volume ${s.volume[i]}`,
-      lost, ...flags,
-    ].filter(Boolean).join(' · ');
+    return [head, !s.frames[i] && 'no frames', ...laneRows.flatMap(r => [r.read(i)].flat())].filter(Boolean).join(' · ');
   };
   const shownAt = hover ?? playAt;
-
-  // The turn recording: the whole turn, canonical mic, from where the chart
-  // starts through the spoken answer (a turn that never committed, through
-  // its close). Not kept stays a disabled control with the reason.
-  const recording = s.recording;
-  const recordingReason = recording === undefined ? 'recorded before the chart kept the whole turn'
-    : recording === null ? 'not recorded — Save utterances (Config → Speech) records the whole turn'
-    : playback.kept(TURN_CLIP.RECORDING) === false ? 'no longer kept' : null;
-  const playingRecording = playingKind === TURN_CLIP.RECORDING;
 
   const labelStyle = { color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.06em', fontSize: 8, lineHeight: 1.1, overflow: 'hidden', whiteSpace: 'nowrap' };
   return (
     <div style={{ marginTop: 6 }}>
-      <div role="img" aria-label="Native AFE values for each 80 ms period of this turn, with its processing stages"
+      <div role="img" aria-label={label}
         style={{ display: 'grid', gridTemplateColumns: '64px 1fr', columnGap: 6, rowGap: 3,
           gridTemplateRows: [...rows.map(r => `${height(r)}px`), '12px'].join(' ') }}>
         {rows.map((r, k) => (
@@ -1481,7 +1476,7 @@ function AfeChart({ deviceId, turnId, onset, playback }) {
         ))}
         <div style={{ gridColumn: 2, gridRow: `1 / ${rows.length + 1}`, position: 'relative', cursor: 'crosshair' }}
           onPointerMove={pick} onPointerDown={pick} onPointerLeave={() => setHover(null)}>
-          {guides.map((g, k) => (
+          {shownGuides.map((g, k) => (
             <div key={k} style={{ position: 'absolute', top: 0, bottom: 0, left: pct(g.at), borderLeft: g.border, pointerEvents: 'none' }}/>
           ))}
           {hover != null && (
@@ -1496,7 +1491,7 @@ function AfeChart({ deviceId, turnId, onset, playback }) {
           </>}
         </div>
         <div style={{ ...labelStyle, gridColumn: 1, gridRow: rows.length + 1, textTransform: 'none', letterSpacing: 0 }}>
-          s from {s.support ? 'wake' : 'start'}
+          s from {anchorLabel}
         </div>
         <div style={{ gridColumn: 2, gridRow: rows.length + 1, position: 'relative', fontSize: 8, color: 'var(--muted)' }}>
           {ticks.map(t => {
@@ -1504,23 +1499,132 @@ function AfeChart({ deviceId, turnId, onset, playback }) {
             return (
               <span key={t} style={{ position: 'absolute', left: `${p}%`, lineHeight: 1.4,
                 transform: `translateX(${p < 4 ? 0 : p > 96 ? -100 : -50}%)` }}>
-                {fmtT(t, step < 1 ? 1 : 0)}
+                {fmtTick(t)}
               </span>
             );
           })}
         </div>
       </div>
+      {children}
+      {/* Two lines reserved: a readout wraps, and growing on hover would shift what follows. */}
+      <div style={{ color: shownAt != null ? 'var(--text2)' : 'var(--muted)', minHeight: 34, marginTop: 4 }}>
+        {shownAt != null ? readout(shownAt) : legend}
+      </div>
+    </div>
+  );
+}
+
+// One turn's native AFE series (em_afe.AfeSeriesJson), fetched when the turn
+// is opened: each 80 ms period from the second before the wake through the
+// utterance and on through the spoken answer (a committed turn keeps a
+// response lease until a second after it ends, at most 30 s past the commit).
+// Bars above the lanes place the wake, the utterance and the controller's
+// processing. The turn recording (or a row's wake clip or utterance) draws a
+// playhead over the span it covers.
+function AfeChart({ deviceId, turnId, onset, playback }) {
+  const load = useAfeSeries(`/api/devices/${deviceId}/turns/${turnId}/afe`);
+  const muted = { color: 'var(--muted)' };
+  if (!load) return <div style={muted}>loading the per-period chart…</div>;
+  const s = load.series;
+  if (!s) {
+    return load.error
+      ? <div style={{ color: 'var(--warn)' }}>per-period chart unavailable: {load.error}</div>
+      : <div style={muted}>no per-period chart for this turn: no AFE record arrived, the turn is older than the newest 1000, or it was recorded before the chart existed</div>;
+  }
+
+  const playingKind = playback.playing;
+  const stages = s.stages || {};      // absent: written before the chart placed them
+  const bars = [
+    s.support && { label: 'Wake', span: s.support, color: 'var(--lcd-amber)' },
+    s.utterance && { label: 'Utterance', span: s.utterance, color: 'var(--accent-hi)' },
+    ...AFE_STAGE_ROWS.filter(r => stages[r.key]).map(r => ({ label: r.label, span: stages[r.key], color: r.color })),
+  ].filter(Boolean);
+  const onsetShown = onset != null && onset >= s.start && onset <= s.start + s.frames.length * s.period;
+  const guides = [
+    s.support && { at: s.support[0], border: '1px solid var(--muted)' },
+    s.support && { at: s.support[1], border: '1px dashed var(--muted)' },
+    { at: onset, border: '1px dotted var(--lcd-amber)' },
+  ].filter(Boolean);
+
+  // The turn recording: the whole turn, canonical mic, from where the chart
+  // starts through the spoken answer (a turn that never committed, through
+  // its close). Not kept stays a disabled control with the reason.
+  const recording = s.recording;
+  const recordingReason = recording === undefined ? 'recorded before the chart kept the whole turn'
+    : recording === null ? 'not recorded — Save utterances (Config → Speech) records the whole turn'
+    : playback.kept(TURN_CLIP.RECORDING) === false ? 'no longer kept' : null;
+  const playingRecording = playingKind === TURN_CLIP.RECORDING;
+
+  return (
+    <AfeLanes series={s} lanes={AFE_LANES.TURN} bars={bars} guides={guides}
+      anchor={s.support ? s.support[0] : s.utterance ? s.utterance[0] : s.start} anchorLabel={s.support ? 'wake' : 'start'}
+      playSpan={playingKind ? s[AFE_CLIP_SPANS[playingKind]] : null} elapsed={playback.elapsed}
+      label="Native AFE values for each 80 ms period of this turn, with its processing stages"
+      legend={<>each 80 ms period · gaps: no data · Frames: short (amber) or empty (red) periods · processing bars use the controller's clock and can run ~0.3 s early (Playback is the Echo's own){onsetShown && ' · dotted: playback began'} · hover to read one</>}>
       <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '4px 12px', marginTop: 6 }}>
         <Pill small disabled={recordingReason != null} onClick={() => playback.toggle(TURN_CLIP.RECORDING)}>
           {playingRecording ? '▮ Stop recording' : '▶ Play recording'}
         </Pill>
         {recordingReason && <span style={muted}>{recordingReason}</span>}
       </div>
-      {/* Two lines reserved: a readout wraps, and growing on hover would shift the stages below. */}
-      <div style={{ color: shownAt != null ? 'var(--text2)' : 'var(--muted)', minHeight: 34, marginTop: 4 }}>
-        {shownAt != null ? readout(shownAt)
-          : <>each 80 ms period · gaps: no data · Frames: short (amber) or empty (red) periods · processing bars use the controller's clock and can run ~0.3 s early (Playback is the Echo's own){inRange(onset) && ' · dotted: playback began'} · hover to read one</>}
+    </AfeLanes>
+  );
+}
+
+// A sample clip's or ambient recording's native AFE series (em_afe.AfeTrack,
+// GET …/samples|ambient/{name}/afe): VAD, DTD, ERLE and RMS over the whole
+// WAV, on its own timeline; playing it from its row draws the playhead.
+function RecordingAfeChart({ url, playing, elapsed }) {
+  const load = useAfeSeries(url);
+  const muted = { color: 'var(--muted)' };
+  if (!load) return <div style={muted}>loading the chart…</div>;
+  const s = load.series;
+  if (!s) {
+    return load.error
+      ? <div style={{ color: 'var(--warn)' }}>chart unavailable: {load.error}</div>
+      : <div style={muted}>no chart for this recording</div>;
+  }
+  return (
+    <AfeLanes series={s} lanes={AFE_LANES.RECORDING} anchor={0} anchorLabel="start"
+      playSpan={playing ? s.recording : null} elapsed={elapsed}
+      label="Native AFE values for each 80 ms period of this recording"
+      legend="each 80 ms period of the Echo's native AFE · gaps: no data · ▶ Play draws a playhead · hover to read one"/>
+  );
+}
+
+// One stored recording of the Samples tab (a sample clip or an ambient
+// recording): its controls in a row, `info` after its time, and with Chart
+// its AFE chart under them, the row's playback driving the playhead. A
+// recording without a series keeps the control, disabled (AfeRecordingNote
+// says why).
+function RecordingRow({ entry, info, chartUrl, chartOpen, onChart, playing, elapsed, children }) {
+  return (
+    <div style={{ borderTop: '1px solid var(--hairline)', padding: '6px 0' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+        <span style={{ fontFamily: MONO, fontSize: 10, color: 'var(--text2)', minWidth: 150 }}>
+          {new Date(entry.ts * 1000).toLocaleString()}
+        </span>
+        {info}
+        <span style={{ flex: 1 }}/>
+        <Pill small disabled={!entry.afe} onClick={onChart}>{chartOpen ? 'Hide chart' : 'Chart'}</Pill>
+        {children}
       </div>
+      {chartOpen && entry.afe && (
+        <div style={{ fontFamily: MONO, fontSize: 10, color: 'var(--text2)', lineHeight: 1.7 }}>
+          <RecordingAfeChart url={chartUrl} playing={playing} elapsed={elapsed}/>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// What a recording's Chart shows, and why one has none.
+function AfeRecordingNote({ device }) {
+  const gap = capabilityGap(liveCapabilities(device), CAPABILITY.AFE_METADATA);
+  return (
+    <div style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)', marginBottom: 8 }}>
+      Chart: the Echo&apos;s native VAD, DTD, ERLE and RMS for every 80 ms of the recording.
+      {gap ? ` Not recorded: ${gap}.` : ' Greyed out where none was recorded (recordings from before charts, or from firmware without the native AFE metadata).'}
     </div>
   );
 }
@@ -2192,6 +2296,7 @@ function SamplesTab({ device, isAdmin }) {
   const [error, setError]     = useState('');
   const [confirmWipe, setConfirmWipe] = useState(false);
   const [zipping, setZipping] = useState(false);
+  const [chartOf, setChartOf] = useState(null);   // clip name whose chart is open
 
   const id   = device.device_id;
   const on   = !!device.collectMode;
@@ -2368,25 +2473,21 @@ function SamplesTab({ device, isAdmin }) {
           </div>
         )}
 
+        {clips.length > 0 && <AfeRecordingNote device={device}/>}
         <div style={{ display:'flex', flexDirection:'column' }}>
           {clips.map(c => (
-            <div key={c.name} style={{
-              display:'flex', alignItems:'center', gap:10, padding:'6px 0',
-              borderTop:'1px solid var(--hairline)',
-            }}>
-              <span style={{ fontFamily:MONO, fontSize:10, color:'var(--text2)', minWidth:150 }}>
-                {new Date(c.ts * 1000).toLocaleString()}
-              </span>
-              <span style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)', minWidth:60 }}>
+            <RecordingRow key={c.name} entry={c} chartUrl={`${clipPath(c.name)}/afe`}
+              chartOpen={chartOf === c.name} onChart={() => setChartOf(o => (o === c.name ? null : c.name))}
+              playing={playing === c.name} elapsed={player.elapsed}
+              info={<span style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)', minWidth:60 }}>
                 {(c.ms / 1000).toFixed(1)}s
-              </span>
-              <span style={{ flex:1 }}/>
+              </span>}>
               <Pill small onClick={() => player.toggle(c.name, clipPath(c.name))}>{playing === c.name ? '■ Stop' : '▶ Play'}</Pill>
               <Pill small onClick={async () => {
                 try { downloadUrl(await player.url(c.name, clipPath(c.name)), `${slug}-${c.name}`); } catch {}
               }}>Download</Pill>
               {isAdmin && <Pill small danger onClick={() => doDelete(c.name)}>Delete</Pill>}
-            </div>
+            </RecordingRow>
           ))}
         </div>
       </Panel>
@@ -2411,6 +2512,7 @@ function AmbientPanel({ device, isAdmin }) {
   const [busy, setBusy]   = useState(false);
   const [error, setError] = useState('');
   const [confirmWipe, setConfirmWipe] = useState(false);
+  const [chartOf, setChartOf] = useState(null);   // recording whose chart is open
 
   const id        = device.device_id;
   const on        = !!device.ambientMode;
@@ -2567,28 +2669,26 @@ function AmbientPanel({ device, isAdmin }) {
           </div>
         )}
 
+        {files.length > 0 && <AfeRecordingNote device={device}/>}
         <div style={{ display:'flex', flexDirection:'column' }}>
           {files.map(f => (
-            <div key={f.name} style={{
-              display:'flex', alignItems:'center', gap:10, padding:'6px 0',
-              borderTop:'1px solid var(--hairline)',
-            }}>
-              <span style={{ fontFamily:MONO, fontSize:10, color:'var(--text2)', minWidth:150 }}>
-                {new Date(f.ts * 1000).toLocaleString()}
-              </span>
-              <span style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)', minWidth:60 }}>
-                {clock(f.ms)}
-              </span>
-              <span style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)', minWidth:70 }}>
-                {(f.bytes / 1048576).toFixed(1)} MB
-              </span>
-              <span style={{ flex:1 }}/>
+            <RecordingRow key={f.name} entry={f} chartUrl={`${filePath(f.name)}/afe`}
+              chartOpen={chartOf === f.name} onChart={() => setChartOf(o => (o === f.name ? null : f.name))}
+              playing={playing === f.name} elapsed={player.elapsed}
+              info={<>
+                <span style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)', minWidth:60 }}>
+                  {clock(f.ms)}
+                </span>
+                <span style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)', minWidth:70 }}>
+                  {(f.bytes / 1048576).toFixed(1)} MB
+                </span>
+              </>}>
               <Pill small onClick={() => player.toggle(f.name, filePath(f.name))}>{playing === f.name ? '■ Stop' : '▶ Play'}</Pill>
               <Pill small onClick={async () => {
                 try { downloadBlob(await API.blob(filePath(f.name)), `${slug}-ambient-${f.name}`); } catch {}
               }}>Download</Pill>
               {isAdmin && <Pill small danger onClick={() => doDelete(f.name)}>Delete</Pill>}
-            </div>
+            </RecordingRow>
           ))}
         </div>
       </Panel>

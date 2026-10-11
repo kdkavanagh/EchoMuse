@@ -85,12 +85,14 @@ ABS_FLOOR_DB = -75.0
 
 
 class ClipEntry(TypedDict):
-    """One stored clip as the API lists it (shared by `em_ambient`)."""
+    """One stored clip as the API lists it (shared by `em_ambient`). `afe`:
+    it has a native AFE series beside it (`afe_path`)."""
 
     name:  str
     ts:    float     # epoch seconds, from the filename
     bytes: int
     ms:    int
+    afe:   bool
 
 
 class StoreUsage(TypedDict):
@@ -163,11 +165,13 @@ DEFAULT_CONFIG = SegmentConfig()
 
 @dataclass
 class Clip:
-    """One cut segment, ready to write."""
+    """One cut segment, ready to write. `start` is its first sample's position
+    in the stream the segmenter was fed (`push`'s `at`)."""
     pcm:       bytes
     speech_ms: int      # onset → last above-threshold frame (what min_clip_ms judges)
     peak_db:   float
     truncated: bool     # hit max_clip_ms rather than a silence
+    start:     int = 0
 
     @property
     def duration_ms(self) -> int:
@@ -219,6 +223,8 @@ class Segmenter:
         self._floor: float | None = None
         self._preroll: list[bytes] = []
         self._preroll_ms = 0
+        self._preroll_at = 0      # stream position of _preroll[0]
+        self._clip_at    = 0      # stream position of an open clip's first frame
         self._open  = False
         self._frames: list[bytes] = []
         self._ms          = 0     # audio held in _frames
@@ -254,14 +260,15 @@ class Segmenter:
 
     # ── the loop ─────────────────────────────────────────────────────────
 
-    def push(self, pcm: bytes, rms: float) -> Clip | None:
+    def push(self, pcm: bytes, rms: float, at: int = 0) -> Clip | None:
         """
         Consume one frame. Returns a Clip if this frame closed one.
 
         `rms` is the caller's already-computed normalised RMS for `pcm` —
         the wake listener has it for its own noise-floor tracking, and
         recomputing it here would mean numpy in a module that otherwise
-        needs none.
+        needs none. `at` is the frame's position in the caller's stream, in
+        samples, carried into Clip.start; consecutive frames are contiguous.
         """
         if not pcm:
             return None
@@ -278,7 +285,7 @@ class Segmenter:
             self._floor += alpha * (db - self._floor)
 
         if not self._open:
-            self._remember(pcm, frame_ms)
+            self._remember(pcm, frame_ms, at)
             if db < self.close_db:
                 # Quiet again: a truncated clip's cooldown is over.
                 self._armed = True
@@ -318,12 +325,15 @@ class Segmenter:
 
     # ── internals ────────────────────────────────────────────────────────
 
-    def _remember(self, pcm: bytes, frame_ms: int) -> None:
+    def _remember(self, pcm: bytes, frame_ms: int, at: int) -> None:
         """Hold the last preroll_ms of pre-onset audio."""
+        if not self._preroll:
+            self._preroll_at = at
         self._preroll.append(pcm)
         self._preroll_ms += frame_ms
         while self._preroll and self._preroll_ms - duration_ms(len(self._preroll[0])) >= self.cfg.preroll_ms:
             self._preroll_ms -= duration_ms(len(self._preroll[0]))
+            self._preroll_at += len(self._preroll[0]) // SAMPLE_WIDTH
             self._preroll.pop(0)
 
     def _start(self, db: float, frame_ms: int) -> None:
@@ -332,6 +342,7 @@ class Segmenter:
         # everything held before it becomes the pad.
         self._open       = True
         self._frames     = list(self._preroll)
+        self._clip_at    = self._preroll_at
         self._ms         = sum(duration_ms(len(f)) for f in self._frames)
         self._pad_ms     = max(0, self._ms - frame_ms)
         self._speech_ms  = self._ms
@@ -375,6 +386,7 @@ class Segmenter:
             speech_ms=int(speech_span),
             peak_db=round(peak, 1),
             truncated=truncated,
+            start=self._clip_at,
         )
 
     def _reset_open(self) -> None:
@@ -441,9 +453,41 @@ def encode_wav(pcm: bytes) -> bytes:
     return buf.getvalue()
 
 
+# A recording's native AFE series (em_afe.AfeSeriesJson, on the recording's own
+# timeline) sits beside its WAV as `<epoch_ms>.afe.json`, in this store and in
+# em_ambient's. It is never listed as a recording and goes with its WAV.
+AFE_SUFFIX = ".afe.json"
+
+
+def afe_path(wav: Path) -> Path:
+    return wav.with_name(wav.stem + AFE_SUFFIX)
+
+
+def write_afe(wav: Path, series: str) -> None:
+    """Write `wav`'s series, write-then-rename. Blocking."""
+    path = afe_path(wav)
+    tmp = path.with_name(path.name + ".part")
+    tmp.write_text(series, encoding="utf-8")
+    tmp.replace(path)
+
+
+def read_afe(wav: Path) -> str | None:
+    """`wav`'s series JSON, or None when it has none. Blocking."""
+    try:
+        return afe_path(wav).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+
+
+def remove(wav: Path) -> None:
+    """Delete a recording and its series. Raises OSError as unlink does."""
+    wav.unlink()
+    afe_path(wav).unlink(missing_ok=True)
+
+
 def save_clip(device_id: str, clip: Clip, when_ms: int | None = None,
               db_path: str | None = None,
-              keep: int = KEEP_PER_DEVICE) -> str | None:
+              keep: int = KEEP_PER_DEVICE, afe: str | None = None) -> str | None:
     """
     Write one clip and prune the device back to `keep` files.
 
@@ -460,6 +504,9 @@ def save_clip(device_id: str, clip: Clip, when_ms: int | None = None,
     apart by construction, so this only fires when the clock has been
     stepped backwards under us, which is precisely when silently losing the
     older file would be worst.
+
+    `afe` is the clip's AFE series JSON, written beside it before the clip
+    appears, so a listed clip that will have one already does.
     """
     directory = device_dir(device_id, db_path)
     if directory is None or not clip.pcm:
@@ -474,6 +521,8 @@ def save_clip(device_id: str, clip: Clip, when_ms: int | None = None,
     # worse than no clip at all.
     tmp = path.with_suffix(".wav.part")
     tmp.write_bytes(encode_wav(clip.pcm))
+    if afe is not None:
+        write_afe(path, afe)
     tmp.replace(path)
     prune(device_id, db_path=db_path, keep=keep)
     return name
@@ -481,7 +530,8 @@ def save_clip(device_id: str, clip: Clip, when_ms: int | None = None,
 
 def list_for(device_id: str, db_path: str | None = None) -> list[ClipEntry]:
     """
-    This device's clips, newest first: name, epoch ms, bytes and duration.
+    This device's clips, newest first: name, epoch ms, bytes, duration and
+    whether it has an AFE series.
 
     Duration comes from the file size rather than the WAV header — every
     file here is written by encode_wav, and opening thousands of them to
@@ -492,7 +542,9 @@ def list_for(device_id: str, db_path: str | None = None) -> list[ClipEntry]:
     if directory is None or not directory.is_dir():
         return []
     out: list[ClipEntry] = []
-    for child in directory.iterdir():
+    children = list(directory.iterdir())
+    names = {child.name for child in children}
+    for child in children:
         ts = parse_filename(child.name)
         if ts is None:
             continue
@@ -507,6 +559,7 @@ def list_for(device_id: str, db_path: str | None = None) -> list[ClipEntry]:
             # 44 bytes of RIFF header. A negative would mean a truncated
             # file, which reads as 0 rather than as nonsense.
             "ms":    max(0, duration_ms(size - 44)),
+            "afe":   afe_path(child).name in names,
         })
     out.sort(key=lambda c: c["ts"], reverse=True)
     return out
@@ -534,7 +587,7 @@ def prune(device_id: str, db_path: str | None = None,
     removed: list[str] = []
     for clip in list_for(device_id, db_path)[max(keep, 0):]:
         try:
-            (directory / clip["name"]).unlink()
+            remove(directory / clip["name"])
             removed.append(clip["name"])
         except OSError as e:
             log.warning(f"[samples] Could not prune {clip['name']}: {e}")

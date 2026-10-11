@@ -189,6 +189,52 @@ def test_a_series_without_a_span_or_any_record_is_no_data():
     assert series is not None and series.wire()["frames"] == [10, None]
 
 
+# --- recordings from the diagnostic tap -------------------------------------------------
+
+
+def test_a_recordings_series_is_on_its_own_timeline_whichever_arrives_first():
+    track = em_afe.AfeTrack(capacity=100)
+    capture = 200 * 1280                                        # the lease's capture position
+    for k in range(6):                                          # 80 ms blocks, their records trailing
+        track.mic("L", capture + k * 1280, 1280)
+        if k >= 1:
+            track.afe("L", [rec(capture + (k - 1) * 1280, volume=k)])
+    track.afe("L", [rec(capture + 6 * 1280, volume=6)])          # a record ahead of its block
+    track.mic("L", capture + 6 * 1280, 1280)
+    series = track.series(2 * 1280, 7 * 1280)                   # a clip from the third block on
+    assert series is not None
+    w = series.wire()
+    assert (w["start"], w["recording"], w["support"], w["utterance"], w["stages"]) == (0, [0, 5 * 1280], None, None, {})
+    assert w["volume"] == [3, 4, 5, None, 6]                     # block 5's record never came
+
+
+def test_a_recording_starting_mid_period_keeps_its_offset():
+    track = em_afe.AfeTrack(capacity=100)
+    track.mic("L", 0, 2560)
+    track.afe("L", [rec(0, vad_max=1), rec(1280, vad_max=2)])
+    w = track.series(640, 2560).wire()
+    assert (w["start"], w["recording"], w["vad_max"]) == (-640, [0, 1920], [0.25, 0.5])
+
+
+def test_a_new_lease_maps_the_tap_onto_its_own_records():
+    # A reconnect restarts the capture timeline: the tap goes on, and the new lease's period 0
+    # is not the old lease's.
+    track = em_afe.AfeTrack(capacity=100)
+    track.mic("A", 0, 2560)
+    track.afe("A", [rec(0, vad_max=1), rec(1280, vad_max=1)])
+    track.afe("B", [rec(0, vad_max=3)])
+    track.mic("B", 0, 1280)
+    assert track.series(0, 3840).wire()["vad_max"] == [0.25, 0.25, 0.75]
+
+
+def test_a_tap_without_records_or_past_its_capacity_has_no_data():
+    track = em_afe.AfeTrack(capacity=4)
+    track.mic("L", 0, 1280 * 6)
+    assert track.series(0, 1280 * 6) is None
+    track.afe("L", [rec(k * 1280) for k in range(6)])
+    assert track.series(0, 1280 * 6).wire()["frames"] == [None, None, 10, 10, 10, 10]
+
+
 # --- wake.stats afe -------------------------------------------------------------------
 
 

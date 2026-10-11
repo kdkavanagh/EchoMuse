@@ -218,6 +218,24 @@ def test_frame_size_does_not_change_the_cut():
     assert max(out) - min(out) <= 160
 
 
+def test_a_clip_starts_at_its_first_preroll_frame_in_the_fed_stream():
+    """Clip.start places the WAV in the stream the tap fed, which is how the
+    clip finds its AFE series."""
+    seg = smp.Segmenter()
+    n = len(_frame()) // smp.SAMPLE_WIDTH
+    pos, clips = 0, []
+    for level, count in ((QUIET, 60), (SPEECH, 12), (QUIET, 12)):
+        for _ in range(count):
+            clip = seg.push(_frame(), level, at=pos)
+            pos += n
+            if clip is not None:
+                clips.append(clip)
+    [clip] = clips
+    # 320 ms of preroll: the three frames before the loud one at frame 60, and that frame.
+    assert clip.start == 57 * n
+    assert clip.start + len(clip.pcm) // smp.SAMPLE_WIDTH <= pos
+
+
 def test_config_rejects_a_combination_that_can_never_emit():
     with pytest.raises(ValueError):
         smp.SegmentConfig(open_margin_db=6.0, close_margin_db=12.0)
@@ -331,6 +349,17 @@ def test_usage_reports_what_the_volume_is_carrying(tmp_path):
     assert u["count"] == 2
     assert u["ms"] == 1200
     assert u["bytes"] > 0
+
+
+def test_a_clip_keeps_its_afe_series_beside_it_until_it_goes(tmp_path):
+    db = _db(tmp_path)
+    plain = smp.save_clip("dev", _clip(), 1_700_000_000_000, db)
+    charted = smp.save_clip("dev", _clip(), 1_700_000_001_000, db, afe='{"start":0}')
+    assert {c["name"]: c["afe"] for c in smp.list_for("dev", db)} == {plain: False, charted: True}
+    assert smp.read_afe(smp.resolve("dev", charted, db)) == '{"start":0}'
+    assert smp.read_afe(smp.resolve("dev", plain, db)) is None
+    newest = smp.save_clip("dev", _clip(), 1_700_000_002_000, db, keep=1)
+    assert [p.name for p in smp.device_dir("dev", db).iterdir()] == [newest]
 
 
 # ─── wiring ──────────────────────────────────────────────────────────────────

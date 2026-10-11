@@ -530,6 +530,16 @@ Based on a review of Office turns 433–476 (`docs/turn-latency-review.md`,
   word to where the Dot stopped listening, and play against their chart.
   Refused wakes share the 100-recording window, so a Dot that false-triggers
   often keeps fewer accepted turns.
+- **Sample clips and ambient recordings get the AFE chart too.** While a
+  recording mode runs, its diagnostic lease also takes the `afe` stream, and
+  each saved clip and ambient file keeps its 80 ms records beside the WAV
+  (`<name>.afe.json`, on the recording's own timeline; deleted and pruned
+  with it). **Chart** on a row of the Samples tab opens DNN VAD, double-talk,
+  ERLE and RMS over the whole recording, drawn by the same chart as a turn's;
+  ▶ Play draws the playhead across it. Lists report `afe` per entry;
+  `GET /api/devices/{id}/samples/{name}/afe` and `…/ambient/{name}/afe` serve
+  one. Needs `afe_metadata_v1`, and no firmware update; recordings made
+  before this, or without the capability, have no chart.
 
 ### Earlier in this release
 

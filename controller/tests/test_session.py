@@ -1211,6 +1211,31 @@ def test_a_rejected_candidate_row_carries_its_wake_evidence(afe, sends, expected
         assert series["support"][0] == S and series["utterance"] is None and 10 in series["frames"]
 
 
+@pytest.mark.parametrize("afe", [False, True])
+def test_the_diagnostic_lease_feeds_its_tap_the_mic_and_in_an_afe_session_the_records(afe):
+    # The recording modes' charts: only a session that opted in to `afe` asks for it.
+    async def main():
+        h = Harness(afe=afe)
+        await h.start()
+        mic, records = [], []
+        await h.actor.open_diagnostic(em_session.DiagnosticTap(
+            lambda lease, start, pcm: mic.append((lease, start, pcm.size)),
+            lambda lease, recs: records.extend((lease, r.start) for r in recs)))
+        await h.settle()
+        [(body, _)] = h.link.of("uplink.open")
+        await h.feed(0, 4 * PERIOD)
+        await h.actor.close()
+        return body, mic, records
+
+    body, mic, records = run(main())
+    assert body["reason"] == "diagnostic"
+    assert body["streams"] == ({"mic": "live", "afe": "live"} if afe else {"mic": "live"})
+    lease = body["lease_id"]
+    assert mic and {m[0] for m in mic} == {lease}
+    assert records == ([(lease, k * PERIOD) for k in range(4)] if afe else [])
+
+
+
 # --- button turns and Home Assistant --------------------------------------------------------------
 
 PRESS = 80_000
