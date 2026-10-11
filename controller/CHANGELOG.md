@@ -97,7 +97,9 @@ the device wire protocol is [docs/protocol-v1.md](../docs/protocol-v1.md).
   became a preview (`/api/devices/{id}/sounds/preview`).
 - **Recording modes** (sample collection, ambient recording, capture) now
   hold a diagnostic uplink lease; the ring pulses magenta while one runs.
-- **Activity tab, stage by stage.** Each turn shows its date and time;
+- **Activity tab, stage by stage.** Each turn shows its trace number
+  (`#1234`, the key of `/api/devices/{id}/turns/{n}/trace`; hover for the
+  controller-log id) and its date and time;
   clicking one shows what the controller's streaming recognizer heard and
   why it stopped listening (route, how complete the text looked, silence
   waited), Home Assistant's transcript and the text sent to intent after the

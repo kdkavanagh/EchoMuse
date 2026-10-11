@@ -2047,6 +2047,12 @@ function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, stateLa
                 onMouseEnter={() => setHover(i)} onMouseLeave={() => setHover(null)}
                 style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '3px 0', cursor: 'pointer', borderRadius: 4,
                   background: isSel ? 'var(--accent-tint)' : hover === i ? 'var(--hairline)' : 'transparent' }}>
+                {/* The trace number: the key of GET …/turns/{n}/trace. The title
+                    carries the controller-log id (turn_uuid) of the same turn. */}
+                <span style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)', width: 44, flexShrink: 0, textAlign: 'right', whiteSpace: 'nowrap' }}
+                  title={`Trace ${t.turn_id} — GET /api/devices/${deviceId}/turns/${t.turn_id}/trace${t.turn_uuid ? ` · controller log id ${t.turn_uuid}` : ''}`}>
+                  #{t.turn_id}
+                </span>
                 <span style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)', width: 86, flexShrink: 0, textAlign: 'right', whiteSpace: 'nowrap' }}>{fmtTurnWhen(t.ts)}</span>
                 <div style={{ flex: 1, display: 'flex', height: 14, alignItems: 'stretch' }}>
                   {TURN_STAGES.map(s => seg[s.key] > 0 && (
