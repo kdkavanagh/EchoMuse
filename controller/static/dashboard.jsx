@@ -1315,7 +1315,7 @@ function AfeChart({ deviceId, turnId, onset, playback }) {
     const tick = () => {
       const t = playback.elapsed();
       if (t != null) {
-        const x = (Math.min(span[1], span[0] + t * CAPTURE_RATE) - s.start) / s.period;
+        const x = Math.max(0, Math.min(n, (Math.min(span[1], span[0] + t * CAPTURE_RATE) - s.start) / s.period));
         if (cursorRef.current) cursorRef.current.style.left = `${x / n * 100}%`;
         const i = Math.max(0, Math.min(n - 1, Math.floor(x)));
         if (i !== last) { last = i; setPlayAt(i); }
@@ -1457,12 +1457,11 @@ function AfeChart({ deviceId, turnId, onset, playback }) {
   const shownAt = hover ?? playAt;
 
   // The turn recording: the whole turn, canonical mic, from where the chart
-  // starts through the spoken answer. Not kept stays a disabled control with
-  // the reason; a refused wake (no utterance) offers none.
+  // starts through the spoken answer (a turn that never committed, through
+  // its close). Not kept stays a disabled control with the reason.
   const recording = s.recording;
   const recordingReason = recording === undefined ? 'recorded before the chart kept the whole turn'
-    : recording === null ? (stages.endpoint ? 'not recorded — Save utterances (Config → Speech) records the whole turn'
-                                            : 'not recorded: only an accepted request is')
+    : recording === null ? 'not recorded — Save utterances (Config → Speech) records the whole turn'
     : playback.kept(TURN_CLIP.RECORDING) === false ? 'no longer kept' : null;
   const playingRecording = playingKind === TURN_CLIP.RECORDING;
 
@@ -1511,16 +1510,14 @@ function AfeChart({ deviceId, turnId, onset, playback }) {
           })}
         </div>
       </div>
-      {s.utterance && (
-        <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '4px 12px', marginTop: 6 }}>
-          <Pill small disabled={recordingReason != null} onClick={() => playback.toggle(TURN_CLIP.RECORDING)}>
-            {playingRecording ? '▮ Stop recording' : '▶ Play recording'}
-          </Pill>
-          {recordingReason && <span style={muted}>{recordingReason}</span>}
-        </div>
-      )}
+      <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '4px 12px', marginTop: 6 }}>
+        <Pill small disabled={recordingReason != null} onClick={() => playback.toggle(TURN_CLIP.RECORDING)}>
+          {playingRecording ? '▮ Stop recording' : '▶ Play recording'}
+        </Pill>
+        {recordingReason && <span style={muted}>{recordingReason}</span>}
+      </div>
       {/* Two lines reserved: a readout wraps, and growing on hover would shift the stages below. */}
-      <div style={{ color: shownAt != null ? 'var(--text2)' : 'var(--muted)', minHeight: 34, marginTop: s.utterance ? 4 : 0 }}>
+      <div style={{ color: shownAt != null ? 'var(--text2)' : 'var(--muted)', minHeight: 34, marginTop: 4 }}>
         {shownAt != null ? readout(shownAt)
           : <>each 80 ms period · gaps: no data · Frames: short (amber) or empty (red) periods · processing bars use the controller's clock and can run ~0.3 s early (Playback is the Echo's own){inRange(onset) && ' · dotted: playback began'} · hover to read one</>}
       </div>

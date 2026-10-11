@@ -376,7 +376,9 @@ compare **Noise suppression** or a new position on the same phrase.
 On a Dot that reports native AFE metadata (Fire OS 6), each turn also gets a
 **turn recording**. It is what the microphone heard from just before the wake
 word, through the spoken answer, to a second after the turn ends (at most
-30 s after the request). Press **Play recording** under the turn's chart in
+30 s after the request). A turn that ends without a request — no command
+heard, cut short, or a refused wake — is recorded too, up to where the Dot
+stopped listening. Press **Play recording** under the turn's chart in
 **Activity** to hear it while a playhead runs across the chart. To make it,
 the Dot keeps sending microphone audio while it answers, which it otherwise
 stops doing once your request ends. It is the Echo's own processed audio, with

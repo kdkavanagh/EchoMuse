@@ -17,8 +17,10 @@ Two kinds (`RecordingKind`), both kept only while `saveUtterances` is on:
   * **The turn recording** (`turn_recordings/`) is the whole turn as the
     native AFE output it: canonical mic PCM, no gain, from where the turn's
     chart starts through the spoken answer and a second past the turn's end
-    (em_session's response lease). Only turns with an AFE chart (Fire OS 6,
-    `afe_metadata_v1`) have one; the dashboard plays it against the chart.
+    (em_session's response lease). A turn that never committed, a refused
+    wake included, is recorded through its lease's close. Only turns with an
+    AFE chart (Fire OS 6, `afe_metadata_v1`) have one; the dashboard plays it
+    against the chart.
 
 Storage: files live beside the SQLite DB, so they sit inside the persisted
 Docker volume and survive image upgrades. Retention is a hard per-device

@@ -524,6 +524,12 @@ Based on a review of Office turns 433–476 (`docs/turn-latency-review.md`,
   (`GET /api/devices/{id}/turns/{turn}/recording`). Mute or a disconnect
   during the answer erases the answer's part. With **Save utterances** off,
   no microphone audio leaves the Dot after the request, as before.
+- **Every turn gets its recording, not only accepted requests.** A turn that
+  ended without one (no command heard, cut short) and a refused wake are
+  recorded too while **Save utterances** is on, from just before the wake
+  word to where the Dot stopped listening, and play against their chart.
+  Refused wakes share the 100-recording window, so a Dot that false-triggers
+  often keeps fewer accepted turns.
 
 ### Earlier in this release
 

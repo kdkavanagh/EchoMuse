@@ -1124,6 +1124,47 @@ def test_the_afe_series_places_each_saved_recording_on_its_timeline_sample_for_s
     assert saved["turn"] == ramp(a, b).tobytes()
 
 
+@pytest.mark.parametrize("terminal", ["no_input", "unverified_wake"])
+def test_a_turn_that_never_commits_keeps_its_turn_recording_too(monkeypatch, terminal):
+    saved = {}
+
+    def save_recording(device_id, row_id, pcm, kind=em_session.em_recordings.RecordingKind.UTTERANCE):
+        saved[str(kind)] = pcm
+        return None
+
+    monkeypatch.setattr(em_session.em_recordings, "save", save_recording)
+
+    def ramp(a, b):                         # each sample names its capture index
+        return (np.arange(a, b) % 32_749).astype(np.int16)
+
+    async def main():
+        h = Harness(config={"saveUtterances": True}, afe=True)
+        h.device.mic_pcm = ramp
+        if terminal == "no_input":          # an accepted wake that heard no command
+            h.worker.tokens = TURN_647_TOKENS
+            await h.start()
+            h.actor.on_message(candidate())
+            await h.settle()
+            await h.feed(S - 4_800 - 20_000, OPEN + 90_000)
+        else:                               # a refused wake
+            h.worker.verification = "fail"
+            await producing_sound_case(h)
+        await h.wait_for(lambda: h.rows)
+        await h.actor.close()
+        return h, h.rows[0]
+
+    h, row = run(main())
+    assert row["terminal_reason"] == terminal and row.get("commit_id") is None
+    # What the lease heard, from the candidate lease's mic start through its close, placed on the
+    # chart sample for sample.
+    series = json.loads(row["afe_series"])
+    heard = series["utterance"] or series["support"]
+    a, b = series["recording"]
+    assert a == (S - 4_800) // CELL * CELL and heard[1] <= b <= h.device.pos[Kind.MIC]
+    assert set(saved) == {"turn"} and saved["turn"] == ramp(a, b).tobytes()
+
+
+
 def test_an_opted_in_candidate_lease_mirrors_the_afe_stream_from_its_reference_start():
     async def main(afe: bool):
         h = Harness(afe=afe)

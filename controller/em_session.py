@@ -873,7 +873,7 @@ class _Turn:
     persisted: asyncio.Task[int | None] | None = None   # the row write; its result is the row id
     wake_db: float | None = None
     wake_clip: _Clip | None = None
-    capture: _Clip | None = None              # the committed lease's mic for the turn recording; None: not made
+    capture: _Clip | None = None              # the turn lease's mic for the turn recording; None: not made
     stt_copy: bytes | None = None             # the committed span as sent to STT, sample for sample
     stt_raw: str | None = None                # HA's transcript before wake-phrase removal
     stt_text: str | None = None               # what was routed: stripped HA transcript or local command
@@ -1378,14 +1378,19 @@ class SessionActor:
 
     async def _reject_candidate(self, candidate: _Candidate, reason: TerminalReason) -> None:
         """Close the candidate lease (also releasing any provisional duck); no turn, focus, or chime
-        (a local_wake_chime device may already have chimed an idle candidate; it is not retracted)."""
+        (a local_wake_chime device may already have chimed an idle candidate; it is not retracted).
+        While `saveUtterances` is on, what the lease heard is kept as the row's turn recording."""
         self._candidate = None
         afe, series = _afe_snapshot(candidate.runtime, candidate, None)
+        timeline = self._timeline(candidate.runtime)
+        capture = (_lease_capture(timeline, _support(candidate), None)
+                   if timeline is not None and series is not None and self._records_turn(candidate.runtime)
+                   else None)
         close = LeaseEnd.ARBITRATION_LOST if reason == TerminalReason.ARBITRATION_LOST else LeaseEnd.REJECTED
         await self._close_uplink(candidate.lease_id, close)
         self._release_runtime(candidate.lease_id)
         self._emit(ActorEvent(ActorEventKind.TERMINAL, self.state, reason, self._dialog_active))
-        self._persists.add(self._spawn(self._persist_candidate(candidate, reason, afe, series)))
+        self._persists.add(self._spawn(self._persist_candidate(candidate, reason, afe, series, capture)))
 
     async def _accept_candidate(self, candidate: _Candidate) -> None:
         context, target = self._command_context(candidate)
@@ -2008,8 +2013,8 @@ class SessionActor:
         turn.wake_clip = self._wake_clip(turn, timeline)
         turn.afe_evidence, turn.afe_series = _afe_snapshot(turn.runtime, turn.candidate, _utterance_span(turn))
         turn.timings["audio_ms"] = round((commit.end - commit.start) * 1000 / SAMPLE_RATE)
-        if turn.runtime.afe is not None and self._config().get("saveUtterances"):
-            turn.capture = self._capture(turn, timeline)
+        if self._records_turn(turn.runtime):
+            turn.capture = _lease_capture(timeline, _support(turn.candidate), _utterance_span(turn))
         await self._open_response_lease(turn, commit)
         await self._close_uplink(turn.runtime.lease_id, LeaseEnd.COMMITTED)
         self._release_runtime(turn.runtime.lease_id)
@@ -2914,6 +2919,9 @@ class SessionActor:
         timeline = self._timeline(turn.runtime)
         if timeline is not None and turn.wake_clip is None:
             turn.wake_clip = self._wake_clip(turn, timeline)
+        if timeline is not None and turn.commit is None and self._records_turn(turn.runtime):
+            # A turn that never committed is recorded too: what its lease heard, through its close.
+            turn.capture = _lease_capture(timeline, _support(turn.candidate), _utterance_span(turn))
         if turn.coverage is None and turn.runtime.echo_total:
             turn.coverage = turn.runtime.echo_known / turn.runtime.echo_total
         if turn.afe_evidence is None:
@@ -3000,17 +3008,10 @@ class SessionActor:
             return None
         return _Clip(a, timeline.mic.read(a, b).tobytes())
 
-    def _capture(self, turn: _Turn, timeline: LeaseTimeline) -> _Clip | None:
-        """The committed lease's canonical mic for the turn recording: from where the turn's chart
-        starts (or the lease's first contiguous sample, if later) through the newest contiguous
-        sample. The response lease takes the mic on from its end."""
-        assert turn.commit is not None
-        run = timeline.mic.known.containing(turn.commit.start)
-        chart = series_range(_support(turn.candidate), _utterance_span(turn))
-        if run is None or chart is None:
-            return None
-        a = max(run[0], chart[0])
-        return _Clip(a, timeline.mic.read(a, run[1]).tobytes())
+    def _records_turn(self, runtime: _Runtime) -> bool:
+        """A turn recording is made of a lease that took `afe` (its turn has a chart to play it
+        against) while `saveUtterances` is on, however the turn ends."""
+        return runtime.afe is not None and bool(self._config().get("saveUtterances"))
 
     async def _persist(self, turn: _Turn) -> int | None:
         """The turn row with its §11.3 decision trace; utterance WAV, wake clip and turn recording
@@ -3106,10 +3107,14 @@ class SessionActor:
         return row_id
 
     async def _persist_candidate(self, candidate: _Candidate, reason: TerminalReason,
-                                 afe: AfeEvidence | None, series: AfeSeries | None) -> None:
-        """A rejected candidate is a turn row with its attribution reason and no audio (§11.3)."""
+                                 afe: AfeEvidence | None, series: AfeSeries | None,
+                                 capture: _Clip | None) -> None:
+        """A rejected candidate is a turn row with its attribution reason, and `capture` as its turn
+        recording, placed by the series (§11.3)."""
+        if series is not None:
+            series = replace(series, recording=capture.span if capture else None)
         try:
-            await self.deps.persist_turn(TurnRow(
+            row_id = await self.deps.persist_turn(TurnRow(
                 ts=time.time(), trigger=UtteranceKind.WAKE, wake_model=candidate.model.wake_phrase,
                 wake_score=candidate.peak, wake_threshold=candidate.threshold,
                 total_ms=round((asyncio.get_running_loop().time() - candidate.received) * 1000),
@@ -3121,6 +3126,14 @@ class SessionActor:
             ))
         except Exception:
             log.exception("[%s] rejected candidate not persisted", self.device_id)
+            return
+        if capture is None or not capture.pcm:
+            return
+        try:
+            await asyncio.get_running_loop().run_in_executor(None, _save_turn_recording, self.device_id,
+                                                             row_id, capture.pcm)
+        except Exception:
+            log.exception("[%s] turn %s audio not saved", self.device_id, row_id)
 
     # --- wire helpers -----------------------------------------------------------------------------
 
@@ -3258,9 +3271,24 @@ def _afe_series(turn: _Turn, response: AfeTimeline) -> AfeSeries | None:
     return turn_series(turn.runtime.afe, _support(turn.candidate), _utterance_span(turn), response=response)
 
 
+def _lease_capture(timeline: LeaseTimeline, support: tuple[int, int] | None,
+                   utterance: tuple[int, int] | None) -> _Clip | None:
+    """A lease's canonical mic for the turn recording: the contiguous run holding the utterance's
+    start (the support window's without one), from where the turn's chart starts (or the run's first
+    sample, if later) through its newest sample. After a commit the response lease takes the mic on
+    from its end."""
+    chart, anchor = series_range(support, utterance), utterance or support
+    run = timeline.mic.known.containing(anchor[0]) if anchor is not None else None
+    if chart is None or run is None:
+        return None
+    a = max(run[0], chart[0])
+    return _Clip(a, timeline.mic.read(a, run[1]).tobytes())
+
+
 def _turn_recording(turn: _Turn) -> _Clip | None:
-    """The turn recording: `turn.capture`, and the response lease's mic contiguous from its end.
-    Mute and session loss erase the response's mic (UplinkSession.clear), leaving the capture."""
+    """The turn recording: `turn.capture`, and after a commit the response lease's mic contiguous
+    from its end. Mute and session loss erase the response's mic (UplinkSession.clear), leaving the
+    capture."""
     capture = turn.capture
     if capture is None:
         return None
