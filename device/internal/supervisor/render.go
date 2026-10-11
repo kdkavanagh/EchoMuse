@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"math"
+	"strings"
 
 	"github.com/wilbowes/EchoMuse/internal/assets"
 	"github.com/wilbowes/EchoMuse/internal/audio/ema"
@@ -129,9 +130,13 @@ func (s *Supervisor) onProgress(p render.Progress) {
 }
 
 // onFinished forwards render.finished and releases dialog-output focus.
-// Device-local playbacks are not reported.
+// Device-local playbacks are not reported; the offline notice's end (or
+// replacement) re-arms it.
 func (s *Supervisor) onFinished(f render.Finished) {
 	if f.Local {
+		if strings.HasPrefix(f.PlaybackID, offlineNoticePrefix) {
+			s.noticePlaying.Store(false)
+		}
 		return
 	}
 	s.mu.Lock()

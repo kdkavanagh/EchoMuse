@@ -210,7 +210,7 @@ The LED ring tells you what's happening (full list in
 | Cyan pulse | An alarm or timer is ringing |
 | Cyan arc | Volume level, shown for 2 seconds after a volume press |
 | Solid red | Microphones muted (the physical mute button). Mute also cuts off whatever the assistant was doing |
-| Orange pulse | Not connected to the controller |
+| Slow red pulse | Not connected to the controller. Saying the wake word gets "I can't connect to the smart home right now" |
 
 ## Everyday things
 

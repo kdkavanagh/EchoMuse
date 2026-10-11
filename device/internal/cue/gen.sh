@@ -3,9 +3,9 @@
 #
 # The .pcm files beside this script are what go:embed ships: build artefacts
 # that happen to be committed, in the same spirit as
-# internal/wakeword/testdata's fixture. The wake chime is decoded from its
-# .flac, kept only as provenance and as the input here; the no-input chime
-# is synthesized below, so this script is its source.
+# internal/wakeword/testdata's fixture. The wake chime and the offline notice
+# are decoded from their .flac/.mp3, kept only as provenance and as the input
+# here; the no-input chime is synthesized below, so this script is its source.
 #
 # 48kHz mono S16_LE is the render mixer's native format, so anything else
 # would require device-side resampling.
@@ -19,6 +19,19 @@ pcm() {
 
 out=wake_word_triggered.pcm
 pcm -i wake_word_triggered.flac
+
+# The offline notice, spoken when the wake word is heard with no controller.
+# offline_notice.mp3 is Home Assistant's TTS for "I can't connect to the
+# smart home right now.", rendered 2026-10-11 by a TTS-only run of the Dots'
+# Assist pipeline ("STT": tts.elevenlabs_text_to_speech, voice
+# Xb7hH8MSUJpSbSDYk0k2) -- the voice the Dots answer in -- with
+#   {"type": "assist_pipeline/run", "start_stage": "tts", "end_stage": "tts",
+#    "input": {"text": "..."}, "pipeline": "<id>"}
+# and fetching tts-end's tts_output.url. Decoded exactly as the controller
+# decodes a live reply (em_media), so it plays at a reply's level; its own
+# ~0.24 s tail is the pause before the no-input chime.
+out=offline_notice.pcm
+pcm -i offline_notice.mp3
 
 # note FREQ ONSET DECAY AMPLITUDE: a struck tone with 4 ms attack whose 2nd
 # and 3rd harmonics die 3x and 5x faster than the fundamental.

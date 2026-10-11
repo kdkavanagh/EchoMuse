@@ -1,5 +1,6 @@
-// Package cue holds the firmware's built-in earcon assets as 48 kHz mono
-// S16 PCM for the mixer's earcon source (SPEC §11.2, §18.2).
+// Package cue holds the firmware's built-in sounds as 48 kHz mono S16 PCM:
+// the earcons controllers name in render.start (SPEC §11.2, §18.2), and the
+// offline notice the device plays on its own.
 package cue
 
 import (
@@ -29,18 +30,33 @@ var wakeChimePCM []byte
 //go:embed no_input_chime.pcm
 var noInputChimePCM []byte
 
+// offlineNoticePCM is Home Assistant's TTS of "I can't connect to the smart
+// home right now.", decoded by gen.sh (provenance there).
+//
+//go:embed offline_notice.pcm
+var offlineNoticePCM []byte
+
 var assets = map[string][]int16{
 	WakeChime:    decodeS16LE(wakeChimePCM),
 	NoInputChime: decodeS16LE(noInputChimePCM),
 }
 
-func decodeS16LE(b []byte) []int16 {
-	if len(b)%2 != 0 {
-		panic("cue: embedded PCM has an odd byte count")
+var offlineNotice = decodeS16LE(offlineNoticePCM, noInputChimePCM)
+
+// decodeS16LE decodes the concatenation of parts into one slice.
+func decodeS16LE(parts ...[]byte) []int16 {
+	n := 0
+	for _, b := range parts {
+		if len(b)%2 != 0 {
+			panic("cue: embedded PCM has an odd byte count")
+		}
+		n += len(b) / 2
 	}
-	pcm := make([]int16, len(b)/2)
-	for i := range pcm {
-		pcm[i] = int16(binary.LittleEndian.Uint16(b[2*i:]))
+	pcm := make([]int16, 0, n)
+	for _, b := range parts {
+		for i := 0; i < len(b); i += 2 {
+			pcm = append(pcm, int16(binary.LittleEndian.Uint16(b[i:])))
+		}
 	}
 	return pcm
 }
@@ -54,3 +70,8 @@ func Asset(name string) ([]int16, error) {
 	}
 	return pcm, nil
 }
+
+// OfflineNotice is what a wake heard with no controller plays: the spoken
+// notice, its own trailing pause, then the no-input chime. It is not a
+// render.start asset. The slice is shared and must not be modified.
+func OfflineNotice() []int16 { return offlineNotice }

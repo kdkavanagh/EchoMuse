@@ -51,6 +51,10 @@ func Open(dir string) (*Store, error) {
 	return &Store{dir: dir}, nil
 }
 
+// Dir is the store's directory. Files in it not named `<sha256>.<ext>` are
+// the owner's own; GC leaves them alone.
+func (s *Store) Dir() string { return s.dir }
+
 // Path is where the asset sha with extension ext is installed.
 func (s *Store) Path(sha, ext string) string {
 	return filepath.Join(s.dir, sha+"."+ext)

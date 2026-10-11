@@ -88,6 +88,7 @@ func (s *Supervisor) ready(sess Session, r proto.SessionReady) {
 	s.announceMu.Lock()
 	s.mu.Lock()
 	s.session, s.sessCtx, s.sessCancel = sess, ctx, cancel
+	s.offCancel()
 	clear(s.unfetchable)
 	s.mu.Unlock()
 	s.afe.on.Store(afe)
@@ -126,16 +127,31 @@ func (s *Supervisor) Rejected(reason proto.RejectReason) {
 
 // Lost implements client.Handler: every dialog/uplink lease and network
 // playback ends; local alerts, privacy and physical stop continue (§16.1).
+// A wake or dialog the controller was still handling gets the offline
+// notice, so the user is not left with silence; the detector keeps (or
+// restores) the last model and answers later wakes itself.
 func (s *Supervisor) Lost(reason client.LostReason) {
 	log.Printf("[session] lost: %s", reason)
-	s.endSession()
+	inFlight := s.endSession()
 	s.cfg.Physical.SetLinkState(server.LinkDown)
+	s.mu.Lock()
+	s.offCancel()
+	s.offCtx, s.offCancel = context.WithCancel(context.Background())
+	s.mu.Unlock()
+	s.restoreWake()
+	if inFlight {
+		s.offlineNotice("session-lost")
+	}
 }
 
-func (s *Supervisor) endSession() {
+// endSession tears the session down and reports whether a wake or dialog
+// was in flight: a candidate lease the controller had not closed, or a
+// dialog focus lease (a turn, its reply window, or its response).
+func (s *Supervisor) endSession() bool {
 	s.announceMu.Lock()
 	s.mu.Lock()
 	cancel := s.sessCancel
+	inFlight := s.session != nil && (len(s.candidates) > 0 || len(s.leases) > 0)
 	s.session, s.sessCtx, s.sessCancel = nil, nil, nil
 	clear(s.candidateAck)
 	clear(s.candidates)
@@ -151,6 +167,7 @@ func (s *Supervisor) endSession() {
 	s.mix.EndSession()
 	s.ex.ClockSessionLost()
 	s.cfg.Physical.ClearControllerLEDs()
+	return inFlight
 }
 
 // Control implements client.Handler for every C→D message the link does

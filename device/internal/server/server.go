@@ -95,7 +95,7 @@ type LinkState uint8
 
 const (
 	LinkUp      LinkState = iota // session established: no link layer
-	LinkDown                     // disconnected: orange pulse
+	LinkDown                     // no session: slow red pulse
 	LinkPending                  // pending approval: slow white pulse
 )
 
@@ -105,7 +105,7 @@ func (s *Server) SetLinkState(state LinkState) {
 	case LinkPending:
 		s.ring.animate(LayerLink, AnimSpec{Pattern: PatternPulse, Colors: [][3]uint8{{80, 80, 80}}, PeriodMs: 2800})
 	case LinkDown:
-		s.ring.animate(LayerLink, AnimSpec{Pattern: PatternPulse, Colors: [][3]uint8{{200, 50, 0}}, PeriodMs: 2000})
+		s.ring.animate(LayerLink, AnimSpec{Pattern: PatternPulse, Colors: [][3]uint8{{180, 0, 0}}, PeriodMs: 4000})
 	default:
 		s.ring.clear(LayerLink)
 	}

@@ -17,6 +17,9 @@ import (
 // mixer marks it Local, so it is never reported.
 const localChimePrefix = "local-wake-chime:"
 
+// offlineNoticePrefix names the offline notice's (local, unreported) playback.
+const offlineNoticePrefix = "offline-notice:"
+
 // wakeCandidate is the wake.candidate body: the detector's fields plus the
 // supervisor's active_alert and whether the device chimed, marshalled flat
 // (WIRE §4.4).
@@ -45,8 +48,13 @@ func (s *Supervisor) producingSound(from, to uint64) bool {
 // onCandidate opens the candidate lease and, when the device was producing
 // sound, the provisional duck, starts the local wake chime when it applies,
 // then reports the candidate. The controller decides every candidate,
-// including while capture is not permitted.
+// including while capture is not permitted. With no session there is no one
+// to decide it: offlineWake answers instead.
 func (s *Supervisor) onCandidate(c detector.Candidate) {
+	if !s.connected() {
+		s.offlineWake(c)
+		return
+	}
 	s.up.OpenCandidate(c.LeaseID, c.SupportStart)
 	// The provisional duck waits for the ack exactly as long as its lease.
 	s.fm.CandidateOpen(c.CandidateID, c.ProducingSound, uplink.CandidateAckWait)
@@ -70,9 +78,60 @@ func (s *Supervisor) onCandidate(c detector.Candidate) {
 	s.candidateAck[id] = c.LeaseID
 }
 
+// offlineWake answers a wake heard with no controller with the offline
+// notice. Nothing is leased, ducked or reported. A wake heard while the
+// device produced sound is ignored: only the controller can tell the wake
+// word from the device's own output (§6.1), and that includes the notice
+// itself. So is one during an alert, which the action button stops.
+func (s *Supervisor) offlineWake(c detector.Candidate) {
+	if c.ProducingSound {
+		log.Printf("[wake] offline: candidate %s heard over the device's own sound; ignored", c.CandidateID)
+		return
+	}
+	s.offlineNotice(c.CandidateID)
+}
+
+// offlineNotice plays cue.OfflineNotice ("I can't connect to the smart home
+// right now", then the no-input chime) unless an alert is active or the
+// notice is already playing. Must not hold mu.
+func (s *Supervisor) offlineNotice(id string) {
+	if s.activeAlert() != nil {
+		log.Printf("[wake] offline: %s during an alert; no notice", id)
+		return
+	}
+	if !s.noticePlaying.CompareAndSwap(false, true) {
+		return
+	}
+	if err := s.mix.StartLocal(offlineNoticePrefix+id, render.Earcon, cue.OfflineNotice(), 0); err != nil {
+		s.noticePlaying.Store(false)
+		log.Printf("[wake] offline notice: %v", err)
+		return
+	}
+	log.Printf("[wake] offline: notice for %s", id)
+}
+
+// restoreWake has the detector score with the last recorded model while no
+// controller has named one (wakeword.Activator.Restore).
+func (s *Supervisor) restoreWake() {
+	s.mu.Lock()
+	ctx := s.offCtx
+	s.mu.Unlock()
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		restored, err := s.act.Restore(ctx)
+		switch {
+		case err != nil:
+			log.Printf("[wake] restore last model: %v", err)
+		case restored:
+			log.Printf("[wake] scoring with the last model until a controller names one")
+		}
+	}()
+}
+
 // localWakeChime plays the wake chime the moment an idle candidate opens
 // (config wakeSound) instead of after the controller's acceptance. Never
-// while disconnected (a chime followed by nothing), producing sound (the
+// while disconnected (offlineWake answers those), producing sound (the
 // controller verifies those wakes and chimes on acceptance), with an alert
 // active (the wake stops it) or during a diagnostic lease (wakes are
 // refused). A rejected candidate keeps its chime. Must not hold mu.

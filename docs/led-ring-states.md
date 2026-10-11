@@ -31,7 +31,7 @@ Colours are RGB values sent to the LEDs. Scene colours are for the default
 | Cyan arc `(0,200,200)`, N of 12 LEDs, 2 s | Volume level after a volume-button press | Device | Yes |
 | Cyan pulse `(0,140,220)`, 0.9 s cycle | Alarm or timer ringing | Device | Yes |
 | Solid dim cyan `(0,24,38)` | Alarm or timer active but backgrounded while you talk to it | Device | Yes |
-| Orange pulse `(200,50,0)`, 2 s cycle | Not connected to the controller | Device | Shown *because of* the loss |
+| Slow red pulse `(180,0,0)`, 4 s cycle | Not connected to the controller; the wake word gets the spoken offline notice | Device | Shown *because of* the loss |
 | Grey-white pulse `(80,80,80)`, 2.8 s cycle | Connected, waiting for admin approval | Device | — |
 | Solid scene colour (green) | Listening, or waiting for your reply | Controller | No — cleared |
 | Spinner (green head and trail) | Thinking: request sent to Home Assistant | Controller | No — cleared |
@@ -66,11 +66,14 @@ Consequences worth knowing:
 
 - **Mute hides everything except the volume arc.** Controller states, a ringing
   alarm and the offline pulse are all hidden behind solid red while muted.
+  Solid red with the mute-button LED lit is mute; a slow red pulse with it
+  dark is the lost link.
 - **A ringing alarm or timer hides the conversation ring.** If you say the wake
   word during an alarm, the ring shows the alert layer (dim cyan while your
   request is handled), not the green listening ring.
-- **An alarm that rings while the controller is down shows cyan, not orange.**
-  The alert layer outranks the link layer; orange returns when the alarm ends.
+- **An alarm that rings while the controller is down shows cyan, not red.**
+  The alert layer outranks the link layer; the red pulse returns when the
+  alarm ends.
 
 ## Device-local states
 
@@ -139,16 +142,25 @@ or the wake word followed by "stop" or "snooze" — clears the layer.
 
 | Link state | Ring |
 |---|---|
-| Not connected, connecting, or session lost | Orange `(200,50,0)` pulse, 2 s cycle |
+| Not connected, connecting, or session lost | Slow red `(180,0,0)` pulse, 4 s cycle |
 | Controller answered `pending_approval` | Grey-white `(80,80,80)` pulse, 2.8 s cycle |
-| Controller rejected the device for another reason | Orange pulse |
+| Controller rejected the device for another reason | Slow red pulse |
 | Session established (`session.ready`) | Layer cleared |
 
-The orange pulse is set at startup, so a device that has not yet reached the
-controller shows orange as soon as the ring initializes. A session is lost after
+The red pulse is set at startup, so a device that has not yet reached the
+controller shows it as soon as the ring initializes. A session is lost after
 3 s without any control message from the controller (heartbeats run every
-second); the device then clears the controller layer and pulses orange. The 2 s
+second); the device then clears the controller layer and pulses red. The 2 s
 "degraded" link state is shown on the dashboard only, not on the ring.
+
+While there is no session (red or grey-white), the wake word is answered by
+the device itself: it says "I can't connect to the smart home right now" and
+plays the falling no-input chime, and the ring keeps pulsing. A request the
+controller was still handling when the session was lost gets the same
+notice. Wakes heard while the Dot is playing sound or an alarm is active are
+ignored (only the controller can tell the wake word from the Dot's own
+output). See
+[post-afe-audio-architecture.md §11.2](post-afe-audio-architecture.md#112-leds-and-earcons).
 
 Approve pending devices on the dashboard (`DEVICE_APPROVAL=strict`); the pulse
 clears when the session opens.
@@ -221,8 +233,8 @@ ring to the current state:
 
 The error reasons `speech_unavailable`, `ha_timeout`, `response_timeout`,
 `stt_failed` and `ha_error` are also followed by the spoken line "Something went
-wrong." Rhythm, not colour, distinguishes the cues: red, orange and cyan belong
-to the device-local states.
+wrong." Rhythm, not colour, distinguishes the cues: red and cyan belong to the
+device-local states.
 
 ### Timer remaining
 
@@ -250,7 +262,7 @@ error cue.
 Controller-driven states cannot outlive the controller:
 
 - **Session loss.** When the device loses the session (3 s of silence, or the
-  socket closing), it clears the controller layer and shows the orange pulse.
+  socket closing), it clears the controller layer and shows the red pulse.
 - **Dialog lease expiry.** When the last dialog focus lease expires on the
   device without being renewed, the device clears the controller layer.
 - **Animation TTL.** Every `led_anim` except `off` carries `ttlSec`; if nothing
@@ -275,8 +287,8 @@ wizard ([rooting.md](rooting.md)).
 
 The **Ring** section of a device's (or the global) configuration selects the
 palette for the controller-driven states. Changes apply immediately. The
-device-local colours — red mute, cyan volume arc, cyan alert, orange and grey
-link pulses — are fixed in firmware and do not follow the scene.
+device-local colours — red mute and link pulse, cyan volume arc, cyan alert,
+grey approval pulse — are fixed in firmware and do not follow the scene.
 
 | `ledScene` | Listening (solid) | Thinking | Meter and cues |
 |---|---|---|---|

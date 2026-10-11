@@ -1,13 +1,17 @@
 // Package wakeword activates the speech assets named in session.ready on the
 // device detector (SPEC §5.1, §16.5): fetch missing files, verify hashes, load
 // runtime+graph+sidecar, switch between hops, then delete unreferenced files.
+// The last activation that succeeded is recorded beside the assets, so the
+// detector can score with it again before any controller names a model.
 package wakeword
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/wilbowes/EchoMuse/internal/assets"
@@ -26,6 +30,20 @@ const (
 	extSidecar = "json"
 )
 
+// recordName is the last successful activation's record, in the speech
+// directory beside the files it names (Store.GC leaves it alone).
+const recordName = "active.json"
+
+// record is what Restore loads: the assets and policy of the last
+// activation that succeeded.
+type record struct {
+	Assets     Assets              `json:"assets"`
+	Thresholds detector.Thresholds `json:"thresholds"`
+	// Open and Shadow keep nil (absent) distinct from empty, as session.ready does.
+	Open   []detector.OpenRule `json:"open_rules"`
+	Shadow []detector.OpenRule `json:"shadow_rules"`
+}
+
 // Assets is session.ready `assets`.
 type Assets struct {
 	RuntimeSHA256 string `json:"runtime_sha256"`
@@ -36,6 +54,20 @@ type Assets struct {
 // Paths are the installed files of one Assets set.
 type Paths struct {
 	Runtime, Graph, Sidecar string
+}
+
+type assetFile struct {
+	sha, ext string
+	dst      *string
+}
+
+// files lists want's three files, each with the Paths field it installs to.
+func (want Assets) files(p *Paths) [3]assetFile {
+	return [3]assetFile{
+		{want.RuntimeSHA256, extRuntime, &p.Runtime},
+		{want.GraphSHA256, extGraph, &p.Graph},
+		{want.SidecarSHA256, extSidecar, &p.Sidecar},
+	}
 }
 
 // LoadFunc builds a scorer from installed, hash-verified files.
@@ -90,25 +122,23 @@ func NewActivator(det *detector.Detector, store *assets.Store, load LoadFunc) *A
 // controller cannot supply reports wake_unavailable=missing_asset; a file
 // that fails to load reports load_failed. Either way the non-named graph
 // stops. On success the switch is atomic between hops with a new scorer
-// revision, and unreferenced speech files are deleted. A transport or
-// context error that leaves an asset missing also reports missing_asset and
-// is returned. The same assets again only update the policy.
+// revision, the activation is recorded for Restore, and unreferenced speech
+// files are deleted. A transport or context error that leaves an asset
+// missing also reports missing_asset and is returned. The same assets again
+// only update the policy (and the record).
 func (a *Activator) Activate(ctx context.Context, tr assets.Transport, want Assets, th detector.Thresholds, rules detector.Rules) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	rec := record{Assets: want, Thresholds: th, Open: rules.Open, Shadow: rules.Shadow}
 	if a.active != nil && *a.active == want {
-		return a.det.SetPolicy(th, rules)
+		if err := a.det.SetPolicy(th, rules); err != nil {
+			return err
+		}
+		return a.save(rec)
 	}
 
 	var p Paths
-	for _, f := range []struct {
-		sha, ext string
-		dst      *string
-	}{
-		{want.RuntimeSHA256, extRuntime, &p.Runtime},
-		{want.GraphSHA256, extGraph, &p.Graph},
-		{want.SidecarSHA256, extSidecar, &p.Sidecar},
-	} {
+	for _, f := range want.files(&p) {
 		path, err := a.install(ctx, tr, f.sha, f.ext)
 		if err != nil {
 			a.unavailable(detector.UnavailableMissingAsset, err)
@@ -129,10 +159,101 @@ func (a *Activator) Activate(ctx context.Context, tr assets.Transport, want Asse
 	}
 	w := want
 	a.active = &w
+	if err := a.save(rec); err != nil {
+		return err
+	}
 	if err := a.store.GC([]string{want.RuntimeSHA256, want.GraphSHA256, want.SidecarSHA256}); err != nil {
 		return fmt.Errorf("wakeword: gc: %w", err)
 	}
 	return nil
+}
+
+// Restore loads the recorded activation from installed files alone, so the
+// detector scores while no controller has named a model: after a boot, or
+// after an activation failed. It does nothing once ctx is done (a
+// controller's activation supersedes it) or while a model is active, and
+// with no record or an unusable file it changes nothing and fetches
+// nothing. It reports whether it loaded the recorded model.
+func (a *Activator) Restore(ctx context.Context) (bool, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if ctx.Err() != nil || a.active != nil {
+		return false, nil
+	}
+	b, err := os.ReadFile(a.recordPath())
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("wakeword: %w", err)
+	}
+	var rec record
+	if err := json.Unmarshal(b, &rec); err != nil {
+		return false, fmt.Errorf("wakeword: %s: %w", recordName, err)
+	}
+	var p Paths
+	for _, f := range rec.Assets.files(&p) {
+		if err := a.store.Verify(f.sha, f.ext); err != nil {
+			return false, err
+		}
+		*f.dst = a.store.Path(f.sha, f.ext)
+	}
+	scorer, err := a.load(p)
+	if err != nil {
+		return false, err
+	}
+	rules := detector.Rules{Open: rec.Open, Shadow: rec.Shadow}
+	if err := a.det.SetModel(detector.Model{Scorer: scorer, GraphSHA256: rec.Assets.GraphSHA256, Thresholds: rec.Thresholds, Rules: rules}); err != nil {
+		scorer.Close()
+		return false, err
+	}
+	w := rec.Assets
+	a.active = &w
+	return true, nil
+}
+
+func (a *Activator) recordPath() string { return filepath.Join(a.store.Dir(), recordName) }
+
+// save replaces the record atomically: written, synced, renamed, and the
+// directory synced.
+func (a *Activator) save(rec record) error {
+	b, err := json.Marshal(rec)
+	if err != nil {
+		return fmt.Errorf("wakeword: record: %w", err)
+	}
+	path := a.recordPath()
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return fmt.Errorf("wakeword: record: %w", err)
+	}
+	_, err = f.Write(b)
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(tmp, path)
+	}
+	if err == nil {
+		err = syncDir(a.store.Dir())
+	}
+	if err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("wakeword: record: %w", err)
+	}
+	return nil
+}
+
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // install re-verifies an installed file (a corrupt one is removed) and

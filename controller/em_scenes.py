@@ -214,7 +214,7 @@ def resolve(config: Mapping[str, object] | None) -> SceneSpec:
 
     # A brief self-clearing cue played at turn end so outcomes are
     # distinguishable. Rhythm carries the meaning, not colour: adding a new
-    # colour would collide with red (mute) / orange (link) / cyan (volume).
+    # colour would collide with red (mute, link) / cyan (volume).
     outcome_colors = _colors([preset.spin_head] if not preset.rotate else preset.listening)
     nospeech_anim: LedAnim = {"pattern": AnimPattern.PULSE, "colors": outcome_colors,
                               "periodMs": NOSPEECH_PERIOD_MS, "ttlSec": OUTCOME_TTL}

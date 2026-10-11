@@ -393,7 +393,7 @@ adb shell 'S=$( [ "$(getprop ro.boot.slot_suffix)" = _a ] && echo _b || echo _a 
 ✅ LED ring (12 RGB LEDs), buttons, hardware mic mute
 ✅ No inbound ports — the device dials out to the controller: /device/v1/control, /device/v1/audio, /device/v1/assets, plus /shell on demand
 ✅ Device identity via ro.serialno; approval flow (strict or auto)
-✅ Orange ring pulse while not connected; grey-white pulse while waiting for approval
+✅ Slow red ring pulse while not connected; grey-white pulse while waiting for approval
 ```
 
 From here the dashboard takes over: approve the device, then follow the

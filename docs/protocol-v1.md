@@ -50,7 +50,8 @@ the pre-v1 `/control` link is gone, so firmware predating v1 gets no answer.
 Each side sends `heartbeat` every 1 s; any received control message counts as
 liveness. 2 s of silence = degraded (dashboard only). 3 s = session lost: both
 sides close all three sockets and end every dialog/focus/uplink lease. The
-device keeps executing alerts.
+device keeps executing alerts, and until the next `session.ready` answers the
+wake word itself with its offline notice (architecture §11.2).
 
 ## 3. EMA1 audio frame
 
@@ -291,8 +292,9 @@ Per-event fields present only for that event.
 `drained` is declared 150 ms after the last buffer completion.
 
 `render.progress` and `render.finished` report only playbacks the controller
-started. A device-originated local playback (the `local_wake_chime` chime) is
-mixed like any other, reference included, but never reported.
+started. A device-originated local playback (the `local_wake_chime` chime, the
+offline notice) is mixed like any other, reference included, but never
+reported.
 
 ### 4.3 Focus
 

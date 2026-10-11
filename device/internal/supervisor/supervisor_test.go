@@ -580,14 +580,13 @@ func (h *harness) wakeSound(on bool) {
 
 // local_wake_chime: with config wakeSound on, an idle candidate on a
 // connected device starts the built-in chime and reports chimed:true; while
-// producing sound, with an alert active, during a diagnostic lease, without
-// a session or with wakeSound off the chime is left to the controller.
+// producing sound, with an alert active, during a diagnostic lease or with
+// wakeSound off the chime is left to the controller.
 func TestLocalWakeChimeOnlyForIdleConnectedCandidates(t *testing.T) {
 	cases := []struct {
 		name      string
 		setup     func(*harness)
 		producing bool
-		lost      bool
 		chimed    bool
 	}{
 		{name: "idle", chimed: true},
@@ -595,7 +594,6 @@ func TestLocalWakeChimeOnlyForIdleConnectedCandidates(t *testing.T) {
 		{name: "producing sound", producing: true},
 		{name: "active alert", setup: func(h *harness) { h.ringTimer("t1") }},
 		{name: "diagnostic lease", setup: func(h *harness) { h.up.diagnostic = true }},
-		{name: "no session", lost: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -605,22 +603,90 @@ func TestLocalWakeChimeOnlyForIdleConnectedCandidates(t *testing.T) {
 			if tc.setup != nil {
 				tc.setup(h)
 			}
-			if tc.lost {
-				h.s.Lost(client.LostTimeout)
-			}
 			h.s.onCandidate(detector.Candidate{CandidateID: "c1", LeaseID: "L1", ProducingSound: tc.producing})
 			if earcon := h.mix()&render.MaskEarcon != 0; earcon != tc.chimed {
 				t.Fatalf("earcon in the final mix = %v, want %v", earcon, tc.chimed)
 			}
-			wc := h.sess.of(proto.TypeWakeCandidate)
-			switch {
-			case tc.lost && len(wc) != 0:
-				t.Fatalf("wake.candidate without a session: %v", wc)
-			case !tc.lost && (len(wc) != 1 || wc[0].body["chimed"] != tc.chimed):
+			if wc := h.sess.of(proto.TypeWakeCandidate); len(wc) != 1 || wc[0].body["chimed"] != tc.chimed {
 				t.Fatalf("wake.candidate %v, want chimed:%v", wc, tc.chimed)
 			}
 			if p := h.sess.of(proto.TypeRenderProgress); len(p) != 0 {
 				t.Fatalf("device-local chime reported: %v", p)
+			}
+		})
+	}
+}
+
+// With no session, an idle wake plays the offline notice itself — no lease,
+// no report, whatever wakeSound says. A wake heard over the device's own
+// sound or during an alert gets nothing.
+func TestOfflineWakePlaysTheNotice(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		setup     func(*harness)
+		producing bool
+		notice    bool
+	}{
+		{name: "idle", notice: true},
+		{name: "producing sound", producing: true},
+		{name: "active alert", setup: func(h *harness) { h.ringTimer("t1") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, opts{})
+			h.ready()
+			h.wakeSound(false)
+			h.s.Lost(client.LostTimeout)
+			if tc.setup != nil {
+				tc.setup(h)
+			}
+			h.s.onCandidate(detector.Candidate{CandidateID: "c1", LeaseID: "L1", ProducingSound: tc.producing})
+			if earcon := h.mix()&render.MaskEarcon != 0; earcon != tc.notice {
+				t.Fatalf("earcon in the final mix = %v, want %v", earcon, tc.notice)
+			}
+			if _, leased := h.up.opened["L1"]; leased {
+				t.Fatal("candidate lease opened with no session")
+			}
+			if out := h.s.fm.Output(); out.Mix.ContentDuckDB != 0 {
+				t.Fatalf("offline candidate ducked: %+v", out)
+			}
+			if wc := h.sess.of(proto.TypeWakeCandidate); len(wc) != 0 {
+				t.Fatalf("wake.candidate without a session: %v", wc)
+			}
+		})
+	}
+}
+
+// A wake or dialog the controller was still handling when the session was
+// lost gets the offline notice; losing an idle session plays nothing.
+func TestSessionLossDuringAWakeOrDialogPlaysTheNotice(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		setup  func(*harness)
+		notice bool
+	}{
+		{name: "idle"},
+		{name: "candidate awaiting its ack", notice: true, setup: func(h *harness) {
+			h.s.onCandidate(detector.Candidate{CandidateID: "c1", LeaseID: "L1"})
+		}},
+		{name: "rejected candidate", setup: func(h *harness) {
+			h.s.onCandidate(detector.Candidate{CandidateID: "c1", LeaseID: "L1"})
+			id := h.sess.of(proto.TypeWakeCandidate)[0].id
+			h.control(proto.TypeCommandAck, 0, proto.CommandAck{MessageID: id, Status: proto.AckRejected})
+		}},
+		{name: "turn or reply window", notice: true, setup: func(h *harness) {
+			h.expectAck(h.control(proto.TypeFocusAcquire, 3, proto.FocusAcquire{LeaseID: "f1", Owner: "turn", Focus: "dialog_input", TTLMs: 3000}), proto.AckAccepted, "")
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, opts{})
+			h.ready()
+			h.wakeSound(false) // only the notice can be the earcon
+			if tc.setup != nil {
+				tc.setup(h)
+			}
+			h.s.Lost(client.LostTimeout)
+			if earcon := h.mix()&render.MaskEarcon != 0; earcon != tc.notice {
+				t.Fatalf("earcon in the final mix = %v, want %v", earcon, tc.notice)
 			}
 		})
 	}

@@ -182,3 +182,93 @@ func TestActivateRefetchesCorruptInstalledFile(t *testing.T) {
 		t.Fatalf("sidecar %q, %v", got, err)
 	}
 }
+
+// reboot is a fresh detector and activator over f's speech directory, as
+// after a process restart.
+func (f *fixture) reboot(t *testing.T) *fixture {
+	g := newFixture(t)
+	g.store = f.store
+	return g
+}
+
+var shadow = detector.Rules{Shadow: []detector.OpenRule{{Profile: detector.ProfileIdle, Windows: 2, Combine: detector.CombineAll, Threshold: 0.95}}}
+
+// After a restart the last successful activation scores again from the
+// installed files alone, under its recorded policy; the controller naming
+// the same assets later neither fetches nor reloads.
+func TestRestoreLoadsTheLastActivationWithoutAController(t *testing.T) {
+	f := newFixture(t)
+	if err := f.activator().Activate(context.Background(), f.tr, f.want, th, shadow); err != nil {
+		t.Fatal(err)
+	}
+	g := f.reboot(t)
+	a := g.activator()
+	restored, err := a.Restore(context.Background())
+	if err != nil || !restored {
+		t.Fatalf("restore = %v, %v", restored, err)
+	}
+	st := g.lastStats()
+	if st.GraphSHA256 == nil || *st.GraphSHA256 != f.want.GraphSHA256 || st.WakeUnavailable != nil || len(st.Shadow) != 1 {
+		t.Fatalf("stats after restore %+v", st)
+	}
+	if err := a.Activate(context.Background(), g.tr, f.want, th, shadow); err != nil {
+		t.Fatal(err)
+	}
+	if g.tr.fetches != 0 || g.loads != 1 {
+		t.Fatalf("fetches %d loads %d after restore and the same activation", g.tr.fetches, g.loads)
+	}
+}
+
+// Restore yields to the controller: nothing once its context is done (a
+// session became ready) or while a model is active, nothing without a
+// record, and nothing — no fetch, no unavailability — when a recorded file
+// is gone.
+func TestRestoreChangesNothingItCannotOrNeedNotDo(t *testing.T) {
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	for _, tc := range []struct {
+		name      string
+		activated bool // an activation succeeded before the restart
+		prepare   func(t *testing.T, f *fixture, a *wakeword.Activator)
+		ctx       context.Context
+		err       bool
+	}{
+		{name: "never activated", ctx: context.Background()},
+		{name: "session ready", activated: true, ctx: cancelled},
+		{name: "model active", activated: true, ctx: context.Background(), prepare: func(t *testing.T, f *fixture, a *wakeword.Activator) {
+			if err := a.Activate(context.Background(), f.tr, f.want, th, detector.Rules{}); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "graph gone", activated: true, ctx: context.Background(), err: true, prepare: func(t *testing.T, f *fixture, _ *wakeword.Activator) {
+			if err := os.Remove(f.store.Path(f.want.GraphSHA256, "onnx")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			if tc.activated {
+				if err := f.activator().Activate(context.Background(), f.tr, f.want, th, shadow); err != nil {
+					t.Fatal(err)
+				}
+			}
+			g := f.reboot(t)
+			a := g.activator()
+			if tc.prepare != nil {
+				tc.prepare(t, g, a)
+			}
+			loads := g.loads
+			restored, err := a.Restore(tc.ctx)
+			if restored || (err != nil) != tc.err {
+				t.Fatalf("restore = %v, %v", restored, err)
+			}
+			if g.loads != loads || g.tr.fetches != 0 {
+				t.Fatalf("restore loaded %d, fetched %d", g.loads-loads, g.tr.fetches)
+			}
+			if st := g.lastStats(); st.WakeUnavailable != nil {
+				t.Fatalf("restore reported %s", *st.WakeUnavailable)
+			}
+		})
+	}
+}

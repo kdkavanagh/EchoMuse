@@ -178,6 +178,8 @@ type Supervisor struct {
 	session      Session
 	sessCtx      context.Context
 	sessCancel   context.CancelFunc
+	offCtx       context.Context // live while no session is up; ready cancels it (restoreWake yields)
+	offCancel    context.CancelFunc
 	candidates   map[string]candidateState // candidate lease id → candidate
 	candidateAck map[string]string         // wake.candidate message id → lease id
 	playbacks    map[string]playbackState
@@ -193,6 +195,7 @@ type Supervisor struct {
 	lastMask        atomic.Uint32 // final-mix mask of the latest tap
 	alertForeground atomic.Bool
 	fetching        atomic.Bool
+	noticePlaying   atomic.Bool // the offline notice is in the earcon slot
 	physicalSeq     atomic.Uint64
 	burstSeq        uint64 // tick goroutine
 }
@@ -227,6 +230,7 @@ func Assemble(cfg Config, d Deps) (*Supervisor, error) {
 		unfetchable: map[string]bool{}, soundWant: map[string]bool{},
 		muted: cfg.Physical.IsMuted(),
 	}
+	s.offCtx, s.offCancel = context.WithCancel(context.Background())
 	s.masks = cells.NewMaskHistory(s.timeline.Fit(), s.renderFit)
 	s.acc = cells.NewAccumulator(s.masks, s.appendCells)
 
@@ -291,6 +295,8 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	go s.up.Run(ctx)
+	// Score with the last model before any controller names one (§16.5).
+	s.restoreWake()
 	go s.ex.Run(ctx)
 	go s.tickLoop(ctx)
 	mixErr := make(chan error, 1)

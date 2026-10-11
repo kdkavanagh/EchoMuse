@@ -351,6 +351,19 @@ Based on a review of Office turns 433–476 (`docs/turn-latency-review.md`,
   silence. Firmware with the new `no_input_chime` capability carries the
   sound; older firmware and button presses stay silent, and an unanswered
   follow-up question still ends without a cue.
+- **A Dot without its controller says so.** While a Dot has no session —
+  controller down, network gone, or the link lost — its ring pulses red
+  slowly (4 s cycle; it was orange), and the wake word gets a spoken "I can't
+  connect to the smart home right now" followed by the no-input chime,
+  played by the Dot itself in the voice of your Assist pipeline (rendered
+  once through Home Assistant TTS and built into the firmware). A request
+  the controller was still handling when the link dropped gets the same
+  answer instead of silence. The Dot keeps the last wake model it ran and
+  loads it again at boot, so a Dot that restarts while the controller is
+  down still hears the wake word; only a Dot that has never connected has
+  none. Every Dot in earshot answers, since nothing chooses one without the
+  controller; wakes heard over the Dot's own sound or a ringing alarm are
+  ignored (the action button still stops an alarm).
 - **Answers to follow-up questions are heard like a button press (policy
   `post_afe_7`).** When a follow-up question finishes, the Dot now starts
   listening at once, exactly as after a button press: the ring shows

@@ -110,9 +110,9 @@ Unknown device connects
 | State | LED behaviour |
 |-------|--------------|
 | Pending (seen, not approved) | Slow white pulse — 1.5s cycle, all 12 LEDs |
-| Disconnected / no server | Orange pulse (existing behaviour) |
+| Disconnected / no server | Slow red pulse — 4s cycle |
 
-The distinction matters — white means "server knows about me, waiting for approval", orange means "can't find server at all".
+The distinction matters — white means "server knows about me, waiting for approval", red means "can't find server at all".
 
 ---
 
