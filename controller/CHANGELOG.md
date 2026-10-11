@@ -345,10 +345,11 @@ Based on a review of Office turns 433–476 (`docs/turn-latency-review.md`,
   on, the wake chime now also plays when a follow-up question has finished
   and the reply window opens, since the answer needs no wake word. It is
   skipped when you have already started answering over the question's end.
-- **A wake that hears nothing after the wake word ends with a falling chime.**
+- **A wake that hears nothing after the wake word ends with an error tone.**
   With Wake chime on, a wake turn that closes `no_input` now plays a new
-  built-in earcon, `builtin:no_input_chime` (the wake chime's two pitches,
-  falling), as the ring throbs, so the Dot says it has stopped listening. Turn
+  built-in earcon, `builtin:no_input_chime` (the Amazon Echo's own error
+  tone, `ui_error_generic_2`), as the ring throbs, so the Dot says it has
+  stopped listening and sent nothing to Home Assistant. Turn
   647 heard a whole command its speech detector never counted and ended in
   silence. Firmware with the new `no_input_chime` capability carries the
   sound; older firmware and button presses stay silent, and an unanswered

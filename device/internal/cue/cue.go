@@ -28,9 +28,10 @@ var ErrNotFound = errors.New("cue: unknown built-in asset")
 //go:embed wake_word_triggered.pcm
 var wakeChimePCM []byte
 
-// noInputChimePCM is synthesized by gen.sh.
+// noInputChimePCM is ui_error_generic_2.mp3, the Amazon Echo's error
+// earcon, decoded by gen.sh.
 //
-//go:embed no_input_chime.pcm
+//go:embed ui_error_generic_2.pcm
 var noInputChimePCM []byte
 
 // announcementChimePCM is alerts_notification_01.mp3, the Amazon Echo's

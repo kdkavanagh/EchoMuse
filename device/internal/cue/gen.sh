@@ -3,10 +3,8 @@
 #
 # The .pcm files beside this script are what go:embed ships: build artefacts
 # that happen to be committed, in the same spirit as
-# internal/wakeword/testdata's fixture. The wake chime, the announcement
-# chime and the offline notice are decoded from their .flac/.mp3, kept only as
-# provenance and as the input here; the no-input chime is synthesized below,
-# so this script is its source.
+# internal/wakeword/testdata's fixture. Each is decoded from the .flac/.mp3
+# of the same name, kept only as provenance and as the input here.
 #
 # 48kHz mono S16_LE is the render mixer's native format, so anything else
 # would require device-side resampling.
@@ -27,6 +25,12 @@ pcm -i wake_word_triggered.flac
 out=alerts_notification_01.pcm
 pcm -i alerts_notification_01.mp3
 
+# The no-input chime, ending a wake that heard no command, and closing the
+# offline notice: ui_error_generic_2.mp3, the Amazon Echo's own error earcon.
+# Decoded as-is, 0.68 s at 48 kHz, its stereo downmixed (peak -12.9 dBFS).
+out=ui_error_generic_2.pcm
+pcm -i ui_error_generic_2.mp3
+
 # The offline notice, spoken when the wake word is heard with no controller.
 # offline_notice.mp3 is Home Assistant's TTS for "I can't connect to the
 # smart home right now.", rendered 2026-10-11 by a TTS-only run of the Dots'
@@ -39,17 +43,3 @@ pcm -i alerts_notification_01.mp3
 # ~0.24 s tail is the pause before the no-input chime.
 out=offline_notice.pcm
 pcm -i offline_notice.mp3
-
-# note FREQ ONSET DECAY AMPLITUDE: a struck tone with 4 ms attack whose 2nd
-# and 3rd harmonics die 3x and 5x faster than the fundamental.
-note() {
-	u="(t-$2)"
-	echo "$4*gte(t,$2)*min(1,$u/0.004)*(sin(2*PI*$1*$u)*exp(-$u/$3)+0.3*sin(4*PI*$1*$u)*exp(-3*$u/$3)+0.1*sin(6*PI*$1*$u)*exp(-5*$u/$3))"
-}
-
-# The no-input chime: the wake chime's two pitches (~792 Hz rising to
-# ~939 Hz) falling instead, so "stopped listening" mirrors "listening";
-# a little softer (peak -8.4 dBFS against the wake chime's -3.1).
-out=no_input_chime.pcm
-pcm -f lavfi -i "aevalsrc='$(note 939 0 0.08 0.24)+$(note 792 0.1 0.18 0.30)':s=48000:c=mono:d=0.8" \
-	-af 'afade=t=out:st=0.65:d=0.15'

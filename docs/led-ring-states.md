@@ -155,11 +155,11 @@ second); the device then clears the controller layer and pulses red. The 2 s
 
 While there is no session (red or grey-white), the wake word is answered by
 the device itself: it says "I can't connect to the smart home right now" and
-plays the falling no-input chime, and the ring keeps pulsing. A request the
-controller was still handling when the session was lost gets the same
-notice. Wakes heard while the Dot is playing sound or an alarm is active are
-ignored (only the controller can tell the wake word from the Dot's own
-output). See
+plays the no-input chime (the Echo's error tone), and the ring keeps
+pulsing. A request the controller was still handling when the session was
+lost gets the same notice. Wakes heard while the Dot is playing sound or an
+alarm is active are ignored (only the controller can tell the wake word from
+the Dot's own output). See
 [post-afe-audio-architecture.md §11.2](post-afe-audio-architecture.md#112-leds-and-earcons).
 
 Approve pending devices on the dashboard (`DEVICE_APPROVAL=strict`); the pulse
@@ -228,7 +228,7 @@ ring to the current state:
 
 | Cue | Look | Sent when |
 |---|---|---|
-| No speech | One slow throb (0.9 s pulse) | The turn ended with `no_input` — nothing was said after the wake word or button. After a wake word, with Wake chime on, the falling no-input chime plays with it. A follow-up question nobody answered ends without it |
+| No speech | One slow throb (0.9 s pulse) | The turn ended with `no_input` — nothing was said after the wake word or button. After a wake word, with Wake chime on, the no-input chime (the Echo's error tone) plays with it. A follow-up question nobody answered ends without it |
 | Error | Fast blinking (0.22 s pulse) | The turn ended `interrupted`, `audio_overrun`, `speech_unavailable`, `ha_timeout`, `response_timeout`, `stt_failed` or `ha_error`; a wake word or button press was refused because the speech worker is unavailable or a recording mode is on; a button press was refused while muted (hidden by the red ring); a spoken line or question could not be fetched or played |
 
 The error reasons `speech_unavailable`, `ha_timeout`, `response_timeout`,

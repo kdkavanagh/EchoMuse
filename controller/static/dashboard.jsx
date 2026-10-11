@@ -6400,7 +6400,7 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
         {wakeGap && <div style={{ marginTop:8, fontFamily:MONO, fontSize:9, color:'var(--warn)' }}>Wake controls unavailable: {wakeGap}</div>}
         <div className="em-grid2" style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:'0 24px', marginTop:16, ...inputStyle }}>
           <Toggle label="Wake chime"
-            sub={renderGap || 'plays the moment the Echo hears the wake word (on supporting firmware); while it is playing audio, once the wake is confirmed; and when a follow-up question finishes, to say it is listening for your answer. A falling chime says it stopped listening when nothing followed the wake word (on supporting firmware)'}
+            sub={renderGap || 'plays the moment the Echo hears the wake word (on supporting firmware); while it is playing audio, once the wake is confirmed; and when a follow-up question finishes, to say it is listening for your answer. An error tone says it stopped listening when nothing followed the wake word (on supporting firmware)'}
             value={!renderGap && (config.wakeSound ?? false)}
             disabled={!!renderGap}
             onChange={v => set('wakeSound', v)}/>
