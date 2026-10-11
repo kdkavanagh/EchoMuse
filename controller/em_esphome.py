@@ -86,7 +86,11 @@ HookCoro = Coroutine[object, object, object]
 
 @dataclass(frozen=True, slots=True)
 class Hooks:
-    announce: Callable[[str, str | None, bool], HookCoro] | None = None
+    # announce(url, preannounce, preannounce_url, start_conversation). A media-player
+    # announcement (play_media with `announce`, which tts.speak sends) has no preannounce
+    # setting, so it always asks for one; an assist_satellite announcement asks exactly when
+    # HA names a preannounce sound (its `preannounce` on).
+    announce: Callable[[str, bool, str | None, bool], HookCoro] | None = None
     set_volume: Callable[[int], HookCoro] | None = None
     stop_alert: Callable[[], HookCoro] | None = None
     timer_event: Callable[[TimerEvent, str, str, int, int, bool], HookCoro] | None = None
@@ -243,7 +247,7 @@ class EchoMuseSatellite(SatelliteServerProtocol):
         if msg.has_media_url:
             if msg.has_announcement and msg.announcement:
                 if self.server.hooks.announce is not None:
-                    self._spawn(self.server.hooks.announce(msg.media_url, None, False),
+                    self._spawn(self.server.hooks.announce(msg.media_url, True, None, False),
                                 "media-announce")
             else:
                 self._spawn(em_player.play(self.device_id, msg.media_url), "play-media")
@@ -262,7 +266,8 @@ class EchoMuseSatellite(SatelliteServerProtocol):
         success = False
         try:
             if media_id and self.server.hooks.announce is not None:
-                await self.server.hooks.announce(media_id, preannounce, start_conversation)
+                await self.server.hooks.announce(media_id, preannounce is not None, preannounce,
+                                                 start_conversation)
                 success = True
         except Exception:
             log.exception("[%s] announcement failed", self._log_name)

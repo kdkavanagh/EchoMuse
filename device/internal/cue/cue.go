@@ -14,6 +14,9 @@ const (
 	WakeChime = "builtin:wake_chime"
 	// NoInputChime ends a wake turn that heard no command (no_input_chime).
 	NoInputChime = "builtin:no_input_chime"
+	// AnnouncementChime precedes a Home Assistant announcement
+	// (announcement_chime).
+	AnnouncementChime = "builtin:announcement_chime"
 )
 
 var ErrNotFound = errors.New("cue: unknown built-in asset")
@@ -30,6 +33,12 @@ var wakeChimePCM []byte
 //go:embed no_input_chime.pcm
 var noInputChimePCM []byte
 
+// announcementChimePCM is alerts_notification_01.mp3, the Amazon Echo's
+// announcement earcon, decoded by gen.sh.
+//
+//go:embed alerts_notification_01.pcm
+var announcementChimePCM []byte
+
 // offlineNoticePCM is Home Assistant's TTS of "I can't connect to the smart
 // home right now.", decoded by gen.sh (provenance there).
 //
@@ -37,8 +46,9 @@ var noInputChimePCM []byte
 var offlineNoticePCM []byte
 
 var assets = map[string][]int16{
-	WakeChime:    decodeS16LE(wakeChimePCM),
-	NoInputChime: decodeS16LE(noInputChimePCM),
+	WakeChime:         decodeS16LE(wakeChimePCM),
+	NoInputChime:      decodeS16LE(noInputChimePCM),
+	AnnouncementChime: decodeS16LE(announcementChimePCM),
 }
 
 var offlineNotice = decodeS16LE(offlineNoticePCM, noInputChimePCM)

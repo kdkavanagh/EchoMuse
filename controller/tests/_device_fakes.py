@@ -56,7 +56,8 @@ class FakeActor:
     async def start(self) -> None: ...
     async def close(self) -> None: ...
 
-    def attach(self, link, render, *, afe_metadata=False, no_input_chime=False) -> None:
+    def attach(self, link, render, *, afe_metadata=False, no_input_chime=False,
+               announcement_chime=False) -> None:
         self.attached = (link, render)
         self.afe_metadata = afe_metadata
 

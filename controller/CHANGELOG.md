@@ -366,6 +366,17 @@ Based on a review of Office turns 433–476 (`docs/turn-latency-review.md`,
   none. Every Dot in earshot answers, since nothing chooses one without the
   controller; wakes heard over the Dot's own sound or a ringing alarm are
   ignored (the action button still stops an alarm).
+- **Announcements open with the Echo's announcement chime.** A Home Assistant
+  announcement — `tts.speak` or `media_player.play_media` with `announce` to
+  a Dot, or `assist_satellite.announce` with its preannounce on — now starts
+  with a new built-in earcon, `builtin:announcement_chime`, the Amazon Echo's
+  own announcement sound, with any music already ducked. On the
+  `assist_satellite` path it takes the place of Home Assistant's preannounce
+  sound, including a custom `preannounce_media_id`; with preannounce off
+  there is still no sound. A wake, stop or new turn during the chime drops the
+  announcement, as during the announcement itself. Firmware with the new
+  `announcement_chime` capability carries the sound; older firmware plays
+  Home Assistant's preannounce sound as before.
 - **Answers to follow-up questions are heard like a button press (policy
   `post_afe_7`).** When a follow-up question finishes, the Dot now starts
   listening at once, exactly as after a button press: the ring shows

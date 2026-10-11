@@ -458,8 +458,8 @@ class _Host:
         await esphome.device_connected(
             did, label=device.label, capabilities=device.capabilities,
             hooks=esphome.Hooks(
-                announce=lambda url, pre, sc: device.actor.announce(
-                    url, preannounce_url=pre, start_conversation=sc),
+                announce=lambda url, pre, pre_url, sc: device.actor.announce(
+                    url, preannounce=pre, preannounce_url=pre_url, start_conversation=sc),
                 set_volume=lambda level: device.send(MessageType.VOLUME_SET, {"level": level}),
                 stop_alert=lambda: _stop_alert(did),
                 timer_event=functools.partial(alerts().on_timer_event, did),

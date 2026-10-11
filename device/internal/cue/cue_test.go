@@ -7,7 +7,7 @@ import (
 
 // A resample or stereo decode still "plays", just wrong; bound the duration.
 func TestBuiltinsAre48kHzMono(t *testing.T) {
-	for _, name := range []string{WakeChime, NoInputChime} {
+	for _, name := range []string{WakeChime, NoInputChime, AnnouncementChime} {
 		pcm, err := Asset(name)
 		if err != nil {
 			t.Fatal(err)

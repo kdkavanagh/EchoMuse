@@ -3,9 +3,10 @@
 #
 # The .pcm files beside this script are what go:embed ships: build artefacts
 # that happen to be committed, in the same spirit as
-# internal/wakeword/testdata's fixture. The wake chime and the offline notice
-# are decoded from their .flac/.mp3, kept only as provenance and as the input
-# here; the no-input chime is synthesized below, so this script is its source.
+# internal/wakeword/testdata's fixture. The wake chime, the announcement
+# chime and the offline notice are decoded from their .flac/.mp3, kept only as
+# provenance and as the input here; the no-input chime is synthesized below,
+# so this script is its source.
 #
 # 48kHz mono S16_LE is the render mixer's native format, so anything else
 # would require device-side resampling.
@@ -19,6 +20,12 @@ pcm() {
 
 out=wake_word_triggered.pcm
 pcm -i wake_word_triggered.flac
+
+# The announcement chime, played before a Home Assistant announcement:
+# alerts_notification_01.mp3, the Amazon Echo's own announcement earcon.
+# Decoded as-is, 1.44 s at 48 kHz, its stereo downmixed (peak -6.5 dBFS).
+out=alerts_notification_01.pcm
+pcm -i alerts_notification_01.mp3
 
 # The offline notice, spoken when the wake word is heard with no controller.
 # offline_notice.mp3 is Home Assistant's TTS for "I can't connect to the

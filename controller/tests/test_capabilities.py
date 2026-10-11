@@ -69,6 +69,7 @@ def test_a_malformed_or_unsupported_hello_is_refused(bad):
     ("ambient_light_capable", "ambient_light"),
     ("local_wake_chime_capable", "local_wake_chime"),
     ("no_input_chime_capable", "no_input_chime"),
+    ("announcement_chime_capable", "announcement_chime"),
     ("open_rules_capable", "open_rules_v1"),
     ("afe_metadata_capable", "afe_metadata_v1"),
 ])

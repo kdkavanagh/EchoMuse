@@ -145,6 +145,7 @@ class Capability(enum.StrEnum):
     ALERT_PREFETCH = "alert_prefetch"
     LOCAL_WAKE_CHIME = "local_wake_chime"
     NO_INPUT_CHIME = "no_input_chime"
+    ANNOUNCEMENT_CHIME = "announcement_chime"
     OPEN_RULES = "open_rules_v1"
     AFE_METADATA = "afe_metadata_v1"
 

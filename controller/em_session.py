@@ -161,6 +161,7 @@ HA_TIMEOUT_S = 30.0              # intent run sent → intent-end
 RESPONSE_START_S = 10.0          # intent-end → response audio start
 RESPONSE_STALL_S = 2.0           # no output progress
 RESPONSE_TOTAL_S = 120.0         # one spoken response
+ANNOUNCEMENT_CHIME_S = 5.0       # the 1.44 s announcement chime's drain
 # A reply turn opened at the drain starts this long before its trigger: the 480 ms an answer
 # may overlap the question's end, plus the pre-roll (§16.6).
 REPLY_LEAD = REPLY_OVERLAP + PREROLL
@@ -376,6 +377,7 @@ ECHO_TAG = "echo"                # submit_echo tag for per-cell labels
 CANDIDATE_TAG = "candidate:"     # submit_echo tag prefix for a candidate comparison
 WAKE_CHIME = "builtin:wake_chime"
 NO_INPUT_CHIME = "builtin:no_input_chime"
+ANNOUNCEMENT_CHIME = "builtin:announcement_chime"
 
 
 def _stream_url(url: str) -> AsyncIterator[np.ndarray]:
@@ -909,7 +911,8 @@ class _Turn:
 @dataclass
 class _Announcement:
     url: str
-    preannounce_url: str | None
+    preannounce: bool               # HA wants a sound before the announcement
+    preannounce_url: str | None     # HA's sound, if it named one
     start_conversation: bool
     future: asyncio.Future[None]
 
@@ -929,6 +932,7 @@ class SessionActor:
         self.link: _Link | None = None
         self.render: RenderClient | None = None
         self._no_input_chime_capable = False   # the session's device plays NO_INPUT_CHIME
+        self._announcement_chime_capable = False   # the session's device plays ANNOUNCEMENT_CHIME
         self.uplink: UplinkSession | None = None
         self._queue: asyncio.PriorityQueue[tuple[int, int, _Event]] = asyncio.PriorityQueue()
         self._sequence = 0
@@ -981,12 +985,14 @@ class SessionActor:
             await self._task
 
     def attach(self, link: _Link, render: RenderClient, *, afe_metadata: bool = False,
-               no_input_chime: bool = False) -> None:
+               no_input_chime: bool = False, announcement_chime: bool = False) -> None:
         """Session ready: the new session's link, renderer, and an empty uplink record.
         `afe_metadata`: session.ready granted it, so the session carries the `afe` stream.
-        `no_input_chime`: the device announced it, so it plays NO_INPUT_CHIME."""
+        `no_input_chime`, `announcement_chime`: the device announced it, so it plays
+        NO_INPUT_CHIME, ANNOUNCEMENT_CHIME."""
         self.link, self.render = link, render
         self._no_input_chime_capable = no_input_chime
+        self._announcement_chime_capable = announcement_chime
         self.uplink = UplinkSession(afe_metadata=afe_metadata)
         self._post(P_LOSS, _Attach())
 
@@ -1037,13 +1043,15 @@ class SessionActor:
     def cancel_turn(self, reason: TerminalReason = TerminalReason.INTERRUPTED) -> None:
         self._post(P_STOP, _Cancel(reason))
 
-    async def announce(self, url: str, *, preannounce_url: str | None,
+    async def announce(self, url: str, *, preannounce: bool, preannounce_url: str | None,
                        start_conversation: bool) -> None:
-        """Play an HA announcement as dialog output; returns after guarded drain or cancellation."""
+        """Play an HA announcement as dialog output; returns after guarded drain or cancellation.
+        `preannounce`: a sound goes first — the Dot's ANNOUNCEMENT_CHIME when it has one, else
+        `preannounce_url` if HA named one."""
         if self.link is None or self.render is None or self._closed:
             return
         future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-        self._post(P_RESULT, _Announcement(url, preannounce_url, start_conversation, future))
+        self._post(P_RESULT, _Announcement(url, preannounce, preannounce_url, start_conversation, future))
         await future
 
     async def open_diagnostic(self, tap: DiagnosticTap) -> None:
@@ -2800,7 +2808,10 @@ class SessionActor:
                     return
                 self._generation += 1
                 owner, generation = str(uuid.uuid4()), self._generation
-                if item.preannounce_url:
+                if item.preannounce and self._announcement_chime_capable:
+                    if not await self._play_announcement_chime(owner, generation):
+                        return
+                elif item.preannounce and item.preannounce_url:
                     if await self._play_dialog(owner, generation, item.preannounce_url,
                                                announcement=True) != FinishReason.DRAINED:
                         return
@@ -2828,6 +2839,36 @@ class SessionActor:
         finally:
             if not item.future.done():
                 item.future.set_result(None)
+
+    async def _play_announcement_chime(self, owner: str, generation: int) -> bool:
+        """§11.2: the announcement chime, under the announcement's dialog_output focus so content
+        ducks from the chime on, and the dialog playback meanwhile, so a wake, stop or new turn
+        interrupts it as it would the announcement. False: it was, and the announcement is dropped.
+        No chime over a foreground alert, which preempts the announcement itself (§16.7)."""
+        render = self.render
+        if render is None:
+            return False
+        if self._alert_foreground:
+            return True
+        await self._acquire_focus(owner, Focus.DIALOG_OUTPUT, generation)
+        try:
+            chime = await render.play_local(SourceClass.EARCON, ANNOUNCEMENT_CHIME, generation=generation)
+        except Exception:
+            log.warning("[%s] announcement chime failed", self.device_id, exc_info=True)
+            return True
+        self._dialog_playback = chime
+        try:
+            reason = (await asyncio.wait_for(asyncio.shield(chime.finished), ANNOUNCEMENT_CHIME_S))["reason"]
+        except TimeoutError:
+            await chime.cancel(DialogEnd.RESPONSE_TIMEOUT)
+            log.warning("[%s] announcement chime did not drain in %.0f s", self.device_id, ANNOUNCEMENT_CHIME_S)
+            return True
+        if reason == FinishReason.CANCELLED:
+            await self._release_owner(owner, only=Focus.DIALOG_OUTPUT)
+            return False
+        if reason != FinishReason.DRAINED:
+            log.warning("[%s] announcement chime %s", self.device_id, reason)
+        return True
 
     # --- dialog output -------------------------------------------------------------------------
 

@@ -132,8 +132,10 @@ class FakeRender:
     def __init__(self):
         self.streams: list[FakePlayback] = []
         self.local: list[tuple[str, str]] = []
+        self.played: list[str] = []    # stream URLs and local assets, in the order they started
         self.failed = None
         self.autostart = True          # False: a stream's audio starts only when the test says
+        self.local_finish = "drained"  # how a local asset's playback ends, at once
 
     async def play_stream(self, source_class, pcm48, *, generation, gain_db=0.0, announcement=False):
         assert source_class == "dialog_output"
@@ -141,10 +143,16 @@ class FakeRender:
         if self.autostart:
             playback.start()
         self.streams.append(playback)
+        self.played.append(pcm48)
         return playback
 
     async def play_local(self, source_class, asset, *, generation, gain_db=0.0):
         self.local.append((source_class, asset))
+        self.played.append(asset)
+        playback = FakePlayback(asset, generation, False)
+        playback.start()
+        playback.finish(self.local_finish)
+        return playback
 
     def fail_all(self, reason):
         self.failed = reason
@@ -425,7 +433,7 @@ class Device:
 
 
 class Harness:
-    def __init__(self, config=None, afe=False, no_input_chime=True):
+    def __init__(self, config=None, afe=False, no_input_chime=True, announcement_chime=True):
         self.link = FakeLink()
         self.render = FakeRender()
         self.worker = FakeWorker()
@@ -439,6 +447,7 @@ class Harness:
         self.config = {"wakeSound": True, "wakeArbitrationMs": 700, **(config or {})}
         self.link.render = self.render
         self.no_input_chime = no_input_chime   # the device announces no_input_chime
+        self.announcement_chime = announcement_chime   # ... and announcement_chime
         self.media_playing = False              # the Dot's own content player
         self.media_pauses = 0
 
@@ -473,7 +482,8 @@ class Harness:
 
     async def start(self):
         await self.actor.start()
-        self.actor.attach(self.link, self.render, afe_metadata=self.device.afe, no_input_chime=self.no_input_chime)
+        self.actor.attach(self.link, self.render, afe_metadata=self.device.afe, no_input_chime=self.no_input_chime,
+                          announcement_chime=self.announcement_chime)
         self.device.open_streams()
         await self.settle()
 
@@ -1586,8 +1596,8 @@ def test_a_reply_window_that_never_gets_mic_closes_no_input_by_the_wall_clock(mo
     async def main():
         h = Harness()
         await h.start()
-        announce = asyncio.create_task(h.actor.announce("http://ha/announce", preannounce_url=None,
-                                                        start_conversation=True))
+        announce = asyncio.create_task(h.actor.announce("http://ha/announce", preannounce=False,
+                                                        preannounce_url=None, start_conversation=True))
         await h.wait_for(lambda: h.render.streams)
         reply_open = [b for b, _ in h.link.of("uplink.open") if b["reason"] == "reply"]
         h.render.streams[0].finish("drained")                 # no mic ever reached the reply lease
@@ -1830,8 +1840,8 @@ def test_stop_is_a_local_dialog_stop_only_while_the_reply_is_audible(audible):
         h.ha.stt_text = "Ophelia, stop."
         h.ha.next_run = FakeRun([IntentEnded("", None, False, "action_done", True), RunEnded()])
         await h.start()
-        announce = asyncio.create_task(h.actor.announce("http://ha/announce", preannounce_url=None,
-                                                        start_conversation=False))
+        announce = asyncio.create_task(h.actor.announce("http://ha/announce", preannounce=False,
+                                                        preannounce_url=None, start_conversation=False))
         await h.wait_for(lambda: h.render.streams)
         h.actor.on_message(candidate())
         await h.settle()
@@ -1929,8 +1939,8 @@ def test_announcement_with_start_conversation_sends_the_reply_through_the_esphom
         h = Harness()
         await h.start()
         h.reply_events = [IntentEnded("Okay.", "conv-9", False, None, False), TtsReady("http://ha/tts/ok", False)]
-        announce = asyncio.create_task(h.actor.announce("http://ha/announce", preannounce_url=None,
-                                                        start_conversation=True))
+        announce = asyncio.create_task(h.actor.announce("http://ha/announce", preannounce=False,
+                                                        preannounce_url=None, start_conversation=True))
         await h.wait_for(lambda: h.render.streams)
         prompt = h.render.streams[0]
         assert prompt.announcement and prompt.source == "http://ha/announce"
@@ -1952,5 +1962,47 @@ def test_announcement_with_start_conversation_sends_the_reply_through_the_esphom
         await h.wait_for(lambda: h.rows)
         row = h.rows[0]
         assert row["trigger"] == "ha_reply" and row["commit_route"] == "R" and row["terminal_reason"] == "completed"
+        await h.actor.close()
+    run(main())
+
+
+# A media-player announcement (tts.speak) always asks for a preannounce; an assist_satellite
+# one asks with HA's sound, or not at all. The Dot's chime takes the place of HA's sound.
+@pytest.mark.parametrize("capable, preannounce, url, played", [
+    (True, True, None, ["builtin:announcement_chime", "http://ha/announce"]),
+    (True, True, "http://ha/pre", ["builtin:announcement_chime", "http://ha/announce"]),
+    (True, False, None, ["http://ha/announce"]),
+    (False, True, "http://ha/pre", ["http://ha/pre", "http://ha/announce"]),
+    (False, True, None, ["http://ha/announce"]),
+])
+def test_an_announcement_opens_with_the_announcement_chime(capable, preannounce, url, played):
+    async def main():
+        h = Harness(announcement_chime=capable)
+        await h.start()
+        announce = asyncio.create_task(h.actor.announce("http://ha/announce", preannounce=preannounce,
+                                                        preannounce_url=url, start_conversation=False))
+        await h.wait_for(lambda: h.render.streams)
+        if h.render.streams[0].source == "http://ha/pre":
+            h.render.streams[0].finish("drained")
+            await h.wait_for(lambda: len(h.render.streams) == 2)
+        assert h.render.played == played
+        assert all(p.announcement for p in h.render.streams)
+        h.render.streams[-1].finish("drained")
+        await asyncio.wait_for(announce, 2)
+        await h.actor.close()
+    run(main())
+
+
+def test_an_interrupted_announcement_chime_drops_the_announcement():
+    async def main():
+        h = Harness()
+        h.render.local_finish = "cancelled"     # e.g. the Dot's own wake chime took its slot
+        await h.start()
+        await asyncio.wait_for(h.actor.announce("http://ha/announce", preannounce=True,
+                                                preannounce_url=None, start_conversation=False), 2)
+        assert h.render.played == ["builtin:announcement_chime"]
+        acquired = [b["lease_id"] for b, _ in h.link.of("focus.acquire") if b["focus"] == "dialog_output"]
+        released = [b["lease_id"] for b, _ in h.link.of("focus.release")]
+        assert len(acquired) == 1 and acquired == released
         await h.actor.close()
     run(main())
