@@ -425,7 +425,7 @@ class Device:
 
 
 class Harness:
-    def __init__(self, config=None, afe=False):
+    def __init__(self, config=None, afe=False, no_input_chime=True):
         self.link = FakeLink()
         self.render = FakeRender()
         self.worker = FakeWorker()
@@ -438,6 +438,7 @@ class Harness:
         self.events = []
         self.config = {"wakeSound": True, "wakeArbitrationMs": 700, **(config or {})}
         self.link.render = self.render
+        self.no_input_chime = no_input_chime   # the device announces no_input_chime
 
         async def persist(row):
             self.rows.append(row)
@@ -466,7 +467,7 @@ class Harness:
 
     async def start(self):
         await self.actor.start()
-        self.actor.attach(self.link, self.render, afe_metadata=self.device.afe)
+        self.actor.attach(self.link, self.render, afe_metadata=self.device.afe, no_input_chime=self.no_input_chime)
         self.device.open_streams()
         await self.settle()
 
@@ -558,6 +559,33 @@ def test_the_controller_chimes_an_accepted_wake_only_when_the_device_did_not(chi
         await h.settle()
         assert h.actor.state == "ARMED" and h.actor.turn_active
         assert h.render.local == ([("earcon", "builtin:wake_chime")] if controller_chime else [])
+        await h.actor.close()
+    run(main())
+
+
+# Turn 647 (2026-10-10 23:02, decision trace): an idle wake the Dot chimed itself. The recognizer
+# heard "go turn off all of my scene", but no cell was ever speech, so no command speech ended and
+# the turn closed `no_input` 5 s after its trigger, with only the LED throb to say so.
+TURN_647_TOKENS = [("▁GO", OPEN + 12_800), ("▁TURN", OPEN + 33_280), ("▁OFF", OPEN + 40_000),
+                   ("▁ALL", OPEN + 44_000), ("▁OF", OPEN + 47_000), ("▁MY", OPEN + 50_000),
+                   ("▁SCENE", OPEN + 53_760)]
+
+
+@pytest.mark.parametrize("wake_sound, capable, chime", [(True, True, True), (False, True, False),
+                                                        (True, False, False)])
+def test_a_wake_that_hears_no_command_ends_with_the_no_input_chime(wake_sound, capable, chime):
+    async def main():
+        h = Harness(config={"wakeSound": wake_sound}, no_input_chime=capable)
+        h.worker.tokens = TURN_647_TOKENS
+        await h.start()
+        h.actor.on_message(candidate(chimed=True))
+        await h.settle()
+        await h.feed(S - 4_800 - 20_000, OPEN + 90_000)
+        await h.wait_for(lambda: h.rows)
+        row = h.rows[0]
+        assert row["terminal_reason"] == "no_input" and row["asr_text"] == "GO TURN OFF ALL OF MY SCENE"
+        assert h.cues() == ["nospeech_anim"] and h.ha.stt_calls == []
+        assert h.render.local == ([("earcon", "builtin:no_input_chime")] if chime else [])
         await h.actor.close()
     run(main())
 

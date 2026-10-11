@@ -790,9 +790,10 @@ func TestRenderRoutingAndGenerationFencing(t *testing.T) {
 	h.expectAck(start("p4", "content", 4, proto.U64(78), nil), proto.AckRejected, codeStaleGeneration)
 	h.expectAck(start("px", "content", 6, proto.NullU64{}, nil), proto.AckRejected, codeInvalid)
 	h.expectAck(start("pq", "mystery", 1, proto.NullU64{}, nil), proto.AckRejected, codeInvalidClass)
-	chime, bogus := "builtin:wake_chime", "builtin:nope"
+	chime, noInput, bogus := cue.WakeChime, cue.NoInputChime, "builtin:nope"
 	h.expectAck(start("e1", "earcon", 1, proto.NullU64{}, &chime), proto.AckAccepted, "")
 	h.expectAck(start("e2", "earcon", 2, proto.NullU64{}, &bogus), proto.AckRejected, codeUnknownAsset)
+	h.expectAck(start("e3", "earcon", 2, proto.NullU64{}, &noInput), proto.AckAccepted, "")
 	fallback := alerts.SoundFallback
 	h.expectAck(start("a1", "alert_preview", 1, proto.NullU64{}, &fallback), proto.AckAccepted, "")
 

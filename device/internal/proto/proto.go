@@ -67,6 +67,9 @@ const (
 	// open when config wakeSound is on, and reports it in wake.candidate's
 	// chimed.
 	CapLocalWakeChime Capability = "local_wake_chime"
+	// CapNoInputChime: render.start accepts the earcon local_asset
+	// "builtin:no_input_chime", which ends a wake turn that heard no command.
+	CapNoInputChime Capability = "no_input_chime"
 	// CapOpenRules: the device opens candidates on session.ready's
 	// detector.open_rules, evaluates its shadow_rules, credits the opening
 	// rule in wake.candidate and reports shadow counters in wake.stats.
@@ -379,7 +382,8 @@ type StreamEnd struct {
 }
 
 // RenderStart's Epoch is set only for network sources; LocalAsset only for
-// local ones ("builtin:wake_chime", "builtin:fallback" or an alert sha256).
+// local ones ("builtin:wake_chime", "builtin:no_input_chime",
+// "builtin:fallback" or an alert sha256).
 type RenderStart struct {
 	PlaybackID   string             `json:"playback_id"`
 	SourceClass  render.SourceClass `json:"source_class"`

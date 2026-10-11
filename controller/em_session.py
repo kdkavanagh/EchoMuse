@@ -374,6 +374,7 @@ LINE_LEFT_IT = "Okay, I left it."
 ECHO_TAG = "echo"                # submit_echo tag for per-cell labels
 CANDIDATE_TAG = "candidate:"     # submit_echo tag prefix for a candidate comparison
 WAKE_CHIME = "builtin:wake_chime"
+NO_INPUT_CHIME = "builtin:no_input_chime"
 
 
 def _stream_url(url: str) -> AsyncIterator[np.ndarray]:
@@ -911,6 +912,7 @@ class SessionActor:
         self.awaiting_intent = False
         self.link: _Link | None = None
         self.render: RenderClient | None = None
+        self._no_input_chime_capable = False   # the session's device plays NO_INPUT_CHIME
         self.uplink: UplinkSession | None = None
         self._queue: asyncio.PriorityQueue[tuple[int, int, _Event]] = asyncio.PriorityQueue()
         self._sequence = 0
@@ -962,10 +964,13 @@ class SessionActor:
         if self._task is not None:
             await self._task
 
-    def attach(self, link: _Link, render: RenderClient, *, afe_metadata: bool = False) -> None:
+    def attach(self, link: _Link, render: RenderClient, *, afe_metadata: bool = False,
+               no_input_chime: bool = False) -> None:
         """Session ready: the new session's link, renderer, and an empty uplink record.
-        `afe_metadata`: session.ready granted it, so the session carries the `afe` stream."""
+        `afe_metadata`: session.ready granted it, so the session carries the `afe` stream.
+        `no_input_chime`: the device announced it, so it plays NO_INPUT_CHIME."""
         self.link, self.render = link, render
+        self._no_input_chime_capable = no_input_chime
         self.uplink = UplinkSession(afe_metadata=afe_metadata)
         self._post(P_LOSS, _Attach())
 
@@ -2932,6 +2937,8 @@ class SessionActor:
         if reason == TerminalReason.NO_INPUT:
             if turn.trigger not in REPLY_KINDS:
                 self._cue(Cue.NOSPEECH_ANIM)
+            if turn.trigger == UtteranceKind.WAKE:
+                self._spawn(self._play_no_input_chime(turn.generation))
         elif reason in ERROR_CUE_REASONS:
             self._cue(Cue.ERROR_ANIM)
         elif reason in ERROR_LINE_REASONS:
@@ -2948,6 +2955,17 @@ class SessionActor:
                 self._spawn(self._prompt(exp, LINE_SORRY))
             else:
                 self._spawn(self._speak(LINE_SORRY, turn.turn_id, turn.generation))
+
+    async def _play_no_input_chime(self, generation: int) -> None:
+        """With `wakeSound` on, a wake that heard no command ends with the no-input chime
+        (§11.2), after its lease closed: the Dot has stopped listening."""
+        if (not self._no_input_chime_capable or self.render is None
+                or not em_config_sections.wake_sound(self._config())):
+            return
+        try:
+            await self.render.play_local(SourceClass.EARCON, NO_INPUT_CHIME, generation=generation)
+        except Exception:
+            log.warning("[%s] no-input chime failed", self.device_id, exc_info=True)
 
     def _wake_clip(self, turn: _Turn, timeline: LeaseTimeline) -> _Clip | None:
         """Accepted candidate support −300 ms … support_end, canonical PCM."""

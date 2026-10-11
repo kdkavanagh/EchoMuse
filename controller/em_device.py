@@ -96,7 +96,7 @@ class Actor(Protocol):
     async def start(self) -> None: ...
     async def close(self) -> None: ...
     def attach(self, link: em_device_link.DeviceLink, render: em_render.RenderClient, *,
-               afe_metadata: bool) -> None: ...
+               afe_metadata: bool, no_input_chime: bool) -> None: ...
     def detach(self, reason: CloseReason) -> None: ...
     def on_message(self, envelope: em_device_link.Envelope) -> None: ...
     def on_audio(self, frame: bytes) -> None: ...
@@ -410,6 +410,10 @@ class Device:
         return Capability.LOCAL_WAKE_CHIME in self.capabilities
 
     @property
+    def no_input_chime_capable(self) -> bool:
+        return Capability.NO_INPUT_CHIME in self.capabilities
+
+    @property
     def open_rules_capable(self) -> bool:
         return Capability.OPEN_RULES in self.capabilities
 
@@ -495,7 +499,8 @@ class Device:
         self.muted = hello.muted
         self.volume = hello.volume_level
         # session.ready granted afe_metadata exactly when the hello announced it (LinkHub.admit).
-        self.actor.attach(link, render, afe_metadata=self.afe_metadata_capable)
+        self.actor.attach(link, render, afe_metadata=self.afe_metadata_capable,
+                          no_input_chime=self.no_input_chime_capable)
         await self.host.alerts.on_session_hello(self.device_id, hello.alerts,
                                                 capabilities=self.capabilities)
         await self.apply_config(self.config)

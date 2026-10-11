@@ -135,7 +135,7 @@ is never filled.
 {"capabilities":["audio_timeline_v1","uplink_leases_v1","device_wake_v1",
   "render_reference_v1","render_progress_v1","focus_leases_v1","alert_cache_v1",
   "turn_protocol_v1","leds","led_anim","buttons","button_hold","alert_prefetch","local_wake_chime",
-  "open_rules_v1","ambient_light","afe_metadata_v1"],
+  "no_input_chime","open_rules_v1","ambient_light","afe_metadata_v1"],
  "platform":"fireos6",
  "firmware_version":"v3.0.0","os_version":"Fire OS 6.5.6.9 (NS6569/6009)",
  "boot_id":"<proc boot_id>","protocols":[1],
@@ -151,6 +151,9 @@ is never filled.
 sensor is readable. `ambient_light_status` is the legacy `als.Report()` object.
 `local_wake_chime`: the device plays the wake chime itself at candidate open
 when `config` `wakeSound` is true (§4.4).
+`no_input_chime`: `render.start` accepts the earcon `local_asset`
+`builtin:no_input_chime` (architecture §11.2); the controller sends it to no
+other device.
 `open_rules_v1`: the device opens candidates on `session.ready`
 `detector.open_rules`, evaluates `detector.shadow_rules` without acting on
 them, names the opening rule in `wake.candidate.rule` and reports shadow
@@ -254,7 +257,7 @@ it uses the mic capture epoch, opens and ends with it.
 ```json
 {"playback_id":"uuid","source_class":"content|dialog_output|earcon|alert_preview",
  "epoch":"<kind-3 epoch, absent for local sources>","gain_db":0.0,"format":1,
- "local_asset":"builtin:wake_chime|<sha256>|builtin:fallback|null",
+ "local_asset":"builtin:wake_chime|builtin:no_input_chime|<sha256>|builtin:fallback|null",
  "announcement":false}
 ```
 Network sources (`content`, `dialog_output`) receive kind-3 packets on the

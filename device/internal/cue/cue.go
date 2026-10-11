@@ -8,18 +8,31 @@ import (
 	"errors"
 )
 
-// WakeChime is the render.start local_asset name of the wake chime.
-const WakeChime = "builtin:wake_chime"
+// The render.start local_asset names of the built-in earcons.
+const (
+	WakeChime = "builtin:wake_chime"
+	// NoInputChime ends a wake turn that heard no command (no_input_chime).
+	NoInputChime = "builtin:no_input_chime"
+)
 
 var ErrNotFound = errors.New("cue: unknown built-in asset")
 
 // wakeChimePCM is sounds/wake_word_triggered.flac from
-// esphome/home-assistant-voice-pe (MIT), decoded by gen.sh.
+// esphome/home-assistant-voice-pe (© 2024 Clayton Charles Tapp, CC BY 4.0),
+// decoded by gen.sh.
 //
 //go:embed wake_word_triggered.pcm
 var wakeChimePCM []byte
 
-var wakeChime = decodeS16LE(wakeChimePCM)
+// noInputChimePCM is synthesized by gen.sh.
+//
+//go:embed no_input_chime.pcm
+var noInputChimePCM []byte
+
+var assets = map[string][]int16{
+	WakeChime:    decodeS16LE(wakeChimePCM),
+	NoInputChime: decodeS16LE(noInputChimePCM),
+}
 
 func decodeS16LE(b []byte) []int16 {
 	if len(b)%2 != 0 {
@@ -35,8 +48,9 @@ func decodeS16LE(b []byte) []int16 {
 // Asset returns a built-in earcon. The slice is shared and must not be
 // modified; render.Mixer only reads local PCM.
 func Asset(name string) ([]int16, error) {
-	if name != WakeChime {
+	pcm, ok := assets[name]
+	if !ok {
 		return nil, ErrNotFound
 	}
-	return wakeChime, nil
+	return pcm, nil
 }
