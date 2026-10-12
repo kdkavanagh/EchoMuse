@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/wilbowes/EchoMuse/pkg/led"
 )
@@ -191,21 +192,30 @@ func TestStepsStayInsideTheButtonBand(t *testing.T) {
 	}
 }
 
-// Privacy and alert indication are local layers above controller frames
-// and survive controller loss (§11.2).
+// Privacy and a sounding alert are local layers above controller frames and
+// survive controller loss; a backgrounded alert yields the ring to the
+// dialog that backgrounded it (§11.2).
 func TestRingLayerPrecedence(t *testing.T) {
 	s, _ := newTestServer(t, 90)
 	leds := &fakeLEDs{}
 	s.ring.SetController(leds)
+	dimCyan := led.Led{ID: 0, G: 24, B: 38}
+	pulsing := func() bool { f := leds.frame()[0]; return f.R == 0 && f.B > 0 && f != dimCyan }
 
 	green := solidFrame(0, 200, 0)
 	s.SetLEDs(green)
 	if leds.frame()[0].G != 200 {
 		t.Fatal("controller frame not painted")
 	}
+	s.SetAlertIndication(true, true)
+	for deadline := time.Now().Add(time.Second); !pulsing(); time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("sounding alert did not outrank the controller layer: %+v", leds.frame()[0])
+		}
+	}
 	s.SetAlertIndication(true, false)
-	if f := leds.frame()[0]; f.G == 200 || f.B == 0 {
-		t.Fatalf("alert indication did not outrank controller layer: %+v", f)
+	if f := leds.frame()[0]; f.G != 200 || f.B != 0 {
+		t.Fatalf("backgrounded alert hid the dialog's ring: %+v", f)
 	}
 	s.MuteToggle()
 	if f := leds.frame()[0]; f.R != 180 || f.G != 0 {
@@ -213,8 +223,8 @@ func TestRingLayerPrecedence(t *testing.T) {
 	}
 	s.ClearControllerLEDs()
 	s.MuteToggle()
-	if f := leds.frame()[0]; f.B == 0 {
-		t.Fatalf("alert indication lost after unmute: %+v", f)
+	if f := leds.frame()[0]; f != dimCyan {
+		t.Fatalf("backgrounded alert not shown once the dialog ring cleared: %+v", f)
 	}
 	s.SetAlertIndication(false, false)
 	if f := leds.frame()[0]; f != (led.Led{ID: 0}) {

@@ -244,11 +244,11 @@ installed, and which are missing.
 Plays a short confirmation sound on the Dot when it hears the wake word. Off
 by default. On current firmware the Dot starts it itself as soon as it detects
 the wake word, without a round trip to the controller. While the Dot is playing
-audio (music, a reply) it waits until the controller has confirmed the wake
-was a person and not its own speaker, so it chimes slightly later; older
-firmware always chimes after the controller accepts the wake. It does not play
-when the wake word interrupts a ringing timer or alarm or a spoken response —
-the sound stopping is the acknowledgement.
+music or an alarm or timer is ringing, it waits until the controller has
+accepted the wake (over its own audio, confirmed it was a person and not its
+own speaker), so it chimes slightly later; older firmware always chimes
+after the controller accepts the wake. It does not play when the wake word
+interrupts a spoken response — the response stopping is the acknowledgement.
 
 The same chime plays when a follow-up question finishes and the Dot starts
 listening for your answer without the wake word (see [Answers to follow-up

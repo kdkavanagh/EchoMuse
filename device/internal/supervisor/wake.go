@@ -131,10 +131,10 @@ func (s *Supervisor) restoreWake() {
 
 // localWakeChime plays the wake chime the moment an idle candidate opens
 // (config wakeSound) instead of after the controller's acceptance. Never
-// while disconnected (offlineWake answers those), producing sound (the
-// controller verifies those wakes and chimes on acceptance), with an alert
-// active (the wake stops it) or during a diagnostic lease (wakes are
-// refused). A rejected candidate keeps its chime. Must not hold mu.
+// while disconnected (offlineWake answers those), during a diagnostic lease
+// (wakes are refused), producing sound (the controller verifies those wakes)
+// or with an alert active: the controller chimes those on acceptance. A
+// rejected candidate keeps its chime. Must not hold mu.
 func (s *Supervisor) localWakeChime(c detector.Candidate, alertActive bool) bool {
 	if !s.cfg.DeviceConfig.Get().WakeSound || c.ProducingSound || alertActive ||
 		!s.connected() || s.up.DiagnosticLive() {

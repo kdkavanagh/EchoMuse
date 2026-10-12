@@ -439,7 +439,9 @@ listens for a bare "stop".
   Home Assistant.
 - **Over music:** the music ducks under your turn and comes back afterwards.
 - **Over an alarm or timer:** the wake word moves the ring into the
-  background (the sound stops, the ring stays pending) so you can speak.
+  background (the sound stops, the ring stays pending) so you can speak. The
+  Dot then answers as for any wake: the chime (with the wake chime on) and
+  the green listening ring.
   - "Ophelia, stop" (or "cancel", or "stop the timer", "turn off the alarm")
     dismisses the ring that was sounding when you said the wake word, even if
     another one became due while you were talking.
@@ -449,9 +451,10 @@ listens for a bare "stop".
   - A ring stays in the background for at most 15 seconds in total; then it
     takes over again.
 
-No chime plays for these; the sound stopping is the acknowledgement. Voice
-stop needs the controller, but not Home Assistant or its STT. The action
-button needs neither.
+The wake word over a reply plays no chime: the reply cutting off is the
+acknowledgement. The stop itself plays nothing in any of these cases; the
+sound stopping is the confirmation. Voice stop needs the controller, but not
+Home Assistant or its STT. The action button needs neither.
 
 **Caveat:** extra words make it a normal request. "Ophelia, stop please" is
 a local stop; "Ophelia, don't stop" and "Ophelia, stop the music" go to Home

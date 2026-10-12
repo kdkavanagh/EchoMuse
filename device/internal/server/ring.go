@@ -17,9 +17,12 @@ const numLEDs = 12
 type Layer uint8
 
 const (
-	LayerController Layer = iota // retained leds/led_anim
-	LayerLink                    // disconnected/pending local indication
-	LayerAlert                   // foreground/background alert (§11.2)
+	// LayerAlertBackground: an alert backgrounded by a dialog sits under the
+	// dialog's ring, showing only while the controller paints nothing (§11.2).
+	LayerAlertBackground Layer = iota
+	LayerController // retained leds/led_anim
+	LayerLink       // disconnected/pending local indication
+	LayerAlert      // foreground alert (§11.2)
 	layerCount
 )
 

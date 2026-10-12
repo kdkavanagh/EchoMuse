@@ -30,7 +30,7 @@ Colours are RGB values sent to the LEDs. Scene colours are for the default
 | Solid red `(180,0,0)`, mute-button LED on | Microphones off | Device | Yes, and persists across reboot |
 | Cyan arc `(0,200,200)`, N of 12 LEDs, 2 s | Volume level after a volume-button press | Device | Yes |
 | Cyan pulse `(0,140,220)`, 0.9 s cycle | Alarm or timer ringing | Device | Yes |
-| Solid dim cyan `(0,24,38)` | Alarm or timer active but backgrounded while you talk to it | Device | Yes |
+| Solid dim cyan `(0,24,38)` | Alarm or timer backgrounded while you talk to it; the conversation ring shows over it | Device | Yes |
 | Slow red pulse `(180,0,0)`, 4 s cycle | Not connected to the controller; the wake word gets the spoken offline notice | Device | Shown *because of* the loss |
 | Grey-white pulse `(80,80,80)`, 2.8 s cycle | Connected, waiting for admin approval | Device | — |
 | Solid scene colour (green) | Listening, or waiting for your reply | Controller | No — cleared |
@@ -51,9 +51,10 @@ you see:
 |---|---|---|
 | 1 (highest) | Volume arc | `device/internal/server/ring.go` `showVolume` |
 | 2 | Privacy mute | `device/internal/server/mute.go` |
-| 3 | Alert (alarm or timer ringing) | `device/internal/server/server.go` `SetAlertIndication` |
+| 3 | Alert sounding (foreground) | `device/internal/server/server.go` `SetAlertIndication` |
 | 4 | Link (offline, awaiting approval) | `device/internal/server/server.go` `SetLinkState` |
 | 5 | Controller (`leds` / `led_anim`) | `device/internal/server/server.go` `SetLEDs`, `StartAnim` |
+| 6 | Alert backgrounded | `device/internal/server/server.go` `SetAlertIndication` |
 | — | Nothing active | ring dark |
 
 A hidden layer keeps running and keeps its latest frame, so when a higher layer
@@ -68,11 +69,14 @@ Consequences worth knowing:
   alarm and the offline pulse are all hidden behind solid red while muted.
   Solid red with the mute-button LED lit is mute; a slow red pulse with it
   dark is the lost link.
-- **A ringing alarm or timer hides the conversation ring.** If you say the wake
-  word during an alarm, the ring shows the alert layer (dim cyan while your
-  request is handled), not the green listening ring.
+- **A sounding alarm or timer hides the conversation ring; a backgrounded one
+  does not.** Saying the wake word during an alarm backgrounds it, so the ring
+  turns to the green listening ring, then thinking and speaking, as for any
+  wake. The dim cyan shows only in the moments the controller paints nothing,
+  such as between hearing the wake word and accepting it. If the alarm sounds
+  again after the request, its cyan pulse takes over again.
 - **An alarm that rings while the controller is down shows cyan, not red.**
-  The alert layer outranks the link layer; the red pulse returns when the
+  A sounding alert outranks the link layer; the red pulse returns when the
   alarm ends.
 
 ## Device-local states
@@ -119,13 +123,13 @@ volume set) lights none.
 
 Alarms and timers ring on the device (see
 [post-afe-audio-architecture.md §10](post-afe-audio-architecture.md#10-timers-and-alarms-stock-home-assistant)).
-While an occurrence is active the alert layer shows:
+While an occurrence is active the alert layers show:
 
 | Alert state | Ring |
 |---|---|
-| Foreground (sounding) | Cyan `(0,140,220)` pulse, 0.9 s cycle, 15–100 % brightness |
-| Background (silenced while dialog has focus) | Solid dim cyan `(0,24,38)` |
-| Ended (stopped, snoozed, dismissed, time limit) | Layer cleared |
+| Foreground (sounding) | Cyan `(0,140,220)` pulse, 0.9 s cycle, 15–100 % brightness, above the conversation ring |
+| Background (silenced while dialog has focus) | Solid dim cyan `(0,24,38)`, beneath the conversation ring |
+| Ended (stopped, snoozed, dismissed, time limit) | Layers cleared |
 
 An alert goes to the background when dialog takes focus: a wake word spoken
 during the ring and the turn that follows it, or a response that is still
@@ -134,9 +138,9 @@ to the foreground when the dialog ends, and after
 15 s of background time per occurrence the device cancels the dialog and brings
 the alert back.
 
-The alert layer is driven entirely by the device's alert executor, so it keeps
-working when the controller is down. Stopping it — a tap on the action button,
-or the wake word followed by "stop" or "snooze" — clears the layer.
+The alert layers are driven entirely by the device's alert executor, so they
+keep working when the controller is down. Stopping the alert — a tap on the
+action button, or the wake word followed by "stop" or "snooze" — clears them.
 
 ### Offline and awaiting approval
 

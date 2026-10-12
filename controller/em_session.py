@@ -1449,10 +1449,13 @@ class SessionActor:
                      inherited.conversation_id if inherited else None, inherited, local_only=local_only)
         self._turn = turn
         await self._acquire_focus(turn_id, Focus.DIALOG_INPUT, turn.generation)
-        # No chime when the wake stops an alert or cancels a reply: the stopping is the acknowledgement
-        # (§16.2). Content only ducks, so a media-context wake chimes, unless it lost arbitration: the
-        # winner chimes. None when the device already chimed at candidate open (local_wake_chime, §11.2).
-        chime = context is None or (context.kind == ContextKind.MEDIA and not local_only)
+        # An alert-context wake chimes like any other: a ring falling silent cannot tell the user they
+        # were heard, since its own gaps are silent too. No chime when the wake cancels a reply: the
+        # stopping is the acknowledgement (§16.2). Content only ducks, so a media-context wake chimes,
+        # unless it lost arbitration: the winner chimes. None when the device already chimed at
+        # candidate open (local_wake_chime, §11.2).
+        chime = (context is None or context.kind == ContextKind.ALERT
+                 or (context.kind == ContextKind.MEDIA and not local_only))
         if (chime and em_config_sections.wake_sound(self._config()) and self.render is not None
                 and not candidate.wire.chimed):
             try:

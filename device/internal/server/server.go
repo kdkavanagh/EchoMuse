@@ -112,15 +112,23 @@ func (s *Server) SetLinkState(state LinkState) {
 }
 
 // SetAlertIndication projects the locally executing occurrence. Foreground
-// pulses cyan; background/pending stays dim cyan. It survives link loss.
+// pulses cyan above the controller and link layers, so it survives link loss.
+// A background occurrence has yielded to a dialog, so its dim cyan sits under
+// the controller layer: the dialog's listening, thinking and speaking ring
+// shows over it, as on any other wake.
 func (s *Server) SetAlertIndication(active, foreground bool) {
 	switch {
 	case !active:
 		s.ring.clear(LayerAlert)
+		s.ring.clear(LayerAlertBackground)
 	case foreground:
 		s.ring.animate(LayerAlert, AnimSpec{Pattern: PatternPulse, Colors: [][3]uint8{{0, 140, 220}}, PeriodMs: 900})
+		s.ring.clear(LayerAlertBackground)
 	default:
-		s.ring.animate(LayerAlert, AnimSpec{Pattern: PatternSolid, Colors: [][3]uint8{{0, 24, 38}}})
+		// Painted before the foreground pulse goes, so the ring never shows
+		// the layers beneath in between.
+		s.ring.animate(LayerAlertBackground, AnimSpec{Pattern: PatternSolid, Colors: [][3]uint8{{0, 24, 38}}})
+		s.ring.clear(LayerAlert)
 	}
 }
 

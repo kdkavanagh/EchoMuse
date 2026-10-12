@@ -565,6 +565,15 @@ Based on a review of Office turns 433–476 (`docs/turn-latency-review.md`,
   heard after its own wake word, so that turn sends "What time is it?". A
   later mention ("what does Ophelia mean" with the wake word dropped) still
   has too few words after it and is kept.
+- **The wake word over a ringing alarm or timer gets the usual wake
+  response.** The ring went quiet, but the LEDs stayed dim cyan and, with
+  Wake chime on, no chime played: the alarm's silence was meant as the
+  acknowledgement, yet it sounds the same as a gap between its bursts. The
+  controller now chimes an alert-context wake on acceptance, and the Dot puts
+  a backgrounded alert's dim cyan beneath the conversation ring, so the green
+  listening ring, the thinking spinner and the speaking meter show as for any
+  wake; a sounding alert still outranks them. The LEDs need the firmware
+  update the dashboard offers; the chime needs only the controller.
 
 ### Earlier in this release
 

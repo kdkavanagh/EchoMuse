@@ -709,7 +709,7 @@ def test_wake_then_stop_with_a_ringing_alarm_dismisses_it_locally_without_home_a
         alert = {"id": "occ-1", "kind": "alarm", "name": "Wake up", "foreground": False}
         h.actor.on_message(candidate(active_alert=alert))
         await h.settle()
-        assert h.render.local == []                        # the ring stopping is the acknowledgement
+        assert h.render.local == [("earcon", "builtin:wake_chime")]   # the wake program, as at idle
         await h.feed(S - 4_800 - 20_000, OPEN + 40_000)
         await h.wait_for(lambda: h.link.requests)
         msg, body = h.link.requests[0]
