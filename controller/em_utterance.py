@@ -11,7 +11,8 @@ returns decisions. Positions are capture-epoch sample indices at 16 kHz.
   streaming-text stability over the wake-cut text, and evaluates
   `EndpointReducer` after each 80 ms block once cells and ASR both reached it.
 - `ReplyWatch` (one per reply expectation) finds an early answer during the
-  prompt.
+  prompt and the chime after it; `answer_under_way` tells, at the drain, whether
+  an answer began over the question's end.
 - `local_action` is the §16.2 local-command gate plus grammar match.
 """
 
@@ -361,6 +362,8 @@ class UtteranceTrace(TypedDict):
     pauses: list[PauseTrace]
     recognizer: list[RecognitionTrace]
     endpoint: list[EndpointEvent]
+    guard_until: int | None        # a primed reply's opening guard (§16.6); None: none
+    answer_start: int | None       # where the run holding the first command speech began
 
 
 @dataclass(frozen=True, slots=True)
@@ -375,6 +378,8 @@ class UtteranceSpec:
     `pause_server` also transcribes the utterance at each pause (config `pauseAsr`).
     `no_input_at` is where a reply reopened after a gap closes `no_input`: its
     window's original end (None: the reducer's own, from `trigger`).
+    `guard_until`: a reply whose VAD was primed as its window opened opens no run
+    on cells after its trigger that start before this sample (§16.6).
     """
 
     utterance_id: str
@@ -390,6 +395,7 @@ class UtteranceSpec:
     extended: bool = False
     pause_server: WyomingServer | None = None
     no_input_at: int | None = None
+    guard_until: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -485,6 +491,7 @@ class Utterance:
             trigger_sample=spec.trigger,
             seed_start=spec.seed_start if spec.kind == UtteranceKind.WAKE else None,
             reply=reply,
+            guard_until=spec.guard_until,
         )
         self._stability = TextStability(spec.trigger)
         self._first_cell = spec.start - spec.start % CELL
@@ -575,13 +582,6 @@ class Utterance:
     @property
     def cells(self) -> list[ClassifiedCell]:
         return list(self._cells)
-
-    @property
-    def answer_under_way(self) -> bool:
-        """A command-speech run that opened by the trigger is open at the newest cell: for a
-        reply, an answer begun over the question's end (§16.6), which the reply chime would cover."""
-        start = self._attributor.answer_start
-        return start is not None and start <= self.spec.trigger
 
     @property
     def reopen_at(self) -> int | None:
@@ -762,6 +762,8 @@ class Utterance:
                     for p in self._pauses],
             recognizer=list(self._recognitions),
             endpoint=list(self._events),
+            guard_until=self.spec.guard_until,
+            answer_start=self._reducer.answer_run,
         )
 
 
@@ -778,12 +780,26 @@ def redecoded_command(spec: UtteranceSpec, tokens: Sequence[str], seconds: Seque
 class ReplyWatch:
     """Finds an early answer (§16.6) while a question carrying a reply expectation plays.
 
-    Push every released cell of the reply lease until the question drains;
-    returns the onset sample once. The reply turn's trigger is the onset, and
-    its utterance starts 300 ms before it.
+    Push every released cell of the reply lease until the reply window opens, through
+    the question and the wake chime after it; returns the onset sample once. The
+    reply turn's trigger is the onset, and its utterance starts 300 ms before it.
     """
 
     _early: EarlyAnswerDetector = field(default_factory=EarlyAnswerDetector)
 
     def push(self, ev: Evidence) -> int | None:
         return self._early.push(ev.cell, ev.background)
+
+
+def answer_under_way(history: Sequence[Evidence], start: int, trigger: int) -> bool:
+    """At a question's drain (§16.6): a command-speech run that opened by `trigger`, and no more
+    than REPLY_OVERLAP before it, is open at the newest of the lease's released cells, as a reply
+    utterance from `start` with its trigger there classifies them: an answer begun over the
+    question's end, which the wake chime would cover. `history` is contiguous and in order."""
+    attributor = Attributor(trigger_sample=trigger, reply=True)
+    first = start - start % CELL
+    for ev in history:
+        if ev.end > first:
+            attributor.classify(ev.cell, ev.background)
+    answer = attributor.answer_start
+    return answer is not None and answer <= trigger

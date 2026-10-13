@@ -418,6 +418,25 @@ Based on a review of Office turns 433–476 (`docs/turn-latency-review.md`,
   it, silently (turn 654, where the idle Living Room Dot won and heard
   nothing). "Cancel" and "stop the music" still go to Home Assistant. A bare
   "pause" now ends after the short pause, like "stop".
+- **Answers to follow-up questions are heard (policy `post_afe_9`).** A
+  reply window could hear nothing at all: the speech detector carried what it
+  had learned from the question's own echo into the window and then scored a
+  quieter answer as silence for seconds. The Master Bathroom's "the bedroom
+  fan" (turn 722, answering "Which fan should I turn off?") was transcribed
+  but never counted as speech, and the window closed after 7 s; turns 686 and
+  689 failed the same way. The window now starts the detector from the state
+  it was in just after you finished asking (about 0.3 s after you stopped
+  talking), or from a fresh state when Home Assistant started the
+  conversation, and ignores anything in its first 320 ms except to date an
+  answer that began there. With Wake chime on, the window now opens when the
+  chime has finished instead of under it, so its 7 s start after the chime;
+  you can still answer over the chime. Replayed on saved recordings, it heard
+  all 3 missed answers, the 4 that already worked, and 68 of 70 wake
+  commands used as stand-in answers, with no false start in 36 quiet
+  stretches; on steady room noise false starts stay at 2% of windows (12%
+  without the 320 ms guard). Each reply's trace records where its detector
+  state came from (`reply_window`) and the guard (`guard_until`,
+  `answer_start`).
 - **Configurable wake open rules, with shadow rules to try them first.**
   Firmware with the new `open_rules_v1` capability opens a wake on any of a
   list of rules (last 1–3 scores, average or every one, ≥ a threshold). The

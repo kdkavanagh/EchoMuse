@@ -4,6 +4,7 @@ import pytest
 from em_attribution import (
     CELL,
     MAX_LAG,
+    REPLY_GUARD,
     REPLY_OVERLAP,
     Attributor,
     BackgroundTracker,
@@ -308,3 +309,66 @@ def test_an_answer_may_start_up_to_480_ms_before_the_reply_window(lead, taken):
     after = [c for c in cells if c.end > trigger]
     assert all(c.command for c in after) is taken and any(c.command for c in after) is taken
     assert attr.answer_start == (first * CELL if taken else None)
+
+
+# A primed reply window (§16.6): trigger mid-cell, as the mic frontier at the chime's end is.
+GUARD_TRIGGER = 40 * CELL + 256
+GUARD_CELLS = 11                       # cells 40‥50 overlap [trigger, trigger + 320 ms)
+
+
+def _guarded():
+    attr = Attributor(trigger_sample=GUARD_TRIGGER, reply=True, guard_until=GUARD_TRIGGER + REPLY_GUARD)
+    _vads(attr, [0.05] * 40)
+    return attr
+
+
+def test_no_run_opens_inside_a_primed_reply_windows_guard():
+    # Room noise the restored state still calls speech, for the guard's length: never an answer.
+    attr = _guarded()
+    noise = _vads(attr, [0.9] * GUARD_CELLS, first=40)
+    assert all(c.cls == CellClass.UNKNOWN and c.rule == Rule.GUARD and not c.command for c in noise)
+    assert attr.answer_start is None
+    after = _vads(attr, [0.05] * 20, first=40 + GUARD_CELLS)
+    assert not any(c.command for c in after)
+    assert ("unknown", "guard", 40 * CELL, (40 + GUARD_CELLS) * CELL) in [
+        (s.cls, s.rule, s.start, s.end) for s in attr.trace]
+
+
+def test_an_answer_begun_as_the_window_opened_runs_from_its_first_cell_once_the_guard_ends():
+    attr = _guarded()
+    held = _vads(attr, [0.9] * GUARD_CELLS, first=40)
+    assert not any(c.command for c in held)                     # never relabelled after the guard
+    answer = _vads(attr, [0.9] * 10, first=40 + GUARD_CELLS)
+    assert all(c.cls == CellClass.COMMAND_SPEECH and c.command for c in answer)
+    assert attr.answer_start == 40 * CELL                       # the cell holding the trigger
+    assert {c.run_start for c in answer} == {40 * CELL}
+
+
+def test_a_run_after_the_guard_starts_where_its_speech_began_inside_it():
+    # "Yeah" from 160 ms into the window: VAD 0.5 (hold) for 2 cells, then 0.9.
+    attr = _guarded()
+    _vads(attr, [0.05] * 5, first=40)
+    onset = _vads(attr, [0.5, 0.5] + [0.9] * 4, first=45)
+    assert not any(c.command for c in onset)
+    answer = _vads(attr, [0.9] * 5, first=51)
+    assert answer[0].command and answer[0].rule == Rule.VAD
+    assert attr.answer_start == 45 * CELL and answer[0].run_start == 45 * CELL
+
+
+def test_speech_that_begins_after_the_guard_is_not_backdated():
+    attr = _guarded()
+    _vads(attr, [0.05] * 15, first=40)
+    answer = _vads(attr, [0.5, 0.9, 0.9], first=55)
+    assert answer[0].cls == CellClass.UNKNOWN and answer[1].command
+    assert attr.answer_start == 56 * CELL
+
+
+@pytest.mark.parametrize("seed_start, reply", [(0, False), (None, False), (None, True)])
+def test_wake_button_and_early_answer_utterances_have_no_guard(seed_start, reply):
+    # Wake (seeded), button, and a reply opened at an early answer's onset: no guard_until.
+    trigger = 40 * CELL
+    attr = Attributor(trigger_sample=trigger, seed_start=seed_start, reply=reply)
+    _vads(attr, [0.05] * 40)
+    answer = _vads(attr, [0.9] * 5, first=40)
+    assert all(c.cls == CellClass.COMMAND_SPEECH and c.command for c in answer)
+    assert attr.answer_start == trigger and answer[0].rule == Rule.VAD

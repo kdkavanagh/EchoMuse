@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Callable, Protocol, Sequence
 
 from echomuse_grammar import GrammarClass
-from em_attribution import CellClass, ClassifiedCell
+from em_attribution import CELL, CellClass, ClassifiedCell
 from em_wake_phrase import normalize_command, words
 
 SAMPLE_RATE = 16_000
@@ -241,7 +241,10 @@ class EndpointReducer:
         """`reply`: a no-wake reply whose trigger is where its window opened (§9.1). It
         closes `no_input` NO_INPUT_REPLY after the trigger, counts `too_long` from its first
         command speech, and commits a span from REPLY_SPAN_PREROLL before the run holding
-        that speech (never before `utterance_start`), not the chime and the wait before it.
+        that speech, as the attributor placed that run's start (never before
+        `utterance_start`), not the chime and the wait before it. Cells after the trigger
+        that a run was dated back over (a reply's opening guard) count toward route A's
+        minimum command speech, so a short answer begun as the window opened can end.
         `no_input_at` overrides where `no_input` falls: a reply reopened after a gap keeps
         its window's original end."""
         if utterance_start > trigger_sample:
@@ -259,7 +262,10 @@ class EndpointReducer:
         self._cells: list[ClassifiedCell] = []
         self._command_ends: list[int] = []
         self._command_start: int | None = None   # first command_speech cell starting at/after the trigger
-        self._answer_run: int | None = None      # first cell of the run holding the first command speech
+        self._answer_run: int | None = None      # where the run holding the first command speech began
+        # Cells after the trigger that the answer's run was dated back over (a reply's opening
+        # guard, §16.6): they count toward route A's minimum command speech.
+        self._held_cells = 0
         self._frontier = utterance_start
         self._commit: Commit | None = None
         self._close: Close | None = None
@@ -272,19 +278,20 @@ class EndpointReducer:
     def close(self) -> Close | None:
         return self._close
 
+    @property
+    def answer_run(self) -> int | None:
+        """Where the run holding the first command speech began; None before any."""
+        return self._answer_run
+
     def observe(self, cells: Sequence[ClassifiedCell]) -> None:
         """Add newly classified cells in sample order before the next evidence-frontier `step()`."""
         for cell in cells:
             if self._cells and cell.start <= self._cells[-1].start:
                 raise ValueError("cells must be observed once in sample order")
-            if cell.command and self._answer_run is None:
-                # A run is the contiguous command_speech cells before it (§8.2 hysteresis).
-                run = cell.start
-                for prev in reversed(self._cells):
-                    if prev.cls != CellClass.COMMAND_SPEECH or prev.end != run:
-                        break
-                    run = prev.start
-                self._answer_run = run
+            if cell.command and self._answer_run is None and cell.run_start is not None:
+                self._answer_run = cell.run_start
+                held_from = max(cell.run_start, self.trigger_sample - self.trigger_sample % CELL)
+                self._held_cells = max(0, cell.start - held_from) // CELL
             self._cells.append(cell)
             if cell.command:
                 self._command_ends.append(cell.end)
@@ -333,7 +340,8 @@ class EndpointReducer:
         return next((end for end in reversed(self._command_ends) if end <= sample), None)
 
     def _route_a(self, frontier: int, stable: StableText, cells: list[ClassifiedCell]) -> Pending | None:
-        if len(self._command_ends) < MIN_COMMAND_CELLS or not stable.prefix or len(cells) < PAUSE_WINDOW_CELLS:
+        if (len(self._command_ends) + self._held_cells < MIN_COMMAND_CELLS or not stable.prefix
+                or len(cells) < PAUSE_WINDOW_CELLS):
             return None
         window = cells[-PAUSE_WINDOW_CELLS:]
         quiet = sum(c.cls in PAUSE_QUIET for c in window)

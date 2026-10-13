@@ -6,9 +6,11 @@ tokens with emission samples, fed in sample order exactly as the actor does.
 
 from __future__ import annotations
 
+import pytest
+
 from echomuse_grammar import AMPM_CHOICES, CommandContext, GrammarClass
 from em_pause_asr import PauseDecode, WyomingServer
-from em_attribution import CELL, Cell, EchoResult
+from em_attribution import CELL, REPLY_GUARD, Cell, EchoResult
 from em_audio_timeline import CELL_FLAG_GAP, build_cells
 from em_utterance import (
     BLOCK,
@@ -22,6 +24,7 @@ from em_utterance import (
     TextSource,
     Utterance,
     UtteranceSpec,
+    answer_under_way,
 )
 
 SPEECH_DB, QUIET_DB, ROOM_DB = -30.0, -70.0, -70.0
@@ -531,6 +534,34 @@ def test_speech_under_way_at_the_drain_is_not_the_answer_but_a_new_run_after_it_
     segments = u.trace()["segments"]
     assert ("background_speech", "under_way", 23_552, 40_960) in segments
     assert not any(cls == "command_speech" and b > DRAIN and a < 40_960 for cls, _, a, b in segments)
+
+
+def test_a_primed_reply_takes_an_answer_begun_as_its_window_opened_from_its_first_cell():
+    # "Yeah" from the cell holding the trigger: no run opens inside the 320 ms guard, then the
+    # run opens dated back to that cell, and HA hears the answer from 300 ms before it.
+    u = Utterance(reply_spec(guard_until=DRAIN + REPLY_GUARD))
+    decisions = drive(u, speech_between((23_552, 30_208)), [("▁YEAH", 26_000)], 120_000)
+    commit = decisions[-1]
+    assert isinstance(commit, Commit) and commit.text == "yeah" and commit.boundary == 30_208
+    assert commit.start == 23_552 - 4_800
+    trace = u.trace()
+    assert trace["guard_until"] == DRAIN + REPLY_GUARD and trace["answer_start"] == 23_552
+    assert ("unknown", "guard", 23_552, 29_184) in trace["segments"]
+
+
+def _released(spans, first, until):
+    return [Evidence(Cell(s, SPEECH_DB if any(a <= s < b for a, b in spans) else QUIET_DB,
+                          0.95 if any(a <= s < b for a, b in spans) else 0.05, EchoResult.NO_REFERENCE), ROOM_DB)
+            for s in range(first, until, CELL)]
+
+
+@pytest.mark.parametrize("onset, under_way", [(DRAIN - 4_800, True), (DRAIN - 9_728, False), (None, False)])
+def test_an_answer_begun_over_the_questions_end_is_under_way_at_the_drain(onset, under_way):
+    # Up to 480 ms over the question's end it is the answer, already talking; earlier, talk
+    # already under way; nothing at all, nothing to wait for.
+    spans = [] if onset is None else [(onset - onset % CELL, DRAIN + 1_024)]
+    history = _released(spans, 0, DRAIN - DRAIN % CELL + CELL)
+    assert answer_under_way(history, REPLY_START, DRAIN) is under_way
 
 
 def test_a_silent_reply_window_closes_no_input_seven_seconds_after_it_opened():

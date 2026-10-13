@@ -37,7 +37,8 @@ class CellClass(enum.StrEnum):
 
 class Rule(enum.StrEnum):
     """Deciding rules recorded in the decision trace (§8.2); gap cells record why they are gaps.
-    `under_way`: a reply's speech that had begun before its window (§16.6)."""
+    `under_way`: a reply's speech that had begun before its window (§16.6). `guard`: speech
+    that would open a reply's run inside its opening guard (§16.6)."""
 
     GAP = "gap"
     MUTE = "mute"
@@ -46,6 +47,7 @@ class Rule(enum.StrEnum):
     LEVEL = "level"
     HYSTERESIS = "hysteresis"
     UNDER_WAY = "under_way"
+    GUARD = "guard"
 
 
 class EchoResult(enum.StrEnum):
@@ -113,6 +115,10 @@ EARLY_ANSWER_MARGIN_DB = 12.0
 # §16.6 reply window: an answer may start this far before the reply's trigger (480 ms over the
 # question's end); a run open at the trigger that opened earlier is speech already under way.
 REPLY_OVERLAP = 7_680
+# §16.6 reply window: no run opens in this much of a primed window from its trigger, where a
+# restored Silero state can still flag room noise; a run opening after it starts where its
+# contiguous speech began inside it.
+REPLY_GUARD = 5_120
 
 
 _EPS = 1e-12
@@ -154,7 +160,9 @@ class Cell:
 
 @dataclass(frozen=True, slots=True)
 class ClassifiedCell:
-    """One classified cell. `command` is command speech proper: `command_speech` ending after the trigger."""
+    """One classified cell. `command` is command speech proper: `command_speech` ending after the trigger.
+    `run_start`: for a `command_speech` cell, where its run began (§16.6: a reply's run that opened
+    after its opening guard begins where its speech began inside the guard); else None."""
 
     start: int
     cls: CellClass
@@ -164,6 +172,7 @@ class ClassifiedCell:
     background: float | None = None
     foreground: float | None = None
     ratio: float | None = None
+    run_start: int | None = None
 
     @property
     def end(self) -> int:
@@ -253,17 +262,27 @@ class Attributor:
     open at the trigger that opened more than REPLY_OVERLAP before it is speech
     already under way, not the answer: its cells after the trigger are
     `background_speech` (rule `under_way`) until the run closes.
+
+    `guard_until`: a reply whose VAD was primed as its window opened. No run opens
+    on a cell after the trigger that starts before it: such a cell is `unknown`
+    (rule `guard`). A run that opens after the guard while the speech it continues
+    (contiguous cells above NON_SPEECH_MAX_VAD) began inside it starts where that
+    speech began, never before the cell holding the trigger, so an answer begun as
+    the window opened keeps its first words.
     """
 
-    def __init__(self, *, trigger_sample: int, seed_start: int | None = None, reply: bool = False) -> None:
+    def __init__(self, *, trigger_sample: int, seed_start: int | None = None, reply: bool = False,
+                 guard_until: int | None = None) -> None:
         self._trigger = trigger_sample
         self._seed_start = seed_start
         self._reply = reply
+        self._guard_until = guard_until
         self._seed: list[float] | None = [] if seed_start is not None else None
         self._foreground: list[float] = []
         self._f: float | None = None
         self._in_run = False
-        self._run_start = 0                # the open run's first cell, while `_in_run`
+        self._run_start = 0                # the open run's first sample, while `_in_run`
+        self._speech_start: int | None = None   # first cell of the speech (VAD above NON_SPEECH_MAX_VAD) at the newest cell
         self._next: int | None = None
         self._trace: list[TraceSegment] = []
 
@@ -276,6 +295,16 @@ class Attributor:
     @property
     def _under_way_run(self) -> bool:
         return self._reply and self._run_start < self._trigger - REPLY_OVERLAP
+
+    def _guarded(self, cell: Cell) -> bool:
+        return self._guard_until is not None and cell.end > self._trigger and cell.start < self._guard_until
+
+    def _opened_run_start(self, cell: Cell) -> int:
+        """Where a run opening on `cell` begins: there, or where its speech began inside the guard."""
+        speech = self._speech_start
+        if self._guard_until is None or speech is None or speech >= self._guard_until:
+            return cell.start
+        return max(speech, self._trigger - self._trigger % CELL)
 
     @property
     def foreground(self) -> float | None:
@@ -339,9 +368,19 @@ class Attributor:
             background,
             f_before,
             ratio,
+            self._run_start if cls == CellClass.COMMAND_SPEECH else None,
         )
 
     def _decide(self, cell: Cell, background: float | None) -> tuple[CellClass, Rule]:
+        """The cell's class, then where the speech at it began: for a guarded run's start."""
+        cls, rule = self._decide_cell(cell, background)
+        if cls in (CellClass.GAP, CellClass.SELF_OUTPUT, CellClass.NON_SPEECH) or cell.vad is None:
+            self._speech_start = None
+        elif self._speech_start is None:
+            self._speech_start = cell.start
+        return cls, rule
+
+    def _decide_cell(self, cell: Cell, background: float | None) -> tuple[CellClass, Rule]:
         f = self._f
         level = cell.valid_level
         if level is None:
@@ -370,7 +409,9 @@ class Attributor:
                 r = (level - background) / max(f - background, R_MIN_SPAN_DB)
             if r is not None and r < RUN_OPEN_R:
                 return CellClass.UNKNOWN, Rule.LEVEL
-            self._in_run, self._run_start = True, cell.start
+            if self._guarded(cell):
+                return CellClass.UNKNOWN, Rule.GUARD
+            self._in_run, self._run_start = True, self._opened_run_start(cell)
             return CellClass.COMMAND_SPEECH, Rule.VAD if r is None else Rule.LEVEL
         return CellClass.UNKNOWN, Rule.VAD
 

@@ -71,7 +71,7 @@ ERRORS_UNAVAILABLE = 3
 PROBE_INTERVAL_S = 10.0
 PROBE_DEADLINE_S = 1.0
 PROBES_TO_RECOVER = 2
-POLICY_REVISION = "post_afe_8"
+POLICY_REVISION = "post_afe_9"
 
 
 class ObservationSource(enum.StrEnum):
@@ -147,6 +147,19 @@ class EchoPayload:
     lag_samples: int | None
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class VoiceSnapshot:
+    """Silero's recurrent state (2×1×128) and 64-sample context as an utterance's pause
+    finalized (§16.6): tuned to that speaker's voice in that room just after they stopped.
+    `sample` is the mic frontier the utterance had been fed through then (VAD had analyzed
+    every whole cell before it). Restored into a reply lease as its window opens
+    (`SpeechWorker.prime_vad`), it hears an answer from the first cell."""
+
+    state: np.ndarray
+    context: np.ndarray
+    sample: int
+
+
 @dataclass(frozen=True, slots=True)
 class AsrPayload:
     """`text` is the raw streaming text; `stable_prefix` and `grammar_result`
@@ -164,7 +177,9 @@ class AsrPayload:
     without it; from the first result after the server answers, every result
     that repeats the finalized one carries it. It stands in for the text, never
     for the tokens, which stay Kroko's. `pause_decode` reports the request on
-    the result where it was answered or dropped, including one that gave no text."""
+    the result where it was answered or dropped, including one that gave no text.
+
+    `voice` is the lane's Silero state at a finalize, on that result only."""
 
     tokens: tuple[str, ...]
     token_emission_sample: tuple[int, ...]
@@ -175,6 +190,7 @@ class AsrPayload:
     finalize_ms: int | None
     pause_text: str | None = None
     pause_decode: PauseDecode | None = None
+    voice: VoiceSnapshot | None = None
 
     @property
     def finalized(self) -> bool:
@@ -382,19 +398,34 @@ def evidence_copy(canonical_pcm: np.ndarray) -> np.ndarray:
 
 class _VadState:
     """Silero recurrent state plus the 64-sample context, and the cell
-    remainder of the block stream (an 80 ms block is 2.5 cells)."""
+    remainder of the block stream (an 80 ms block is 2.5 cells). `prime`
+    restores a model state from the first cell at or after its sample
+    (§16.6 reply window); a reset of the cell stream leaves it pending."""
 
     def __init__(self) -> None:
         self.window = np.zeros(VAD_CONTEXT_SAMPLES + VAD_CELL_SAMPLES, dtype=np.float32)
         self.state = np.zeros(VAD_STATE_SHAPE, dtype=np.float32)
         self.pending = np.empty(0, dtype=np.int16)
         self.next_sample: int | None = None   # first sample of `pending`
+        self.prime: tuple[int, VoiceSnapshot | None] | None = None   # (from sample, state; None: fresh)
 
     def reset(self) -> None:
         self.window.fill(0)
         self.state = np.zeros(VAD_STATE_SHAPE, dtype=np.float32)
         self.pending = np.empty(0, dtype=np.int16)
         self.next_sample = None
+
+    def snapshot(self, sample: int) -> VoiceSnapshot:
+        return VoiceSnapshot(self.state.copy(), self.window[:VAD_CONTEXT_SAMPLES].copy(), sample)
+
+    def restore(self, voice: VoiceSnapshot | None) -> None:
+        """The model state and context from `voice`, or fresh ones; the cell stream is untouched."""
+        if voice is None:
+            self.state = np.zeros(VAD_STATE_SHAPE, dtype=np.float32)
+            self.window[:VAD_CONTEXT_SAMPLES] = 0
+        else:
+            self.state = voice.state.copy()
+            self.window[:VAD_CONTEXT_SAMPLES] = voice.context
 
 
 @dataclass(frozen=True, slots=True)
@@ -591,6 +622,19 @@ class SpeechWorker:
         self._submit(_Job(f"mic:{lease_id}", ObservationKind.VAD, self._now(), run, lease, StreamId.MIC, 0, None,
                           control=True))
 
+    def prime_vad(self, lease_id: str, from_sample: int, voice: VoiceSnapshot | None) -> None:
+        """§16.6 reply window: restore `voice` (None: a fresh state) into the lease's VAD from
+        the first cell at or after `from_sample` it has yet to analyze; earlier cells keep the
+        state they carried. Ordered with the lease's mic blocks: blocks submitted before it
+        are analyzed first."""
+        lease = self._lease(lease_id)
+
+        def run() -> tuple[Observation, ...]:
+            lease.vad.prime = (from_sample, voice)
+            return ()
+        self._submit(_Job(f"mic:{lease_id}", ObservationKind.VAD, self._now(), run, lease, StreamId.MIC, 0, None,
+                          control=True))
+
     # -- utterance ASR ------------------------------------------------------
 
     def open_utterance(
@@ -694,8 +738,12 @@ class SpeechWorker:
         if n_cells:
             first_cell = vad.next_sample
             cells = vad.pending[:n_cells * VAD_CELL_SAMPLES].astype(np.float32) / np.float32(32768.0)
-            probs = tuple(models.vad(vad, cells[i * VAD_CELL_SAMPLES:(i + 1) * VAD_CELL_SAMPLES])
-                          for i in range(n_cells))
+            probs: list[float] = []
+            for i in range(n_cells):
+                if vad.prime is not None and first_cell + i * VAD_CELL_SAMPLES >= vad.prime[0]:
+                    vad.restore(vad.prime[1])
+                    vad.prime = None
+                probs.append(models.vad(vad, cells[i * VAD_CELL_SAMPLES:(i + 1) * VAD_CELL_SAMPLES]))
             vad.pending = vad.pending[n_cells * VAD_CELL_SAMPLES:]
             vad.next_sample = first_cell + n_cells * VAD_CELL_SAMPLES
             u = lease.utterance
@@ -704,7 +752,7 @@ class SpeechWorker:
                     if p >= SPEECH_POSITIVE_VAD:
                         u.speech_end = first_cell + (i + 1) * VAD_CELL_SAMPLES
             out.append(self._observe(lease, StreamId.MIC, ObservationKind.VAD, vad.next_sample,
-                                     VadPayload(first_cell, probs), u.utterance_id if u else None))
+                                     VadPayload(first_cell, tuple(probs)), u.utterance_id if u else None))
         u = lease.utterance
         if u is not None:
             end = first + evidence.size
@@ -735,13 +783,16 @@ class SpeechWorker:
         Its transcript is the judged text from the first block after it
         arrives, for as long as Kroko's finalized result stands. A request is
         dropped when new speech replaces that result or a later pause sends
-        another."""
+        another.
+
+        A finalize also copies the lane's Silero state: the utterance's voice snapshot."""
         analyzed = lease.vad.next_sample
         finalize = (u.speech_end is not None and u.speech_end != u.finalized_end
                     and analyzed is not None and analyzed - u.speech_end >= FINALIZE_PAUSE)
         live: AsrResult | None = None
         decode: PauseDecode | None = None
         finalize_ms: int | None = None
+        voice: VoiceSnapshot | None = None
         if finalize:
             evidence = np.concatenate(u.evidence)
             if u.pause is not None:
@@ -755,6 +806,7 @@ class SpeechWorker:
             finalize_ms = round((time.monotonic() - sent) * 1000)
             u.finalized = _Finalized(shadow.tokens, self._emissions(u, shadow), shadow.text)
             u.finalized_end = u.speech_end
+            voice = lease.vad.snapshot(u.fed_through)
         elif u.finalized is not None:
             live = models.result(u.stream)
             if live.tokens != u.finalized.tokens[:len(live.tokens)]:
@@ -788,7 +840,7 @@ class SpeechWorker:
         stable = u.stability.push(text, u.fed_through, blanks)
         payload = AsrPayload(tokens, emissions, raw_text, stable.prefix if stable.prefix_sample is not None else None,
                              blanks, None if u.grammar is None else u.grammar(text), finalize_ms,
-                             pause_text=pause_text, pause_decode=decode)
+                             pause_text=pause_text, pause_decode=decode, voice=voice)
         return self._observe(lease, StreamId.MIC, ObservationKind.ASR, u.fed_through, payload, u.utterance_id)
 
     @staticmethod

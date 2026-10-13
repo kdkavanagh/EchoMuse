@@ -53,6 +53,46 @@ def test_observations_with_a_callback_are_not_also_queued():
     assert asyncio.run(main()) == 0 and len(got) == 1
 
 
+class _StateVad:
+    """Stands in for Silero: a cell's probability is the state it ran from plus its context's
+    first sample, and each cell adds 1 to the state."""
+
+    revision = "fake"
+
+    def vad(self, state, cell):
+        p = float(state.state[0, 0, 0] + state.window[0])
+        state.state = state.state + 1
+        state.window[:sw.VAD_CONTEXT_SAMPLES] = cell[-sw.VAD_CONTEXT_SAMPLES:]
+        return p
+
+
+def test_a_primed_lease_restores_the_voice_from_the_first_cell_at_its_sample():
+    """§16.6 reply window: cells before the prime keep the carried state, the first cell at
+    or after its sample runs from the snapshot (state and context), a later prime without a
+    snapshot starts a fresh state."""
+    got = []
+
+    async def main():
+        w = sw.SpeechWorker(None, on_observation=got.append)
+        w._executor = sw.ThreadPoolExecutor(max_workers=1)
+        w.models = _StateVad()
+        w._wake["g"] = object()                             # the lease's wake graph: unused here
+        w.open_lease("dev", 7, "L", "g")
+        silence = np.zeros(1_280, dtype=np.int16)
+        w.submit_mic_block("L", 0, silence)                 # cells 0, 512 (256 samples pending)
+        voice = sw.VoiceSnapshot(np.full((2, 1, 128), 100, dtype=np.float32),
+                                 np.full(64, 0.5, dtype=np.float32), 999)
+        w.prime_vad("L", 1_280, voice)
+        w.submit_mic_block("L", 1_280, silence)             # cells 1,024 (carried), 1,536, 2,048
+        w.prime_vad("L", 3_000, None)
+        w.submit_mic_block("L", 2_560, silence)             # cells 2,560 (carried), 3,072 (fresh)
+        await w.close()
+
+    asyncio.run(main())
+    probs = [p for o in got if isinstance(o.payload, sw.VadPayload) for p in o.payload.probabilities]
+    assert probs == [0.0, 1.0, 2.0, 100.5, 101.0, 102.0, 0.0]
+
+
 @pytest.fixture(scope="module")
 def bundle_dir(tmp_path_factory):
     pytest.importorskip("onnxruntime")
@@ -196,6 +236,11 @@ def test_finalize_at_each_pause_carries_the_last_word_before_the_live_chunk(bund
     for speech_end, i in zip(pauses, finals):
         assert 0 <= asr[i].through_sample - (speech_end + sw.FINALIZE_PAUSE) < sw.BLOCK_SAMPLES
         assert asr[i].payload.text.lower().endswith("your country")
+        # Each finalize carries the lane's Silero state there: the utterance's voice snapshot.
+        voice = asr[i].payload.voice
+        assert voice.sample == asr[i].through_sample and voice.state.shape == sw.VAD_STATE_SHAPE
+        assert voice.context.shape == (sw.VAD_CONTEXT_SAMPLES,) and np.any(voice.state)
+    assert all(o.payload.voice is None for i, o in enumerate(asr) if i not in finals)
 
     first = asr[finals[0]]
     assert not asr[finals[0] - 1].payload.text.lower().endswith("your country")   # live still lacks it

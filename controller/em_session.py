@@ -60,6 +60,7 @@ from em_attribution import (
     CELL,
     ECHO_WINDOW_CELLS,
     MAX_LAG,
+    REPLY_GUARD,
     REPLY_OVERLAP,
     Coverage,
     EchoResult,
@@ -118,6 +119,7 @@ from em_speech_worker import (
     VadPayload,
     VerificationPayload,
     VerificationResult,
+    VoiceSnapshot,
 )
 from em_stt_copy import STT_TAIL_SILENCE, asr_gain_for, stt_copy
 from em_utterance import (
@@ -135,6 +137,7 @@ from em_utterance import (
     UtteranceKind,
     UtteranceTrace,
     UtteranceSpec,
+    answer_under_way,
     pause_command,
     redecoded_command,
 )
@@ -162,8 +165,9 @@ RESPONSE_START_S = 10.0          # intent-end → response audio start
 RESPONSE_STALL_S = 2.0           # no output progress
 RESPONSE_TOTAL_S = 120.0         # one spoken response
 ANNOUNCEMENT_CHIME_S = 5.0       # the 1.44 s announcement chime's drain
-# A reply turn opened at the drain starts this long before its trigger: the 480 ms an answer
-# may overlap the question's end, plus the pre-roll (§16.6).
+WAKE_CHIME_S = 3.0               # the wake chime's drain, before a reply window opens after it
+# A reply turn opened at the window's opening starts this long before its trigger: the 480 ms an
+# answer may overlap the chime's or the question's end, plus the pre-roll (§16.6).
 REPLY_LEAD = REPLY_OVERLAP + PREROLL
 # Wall-clock bound on a reply window without command speech (§16.2): the 7 s window is sample
 # time, so a lease that delivers no mic, or stops, would otherwise leave the Dot listening.
@@ -841,6 +845,30 @@ class _WhichTimerPending:
 _PendingOperation = _AmPmPending | _WhichTimerPending
 
 
+class ReplyVad(enum.StrEnum):
+    """Where a reply's VAD state came from as its window opened (§16.6)."""
+
+    VOICE = "voice"        # the asking turn's voice snapshot, restored at the trigger
+    FRESH = "fresh"        # no snapshot: a fresh state from the question's drain
+    CARRIED = "carried"    # an answer early or under way: the lease's state, untouched
+
+
+class ReplyWindowTrace(TypedDict):
+    """How a reply window opened (§16.6), in the reply turn's decision trace. `drain`: the mic
+    frontier when the question drained (None: before it had mic, or an early answer during
+    the question). `chime`: how the wake chime before the window ended (a render.finished
+    reason, `timeout`, `failed`); None: no chime. `voice_from`: the turn whose snapshot it is
+    and `voice_at` where that turn took it. `primed_at`: the VAD state applies from the
+    first cell at or after it."""
+
+    drain: int | None
+    chime: str | None
+    vad: ReplyVad
+    voice_from: str | None
+    voice_at: int | None
+    primed_at: int | None
+
+
 @dataclass
 class _Expectation:
     """A §9.1 reply expectation. `owner` names its focus/uplink leases and becomes
@@ -859,9 +887,11 @@ class _Expectation:
     reprompted: bool = False
     runtime: _Runtime | None = None
     watch: ReplyWatch = field(default_factory=ReplyWatch)
-    prompt: Playback | None = None
+    prompt: Playback | None = None    # the question, then the wake chime after it
     awaiting_audio: bool = False      # the window opened before the lease had any mic: open at its first cell
-    window_opened: float | None = None   # loop time the reply window opened (drain, or an early answer)
+    window_opened: float | None = None   # loop time the reply window opened (after the chime, or an early answer)
+    window: ReplyWindowTrace | None = None   # how it opened; None until the drain or an early answer
+    opening: bool = False             # its reply turn is opening: nothing opens another
     origin: _Turn | None = None       # the turn that asked; its row records what became of the question
 
 
@@ -910,6 +940,7 @@ class _Turn:
     timings: dict[str, int] = field(default_factory=dict)
     reopened: list[UtteranceTrace] = field(default_factory=list)   # a reply's utterances before a gap
     local_only: bool = False                  # a media-context wake that lost arbitration: acts on a local command only
+    voice: VoiceSnapshot | None = None        # Silero state at its utterance's latest pause finalize (§16.6)
 
 
 @dataclass
@@ -1589,7 +1620,8 @@ class SessionActor:
 
     def _spec(self, kind: UtteranceKind, start: int, trigger: int, inherited: _Expectation | None = None, *,
               seed_start: int | None = None, wake_open: int | None = None, wake_phrase: str | None = None,
-              context: CommandContext | None = None, no_input_at: int | None = None) -> UtteranceSpec:
+              context: CommandContext | None = None, no_input_at: int | None = None,
+              guard_until: int | None = None) -> UtteranceSpec:
         vocab = self.deps.vocabulary()
         return UtteranceSpec(
             utterance_id=str(uuid.uuid4()), kind=kind, start=start, trigger=trigger,
@@ -1601,6 +1633,7 @@ class SessionActor:
             # Route R (the ESPHome reply) reads no completeness: nothing to transcribe at its pauses.
             pause_server=None if kind == UtteranceKind.HA_REPLY else self._pause_server(),
             no_input_at=no_input_at,
+            guard_until=guard_until,
         )
 
     async def _open_utterance(self, turn: _Turn) -> None:
@@ -1626,20 +1659,26 @@ class SessionActor:
             turn.utterance.push_cell(ev)
         await self._pump(runtime)
 
-    async def _open_reply(self, exp: _Expectation, trigger: int, *, early: bool = False) -> None:
+    async def _open_reply(self, exp: _Expectation, trigger: int, *, early: bool = False,
+                          guarded: bool = False) -> None:
         """The reply turn (id = exp.owner) under the expectation's context (§9.1, §16.6), opened
-        like a button turn: at the guarded drain with its trigger there, or at an early answer's
-        onset. The normal reducer then decides what is the answer; a silent window closes
-        `no_input`. The utterance starts REPLY_LEAD before a drain trigger (300 ms before an
-        early answer's onset), never before the lease's first retained sample. Unless an answer
-        is already under way, the drain is cued with the wake chime (§11.2)."""
+        like a button turn: as its window opens (`_begin_window`) with its trigger there, or at
+        an early answer's onset. The normal reducer then decides what is the answer; a silent
+        window closes `no_input`. The utterance starts REPLY_LEAD before a window's trigger
+        (300 ms before an early answer's onset), never before the lease's first retained
+        sample. `guarded`: its VAD was primed for the window, so no run opens in the first
+        REPLY_GUARD after the trigger."""
         runtime = exp.runtime
         timeline = self._timeline(runtime) if runtime is not None else None
-        if exp is not self._expectation or runtime is None or timeline is None:
+        if exp is not self._expectation or exp.opening or runtime is None or timeline is None:
             return
+        exp.opening = True
         exp.awaiting_audio = False
         if exp.window_opened is None:                 # an early answer opens its window here
             exp.window_opened = asyncio.get_running_loop().time()
+        if exp.window is None:                        # an early answer during the question
+            exp.window = ReplyWindowTrace(drain=None, chime=None, vad=ReplyVad.CARRIED, voice_from=None,
+                                          voice_at=None, primed_at=None)
         # §16.2: the generation increases before prior output is cancelled.
         self._generation += 1
         if exp.prompt is not None and not exp.prompt.done:
@@ -1652,22 +1691,15 @@ class SessionActor:
         first = timeline.mic.first_sample if timeline.mic.first_sample is not None else trigger
         start = min(trigger, max(trigger - (PREROLL if early else REPLY_LEAD), first))
         kind = UtteranceKind.HA_REPLY if exp.source == UtteranceKind.HA_REPLY else UtteranceKind.REPLY
-        turn = _Turn(exp.owner, self._generation, kind, asyncio.get_running_loop().time(),
-                     Utterance(self._spec(kind, start, trigger, exp)), runtime,
+        spec = self._spec(kind, start, trigger, exp, guard_until=trigger + REPLY_GUARD if guarded else None)
+        turn = _Turn(exp.owner, self._generation, kind, asyncio.get_running_loop().time(), Utterance(spec), runtime,
                      conversation_id=exp.conversation_id, expectation=exp)
         self._turn = turn
         self._set_state(ActorState.ARMED)
-        log.info("[%s] reply turn %s open for %s at %d%s", self.device_id, turn.turn_id,
+        log.info("[%s] reply turn %s open for %s at %d%s (vad %s)", self.device_id, turn.turn_id,
                  exp.origin.turn_id if exp.origin is not None else exp.source, trigger,
-                 " (early answer)" if early else "")
+                 " (early answer)" if early else "", exp.window["vad"])
         await self._open_utterance(turn)
-        if (early or not self._current(turn) or turn.utterance.answer_under_way
-                or not em_config_sections.wake_sound(self._config()) or self.render is None):
-            return
-        try:
-            await self.render.play_local(SourceClass.EARCON, WAKE_CHIME, generation=turn.generation)
-        except Exception:
-            log.warning("[%s] reply chime failed", self.device_id, exc_info=True)
 
     # --- audio and evidence ---------------------------------------------------------------
 
@@ -1748,6 +1780,9 @@ class SessionActor:
                                                asr.trailing_blank_frames, obs.through_sample,
                                                finalize_ms=asr.finalize_ms, pause_text=asr.pause_text,
                                                pause_decode=asr.pause_decode)
+                    turn = self._turn
+                    if asr.voice is not None and turn is not None and turn.utterance is runtime.utterance:
+                        turn.voice = asr.voice
             case EchoPayload() as echo:
                 if obs.utterance_id and obs.utterance_id.startswith(CANDIDATE_TAG):
                     if candidate is not None:
@@ -1808,7 +1843,7 @@ class SessionActor:
         if exp is not None and exp.runtime is runtime and runtime.utterance is None:
             if exp.awaiting_audio:
                 if runtime.assembler.history:
-                    await self._open_reply(exp, runtime.assembler.history[0].start)
+                    await self._open_reply(exp, runtime.assembler.history[0].start, guarded=True)
                     return
             else:
                 for ev in released:
@@ -1849,14 +1884,15 @@ class SessionActor:
     async def _reopen_reply(self, turn: _Turn, at: int) -> None:
         """A gap before any answer does not end a reply window (§16.6): the reply listens on with
         a fresh utterance from the gap's end, its trigger no earlier than the window's, closing
-        `no_input` at the window's original end. The trace keeps the utterance it replaces."""
+        `no_input` at the window's original end and keeping its opening guard. The trace keeps
+        the utterance it replaces."""
         old = turn.utterance
         log.info("[%s] reply turn %s: gap before any answer, listening on from %d", self.device_id,
                  turn.turn_id, at)
         turn.reopened.append(old.trace())
         self.deps.worker.close_utterance(turn.runtime.lease_id)
         turn.utterance = Utterance(self._spec(old.spec.kind, at, max(old.spec.trigger, at), turn.expectation,
-                                              no_input_at=old.no_input_at))
+                                              no_input_at=old.no_input_at, guard_until=old.spec.guard_until))
         await self._open_utterance(turn)
 
     async def _recognize(self, utterance_id: str, text: str) -> None:
@@ -2377,22 +2413,85 @@ class SessionActor:
             await self._acquire_focus(exp.owner, Focus.DIALOG_INPUT, exp.generation)
 
     async def _begin_window(self, exp: _Expectation) -> None:
-        """After the guarded drain (or without prompt audio) the reply turn opens at once, its
-        trigger at the mic frontier (§9.1, §16.6); before the lease has any mic, at its first
-        released cell."""
+        """After the guarded drain (or without prompt audio) the reply window opens (§9.1, §16.6).
+
+        The lease's VAD carried the question's echo, which leaves Silero deaf to a quieter answer
+        for seconds. So unless an answer is already under way (`answer_under_way`: it opens at
+        once, its VAD untouched), the asking turn's voice snapshot is restored as the window
+        opens; without one, a fresh state starts at the drain and warms over the chime. With
+        Wake Sound on, the wake chime plays first and the window opens once it has finished
+        (bounded by WAKE_CHIME_S), so it never sounds inside the window; the early-answer watch
+        runs on through it. The reply turn's trigger is the mic frontier as the window opens;
+        before the lease has any mic, its first released cell."""
         if exp is not self._expectation or exp.runtime is None:
             return
         await self._hold_reply_focus(exp)
         self._set_state(ActorState.ARMED)
-        exp.window_opened = asyncio.get_running_loop().time()
-        timeline = self._timeline(exp.runtime)
+        runtime = exp.runtime
+        timeline = self._timeline(runtime)
         drain = timeline.mic.frontier if timeline is not None else None
-        if drain is None:
+        if timeline is not None and drain is not None:
+            first = timeline.mic.first_sample if timeline.mic.first_sample is not None else drain
+            if answer_under_way(runtime.assembler.history, max(drain - REPLY_LEAD, first), drain):
+                exp.window_opened = asyncio.get_running_loop().time()
+                exp.window = ReplyWindowTrace(drain=drain, chime=None, vad=ReplyVad.CARRIED, voice_from=None,
+                                              voice_at=None, primed_at=None)
+                await self._open_reply(exp, drain)
+                return
+        voice = self._voice(exp)
+        fresh_at = drain if drain is not None else 0
+        if voice is None:
+            self.deps.worker.prime_vad(runtime.lease_id, fresh_at, None)
+        window = exp.window = ReplyWindowTrace(
+            drain=drain, chime=None, vad=ReplyVad.FRESH if voice is None else ReplyVad.CARRIED,
+            voice_from=None, voice_at=None, primed_at=fresh_at if voice is None else None)
+        if em_config_sections.wake_sound(self._config()) and self.render is not None:
+            window["chime"] = await self._reply_chime(exp)
+            if exp is not self._expectation or exp.opening or exp.runtime is not runtime:
+                return                                # an early answer, a wake or a stop took over
+        exp.window_opened = asyncio.get_running_loop().time()
+        timeline = self._timeline(runtime)
+        trigger = timeline.mic.frontier if timeline is not None else None
+        if voice is not None:
+            primed_at = trigger if trigger is not None else 0
+            self.deps.worker.prime_vad(runtime.lease_id, primed_at, voice)
+            window["vad"], window["voice_at"], window["primed_at"] = ReplyVad.VOICE, voice.sample, primed_at
+            window["voice_from"] = exp.origin.turn_id if exp.origin is not None else None
+        if trigger is None:
             exp.awaiting_audio = True
             log.info("[%s] reply window for %s waits for the microphone", self.device_id,
                      exp.origin.turn_id if exp.origin is not None else exp.source)
             return
-        await self._open_reply(exp, drain)
+        await self._open_reply(exp, trigger, guarded=True)
+
+    @staticmethod
+    def _voice(exp: _Expectation) -> VoiceSnapshot | None:
+        """The asking turn's voice snapshot (§16.6): a wake or button turn's, or a reply's that
+        committed. An uncommitted reply's state is the one that missed its answer."""
+        origin = exp.origin
+        if origin is None or (origin.trigger in REPLY_KINDS and origin.commit is None):
+            return None
+        return origin.voice
+
+    async def _reply_chime(self, exp: _Expectation) -> str:
+        """The wake chime before a reply window (§11.2), as the expectation's prompt so an early
+        answer or a dropped expectation cancels it; how it ended, `timeout` after WAKE_CHIME_S
+        (then cancelled), or `failed`."""
+        render = self.render
+        if render is None:
+            return FinishReason.FAILED
+        try:
+            chime = await render.play_local(SourceClass.EARCON, WAKE_CHIME, generation=self._generation)
+        except Exception:
+            log.warning("[%s] reply chime failed", self.device_id, exc_info=True)
+            return FinishReason.FAILED
+        exp.prompt = chime
+        try:
+            return (await asyncio.wait_for(asyncio.shield(chime.finished), WAKE_CHIME_S))["reason"]
+        except TimeoutError:
+            await chime.cancel(DialogEnd.RESPONSE_TIMEOUT)
+            log.warning("[%s] reply chime did not drain in %.0f s", self.device_id, WAKE_CHIME_S)
+            return "timeout"
 
     # --- local commands, alarms, clarifications ------------------------------------------------
 
@@ -3516,6 +3615,11 @@ def _trace(turn: _Turn, row: TurnRow, utterance: UtteranceTrace, afe: AfeEvidenc
         "utterance": utterance,
         # A reply that met a gap before any answer listened on with a fresh utterance (§16.6).
         **({"reopened": turn.reopened} if turn.reopened else {}),
+        # How a reply's window opened and where its VAD state came from (§16.6).
+        **({"reply_window": turn.expectation.window}
+           if turn.trigger in REPLY_KINDS and turn.expectation is not None else {}),
+        # Where this turn's voice snapshot was taken, for a reply window it opens.
+        **({"voice_at": turn.voice.sample} if turn.voice is not None else {}),
         **({"local_only": True} if turn.local_only else {}),
         # Evidence only (afe_metadata_v1): null when the device does not report it.
         "afe_evidence": afe.wire() if afe is not None else None,

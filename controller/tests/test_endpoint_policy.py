@@ -1,7 +1,7 @@
 import pytest
 
 from echomuse_grammar import GrammarClass
-from em_attribution import CELL, CellClass, ClassifiedCell, Rule
+from em_attribution import CELL, REPLY_GUARD, Attributor, Cell, CellClass, ClassifiedCell, Rule
 from em_endpoint_policy import (
     EndpointReducer,
     EndpointState,
@@ -290,3 +290,18 @@ def test_local_command_preconditions_are_stable_and_not_mostly_self_output():
         commit_boundary=7 * CELL,
         cells=cells,
     )
+
+
+def test_a_guarded_replys_span_starts_300_ms_before_where_its_answer_began_inside_the_guard():
+    # A primed reply window (§16.6): the answer starts with the window, its run can open only
+    # after the 320 ms guard, and the attributor dates the run back to the answer's first cell.
+    trigger = 40 * CELL
+    attr = Attributor(trigger_sample=trigger, reply=True, guard_until=trigger + REPLY_GUARD)
+    r = EndpointReducer(utterance_start=trigger - 12_480, trigger_sample=trigger, completeness=complete, reply=True)
+    vads = [0.05] * 25 + [0.9] * 25 + [0.05] * 30                    # cells 15‥94: the answer is 40‥64
+    cells = [attr.classify(Cell((15 + i) * CELL, -40.0, v), -60.0) for i, v in enumerate(vads)]
+    assert [c.start for c in cells if c.command][0] == 50 * CELL     # the first cell after the guard
+    r.observe(cells)
+    assert r.answer_run == trigger
+    commit = r.finalize_once(65 * CELL, route="A", text="yeah", valid_audio_end=95 * CELL)
+    assert commit.start == trigger - 4_800

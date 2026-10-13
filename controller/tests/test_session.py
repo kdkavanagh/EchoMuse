@@ -37,7 +37,9 @@ from em_speech_worker import (
     ReferenceScorePayload,
     VadPayload,
     VerificationPayload,
+    VoiceSnapshot,
 )
+from em_utterance import CellAssembler, Utterance, UtteranceKind, UtteranceSpec
 from em_wake_scorer import ReferenceCandidate
 
 MIC_EPOCH, REF_EPOCH = 11, 22
@@ -135,7 +137,8 @@ class FakeRender:
         self.played: list[str] = []    # stream URLs and local assets, in the order they started
         self.failed = None
         self.autostart = True          # False: a stream's audio starts only when the test says
-        self.local_finish = "drained"  # how a local asset's playback ends, at once
+        self.local_finish = "drained"  # how a local asset's playback ends, at once; None: when the test says
+        self.local_playbacks: list[FakePlayback] = []
 
     async def play_stream(self, source_class, pcm48, *, generation, gain_db=0.0, announcement=False):
         assert source_class == "dialog_output"
@@ -151,7 +154,9 @@ class FakeRender:
         self.played.append(asset)
         playback = FakePlayback(asset, generation, False)
         playback.start()
-        playback.finish(self.local_finish)
+        self.local_playbacks.append(playback)
+        if self.local_finish is not None:
+            playback.finish(self.local_finish)
         return playback
 
     def fail_all(self, reason):
@@ -249,7 +254,9 @@ class FakeWorker:
     """Scripted evidence: `vad(sample)`, `tokens` [(token, emission sample)], verification result.
     With a pause server, `pause_text` = (sample, text) stands from that sample on: the first
     result there is Kroko's pause decode with the server's answer already in, as the worker
-    reports a fast server; `span_text` is the server's committed-span transcript."""
+    reports a fast server; `span_text` is the server's committed-span transcript. A pause
+    finalizes at each of `pauses`: an utterance's first result fed through one carries a
+    voice snapshot taken there. `primes` records `prime_vad`."""
 
     policy_hash = "post_afe_1"
 
@@ -266,6 +273,8 @@ class FakeWorker:
         self.pause_servers: list = []
         self.pause_text: tuple[int, str] | None = None
         self.span_text = ""
+        self.pauses: list[int] = []
+        self.primes: list[tuple[str, int, VoiceSnapshot | None]] = []
         self.span_requests = 0
 
     def post(self, lease_id, kind, through, payload, utterance_id=None, stream="mic"):
@@ -287,7 +296,7 @@ class FakeWorker:
         self.pause_servers.append(pause_server)
         lease = self.leases[lease_id]
         fed = max(lease["mic_through"] or start, start)
-        lease["utt"] = [utterance_id, start, fed, pause_server, False]
+        lease["utt"] = [utterance_id, start, fed, pause_server, False, set()]
         if fed > start:
             self._asr(lease_id)
 
@@ -300,15 +309,22 @@ class FakeWorker:
         utt_id, start, fed, server = utt[:4]
         emitted = [(t, s) for t, s in self.tokens if start <= s <= fed]
         last = emitted[-1][1] if emitted else start
-        text = decode = None
+        text = decode = voice = None
         if server is not None and self.pause_text is not None and fed >= self.pause_text[0]:
             text = self.pause_text[1]
             if not utt[4]:
                 utt[4] = True
                 decode = PauseDecode(fed, text, 250, None)
+        due = {p for p in self.pauses if start <= p <= fed} - utt[5]
+        if due:
+            utt[5] |= due
+            voice = VoiceSnapshot(np.full((2, 1, 128), 0.5, dtype=np.float32), np.zeros(64, dtype=np.float32), fed)
         self.post(lease_id, "asr", fed, AsrPayload(
             tuple(t for t, _ in emitted), tuple(s for _, s in emitted), "", None, (fed - last) // 640, None,
-            120 if decode is not None else None, pause_text=text, pause_decode=decode), utt_id)
+            120 if decode is not None else None, pause_text=text, pause_decode=decode, voice=voice), utt_id)
+
+    def prime_vad(self, lease_id, from_sample, voice):
+        self.primes.append((lease_id, from_sample, voice))
 
     def submit_mic_block(self, lease_id, first, pcm, *, flags=0):
         lease = self.leases[lease_id]
@@ -1586,7 +1602,8 @@ def test_ha_turn_with_continue_conversation_opens_a_reply_turn_that_ends_silentl
         assert len(reply_focus(h, reply_open[0]["owner"])) == 1
         base = PRESS + 50_000
         await h.feed(base, base + 4_000)            # no audio reached the reply lease before the drain
-        # The reply turn opens on the lease's first audio, cued like a wake: no wake word needed.
+        # The wake chime cues the window, which opens once it has finished, on the lease's first
+        # audio: no wake word needed.
         assert h.render.local == ([("earcon", "builtin:wake_chime")] if wake_sound else [])
         await h.wait_for(lambda: h.rows)
         row = h.rows[0]
@@ -1609,8 +1626,9 @@ def test_ha_turn_with_continue_conversation_opens_a_reply_turn_that_ends_silentl
 
 
 async def question_drained(h: Harness) -> int:
-    """Button turn → HA asks "Which TV?" (conv-1); its quiet tail plays, it drains, and the reply
-    turn opens. Returns the reply's trigger (the mic frontier at the drain)."""
+    """Button turn → HA asks "Which TV?" (conv-1); its quiet tail plays, it drains, the wake chime
+    plays (and ends at once), and the reply turn opens. Returns the reply's trigger (the mic
+    frontier then, which is still the drain's)."""
     h.ha.next_run = FakeRun([
         IntentEnded("Which TV?", "conv-1", True, "action_done", False),
         TtsReady("http://ha/tts/1", False), RunEnded()])
@@ -1619,7 +1637,7 @@ async def question_drained(h: Harness) -> int:
     base = PRESS + 50_000
     await h.feed(base, base + 24_000)                    # quiet question tail
     h.render.streams[0].finish("drained")
-    await h.wait_for(lambda: h.actor.state == "ARMED")
+    await h.wait_for(lambda: h.actor._turn is not None and h.actor._turn.trigger == "reply")
     return h.actor._turn.utterance.spec.trigger
 
 
@@ -1783,9 +1801,13 @@ def test_an_answer_to_home_assistants_question_is_sent_on_in_its_conversation_wi
         assert question["continuation"] == "answered"
         assert reply["trigger"] == "reply" and reply["reply_to"] == question["turn_uuid"]
         assert reply["conversation_id"] == "conv-1" and reply["continuation"] is None
-        # HA hears the answer from 300 ms before its first cell (156,160), not the chime and
-        # the wait from the utterance start (the drain − 780 ms): 151,360 … boundary + 192 ms.
+        # The answer begins just after the window opens: its run opens only after the 320 ms guard,
+        # but starts at its first cell (156,160), and HA hears it from 300 ms before that, not
+        # the wait from the utterance start (the trigger − 780 ms): 151,360 … boundary + 192 ms.
         assert reply["audio_ms"] == (165_888 + 3_072 - (156_160 - 4_800)) // 16
+        utterance = json.loads(reply["decision_trace"])["utterance"]
+        assert utterance["guard_until"] == utterance["trigger"] + 5_120 > 156_160
+        assert utterance["answer_start"] == 156_160
         await h.actor.close()
     run(main())
 
@@ -1810,13 +1832,178 @@ def test_an_answer_already_underway_when_the_question_drains_gets_no_chime_over_
         # but its onset is complete in the retained audio by the drain.
         await h.feed(base, base + 32_000)
         assert h.actor.state == "SPEAKING"
+        drain = h.device.pos[Kind.MIC]
         h.render.streams[0].finish("drained")
+        await h.wait_for(lambda: reply_open(h))
+        # It opens at once at the drain, unchimed, its VAD carried on undisturbed, unguarded.
+        assert h.actor._turn.utterance.spec.trigger == drain and h.actor._turn.utterance.spec.guard_until is None
+        assert h.render.local == [] and h.worker.primes == []
         await h.feed(base + 32_000, base + 80_000)
         await h.wait_for(lambda: len(h.render.streams) == 2)
         assert h.ha.intents[1] == ("The living room.", "conv-1")
-        assert h.render.local == []
+        h.render.streams[1].finish("drained")
+        await h.wait_for(lambda: len(h.rows) == 2)
+        trace = json.loads(h.rows[1]["decision_trace"])
+        assert trace["reply_window"] == {"drain": drain, "chime": None, "vad": "carried", "voice_from": None,
+                                         "voice_at": None, "primed_at": None}
         await h.actor.close()
     run(main())
+
+
+async def question_asked(h: Harness, *, voice: bool = True, held_chime: bool = False) -> int:
+    """Button turn ("what time is it", whose pause finalized after it unless `voice` is False:
+    its voice snapshot) → HA asks "Which TV?" (conv-1); its quiet tail plays and drains.
+    `held_chime`: the wake chime plays on until the test finishes it. Returns the drain (the
+    mic frontier then)."""
+    if voice:
+        h.worker.pauses = [QUESTION[1] + 5_120]
+    h.ha.next_run = FakeRun([
+        IntentEnded("Which TV?", "conv-1", True, "action_done", False),
+        TtsReady("http://ha/tts/1", False), RunEnded()])
+    await button_turn(h, PRESS + 50_000)
+    await h.wait_for(lambda: h.render.streams)
+    base = PRESS + 50_000
+    await h.feed(base, base + 24_000)                    # quiet question tail
+    if held_chime:
+        h.render.local_finish = None
+    h.render.streams[0].finish("drained")
+    await h.wait_for(lambda: h.actor.state == "ARMED")
+    return h.device.pos[Kind.MIC]
+
+
+def reply_open(h: Harness) -> bool:
+    return h.actor._turn is not None and h.actor._turn.trigger == "reply"
+
+
+def test_the_reply_window_opens_once_the_chime_has_finished_with_the_askers_voice_restored():
+    async def main():
+        h = Harness()
+        drain = await question_asked(h, held_chime=True)
+        assert h.render.local == [("earcon", "builtin:wake_chime")]
+        await h.feed(drain, drain + 25_600)                    # the chime plays for 1.6 s
+        assert h.actor._turn is None and h.worker.primes == []   # no window yet; the VAD carries on
+        h.render.local_playbacks[0].finish("drained")
+        await h.wait_for(lambda: reply_open(h))
+        turn = h.actor._turn
+        trigger = turn.utterance.spec.trigger
+        assert trigger == drain + 25_600                       # the mic frontier as the chime ended
+        await h.wait_for(lambda: h.rows)
+        question = h.rows[0]
+        voice_at = json.loads(question["decision_trace"])["voice_at"]
+        assert voice_at >= QUESTION[1] + 5_120
+        # The question turn's snapshot, restored into the reply lease from the trigger on.
+        [(lease, at, voice)] = h.worker.primes
+        assert (lease, at, voice.sample) == (turn.runtime.lease_id, trigger, voice_at)
+        await h.feed(trigger, trigger + 7 * 16_000 + 4_000)
+        await h.wait_for(lambda: len(h.rows) == 2)
+        trace = json.loads(h.rows[1]["decision_trace"])
+        assert trace["reply_window"] == {"drain": drain, "chime": "drained", "vad": "voice",
+                                         "voice_from": question["turn_uuid"], "voice_at": voice_at,
+                                         "primed_at": trigger}
+        assert trace["utterance"]["guard_until"] == trigger + 5_120
+        # Its 7 s count from the chime's end, not the question's.
+        close = trace["utterance"]["endpoint"][-1]
+        assert close["reason"] == "no_input" and trigger + 7 * 16_000 <= close["at"] < trigger + 7 * 16_000 + BLOCK
+        await h.actor.close()
+    run(main())
+
+
+@pytest.mark.parametrize("wake_sound, voice", [(False, True), (True, False), (False, False)])
+def test_a_reply_windows_vad_starts_from_the_askers_voice_else_fresh_from_the_drain(wake_sound, voice):
+    async def main():
+        h = Harness(config={"wakeSound": wake_sound})
+        drain = await question_asked(h, voice=voice, held_chime=wake_sound)
+        if wake_sound:
+            # No snapshot: a fresh state from the drain, set before the chime so it warms over it.
+            lease = h.actor._expectation.runtime.lease_id
+            assert not reply_open(h) and h.worker.primes == [(lease, drain, None)]
+            h.render.local_playbacks[0].finish("drained")
+        await h.wait_for(lambda: reply_open(h))
+        turn = h.actor._turn
+        assert h.render.local == ([("earcon", "builtin:wake_chime")] if wake_sound else [])
+        assert turn.utterance.spec.trigger == drain            # no mic arrived in between
+        [(lease, at, snapshot)] = h.worker.primes
+        assert lease == turn.runtime.lease_id and at == drain and (snapshot is not None) is voice
+        window = turn.expectation.window
+        assert window["vad"] == ("voice" if voice else "fresh") and window["primed_at"] == drain
+        assert window["chime"] == ("drained" if wake_sound else None)
+        assert turn.utterance.spec.guard_until == drain + 5_120
+        await h.actor.close()
+    run(main())
+
+
+def test_an_early_answer_during_the_chime_cancels_it_and_opens_the_reply_at_its_onset():
+    async def main():
+        h = Harness()
+        drain = await question_asked(h, held_chime=True)
+        onset = -(-(drain + 3_072) // CELL) * CELL            # 200 ms into the chime
+        answer = (onset, onset + 9_728)
+        h.worker.vad = speech(answer)
+        h.device.level = levels(answer)
+        h.worker.tokens = [("▁LIVING", onset + 3_000), ("▁ROOM", onset + 6_000)]
+        h.ha.stt_text = "The living room."
+        h.ha.next_run = FakeRun([IntentEnded("Turned off.", "conv-1", False, "action_done", False),
+                                 TtsReady("http://ha/tts/2", False), RunEnded()])
+        await h.feed(drain, drain + 60_000)
+        await h.wait_for(lambda: len(h.render.streams) == 2)
+        assert h.ha.intents[1] == ("The living room.", "conv-1")
+        assert h.render.local_playbacks[0].finished.result()["reason"] == "cancelled"
+        assert h.worker.primes == []                          # the answer is heard on the carried state
+        h.render.streams[1].finish("drained")
+        await h.wait_for(lambda: len(h.rows) == 2)
+        trace = json.loads(h.rows[1]["decision_trace"])
+        assert trace["utterance"]["trigger"] == onset and trace["utterance"]["guard_until"] is None
+        assert trace["reply_window"]["chime"] == "cancelled" and trace["reply_window"]["vad"] == "carried"
+        await h.actor.close()
+    run(main())
+
+
+def test_a_committed_answers_voice_primes_the_window_of_the_question_it_leads_to():
+    async def main():
+        h = Harness()
+        drain = await question_asked(h)
+        await h.wait_for(lambda: reply_open(h))
+        first = h.actor._turn
+        answer = (drain + 16_384, drain + 26_112)
+        h.worker.vad = speech(answer)
+        h.device.level = levels(answer)
+        h.worker.tokens = [("▁LIVING", answer[0] + 3_000), ("▁ROOM", answer[0] + 6_000)]
+        h.worker.pauses = [answer[1] + 5_120]
+        h.ha.stt_text = "The living room."
+        h.ha.next_run = FakeRun([IntentEnded("Which lamp?", "conv-1", True, "action_done", False),
+                                 TtsReady("http://ha/tts/2", False), RunEnded()])
+        await h.feed(drain, drain + 60_000)
+        await h.wait_for(lambda: len(h.render.streams) == 2)
+        assert first.commit is not None and first.voice is not None and first.voice.sample >= answer[1] + 5_120
+        pos = h.device.pos[Kind.MIC]
+        await h.feed(pos, pos + 16_000)                       # "Which lamp?" plays
+        h.render.streams[1].finish("drained")
+        await h.wait_for(lambda: reply_open(h) and h.actor._turn is not first)
+        second = h.actor._turn
+        assert h.worker.primes[0][2] is not first.voice        # the first window had the button turn's
+        assert h.worker.primes[-1][1:] == (second.utterance.spec.trigger, first.voice)
+        window = second.expectation.window
+        assert window["vad"] == "voice" and window["voice_from"] == first.turn_id
+        await h.actor.close()
+    run(main())
+
+
+def test_a_reply_window_never_takes_its_voice_from_a_reply_that_did_not_commit():
+    voice = VoiceSnapshot(np.zeros((2, 1, 128), np.float32), np.zeros(64, np.float32), 1_000)
+
+    def asked_by(kind, committed):
+        origin = em_session._Turn("t", 0, kind, 0.0, Utterance(UtteranceSpec("u", kind, 0, 0)),
+                                  em_session._Runtime("L", CellAssembler()), voice=voice)
+        origin.commit = object() if committed else None
+        return em_session._Expectation("e", "o", 0, UtteranceKind.REPLY, None, "t", 0.0, 1, origin=origin)
+
+    assert SessionActor._voice(asked_by(UtteranceKind.REPLY, committed=False)) is None
+    assert SessionActor._voice(asked_by(UtteranceKind.HA_REPLY, committed=False)) is None
+    assert SessionActor._voice(asked_by(UtteranceKind.REPLY, committed=True)) is voice
+    assert SessionActor._voice(asked_by(UtteranceKind.WAKE, committed=False)) is voice   # any terminal
+    assert SessionActor._voice(asked_by(UtteranceKind.BUTTON, committed=True)) is voice
+    assert SessionActor._voice(em_session._Expectation("e", "o", 0, UtteranceKind.HA_REPLY, None, None,
+                                                       0.0, 1)) is None              # HA asked on its own
 
 
 def test_an_answer_whose_speech_score_never_reaches_085_is_taken():
