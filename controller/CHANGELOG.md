@@ -77,6 +77,14 @@ the device wire protocol is [docs/protocol-v1.md](../docs/protocol-v1.md).
   alert engine, and a voice alarm answers with its first due time ("Alarm
   set for 7 AM tomorrow."). The Activity tab shows these turns as handled by
   the timer cancel or the alarm question, with the HA intent time.
+- **"Say that again" replays the last answer.** "Say that again", "repeat
+  that", "what did you say" and similar replay the Dot's last spoken
+  response, the same audio from Home Assistant, without asking the
+  conversation agent again, as long as it ended within the last two minutes;
+  otherwise the Dot says "I haven't said anything in the last two minutes."
+  Announcements are not replayed. A replayed question can be answered
+  without the wake word, in the same conversation. The Activity tab shows
+  these turns as a replay.
 - **Alarms live in Home Assistant.** The controller creates one Local
   Calendar per speaker ("EchoMuse &lt;name&gt;"); every alarm is an event on
   it and can be edited in HA's calendar. It installs five scripts exposed to

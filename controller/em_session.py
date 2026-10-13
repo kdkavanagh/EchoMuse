@@ -178,6 +178,8 @@ PLAYBACK_POLL_S = 0.05           # dialog output start/progress check while it w
 # HA's sentence matcher on a stable prefix (§16.6): an answer later than this could no longer
 # shorten any pause, so the query stops waiting for it.
 RECOGNIZE_TIMEOUT_S = 2.0
+# "Say that again" replays the last voice-turn output only this long after it ended (§16.7).
+REPEAT_WINDOW_S = 120.0
 
 # A committed turn's response lease (§4.4) carries its AFE records, and while `saveUtterances` is on
 # its mic, on through the response: at most this long after the commit, and this long past the
@@ -305,6 +307,7 @@ class TurnOutcome(enum.StrEnum):
     ALARM_QUERY = "alarm_query"
     TIMER = "timer"
     CLARIFICATION = "clarification"
+    REPEAT = "repeat"
 
 
 class WakeAttribution(enum.StrEnum):
@@ -372,6 +375,7 @@ LINE_UNKNOWN = "I'm not sure that worked."
 LINE_AMPM = "AM or PM?"
 LINE_AMPM_AGAIN = "Please say AM or PM."
 LINE_LEFT_IT = "Okay, I left it."
+LINE_NOTHING_TO_REPEAT = "I haven't said anything in the last two minutes."
 
 ECHO_TAG = "echo"                # submit_echo tag for per-cell labels
 CANDIDATE_TAG = "candidate:"     # submit_echo tag prefix for a candidate comparison
@@ -917,6 +921,34 @@ class _Announcement:
     future: asyncio.Future[None]
 
 
+@dataclass(frozen=True, slots=True)
+class _Said:
+    """What a voice turn's dialog output said, as "say that again" replays it (§16.7): its text
+    and, when it asked a question, the reply window the replay reopens (§9.1)."""
+
+    text: str | None
+    asks: bool = False
+    conversation_id: str | None = None
+    choices: tuple[Choice, ...] | None = None
+    pending: _PendingOperation | None = None
+
+    @staticmethod
+    def of(text: str | None, exp: _Expectation | None) -> _Said:
+        if exp is None:
+            return _Said(text)
+        return _Said(text, True, exp.conversation_id, exp.choices, exp.pending_operation)
+
+
+@dataclass
+class _Spoken:
+    """The last voice-turn dialog output this Dot played (§16.7). HA serves a pipeline's TTS URL
+    for minutes after its last fetch, so replaying `url` is the same audio without a new run."""
+
+    url: str
+    said: Callable[[], _Said]       # read at replay: a streamed response learns its text after it starts
+    ended_at: float | None = None   # monotonic; None while it plays
+
+
 _Event = (_Attach | _Detach | _MicEpoch | Envelope | _Audio | Observation | _Recognized | _Button | _Cancel
           | _Diagnostic | _Announcement | _Close)
 
@@ -956,6 +988,7 @@ class SessionActor:
         self._listener_futures: set[asyncio.Future[object]] = set()   # awaitables listeners returned
         self._dialog_active = False
         self._response_leases: dict[str, _ResponseLease] = {}   # by lease id, until each has ended
+        self._last_spoken: _Spoken | None = None   # what "say that again" replays; memory only
 
     # --- public surface -------------------------------------------------------
 
@@ -2125,6 +2158,9 @@ class SessionActor:
         if exp is not None and exp.choices:
             await self._answer_choice(turn, exp, exp.choices, text)
             return
+        if echomuse_grammar.parse_repeat(text) is not None:
+            await self._repeat(turn)
+            return
         alarm = echomuse_grammar.parse_alarm(text)
         if alarm is not None:
             await self._alarm(turn, alarm)
@@ -2251,6 +2287,10 @@ class SessionActor:
         if tts is not None and playback is None:
             playback = self._spawn(self._play_response(turn, tts.url, start_by))
         reason = await playback if playback is not None else FinishReason.DRAINED
+        await self._after_response(turn, reason)
+
+    async def _after_response(self, turn: _Turn, reason: PlaybackEnd) -> None:
+        """The response played: close the turn, or hand it to the reply expectation its question opened (§9.1)."""
         if not self._current(turn):
             return
         if reason not in (FinishReason.DRAINED, FinishReason.CANCELLED):
@@ -2295,7 +2335,8 @@ class SessionActor:
             turn.playback = playback
 
         reason = await self._play_dialog(turn.turn_id, turn.generation, url, bind=bind, started=started,
-                                         start_by=start_by, fence=lambda: self._current(turn))
+                                         start_by=start_by, fence=lambda: self._current(turn),
+                                         said=lambda: _Said.of(turn.response_text, turn.next_expectation))
         turn.playback_reason = reason
         if turn.audible_at is not None:
             turn.timings["playback_ms"] = round((time.monotonic() - turn.audible_at) * 1000)
@@ -2470,6 +2511,38 @@ class SessionActor:
         await self._answer(turn, em_alert_speech.alarms_line(alarms.get("alarms") or [], datetime.now(timezone.utc),
                                                              next_only=query.next_only)
                            if alarms.get("ok") else em_alert_speech.LINE_ALARMS_UNAVAILABLE)
+
+    async def _repeat(self, turn: _Turn) -> None:
+        """"Say that again": this Dot's last voice-turn output, fetched again from HA's TTS URL, if
+        it ended at most REPEAT_WINDOW_S ago. A question reopens its reply window (§9.1, §16.7)."""
+        turn.outcome = TurnOutcome.REPEAT
+        last = self._last_spoken
+        if last is None or (last.ended_at is not None and time.monotonic() - last.ended_at > REPEAT_WINDOW_S):
+            await self._answer(turn, LINE_NOTHING_TO_REPEAT)
+            return
+        said = last.said()
+        turn.response_text = said.text
+        if said.asks:
+            if self._chain_allowed(turn):
+                turn.conversation_id = said.conversation_id
+                turn.next_expectation = self._new_expectation(
+                    UtteranceKind.REPLY, said.conversation_id, turn.turn_id, previous=self._chain_parent(turn),
+                    choices=said.choices, pending=said.pending, origin=turn)
+            else:
+                turn.continuation = FollowUp.CHAIN_LIMIT
+        reason = await self._play_response(turn, last.url)
+        if not self._current(turn):
+            return
+        if turn.audible_at is None and reason in (FinishReason.FAILED, DialogEnd.RESPONSE_TIMEOUT):
+            # HA no longer serves the audio: it restarted since.
+            log.info("[%s] repeat: %s no longer plays (%s)", self.device_id, last.url, reason)
+            exp = turn.next_expectation
+            if exp is not None:
+                self._settle(exp, FollowUp.PROMPT_FAILED)
+                turn.next_expectation = None
+            await self._answer(turn, LINE_NOTHING_TO_REPEAT)
+            return
+        await self._after_response(turn, reason)
 
     async def _timers(self, turn: _Turn) -> tuple[list[HaTimer], list[HaTimer]] | None:
         """(this speaker's timers, every timer in HA) from HA's own `HassTimerStatus`, which
@@ -2766,7 +2839,7 @@ class SessionActor:
 
         reason = await self._play_dialog(exp.owner, exp.generation, url, bind=bind, started=started,
                                          drained=lambda: self._hold_reply_focus(exp),
-                                         fence=lambda: exp is self._expectation)
+                                         fence=lambda: exp is self._expectation, said=lambda: _Said.of(text, exp))
         if exp is not self._expectation:
             return
         if reason != FinishReason.DRAINED or exp.runtime is None:
@@ -2881,7 +2954,8 @@ class SessionActor:
                            started: Callable[[], Awaitable[None]] | None = None,
                            drained: Callable[[], Awaitable[None]] | None = None,
                            start_by: Callable[[], float] | None = None,
-                           fence: Callable[[], bool] = lambda: True) -> PlaybackEnd:
+                           fence: Callable[[], bool] = lambda: True,
+                           said: Callable[[], _Said] | None = None) -> PlaybackEnd:
         """Play `url` as dialog output under a dialog_output lease for `owner`.
 
         Returns the finish reason (`drained`, `cancelled`, `failed`, `underrun`),
@@ -2890,10 +2964,13 @@ class SessionActor:
         a later intent-end can tighten it; None: RESPONSE_START_S after the stream opens.
         `drained` runs after a drain and before the dialog_output lease is released,
         so focus a prompt hands on never lapses in between.
+        `said`: a voice turn's output, which "say that again" replays once its audio starts;
+        None for announcements.
         """
         render = self.render
         if render is None:
             return FinishReason.FAILED
+        spoken: _Spoken | None = None
         await self._acquire_focus(owner, Focus.DIALOG_OUTPUT, generation)
         try:
             try:
@@ -2917,6 +2994,8 @@ class SessionActor:
                 return playback.finished.result()["reason"] if playback.done else FinishReason.FAILED
             if not fence():
                 return DialogEnd.FENCED
+            if said is not None:
+                spoken = self._last_spoken = _Spoken(url, said)
             if started is not None:
                 await started()
             audible = last_at = time.monotonic()
@@ -2943,6 +3022,10 @@ class SessionActor:
                 await drained()
             return reason
         finally:
+            if spoken is not None:
+                final = spoken.said()
+                spoken.said = lambda: final   # the snapshot: the live callable holds its turn
+                spoken.ended_at = time.monotonic()
             await self._release_owner(owner, only=Focus.DIALOG_OUTPUT)
 
     async def _tts(self, text: str) -> str | None:
@@ -2963,7 +3046,8 @@ class SessionActor:
             if url is None:
                 self._cue(Cue.ERROR_ANIM)
             return
-        reason = await self._play_dialog(owner, generation, url, fence=lambda: generation == self._generation)
+        reason = await self._play_dialog(owner, generation, url, fence=lambda: generation == self._generation,
+                                         said=lambda: _Said(text))
         if reason not in (FinishReason.DRAINED, FinishReason.CANCELLED, DialogEnd.FENCED):
             self._cue(Cue.ERROR_ANIM)
 

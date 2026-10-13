@@ -26,6 +26,7 @@ from .core import (
     parse_alarm,
 )
 from .normalize import normalize, tokens
+from .repeat import RepeatRequest, parse_repeat
 from .timer_data import SOURCE_SHA256, TEMPLATE_VERSION
 
 __all__ = (
@@ -46,6 +47,7 @@ __all__ = (
     "Meridiem",
     "MissingSlot",
     "RelativeDay",
+    "RepeatRequest",
     "Result",
     "SOURCE_SHA256",
     "TEMPLATE_VERSION",
@@ -57,6 +59,7 @@ __all__ = (
     "normalize",
     "parse_alarm",
     "parse_alarm_query",
+    "parse_repeat",
     "parse_timer_cancel",
     "tokens",
 )

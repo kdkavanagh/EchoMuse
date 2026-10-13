@@ -58,7 +58,7 @@ def test_corpus_shape() -> None:
     header = CORPUS.read_text(encoding="utf-8").splitlines()[:2]
     assert f"home-assistant-intents {TEMPLATE_VERSION}" in header[1]
     counts = Counter(family for _, family, _ in CASES)
-    assert set(counts) == {"timer", "alarm", "alarm_query", "local", "home", "reply"}
+    assert set(counts) == {"timer", "alarm", "alarm_query", "repeat", "local", "home", "reply"}
     assert all(counts[family] >= 40 for family in counts)
 
 
@@ -224,6 +224,8 @@ def test_match_choice() -> None:
         ("stop the timer", "complete", "timer"),
         ("what alarms do i have", "complete", "alarm_query"),
         ("how much time is left", "complete", "timer"),
+        ("could you say that again", "complete", "repeat"),
+        ("what was that", "extendable", "repeat"),
     ],
 )
 def test_classify_across_families(text: str, klass: str, family: str | None) -> None:

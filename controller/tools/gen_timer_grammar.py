@@ -384,6 +384,25 @@ HAND_CASES = {
         ("cancel my alarm", "unknown"), ("what time is it", "unknown"), ("when is my appointment", "unknown"),
         ("", "unknown"),
     ],
+    "repeat": [
+        ("say that again", "complete"), ("say it again", "complete"), ("say that one more time", "complete"),
+        ("Say that again, please.", "complete"), ("can you say that again", "complete"),
+        ("could you please say that again", "complete"), ("sorry can you say that again", "complete"),
+        ("repeat that", "complete"), ("repeat it", "complete"), ("repeat yourself", "complete"),
+        ("repeat what you said", "complete"), ("repeat what you just said", "complete"),
+        ("could you repeat that please", "complete"), ("please repeat that", "complete"),
+        ("repeat that again", "complete"), ("what did you just say", "complete"), ("come again", "complete"),
+        ("what was that again", "complete"), ("what did you say again", "complete"),
+        ("sorry what was that again", "complete"),
+        ("repeat", "extendable"), ("repeat please", "extendable"), ("what was that", "extendable"),
+        ("sorry what was that", "extendable"), ("what did you say", "extendable"), ("pardon", "extendable"),
+        ("pardon me", "extendable"), ("sorry, what did you say?", "extendable"),
+        ("what", "unknown"), ("huh", "unknown"), ("sorry", "unknown"), ("say that", "unknown"),
+        ("say again", "unknown"), ("repeat after me", "unknown"), ("what was that song", "unknown"),
+        ("what did you say about the weather", "unknown"), ("repeat the playlist", "unknown"),
+        ("turn on repeat", "unknown"), ("say hello again", "unknown"), ("what time is it", "unknown"),
+        ("", "unknown"),
+    ],
 }
 
 

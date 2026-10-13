@@ -41848,3 +41848,45 @@ cancel my alarm	alarm_query	unknown
 what time is it	alarm_query	unknown
 when is my appointment	alarm_query	unknown
 	alarm_query	unknown
+# hand-written repeat
+say that again	repeat	complete
+say it again	repeat	complete
+say that one more time	repeat	complete
+Say that again, please.	repeat	complete
+can you say that again	repeat	complete
+could you please say that again	repeat	complete
+sorry can you say that again	repeat	complete
+repeat that	repeat	complete
+repeat it	repeat	complete
+repeat yourself	repeat	complete
+repeat what you said	repeat	complete
+repeat what you just said	repeat	complete
+could you repeat that please	repeat	complete
+please repeat that	repeat	complete
+repeat that again	repeat	complete
+what did you just say	repeat	complete
+come again	repeat	complete
+what was that again	repeat	complete
+what did you say again	repeat	complete
+sorry what was that again	repeat	complete
+repeat	repeat	extendable
+repeat please	repeat	extendable
+what was that	repeat	extendable
+sorry what was that	repeat	extendable
+what did you say	repeat	extendable
+pardon	repeat	extendable
+pardon me	repeat	extendable
+sorry, what did you say?	repeat	extendable
+what	repeat	unknown
+huh	repeat	unknown
+sorry	repeat	unknown
+say that	repeat	unknown
+say again	repeat	unknown
+repeat after me	repeat	unknown
+what was that song	repeat	unknown
+what did you say about the weather	repeat	unknown
+repeat the playlist	repeat	unknown
+turn on repeat	repeat	unknown
+say hello again	repeat	unknown
+what time is it	repeat	unknown
+	repeat	unknown

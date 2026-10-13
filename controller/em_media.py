@@ -1,7 +1,8 @@
 """Audio decode for render: URLs to 48 kHz mono int16 via ffmpeg.
 
 `stream_url` serves HA TTS URLs (unauthenticated capability URLs that expire
-after ~300 s: fetched immediately, never cached, §16.7) and music. The HTTP
+after ~300 s: fetched immediately, never cached, §16.7; the actor keeps only
+the last response's URL, for a "say that again" refetch) and music. The HTTP
 response is piped through one ffmpeg process and PCM is yielded as it is
 decoded; neither the encoded response nor the decoded audio is accumulated.
 """

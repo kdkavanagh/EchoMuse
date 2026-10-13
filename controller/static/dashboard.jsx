@@ -160,7 +160,7 @@ const FOLLOW_UP = Object.freeze({
 // em_session.TurnOutcome — turns.outcome of a current row.
 const TURN_OUTCOME = Object.freeze({
   HA: 'ha', LOCAL_COMMAND: 'local_command', ALARM: 'alarm',
-  ALARM_QUERY: 'alarm_query', TIMER: 'timer', CLARIFICATION: 'clarification',
+  ALARM_QUERY: 'alarm_query', TIMER: 'timer', CLARIFICATION: 'clarification', REPEAT: 'repeat',
 });
 
 // turns.outcome of a row from before the post-AFE cutover.
@@ -1181,6 +1181,7 @@ const TURN_HANDLERS = Object.freeze({
   [TURN_OUTCOME.TIMER]:         'EchoMuse timer cancel → Home Assistant HassCancelTimer (no conversation agent)',
   [TURN_OUTCOME.ALARM_QUERY]:   'EchoMuse alarm question (alarm engine)',
   [TURN_OUTCOME.CLARIFICATION]: 'EchoMuse (asked for AM or PM)',
+  [TURN_OUTCOME.REPEAT]:        'EchoMuse replay of the last response (no conversation agent)',
   [TURN_OUTCOME.LOCAL_COMMAND]: 'Local command on the controller (Home Assistant not involved)',
 });
 

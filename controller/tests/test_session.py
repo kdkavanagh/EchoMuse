@@ -1345,6 +1345,112 @@ def test_alarm_questions_are_answered_from_the_alert_engine_and_timer_questions_
     run(main())
 
 
+async def later_button_turn(h: Harness, press: int, words: str, stt_text: str) -> None:
+    """Another button turn on the running harness, spoken like QUESTION from `press` on."""
+    span = (press + 1_536, press + 9_728)
+    h.worker.vad = speech(span)
+    h.device.level = levels(span)
+    h.worker.tokens = [(f"▁{w}", press + 2_500 + 1_500 * i) for i, w in enumerate(words.split())]
+    h.ha.stt_text = stt_text
+    h.actor.button_turn(button(press))
+    await h.settle()
+    await h.feed(h.device.pos[Kind.MIC], press + 50_000)
+
+
+async def answered(h: Harness, speech_: str, url: str) -> None:
+    """A button turn HA answers with `speech_` at `url`, played to the end."""
+    h.ha.next_run = FakeRun([IntentEnded(speech_, "c", False, "action_done", True),
+                             TtsReady(url, False), RunEnded()])
+    await button_turn(h, PRESS + 50_000)
+    await h.wait_for(lambda: h.render.streams)
+    h.render.streams[0].finish("drained")
+    await h.wait_for(lambda: h.rows)
+
+
+def test_say_that_again_replays_the_last_response_without_home_assistant_for_two_minutes():
+    async def main():
+        h = Harness()
+        await answered(h, "It is 3 PM.", "http://ha/tts/1")
+        await later_button_turn(h, PRESS + 100_000, "SAY THAT AGAIN", "Say that again.")
+        await h.wait_for(lambda: len(h.render.streams) == 2)
+        assert h.render.urls() == ["http://ha/tts/1", "http://ha/tts/1"]
+        h.render.streams[1].finish("drained")
+        await h.wait_for(lambda: len(h.rows) == 2)
+        assert h.rows[1]["outcome"] == "repeat" and h.rows[1]["response_text"] == "It is 3 PM."
+        assert h.ha.intents == [("What time is it?", None)] and h.ha.tts == []
+
+        # The replay restarted the window; once it has run out there is nothing to repeat.
+        h.actor._last_spoken.ended_at -= em_session.REPEAT_WINDOW_S + 1
+        await later_button_turn(h, PRESS + 200_000, "SAY THAT AGAIN", "Say that again.")
+        await h.wait_for(lambda: len(h.render.streams) == 3)
+        assert h.render.urls()[2] == f"tts://{em_session.LINE_NOTHING_TO_REPEAT}"
+        h.render.streams[2].finish("drained")
+        await h.wait_for(lambda: len(h.rows) == 3)
+        assert h.rows[2]["outcome"] == "repeat" and h.ha.intents == [("What time is it?", None)]
+        await h.actor.close()
+    run(main())
+
+
+def test_say_that_again_skips_announcements_and_says_so_when_home_assistant_lost_the_audio():
+    async def main():
+        h = Harness()
+        await answered(h, "It is 3 PM.", "http://ha/tts/1")
+        announce = asyncio.create_task(h.actor.announce("http://ha/announce", preannounce=False,
+                                                        preannounce_url=None, start_conversation=False))
+        await h.wait_for(lambda: len(h.render.streams) == 2)
+        h.render.streams[1].finish("drained")
+        await announce
+        h.render.autostart = False
+        await later_button_turn(h, PRESS + 100_000, "REPEAT THAT", "Repeat that.")
+        await h.wait_for(lambda: len(h.render.streams) == 3)
+        assert h.render.urls()[2] == "http://ha/tts/1"
+        h.render.autostart = True
+        h.render.streams[2].finish("failed")                 # HA restarted: its TTS URL is gone
+        await h.wait_for(lambda: len(h.render.streams) == 4)
+        assert h.render.urls()[3] == f"tts://{em_session.LINE_NOTHING_TO_REPEAT}"
+        h.render.streams[3].finish("drained")
+        await h.wait_for(lambda: len(h.rows) == 2)
+        assert h.rows[1]["outcome"] == "repeat" and h.rows[1]["response_text"] == em_session.LINE_NOTHING_TO_REPEAT
+        await h.actor.close()
+    run(main())
+
+
+def test_say_that_again_in_a_reply_window_replays_the_question_and_reopens_it_in_its_conversation():
+    async def main():
+        h = Harness()
+        drain = await question_drained(h)                     # HA asked "Which TV?" in conv-1
+        again = (drain + 16_000, drain + 24_192)
+        h.worker.vad = speech(again)
+        h.device.level = levels(again)
+        h.worker.tokens = [("▁SAY", again[0] + 1_000), ("▁THAT", again[0] + 3_000), ("▁AGAIN", again[0] + 6_000)]
+        h.ha.stt_text = "Say that again."
+        await h.feed(drain, drain + 60_000)
+        await h.wait_for(lambda: len(h.render.streams) == 2)
+        assert h.render.urls() == ["http://ha/tts/1", "http://ha/tts/1"] and len(h.ha.intents) == 1
+        h.render.streams[1].finish("drained")
+        await h.wait_for(lambda: h.actor.state == "ARMED")
+        reopened = h.actor._turn.utterance.spec.trigger
+        answer = (reopened + 16_000, reopened + 25_728)
+        h.worker.vad = speech(answer)
+        h.device.level = levels(answer)
+        h.worker.tokens = [("▁LIVING", answer[0] + 3_000), ("▁ROOM", answer[0] + 6_000)]
+        h.ha.stt_text = "The living room."
+        h.ha.next_run = FakeRun([IntentEnded("Turned off.", "conv-1", False, "action_done", False),
+                                 TtsReady("http://ha/tts/2", False), RunEnded()])
+        await h.feed(h.device.pos[Kind.MIC], reopened + 80_000)
+        await h.wait_for(lambda: len(h.render.streams) == 3)
+        assert h.ha.intents[1] == ("The living room.", "conv-1")
+        h.render.streams[2].finish("drained")
+        await h.wait_for(lambda: len(h.rows) == 3)
+        question, repeat, reply = h.rows
+        assert repeat["outcome"] == "repeat" and repeat["response_text"] == "Which TV?"
+        assert repeat["conversation_id"] == "conv-1" and reply["reply_to"] == repeat["turn_uuid"]
+        assert question["continuation"] == "answered" and repeat["continuation"] == "answered"
+        await h.actor.close()
+    run(main())
+
+
+
 def ha_timer(id_, minutes, left, name="", device="hadev", seconds=0):
     return {"id": id_, "name": name, "device_id": device, "is_active": True, "total_seconds_left": left,
             "start_hours": 0, "start_minutes": minutes, "start_seconds": seconds}

@@ -11,6 +11,7 @@ from em_alert_wire import RingKind, Weekday
 
 from .alerts import parse_alarm_query
 from .normalize import normalize, tokens
+from .repeat import parse_repeat
 from .timer_data import SKIP_WORDS, SLOT_RANGES, TIMER_PATTERNS
 
 # A generated timer_data node: ('word' | 'slot', str), ('optional', node) or
@@ -33,6 +34,7 @@ class GrammarFamily(StrEnum):
     ALARM = "alarm"
     TIMER = "timer"
     ALARM_QUERY = "alarm_query"
+    REPEAT = "repeat"
     HOME = "home"
     LOCAL = "local"
 
@@ -102,9 +104,9 @@ class Result:
 
     ``family`` is None only for ``unknown`` from :func:`classify`. ``parse`` is
     family-specific: timer → tuple of matching HA intent names, alarm →
-    :class:`AlarmParse`, alarm_query → :class:`AlarmQuery`, home → :class:`HomeParse`,
-    local → :class:`LocalParse`, reply → the selected choice value; None when no
-    parse exists.
+    :class:`AlarmParse`, alarm_query → :class:`AlarmQuery`, repeat → :class:`RepeatRequest`,
+    home → :class:`HomeParse`, local → :class:`LocalParse`, reply → the selected choice value;
+    None when no parse exists.
     """
 
     klass: GrammarClass
@@ -629,6 +631,11 @@ def family_result(family: GrammarFamily, text: str, vocabulary: Iterable[str] = 
         parsed = parse_alarm_query(text)
         result = (Result(GrammarClass.COMPLETE, GrammarFamily.ALARM_QUERY, parsed) if parsed is not None
                   else Result(GrammarClass.UNKNOWN, GrammarFamily.ALARM_QUERY))
+    elif family == GrammarFamily.REPEAT:
+        repeat = parse_repeat(text)
+        result = (Result(GrammarClass.UNKNOWN, GrammarFamily.REPEAT) if repeat is None
+                  else Result(GrammarClass.EXTENDABLE if repeat.extendable else GrammarClass.COMPLETE,
+                              GrammarFamily.REPEAT, repeat))
     elif family == GrammarFamily.HOME:
         result = _home(text, vocabulary)
     elif family == GrammarFamily.LOCAL:
