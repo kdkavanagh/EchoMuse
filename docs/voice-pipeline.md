@@ -195,8 +195,10 @@ two models on the uploaded audio, only while a lease is open:
   supplies timing evidence, local commands, and where the wake word sits in
   your sentence; the final words come from Home Assistant (Stage 8).
 
-Both read a copy of the audio boosted by a fixed +20 dB, because the Echo's
-front end delivers speech too quietly for them. The models ship as a
+Both read a copy of the audio boosted by a fixed gain, because the Echo's
+front end delivers speech too quietly for them: +20 dB for Kroko, and +30 dB
+for Silero, whose scores fall with the level so that quiet commands at +20 dB
+went unheard. The models ship as a
 hash-pinned bundle fetched by `controller/tools/fetch_speech_bundle.py` (the
 Docker image does this at build time); the controller refuses to start if a
 file is missing or does not match.

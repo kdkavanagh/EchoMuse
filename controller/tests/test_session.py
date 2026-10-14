@@ -2019,7 +2019,7 @@ def test_an_answer_whose_speech_score_never_reaches_085_is_taken():
         h.render.streams[0].finish("drained")
         await h.wait_for(lambda: h.actor.state == "ARMED")
         answer = (base + 26_112, base + 35_840)
-        # Turn 532's answer peaked at 0.80: the reducer's run opens at 0.65.
+        # Turn 532's answer peaked at 0.80: the reducer's run opens at 0.70.
         h.worker.vad = lambda s: 0.8 if answer[0] <= s < answer[1] else 0.05
         h.device.level = levels(answer)
         h.worker.tokens = [("▁LIVING", base + 29_000), ("▁ROOM", base + 32_000)]

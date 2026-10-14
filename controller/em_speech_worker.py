@@ -50,7 +50,10 @@ BLOCK_SAMPLES = 1_280                 # one 80 ms capture block (§4.1)
 VAD_CELL_SAMPLES = 512                # §16.6 analysis cell
 VAD_CONTEXT_SAMPLES = 64
 VAD_STATE_SHAPE = (2, 1, 128)
-EVIDENCE_GAIN = 10                    # +20 dB evidence copy (§16.6)
+EVIDENCE_GAIN = 10                    # +20 dB evidence copy: every ASR decode (§16.6)
+# Silero v5 is level-sensitive and Kroko is not: the VAD reads its own +30 dB
+# input, so quiet commands clear RUN_OPEN_VAD (§16.6 "Evidence copy and VAD input", [P3]).
+VAD_GAIN = 10 ** 1.5                  # +30 dB VAD input (§16.6)
 VERIFICATION_PREROLL = 4_800          # support_start − 300 ms
 VERIFICATION_LOOKAHEAD = 7_680        # candidate open + 480 ms
 # Internal zeros after every fresh decode (wake verification, span re-decode,
@@ -71,7 +74,7 @@ ERRORS_UNAVAILABLE = 3
 PROBE_INTERVAL_S = 10.0
 PROBE_DEADLINE_S = 1.0
 PROBES_TO_RECOVER = 2
-POLICY_REVISION = "post_afe_9"
+POLICY_REVISION = "post_afe_10"
 
 
 class ObservationSource(enum.StrEnum):
@@ -385,11 +388,22 @@ def load_wake_graph(registry: WakeRegistry, sha256: str) -> WakeGraph:
 
 
 def evidence_copy(canonical_pcm: np.ndarray) -> np.ndarray:
-    """Canonical PCM × +20 dB (×10), clamped to int16 (§16.6)."""
+    """Canonical PCM × +20 dB (×10), clamped to int16 (§16.6): what every
+    ASR decode reads."""
     pcm = np.asarray(canonical_pcm)
     if pcm.dtype != np.int16 or pcm.ndim != 1:
         raise ValueError("canonical PCM must be 1-D int16")
     return np.clip(pcm.astype(np.int32) * EVIDENCE_GAIN, -32768, 32767).astype(np.int16)
+
+
+def vad_input(canonical_pcm: np.ndarray) -> np.ndarray:
+    """Canonical PCM × +30 dB (×10**1.5), saturated to int16 full scale as the
+    evidence copy is, as float32 in [-1, 1]: what Silero reads (§16.6)."""
+    pcm = np.asarray(canonical_pcm)
+    if pcm.dtype != np.int16 or pcm.ndim != 1:
+        raise ValueError("canonical PCM must be 1-D int16")
+    scaled = np.clip(pcm.astype(np.float64) * VAD_GAIN, -32768, 32767).astype(np.int16)
+    return scaled.astype(np.float32) / np.float32(32768.0)
 
 
 # ---------------------------------------------------------------------------
@@ -405,14 +419,14 @@ class _VadState:
     def __init__(self) -> None:
         self.window = np.zeros(VAD_CONTEXT_SAMPLES + VAD_CELL_SAMPLES, dtype=np.float32)
         self.state = np.zeros(VAD_STATE_SHAPE, dtype=np.float32)
-        self.pending = np.empty(0, dtype=np.int16)
+        self.pending = np.empty(0, dtype=np.float32)   # VAD input of the incomplete cell
         self.next_sample: int | None = None   # first sample of `pending`
         self.prime: tuple[int, VoiceSnapshot | None] | None = None   # (from sample, state; None: fresh)
 
     def reset(self) -> None:
         self.window.fill(0)
         self.state = np.zeros(VAD_STATE_SHAPE, dtype=np.float32)
-        self.pending = np.empty(0, dtype=np.int16)
+        self.pending = np.empty(0, dtype=np.float32)
         self.next_sample = None
 
     def snapshot(self, sample: int) -> VoiceSnapshot:
@@ -696,8 +710,8 @@ class SpeechWorker:
 
     def submit_mic_block(self, lease_id: str, first_sample: int, canonical_pcm: np.ndarray,
                          *, flags: int = 0) -> None:
-        """One uploaded mic block (canonical int16). The evidence copy is
-        built once here and shared by VAD and the utterance's ASR."""
+        """One uploaded mic block (canonical int16). Its VAD input and its
+        evidence copy for the utterance's ASR are each built once here."""
         lease = self._lease(lease_id)
         models = self._require_started()
         pcm = np.asarray(canonical_pcm)
@@ -707,16 +721,17 @@ class SpeechWorker:
             self.reset_mic(lease_id)
             if flags & FLAG_MUTED:
                 return
+        vad_in = vad_input(pcm)
         evidence = evidence_copy(pcm)
         end = first_sample + pcm.size
         lease.mic_through = end
         utterance_id = lease.utterance.utterance_id if lease.utterance else None
         self._submit(_Job(f"mic:{lease_id}", ObservationKind.VAD, self._now(),
-                          lambda: self._run_mic(models, lease, first_sample, evidence),
+                          lambda: self._run_mic(models, lease, first_sample, vad_in, evidence),
                           lease, StreamId.MIC, end, utterance_id))
 
     def _run_mic(self, models: SpeechModels, lease: _Lease, first: int,
-                 evidence: np.ndarray) -> tuple[Observation, ...]:
+                 vad_in: np.ndarray, evidence: np.ndarray) -> tuple[Observation, ...]:
         if lease.dirty:
             lease.vad.reset()
             lease.utterance = None
@@ -731,13 +746,13 @@ class SpeechWorker:
         if vad.next_sample is None:
             skip = (-first) % VAD_CELL_SAMPLES   # cells lie on the epoch's 512 grid
             vad.next_sample = first + skip
-            vad.pending = evidence[skip:].copy()
+            vad.pending = vad_in[skip:]
         else:
-            vad.pending = np.concatenate((vad.pending, evidence))
+            vad.pending = np.concatenate((vad.pending, vad_in))
         n_cells = vad.pending.size // VAD_CELL_SAMPLES
         if n_cells:
             first_cell = vad.next_sample
-            cells = vad.pending[:n_cells * VAD_CELL_SAMPLES].astype(np.float32) / np.float32(32768.0)
+            cells = vad.pending[:n_cells * VAD_CELL_SAMPLES]
             probs: list[float] = []
             for i in range(n_cells):
                 if vad.prime is not None and first_cell + i * VAD_CELL_SAMPLES >= vad.prime[0]:

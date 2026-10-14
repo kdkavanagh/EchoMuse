@@ -38,6 +38,59 @@ def test_evidence_copy_is_times_ten_clamped_to_int16():
     assert out.tolist() == [0, 10, -10, 32760, 32767, -32768, 32767, -32768]
 
 
+def test_vad_input_is_times_ten_to_the_one_and_a_half_saturated_as_float():
+    pcm = np.array([0, 100, -100, 1036, 1037, -1037, 32767, -32768], dtype=np.int16)
+    out = sw.vad_input(pcm)
+    assert out.dtype == np.float32
+    assert (out * 32768).tolist() == [0, 3162, -3162, 32761, 32767, -32768, 32767, -32768]
+
+
+class _GainProbe:
+    """Stands in for both models and keeps what each was given."""
+
+    revision = "fake"
+
+    def __init__(self):
+        self.cells, self.decoded = [], []
+        self.recognizer = self
+
+    def create_stream(self):
+        return object()
+
+    def vad(self, state, cell):
+        self.cells.append(cell.copy())
+        return 0.0
+
+    def decode(self, stream, evidence):
+        self.decoded.append(evidence.copy())
+
+    def result(self, stream):
+        return sw.AsrResult("", (), (), 0)
+
+
+def test_vad_reads_its_own_input_and_asr_the_evidence_copy():
+    """§16.6: Silero gets the +30 dB VAD input on the 512 cell grid; the utterance's
+    stream gets the +20 dB evidence copy of the same blocks."""
+    probe = _GainProbe()
+    pcm = (np.arange(2_560) % 2_000 - 1_000).astype(np.int16)
+
+    async def main():
+        w = sw.SpeechWorker(None, on_observation=lambda o: None)
+        w._executor = sw.ThreadPoolExecutor(max_workers=1)
+        w.models = probe
+        w._wake["g"] = object()
+        w.open_lease("dev", 7, "L", "g")
+        w.open_utterance("L", "U", 0, 0, SampleTimeline())
+        w.submit_mic_block("L", 0, pcm[:1_280])
+        w.submit_mic_block("L", 1_280, pcm[1_280:])
+        await w.close()
+
+    asyncio.run(main())
+    assert [c.size for c in probe.cells] == [512] * 5
+    assert np.array_equal(np.concatenate(probe.cells), sw.vad_input(pcm))
+    assert np.array_equal(np.concatenate(probe.decoded), sw.evidence_copy(pcm))
+
+
 def test_observations_with_a_callback_are_not_also_queued():
     """The controller consumes observations through `on_observation` and never reads the
     queue; buffering them there as well kept every VAD/ASR/echo result for the process lifetime."""
@@ -193,7 +246,7 @@ def test_real_vad_and_streaming_asr_over_an_utterance(bundle_dir, registry, spee
     assert probs.size == end // 512
     assert probs[: 16_000 // 512 - 2].max() < 0.2                     # leading digital silence
     speech_cells = probs[16_000 // 512 + 10: (16_000 + 80_000) // 512]
-    assert speech_cells.max() > 0.8                                   # evidence copy reaches Silero
+    assert speech_cells.max() > 0.8                                   # the VAD input reaches Silero
     asr = [o for o in obs if o.kind == "asr"]
     assert all(o.utterance_id == "U" for o in asr)
     assert [o.through_sample for o in asr] == sorted(o.through_sample for o in asr)

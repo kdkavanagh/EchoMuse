@@ -437,6 +437,18 @@ Based on a review of Office turns 433–476 (`docs/turn-latency-review.md`,
   without the 320 ms guard). Each reply's trace records where its detector
   state came from (`reply_window`) and the guard (`guard_until`,
   `answer_start`).
+- **Quiet commands are heard (policy `post_afe_10`).** The speech detector
+  scores quiet speech lower than loud speech, and at the level it shared with
+  the speech recognizer (+20 dB) the quietest commands never counted as
+  speech: the Master Bathroom's "turn off the lights" and "open the curtains"
+  (turns 729 and 732) were transcribed, but both turns ended as no input. The
+  detector now reads its own copy of the microphone at +30 dB, and a command
+  needs a score of 0.70 instead of 0.65 to start, which takes back part of the
+  room sound the louder copy lets through. Replayed on 87 saved wake turns, it
+  heard all 84 commands instead of 82, and where a command ends did not move
+  (median 0 ms); on quiet room audio, false command starts went from 1.3 to
+  2.6 an hour. The speech recognizer, wake verification and the audio sent to
+  Home Assistant are unchanged.
 - **Configurable wake open rules, with shadow rules to try them first.**
   Firmware with the new `open_rules_v1` capability opens a wake on any of a
   list of rules (last 1–3 scores, average or every one, ≥ a threshold). The
