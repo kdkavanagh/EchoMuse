@@ -7,10 +7,9 @@ turn plumbing `em_session`'s.
 A correction is proposed only for text HA's sentence matcher does not already understand,
 from six rules (`Rule`), and is applied only when HA's matcher fully accepts it under the
 turn's own context, it preserves everything the original said explicitly (negation,
-polarity, actions, numbers, units, named targets, and every slot HA had resolved), it is
-not a security-state command, and no competing interpretation comes within
-AMBIGUITY_MARGIN of it. Similarity here is a retrieval and scoring heuristic, not a
-probability that the correction is what was meant.
+polarity, actions, numbers, units, named targets, and every slot HA had resolved), and
+no competing interpretation comes within AMBIGUITY_MARGIN of it. Similarity here is a
+retrieval and scoring heuristic, not a probability that the correction is what was meant.
 
 Every rule reads only the canonical text (`fix_key`): lowercase, edge punctuation trimmed,
 whitespace collapsed, exactly what the endpoint's stable prefix is. So a correction
@@ -247,13 +246,6 @@ _NUMBER_WORDS: Final = {
 }
 _TENS = {"twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"}
 _ORDINAL = re.compile(r"(\d+)(?:st|nd|rd|th)")
-SECURITY_WORDS: Final = frozenset({
-    "arm", "armed", "arming", "disarm", "disarmed", "disarming", "alarm", "alarms", "lock", "locks", "locked",
-    "locking", "unlock", "unlocked", "unlocking", "security", "burglar", "intruder", "garage", "door",
-    "doors", "gate", "gates", "deadbolt",
-})
-SECURITY_DOMAINS: Final = frozenset({"lock", "alarm_control_panel"})
-SECURITY_DEVICE_CLASSES: Final = frozenset({"garage", "door", "gate", "lock"})
 STOPWORDS: Final = frozenset({
     "the", "a", "an", "to", "is", "it", "of", "in", "on", "at", "for", "and", "my", "me", "be", "are", "what",
     "what's", "whats", "i", "you", "this", "that", "please", "can", "could", "would", "all", "some",
@@ -364,7 +356,6 @@ class Status(StrEnum):
     CATCH_ALL = "catch_all"                # accepted only by a free-text slot or trigger
     UNRESOLVED = "unresolved"              # the inserted name did not resolve to its target
     CHANGED_RESOLVED = "changed_resolved"  # a slot HA had resolved changed, or cannot be shown kept
-    SECURITY = "security"                  # a security-state command: never applied automatically
 
 
 class Reason(StrEnum):
@@ -375,7 +366,6 @@ class Reason(StrEnum):
     NO_CANDIDATE = "no_candidate"
     NO_VALID_CANDIDATE = "no_valid_candidate"
     AMBIGUOUS = "ambiguous"
-    SECURITY = "security"
     CONTEXTUAL = "contextual"              # a follow-up in a conversation or reply window
     NOT_READY = "not_ready"                # tables not built, HA's matcher unavailable
     TIMEOUT = "timeout"                    # on: past FINAL_DEADLINE_S
@@ -1100,22 +1090,8 @@ def _resolves_target(c: Candidate, v: SentenceRecognition, t: Tables) -> bool:
     return target.kind != TargetKind.ENTITY or bool(set(v.targets) & target.ids)
 
 
-def security_sensitive(original_text: str, candidate_text: str, v: SentenceRecognition | None) -> bool:
-    """A lock, alarm panel, door or gate command, by its words or by what it would target."""
-    words = set(tokens(original_text)) | set(tokens(spoken_letters(original_text))) | set(tokens(candidate_text))
-    if words & SECURITY_WORDS:
-        return True
-    if v is None:
-        return False
-    if "domain" in v.details and v.details["domain"].value in SECURITY_DOMAINS:
-        return True
-    if "device_class" in v.details and v.details["device_class"].value in SECURITY_DEVICE_CLASSES:
-        return True
-    return any(e.split(".", 1)[0] in SECURITY_DOMAINS for e in v.targets)
-
-
-def _check(c: Candidate, v: SentenceRecognition | None, original_text: str,
-           original: SentenceRecognition | None, t: Tables) -> Checked:
+def _check(c: Candidate, v: SentenceRecognition | None, original: SentenceRecognition | None,
+           t: Tables) -> Checked:
     if v is None or not v.match:
         return Checked(c, Status.NO_MATCH, v)
     meaning = interpretation(v, c.text, t)
@@ -1126,8 +1102,6 @@ def _check(c: Candidate, v: SentenceRecognition | None, original_text: str,
     changed = _keeps_resolved(original, v, t)
     if changed is not None:
         return Checked(c, Status.CHANGED_RESOLVED, v, changed, meaning)
-    if security_sensitive(original_text, c.text, v):
-        return Checked(c, Status.SECURITY, v, None, meaning)
     return Checked(c, Status.OK, v, None, meaning)
 
 
@@ -1136,7 +1110,7 @@ def decide(proposal: Proposal, verdicts: Sequence[SentenceRecognition | None],
     """Apply acceptance (§16.8) to HA's verdict on each validated candidate."""
     if original is not None and original.match:
         return Decision(Reason.ORIGINAL_MATCHED)
-    checked = [_check(c, v, proposal.text, original, tables) for c, v in zip(proposal.validate, verdicts)]
+    checked = [_check(c, v, original, tables) for c, v in zip(proposal.validate, verdicts)]
     rejected = proposal.rejected
     if not checked:
         return Decision(Reason.NO_CANDIDATE, rejected=rejected)
@@ -1159,8 +1133,7 @@ def decide(proposal: Proposal, verdicts: Sequence[SentenceRecognition | None],
         return Decision(Reason.AMBIGUOUS, None, proposed, tuple(checked), rejected)
     eligible = [ch for ch in top if ch.status == Status.OK]
     if not eligible:
-        reason = Reason.SECURITY if any(ch.status == Status.SECURITY for ch in top) else Reason.NO_VALID_CANDIDATE
-        return Decision(reason, None, proposed, tuple(checked), rejected)
+        return Decision(Reason.NO_VALID_CANDIDATE, None, proposed, tuple(checked), rejected)
     by_rank = max(eligible, key=lambda ch: (ch.candidate.rank, ch.candidate.evidence, ch.candidate.text))
     by_evidence = max(eligible, key=lambda ch: (ch.candidate.evidence, ch.candidate.text))
     return Decision(Reason.APPLIED, by_rank, by_rank, tuple(checked), rejected,

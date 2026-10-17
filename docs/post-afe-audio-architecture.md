@@ -1905,15 +1905,14 @@ A cut-off's evidence is its coverage; its raw similarity is recorded only. Every
 2. `catch_all`: it matched only through free text and its rule is not `lead_in`, `phrase` or `cutoff`. Free text is a trigger whose template has a `{list}` or `{wildcard}` (`play {query}`), an intent whose name slot is itself free text (`HassStartTimer`, `HassBroadcast`, `HassShoppingListAddItem`, `HassListAddItem`, `HassListCompleteItem`, `HassMediaSearchAndPlay`, `HassRespond`), or any filled slot outside `em_text_fix.STRUCTURED_SLOTS` (the target, state, level, color, unit and duration slots; `search_query`, `item` and `message` are free text).
 3. `unresolved`: a `slot` or `name` candidate whose insertion HA did not resolve: an entity must be HA's `name` slot and among the matched targets, an area or floor HA's `area` or `floor` slot, and a user term literally a slot value (or, for a trigger, in its template).
 4. `changed_resolved`: a `name`, `area`, `floor`, `domain` or `device_class` the original's intent had filled is changed, or cannot be shown kept, by the same slot value (names and aliases compared by entity, area or floor ID) or by every matched target lying in it.
-5. `security`: the original (also with its letters spelled out), or the candidate, contains a security word (arm, alarm, lock, unlock, door, gate, garage, security, burglar, intruder, deadbolt, and their forms), or HA's verdict has domain `lock` or `alarm_control_panel`, device class `garage`, `door`, `gate` or `lock`, or a target in those domains. Never applied; shadow records it.
-6. `ok`.
+5. `ok`.
 
 **Decision**, in order (the turn's `reason`):
 
 - The original fully matches: `original_matched`. Text HA already understands is never changed, and no candidate is generated.
 - No candidate to validate: `no_candidate`. None HA matches: `no_valid_candidate`.
 - Matched candidates are grouped by interpretation: an intent's name, its slots with names, areas and floors reduced to IDs, and its targets; a trigger's template (and, for a catch-all trigger, the text itself). Spellings of one interpretation are one choice. Groups rank by their best evidence. When the runner-up group, whatever its status, or a held candidate comes within `AMBIGUITY_MARGIN` = 0.05 of the leader: `ambiguous` (“shower” between “shower mode” and “shower time”).
-- The leading group has no `ok` member: `security` if one is a security command, else `no_valid_candidate`.
+- The leading group has no `ok` member: `no_valid_candidate`.
 - Otherwise its `ok` member of highest rank is selected: `applied` under `on`, `would_apply` under `shadow`.
 
 **Preference.** User lists rank, they do not decide. A candidate whose text is user phrase *i* of *n* (0 = first) gets `PHRASE_PREFERENCE` × (*n* − *i*) ÷ *n* = up to 0.02; one that contains user term *i* of *m* (as a span of up to 6 words; the best-placed term only) gets `TERM_PREFERENCE` × (*m* − *i*) ÷ *m* = up to 0.01; the sum is capped at `PREFERENCE_CAP` = 0.02, so repeats add nothing. Rank = evidence + preference. Preference is added after preservation; thresholds and ambiguity read evidence alone, so it cannot lift a candidate over a threshold, break a tie between interpretations, or override protection. It decides the order candidates are validated in and which spelling of the winning interpretation is sent; `preference_changed` records when evidence alone would have chosen another. User terms are name-rule targets and user phrases are phrase and cut-off sources; a term never supplies a verb, so a request whose command word needs repair needs a full phrase (`play Cherub Rock`).
@@ -1948,7 +1947,7 @@ A rebuild starts `REBUILD_DEBOUNCE_S` = 1.5 s after the latest invalidation, nee
 | Field | Meaning |
 |---|---|
 | `mode` | `shadow` or `on` |
-| `reason` | `applied`, `would_apply`, `original_matched`, `no_candidate`, `no_valid_candidate`, `ambiguous`, `security`, `contextual`, `not_ready`, `timeout`, `error`, `stale` |
+| `reason` | `applied`, `would_apply`, `original_matched`, `no_candidate`, `no_valid_candidate`, `ambiguous`, `contextual`, `not_ready`, `timeout`, `error`, `stale` |
 | `original`, `proposed`, `sent`, `applied` | The transcript as heard (wake phrase removed), the best candidate HA accepted (eligible or not; null if none), the text step 3 sent, and whether that was a correction |
 | `rule`, `source`, `raw`, `coverage`, `preference`, `rank`, `status` | The proposal's evidence, when there is one |
 | `preference_changed` | User preference chose the spelling sent |
@@ -1962,7 +1961,7 @@ A rebuild starts `REBUILD_DEBOUNCE_S` = 1.5 s after the latest invalidation, nee
 **Limitations.**
 
 - Nothing biases or trains ASR. The lists change neither Kroko, a pause server, nor HA's STT.
-- Security-state commands and follow-ups are never corrected automatically.
+- Follow-ups are never corrected automatically.
 - HA's acceptance shows the corrected text is executable, not that it is what was said.
 - A corrected text may still go to an LLM: the pipeline's agent, `prefer_local_intents`, language and conversation decide what runs it.
 - Corrections never feed the endpoint. A garbled command word in a request no trigger, history entry or user phrase knows is not repaired, and an almost empty transcript (“st”) is not completed.
@@ -1986,7 +1985,7 @@ A rebuild starts `REBUILD_DEBOUNCE_S` = 1.5 s after the latest invalidation, nee
 | Speaker gating? | None in the initial implementation; speaker takeover is backlog (section 19.1) | Only a two-clip sanity test exists [P1]; published approaches use trained per-frame models |
 | TV-room endpoint? | Grammar-complete background-speech route; background speech ≥10 dB down counts as pause after `needs_more`/`unknown` text; bounded retry | Equal-level voices are not separable from one stream; speech ≥10 dB down is, and a 1,792 ms pause outlasts soft stretches inside a command |
 | Completeness beyond the grammar? | HA's built-in sentence matcher (`conversation/agent/homeassistant/debug`), only for text the grammar leaves `unknown`; a probe word separates `complete` from wildcard-`extendable` | It knows the user's own sentences and triggers; 20 of 38 `unknown` turns become `complete` or `extendable`; recognizes without executing [H6] |
-| Correct misheard transcripts? | After the step 2 routes, repair a command HA's matcher does not understand with six bounded rules, and send a repair only when HA's matcher fully accepts it, it keeps everything the original said explicitly, it is not a security-state command, and no other interpretation comes within 0.05; `shadow` by default (section 16.8) | Of 211 recent HA turns, 166 already matched, 11 would be repaired (every labelled one right) and 3 abstained as ambiguous; a matcher check recognizes without executing [H6] |
+| Correct misheard transcripts? | After the step 2 routes, repair a command HA's matcher does not understand with six bounded rules, and send a repair only when HA's matcher fully accepts it, it keeps everything the original said explicitly, and no other interpretation comes within 0.05; `shadow` by default (section 16.8) | Of 211 recent HA turns, 166 already matched, 11 would be repaired (every labelled one right) and 3 abstained as ambiguous; a matcher check recognizes without executing [H6] |
 | Unsolicited follow-up? | Not implemented | No available directedness/NTT model |
 | Native AFE metadata? | Decoded on the device and carried as evidence under `afe_metadata_v1`; no decision reads it. Direction/wake-time energy: `unavailable` | v3.3 validated per frame on the device (section 4.5); no measurement yet relates a field to an outcome |
 | Presentation timing? | Estimated callback/sample accounting plus 150 ms drain guard | No measured DAC timestamp API; guard is a release gate |

@@ -1250,7 +1250,6 @@ const TEXT_FIX_REASONS = Object.freeze({
   no_candidate:       ['nothing to propose', 'var(--muted)'],
   no_valid_candidate: ["no candidate kept what was said and passed Home Assistant's matcher", 'var(--muted)'],
   ambiguous:          ['ambiguous: interpretations too close to choose between', 'var(--warn)'],
-  security:           ['a lock, alarm, door or gate command: never applied automatically', 'var(--warn)'],
   contextual:         ['a follow-up in a conversation: bypassed', 'var(--muted)'],
   not_ready:          ["not ready: tables not built or Home Assistant's matcher unavailable", 'var(--warn)'],
   timeout:            ['not ready within 100 ms of the final transcript', 'var(--warn)'],
@@ -1271,7 +1270,7 @@ const TEXT_FIX_STATUSES = Object.freeze({
   ok: 'eligible', not_preserved: 'drops or changes what was said',
   not_validated: 'not checked (past the validation limit)', no_match: "HA's matcher does not accept it",
   catch_all: 'matched only by a free-text slot or wildcard', unresolved: 'the name did not resolve to its target',
-  changed_resolved: 'changes a slot HA had resolved', security: 'a security command',
+  changed_resolved: 'changes a slot HA had resolved',
 });
 const fixWord = (map, k) => (k == null ? '—' : map[k] || String(k).replace(/_/g, ' '));
 

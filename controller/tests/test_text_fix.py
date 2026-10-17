@@ -47,7 +47,6 @@ from em_text_fix import (
     parse_list,
     parse_mode,
     propose,
-    security_sensitive,
     sent_text,
     similarity,
     user_vocabulary,
@@ -215,18 +214,12 @@ def test_a_room_ha_already_resolved_is_never_replaced():
     assert decision.checked[0].status == Status.CHANGED_RESOLVED and decision.selected is None
 
 
-def test_a_security_command_is_proposed_but_never_eligible():
-    # Turn 773: "arm the alarm" heard as "RMV alarm".
+def test_rmv_alarm_is_ambiguous_between_arming_and_arming_away():
+    # Turn 773: "arm the alarm" heard as "RMV alarm". HA accepts both modes' triggers.
     decision, _ = correct("RMV alarm.")
-    matched = [ch for ch in decision.checked if ch.verdict is not None and ch.verdict.match]
-    assert matched and all(ch.status == Status.SECURITY for ch in matched)
-    assert decision.selected is None and decision.proposed is not None
-
-
-def test_a_lock_target_is_security_sensitive_whatever_the_words():
-    lock = SentenceRecognition(True, False, "builtin", "<turn> on {name}", "HassTurnOn",
-                               {"name": SlotValue("Back", "back"), "domain": SlotValue("lock", "")}, {}, ("lock.back",))
-    assert security_sensitive("turn on back", "turn on back", lock)
+    templates = {ch.verdict.template for ch in decision.checked if ch.status == Status.OK}
+    assert any("away" in t for t in templates) and any("away" not in t for t in templates)
+    assert decision.reason == Reason.AMBIGUOUS and decision.selected is None
 
 
 def test_a_catch_all_match_validates_a_full_phrase_but_not_a_name_insertion():

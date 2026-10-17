@@ -664,8 +664,6 @@ It never:
   request: one of your preferred phrases, an automation trigger, or a request
   Home Assistant answered before;
 - changes a room or device Home Assistant had already recognised;
-- applies a correction to a lock, alarm panel, door, gate or garage command
-  (Shadow still records it);
 - guesses between two different readings that are about as likely ("shower"
   as "shower mode" or "shower time"): it sends the request as heard;
 - touches an answer to a question (a follow-up in a conversation, or a reply
@@ -723,10 +721,10 @@ model.
 A turn's detail shows a **Correction** stage after Home Assistant's
 transcription: heard → proposed → sent, whether it was applied and why (for
 example "shadow: would have sent", "HA already understood the heard text",
-"ambiguous", "security command — never applied automatically", "follow-up —
-bypassed"), the kind of repair and where its text came from, its scores and
-preference, and whether it was ready within the 0.1 s. The turns API returns
-the same as `stt_fix`. The transcript as heard is always kept (`stt_text`).
+"ambiguous", "follow-up — bypassed"), the kind of repair and where its text
+came from, its scores and preference, and whether it was ready within the
+0.1 s. The turns API returns the same as `stt_fix`. The transcript as heard is
+always kept (`stt_text`).
 
 ### Good to know
 

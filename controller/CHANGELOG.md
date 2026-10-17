@@ -626,12 +626,12 @@ Based on a review of Office turns 433–476 (`docs/turn-latency-review.md`,
   Assistant's own sentence matcher, which runs nothing, fully understands it
   in the pipeline's language for this speaker; nothing said explicitly (not,
   on/off, numbers, units, the action, a room or device already recognised)
-  changed; it is not a lock, alarm, door, gate or garage command; and no
-  other reading comes within 0.05. Text the matcher already understands, and
-  answers to a question, are sent as heard. Config → **Transcript correction**
-  (`transcriptFix`): **Shadow** (default) records what would have been sent
-  and still sends the transcript as heard; **On** sends a repair that is ready
-  within 0.1 s of the final transcript; **Off** does nothing. Two ranked
+  changed; and no other reading comes within 0.05. Text the matcher already
+  understands, and answers to a question, are sent as heard. Config →
+  **Transcript correction** (`transcriptFix`): **Shadow** (default) records
+  what would have been sent and still sends the transcript as heard; **On**
+  sends a repair that is ready within 0.1 s of the final transcript; **Off**
+  does nothing. Two ranked
   lists, **Preferred terms** (`transcriptFixTerms`) and **Preferred phrases**
   (`transcriptFixPhrases`), add your own titles and requests; they rank
   candidates and never train speech-to-text. Each turn records the outcome in
