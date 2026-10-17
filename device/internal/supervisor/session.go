@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"slices"
 
 	"github.com/wilbowes/EchoMuse/internal/client"
 	"github.com/wilbowes/EchoMuse/internal/config"
@@ -20,8 +21,21 @@ var v1Capabilities = []proto.Capability{
 	proto.CapRenderProgress, proto.CapFocusLeases, proto.CapTurnProtocol,
 }
 
-// retainedCapabilities are the retained hardware capabilities (§18.2).
-var retainedCapabilities = []proto.Capability{proto.CapLEDs, proto.CapLEDAnim, proto.CapButtons, proto.CapButtonHold}
+// platformCapabilities are the hardware and platform capabilities each
+// image implements (§18.2; docs/echo-show-port-plan.md decisions 6, 7). The
+// Dot keeps its ring, buttons, Wi-Fi management, BLE proxy and privacy
+// mute; on the Show Android owns Wi-Fi, Bluetooth and the keys, there is no
+// ring, mute is deferred (Phase 7) and the kiosk screen can be woken.
+var platformCapabilities = map[proto.Platform][]proto.Capability{
+	proto.PlatformFireOS6: {
+		proto.CapLEDs, proto.CapLEDAnim, proto.CapButtons, proto.CapButtonHold,
+		proto.CapWifiControl, proto.CapBLEProxy, proto.CapPrivacyMute,
+	},
+	proto.PlatformFireOS6Crown: {proto.CapScreenWake},
+}
+
+// has reports whether this platform implements c.
+func (s *Supervisor) has(c proto.Capability) bool { return slices.Contains(s.platformCaps, c) }
 
 // Hello builds a fresh session.hello (WIRE §4.1).
 func (s *Supervisor) Hello() proto.SessionHello {
@@ -29,7 +43,7 @@ func (s *Supervisor) Hello() proto.SessionHello {
 	if s.ex.CacheCapable() {
 		caps = append(caps, proto.CapAlertCache)
 	}
-	caps = append(caps, retainedCapabilities...)
+	caps = append(caps, s.platformCaps...)
 	caps = append(caps, proto.CapAlertPrefetch, proto.CapLocalWakeChime, proto.CapOpenRules)
 	if s.cfg.AmbientReadable() {
 		caps = append(caps, proto.CapAmbientLight)
@@ -54,9 +68,14 @@ func (s *Supervisor) Hello() proto.SessionHello {
 		privacy.CaptureEpoch = proto.U64(epoch)
 	}
 	level, seeded := s.cfg.Physical.VolumeState()
+	volume := proto.Volume{Level: &level, Seeded: seeded}
+	if s.cfg.Physical.VolumeUnavailable() != "" {
+		// The controller shows volume unavailable on a null level.
+		volume = proto.Volume{}
+	}
 	return proto.SessionHello{
 		Capabilities:       caps,
-		Platform:           proto.PlatformFireOS6,
+		Platform:           s.cfg.Platform,
 		FirmwareVersion:    s.cfg.FirmwareVersion,
 		OSVersion:          platform.OSVersion(),
 		BootID:             s.cfg.BootID,
@@ -67,7 +86,7 @@ func (s *Supervisor) Hello() proto.SessionHello {
 		Clock:              s.ex.ClockInfo(),
 		Alerts:             s.ex.Hello(),
 		Assets:             installed,
-		Volume:             proto.Volume{Level: level, Seeded: seeded},
+		Volume:             volume,
 	}
 }
 
@@ -295,9 +314,26 @@ func (s *Supervisor) retained(env proto.Envelope) {
 			s.cfg.Physical.SeedVolume(v.StartupVolume)
 		}
 		s.fm.SetDuckDB(v.DuckDB)
+		if m.BLEProxyEnabled != nil && *m.BLEProxyEnabled && !s.has(proto.CapBLEProxy) {
+			log.Printf("[session] config bleProxyEnabled ignored: no BLE proxy on %s", s.cfg.Platform)
+		}
 		if s.cfg.Retained.ConfigApplied != nil {
 			s.cfg.Retained.ConfigApplied(v)
 		}
+	case proto.TypeWifiChange, proto.TypeWifiCommit, proto.TypeWifiScan:
+		if !s.has(proto.CapWifiControl) {
+			// The controller sends these only to wifi_control devices;
+			// Android owns Wi-Fi here.
+			log.Printf("[session] %s ignored: Wi-Fi is managed by the device on %s", env.Type, s.cfg.Platform)
+			return
+		}
+		s.wifi(env)
+	}
+}
+
+// wifi delivers the Wi-Fi management messages (wifi_control).
+func (s *Supervisor) wifi(env proto.Envelope) {
+	switch env.Type {
 	case proto.TypeWifiChange:
 		var b struct {
 			SSID string `json:"ssid"`

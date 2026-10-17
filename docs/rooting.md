@@ -1,4 +1,4 @@
-# Rooting the Echo Dot Gen 2 (biscuit)
+# Rooting the Echo Dot Gen 2 (biscuit) and the Echo Show 8 (crown)
 
 > **You do this at your own risk. We accept no responsibility for negative
 > outcomes experienced.**
@@ -7,11 +7,16 @@ EchoMuse needs an Echo Dot Gen 2 that is unlocked with amonet-biscuit v2 and
 running Fire OS 6 rooted with boot-root.zip. Two separate jobs get you there,
 and they carry very different risk.
 
-**Fire OS 5 is not supported.** The EchoMuse firmware runs its audio only
-through Fire OS 6's `mixer` daemon, the provisioning wizard refuses an
+**Fire OS 5 is not supported.** On the Dot the EchoMuse firmware runs its
+audio only through Fire OS 6's `mixer` daemon, the provisioning wizard refuses an
 Android 5.x Dot at its first step, and the controller refuses a Dot that does
 not report Fire OS 6. A Dot on Fire OS 5 (amonet-biscuit v1) has to move to
 Fire OS 6 first; see [Moving a Dot from Fire OS 5](#moving-a-dot-from-fire-os-5).
+
+**The Echo Show 8 (1st gen, `crown`)** is a different device with its own
+unlock, and everything about it is in its own section:
+[Echo Show 8 (1st gen, crown)](#echo-show-8-1st-gen-crown). The rest of this
+page is the Dot.
 
 ## Hardware
 
@@ -211,10 +216,227 @@ Fire OS 6 and boot-root.zip returns the Dot to the state the wizard starts
 from. If it will not reach TWRP at all, that is the unlock's territory and
 R0rt1z2's thread covers recovery and unbricking.
 
+## Echo Show 8 (1st gen, crown)
+
+> **You do this at your own risk. We accept no responsibility for negative
+> outcomes experienced.**
+
+The Echo Show 8 1st gen (2019, `crown`, model AEOCW) runs the same EchoMuse
+firmware as the Dot. Unlike the Dot's headless image, its Fire OS 6 keeps the
+full Android framework: the screen runs **your kiosk** (Fully Kiosk Browser
+showing a Home Assistant dashboard, say), and Wi-Fi, Bluetooth, the clock
+and the volume keys stay Android's. EchoMuse records and plays through
+Android's audio server, which still runs Amazon's echo cancellation. The
+design and the measurements behind it are in
+[echo-show-port-plan.md](echo-show-port-plan.md) and
+[echo-show-crown.md](echo-show-crown.md).
+
+### Unlocking — R0rt1z2's amonet-crown
+
+The unlock, root and recovery for this device are **R0rt1z2's** work:
+
+- [amonet-crown — unlock, root, TWRP, unbrick](https://xdaforums.com/t/unlock-root-twrp-unbrick-amazon-echo-show-8-1st-gen-2019-crown.4766687/)
+  on XDA Forums
+
+That thread is canon; this page does not copy it, and where the two differ,
+the thread is right. It is for the **1st gen** Echo Show 8 only, not the 2nd
+gen. Its first post unlocks the bootloader; its second ("Getting a rooted
+shell") flashes `boot-root.img`, after which the adb shell is root (`#`).
+That is the state EchoMuse starts from. Take its warnings seriously: most
+units have no bootrom download mode, so a brick can be permanent, and the
+bootloader and other critical partitions must never be written.
+
+> **Which build?** EchoMuse is developed and tested against **Fire OS 6574.1**,
+> `NS65741/8146`, on one unit. The wizard warns on any other build. Check with
+> `adb shell getprop ro.build.version.name`.
+
+### Before the wizard
+
+1. **Join Wi-Fi on the Show itself**, from the setup screen's Wi-Fi page (or
+   Settings, once setup is done). EchoMuse never configures Wi-Fi or Bluetooth
+   on the Show, and the wizard refuses one that is not on a network.
+2. **Install your kiosk.** Fire OS may block `adb install` until you run
+   `adb shell settings put global disable_bouncer 1` (the thread's second
+   post). The wizard refuses to continue until a home app other than Amazon's
+   exists: it hides Amazon's launchers, and with nothing else the Show would
+   boot to a blank screen. Fully Kiosk Browser ships its home-screen activity
+   (`de.ozerov.fully/.LauncherReplacement`) switched off, normally switched on
+   by its own launcher setting; when Fully is installed and no other home app
+   is, the wizard switches it on itself (`pm enable`) and says so.
+3. **Keep the kiosk off the microphone.** Android 7.1 allows one recording at
+   a time and EchoMuse holds it: leave the kiosk's acoustic (sound) detection
+   off, and do not use an in-page Assist microphone on the dashboard.
+4. **Give the kiosk a way into Settings.** The Show's own Wi-Fi and Bluetooth
+   pages are how you manage its network from now on. Android's generic
+   Wi-Fi settings link does not open on this build; these explicit
+   components do (add them to Fully's app launcher, for example):
+
+   ```
+   com.android.settings/.Settings$WifiSettingsActivity
+   com.android.settings/.Settings$BluetoothSettingsActivity
+   ```
+
+   From adb: `adb shell am start -n 'com.android.settings/.Settings$WifiSettingsActivity'`.
+
+Amazon's keyboard is the only one on the Show and stays installed, with its
+dictation microphone denied (below); install another if you want one
+without Amazon's dictation.
+
+### What the wizard does
+
+All from the running system, with no partition, boot image or recovery
+writes:
+
+1. Checks the device: `crown`, Android 7.1.x, a root adb shell, the tested
+   build (a warning only), and an address on `wlan0`.
+2. Checks that a non-Amazon home app (your kiosk) is offered, from
+   `cmd package query-activities` for the home intent, switching Fully's on
+   if needed (above).
+3. Writes one file, `/system/etc/init/echomuse.rc`, remounting `/system`
+   read-write for the write and read-only after it. There is one system
+   partition, so nothing is mirrored, and no `/tmp` is created.
+4. Installs the firmware bundled with the controller under `/data/local/bin`,
+   its startup script, and the device-link TLS credentials, as on the Dot.
+5. **Neutralises Alexa**, in the order
+   [echo-show-crown.md §9.4](echo-show-crown.md#94-how-and-in-what-order)
+   sets:
+   - marks setup complete (`settings put global device_provisioned 1`,
+     `settings put secure user_setup_complete 1`);
+   - **repairs Settings**: on a Show never registered with Amazon, Amazon's
+     Settings app has no configuration bundle and every page crashes (Wi-Fi
+     and Bluetooth included). When
+     `/data/data/com.android.settings/shared_prefs/com.amazon.settings.CONFIG_BUNDLE_STORE.xml`
+     has no `bundle_location`, the wizard stops Settings and sends it one
+     broadcast, `com.amazon.dcp.sso.broadcast.CORPFMHasChanged`, to the
+     explicit component
+     `com.android.settings/com.amazon.settings.AccountPropertyChangeReceiver`,
+     which writes the bundle;
+   - makes your kiosk the default home app (`cmd package set-home-activity`);
+   - copies the lists to `/data/local/etc/echomuse/` and records the tiers it
+     applied in `/data/local/etc/echomuse/crown_tiers`;
+   - hides **Tier 1** with `pm hide`: the calling and camera apps, the setup
+     screen, the launcher and screensaver, alarms, multi-room audio, and
+     every Amazon package that could re-enable, reinstall or factory-reset
+     the others (`controller/device_payloads/crown_hide_packages.txt`, 26
+     packages). **Tier 2** (Amazon's cloud, smart-home radio and telemetry
+     apps, `crown_hide_packages_tier2.txt`) is a switch in the wizard, off by
+     default; turn it on once Tier 1 has been checked on your Show;
+   - **denies the microphone** to the Amazon apps that must stay installed:
+     Alexa's wake engine (`amazon.speech.sim`) and Amazon's dictation
+     keyboard, with `appops set <package> RECORD_AUDIO ignore`
+     (`crown_mic_deny_packages.txt`). Android then refuses their recorders
+     even though they hold the permission;
+   - checks that home resolves to the kiosk it chose. That can only be
+     checked after hiding: until Amazon's setup screen (priority 101) is
+     hidden, it wins over any default home app.
+
+   Two Amazon packages are never hidden, whatever a list says, because the
+   Show breaks without them (measured): `amazon.speech.sim` (hidden, the
+   system UI crash-loops ten minutes after boot and Amazon apps crash with
+   dialogs on screen) and `com.amazon.kindle.otter.oobe` (hidden, every
+   Settings page crashes). The wizard unhides either if an earlier list hid
+   it.
+6. Reboots, checks that `echomuse` and Android's `audioserver` are running,
+   and waits for the Show to reach the controller (pending approval if new).
+
+Hidden packages are not deleted: they stay on `/system`, invisible to
+Android, until unhidden.
+
+### What runs at boot
+
+`echomuse.rc` starts `start_server.sh` once Android has finished booting:
+
+```
+service echomuse /system/bin/sh /data/local/bin/start_server.sh
+    class late_start
+    user root
+    group audio system inet net_raw wakelock
+    seclabel u:r:adbd:s0
+    disabled
+
+on property:sys.boot_completed=1
+    start echomuse
+```
+
+As on the Dot, init starts the script in `adbd` and the script moves itself
+into boot-root's permissive `su` domain before it starts anything. On the Show
+this is required, not only convenient: in `adbd`, Android's audio server
+refuses its binder replies, so nothing could record and `pm` would not
+answer (measured, [echo-show-crown.md §10.4](echo-show-crown.md)). The
+process runs as uid 0 with primary group `audio`.
+
+The script recognises the Show by `ro.product.device` and, instead of the
+Dot's preparation, waits for `audioserver`, stops a short list of Amazon
+native services (`CROWN_STOPLIST`: the hybrid Alexa engine `ahe`, smart-home,
+Ring/Sidewalk, mesh and telemetry daemons, and `whad_cc`), holds a kernel
+wake lock, re-hides any package on the applied lists that has become
+visible again, and re-denies the microphone to any package on the mic-deny
+list whose app op is no longer `ignore` (both persist, so this normally
+finds nothing to do). It never stops `audioserver` or `media`, and never touches
+`tinymix`, `wpa_supplicant` or the Wi-Fi and Bluetooth stack. The server's
+log is `/data/local/tmp/echomuse/server.log` (the Show has no `/tmp`); the
+supervisor's is `/data/local/etc/echomuse/supervisor.log`, as on the Dot.
+
+### What EchoMuse writes on the Show
+
+| Where | What |
+|---|---|
+| `/system` | One file: `/system/etc/init/echomuse.rc` |
+| `/data` | The firmware and startup script (`/data/local/bin`); TLS credentials, the hide and mic-deny lists, `crown_tiers` and the supervisor log (`/data/local/etc/echomuse`); the server log (`/data/local/tmp/echomuse`) |
+| Package state | The hidden flag on the listed packages, and Fully's `.LauncherReplacement` switched on if the wizard had to (`/data/system/users/0/package-restrictions.xml`) |
+| App ops | `RECORD_AUDIO` set to `ignore` for the mic-deny list (`/data/system/appops.xml`) |
+| Settings | `device_provisioned=1`, `user_setup_complete=1`, the kiosk as default home app, and Amazon Settings' configuration bundle written by its own receiver |
+
+Nothing below Fire OS userspace: no bootloader, boot image, recovery or
+partition table writes.
+
+### To undo it on the Show
+
+Remove the boot hook, unhide both lists, allow the microphones again, and
+reboot:
+
+```sh
+adb shell 'stop echomuse; mount -o rw,remount /system && rm /system/etc/init/echomuse.rc && mount -o ro,remount /system'
+adb shell 'cd /data/local/etc/echomuse && for f in crown_hide_packages.txt crown_hide_packages_tier2.txt; do while read -r p _; do case "$p" in ""|"#"*) ;; *) pm unhide "$p" </dev/null ;; esac; done < "$f"; done; rm -f crown_tiers'
+adb shell 'cd /data/local/etc/echomuse && while read -r p _; do case "$p" in ""|"#"*) ;; *) appops set "$p" RECORD_AUDIO default </dev/null ;; esac; done < crown_mic_deny_packages.txt'
+adb reboot
+```
+
+The Show then comes back with Amazon's launcher (`pm unhide` on a package
+that was never hidden is harmless). Setup stays marked complete; set
+`device_provisioned` and `user_setup_complete` back to `0` to see Amazon's
+setup again. `/data/local/bin` and `/data/local/etc/echomuse` can then be
+deleted, and the kiosk uninstalled with `adb uninstall`. Going all the way
+back to stock Fire OS is the thread's "Going back to FireOS" (a stock update
+installed from TWRP).
+
+### Danger: Amazon's account broadcasts
+
+The receiver the wizard uses to repair Settings,
+`com.amazon.settings.AccountPropertyChangeReceiver`, also handles
+`com.amazon.dcp.sso.action.account.removed`, and on a Show with setup marked
+complete that action **factory-resets the device** (Amazon's
+`DeviceUtils.resetDevice`), wiping `/data` and EchoMuse with it. Never send
+that action, and never broadcast to that receiver by hand with any action but
+`com.amazon.dcp.sso.broadcast.CORPFMHasChanged`. The wizard sends exactly
+that one, to that explicit component.
+
+### Recovery
+
+The wizard changes one file, package state and app ops, all reversible over adb, and
+adb stays root whatever the screen shows, so a Show stuck on a blank screen
+(no home app) is recovered with the undo commands above. TWRP is reachable by
+holding Volume Up while the Show powers on (the thread's `boot-recovery.sh`
+does the same). Anything below that is the unlock's territory, and
+R0rt1z2's crown thread covers it.
+
 ## Credits
 
 - **R0rt1z2** — [amonet-biscuit](https://xdaforums.com/t/unlock-root-twrp-unbrick-amazon-echo-dot-2nd-gen-2016-biscuit.4761416/):
-  persistent unlock, TWRP, boot-root and unbrick for this device
+  persistent unlock, TWRP, boot-root and unbrick for the Dot; and
+  [amonet-crown](https://xdaforums.com/t/unlock-root-twrp-unbrick-amazon-echo-show-8-1st-gen-2019-crown.4766687/),
+  the same for the Echo Show 8 1st gen (with k4y0z, FieryFlames, bengris32
+  and TheVancedGamer)
 - **Dragon863** — [EchoCLI](https://github.com/Dragon863/EchoCLI): tethered root research
 - **Binozo** — [GoTinyAlsa](https://github.com/Binozo/GoTinyAlsa) and the original EchoGo SDK
 

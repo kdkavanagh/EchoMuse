@@ -56,7 +56,7 @@ import em_wake_registry
 import em_wake_rules
 import em_shell
 import em_support
-from em_device_link import MessageType
+from em_device_link import Capability, MessageType
 from em_session import ActorState, VoicePhase
 from version import VERSION as CONTROLLER_VERSION
 from version import UpdateStatus
@@ -511,6 +511,7 @@ async def create_app(services: ControllerServices) -> web.Application:
 
     # Provisioning
     app.router.add_get("/api/provision/start_script", _get_provision_start_script)
+    app.router.add_get("/api/provision/crown_lists",  _get_provision_crown_lists)
     app.router.add_get("/api/provision/firmware",     _get_provision_firmware)
     app.router.add_post("/api/provision/tls_credentials", _post_provision_tls_credentials)
     app.router.add_post("/api/provision/diagnostics",     _post_provision_diagnostics)
@@ -569,6 +570,7 @@ class ErrorCode(enum.StrEnum):
     NOT_CAPTURING = "not_capturing"
     NOT_CONNECTED = "not_connected"
     NOT_FOUND = "not_found"
+    NOT_SUPPORTED = "not_supported"
     RECORDING_AMBIENT = "recording_ambient"
     REMOVED_CONFIG_KEY = "removed_config_key"
     SCAN_FAILED = "scan_failed"
@@ -1747,6 +1749,9 @@ def _validate_config(values: Mapping[str, object],
         if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 3600:
             return _error(ErrorCode.INVALID_CONFIG,
                           "timerRingSeconds must be an integer from 1 through 3600", 400)
+    message = sections_mod.screen_wake_error(values)
+    if message is not None:
+        return _error(ErrorCode.INVALID_CONFIG, message, 400)
     return None
 
 
@@ -1856,7 +1861,7 @@ async def _post_device_wifi(request: web.Request) -> web.Response:
         return _error(ErrorCode.INVALID_CREDENTIALS,
                       f"WPA passphrase must be 8–63 characters (got {len(psk)})", 400)
 
-    live = _require_online(device_id)
+    live = _require_wifi_control(device_id)
     st = _wifi_change(device_id)
     if st.pending is not None:
         return _error(ErrorCode.WIFI_CHANGE_IN_PROGRESS,
@@ -1891,7 +1896,7 @@ async def _post_device_wifi_scan(request: web.Request) -> web.Response:
     takes ~5s).
     """
     device_id = request.match_info["id"]
-    live = _require_online(device_id)
+    live = _require_wifi_control(device_id)
     if live.wifi_scan_future is not None:
         return _error(ErrorCode.SCAN_IN_PROGRESS, "A scan is already running", 409)
 
@@ -1904,8 +1909,7 @@ async def _post_device_wifi_scan(request: web.Request) -> web.Response:
         return _error(ErrorCode.DEVICE_OFFLINE, "Device is not connected", 409)
     except asyncio.TimeoutError:
         return _error(ErrorCode.SCAN_TIMEOUT,
-                      "Device did not return scan results within 20s "
-                      "(old firmware without WiFi support?)", 504)
+                      "Device did not return scan results within 20s", 504)
     finally:
         live.wifi_scan_future = None
     error = msg.get("error")
@@ -3418,6 +3422,59 @@ async def _stream_file_to_device(shell: em_shell.ShellBroker, live: em_device.De
 START_SCRIPT_PATH = "/data/local/bin/start_server.sh"
 
 
+async def _sync_payload(shell: em_shell.ShellBroker, live: em_device.Device, device_id: str,
+                        payload: str, path: str, *, mode: str, effect: str) -> bool:
+    """
+    Heal drift in one device_payloads/ file installed on a device at `path`:
+    compare md5s, push the canonical copy when they differ. `effect` ends the
+    success log line (when the new copy is read). True when the device's copy
+    is the canonical one on return. Best-effort: a failure logs and returns
+    False, and never raises into the firmware update it usually rides along
+    with.
+
+    Replacement is rename-based on purpose: a shell running the old copy
+    keeps reading the OLD inode, and a reader never sees half a file.
+    """
+    try:
+        data = (PAYLOADS_DIR / payload).read_bytes()
+    except OSError as e:
+        log.error(f"[api] {payload} payload unreadable — skipping sync: {e}")
+        return False
+    want = hashlib.md5(data).hexdigest()
+
+    out = await _shell_run(shell, live, _md5_of(path))
+    if want in out:
+        return True  # in sync — the common case
+    await asyncio.sleep(1.0)  # let the md5 shell session close cleanly
+
+    await push_log_event(device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
+                         f"{payload} out of date — syncing canonical version")
+    tmp = path + ".new"
+    pushed = await _stream_file_to_device(shell, live, data, tmp, mode=mode)
+    if not pushed:
+        await push_log_event(device_id, db.LogLevel.WARN, db.LogSource.CONTROLLER,
+                             f"{payload} sync failed: {pushed}")
+        return False
+    await asyncio.sleep(1.0)
+
+    # ${NEW%% *} keeps the hash: md5sum prints "<hash>  <path>". The
+    # expansion needs no tool.
+    res = await _shell_run(shell, live,
+        f'NEW=$({_md5_of(tmp)}); NEW=${{NEW%% *}}; '
+        f'if [ "$NEW" = "{want}" ]; then '
+        f'mv {tmp} {path} && chmod {mode} {path} && echo PAYLOAD_SYNCED; '
+        f'else rm -f {tmp}; echo PAYLOAD_MD5_MISMATCH:$NEW; fi')
+    synced = "PAYLOAD_SYNCED" in res
+    if synced:
+        await push_log_event(device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
+                             f"{payload} synced — {effect}")
+    else:
+        await push_log_event(device_id, db.LogLevel.WARN, db.LogSource.CONTROLLER,
+                             f"{payload} sync failed ({res.strip() or 'no output'})")
+    await asyncio.sleep(1.0)
+    return synced
+
+
 async def _sync_start_script(shell: em_shell.ShellBroker, live: em_device.Device,
                              device_id: str) -> bool:
     """
@@ -3429,58 +3486,90 @@ async def _sync_start_script(shell: em_shell.ShellBroker, live: em_device.Device
     compares the device's script against the canonical payload
     (controller/device_payloads/) and pushes it when they differ.
 
-    Replacement is rename-based on purpose: the running script's shell keeps
-    reading the OLD inode, so the update only takes effect at the next
-    device reboot — safe to do while the script sits in its `wait` loop.
-    Best-effort: a sync failure logs but never blocks the firmware update.
+    The running script's shell keeps reading the old inode (_sync_payload's
+    rename), so the update only takes effect at the next device reboot — safe
+    to do while the script sits in its `wait` loop.
 
-    True when the device's script is the canonical one on return — what
-    Fire OS 6's debloat needs before it runs the script's `debloat` mode.
+    True when the device's script is the canonical one on return — what the
+    debloat needs before it runs the script's `debloat` mode.
     """
-    path = START_SCRIPT_PATH
-    try:
-        script = (PAYLOADS_DIR / "start_server.sh").read_bytes()
-    except OSError as e:
-        log.error(f"[api] start_server.sh payload unreadable — skipping sync: {e}")
-        return False
-    want = hashlib.md5(script).hexdigest()
+    return await _sync_payload(shell, live, device_id, "start_server.sh", START_SCRIPT_PATH,
+                               mode="755", effect="takes effect on next device reboot")
 
-    out = await _shell_run(shell, live, _md5_of(path))
-    if want in out:
-        return True  # in sync — the common case
-    await asyncio.sleep(1.0)  # let the md5 shell session close cleanly
 
-    await push_log_event(device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
-                         "start_server.sh out of date — syncing canonical version")
-    tmp = path + ".new"
-    pushed = await _stream_file_to_device(shell, live, script, tmp)
-    if not pushed:
-        await push_log_event(device_id, db.LogLevel.WARN, db.LogSource.CONTROLLER,
-                             f"start_server.sh sync failed: {pushed}")
-        return False
-    await asyncio.sleep(1.0)
+# ─── Echo Show hide lists and mic denials (docs/echo-show-crown.md §9) ──────
 
-    # ${NEW%% *} keeps the hash: md5sum prints "<hash>  <path>". The
-    # expansion needs no tool.
-    res = await _shell_run(shell, live,
-        f'NEW=$({_md5_of(tmp)}); NEW=${{NEW%% *}}; '
-        f'if [ "$NEW" = "{want}" ]; then '
-        f'mv {tmp} {path} && chmod 755 {path} && echo SCRIPT_SYNCED; '
-        f'else rm -f {tmp}; echo SCRIPT_MD5_MISMATCH:$NEW; fi')
-    synced = "SCRIPT_SYNCED" in res
-    if synced:
-        await push_log_event(device_id, db.LogLevel.INFO, db.LogSource.CONTROLLER,
-                             "start_server.sh synced — takes effect on next device reboot")
-    else:
-        await push_log_event(device_id, db.LogLevel.WARN, db.LogSource.CONTROLLER,
-                             f"start_server.sh sync failed ({res.strip() or 'no output'})")
-    await asyncio.sleep(1.0)
+# Where the wizard installs the Show's lists, and the file recording the
+# tiers it applied ("1", or "1 2"). Must match EM_ETC, CROWN_TIERS and
+# CROWN_MIC_DENY in device_payloads/start_server.sh, whose crown branch reads
+# them at every boot.
+CROWN_ETC_DIR = "/data/local/etc/echomuse"
+CROWN_TIERS_PATH = f"{CROWN_ETC_DIR}/crown_tiers"
+
+
+class HideTier(enum.StrEnum):
+    """A hide-list tier, as written in the device's crown_tiers file."""
+
+    ONE = "1"   # findings §9.1: must hide
+    TWO = "2"   # findings §9.2: recommended, opt-in from the wizard
+
+
+# Each tier's list, by its file name in device_payloads/ and in CROWN_ETC_DIR.
+CROWN_HIDE_LISTS: dict[HideTier, str] = {
+    HideTier.ONE: "crown_hide_packages.txt",
+    HideTier.TWO: "crown_hide_packages_tier2.txt",
+}
+
+# The packages kept visible whose microphone is denied by app op instead,
+# applied with Tier 1 (the file's header has why).
+CROWN_MIC_DENY_LIST = "crown_mic_deny_packages.txt"
+
+
+def _package_list(text: str) -> list[str]:
+    """A package list's names: one per line, `#` comment lines and blank
+    lines dropped. start_server.sh's crown branch reads the same files."""
+    return [ln.strip() for ln in text.splitlines()
+            if ln.strip() and not ln.lstrip().startswith("#")]
+
+
+def crown_hide_packages(tier: HideTier) -> list[str]:
+    """The packages of one tier, from the canonical payload."""
+    return _package_list((PAYLOADS_DIR / CROWN_HIDE_LISTS[tier]).read_text())
+
+
+def crown_mic_deny_packages() -> list[str]:
+    """The packages whose microphone is denied, from the canonical payload."""
+    return _package_list((PAYLOADS_DIR / CROWN_MIC_DENY_LIST).read_text())
+
+
+async def _sync_crown_lists(shell: em_shell.ShellBroker, live: em_device.Device,
+                            device_id: str) -> bool:
+    """
+    Bring an Echo Show's copies of the hide lists and the mic-deny list up
+    to date, so a list that changed reaches devices already in the field:
+    start_server.sh re-applies them at every boot and in its `debloat` mode.
+    Which tiers apply stays the operator's choice, recorded by the wizard in
+    crown_tiers and untouched here. True when every copy is canonical on
+    return.
+    """
+    effects = {name: "re-hidden now and at every boot" for name in CROWN_HIDE_LISTS.values()}
+    effects[CROWN_MIC_DENY_LIST] = "re-denied now and at every boot"
+    synced = True
+    for name, effect in effects.items():
+        synced = await _sync_payload(shell, live, device_id, name, f"{CROWN_ETC_DIR}/{name}",
+                                     mode="644", effect=effect) and synced
     return synced
 
 
 # `start_server.sh debloat`'s last line: how many listed services init no
 # longer runs, and which (listed services, or dnsmasq) are still up.
 _DENYLIST_RESULT = re.compile(r"DEBLOAT_STOPPED:(\d+) STILL_RUNNING:(\S*)")
+
+# The Show's lines before it: listed packages hidden again by this pass, and
+# those the package manager refused to hide; then listed packages whose
+# microphone this pass denied again, and those still allowed after it.
+_HIDE_RESULT = re.compile(r"HIDE_REASSERTED:(\S*) STILL_VISIBLE:(\S*)")
+_MIC_RESULT = re.compile(r"MIC_REASSERTED:(\S*) STILL_ALLOWED:(\S*)")
 
 
 @dataclass(frozen=True, slots=True)
@@ -3491,12 +3580,48 @@ class DenylistResult:
     still_running: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class HideResult:
+    """What the Show's `start_server.sh debloat` reported about its hide lists."""
+
+    rehidden: tuple[str, ...]
+    still_visible: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MicDenyResult:
+    """What the Show's `start_server.sh debloat` reported about its mic denials."""
+
+    redenied: tuple[str, ...]
+    still_allowed: tuple[str, ...]
+
+
+def _names(field: str) -> tuple[str, ...]:
+    return tuple(n for n in field.split(",") if n)
+
+
 def _parse_denylist_result(out: str) -> DenylistResult | None:
     """The result line in `start_server.sh debloat`'s output; None without one."""
     m = _DENYLIST_RESULT.search(out)
     if m is None:
         return None
-    return DenylistResult(int(m.group(1)), tuple(n for n in m.group(2).split(",") if n))
+    return DenylistResult(int(m.group(1)), _names(m.group(2)))
+
+
+def _parse_hide_result(out: str) -> HideResult | None:
+    """The Show's hide line in `start_server.sh debloat`'s output; None on a Dot."""
+    m = _HIDE_RESULT.search(out)
+    if m is None:
+        return None
+    return HideResult(_names(m.group(1)), _names(m.group(2)))
+
+
+def _parse_mic_result(out: str) -> MicDenyResult | None:
+    """The Show's mic line in `start_server.sh debloat`'s output; None on a Dot."""
+    m = _MIC_RESULT.search(out)
+    if m is None:
+        return None
+    return MicDenyResult(_names(m.group(1)), _names(m.group(2)))
 
 
 async def _sync_debloat(shell: em_shell.ShellBroker, live: em_device.Device,
@@ -3508,6 +3633,11 @@ async def _sync_debloat(shell: em_shell.ShellBroker, live: em_device.Device,
     by the script's `debloat` mode. No reboot needed — the services stop now,
     and every boot stops them again.
 
+    On an Echo Show the same mode stops the Show's native stop list
+    (CROWN_STOPLIST), re-hides the hide lists of the tiers the wizard
+    applied and re-denies the microphones on the mic-deny list, so the lists
+    are synced first: a change to one reaches the device here.
+
     The script is synced first, and the mode runs only when the device's copy
     is then the canonical one: a script predating the mode ignores its
     argument and would run in full, starting a second supervisor beside the
@@ -3518,7 +3648,30 @@ async def _sync_debloat(shell: em_shell.ShellBroker, live: em_device.Device,
                              "debloat not applied: start_server.sh could not be brought "
                              "up to date, and an older copy would start a second server")
         return
+    if (live.platform is em_device_link.DevicePlatform.FIREOS6_CROWN
+            and not await _sync_crown_lists(shell, live, device_id)):
+        await push_log_event(device_id, db.LogLevel.WARN, db.LogSource.CONTROLLER,
+                             "debloat: the hide and mic-deny lists could not be brought up "
+                             "to date — re-applying the device's own copies")
     out = await _shell_run(shell, live, f"sh {START_SCRIPT_PATH} debloat 2>&1", timeout=60.0)
+    hidden = _parse_hide_result(out)
+    if hidden is not None and hidden.still_visible:
+        await push_log_event(device_id, db.LogLevel.WARN, db.LogSource.CONTROLLER,
+                             f"debloat: the package manager refused to hide "
+                             f"{', '.join(hidden.still_visible)}")
+    elif hidden is not None and hidden.rehidden:
+        await push_log_event(device_id, db.LogLevel.WARN, db.LogSource.CONTROLLER,
+                             f"debloat: re-hid {len(hidden.rehidden)} package(s) that had "
+                             f"become visible again: {', '.join(hidden.rehidden)}")
+    mic = _parse_mic_result(out)
+    if mic is not None and mic.still_allowed:
+        await push_log_event(device_id, db.LogLevel.WARN, db.LogSource.CONTROLLER,
+                             f"debloat: could not deny the microphone to "
+                             f"{', '.join(mic.still_allowed)}")
+    elif mic is not None and mic.redenied:
+        await push_log_event(device_id, db.LogLevel.WARN, db.LogSource.CONTROLLER,
+                             f"debloat: denied the microphone again to "
+                             f"{', '.join(mic.redenied)}, which had it allowed")
     result = _parse_denylist_result(out)
     if result is None:
         await push_log_event(device_id, db.LogLevel.WARN, db.LogSource.CONTROLLER,
@@ -3691,6 +3844,51 @@ async def _get_provision_start_script(request: web.Request) -> web.Response:
         content_type='text/plain',
         headers={'Content-Disposition': 'attachment; filename="start_server.sh"'},
     )
+
+
+class PackageListJson(TypedDict):
+    """One list file in GET /api/provision/crown_lists."""
+
+    file: str            # its name in `dir` on the device
+    text: str            # the payload, byte for byte, for the wizard to install
+    packages: list[str]  # the same, parsed (_package_list)
+
+
+class HideListJson(PackageListJson):
+    """A hide list, with the tier it belongs to."""
+
+    tier: HideTier
+
+
+class CrownListsJson(TypedDict):
+    """GET /api/provision/crown_lists."""
+
+    dir: str
+    tiers_file: str
+    hide: list[HideListJson]
+    mic_deny: PackageListJson
+
+
+def _package_list_json(name: str) -> PackageListJson:
+    text = _read_payload(name)
+    return {"file": name, "text": text, "packages": _package_list(text)}
+
+
+@auth.require_admin
+async def _get_provision_crown_lists(request: web.Request) -> web.Response:
+    """
+    GET /api/provision/crown_lists — the Echo Show's hide lists and mic-deny
+    list, for the wizard's Neutralise Alexa step: each file as it is
+    installed on the device (where start_server.sh re-applies it at every
+    boot) and its package names parsed here, so the wizard never parses the
+    file format.
+    """
+    hide: list[HideListJson] = []
+    for tier, name in CROWN_HIDE_LISTS.items():
+        hide.append({**_package_list_json(name), "tier": tier})
+    body: CrownListsJson = {"dir": CROWN_ETC_DIR, "tiers_file": CROWN_TIERS_PATH, "hide": hide,
+                            "mic_deny": _package_list_json(CROWN_MIC_DENY_LIST)}
+    return _ok(body)
 
 
 @auth.require_admin
@@ -4553,7 +4751,9 @@ async def _get_support_bundle(request: web.Request) -> web.Response:
             "capabilities":     sorted(live.capabilities) if live is not None else [],
             # Why ambient_light is absent: no_chip, no_attribute, or ok (#90).
             "ambient_light_status": hello.ambient_light_status if hello is not None else None,
-            "muted":        live.muted if live is not None else None,
+            # Which image the device runs: decides which capabilities to expect.
+            "platform":     live.platform if live is not None else None,
+            "muted":        live.privacy_state if live is not None else None,
             "rtt_ms":       live.rtt_last_ms if live is not None else None,
             "volume":       live.volume if live is not None else None,
             "media_state":  em_player.state(did),
@@ -4823,6 +5023,18 @@ def _require_online(device_id: str, message: str = "Device is not connected") ->
     return device
 
 
+def _require_wifi_control(device_id: str) -> em_device.Device:
+    """The connected Device that manages its own Wi-Fi for EchoMuse
+    (`wifi_control`); 409 device_offline or not_supported, with the reason
+    the dashboard shows beside the disabled controls."""
+    device = _require_online(device_id)
+    if not device.wifi_control_capable:
+        gap = device.capability_gap(Capability.WIFI_CONTROL)
+        raise ApiError(ErrorCode.NOT_SUPPORTED,
+                       f"Wi-Fi changes unavailable: {gap or 'no wifi_control capability'}", 409)
+    return device
+
+
 # ─── Device state merge ───────────────────────────────────────────────────────
 
 def _stored_volume(row: db.DeviceRow) -> float | None:
@@ -4877,6 +5089,8 @@ class DeviceJson(TypedDict):
     # Live connection
     connected: bool
     capabilities: list[str]
+    capability_gaps: dict[str, str]
+    platform: em_device_link.DevicePlatform | None
     firmware_version: str | None
     turn_state: ActorState | None
     speaking: bool
@@ -4884,6 +5098,7 @@ class DeviceJson(TypedDict):
     thinking: bool
     muted: bool | None
     volume: float | None
+    volume_gap: str | None
     ambient: dict[str, object] | None
     alert_state: dict[str, object] | None
     ringing: bool | None
@@ -4949,17 +5164,27 @@ def _merge_device(row: db.DeviceRow) -> DeviceJson:
         # Capability names (SPEC §11.1): a control whose capability is absent
         # is shown disabled with the reason, never as a silent no-op.
         "capabilities":       sorted(live.capabilities) if live is not None else [],
+        # Why each absent optional capability is absent, where that depends
+        # on the platform (em_device.capability_gap): "managed by the device"
+        # on an Echo Show, "firmware update available" on an older Dot.
+        "capability_gaps":    ({cap.value: gap.value for cap, gap in live.capability_gaps.items()}
+                               if live is not None else {}),
+        "platform":           live.platform if live is not None else None,
         "firmware_version":   live.firmware_version if live is not None else None,
         "turn_state":         turn_state,
         "speaking":           phase is VoicePhase.SPEAKING,
         "listening":          phase is VoicePhase.LISTENING,
         "thinking":           phase is VoicePhase.THINKING,
-        "muted":              live.muted if live is not None else None,
+        # Null: unknown, or a device without privacy_mute (capability_gaps says why).
+        "muted":              live.privacy_state if live is not None else None,
         # Live level while connected, otherwise the last one the device
-        # reported (persisted as startupVolume), as an HA 0..1 float.
-        "volume":             (em_volume.device_level_to_ha(live.volume)
+        # reported (persisted as startupVolume), as an HA 0..1 float. Null for
+        # a session without volume control, whose reason is volume_gap.
+        "volume":             (None if live is not None and not live.volume_available
+                               else em_volume.device_level_to_ha(live.volume)
                                if live is not None and live.volume is not None
                                else _stored_volume(row)),
+        "volume_gap":         live.volume_gap if live is not None else None,
         "ambient":            live.ambient if live is not None else None,
         "alert_state":        alert_state,
         "ringing":            (alert_state.get("active") is not None

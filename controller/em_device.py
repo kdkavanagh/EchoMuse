@@ -85,6 +85,65 @@ class ApprovalMode(enum.StrEnum):
     AUTO = "auto"
 
 
+class CapabilityGap(enum.StrEnum):
+    """Why an optional capability is absent, when the controller names the
+    reason: shown beside the control it disables (never a silent no-op), and
+    the refusal of an API call that needs it."""
+
+    # The Echo Show's own Android stack owns Wi-Fi and Bluetooth.
+    MANAGED_BY_DEVICE = "managed by the device"
+    # The platform's firmware announces it; this device's firmware predates it.
+    FIRMWARE_UPDATE = "firmware update available"
+    MUTE_NOT_SUPPORTED = "mute not supported on this device yet"
+    NO_RING = "no LED ring on this device"
+    NO_BUTTON = "no action button on this device"
+    NO_SCREEN = "no screen on this device"
+
+
+# Why a device reports no volume (`volume.level` null in its hello): an Echo
+# Show whose firmware's startup check of the pinned Android volume calls
+# failed. It ignores volume_set and startupVolume for the whole run.
+VOLUME_UNAVAILABLE = "volume control unavailable: Android volume check failed (see device log)"
+
+
+# Capabilities a platform lacks by design, and why. A Fire OS 6 Dot's
+# firmware announces wifi_control, ble_proxy and privacy_mute; the Echo Show's
+# announces screen_wake and none of the ring, button, network or mute ones.
+_NOT_ON_PLATFORM: dict[DevicePlatform, dict[Capability, CapabilityGap]] = {
+    DevicePlatform.FIREOS6: {Capability.SCREEN_WAKE: CapabilityGap.NO_SCREEN},
+    DevicePlatform.FIREOS6_CROWN: {
+        Capability.LEDS: CapabilityGap.NO_RING,
+        Capability.LED_ANIM: CapabilityGap.NO_RING,
+        Capability.BUTTONS: CapabilityGap.NO_BUTTON,
+        Capability.BUTTON_HOLD: CapabilityGap.NO_BUTTON,
+        Capability.WIFI_CONTROL: CapabilityGap.MANAGED_BY_DEVICE,
+        Capability.BLE_PROXY: CapabilityGap.MANAGED_BY_DEVICE,
+        Capability.PRIVACY_MUTE: CapabilityGap.MUTE_NOT_SUPPORTED,
+    },
+}
+# Optional capabilities newer than some firmware in the field on a platform
+# that has them: absent there, the bundled firmware brings them.
+_PLATFORM_OPTIONAL: frozenset[Capability] = frozenset({
+    Capability.WIFI_CONTROL, Capability.BLE_PROXY, Capability.PRIVACY_MUTE,
+    Capability.SCREEN_WAKE,
+})
+
+
+def capability_gap(platform: DevicePlatform | None, capabilities: Iterable[str],
+                   capability: Capability) -> CapabilityGap | None:
+    """Why `capability` is missing from a session's announced set: the
+    platform lacks it by design, or it is one of `_PLATFORM_OPTIONAL` and the
+    firmware predates it. None when it is present, when no session names a
+    platform, or when the dashboard's own per-capability reason applies (an
+    older Dot firmware without led_anim, say)."""
+    if platform is None or capability in capabilities:
+        return None
+    reason = _NOT_ON_PLATFORM[platform].get(capability)
+    if reason is None and capability in _PLATFORM_OPTIONAL:
+        return CapabilityGap.FIRMWARE_UPDATE
+    return reason
+
+
 class Actor(Protocol):
     @property
     def state(self) -> em_session.ActorState: ...
@@ -300,6 +359,8 @@ class Device:
         self.link: em_device_link.DeviceLink | None = None
         self.render: em_render.RenderClient | None = None
         self.capabilities: frozenset[str] = frozenset()
+        # The image the last session's hello named (admission requires one).
+        self.platform: DevicePlatform | None = None
         self.firmware_version: str | None = None
         self.ip: str | None = None
         self.secure = False
@@ -311,7 +372,11 @@ class Device:
         self.alert_state: dict[str, object] | None = None
         self.alerts_wakeup: str | None = None
         self.volume: int | None = None
+        # False for a session whose hello carried `volume.level` null.
+        self.volume_available = True
+        # As the device reports it; `privacy_state` is what is shown.
         self.muted: bool | None = None
+        self._ble_adverts_dropped = False   # logged once per session
         self.ambient: dict[str, object] | None = None
         self.wifi_scan_future: asyncio.Future[dict[str, object]] | None = None
         self.config: em_config_sections.DeviceConfig = {}
@@ -390,6 +455,10 @@ class Device:
         self._led_event.set()
 
     @property
+    def leds_capable(self) -> bool:
+        return Capability.LEDS in self.capabilities
+
+    @property
     def led_anim_capable(self) -> bool:
         return Capability.LED_ANIM in self.capabilities
 
@@ -416,6 +485,56 @@ class Device:
     @property
     def afe_metadata_capable(self) -> bool:
         return Capability.AFE_METADATA in self.capabilities
+
+    @property
+    def wifi_control_capable(self) -> bool:
+        return Capability.WIFI_CONTROL in self.capabilities
+
+    @property
+    def ble_proxy_capable(self) -> bool:
+        return Capability.BLE_PROXY in self.capabilities
+
+    @property
+    def privacy_mute_capable(self) -> bool:
+        return Capability.PRIVACY_MUTE in self.capabilities
+
+    @property
+    def screen_wake_capable(self) -> bool:
+        return Capability.SCREEN_WAKE in self.capabilities
+
+    def capability_gap(self, capability: Capability) -> CapabilityGap | None:
+        """Why this device lacks `capability` (module `capability_gap`)."""
+        return capability_gap(self.platform, self.capabilities, capability)
+
+    @property
+    def capability_gaps(self) -> dict[Capability, CapabilityGap]:
+        """Every optional capability this device lacks for a reason the
+        controller names, with that reason: what the dashboard disables
+        controls with."""
+        gaps = {cap: capability_gap(self.platform, self.capabilities, cap)
+                for cap in Capability if cap not in REQUIRED_CAPABILITIES}
+        return {cap: gap for cap, gap in gaps.items() if gap is not None}
+
+    @property
+    def privacy_state(self) -> bool | None:
+        """Privacy mute as shown (dashboard, support bundle): what the device
+        reports, or None (unavailable, with `capability_gaps`' reason) on a
+        device without `privacy_mute`, whose `muted` says nothing."""
+        return self.muted if self.privacy_mute_capable else None
+
+    @property
+    def volume_gap(self) -> str | None:
+        """Why this session has no volume control, or None when it has one."""
+        return None if self.volume_available else VOLUME_UNAVAILABLE
+
+    async def set_volume(self, level: int) -> None:
+        """`volume_set` (0..127), the one path every volume change takes (HA's
+        media player). Refused, not sent, while the session has no volume
+        control: the device would ignore it."""
+        if not self.volume_available:
+            log.warning("[%s] volume_set %d refused: %s", self.device_id, level, VOLUME_UNAVAILABLE)
+            return
+        await self.send(MessageType.VOLUME_SET, {"level": level})
 
     @property
     def capture_permitted(self) -> bool:
@@ -465,10 +584,14 @@ class Device:
         self.button_multi_tap_ms = int(cfg.get("buttonMultiTapMs", 0))
         link = self.link
         if link is not None and not link.closed:
-            body: dict[str, object] = {k: cfg[k] for k in DEVICE_CONFIG_KEYS if k in cfg}
+            body: dict[str, object] = {k: cfg[k] for k in DEVICE_CONFIG_KEYS
+                                       if k in cfg and (self.volume_available or k != "startupVolume")}
             if self.local_wake_chime_capable:
                 # Only to firmware that knows the key: it chimes at candidate open (§11.2).
                 body["wakeSound"] = em_config_sections.wake_sound(cfg)
+            if self.screen_wake_capable:
+                # Only to firmware that lights a kiosk screen at candidate open.
+                body.update(em_config_sections.screen_wake(cfg))
             await self.send(MessageType.CONFIG, body)
             # The wake graph and the open/shadow rules are named only in
             # session.ready (§16.1): a changed selection renegotiates the
@@ -487,6 +610,8 @@ class Device:
         self.link = link
         render = self.render = self.host.make_render(self, link)
         self.capabilities = link.capabilities
+        self.platform = hello.platform
+        self._ble_adverts_dropped = False
         self.firmware_version = hello.firmware_version
         self.ip, self.secure = link.peer_ip, link.secure
         self.alerts_wakeup = hello.alerts_wakeup
@@ -494,6 +619,7 @@ class Device:
         self._physical_seq = -1
         self.muted = hello.muted
         self.volume = hello.volume_level
+        self.volume_available = hello.volume_available
         # session.ready granted afe_metadata exactly when the hello announced it (LinkHub.admit).
         self.actor.attach(link, render, afe_metadata=self.afe_metadata_capable)
         await self.host.alerts.on_session_hello(self.device_id, hello.alerts,
@@ -515,7 +641,7 @@ class Device:
             case MessageType.PRIVACY_CHANGED:
                 muted = body.get("muted")
                 self.muted = muted if isinstance(muted, bool) else None
-                self._spawn(self.host.push_state(self, {"muted": self.muted}), "privacy push")
+                self._spawn(self.host.push_state(self, {"muted": self.privacy_state}), "privacy push")
             case MessageType.WAKE_STATS:
                 self.wake_stats = {**body, "received_ms": time.time_ns() // 1_000_000}
                 try:
@@ -558,6 +684,14 @@ class Device:
                 if future is not None and not future.done():
                     future.set_result(body)
             case MessageType.BLE_ADVERTS:
+                if not self.ble_proxy_capable:
+                    # Only a ble_proxy device's scanner feeds the proxy.
+                    if not self._ble_adverts_dropped:
+                        self._ble_adverts_dropped = True
+                        log.warning("[%s] ble_adverts dropped for this session: no ble_proxy "
+                                    "capability (%s)", self.device_id,
+                                    self.capability_gap(Capability.BLE_PROXY))
+                    return
                 adverts = body.get("adverts")
                 self.host.ble_adverts(self.device_id, adverts if isinstance(adverts, list) else [])
             case MessageType.LOG:
@@ -626,14 +760,16 @@ class Device:
 
     async def _volume(self, body: Mapping[str, object]) -> None:
         level = _integer(body.get("level"))
-        if level is None:
+        if level is None or not self.volume_available:
             return
         self.volume = level
         cfg = await asyncio.to_thread(self.store.config, self.device_id)
         cfg["startupVolume"] = level
         await asyncio.to_thread(self.store.set_config, self.device_id, cfg)
-        self.host.volume(self.device_id, em_volume.device_level_to_ha(level))
-        await self.host.push_state(self, {"volume": level})
+        ha_level = em_volume.device_level_to_ha(level)
+        self.host.volume(self.device_id, ha_level)
+        # DeviceJson's `volume` is HA's 0..1 float, not the wire level.
+        await self.host.push_state(self, {"volume": ha_level})
 
     def _ambient(self, body: Mapping[str, object]) -> None:
         lux = body.get("lux")
@@ -761,6 +897,9 @@ class Device:
                 next_renew = loop.time() + LED_RENEW_SECONDS
             if self.link is None or self.link.closed:
                 continue
+            if not self.leds_capable:
+                self._cue = None    # a device without `leds` (the Echo Show) has no ring to paint
+                continue
             if self._cue:
                 cue, self._cue = self._cue, None
                 anim = self.led_scene.get(cue)
@@ -868,9 +1007,10 @@ class LinkHub:
         if missing:
             log.warning("[%s] missing v1 capabilities: %s", device_id, sorted(missing))
             return em_device_link.Rejected(RejectReason.PROTOCOL)
-        if hello.platform is not DevicePlatform.FIREOS6:
-            # Firmware built from this tree runs audio only on Fire OS 6:
-            # admitting another image would only offer it an update that breaks it.
+        if hello.platform is None:
+            # Every DevicePlatform is an image the one firmware binary runs
+            # audio on (the Dot, the Echo Show): admitting any other would
+            # only offer it an update that breaks it.
             log.warning("[%s] unsupported platform: %s", device_id, hello.platform_sent)
             return em_device_link.Rejected(RejectReason.PROTOCOL)
         registration = await register_device(

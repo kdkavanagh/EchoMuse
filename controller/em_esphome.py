@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import socket
 import uuid
@@ -27,7 +28,7 @@ import em_player
 import em_volume
 from em_alerts import TimerEvent
 from em_button import ButtonEvent
-from em_device_link import Capability
+from em_device_link import Capability, DevicePlatform
 from em_session import VoicePhase
 from esphome.feature_flags import MediaPlayerEntityFeature, MediaPlayerState, VoiceAssistantFeature
 from esphome.satellite_server import HANDLED, RejectProtocol, Reply, SatelliteServerProtocol, serve
@@ -36,7 +37,16 @@ from version import VERSION as CONTROLLER_VERSION
 
 log = logging.getLogger("echomuse.esphome")
 
-ESPHOME_DEVICE_MODEL = "Echo Dot Gen 2 (biscuit)"
+# The Echo each platform runs on, as Home Assistant shows it: the satellite's
+# DeviceInfo `model`, and the part of `project_name` after the dot, which HA
+# shows as Model. ESPHOME_DEVICE_MODEL (the Dot's) stands where no session
+# has named a platform yet: the mDNS record, registered at startup, and the
+# Bluetooth proxy, which only a Dot runs.
+ESPHOME_DEVICE_MODELS: dict[DevicePlatform, str] = {
+    DevicePlatform.FIREOS6: "Echo Dot Gen 2 (biscuit)",
+    DevicePlatform.FIREOS6_CROWN: "Echo Show 8 Gen 1 (crown)",
+}
+ESPHOME_DEVICE_MODEL = ESPHOME_DEVICE_MODELS[DevicePlatform.FIREOS6]
 ESPHOME_PROJECT_VERSION = os.environ.get("ESPHOME_PROJECT_VERSION", CONTROLLER_VERSION)
 
 MEDIA_PLAYER_KEY = 1
@@ -128,8 +138,8 @@ class EchoMuseSatellite(SatelliteServerProtocol):
                 friendly_name=f"{self.server.label} Voice Assistant",
                 mac_address=self.server.mac_address,
                 manufacturer="EchoMuse",
-                model=ESPHOME_DEVICE_MODEL,
-                project_name=f"EchoMuse.{ESPHOME_DEVICE_MODEL}",
+                model=self.server.model,
+                project_name=f"EchoMuse.{self.server.model}",
                 project_version=ESPHOME_PROJECT_VERSION,
                 voice_assistant_feature_flags=VOICE_ASSISTANT_FLAGS,
             )
@@ -139,7 +149,7 @@ class EchoMuseSatellite(SatelliteServerProtocol):
             fmt = dict(format="flac", sample_rate=48000, num_channels=1, sample_bytes=2)
             yield api_pb2.ListEntitiesMediaPlayerResponse(
                 object_id="media_player", key=MEDIA_PLAYER_KEY, name=self.server.label,
-                supports_pause=True, feature_flags=MEDIA_PLAYER_FEATURES,
+                supports_pause=True, feature_flags=self.server.media_player_features,
                 supported_formats=[
                     api_pb2.MediaPlayerSupportedFormat(
                         purpose=api_pb2.MEDIA_PLAYER_FORMAT_PURPOSE_DEFAULT, **fmt),
@@ -199,7 +209,7 @@ class EchoMuseSatellite(SatelliteServerProtocol):
             if msg.has_media_url and not (msg.has_announcement and msg.announcement):
                 yield api_pb2.MediaPlayerStateResponse(
                     key=MEDIA_PLAYER_KEY, state=MediaPlayerState.PLAYING,
-                    volume=self.server.volume, muted=False)
+                    volume=self.server.reported_volume, muted=False)
             else:
                 yield self._media_state_msg()
             return
@@ -228,7 +238,7 @@ class EchoMuseSatellite(SatelliteServerProtocol):
                                        bool(msg.start_conversation)), "announce")
             yield api_pb2.MediaPlayerStateResponse(
                 key=MEDIA_PLAYER_KEY, state=MediaPlayerState.ANNOUNCING,
-                volume=self.server.volume, muted=False)
+                volume=self.server.reported_volume, muted=False)
             return
 
         if isinstance(msg, api_pb2.VoiceAssistantTimerEventResponse):
@@ -349,7 +359,7 @@ class EchoMuseSatellite(SatelliteServerProtocol):
     def _media_state_msg(self) -> Message:
         state = _MP_STATE.get(em_player.reported_state(self.device_id), MediaPlayerState.IDLE)
         return api_pb2.MediaPlayerStateResponse(
-            key=MEDIA_PLAYER_KEY, state=state, volume=self.server.volume, muted=False)
+            key=MEDIA_PLAYER_KEY, state=state, volume=self.server.reported_volume, muted=False)
 
     def _ambient_state_msg(self) -> Message:
         lux = self.server.ambient_lux
@@ -386,7 +396,12 @@ class DeviceESPhomeServer:
         self.mac_address = mac_address
         self.port = port
         self.capabilities: frozenset[str] = frozenset()
+        self.model = ESPHOME_DEVICE_MODEL   # the last session's platform's (ESPHOME_DEVICE_MODELS)
         self.volume = 1.0
+        # False while the device has no volume control (an Echo Show whose
+        # Android volume check failed): HA gets no volume slider and an
+        # unknown level, never a made-up one.
+        self.volume_control = True
         self.ambient_lux: int | None = None
         self.alert_ringing: bool | None = None
         self.voice_phase = VoicePhase.IDLE
@@ -394,6 +409,18 @@ class DeviceESPhomeServer:
         self._server: asyncio.AbstractServer | None = None
         self._active_satellite: EchoMuseSatellite | None = None
         self._mdns_info: ServiceInfo | None = None
+
+    @property
+    def media_player_features(self) -> int:
+        if self.volume_control:
+            return MEDIA_PLAYER_FEATURES
+        return MEDIA_PLAYER_FEATURES & ~int(MediaPlayerEntityFeature.VOLUME_SET)
+
+    @property
+    def reported_volume(self) -> float:
+        """The media player's volume for HA: NaN without volume control, which
+        HA's ESPHome integration shows as an unknown level."""
+        return self.volume if self.volume_control else math.nan
 
     def _protocol_factory(self) -> SatelliteServerProtocol:
         if self._active_satellite is not None:
@@ -514,8 +541,10 @@ async def device_connected(
     *,
     label: str,
     capabilities: frozenset[str],
+    platform: DevicePlatform | None,
     hooks: Hooks,
     volume: float | None = None,
+    volume_control: bool,
     ambient_lux: int | None = None,
     voice_phase: VoicePhase,
 ) -> None:
@@ -525,15 +554,18 @@ async def device_connected(
         if row is None or not row.approved or _mdns is None:
             return
         server = await _register_device_server(device_id, label)
-    before = server.capabilities
+    before = server.capabilities, server.model, server.volume_control
     server.label = label
     server.capabilities = frozenset(capabilities)
+    server.volume_control = volume_control
+    server.model = ESPHOME_DEVICE_MODELS[platform] if platform is not None else ESPHOME_DEVICE_MODEL
     server.hooks = hooks
     server.ambient_lux = ambient_lux
     server.voice_phase = voice_phase
     if volume is not None:
         server.volume = max(0.0, min(1.0, volume))
-    if before != server.capabilities and server._active_satellite is not None:
+    if (before != (server.capabilities, server.model, server.volume_control)
+            and server._active_satellite is not None):
         server._active_satellite.close()
     await server.start(_host)
 

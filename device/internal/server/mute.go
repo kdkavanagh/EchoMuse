@@ -6,22 +6,28 @@ import (
 )
 
 // muteController owns the device-sovereign privacy state, physical ADC mute,
-// red ring and discrete mute-button LED (SPEC §3.2, §11.2).
+// red ring and discrete mute-button LED (SPEC §3.2, §11.2). A device
+// without a privacy mute the firmware integrates (supported false: the Show
+// until Phase 7) stays unmuted and never touches the persisted state.
 type muteController struct {
 	mu sync.Mutex
 
-	hw       Hardware
-	ring     *ring
-	path     string
-	muted    bool
-	onChange func(bool)
+	hw        Hardware
+	ring      *ring
+	path      string
+	supported bool
+	muted     bool
+	onChange  func(bool)
 }
 
-func newMuteController(hw Hardware, r *ring, path string) *muteController {
+func newMuteController(hw Hardware, r *ring, path string, supported bool) *muteController {
 	if hw == nil {
 		hw = systemHardware{}
 	}
-	m := &muteController{hw: hw, ring: r, path: path}
+	m := &muteController{hw: hw, ring: r, path: path, supported: supported}
+	if !supported {
+		return m
+	}
 	if st, ok := loadDeviceState(path); ok {
 		m.muted = st.Muted
 	}
@@ -44,6 +50,9 @@ func (m *muteController) isMuted() bool {
 }
 
 func (m *muteController) toggle() {
+	if !m.supported {
+		return
+	}
 	m.set(!m.isMuted())
 	m.reconcilePrivacySoon()
 }

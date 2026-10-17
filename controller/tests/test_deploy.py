@@ -601,21 +601,22 @@ def test_a_transfer_never_deletes_the_destination_before_sending():
 def test_tested_firmware_build_matches_the_docs_fireos6():
     """
     The wizard warns when a device is on a Fire OS 6 build other than the one
-    EchoMuse is tested against (_TESTED_FIREOS6_BUILD), and docs/rooting.md
-    tells people which to flash. Those two have to name the same build: a
-    warning pointing at a version the docs do not mention is worse than no
-    warning, because the person reading it has nowhere to go.
+    EchoMuse is tested against (_TESTED_FIREOS6_BUILD for the Dot,
+    _TESTED_CROWN_BUILD for the Echo Show 8), and docs/rooting.md tells
+    people which to flash. Those have to name the same build: a warning
+    pointing at a version the docs do not mention is worse than no warning,
+    because the person reading it has nowhere to go.
     """
     jsx = (CONTROLLER / "static" / "dashboard.jsx").read_text()
-    m = re.search(r"_TESTED_FIREOS6_BUILD\s*=\s*'([^']+)'", jsx)
-    assert m, "dashboard.jsx no longer declares _TESTED_FIREOS6_BUILD"
-    build = m.group(1)
-
     rooting = (CONTROLLER.parent / "docs" / "rooting.md").read_text()
-    assert build in rooting, (
-        f"the wizard warns against Fire OS 6 build {build} but docs/rooting.md "
-        f"never names it — a reader has nowhere to go"
-    )
+    for const in ("_TESTED_FIREOS6_BUILD", "_TESTED_CROWN_BUILD"):
+        m = re.search(rf"{const}\s*=\s*'([^']+)'", jsx)
+        assert m, f"dashboard.jsx no longer declares {const}"
+        build = m.group(1)
+        assert build in rooting, (
+            f"the wizard warns against Fire OS 6 build {build} but docs/rooting.md "
+            f"never names it — a reader has nowhere to go"
+        )
 
 
 def test_push_log_event_callers_do_not_also_persist():

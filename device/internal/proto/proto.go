@@ -76,15 +76,41 @@ const (
 	// frames. On session.ready's afe_metadata the device announces the afe
 	// stream, serves it under leases and reports wake.stats.afe.
 	CapAFEMetadata Capability = "afe_metadata_v1"
+
+	// Optional platform capabilities. A device announces each only where
+	// the firmware implements it on the image it runs.
+	//
+	// CapWifiControl: the device joins Wi-Fi itself and handles wifi_change,
+	// wifi_scan and wifi_commit, answering wifi_result / wifi_scan_result
+	// (the Dot; Android owns Wi-Fi on the Show).
+	CapWifiControl Capability = "wifi_control"
+	// CapBLEProxy: the device runs the BLE advertisement scanner, sends
+	// ble_adverts and honours config bleProxyEnabled (the Dot).
+	CapBLEProxy Capability = "ble_proxy"
+	// CapPrivacyMute: the device integrates a hardware privacy mute and
+	// reports privacy state (the Dot; deferred on the Show, which reports
+	// privacy.muted false).
+	CapPrivacyMute Capability = "privacy_mute"
+	// CapScreenWake: on wake-candidate open the device lights the kiosk
+	// screen through Fully Kiosk's local REST API when config screenWake is
+	// on (the Show).
+	CapScreenWake Capability = "screen_wake"
 )
 
 // Platform is session.hello's platform: the system image this firmware runs
-// on. It is always PlatformFireOS6 — the firmware's audio backend
-// (libmixerAPI) exists on no other image — and the controller admits a
-// session only when it names fireos6.
+// on, detected once at start (internal/platform). The audio backend depends
+// on both the image and the product, so the value names both; the
+// controller admits a session only when it names one of these.
 type Platform string
 
-const PlatformFireOS6 Platform = "fireos6"
+const (
+	// PlatformFireOS6 is the Echo Dot Gen 2 on Fire OS 6 (biscuit_puffin):
+	// audio through Amazon's mixer daemon (libmixerAPI).
+	PlatformFireOS6 Platform = "fireos6"
+	// PlatformFireOS6Crown is the Echo Show 8 (crown) on Fire OS 6 with the
+	// Android framework: audio through OpenSL ES and AudioFlinger.
+	PlatformFireOS6Crown Platform = "fireos6_crown"
+)
 
 // MessageType is an envelope type.
 type MessageType string
@@ -209,8 +235,12 @@ type Privacy struct {
 	CaptureEpoch NullU64 `json:"capture_epoch"`
 }
 
+// Volume is session.hello's volume. Level is the wire level 0..127; nil
+// (JSON null) means the device cannot control volume this run (the Echo
+// Show when its Android volume check failed at start). A Dot always sends a
+// number.
 type Volume struct {
-	Level  int  `json:"level"`
+	Level  *int `json:"level"`
 	Seeded bool `json:"seeded"`
 }
 

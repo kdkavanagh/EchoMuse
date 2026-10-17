@@ -27,10 +27,17 @@ import (
 // previous network counters (reported as per-interval deltas) and the cached
 // wpa_cli link info. collect runs from the 30 s ticker and after every
 // session.ready, so calls are serialized by mu.
+//
+// wpaCLI is the Dot: there the firmware owns wpa_supplicant and asks it for
+// the SSID and link details. On the Show Android's WifiService owns it and
+// the firmware never touches it (docs/echo-show-port-plan.md decision 7), so
+// those fields are absent and the rest (RSSI from /proc/net/wireless, wlan0
+// counters, CPU, memory, thermals) are read the same way.
 type statsCollector struct {
-	mu   sync.Mutex
-	net  netCounters
-	link linkInfoCache
+	wpaCLI bool
+	mu     sync.Mutex
+	net    netCounters
+	link   linkInfoCache
 }
 
 // collect reads one stats body.
@@ -42,7 +49,12 @@ func (c *statsCollector) collect() proto.Stats {
 	stoUsed, stoTotal := storageStats()
 	rssi := wifiRSSI()
 	tx, rx, txErr, txDrop, rxCrc := c.net.deltas()
-	speed, freq, bssid := c.link.get()
+	var speed, freq int
+	var bssid, ssid string
+	if c.wpaCLI {
+		speed, freq, bssid = c.link.get()
+		ssid = wifi.CurrentSSID()
+	}
 	cpuC, maxC, coreLimit := thermals()
 	return proto.Stats{
 		AmbientLux:       als.Lux(),
@@ -57,7 +69,7 @@ func (c *statsCollector) collect() proto.Stats {
 		StorageUsedMb:    stoUsed,
 		StorageTotalMb:   stoTotal,
 		WifiRssi:         rssi,
-		WifiSsid:         wifi.CurrentSSID(),
+		WifiSsid:         ssid,
 		LinkSpeedMbps:    speed,
 		WifiFreqMhz:      freq,
 		WifiBssid:        bssid,

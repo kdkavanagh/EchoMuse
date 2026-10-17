@@ -1,5 +1,6 @@
-"""Capability negotiation (SPEC §11.1): admission requires the exact v1 set,
-and every UI capability derives from the announced set, never a version."""
+"""Capability negotiation (SPEC §11.1): admission requires the exact v1 set
+and one of the Fire OS 6 images, and every UI capability derives from the
+announced set and the platform, never a version."""
 
 import re
 from pathlib import Path
@@ -10,7 +11,8 @@ pytest.importorskip("websockets")
 
 import em_audio_timeline as tl  # noqa: E402
 import em_device  # noqa: E402
-from _device_fakes import ALL_V1, FakeLink, FakeStore, hello, hello_body, make_hub, run  # noqa: E402
+from _device_fakes import (ALL_V1, FakeHost, FakeLink, FakeStore, envelope, hello, hello_body,  # noqa: E402
+                           make_hub, run, settle)
 from em_device_link import Capability, DevicePlatform, SessionHello  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -70,6 +72,11 @@ def test_a_malformed_or_unsupported_hello_is_refused(bad):
     ("local_wake_chime_capable", "local_wake_chime"),
     ("open_rules_capable", "open_rules_v1"),
     ("afe_metadata_capable", "afe_metadata_v1"),
+    ("leds_capable", "leds"),
+    ("wifi_control_capable", "wifi_control"),
+    ("ble_proxy_capable", "ble_proxy"),
+    ("privacy_mute_capable", "privacy_mute"),
+    ("screen_wake_capable", "screen_wake"),
 ])
 def test_ui_capability_properties_follow_the_announced_set(prop, cap):
     async def scenario():
@@ -127,6 +134,7 @@ def _hello_without_platform() -> SessionHello:
 
 @pytest.mark.parametrize("extra, expected", [
     ({"platform": "fireos6"}, DevicePlatform.FIREOS6),
+    ({"platform": "fireos6_crown"}, DevicePlatform.FIREOS6_CROWN),
     ({"platform": "fireos5"}, None),
     ({"platform": "fireos7"}, None),
     ({"platform": None}, None),
@@ -140,15 +148,18 @@ def test_a_hello_naming_no_platform_parses_as_none():
     assert _hello_without_platform().platform is None
 
 
-def test_admission_accepts_fire_os_6():
-    assert isinstance(_admit(hello(platform="fireos6")), em_device.em_device_link.Admitted)
+@pytest.mark.parametrize("platform", ["fireos6", "fireos6_crown"])
+def test_admission_accepts_both_fire_os_6_images(platform):
+    assert isinstance(_admit(hello(platform=platform)), em_device.em_device_link.Admitted)
 
 
 @pytest.mark.parametrize("platform, logged", [
-    ("fireos5", "'fireos5'"), ("fireos7", "'fireos7'"), (None, "None"), (6, "6")])
-def test_admission_refuses_any_platform_but_fire_os_6(platform, logged, caplog):
-    # Firmware from this tree runs audio only on Fire OS 6: admitting another
-    # image would only offer it an update that breaks it.
+    ("fireos5", "'fireos5'"), ("fireos7", "'fireos7'"), ("crown", "'crown'"),
+    (None, "None"), (6, "6")])
+def test_admission_refuses_any_other_platform(platform, logged, caplog):
+    # Firmware from this tree runs audio only on the Dot's and the Echo Show's
+    # Fire OS 6: admitting another image would only offer it an update that
+    # breaks it.
     assert _admit(hello(platform=platform)) == em_device.em_device_link.Rejected("protocol")
     assert f"unsupported platform: {logged}" in caplog.text
 
@@ -156,3 +167,304 @@ def test_admission_refuses_any_platform_but_fire_os_6(platform, logged, caplog):
 def test_admission_refuses_a_hello_naming_no_platform(caplog):
     assert _admit(_hello_without_platform()) == em_device.em_device_link.Rejected("protocol")
     assert "unsupported platform: absent" in caplog.text
+
+
+# What each image's current firmware announces (decisions 6 and 7 of the
+# Echo Show port plan), and a Dot on firmware predating the Dot-only three.
+DOT = ALL_V1 + ["leds", "led_anim", "buttons", "button_hold", "alert_prefetch",
+                "local_wake_chime", "open_rules_v1", "ambient_light", "afe_metadata_v1",
+                "wifi_control", "ble_proxy", "privacy_mute"]
+DOT_OLDER = [c for c in DOT if c not in ("wifi_control", "ble_proxy", "privacy_mute")]
+SHOW = ALL_V1 + ["alert_prefetch", "local_wake_chime", "open_rules_v1", "afe_metadata_v1",
+                 "ambient_light", "screen_wake"]
+DEVICES = [("fireos6", DOT), ("fireos6", DOT_OLDER), ("fireos6_crown", SHOW)]
+
+
+async def _session(caps, platform, store=None, host=None, **extra):
+    store = store or FakeStore()
+    store.add("DEV1", approved=True)
+    hub, host, store = make_hub(store, host)
+    admitted = await hub.admit(hello(caps, platform=platform, **extra), device_id="DEV1",
+                               peer_ip="10.0.0.5", secure=True, token=None)
+    link = FakeLink(hello(caps, platform=platform, **extra))
+    await admitted.sink.on_ready(link)
+    return hub.devices["DEV1"], link, host, admitted.sink
+
+
+RING, BUTTON = "no LED ring on this device", "no action button on this device"
+UPDATE, MANAGED = "firmware update available", "managed by the device"
+
+
+@pytest.mark.parametrize("platform, caps, gaps", [
+    ("fireos6", DOT, {"screen_wake": "no screen on this device"}),
+    ("fireos6", DOT_OLDER, {"screen_wake": "no screen on this device", "wifi_control": UPDATE,
+                            "ble_proxy": UPDATE, "privacy_mute": UPDATE}),
+    ("fireos6_crown", SHOW, {"leds": RING, "led_anim": RING, "buttons": BUTTON, "button_hold": BUTTON,
+                             "wifi_control": MANAGED, "ble_proxy": MANAGED,
+                             "privacy_mute": "mute not supported on this device yet"}),
+    ("fireos6_crown", [c for c in SHOW if c != "screen_wake"],
+     {"leds": RING, "led_anim": RING, "buttons": BUTTON, "button_hold": BUTTON,
+      "wifi_control": MANAGED, "ble_proxy": MANAGED,
+      "privacy_mute": "mute not supported on this device yet", "screen_wake": UPDATE}),
+    # Absent elsewhere, the dashboard's own per-capability reason applies.
+    ("fireos6", [c for c in DOT if c != "led_anim"], {"screen_wake": "no screen on this device"}),
+])
+def test_capability_gaps_name_the_reason_the_platform_gives(platform, caps, gaps):
+    async def scenario():
+        device, *_ = await _session(caps, platform)
+        assert device.capability_gaps == gaps
+        await device.close()
+    run(scenario())
+
+
+def test_no_session_no_gap():
+    assert em_device.capability_gap(None, [], Capability.WIFI_CONTROL) is None
+
+
+@pytest.mark.parametrize("platform, caps, reason", [
+    ("fireos6_crown", SHOW, MANAGED), ("fireos6", DOT_OLDER, UPDATE)])
+def test_wifi_change_and_scan_are_refused_with_the_reason(platform, caps, reason, monkeypatch):
+    pytest.importorskip("aiohttp")
+    from aiohttp import web
+    from aiohttp.test_utils import make_mocked_request
+
+    import em_api
+
+    async def body(_request):
+        return {"ssid": "Home", "psk": "correct horse"}
+
+    async def scenario():
+        device, link, *_ = await _session(caps, platform)
+        monkeypatch.setattr(em_api, "_devices", {"DEV1": device})
+        monkeypatch.setattr(em_api, "_json_body", body)
+        for handler in (em_api._post_device_wifi, em_api._post_device_wifi_scan):
+            request = make_mocked_request("POST", "/api/devices/DEV1/wifi",
+                                          match_info={"id": "DEV1"}, app=web.Application())
+            with pytest.raises(em_api.ApiError) as refused:
+                await handler.__wrapped__(request)
+            assert (refused.value.code, refused.value.status) == (em_api.ErrorCode.NOT_SUPPORTED, 409)
+            assert refused.value.message == f"Wi-Fi changes unavailable: {reason}"
+        assert not [t for t, _ in link.sent if t.startswith("wifi")]
+        await device.close()
+    run(scenario())
+
+
+def test_a_dot_announcing_wifi_control_may_change_wifi(monkeypatch):
+    pytest.importorskip("aiohttp")
+    import em_api
+
+    async def scenario():
+        device, *_ = await _session(DOT, "fireos6")
+        monkeypatch.setattr(em_api, "_devices", {"DEV1": device})
+        assert em_api._require_wifi_control("DEV1") is device
+        await device.close()
+    run(scenario())
+
+
+ADVERT = {"addr": "AA:BB:CC:DD:EE:FF", "addrType": 0, "rssi": -60, "data": "AgEG"}
+
+
+@pytest.mark.parametrize("platform, caps", DEVICES)
+def test_ble_adverts_reach_the_proxy_only_from_a_ble_proxy_device(platform, caps, caplog):
+    async def scenario():
+        host, forwarded = FakeHost(), []
+        host.ble_adverts = lambda device_id, adverts: forwarded.append(adverts)
+        device, _, _, sink = await _session(caps, platform, host=host)
+        for _ in range(2):
+            sink.on_message(envelope("ble_adverts", {"adverts": [ADVERT]}))
+        capable = "ble_proxy" in caps
+        assert forwarded == ([[ADVERT], [ADVERT]] if capable else [])
+        # Dropped, and said so once per session rather than per batch.
+        assert caplog.text.count("ble_adverts dropped") == (0 if capable else 1)
+        await device.close()
+    run(scenario())
+
+
+@pytest.mark.parametrize("platform, caps", DEVICES)
+def test_mute_is_shown_only_from_a_privacy_mute_device(platform, caps):
+    async def scenario():
+        device, _, host, sink = await _session(caps, platform)
+        sink.on_message(envelope("privacy.changed",
+                                 {"muted": True, "capture_epoch": None, "physical_seq": 1}))
+        await settle()
+        shown = True if "privacy_mute" in caps else None   # unavailable, never "off"
+        assert device.muted is True                          # as the device reported it
+        assert device.privacy_state is shown
+        assert {"muted": shown} in host.pushed
+        await device.close()
+    run(scenario())
+
+
+SCREEN = {"screenWake": True, "screenWakeUrl": "http://192.168.3.159:2323", "screenWakePassword": "pw"}
+
+
+@pytest.mark.parametrize("platform, caps, pushed", [
+    ("fireos6_crown", SHOW, SCREEN), ("fireos6", DOT, {}), ("fireos6", DOT_OLDER, {})])
+def test_screen_wake_config_goes_only_to_a_screen_wake_device(platform, caps, pushed):
+    async def scenario():
+        store = FakeStore()
+        store.configs["DEV1"] = {"duckDb": -18.0, **SCREEN}
+        device, link, *_ = await _session(caps, platform, store)
+        config = next(body for kind, body in link.sent if kind == "config")
+        assert {k: v for k, v in config.items() if k.startswith("screen")} == pushed
+        await device.close()
+    run(scenario())
+
+
+@pytest.mark.parametrize("platform, caps, painted", [
+    ("fireos6", DOT, True), ("fireos6", DOT_OLDER, True), ("fireos6_crown", SHOW, False)])
+def test_the_ring_is_painted_only_on_a_device_with_leds(platform, caps, painted):
+    async def scenario():
+        device, link, *_ = await _session(caps, platform)
+        await settle()
+        assert any(kind in ("leds", "led_anim") for kind, _ in link.sent) is painted
+        await device.close()
+    run(scenario())
+
+
+def test_the_dashboard_device_json_carries_the_platform_reasons(tmp_path, monkeypatch):
+    pytest.importorskip("aiohttp")
+    import em_api
+    import em_db
+
+    em_db.init(str(tmp_path / "t.db"))
+    em_db.register_new_device("DEV1", "10.0.0.5", "v3.0.0", None)
+    em_db.approve_device("DEV1", "Kitchen")
+
+    async def scenario():
+        device, *_ = await _session(SHOW, "fireos6_crown")
+        monkeypatch.setattr(em_api, "_devices", {"DEV1": device})
+        out = em_api._merge_device(em_db.get_device("DEV1"))
+        assert out["platform"] == "fireos6_crown"
+        assert out["muted"] is None                   # unavailable, not "off"
+        assert out["capability_gaps"]["wifi_control"] == "managed by the device"
+        assert out["capability_gaps"]["privacy_mute"] == "mute not supported on this device yet"
+        await device.close()
+        # Offline: nothing live to gate on.
+        monkeypatch.setattr(em_api, "_devices", {})
+        out = em_api._merge_device(em_db.get_device("DEV1"))
+        assert (out["platform"], out["capability_gaps"], out["muted"]) == (None, {}, None)
+    try:
+        run(scenario())
+    finally:
+        em_db._conn.close()
+        em_db._conn = None
+
+
+async def _ha_server(monkeypatch, *, platform=DevicePlatform.FIREOS6, volume_control=True):
+    """An ESPHome satellite server for DEV G090LF11 after device_connected,
+    with no listener."""
+    import em_esphome
+    from em_session import VoicePhase
+
+    async def no_listener(host):
+        return None
+
+    server = em_esphome.DeviceESPhomeServer("G090LF11", "Kitchen", "02:00:00:00:00:01", 16000)
+    monkeypatch.setattr(server, "start", no_listener)
+    monkeypatch.setitem(em_esphome._servers, "G090LF11", server)
+    await em_esphome.device_connected(
+        "G090LF11", label="Kitchen", capabilities=frozenset(ALL_V1), platform=platform,
+        hooks=em_esphome.Hooks(), volume=0.5, volume_control=volume_control,
+        voice_phase=VoicePhase.IDLE)
+    return em_esphome.EchoMuseSatellite(server)
+
+
+@pytest.mark.parametrize("platform, model", [
+    (DevicePlatform.FIREOS6, "Echo Dot Gen 2 (biscuit)"),
+    (DevicePlatform.FIREOS6_CROWN, "Echo Show 8 Gen 1 (crown)"),
+])
+def test_home_assistant_is_told_which_echo_the_platform_is(platform, model, monkeypatch):
+    pytest.importorskip("zeroconf")
+    from esphome.vendor import api_pb2
+
+    async def scenario():
+        satellite = await _ha_server(monkeypatch, platform=platform)
+        info = next(iter(satellite.handle_message(api_pb2.DeviceInfoRequest())))
+        # HA shows the part of project_name after the dot as the Model.
+        assert (info.model, info.project_name) == (model, f"EchoMuse.{model}")
+    run(scenario())
+
+
+# ─── Volume an Echo Show could not verify (hello `volume.level` null) ────────
+
+NO_VOLUME = {"level": None, "seeded": False}
+VOLUME_GAP = "volume control unavailable: Android volume check failed (see device log)"
+
+
+@pytest.mark.parametrize("volume, level, available", [
+    ({"level": 87, "seeded": True}, 87, True),
+    (NO_VOLUME, None, False),
+    ({"seeded": False}, None, True),    # no level: unknown, not "no volume control"
+])
+def test_a_null_volume_level_says_the_device_has_no_volume_control(volume, level, available):
+    parsed = hello(volume=volume)
+    assert (parsed.volume_level, parsed.volume_available) == (level, available)
+
+
+@pytest.mark.parametrize("volume, available", [({"level": 40, "seeded": True}, True), (NO_VOLUME, False)])
+def test_a_device_without_volume_control_is_sent_no_volume(volume, available, caplog):
+    async def scenario():
+        store = FakeStore()
+        store.configs["DEV1"] = {"duckDb": -18.0, "startupVolume": 85}
+        device, link, _, sink = await _session(SHOW, "fireos6_crown", store, volume=volume)
+        assert device.volume_available is available
+        assert device.volume_gap == (None if available else VOLUME_GAP)
+        assert device.volume == (40 if available else None)
+        config = next(body for kind, body in link.sent if kind == "config")
+        assert ("startupVolume" in config) is available
+        await device.set_volume(60)
+        assert (("volume_set", {"level": 60}) in link.sent) is available
+        assert ("volume_set 60 refused" in caplog.text) is not available
+        # A stray volume_state cannot invent a level either.
+        sink.on_message(envelope("volume_state", {"level": 50}))
+        await settle()
+        assert device.volume == (50 if available else None)
+        assert store.configs["DEV1"]["startupVolume"] == (50 if available else 85)
+        await device.close()
+    run(scenario())
+
+
+def test_the_dashboard_shows_no_volume_level_without_volume_control(tmp_path, monkeypatch):
+    pytest.importorskip("aiohttp")
+    import em_api
+    import em_db
+
+    em_db.init(str(tmp_path / "t.db"))
+    em_db.register_new_device("DEV1", "10.0.0.5", "v3.0.0", None)   # stored startupVolume 85
+    em_db.approve_device("DEV1", "Kitchen")
+
+    async def scenario():
+        device, *_ = await _session(SHOW, "fireos6_crown", volume=NO_VOLUME)
+        monkeypatch.setattr(em_api, "_devices", {"DEV1": device})
+        out = em_api._merge_device(em_db.get_device("DEV1"))
+        assert (out["volume"], out["volume_gap"]) == (None, VOLUME_GAP)
+        await device.close()
+    try:
+        run(scenario())
+    finally:
+        em_db._conn.close()
+        em_db._conn = None
+
+
+@pytest.mark.parametrize("volume_control", [True, False])
+def test_home_assistant_gets_no_volume_slider_or_level_without_volume_control(volume_control, monkeypatch):
+    pytest.importorskip("zeroconf")
+    import math
+
+    import em_esphome
+    from esphome.vendor import api_pb2
+
+    async def scenario():
+        satellite = await _ha_server(monkeypatch, platform=DevicePlatform.FIREOS6_CROWN,
+                                     volume_control=volume_control)
+        player = next(m for m in satellite.handle_message(api_pb2.ListEntitiesRequest())
+                      if isinstance(m, api_pb2.ListEntitiesMediaPlayerResponse))
+        volume_set = int(em_esphome.MediaPlayerEntityFeature.VOLUME_SET)
+        assert bool(player.feature_flags & volume_set) is volume_control
+        state = satellite._media_state_msg()
+        # NaN is what HA's ESPHome integration reports as an unknown level.
+        assert math.isnan(state.volume) is not volume_control
+        if volume_control:
+            assert state.volume == pytest.approx(0.5)
+    run(scenario())

@@ -94,3 +94,99 @@ Install deps if needed:
 ```bash
 pip3 install numpy matplotlib
 ```
+
+# slprobe — OpenSL ES capture/playback probe (Echo Show 8, `crown`)
+
+C rebuild of the probe in `docs/echo-show-crown.md` §4.4, used for the Phase 0
+measurements of `docs/echo-show-port-plan.md` (results in findings §10). It
+records through Android's AudioFlinger, the way the Show's firmware will, so
+nothing has to be stopped first; `audioserver` must stay running.
+
+- **Capture:** `SLDataLocator_IODevice` → `SLAndroidSimpleBufferQueue`, 16-bit
+  mono, `SL_ANDROID_KEY_RECORDING_PRESET` set before `Realize`. Each buffer
+  completion is stamped with `CLOCK_MONOTONIC` in the callback.
+- **Playback (optional):** an OpenSL buffer-queue player of a WAV (PCM16) or raw
+  S16LE file on a chosen `SL_ANDROID_KEY_STREAM_TYPE`, started `-D` ms after
+  `SetRecordState(RECORDING)`; each enqueue is stamped.
+- **Output:** `PREFIX.raw` (S16LE mono) and `PREFIX.ts` (text: `T0`, one `R` line
+  per completed buffer, `P` per player enqueue, `E` record events, `X` stalls;
+  format in the source header). A status line per second shows completions,
+  RMS and the digital-zero fraction, and `STALL`/`capture resumed` when buffers
+  stop and restart. `-x MS` cycles a stalled recorder (stop, clear, record)
+  every MS. `-d 0` runs until SIGINT/SIGTERM; `-o none` writes no files.
+
+`build_tools.sh` builds it with the image's NDK clang (`$CC`,
+`armv7a-linux-androideabi22-clang`, `-lOpenSLES`). Options: `slprobe -h`.
+
+```bash
+adb push build/slprobe /data/local/tmp/slprobe
+python3 tools/slprobe/stimulus.py loud loud.wav        # also writes loud.seg
+adb push loud.wav /data/local/tmp/
+adb shell /data/local/tmp/slprobe -p vr -d 29 -i /data/local/tmp/loud.wav -s music -o /data/local/tmp/cap
+adb pull /data/local/tmp/cap.raw /data/local/tmp/cap.ts .
+python3 tools/slprobe/decode.py cap --stim-seg loud.seg  # or 1 s windows without --stim-seg
+adb shell 'rm /data/local/tmp/slprobe /data/local/tmp/loud.wav /data/local/tmp/cap.*'
+```
+
+`decode.py` and `stimulus.py` need numpy. `decode.py` recovers the v3.3 bit-0 metadata with the firmware
+decoder's rule (`internal/audio/afe`: sync `0xA5`, version `0x63`, payload 104,
+popcount checksum) and prints capture timing plus, per segment, the level,
+`PLAYBACK_ACTIVE`, `ERLE_RAW`, `DTD`, `DNN_VAD_PROB`, `UED`, the clip, divergence
+and mute flags, `VOLUME`, and how long after each frame's `AFE_TIMESTAMP` its
+buffer completed. `--csv` dumps every frame. `stimulus.py` writes the
+`docs/echo-show-crown.md` §4.4 stimulus (`echo`) or the louder Phase 0
+programme (`loud`).
+
+# sl_latency — render-to-capture lag through the firmware's own audio path (Echo Show 8, `crown`)
+
+Measures what `internal/opensl`'s `playPipelineNs` is a bound for
+(`docs/echo-show-port-plan.md` decision 4, Phase 1): how the firmware's render
+stamps line up with its capture stamps. It is Go inside the firmware module
+and opens audio exactly as the firmware does (`slmic.OpenOpenSL`,
+`slspeaker.NewOpenSL`): one `VOICE_RECOGNITION` recorder, capture periods
+stamped from `AFE_TIMESTAMP`, and an OpenSL player on `STREAM_MUSIC` fed
+`render.SinkFrames` writes, stamped from the queue depth.
+
+- **Run:** a silent lead-in, then `-n` bursts (`-burst` long, a `-freq` Hz
+  tone or white noise at `-level` dBFS peak), each starting a write, `-gap`
+  apart; then, unless `-stall 0`, one more burst after the writer has stalled
+  `-stall` so the queue ran dry; then a silent tail.
+- **Reference onset:** the burst's first frame as the render accounting
+  stamps it, the completion stamp of its write less one write. `fit-ref` is
+  the supervisor's render clock fit for that frame at the moment it was
+  written, against it.
+- **Capture onsets,** on the firmware's capture stamps, within 300 ms before
+  to 1.5 s after the reference onset:
+  - `pa`: the AFE frame where `PLAYBACK_ACTIVE` rose. The AFE computes it on
+    its input timeline, so it leads the echo in its output (51.8 ms on the
+    Dot, `docs/afe-metadata.md` §1.3); 8 ms resolution.
+  - `erle`: the frame where `ERLE_RAW` rose.
+  - `pcm`: the burst in the AEC residual, by matched filter (energy at
+    `-freq`, or total energy for noise, over a burst-length window). This is
+    the lag the controller's echo comparison sees. It counts only `-min-snr`
+    dB over the room: `VOICE_RECOGNITION` cancels tones by 37–49 dB, so use a
+    higher `-index` or `-wave noise`.
+- **Report:** one row per burst (lags in ms; `pcm_lag` must never be
+  negative, which the report flags), the lag summaries, `pcm − pa`, the AFE
+  decoder's totals (periods, frames, invalid, syncs, gaps, lost), how many
+  periods were stamped from `AFE_TIMESTAMP` or at completion, the mic's
+  drops, and the distribution of read completion − `AFE_TIMESTAMP`.
+- **`-index N`** sets `STREAM_MUSIC` for the run through `service call
+  audio` and restores it afterwards (also on Ctrl-C). **`-o PREFIX`** writes
+  `PREFIX.raw` (the capture as delivered, bit 0 included),
+  `PREFIX.periods.csv` (per period: first sample, stamp, completion, anchor)
+  and `PREFIX.writes.csv` (per write: burst, stall, completion stamp).
+
+Stop `echomuse` first: on Android 7.1 the first recorder holds the input and
+a later one gets no buffers (findings §10.2), and the tool gives up after
+5 s without one. Its pure-Go half, `tools/sl_latency/latency`, has host tests
+(`go test ./tools/...`).
+
+```bash
+adb shell stop echomuse
+adb push build/sl_latency /data/local/tmp/sl_latency
+adb shell /data/local/tmp/sl_latency -n 10 -index 18 -o /data/local/tmp/echomuse/lat
+adb pull /data/local/tmp/echomuse/lat.raw /data/local/tmp/echomuse/lat.periods.csv /data/local/tmp/echomuse/lat.writes.csv .
+adb shell 'rm -r /data/local/tmp/sl_latency /data/local/tmp/echomuse/lat.*'
+adb shell start echomuse
+```

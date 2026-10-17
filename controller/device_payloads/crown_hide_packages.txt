@@ -1,0 +1,75 @@
+# EchoMuse on the Echo Show 8 (`crown`): Tier 1, the packages that must be
+# hidden (docs/echo-show-crown.md §9.1). Applied by the provisioning wizard's
+# Neutralise Alexa step, and re-asserted by start_server.sh at every boot.
+#
+# `pm hide`, not `pm disable` and never `pm uninstall`: hiding persists in
+# /data/system/users/0/package-restrictions.xml, keeps a persistent app from
+# being restarted, and is undone with `pm unhide <package>`. Nothing on
+# /system changes.
+#
+# Without these, Alexa can take back the microphone (the calling and camera
+# apps), the speaker (alarms, multi-room, media), the screen (OOBE,
+# launcher, screensaver), or undo the neutralisation itself: the packages
+# holding CHANGE_COMPONENT_ENABLED_STATE, INSTALL_PACKAGES, DELETE_PACKAGES
+# or MASTER_CLEAR are here, so that a hidden package cannot be re-enabled
+# and /data cannot be factory-reset from under EchoMuse.
+#
+# Two of these are the stock HOME activities (com.amazon.ds2.oobe.efd and
+# com.amazon.paladin). The wizard refuses to hide them until a non-Amazon
+# HOME activity (the user's kiosk) is offered; hiding them with no other
+# HOME leaves only FallbackHome and a blank screen.
+#
+# NEVER hidden, measured on the Show (2026-10-17), and refused by the wizard
+# should a list ever name them:
+#   amazon.speech.sim — Alexa's wake engine. Hidden, KnightSystemUI
+#     crash-loops ("SimClient was never got created", 10 min after boot) and
+#     four SIM clients crash with dialogs on screen. It stays visible with
+#     its microphone denied instead (crown_mic_deny_packages.txt).
+#   com.amazon.kindle.otter.oobe — no HOME activity, but KnightSettings
+#     looks it up when it starts; hidden, every Settings page crashes
+#     (NameNotFoundException), and with them on-device Wi-Fi and Bluetooth.
+#   com.amazon.bluestone.keyboard — the Show's only input method (findings
+#     §9.3); the wizard also never hides whatever package holds every
+#     enabled keyboard. Its dictation microphone is denied instead.
+#
+# One package per line; lines starting with # are comments. Adding a package
+# means repeating docs/echo-show-crown.md §9.4's verification on a device
+# first (the rule docs/fireos6-port.md §4.1 set for the Dot's denylist).
+
+# Microphone and camera
+com.amazon.comms.multimodaltachyonarm
+com.amazon.zordon
+com.amazon.rtcsessioncontroller
+com.amazon.a4b.conferencing.chime
+com.amazon.comms.knightmessaging
+com.amazon.obscura
+com.amazon.device.gadgetscontrolmanager
+
+# Screen: setup, launcher (and its ClockDream screensaver), home UI
+com.amazon.ds2.oobe.efd
+com.amazon.paladin
+com.amazon.bishop
+com.amazon.ambienthome
+com.amazon.spotlight
+
+# Speaker: alerts, multi-room audio (with init service whad_cc), media
+com.amazon.alarms
+com.amazon.whad
+com.amazon.alexa.externalmediaplayer.fireos
+
+# Remote management, app installs and updates, component re-enabling
+com.amazon.device.rdmapplication
+com.amazon.d3
+com.amazon.venezia
+com.amazon.adep
+com.amazon.alta.h2clientservice
+
+# Factory reset and reboot
+com.amazon.diode
+com.amazon.settings.windfall
+com.amazon.csapp
+
+# OTA stays disabled (the first two already are on the tested build)
+com.amazon.device.software.ota
+com.amazon.device.software.ota.override
+com.amazon.device.smarthome.ota

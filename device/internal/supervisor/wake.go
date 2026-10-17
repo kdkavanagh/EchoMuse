@@ -44,8 +44,9 @@ func (s *Supervisor) producingSound(from, to uint64) bool {
 
 // onCandidate opens the candidate lease and, when the device was producing
 // sound, the provisional duck, starts the local wake chime when it applies,
-// then reports the candidate. The controller decides every candidate,
-// including while capture is not permitted.
+// lights the kiosk screen when screen wake is on, then reports the
+// candidate. The controller decides every candidate, including while
+// capture is not permitted.
 func (s *Supervisor) onCandidate(c detector.Candidate) {
 	s.up.OpenCandidate(c.LeaseID, c.SupportStart)
 	// The provisional duck waits for the ack exactly as long as its lease.
@@ -54,6 +55,7 @@ func (s *Supervisor) onCandidate(c detector.Candidate) {
 	// Before the report and outside mu: the mixer delivers its queued
 	// finished/progress hooks, which lock mu, on this goroutine.
 	body.Chimed = s.localWakeChime(c, body.ActiveAlert != nil)
+	s.screenWake()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -90,6 +92,18 @@ func (s *Supervisor) localWakeChime(c detector.Candidate, alertActive bool) bool
 		return false
 	}
 	return true
+}
+
+// screenWake asks the kiosk to light the screen (screen_wake, config
+// screenWake) at every candidate open; the request is asynchronous and its
+// failures never touch the wake path.
+func (s *Supervisor) screenWake() {
+	if !s.has(proto.CapScreenWake) {
+		return
+	}
+	if v := s.cfg.DeviceConfig.Get(); v.ScreenWake {
+		s.cfg.ScreenOn(v.ScreenWakeURL, v.ScreenWakePassword)
+	}
 }
 
 func (s *Supervisor) onCandidateEnd(e detector.CandidateEnd) {

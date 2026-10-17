@@ -1,0 +1,23 @@
+# EchoMuse on the Echo Show 8 (`crown`): Amazon packages that stay installed
+# and visible but may not record. Applied by the provisioning wizard's
+# Neutralise Alexa step after hiding Tier 1, and re-asserted by
+# start_server.sh at every boot while Tier 1 is applied.
+#
+# `appops set <package> RECORD_AUDIO ignore`: AudioFlinger then refuses the
+# package's recorder even with RECORD_AUDIO granted ("Request denied by app
+# op OP_RECORD_AUDIO"; measured 2026-10-17, the recorder fails to realize).
+# The mode persists in /data/system/appops.xml. Undo with
+# `appops set <package> RECORD_AUDIO default`.
+#
+# These are packages hiding would break (crown_hide_packages.txt's header
+# has the measurements), so their microphone is closed instead: Android 7.1
+# allows one recording at a time, and it is EchoMuse's.
+#
+# One package per line; lines starting with # are comments. Never a package
+# on a hide list: a hidden package records nothing anyway.
+
+# Alexa's wake engine; hiding it crash-loops KnightSystemUI
+amazon.speech.sim
+
+# Amazon's dictation keyboard, the Show's only input method
+com.amazon.bluestone.keyboard

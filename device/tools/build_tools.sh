@@ -27,6 +27,47 @@ build_tool() {
     echo "Output: $BUILD_DIR/$name"
 }
 
+# C tools (slprobe) build with the same image's NDK clang ($CC is
+# armv7a-linux-androideabi22-clang from NDK 21.4), linking the platform's
+# libOpenSLES.so.
+build_c_tool() {
+    local name=$1
+    local tool_dir="$(pwd)/tools/$name"
+
+    echo "Building $name..."
+    docker run --rm \
+        --entrypoint bash \
+        -v "$tool_dir":/sdk \
+        echomuse-compiler \
+        -c "cd /sdk && \$CC -O2 -Wall -Wextra -o $name $name.c -lOpenSLES -lm -Wl,--hash-style=both"
+
+    mkdir -p "$BUILD_DIR"
+    mv "$tool_dir/$name" "$BUILD_DIR/$name"
+    echo "Output: $BUILD_DIR/$name"
+}
+
+# Go tools inside the firmware's own module (sl_latency) import its internal
+# packages, so they build from device/ with the firmware stage's cgo flags.
+build_fw_tool() {
+    local name=$1
+    local tool_dir="$(pwd)/tools/$name"
+
+    echo "Building $name..."
+    docker run --rm \
+        --entrypoint bash \
+        -e CGO_CFLAGS="-Wno-deprecated-declarations -Wno-null-dereference" \
+        -v "$(pwd)":/sdk \
+        echomuse-compiler \
+        -c "cd /sdk && go build -tags server -o tools/$name/$name ./tools/$name"
+
+    mkdir -p "$BUILD_DIR"
+    mv "$tool_dir/$name" "$BUILD_DIR/$name"
+    echo "Output: $BUILD_DIR/$name"
+}
+
+# slprobe first: it needs no GoTinyAlsa submodule, the Go tools do.
+build_c_tool slprobe
+build_fw_tool sl_latency
 build_tool capture_mics
 build_tool bf_capture
 
@@ -44,3 +85,12 @@ echo "  adb shell start mixer && adb shell start echomuse"
 echo ""
 echo "Without adb, push over the controller shell plane instead:"
 echo "  python controller/tools/push_file.py <local> <remote>   (resumable)"
+echo ""
+echo "slprobe (Echo Show, crown; see tools/README.md):"
+echo "  adb push $BUILD_DIR/slprobe /data/local/tmp/slprobe"
+echo "  adb shell /data/local/tmp/slprobe -p vr -d 10 -o /data/local/tmp/cap"
+echo ""
+echo "sl_latency (Echo Show, crown; see tools/README.md):"
+echo "  adb shell stop echomuse"
+echo "  adb push $BUILD_DIR/sl_latency /data/local/tmp/sl_latency"
+echo "  adb shell /data/local/tmp/sl_latency -n 10 -o /data/local/tmp/echomuse/lat"

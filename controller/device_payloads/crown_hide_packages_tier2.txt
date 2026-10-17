@@ -1,0 +1,62 @@
+# EchoMuse on the Echo Show 8 (`crown`): Tier 2, recommended but optional
+# (docs/echo-show-crown.md §9.2). Hidden only when the operator ticks it in
+# the provisioning wizard's Neutralise Alexa step (off by default), and then
+# re-asserted by start_server.sh at every boot alongside Tier 1.
+#
+# These free memory and stop Amazon's cloud, telemetry and radio use. None of
+# them can take the microphone, the speaker or the screen; that is Tier 1.
+# Apply Tier 2 once a Tier 1 baseline has passed §9.4 on the device: the
+# Show's own Wi-Fi and Bluetooth (Android's WifiService and
+# com.android.bluetooth, configured from the device's Settings) must still
+# join a network and pair afterwards.
+#
+# Same mechanism and undo as Tier 1: `pm hide`, reversed by
+# `pm unhide <package>`. Running the wizard again with Tier 2 unticked unhides
+# this list.
+#
+# One package per line; lines starting with # are comments. Package names
+# are this build's (NS65741/8146, `pm list packages -u`); the findings name
+# some as families (com.amazon.device.smarthome.*, com.amazon.whisperjoin.*).
+# Adding a package means repeating §9.4's verification on a device first.
+
+# Alexa account and cloud
+com.amazon.alexa.identity
+com.amazon.alexa.datastore.app
+com.amazon.alexa.beaconbroadcaster
+com.amazon.alexa.timeoutmanagerapp
+com.amazon.tcomm
+com.amazon.device.messaging
+com.amazon.imp
+com.amazon.neodelegate
+com.amazon.banyan.core
+amazon.speech.davs.davcservice
+com.amazon.assetsync.service
+com.amazon.a4b.mcc
+com.amazon.ods.kindleconnect
+com.amazon.mlv
+com.amazon.smarthomemapviewapp
+com.amazon.afe.app
+
+# Smart home, Matter, BLE mesh, Sidewalk, Frustration-Free Setup, Wi-Fi sync:
+# Amazon's layers over Android's own Wi-Fi and Bluetooth, which stay.
+# (com.amazon.device.smarthome.ota is in Tier 1.)
+com.amazon.device.smarthome.adapters.ble
+com.amazon.device.smarthome.adapters.echo
+com.amazon.device.smarthome.adapters.wifi
+com.amazon.device.smarthome.dshs.consentmanagementca
+com.amazon.device.smarthome.dshs.endpointdetectorCA
+com.amazon.device.smarthome.dshs.multimodalux
+com.amazon.device.smarthome.dshs.services
+com.amazon.whisperjoin.middleware.v2
+com.amazon.whisperjoin.wss.wifiprovisioner
+com.amazon.wifi.sync
+com.ring.halo.messaging
+com.amazon.gloria.smarthome
+
+# Telemetry and remote configuration
+com.amazon.device.metrics
+com.amazon.device.logmanager
+com.amazon.device.crashmanager
+com.amazon.logan
+com.fireos.usagestats.proxy
+com.fireos.arcus.proxy

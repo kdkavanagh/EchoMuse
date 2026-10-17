@@ -107,10 +107,21 @@ const CAPABILITY = Object.freeze({
   DEVICE_WAKE:     'device_wake_v1',
   RENDER_PROGRESS: 'render_progress_v1',
   FOCUS_LEASES:    'focus_leases_v1',
+  LEDS:            'leds',
   LED_ANIM:        'led_anim',
   BUTTON_HOLD:     'button_hold',
   OPEN_RULES:      'open_rules_v1',
   AFE_METADATA:    'afe_metadata_v1',
+  WIFI_CONTROL:    'wifi_control',
+  BLE_PROXY:       'ble_proxy',
+  PRIVACY_MUTE:    'privacy_mute',
+  SCREEN_WAKE:     'screen_wake',
+});
+
+// em_device_link.DevicePlatform — the image a device's session runs on.
+const PLATFORM_LABEL = Object.freeze({
+  fireos6:       'Echo Dot 2nd gen · Fire OS 6',
+  fireos6_crown: 'Echo Show 8 1st gen · Fire OS 6',
 });
 
 // deviceState()'s key: what the dashboard shows a device doing. Derived here
@@ -318,7 +329,10 @@ function _emitEvent(msg) {
 
 // Why a control is unavailable on a connected device that lacks a capability
 // (§11.1). Features are gated on the capability set the device announced in
-// session.hello, never on its firmware version.
+// session.hello, never on its firmware version. The controller's own reason
+// (`capability_gaps`, em_device.capability_gap) comes first: it knows the
+// platform, so an Echo Show reads "managed by the device" or "no LED ring on
+// this device" where an older Dot reads "firmware update available".
 const CAPABILITY_REASONS = Object.freeze({
   [CAPABILITY.DEVICE_WAKE]:     'this firmware has no on-device wake detector — update it',
   [CAPABILITY.RENDER_PROGRESS]: 'this firmware cannot play device-local sounds — update it',
@@ -330,17 +344,19 @@ const CAPABILITY_REASONS = Object.freeze({
 });
 
 // The reason `cap` is missing, or null when the control is available.
-// `capabilities` null means "no live device to ask" (the fleet view, or an
-// offline device whose settings apply when it returns): nothing is gated.
+// `capabilities` is liveCapabilities(): null means "no live device to ask"
+// (the fleet view, or an offline device whose settings apply when it
+// returns), and nothing is gated.
 function capabilityGap(capabilities, cap) {
-  if (!Array.isArray(capabilities) || capabilities.includes(cap)) return null;
-  return CAPABILITY_REASONS[cap] || `needs the ${cap} capability — update this Echo`;
+  if (capabilities == null || capabilities.names.includes(cap)) return null;
+  return capabilities.gaps[cap] || CAPABILITY_REASONS[cap] || `needs the ${cap} capability — update this Echo`;
 }
 
 // The live capability set to gate on: null unless a current-protocol session
-// is up (see capabilityGap).
+// is up (see capabilityGap). `names` is what the device announced; `gaps` the
+// controller's reason for each absent one whose reason depends on the platform.
 function liveCapabilities(d) {
-  return d.connected ? (d.capabilities || []) : null;
+  return d.connected ? { names: d.capabilities || [], gaps: d.capability_gaps || {} } : null;
 }
 
 // Simulated LED colour for a device the controller cannot use: offline.
@@ -2064,6 +2080,11 @@ function ConnectivityTab({ device, row }) {
   const busy  = !!pending;
   const valid = ssid && (!psk || (psk.length >= 8 && psk.length <= 63)) &&
                 !/["\\]/.test(ssid) && !/["\\]/.test(psk);
+  // wifi_control: the firmware manages Wi-Fi for EchoMuse. On an Echo Show
+  // Android owns the network ("managed by the device"); the controller
+  // refuses these requests there too.
+  const wifiGap = capabilityGap(liveCapabilities(device), CAPABILITY.WIFI_CONTROL);
+  const locked  = busy || !!wifiGap;
 
   return (
     <div style={{ minHeight:'100%', display:'flex', flexDirection:'column', gap:16 }}>
@@ -2109,9 +2130,10 @@ function ConnectivityTab({ device, row }) {
 
         <Panel label="Visible networks">
           <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:8 }}>
-            <Pill small disabled={scanning || !device.connected || busy} onClick={doScan}>
+            <Pill small disabled={scanning || !device.connected || locked} onClick={doScan}>
               {scanning ? 'Scanning…' : networks ? 'Rescan' : 'Scan'}
             </Pill>
+            {wifiGap && <span style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)' }}>{wifiGap}</span>}
             {scanError && <span style={{ fontFamily:MONO, fontSize:10, color:'var(--warn)' }}>{scanError}</span>}
           </div>
           {networks && networks.length === 0 && (
@@ -2120,8 +2142,8 @@ function ConnectivityTab({ device, row }) {
           {networks && networks.length > 0 && (
             <div style={{ maxHeight:170, overflowY:'auto' }}>
               {networks.map(n => (
-                <div key={n.ssid} {...pressable(() => setSsid(n.ssid), { disabled: busy, selected: ssid === n.ssid })}
-                  style={{ display:'flex', justifyContent:'space-between', alignItems:'center', padding:'5px 8px', borderRadius:6, cursor: busy ? 'default' : 'pointer', background: ssid === n.ssid ? 'rgba(64,88,120,0.12)' : 'transparent' }}>
+                <div key={n.ssid} {...pressable(() => setSsid(n.ssid), { disabled: locked, selected: ssid === n.ssid })}
+                  style={{ display:'flex', justifyContent:'space-between', alignItems:'center', padding:'5px 8px', borderRadius:6, cursor: locked ? 'default' : 'pointer', background: ssid === n.ssid ? 'rgba(64,88,120,0.12)' : 'transparent' }}>
                   <span style={{ fontFamily:MONO, fontSize:11, color: ssid === n.ssid ? 'var(--accent)' : 'var(--text)' }}>
                     {n.ssid}{n.ssid === currentSsid ? '  ← current' : ''}
                   </span>
@@ -2134,27 +2156,33 @@ function ConnectivityTab({ device, row }) {
       </div>
 
       <Panel label="Change network">
-        <div style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)', marginBottom:12 }}>
-          The device applies the change itself and rolls back automatically if the new network doesn't
-          work out — including when it connects but can't reach this controller (wrong VLAN, isolated
-          guest network). The previous network is only discarded once the device reports back here.
-        </div>
+        {wifiGap ? (
+          <div style={{ fontFamily:MONO, fontSize:10, color:'var(--warn)', marginBottom:12 }}>
+            Wi-Fi changes unavailable: {wifiGap}
+          </div>
+        ) : (
+          <div style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)', marginBottom:12 }}>
+            The device applies the change itself and rolls back automatically if the new network doesn't
+            work out — including when it connects but can't reach this controller (wrong VLAN, isolated
+            guest network). The previous network is only discarded once the device reports back here.
+          </div>
+        )}
         <div className="em-grid2" style={{ display:'grid', gridTemplateColumns:'1fr 1fr auto', gap:12, alignItems:'end' }}>
           <div>
             <div style={{ fontFamily:MONO, fontSize:9, color:'var(--text2)', letterSpacing:'0.08em', marginBottom:4 }}>SSID</div>
-            <input type="text" value={ssid} disabled={busy} onChange={e => setSsid(e.target.value)} aria-label="SSID"
+            <input type="text" value={ssid} disabled={locked} onChange={e => setSsid(e.target.value)} aria-label="SSID"
               placeholder="Network name" style={{ width:'100%', boxSizing:'border-box' }}/>
           </div>
           <div>
             <div style={{ fontFamily:MONO, fontSize:9, color:'var(--text2)', letterSpacing:'0.08em', marginBottom:4 }}>Passphrase</div>
             <div style={{ display:'flex', gap:6 }}>
-              <input type={showPsk ? 'text' : 'password'} value={psk} disabled={busy} onChange={e => setPsk(e.target.value)} aria-label="Passphrase"
+              <input type={showPsk ? 'text' : 'password'} value={psk} disabled={locked} onChange={e => setPsk(e.target.value)} aria-label="Passphrase"
                 placeholder="WPA passphrase (blank = open)" style={{ flex:1, boxSizing:'border-box' }}/>
               <Pill small onClick={() => setShowPsk(v => !v)}>{showPsk ? 'Hide' : 'Show'}</Pill>
             </div>
           </div>
           {!confirming ? (
-            <Pill accent disabled={!valid || busy || !device.connected} onClick={() => setConfirming(true)}>Switch…</Pill>
+            <Pill accent disabled={!valid || locked || !device.connected} onClick={() => setConfirming(true)}>Switch…</Pill>
           ) : (
             <div style={{ display:'flex', gap:8 }}>
               <Pill danger onClick={doSwitch}>Confirm switch</Pill>
@@ -3481,12 +3509,19 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
             const stoPct   = s?.storageTotalMb ? s.storageUsedMb/s.storageTotalMb*100 : null;
             const stoText  = s?.storageTotalMb != null
               ? `${(s.storageUsedMb/1024).toFixed(1)} / ${(s.storageTotalMb/1024).toFixed(1)} GB` : null;
+            // Privacy mute is shown only from a device with a hardware mute it
+            // reports (privacy_mute); elsewhere it is unavailable, with why.
+            const muteGap  = capabilityGap(liveCapabilities(device), CAPABILITY.PRIVACY_MUTE);
+            const muteText = !device.connected ? '—'
+              : muteGap ? `unavailable — ${muteGap}`
+              : device.muted == null ? '—' : device.muted ? 'Muted' : 'Off';
             return (
               <div style={{ minHeight:'100%', display:'flex', flexDirection:'column', gap:16 }}>
                 <div className="em-grid2" style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:16 }}>
                   <Panel label="Device">
                     {row('IP', deviceIpText(device, ' (last seen)'))}
                     {row('OS', device.os_version || '—')}
+                    {row('Platform', device.platform ? (PLATFORM_LABEL[device.platform] || device.platform) : '—')}
                     {row('EchoMuse firmware', device.firmware_ver || '—')}
                     {row('WiFi network', s?.wifiSsid || '—')}
                     {row('ESPHome port', device.esphome_port != null ? String(device.esphome_port) : '—')}
@@ -3498,9 +3533,12 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                     {row('Status',
                          device.connected ? 'Online' : `Offline · last seen ${relTime(device.last_seen)}`,
                          device.connected ? 'var(--ok)' : 'var(--warn)')}
-                    {row('Volume', device.volume != null
+                    {row('Volume', device.volume_gap ? `unavailable — ${device.volume_gap}`
+                         : device.volume != null
                          ? `${Math.round(device.volume * 100)}%`
-                         : (s?.volumePct != null ? `${s.volumePct}%` : '—'))}
+                         : (s?.volumePct != null ? `${s.volumePct}%` : '—'),
+                         device.volume_gap ? 'var(--muted)' : undefined)}
+                    {row('Mute', muteText, muteGap ? 'var(--muted)' : device.muted ? 'var(--error)' : undefined)}
                     {row('Link', device.connected ? (device.linkTls ? 'wss (TLS)' : 'plain ws') : '—',
                          device.connected ? (device.linkTls ? 'var(--ok)' : 'var(--warn)') : undefined)}
                     {row('Config', (() => {
@@ -3794,7 +3832,8 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                     Re-apply the debloat: re-sync the start script, which carries the service
                     denylist, and stop Amazon's services now — no reboot needed. The same list is
                     stopped on every boot and with every firmware update; this is for a device
-                    already on the current firmware. Idempotent.
+                    already on the current firmware. Idempotent. On an Echo Show it also re-syncs
+                    the Alexa hide lists and re-hides any listed app that has become visible.
                   </div>
                   <Pill small disabled={!device.connected || debloating} onClick={doDebloat}>
                     {debloating ? 'Applying…' : 'Re-apply debloat'}
@@ -4114,14 +4153,28 @@ const LOG_TONE_COLOR = Object.freeze({
   [LOG_TONE.ERROR]: 'var(--error)', [LOG_TONE.OK]: 'var(--ok)', [LOG_TONE.WARN]: 'var(--warn)',
 });
 
+// The devices the wizard provisions, by their em_device_link.DevicePlatform
+// value: the string the firmware announces in session.hello once installed.
+const WIZARD_PLATFORM = Object.freeze({ DOT: 'fireos6', CROWN: 'fireos6_crown' });
+
+// What a step is called on each, for "not applicable" notes.
+const WIZARD_PLATFORM_NAME = Object.freeze({
+  [WIZARD_PLATFORM.DOT]: 'Echo Dot', [WIZARD_PLATFORM.CROWN]: 'Echo Show 8',
+});
+
 // What connect_android requires of the device's own properties before it
-// trusts the shell: Fire OS 6 (Android 7.1.x, biscuit_puffin) with the adb
-// shell already root via boot-root.zip. Throws the refusal; pure and
-// side-effect-free so every outcome is testable without a device.
+// trusts the shell, and which device that makes it:
+//  - Echo Dot 2nd gen: Fire OS 6 (Android 7.1.x, biscuit_puffin) with the adb
+//    shell already root via boot-root.zip;
+//  - Echo Show 8 1st gen: Fire OS 6 (Android 7.1.x, product crown) with the
+//    adb shell already root via the crown thread's boot-root.img.
+// Returns the WIZARD_PLATFORM; throws the refusal. Pure and side-effect-free
+// so every outcome is testable without a device.
 //
-// `uid` is the trimmed stdout of `id -u`.
-function requireFireOS6(opts) {
-  const { release, productName, uid } = opts;
+// `uid` is the trimmed stdout of `id -u`; `productName` and `productDevice`
+// are ro.product.name and ro.product.device.
+function classifyDevice(opts) {
+  const { release, productName, productDevice, uid } = opts;
   const rel = release || '';
   if (rel.startsWith('5.')) {
     throw new Error(
@@ -4131,12 +4184,22 @@ function requireFireOS6(opts) {
   }
   if (!rel.startsWith('7.1')) {
     throw new Error(
-      `Expected Fire OS 6 (Android 7.1.x, biscuit_puffin), got Android ${rel}. Wrong device?`);
+      `Expected Fire OS 6 (Android 7.1.x: an Echo Dot 2nd gen, biscuit_puffin, or an Echo `
+      + `Show 8 1st gen, crown), got Android ${rel}. Wrong device?`);
+  }
+  if (productName === 'crown' || productDevice === 'crown') {
+    if (uid !== '0') {
+      throw new Error(
+        `This is an Echo Show 8 (crown, Android ${rel}) but the adb shell is not root `
+        + `(id -u = "${uid || '(unknown)'}"). Unlock it and flash boot-root.img as R0rt1z2's `
+        + `crown thread describes first — see https://xdaforums.com/t/unlock-root-twrp-unbrick-amazon-echo-show-8-1st-gen-2019-crown.4766687/`);
+    }
+    return WIZARD_PLATFORM.CROWN;
   }
   if (productName !== 'biscuit_puffin') {
     throw new Error(
       `Android ${rel} but product is "${productName || '(unknown)'}", not "biscuit_puffin" `
-      + `— Fire OS 6 on this Dot is always biscuit_puffin. Wrong device?`);
+      + `(Echo Dot 2nd gen) or "crown" (Echo Show 8 1st gen). Wrong device?`);
   }
   if (uid !== '0') {
     throw new Error(
@@ -4144,6 +4207,7 @@ function requireFireOS6(opts) {
       + `(id -u = "${uid || '(unknown)'}"). Fire OS 6 needs R0rt1z2's boot-root.zip flashed `
       + `from TWRP first — see https://xdaforums.com/t/unlock-root-twrp-unbrick-amazon-echo-dot-2nd-gen-2016-biscuit.4761416/`);
   }
+  return WIZARD_PLATFORM.DOT;
 }
 
 // /system/etc/init/echomuse.rc, written byte-for-byte by install_boot_hook
@@ -4167,13 +4231,39 @@ on property:sys.boot_completed=1
     start echomuse
 `;
 
+// The Echo Show 8's echomuse.rc (docs/echo-show-port-plan.md decisions 10
+// and 11). uid 0 with primary group `audio`: `aipc` is the Dot's mixer's
+// requirement and means nothing here. No wifi, bluetooth, net_admin or
+// input groups either: the Show's Wi-Fi, Bluetooth and keys are Android's,
+// and the firmware leaves them alone. The same way in as the Dot, measured
+// on the Show (docs/echo-show-crown.md §10.4): init starts the script in
+// `adbd`, where audioserver refuses its binder replies (no capture, no
+// `pm`), and start_server.sh moves itself into `su`, where both work.
+// boot_completed matters more here: the script's re-hiding needs the
+// package manager. Same trailing-newline rule.
+const _ECHOMUSE_RC_CROWN = `service echomuse /system/bin/sh /data/local/bin/start_server.sh
+    class late_start
+    user root
+    group audio system inet net_raw wakelock
+    seclabel u:r:adbd:s0
+    disabled
+
+on property:sys.boot_completed=1
+    start echomuse
+`;
+
+// The boot hook a platform gets.
+function _rcFor(platform) {
+  return platform === WIZARD_PLATFORM.CROWN ? _ECHOMUSE_RC_CROWN : _ECHOMUSE_RC;
+}
+
 // Whether the file already on device matches what install_boot_hook would
 // write — the remount-write-remount dance is skipped when it does, so a
 // re-run (or a second device provisioned from the same session) doesn't
 // pay for a write that changes nothing. `existing` is `cat`'s output,
-// already trimmed by Client.shell(); _ECHOMUSE_RC is trimmed to match.
-function _rcInstalled(existing) {
-  return (existing || '').trim() === _ECHOMUSE_RC.trim();
+// already trimmed by Client.shell(); `rc` is trimmed to match.
+function _rcInstalled(existing, rc = _ECHOMUSE_RC) {
+  return (existing || '').trim() === rc.trim();
 }
 
 // The Fire OS 6 build EchoMuse is developed and tested against. "NS6569/6009"
@@ -4189,6 +4279,182 @@ function _rcInstalled(existing) {
 // would be the worse error. Mirrored in docs/rooting.md, pinned by test.
 const _TESTED_FIREOS6_BUILD = 'NS6569/6009';
 const _TESTED_FIREOS6_NAME  = 'Fire OS 6.5.6.9';
+// The Echo Show 8's, the same way: the one unit the port was measured on
+// reads "Fire OS 6574.1 (NS65741/8146)" (docs/echo-show-crown.md §1). It
+// matters more here than on the Dot: the Show's volume control uses binder
+// transaction codes pinned for this build.
+const _TESTED_CROWN_BUILD = 'NS65741/8146';
+const _TESTED_CROWN_NAME  = 'Fire OS 6574.1';
+
+// The untested-build warning for a device, or null when it runs the tested
+// build (or says nothing about its build). `buildIds` are
+// ro.build.version.name and ro.build.display.id: either may carry the code.
+function untestedBuild(platform, buildIds) {
+  const [code, name] = platform === WIZARD_PLATFORM.CROWN
+    ? [_TESTED_CROWN_BUILD, _TESTED_CROWN_NAME]
+    : [_TESTED_FIREOS6_BUILD, _TESTED_FIREOS6_NAME];
+  const ids = (buildIds || []).filter(Boolean);
+  if (!ids.length || ids.some(id => id.includes(code))) return null;
+  return `Untested OS build — EchoMuse is developed against ${name} (${code}) on the `
+       + `${WIZARD_PLATFORM_NAME[platform]}. Other Fire OS 6 builds may behave differently.`;
+}
+
+// The address Android's own Wi-Fi holds, from `ip -4 addr show wlan0`, or
+// null. The Echo Show joins Wi-Fi from its own setup screen or Settings, and
+// EchoMuse never configures it (docs/echo-show-port-plan.md decision 7), so
+// connect_android refuses a Show that is not already on a network.
+function _wlanAddress(ipOut) {
+  const m = /^\s*inet (\d{1,3}(?:\.\d{1,3}){3})\//m.exec(ipOut || '');
+  return m ? m[1] : null;
+}
+
+// The Echo Show's HOME activities, and the one Android would start.
+// `--brief` prints one `package/class` line per activity (the class
+// sometimes in its short ".Class" form) under an "Activity #N:" header
+// and a priority line; resolve-activity prints the priority line and the
+// winner (android/…ResolverActivity when Android would ask).
+const _HOME_QUERY = 'cmd package query-activities --brief '
+                  + '-a android.intent.action.MAIN -c android.intent.category.HOME 2>&1';
+const _HOME_RESOLVE = 'cmd package resolve-activity --brief '
+                    + '-a android.intent.action.MAIN -c android.intent.category.HOME 2>&1';
+
+// The `package/class` components in either command's output, as {pkg, cls}.
+function _homeActivities(out) {
+  const found = [];
+  for (const line of (out || '').split('\n')) {
+    const m = /^\s*([A-Za-z][\w.]*)\/([\w.$]+)\s*$/.exec(line);
+    if (m) found.push({ pkg: m[1], cls: m[2] });
+  }
+  return found;
+}
+
+// The HOME activities that can stand in for Amazon's: not Amazon's own
+// (com.amazon.*: the setup screen and the launcher are hidden by the
+// wizard), and not Settings' FallbackHome, the blank placeholder Android
+// shows when nothing else resolves. Hiding Amazon's with none of these left
+// boots the Show to a blank screen (docs/echo-show-crown.md §9.4).
+function _kioskHomes(activities) {
+  return activities.filter(a => !a.pkg.startsWith('com.amazon.') && !a.cls.endsWith('FallbackHome'));
+}
+
+const _component = a => `${a.pkg}/${a.cls}`;
+
+// The same component however it is printed: Android shortens a class in
+// its own package to ".Class".
+const _fullClass = a => (a.cls.startsWith('.') ? a.pkg + a.cls : a.cls);
+const _sameComponent = (a, b) => !!a && !!b && a.pkg === b.pkg && _fullClass(a) === _fullClass(b);
+
+// Kiosks whose HOME activity ships disabled. Fully Kiosk Browser (measured,
+// 1.61.4 on the Show) declares `.LauncherReplacement` disabled and enables
+// it only from its own launcher setting, so it is not a HOME candidate
+// after a plain install. check_home enables it when the kiosk is installed
+// and no other non-Amazon HOME exists, which is what that setting does.
+const _KNOWN_KIOSK_HOMES = Object.freeze([
+  Object.freeze({ pkg: 'de.ozerov.fully', cls: '.LauncherReplacement', name: 'Fully Kiosk Browser' }),
+]);
+
+// The known kiosk whose disabled HOME activity check_home should enable, or
+// null: only when no kiosk HOME is offered at all and the kiosk is
+// installed. `installed` is a Set of package names.
+function _kioskToEnable(homes, installed) {
+  if (_kioskHomes(homes).length) return null;
+  return _KNOWN_KIOSK_HOMES.find(k => installed.has(k.pkg)) || null;
+}
+
+// The kiosk neutralize_alexa makes the default home: a known kiosk first,
+// else the first candidate. Null without one.
+function _chooseKiosk(kiosks) {
+  return kiosks.find(a => _KNOWN_KIOSK_HOMES.some(k => _sameComponent(a, k))) || kiosks[0] || null;
+}
+
+// The packages of the enabled input methods, from `ime list -s` (one
+// `package/class` per line).
+function _imePackages(imeListOut) {
+  return new Set(_homeActivities(imeListOut).map(a => a.pkg));
+}
+
+// Of the packages about to be hidden, those that must be kept because they
+// hold every enabled keyboard: hiding the only IME leaves the Show with no
+// keyboard at all (findings §9.3 keeps com.amazon.bluestone.keyboard until
+// another is installed and enabled). Empty when another IME survives.
+function _imeKeep(toHide, imePackages) {
+  const hiding = new Set(toHide);
+  const survivors = [...imePackages].filter(p => !hiding.has(p));
+  return survivors.length ? [] : [...imePackages].filter(p => hiding.has(p));
+}
+
+// Amazon packages the Show cannot do without, measured on it (2026-10-17):
+// never hidden, whatever a list says, and unhidden if an earlier list hid
+// them. The reason is logged when either happens.
+const _CROWN_KEEP_VISIBLE = Object.freeze({
+  'amazon.speech.sim': 'hidden, KnightSystemUI crash-loops 10 minutes after boot and four '
+    + 'Amazon apps crash with dialogs on screen; its microphone is denied instead',
+  'com.amazon.kindle.otter.oobe': 'hidden, every Settings page crashes, and with them the '
+    + "Show's own Wi-Fi and Bluetooth settings",
+});
+
+// Of `pkgs`, the ones _CROWN_KEEP_VISIBLE protects.
+function _keepVisible(pkgs) {
+  return pkgs.filter(p => Object.hasOwn(_CROWN_KEEP_VISIBLE, p));
+}
+
+// Whether `appops get <pkg> RECORD_AUDIO` reports the microphone denied
+// ("RECORD_AUDIO: ignore", optionally followed by "; time=…").
+const _micDenied = out => /^\s*RECORD_AUDIO: ignore\b/m.test(out || '');
+
+// KnightSettings on a Show never registered with Amazon has no config
+// bundle: no bundle_location in this file, and every Settings activity
+// crashes (FileNotFoundException: null/preference-settings.json), leaving
+// the Wi-Fi and Bluetooth pages unreachable. The measured fix is one
+// broadcast to its AccountPropertyChangeReceiver, which then writes the
+// bundle (bundle_location read /data/user/0/com.android.settings/files/bundle_a).
+const _SETTINGS_BUNDLE_PREFS =
+  '/data/data/com.android.settings/shared_prefs/com.amazon.settings.CONFIG_BUNDLE_STORE.xml';
+const _hasSettingsBundle = xml => /\bbundle_location\b/.test(xml || '');
+// DANGER. The same receiver also handles com.amazon.dcp.sso.action.account.removed,
+// and on a provisioned device that one FACTORY-RESETS the Show (KnightSettings
+// DeviceUtils.resetDevice), wiping /data and EchoMuse with it. Only this exact
+// action, to this explicit component, is ever sent; never a broadcast that
+// could reach the receiver with any other action. Pinned by test.
+const _SETTINGS_BUNDLE_BROADCAST = 'am broadcast -a com.amazon.dcp.sso.broadcast.CORPFMHasChanged '
+  + '-n com.android.settings/com.amazon.settings.AccountPropertyChangeReceiver';
+
+// The Show's own Wi-Fi and Bluetooth pages, for the kiosk's app launcher:
+// the implicit android.settings.WIFI_SETTINGS intent does not resolve on
+// this build, but these explicit components open the pages (measured).
+const _CROWN_SETTINGS_PAGES = Object.freeze({
+  'Wi-Fi':     'com.android.settings/.Settings$WifiSettingsActivity',
+  'Bluetooth': 'com.android.settings/.Settings$BluetoothSettingsActivity',
+});
+
+// What a `pm hide` / `pm unhide` call said. The distinction that matters is
+// between pm REFUSING and pm ANSWERING that the package is not there:
+// `Unknown package: <name>` means the call worked and this build lacks the
+// package (#91). Anything unrecognised counts as rejected, deliberately:
+// the cost of being wrong is an Alexa package left live. Success reads
+// "Package <name> new hidden state: true" (or false, for unhide).
+const PM_VERDICT = Object.freeze({ DONE: 'done', ABSENT: 'absent', REJECTED: 'rejected' });
+const _pmVerdict = (out) => {
+  if (/new hidden state: (true|false)/.test(out || '')) return PM_VERDICT.DONE;
+  if (/Unknown package/i.test(out || '')) return PM_VERDICT.ABSENT;
+  return PM_VERDICT.REJECTED;
+};
+
+// The package names in `pm list packages` output.
+function _listedPackages(out) {
+  const pkgs = new Set();
+  for (const line of (out || '').split('\n')) {
+    const m = /^package:(\S+)\s*$/.exec(line.trim());
+    if (m) pkgs.add(m[1]);
+  }
+  return pkgs;
+}
+
+// Where the server's own output goes: the Dot's tmpfs /tmp, and on the Show
+// (no /tmp at all) /data/local/tmp/echomuse. Mirrors LOG in start_server.sh.
+function _serverLog(platform) {
+  return platform === WIZARD_PLATFORM.CROWN ? '/data/local/tmp/echomuse/server.log' : '/tmp/server.log';
+}
 
 // WiFi security labels, used in the network picker and in error messages.
 // Module scope so WifiPanel and the wizard's step runners share one set.
@@ -4196,9 +4462,14 @@ const _SECURITY_LABEL = {
   wpa2: 'WPA2', wpa3: 'WPA3', open: 'Open', wep: 'WEP', enterprise: 'Enterprise',
 };
 
-// Steps, in order (see docs/fireos6-port.md Phase 3/4). boot-root.zip
-// already has the shell at uid 0, and the only boot-time change EchoMuse
-// makes is the one init .rc written live from this same Android session.
+// Steps, in order. One list for both devices: each names the platforms it
+// runs on (`on`); until connect_android has said which device this is,
+// every step shows, and afterwards the other device's steps show as not
+// applicable. `crownDesc` replaces `desc` on the Echo Show.
+//
+// Echo Dot (docs/fireos6-port.md Phase 3/4). boot-root.zip already has the
+// shell at uid 0, and the only boot-time change EchoMuse makes is the one
+// init .rc written live from this same Android session.
 //
 //  connect_android    — connect in Android mode, verify FireOS 6 + root
 //  install_boot_hook  — echomuse.rc + /tmp on the RUNNING slot only    [auto]
@@ -4215,23 +4486,80 @@ const _SECURITY_LABEL = {
 // install then leaves the other slot stock, which the bootloader falls back
 // to as a known-good boot instead of a second copy of the fault.
 //
+// Echo Show 8 (docs/echo-show-port-plan.md Phases 3/4). Already on Wi-Fi,
+// joined from the device (connect_android refuses it otherwise), and one
+// system partition, so no wifi and no mirror step:
+//
+//  connect_android    — Fire OS 6 crown + root + on Wi-Fi
+//  check_home         — a non-Amazon HOME activity (the kiosk) exists  [auto]
+//  install_boot_hook  — echomuse.rc, /system remounted rw then ro      [auto]
+//  install_em         — push bundled firmware + startup script        [auto]
+//  neutralize_alexa   — setup flags, kiosk as HOME, pm hide the lists  [button]
+//  reboot, reconnect, verify_service (echomuse + audioserver), confirm_link
+//
 // `id` is also what a diagnostics upload names the failed step by.
+const _BOTH_PLATFORMS = [WIZARD_PLATFORM.DOT, WIZARD_PLATFORM.CROWN];
 const _WIZARD_STEPS = [
-  { id: 'connect_android',   label: 'Connect Device',    desc: 'Connect the Echo Dot via USB. Device should be on and booted into Fire OS 6, rooted via boot-root.zip. Appears as "AEOBC" in the USB picker.' },
-  { id: 'install_boot_hook', label: 'Install Boot Hook', desc: 'Write the echomuse init service to /system/etc/init/ on the system slot the Dot is running. The other slot is left stock until this one is proven.' },
-  { id: 'install_em',        label: 'Install EchoMuse',  desc: 'Push the EchoMuse firmware bundled with this controller, and its startup script, to the device.' },
-  { id: 'wifi',              label: 'Configure WiFi',    desc: "Write the WiFi network into wpa_supplicant.conf — the firmware brings WiFi up itself at boot." },
-  { id: 'reboot',            label: 'Reboot',            desc: 'Reboot device to start the echomuse service.' },
-  { id: 'reconnect',         label: 'Reconnect',         desc: 'Re-connect ADB as soon as the device appears as "AEOBC" in the USB picker.' },
-  { id: 'verify_service',    label: 'Verify Service',    desc: "Confirm the echomuse service and Amazon's mixer are both running." },
-  { id: 'confirm_link',      label: 'Confirm Link',      desc: 'Wait for the device to join WiFi and reach this controller (a new device shows up pending approval).' },
-  { id: 'mirror_boot_hook',  label: 'Mirror Boot Hook',  desc: 'Now that the hooked slot is proven, write the same hook to the other system slot, so a bootloader fallback still runs EchoMuse.' },
+  { id: 'connect_android',   label: 'Connect Device',    on: _BOTH_PLATFORMS,
+    desc: 'Connect the Echo device via USB, booted and rooted. Echo Dot: Fire OS 6 rooted via boot-root.zip, "AEOBC" in the USB picker. Echo Show 8: rooted via boot-root.img, already on Wi-Fi (joined on the device), your kiosk app installed.' },
+  { id: 'check_home',        label: 'Check Kiosk',       on: [WIZARD_PLATFORM.CROWN],
+    desc: "Confirm a home-screen app other than Amazon's is installed (your kiosk). Fully Kiosk Browser ships its home screen switched off; the wizard switches it on (pm enable), as Fully's own launcher setting would. Amazon's launchers are hidden later; with no other home screen the display would stay blank." },
+  { id: 'install_boot_hook', label: 'Install Boot Hook', on: _BOTH_PLATFORMS,
+    desc: 'Write the echomuse init service to /system/etc/init/ on the system slot the Dot is running. The other slot is left stock until this one is proven.',
+    crownDesc: 'Write the echomuse init service to /system/etc/init/, remounting /system read-write for the write and read-only again after it.' },
+  { id: 'install_em',        label: 'Install EchoMuse',  on: _BOTH_PLATFORMS,
+    desc: 'Push the EchoMuse firmware bundled with this controller, and its startup script, to the device.' },
+  { id: 'wifi',              label: 'Configure WiFi',    on: [WIZARD_PLATFORM.DOT],
+    desc: "Write the WiFi network into wpa_supplicant.conf — the firmware brings WiFi up itself at boot." },
+  { id: 'neutralize_alexa',  label: 'Neutralise Alexa',  on: [WIZARD_PLATFORM.CROWN],
+    desc: "Mark setup complete, repair Settings, make your kiosk the home screen, hide Amazon's Alexa apps (Tier 1) with pm hide and deny the microphone to the Amazon apps that must stay (Alexa's wake engine, Amazon's keyboard) — all reversible. Tier 2 is optional." },
+  { id: 'reboot',            label: 'Reboot',            on: _BOTH_PLATFORMS,
+    desc: 'Reboot device to start the echomuse service.' },
+  { id: 'reconnect',         label: 'Reconnect',         on: _BOTH_PLATFORMS,
+    desc: 'Re-connect ADB as soon as the device appears as "AEOBC" in the USB picker.',
+    crownDesc: 'Re-connect ADB as soon as the Echo Show appears in the USB picker.' },
+  { id: 'verify_service',    label: 'Verify Service',    on: _BOTH_PLATFORMS,
+    desc: "Confirm the echomuse service and Amazon's mixer are both running.",
+    crownDesc: "Confirm the echomuse service and Android's audioserver are both running." },
+  { id: 'confirm_link',      label: 'Confirm Link',      on: _BOTH_PLATFORMS,
+    desc: 'Wait for the device to join WiFi and reach this controller (a new device shows up pending approval).',
+    crownDesc: 'Wait for the Echo Show to reach this controller over its Wi-Fi (a new device shows up pending approval).' },
+  { id: 'mirror_boot_hook',  label: 'Mirror Boot Hook',  on: [WIZARD_PLATFORM.DOT],
+    desc: 'Now that the hooked slot is proven, write the same hook to the other system slot, so a bootloader fallback still runs EchoMuse.' },
 ];
+
+// Whether a step runs for `platform` (null before connect_android: all do).
+function _stepApplies(step, platform) {
+  return !platform || step.on.includes(platform);
+}
+
+// The ids of the steps one device runs, in order.
+function _stepsFor(platform) {
+  return _WIZARD_STEPS.filter(s => _stepApplies(s, platform)).map(s => s.id);
+}
+
+// The first step at or after index `from` that runs for `platform`
+// (_WIZARD_STEPS.length past the last), and the last one it runs.
+function _nextStep(from, platform) {
+  let i = from;
+  while (i < _WIZARD_STEPS.length && !_stepApplies(_WIZARD_STEPS[i], platform)) i++;
+  return i;
+}
+function _lastStep(platform) {
+  let i = _WIZARD_STEPS.length - 1;
+  while (i > 0 && !_stepApplies(_WIZARD_STEPS[i], platform)) i--;
+  return i;
+}
+
+// A step's description for the device at hand.
+function _stepDesc(step, platform) {
+  return platform === WIZARD_PLATFORM.CROWN && step.crownDesc ? step.crownDesc : step.desc;
+}
 
 // Steps that establish an ADB connection rather than needing one, steps
 // that need no input, and steps with their own input panel.
 const CONNECT_STEPS = new Set(['connect_android', 'reconnect']);
-const AUTO_STEPS = new Set(['install_boot_hook', 'install_em', 'verify_service',
+const AUTO_STEPS = new Set(['check_home', 'install_boot_hook', 'install_em', 'verify_service',
                             'confirm_link', 'mirror_boot_hook']);
 const INPUT_STEPS = new Set(['wifi']);
 
@@ -4361,9 +4689,9 @@ function ReadoptPrompt({ serial, device, onKeep, onAbort }) {
       </div>
       <div style={text}>
         {device.approved
-          ? <>Continue reinstalls EchoMuse and keeps that device: the Dot rejoins as "{name}" with
+          ? <>Continue reinstalls EchoMuse and keeps that device: it rejoins as "{name}" with
               its settings, Home Assistant device and alarms.</>
-          : <>Continue reinstalls EchoMuse and keeps that entry: the Dot rejoins as "{name}",
+          : <>Continue reinstalls EchoMuse and keeps that entry: it rejoins as "{name}",
               still waiting for approval.</>}
       </div>
       {device.connected && (
@@ -4399,6 +4727,13 @@ function ProvisionWizard({ onClose, knownDevices }) {
   const [wifiSsid, setWifiSsid] = useState('');
   const [wifiPsk, setWifiPsk]   = useState('');
   const [wifiNetworks, setWifiNetworks] = useState([]);
+  // Which device connect_android found (a WIZARD_PLATFORM; null before it
+  // has). platformRef for code already in flight, as adbRef.
+  const [platform, setPlatformState] = useState(null);
+  const platformRef = useRef(null);
+  const setPlatform = p => { platformRef.current = p; setPlatformState(p); };
+  // neutralize_alexa's opt-in: hide Tier 2 too (off by default).
+  const [hideTier2, setHideTier2] = useState(false);
   const [duplicateDeviceId, setDuplicateDeviceId] = useState(null);
   // connect_android's open question when the Dot's serial is already
   // registered ({serial, device}); readoptAnswer resolves it.
@@ -4544,36 +4879,58 @@ function ProvisionWizard({ onClose, knownDevices }) {
   // failed something, which is the worst moment to be issuing commands that
   // change anything, and it must not turn one failure into two.
   //
-  // The keys must match `_PROVISION_PROBES` in em_support.py, which drops any
+  // The keys must match `ProvisionProbe` in em_support.py, which drops any
   // name it does not recognise — a probe added here and not there collects
   // output that is silently discarded. `tests/test_support.py` pins the pair.
   //
   // Sent RAW. The controller does the redaction, because those rules and their
   // tests live in em_support.py and a second copy here would drift from them
   // without anyone noticing until a file carried an SSID.
+  //
+  // The common probes, then each device's own: the Dot's are asked of every
+  // device connect_android has not classified, as before the Show existed.
   const _PROVISION_PROBES = {
     props:         'getprop',
     root:          'id 2>&1',
     selinux:       'getenforce 2>&1',
     storage:       'df /data 2>&1',
+    services:      'getprop | grep init.svc',
+    echomuse_service: 'getprop init.svc.echomuse',
+    echomuse_rc:      'cat /system/etc/init/echomuse.rc 2>&1',
+  };
+  const _PROVISION_PROBES_DOT = {
     wpa_status:    'wpa_cli -p /data/misc/wifi/sockets -i wlan0 status 2>&1',
     wpa_scan:      'wpa_cli -p /data/misc/wifi/sockets -i wlan0 scan_results 2>&1',
     wpa_caps:      'wpa_cli -p /data/misc/wifi/sockets -i wlan0 get_capability key_mgmt 2>&1',
-    services:      'getprop | grep init.svc',
     processes:     "ps | grep -E 'wpa_supplicant|SmartHomeWifid' | grep -v grep",
     data_property: 'ls /data/property 2>&1',
-    // Service state, boot hook content and active slot
-    // (docs/fireos6-port.md Phase 4).
+    // Service state and active slot (docs/fireos6-port.md Phase 4).
     mixer_service:    'getprop init.svc.mixer',
-    echomuse_service: 'getprop init.svc.echomuse',
     mixer_streams:    'ls -l /data/mixer_streams 2>&1',
-    echomuse_rc:      'cat /system/etc/init/echomuse.rc 2>&1',
     slot_suffix:      'getprop ro.boot.slot_suffix',
+  };
+  // docs/echo-show-port-plan.md Phase 4: the audio service, the kiosk as
+  // HOME, how much is hidden and which tiers, setup state, the privacy
+  // mute, and whether Android is on Wi-Fi.
+  const _PROVISION_PROBES_CROWN = {
+    audioserver_service: 'getprop init.svc.audioserver',
+    home_activities: _HOME_QUERY,
+    home_resolved:   _HOME_RESOLVE,
+    hidden_packages: 'echo installed=$(pm list packages -u 2>/dev/null | wc -l) visible=$(pm list packages 2>/dev/null | wc -l)',
+    crown_tiers:     'cat /data/local/etc/echomuse/crown_tiers 2>&1',
+    provisioned:     'echo device_provisioned=$(settings get global device_provisioned) user_setup_complete=$(settings get secure user_setup_complete)',
+    amazon_gating:   'cat /sys/devices/platform/amazon-gating/state 2>&1',
+    wlan:            'ip -4 addr show wlan0 2>&1',
+    mic_deny:        'while read -r p _; do case "$p" in ""|"#"*) ;; *) echo "$p: $(appops get $p RECORD_AUDIO </dev/null 2>&1)" ;; esac; done < /data/local/etc/echomuse/crown_mic_deny_packages.txt 2>&1',
+    settings_bundle: `grep -o bundle_location ${_SETTINGS_BUNDLE_PREFS} 2>&1`,
   };
 
   async function collectProvisionDiagnostics(c, stepIdx, err) {
     const probes = {};
-    for (const [name, cmd] of Object.entries(_PROVISION_PROBES)) {
+    const asked = { ..._PROVISION_PROBES,
+                    ...(platformRef.current === WIZARD_PLATFORM.CROWN
+                          ? _PROVISION_PROBES_CROWN : _PROVISION_PROBES_DOT) };
+    for (const [name, cmd] of Object.entries(asked)) {
       try {
         // Bounded per probe. The device has just failed something and may be
         // half gone; without this, one unanswered command hangs the whole
@@ -4628,21 +4985,35 @@ function ProvisionWizard({ onClose, knownDevices }) {
     const model   = await c.shell('getprop ro.product.model');
     const release = await c.shell('getprop ro.build.version.release');
     const name    = await c.shell('getprop ro.product.name');
+    const device  = await c.shell('getprop ro.product.device');
     const serial  = await c.shell('getprop ro.serialno') || await c.shell('getprop ro.boot.serialno');
     const fwBuild = await c.shell('getprop ro.build.version.incremental');
     const fwName  = await c.shell('getprop ro.build.version.name');
+    const display = await c.shell('getprop ro.build.display.id');
     addLog(`Model: ${model || '(unknown)'}  Build: Android ${release}  Codename: ${name || '(unknown)'}  Serial: ${serial || '(unknown)'}`);
     addLog(`OS: ${fwName || '(unknown)'}  ${fwBuild || ''}`);
-    // The adb shell's uid tells a rooted Fire OS 6 Dot apart from one that
-    // boot-root.zip has not been flashed onto yet.
+    // The adb shell's uid tells a rooted device apart from one that
+    // boot-root has not been flashed onto yet.
     const uid = await c.shell('id -u');
-    requireFireOS6({ release, productName: name, uid });
-    if (fwName && !fwName.includes(_TESTED_FIREOS6_BUILD)) {
-      addLog(`Untested OS build — EchoMuse is developed against ${_TESTED_FIREOS6_NAME} `
-           + `(${_TESTED_FIREOS6_BUILD}). Other FireOS 6 builds may behave differently.`, LOG_TONE.WARN);
-    }
-    if (model && !model.toLowerCase().includes('amazon') && !name.toLowerCase().includes('biscuit')) {
+    const kind = classifyDevice({ release, productName: name, productDevice: device, uid });
+    setPlatform(kind);
+    const untested = untestedBuild(kind, [fwName, display]);
+    if (untested) addLog(untested, LOG_TONE.WARN);
+    if (kind === WIZARD_PLATFORM.DOT && model && !model.toLowerCase().includes('amazon')
+        && !name.toLowerCase().includes('biscuit')) {
       addLog('Warning: device may not be an Echo Dot 2nd gen — proceeding anyway.', LOG_TONE.WARN);
+    }
+    if (kind === WIZARD_PLATFORM.CROWN) {
+      // The Show's Wi-Fi is Android's, joined on the device; EchoMuse never
+      // configures it, so there is no Wi-Fi step to fall back on.
+      const addr = _wlanAddress(await c.shell('ip -4 addr show wlan0 2>&1'));
+      if (!addr) {
+        throw new Error(
+          'This Echo Show is not on Wi-Fi. Join your network on the Show itself (the setup '
+          + "screen's Wi-Fi page, or Settings → Network once setup is done), then Retry. "
+          + 'EchoMuse does not configure Wi-Fi on the Echo Show.');
+      }
+      addLog(`On Wi-Fi: wlan0 has ${addr}, joined from the device.`, LOG_TONE.OK);
     }
 
     // A serial this controller already knows is a Dot coming back: reflashed
@@ -4672,7 +5043,7 @@ function ProvisionWizard({ onClose, knownDevices }) {
         await c.close();
         setAdb(null);
         const err = new Error(
-          `Stopped before writing anything to the Dot. Retry to be asked again, or delete `
+          `Stopped before writing anything to the device. Retry to be asked again, or delete `
           + `"${name}" from the controller to provision it as a new device.`
         );
         err.matchedDeviceId = match.device_id;
@@ -4680,14 +5051,16 @@ function ProvisionWizard({ onClose, knownDevices }) {
       }
       setReadopting(match);
       setDuplicateDeviceId(null);
-      addLog(`Re-adopting: once installed, the Dot rejoins as "${name}" with its existing settings.`,
+      addLog(`Re-adopting: once installed, the device rejoins as "${name}" with its existing settings.`,
              LOG_TONE.OK);
     }
 
-    // boot-root.zip already has the shell at uid 0, and the one boot-time
+    // boot-root already has the shell at uid 0, and the one boot-time
     // change (install_boot_hook) is written live from this same session.
     // Stay connected.
-    addLog('FireOS 6 confirmed (biscuit_puffin, rooted via boot-root.zip). Continuing…', LOG_TONE.OK);
+    addLog(kind === WIZARD_PLATFORM.CROWN
+      ? 'Echo Show 8 confirmed (crown, Fire OS 6, adb root, on Wi-Fi). Continuing…'
+      : 'FireOS 6 confirmed (biscuit_puffin, rooted via boot-root.zip). Continuing…', LOG_TONE.OK);
     return c;
   }
 
@@ -5076,9 +5449,12 @@ function ProvisionWizard({ onClose, knownDevices }) {
         addLog('TLS credentials installed — device will connect over wss.', LOG_TONE.OK);
       }
     }
-    // WiFi and the reboot are separate steps — this one only has to leave
-    // the binary and startup script installed and verified.
-    addLog('EchoMuse installed — WiFi and reboot are separate steps.', LOG_TONE.OK);
+    // WiFi (the Show: neutralisation) and the reboot are separate steps —
+    // this one only has to leave the binary and startup script installed
+    // and verified.
+    addLog(platformRef.current === WIZARD_PLATFORM.CROWN
+      ? 'EchoMuse installed — neutralising Alexa and the reboot are separate steps.'
+      : 'EchoMuse installed — WiFi and reboot are separate steps.', LOG_TONE.OK);
   }
 
   // echomuse.rc and the empty /tmp mountpoint start_server.sh
@@ -5103,8 +5479,8 @@ function ProvisionWizard({ onClose, knownDevices }) {
     return slot;
   }
 
-  async function withStagedRc(c, fn) {
-    await c.push('/data/local/tmp/echomuse.rc.new', new TextEncoder().encode(_ECHOMUSE_RC));
+  async function withStagedRc(c, rc, fn) {
+    await c.push('/data/local/tmp/echomuse.rc.new', new TextEncoder().encode(rc));
     try {
       await fn();
     } finally {
@@ -5113,10 +5489,274 @@ function ProvisionWizard({ onClose, knownDevices }) {
   }
 
   async function runInstallBootHook(c) {
+    if (platformRef.current === WIZARD_PLATFORM.CROWN) {
+      await withStagedRc(c, _ECHOMUSE_RC_CROWN, () => installBootHookCrown(c));
+      return;
+    }
     const active = await activeSlot(c);
-    await withStagedRc(c, () => installBootHookActive(c, active));
+    await withStagedRc(c, _ECHOMUSE_RC, () => installBootHookActive(c, active));
     addLog(`The other slot stays stock until a boot from ${active} reaches this controller `
          + '(Mirror Boot Hook).');
+  }
+
+  // The Echo Show has one system partition, mounted read-only on its own
+  // (/system, ext4, verity off), under a ramdisk root that is rebuilt at
+  // every boot: so no slots, no mirror step and no /tmp mountpoint, which
+  // start_server.sh does not use there. Undo: remount /system read-write,
+  // delete /system/etc/init/echomuse.rc, remount read-only (docs/rooting.md).
+  async function bootHookPresentCrown(c) {
+    return _rcInstalled(await c.shell('cat /system/etc/init/echomuse.rc 2>/dev/null'),
+                        _ECHOMUSE_RC_CROWN);
+  }
+
+  async function installBootHookCrown(c) {
+    if (await bootHookPresentCrown(c)) {
+      addLog('Boot hook already in place.', LOG_TONE.OK);
+      return;
+    }
+    addLog('Remounting /system read-write…');
+    const rw = await c.shell('mount -o rw,remount /system 2>&1');
+    if (rw.trim()) addLog(`  → ${rw.trim()}`);
+    try {
+      const out = (await c.shell('(cp /data/local/tmp/echomuse.rc.new /system/etc/init/echomuse.rc '
+                               + '&& chmod 0644 /system/etc/init/echomuse.rc && sync) 2>&1')).trim();
+      if (out) addLog(`  → ${out}`);
+    } finally {
+      // Always attempt the remount back, even if the write above threw.
+      const ro = await c.shell('mount -o ro,remount /system 2>&1');
+      if (ro.trim()) addLog(`  → ${ro.trim()}`);
+    }
+    if (!await bootHookPresentCrown(c)) {
+      throw new Error('/system/etc/init/echomuse.rc did not read back as written.');
+    }
+    addLog('/system/etc/init/echomuse.rc written and verified; /system is read-only again.',
+           LOG_TONE.OK);
+  }
+
+  // The HOME activities the Show offers, logged; throws unless one of them
+  // can replace Amazon's (_kioskHomes). Returns those. Candidates come from
+  // query-activities, not resolve-activity: until Amazon's setup screen
+  // (priority 101) is hidden, it wins resolution over any preferred home
+  // (measured), so resolution is only checked after hiding. A known kiosk
+  // installed with its HOME activity switched off (_kioskToEnable) is
+  // switched on here, as its own launcher setting would.
+  async function requireKioskHome(c) {
+    let all = _homeActivities(await c.shell(_HOME_QUERY));
+    addLog(`Home activities: ${all.map(_component).join(', ') || '(none)'}`);
+    const enable = _kioskToEnable(all, (await packageSets(c)).installed);
+    if (enable) {
+      const comp = _component(enable);
+      addLog(`${enable.name} is installed, but its home screen is switched off: it ships that `
+           + 'way, and its own launcher setting switches it on. Switching it on now: '
+           + `pm enable ${comp}`);
+      const out = (await c.shell(`pm enable ${comp} 2>&1`)).trim();
+      if (out) addLog(`  → ${out}`);
+      all = _homeActivities(await c.shell(_HOME_QUERY));
+      addLog(`Home activities now: ${all.map(_component).join(', ') || '(none)'}`);
+    }
+    const kiosks = _kioskHomes(all);
+    if (!kiosks.length) {
+      throw new Error(
+        "No home-screen app other than Amazon's is installed. Install your kiosk (Fully Kiosk "
+        + 'Browser, for example: `adb shell settings put global disable_bouncer 1`, then '
+        + '`adb install <apk>`), switch on its home-screen (launcher) setting if it has one, '
+        + "and Retry. Amazon's launchers are hidden later, and with no other home screen the "
+        + 'Show would boot to a blank screen.');
+    }
+    return kiosks;
+  }
+
+  async function runCheckHome(c) {
+    const kiosks = await requireKioskHome(c);
+    addLog(`Kiosk home: ${kiosks.map(_component).join(', ')}.`, LOG_TONE.OK);
+  }
+
+  // The visible and the installed (visible or hidden) packages.
+  async function packageSets(c) {
+    const visibleOut = await c.shell('pm list packages 2>&1');
+    if (!visibleOut.includes('package:')) {
+      throw new Error(`The package manager is not answering (${visibleOut || 'no output'}). `
+                    + 'Give the Show a moment to finish booting and Retry.');
+    }
+    return { visible: _listedPackages(visibleOut),
+             installed: _listedPackages(await c.shell('pm list packages -u 2>&1')) };
+  }
+
+  async function memAvailable(c) {
+    const m = /MemAvailable:\s*(\d+)/.exec(await c.shell('cat /proc/meminfo'));
+    return m ? `${Math.round(Number(m[1]) / 1024)} MB` : '(unknown)';
+  }
+
+  // KnightSettings' config bundle (_SETTINGS_BUNDLE_PREFS): written by one
+  // broadcast when missing, which it is on a Show never registered with
+  // Amazon. Without it no Settings page opens, Wi-Fi and Bluetooth included.
+  async function ensureSettingsBundle(c) {
+    const read = async () => _hasSettingsBundle(await c.shell(`cat ${_SETTINGS_BUNDLE_PREFS} 2>/dev/null`));
+    if (await read()) {
+      addLog('Settings already has its config bundle.', LOG_TONE.OK);
+      return;
+    }
+    addLog("Settings has no config bundle (the Show was never registered with Amazon), so its "
+         + 'pages crash. Asking it to write one…');
+    // A Settings process left in its crashed state makes the broadcast wait
+    // 60 s for it (measured); a fresh one answers at once.
+    await c.shell('am force-stop com.android.settings');
+    const out = (await c.shell(`${_SETTINGS_BUNDLE_BROADCAST} 2>&1`)).trim();
+    if (out) addLog(`  → ${out}`);
+    for (let i = 0; i < 10; i++) {
+      if (await read()) {
+        addLog('Settings config bundle written; Settings pages open again.', LOG_TONE.OK);
+        return;
+      }
+      await new Promise(r => setTimeout(r, 1000));
+    }
+    throw new Error(`Settings still has no config bundle (no bundle_location in ${_SETTINGS_BUNDLE_PREFS}), `
+                  + "so the Show's Wi-Fi and Bluetooth pages would not open. Retry.");
+  }
+
+  // docs/echo-show-crown.md §9.4's order: a kiosk HOME must exist, then the
+  // setup flags, Settings' config bundle, the kiosk as preferred HOME, the
+  // hiding, and the microphone denials. The lists come from the controller
+  // (device_payloads/) and are installed beside the tiers they apply, so
+  // start_server.sh re-applies them at every boot; the tiers file is written
+  // before hiding, so a run that stops part-way is finished by the next
+  // boot. Tier 2 follows the operator's choice both ways: unticked on a later
+  // run, its packages are unhidden again.
+  async function runNeutralizeAlexa(c, withTier2) {
+    const kiosks = await requireKioskHome(c);
+    addLog(`MemAvailable before: ${await memAvailable(c)}.`);
+
+    for (const [ns, key] of [['global', 'device_provisioned'], ['secure', 'user_setup_complete']]) {
+      await c.shell(`settings put ${ns} ${key} 1`);
+      const v = (await c.shell(`settings get ${ns} ${key}`)).trim();
+      if (v !== '1') throw new Error(`settings ${ns} ${key} reads "${v}" after setting it to 1.`);
+    }
+    addLog('Setup marked complete (device_provisioned=1, user_setup_complete=1).', LOG_TONE.OK);
+    await ensureSettingsBundle(c);
+
+    // The default home, set now; it only takes effect once Amazon's setup
+    // screen is hidden below, and is checked after that.
+    const kiosk = _chooseKiosk(kiosks);
+    if (kiosks.length > 1) {
+      addLog(`More than one home app besides Amazon's (${kiosks.map(_component).join(', ')}); `
+           + `making ${_component(kiosk)} the default. Change it later in the Show's Settings.`,
+             LOG_TONE.WARN);
+    }
+    {
+      const out = (await c.shell(`cmd package set-home-activity ${_component(kiosk)} 2>&1`)).trim();
+      addLog(`Default home: ${_component(kiosk)} (${out || 'no output'}).`,
+             /Success/.test(out) ? undefined : LOG_TONE.WARN);
+    }
+
+    const resp = await fetchProvision('/api/provision/crown_lists', 'fetching the hide and mic-deny lists.');
+    const { dir, tiers_file: tiersFile, hide: lists, mic_deny: micDeny } = await resp.json();
+    const stage = '/data/local/tmp';
+    await c.shell(`mkdir -p ${dir}`);
+    for (const l of [...lists, micDeny]) {
+      await c.push(`${stage}/${l.file}`, new TextEncoder().encode(l.text));
+      const out = (await c.shell(`cp ${stage}/${l.file} ${dir}/${l.file} && chmod 644 ${dir}/${l.file} `
+                               + `&& rm -f ${stage}/${l.file} 2>&1`)).trim();
+      if (out) addLog(`  → ${out}`);
+    }
+    const tiers = withTier2 ? ['1', '2'] : ['1'];
+    const before = (await c.shell(`cat ${tiersFile} 2>/dev/null`)).split(/\s+/).filter(Boolean);
+    await c.shell(`echo ${tiers.join(' ')} > ${tiersFile}`);
+    const written = (await c.shell(`cat ${tiersFile} 2>&1`)).trim();
+    if (written !== tiers.join(' ')) {
+      throw new Error(`${tiersFile} reads "${written}" after writing "${tiers.join(' ')}".`);
+    }
+
+    let { visible, installed } = await packageSets(c);
+    const applied = lists.filter(l => tiers.includes(l.tier)).flatMap(l => l.packages);
+    // Never hidden: the packages the Show cannot do without, whatever a list
+    // says, and the last keyboard. One hidden by an earlier list is unhidden.
+    for (const pkg of _keepVisible(applied)) {
+      addLog(`Not hiding ${pkg} although a list names it: ${_CROWN_KEEP_VISIBLE[pkg]}.`, LOG_TONE.WARN);
+    }
+    for (const pkg of Object.keys(_CROWN_KEEP_VISIBLE).filter(p => installed.has(p) && !visible.has(p))) {
+      const out = (await c.shell(`pm unhide ${pkg} 2>&1`)).trim();
+      addLog(`Unhid ${pkg}, which an earlier run hid: ${_CROWN_KEEP_VISIBLE[pkg]}. (${out || 'no output'})`,
+             LOG_TONE.WARN);
+    }
+    const imeKeep = _imeKeep(applied, _imePackages(await c.shell('ime list -s 2>&1')));
+    if (imeKeep.length) {
+      addLog(`Not hiding ${imeKeep.join(', ')}: it holds every enabled keyboard. Install and `
+           + 'enable another keyboard first.', LOG_TONE.WARN);
+    }
+    const keep = new Set([..._keepVisible(applied), ...imeKeep]);
+    ({ visible, installed } = await packageSets(c));
+    for (const l of lists) {
+      const hide = tiers.includes(l.tier);
+      if (!hide && !before.includes(l.tier)) continue;   // never applied: leave it alone
+      const verb = hide ? 'hide' : 'unhide';
+      // Only what needs the call: pm is slow per package, and an already
+      // hidden (or, for unhide, visible) package needs nothing.
+      const todo = l.packages.filter(p => installed.has(p) && !keep.has(p)
+                                          && (hide ? visible.has(p) : !visible.has(p)));
+      const absent = l.packages.filter(p => !installed.has(p));
+      addLog(`Tier ${l.tier}: ${hide ? 'hiding' : 'unhiding (no longer chosen)'} `
+           + `${todo.length} of ${l.packages.length} packages`
+           + (absent.length ? ` (${absent.length} not on this build)` : '') + '…');
+      const rejected = [];
+      for (const pkg of todo) {
+        const out = (await c.shell(`pm ${verb} ${pkg} 2>&1`)).trim();
+        const verdict = _pmVerdict(out);
+        if (verdict === PM_VERDICT.REJECTED) rejected.push(`${pkg}: ${out || 'no output'}`);
+        addLog(`  ${pkg} → ${verdict === PM_VERDICT.DONE ? `${verb === 'hide' ? 'hidden' : 'visible'}`
+                          : verdict === PM_VERDICT.ABSENT ? 'not installed on this build'
+                          : (out || 'no output')}`,
+               verdict === PM_VERDICT.DONE ? undefined : LOG_TONE.WARN);
+      }
+      if (rejected.length && hide) {
+        throw new Error(`The package manager refused to hide ${rejected.length} Tier ${l.tier} `
+                      + `package(s): ${rejected.join('; ')}. Retry; every boot also re-hides them.`);
+      }
+    }
+
+    ({ visible, installed } = await packageSets(c));
+    for (const l of lists.filter(x => tiers.includes(x.tier))) {
+      const left = l.packages.filter(p => visible.has(p) && !keep.has(p));
+      if (left.length) throw new Error(`Tier ${l.tier} packages still visible: ${left.join(', ')}.`);
+    }
+    addLog(`${installed.size - visible.size} of ${installed.size} installed packages are hidden.`,
+           LOG_TONE.OK);
+
+    // The Amazon apps that stay but could record: their RECORD_AUDIO app op
+    // set to ignore, so AudioFlinger refuses their recorders even with the
+    // permission granted. Persistent; start_server.sh re-asserts it per boot.
+    const micPkgs = micDeny.packages.filter(p => installed.has(p));
+    addLog(`Denying the microphone to ${micPkgs.join(', ') || 'nothing (none installed)'}…`);
+    const stillAllowed = [];
+    for (const pkg of micPkgs) {
+      if (!_micDenied(await c.shell(`appops get ${pkg} RECORD_AUDIO 2>&1`))) {
+        const out = (await c.shell(`appops set ${pkg} RECORD_AUDIO ignore 2>&1`)).trim();
+        if (out) addLog(`  ${pkg}: ${out}`, LOG_TONE.WARN);
+      }
+      const now = (await c.shell(`appops get ${pkg} RECORD_AUDIO 2>&1`)).trim();
+      if (_micDenied(now)) addLog(`  ${pkg} → microphone denied`);
+      else stillAllowed.push(`${pkg} (${now || 'no output'})`);
+    }
+    if (stillAllowed.length) {
+      throw new Error(`The microphone is still allowed to ${stillAllowed.join('; ')}: it could take `
+                    + "the Show's one recording from EchoMuse. Retry.");
+    }
+
+    // With Amazon's launchers hidden, HOME must resolve to the kiosk chosen
+    // above.
+    const home = _homeActivities(await c.shell(_HOME_RESOLVE)).pop();
+    if (!_sameComponent(home, kiosk)) {
+      throw new Error(`HOME resolves to ${home ? _component(home) : 'nothing'}, not `
+                    + `${_component(kiosk)}, so the Show would not boot to your kiosk. Retry, or `
+                    + 'undo with `pm unhide` on the Tier 1 list (docs/rooting.md).');
+    }
+    addLog(`Home screen: ${_component(home)}.`, LOG_TONE.OK);
+    addLog(`MemAvailable after: ${await memAvailable(c)}.`);
+    addLog("For the Show's own Wi-Fi and Bluetooth settings, add these to your kiosk's app "
+         + 'launcher: ' + Object.entries(_CROWN_SETTINGS_PAGES).map(([n, comp]) => `${n} ${comp}`).join(', ')
+         + ' (Android\'s generic Wi-Fi settings link does not open on this build).');
+    addLog(`Undo: pm unhide each package in ${dir}/${lists.map(l => l.file).join(' and ')}, `
+         + `appops set <package> RECORD_AUDIO default for each in ${dir}/${micDeny.file}, `
+         + `then delete ${tiersFile} (docs/rooting.md).`);
   }
 
   // The device-link hello is the only evidence that the whole chain works:
@@ -5159,12 +5799,18 @@ function ProvisionWizard({ onClose, knownDevices }) {
       }
       await new Promise(r => setTimeout(r, 3000));
     }
+    const crown = platformRef.current === WIZARD_PLATFORM.CROWN;
+    const serverLog = _serverLog(platformRef.current);
     const tail = await c.shell(
-      `grep -E '\\[wifi\\]|\\[clock\\]|mDNS|link|session' /tmp/server.log 2>&1 | tail -n 25`);
-    addLog(`WiFi and link lines from /tmp/server.log:\n${tail || '(none)'}`, LOG_TONE.WARN);
+      `grep -E '\\[wifi\\]|\\[clock\\]|mDNS|link|session' ${serverLog} 2>&1 | tail -n 25`);
+    addLog(`${crown ? 'Link' : 'WiFi and link'} lines from ${serverLog}:\n${tail || '(none)'}`,
+           LOG_TONE.WARN);
     throw new Error(`The device did not reach this controller within ${TIMEOUT_MS / 1000}s. `
-                  + 'The other system slot has not been touched, so a fallback boot still '
-                  + 'comes up as stock Alexa. Fix the cause above, then Retry.');
+                  + (crown
+                      ? 'Check the Show is still on Wi-Fi (its Settings) and can reach this '
+                        + 'controller, fix the cause above, then Retry.'
+                      : 'The other system slot has not been touched, so a fallback boot still '
+                        + 'comes up as stock Alexa. Fix the cause above, then Retry.'));
   }
 
   async function runMirrorBootHook(c) {
@@ -5176,7 +5822,7 @@ function ProvisionWizard({ onClose, knownDevices }) {
       throw new Error(`The running slot ${active} does not carry the boot hook, so this boot `
                     + 'did not come from the slot Install Boot Hook wrote. Not touching the other slot.');
     }
-    await withStagedRc(c, () => installBootHookOther(c, active === '_a' ? '_b' : '_a'));
+    await withStagedRc(c, _ECHOMUSE_RC, () => installBootHookOther(c, active === '_a' ? '_b' : '_a'));
     addLog('Both system slots now carry the boot hook.', LOG_TONE.OK);
   }
 
@@ -5274,20 +5920,24 @@ function ProvisionWizard({ onClose, knownDevices }) {
 
   // The echomuse service starts on `sys.boot_completed=1`
   // (measured 11.7s after boot on hardware — docs/fireos6-port.md Phase 3),
-  // and the mixer is required for it to have anything to talk to. On
-  // failure, tail the supervisor's own log (/tmp/server.log — same path
-  // start_server.sh writes, see device_payloads/start_server.sh) rather
-  // than just naming the stuck property.
+  // and the audio service is required for it to have anything to talk to:
+  // Amazon's mixer on the Dot, Android's audioserver on the Show, whose full
+  // framework also takes longer to reach boot_completed. On failure, tail
+  // the server's own log (_serverLog — the path start_server.sh writes, see
+  // device_payloads/start_server.sh) rather than just naming the stuck
+  // property.
   async function runVerifyService(c) {
-    addLog('Waiting for echomuse and mixer to start…');
-    const TIMEOUT_MS = 90000;
+    const crown = platformRef.current === WIZARD_PLATFORM.CROWN;
+    const audio = crown ? 'audioserver' : 'mixer';
+    addLog(`Waiting for echomuse and ${audio} to start…`);
+    const TIMEOUT_MS = crown ? 180000 : 90000;
     const started = Date.now();
-    let echomuseState = '', mixerState = '', lastNote = -1;
+    let echomuseState = '', audioState = '', lastNote = -1;
     while (Date.now() - started < TIMEOUT_MS) {
       echomuseState = (await c.shell('getprop init.svc.echomuse')).trim();
-      mixerState    = (await c.shell('getprop init.svc.mixer')).trim();
-      if (echomuseState === 'running' && mixerState === 'running') {
-        addLog(`init.svc.echomuse=running, init.svc.mixer=running `
+      audioState    = (await c.shell(`getprop init.svc.${audio}`)).trim();
+      if (echomuseState === 'running' && audioState === 'running') {
+        addLog(`init.svc.echomuse=running, init.svc.${audio}=running `
              + `(after ${Math.round((Date.now() - started) / 1000)}s).`, LOG_TONE.OK);
         return;
       }
@@ -5295,15 +5945,16 @@ function ProvisionWizard({ onClose, knownDevices }) {
       if (elapsed - lastNote >= 10) {
         lastNote = elapsed;
         addLog(`  [${elapsed}s] init.svc.echomuse=${echomuseState || '(unset)'}, `
-             + `init.svc.mixer=${mixerState || '(unset)'}`);
+             + `init.svc.${audio}=${audioState || '(unset)'}`);
       }
       await new Promise(r => setTimeout(r, 2000));
     }
-    const tail = await c.shell('tail -c 4000 /tmp/server.log 2>&1');
-    addLog(`Tail of /tmp/server.log:\n${tail || '(empty or missing)'}`, LOG_TONE.WARN);
+    const serverLog = _serverLog(platformRef.current);
+    const tail = await c.shell(`tail -c 4000 ${serverLog} 2>&1`);
+    addLog(`Tail of ${serverLog}:\n${tail || '(empty or missing)'}`, LOG_TONE.WARN);
     throw new Error(`Service did not reach "running" within ${TIMEOUT_MS / 1000}s — `
                    + `init.svc.echomuse=${echomuseState || '(unset)'}, `
-                   + `init.svc.mixer=${mixerState || '(unset)'}.`);
+                   + `init.svc.${audio}=${audioState || '(unset)'}.`);
   }
 
   // ── Step executor ──
@@ -5322,7 +5973,11 @@ function ProvisionWizard({ onClose, knownDevices }) {
     // and people paste it when something goes wrong — without these it is a
     // single 200-line stream with no way to tell which step a message
     // belongs to, or which one a failure happened in.
-    addLog(`── ${stepIdx + 1}/${steps.length}  ${steps[stepIdx].label.toUpperCase()} ──`, LOG_TONE.HEAD);
+    // Numbered among the steps this device runs (all of them before
+    // connect_android has classified it).
+    const runs = _stepsFor(platformRef.current);
+    addLog(`── ${runs.indexOf(steps[stepIdx].id) + 1}/${runs.length}  `
+         + `${steps[stepIdx].label.toUpperCase()} ──`, LOG_TONE.HEAD);
     let c = adb;
     try {
       // Every step but the two connection steps needs a live handle. Passing
@@ -5334,9 +5989,11 @@ function ProvisionWizard({ onClose, knownDevices }) {
       }
       switch (steps[stepIdx].id) {
         case 'connect_android':   c = await runConnectAndroid(); break;
+        case 'check_home':        await runCheckHome(c); break;
         case 'install_boot_hook': await runInstallBootHook(c); break;
         case 'install_em':        await runInstallEchoMuse(c); break;
         case 'wifi':              await runConfigWifi(c, wifiSsid, wifiPsk); break;
+        case 'neutralize_alexa':  await runNeutralizeAlexa(c, hideTier2); break;
         case 'reboot':            await runReboot(c); break;
         case 'reconnect':         c = await runReconnect(); break;
         case 'verify_service':    await runVerifyService(c); break;
@@ -5345,7 +6002,10 @@ function ProvisionWizard({ onClose, knownDevices }) {
       }
       if (abandoned()) return;
       markStep(stepIdx, STEP_STATE.DONE);
-      if (stepIdx < steps.length - 1) setStep(stepIdx + 1);
+      // The next step this device runs: connect_android has just said
+      // which device it is, so platformRef, not the render's `platform`.
+      const next = _nextStep(stepIdx + 1, platformRef.current);
+      if (next < steps.length) setStep(next);
     } catch (e) {
       // A step abandoned mid-flight may still throw on its way out, once the
       // transport notices. The UI already says what happened; saying it again
@@ -5383,7 +6043,7 @@ function ProvisionWizard({ onClose, knownDevices }) {
   }, [step, running, adb]);
 
   const cur    = steps[step];
-  const isDone = step === steps.length - 1 && stepState[step] === STEP_STATE.DONE;
+  const isDone = step === _lastStep(platform) && stepState[step] === STEP_STATE.DONE;
 
   // Buttons are shown for manual steps; auto steps start themselves.
 
@@ -5397,7 +6057,7 @@ function ProvisionWizard({ onClose, knownDevices }) {
       background: 'rgba(180,176,168,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center',
       backdropFilter: 'blur(8px)',
     }}>
-      <div role="dialog" aria-modal="true" aria-label="Provision Echo Dot" style={{
+      <div role="dialog" aria-modal="true" aria-label="Provision Echo device" style={{
         background: 'linear-gradient(170deg,var(--raised),var(--surface))', border: '1px solid var(--border)',
         borderRadius: 16, width: 'min(900px,95vw)', height: 'min(700px,90vh)',
         display: 'flex', flexDirection: 'column', overflow: 'hidden',
@@ -5408,8 +6068,16 @@ function ProvisionWizard({ onClose, knownDevices }) {
         {/* Header */}
         <div style={{ background: 'linear-gradient(180deg,var(--card),var(--bg))', borderBottom: '1px solid var(--border-hard)', padding: '20px 24px 16px', boxShadow: '0 1px 0 var(--sheen) inset', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <div>
-            <div style={{ fontFamily: SANS, fontSize: 22, fontWeight: 600, color: 'var(--text)', letterSpacing: '-0.02em' }}>Provision Echo Dot</div>
-            <div style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)', letterSpacing: '0.12em', textTransform: 'uppercase', marginTop: 4 }}>Chrome/Edge only · USB-A cable · Fire OS 6 rooted via boot-root.zip</div>
+            <div style={{ fontFamily: SANS, fontSize: 22, fontWeight: 600, color: 'var(--text)', letterSpacing: '-0.02em' }}>
+              {platform ? `Provision ${WIZARD_PLATFORM_NAME[platform]}` : 'Provision Echo device'}
+            </div>
+            <div style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)', letterSpacing: '0.12em', textTransform: 'uppercase', marginTop: 4 }}>
+              {platform === WIZARD_PLATFORM.CROWN
+                ? 'Chrome/Edge only · USB cable · Fire OS 6 rooted via boot-root.img · on Wi-Fi · kiosk installed'
+                : platform === WIZARD_PLATFORM.DOT
+                  ? 'Chrome/Edge only · USB-A cable · Fire OS 6 rooted via boot-root.zip'
+                  : 'Chrome/Edge only · USB cable · Echo Dot 2nd gen or Echo Show 8 1st gen, Fire OS 6, rooted'}
+            </div>
           </div>
           <CircleButton onClick={onClose} title="Close">×</CircleButton>
         </div>
@@ -5420,16 +6088,23 @@ function ProvisionWizard({ onClose, knownDevices }) {
           <div style={{ width: 176, borderRight: '1px solid var(--border)', background: 'var(--hairline)', padding: '12px 0', overflowY: 'auto', flexShrink: 0 }}>
             {steps.map((s, i) => {
               const st = stepState[i]; const active = i === step;
+              // The other device's steps, once connect_android has said
+              // which device this is: shown, so both lists stay legible,
+              // but struck through and never run.
+              const na = !_stepApplies(s, platform);
               return (
                 <div key={s.id}
+                  title={na ? `Not applicable on the ${WIZARD_PLATFORM_NAME[platform]}` : undefined}
                   style={{
                     padding: '6px 14px', display: 'flex', alignItems: 'center', gap: 7,
                     background: active ? 'var(--hairline)' : 'transparent',
                     cursor: 'default',
-                    opacity: running && !active ? 0.5 : 1,
+                    opacity: na ? 0.4 : running && !active ? 0.5 : 1,
                   }}>
-                  <span style={{ fontFamily: MONO, fontSize: 11, color: STEP_STATE_STYLE[st].color, flexShrink: 0 }}>{STEP_STATE_STYLE[st].icon}</span>
-                  <span style={{ fontFamily: MONO, fontSize: 9, color: active ? 'var(--text)' : 'var(--muted)', letterSpacing: '0.04em', lineHeight: 1.4 }}>{s.label}</span>
+                  <span style={{ fontFamily: MONO, fontSize: 11, color: na ? 'var(--muted)' : STEP_STATE_STYLE[st].color, flexShrink: 0 }}>{na ? '–' : STEP_STATE_STYLE[st].icon}</span>
+                  <span style={{ fontFamily: MONO, fontSize: 9, color: active ? 'var(--text)' : 'var(--muted)', letterSpacing: '0.04em', lineHeight: 1.4, textDecoration: na ? 'line-through' : 'none' }}>
+                    {s.label}{na ? ' · n/a' : ''}
+                  </span>
                 </div>
               );
             })}
@@ -5441,7 +6116,7 @@ function ProvisionWizard({ onClose, knownDevices }) {
             {/* Step title + desc */}
             <div style={{ marginBottom: 14 }}>
               <div style={{ fontFamily: SANS, fontSize: 14, fontWeight: 600, color: 'var(--text)', marginBottom: 4 }}>{cur.label}</div>
-              <div style={{ fontFamily: MONO, fontSize: 10, color: 'var(--muted)' }}>{cur.desc}</div>
+              <div style={{ fontFamily: MONO, fontSize: 10, color: 'var(--muted)' }}>{_stepDesc(cur, platform)}</div>
             </div>
 
             {/* connect_android is waiting on this answer (askReadopt). */}
@@ -5468,6 +6143,20 @@ function ProvisionWizard({ onClose, knownDevices }) {
               </div>
             )}
 
+            {/* Neutralise Alexa: the Tier 2 opt-in, then the button. The
+                switch stays while the step can still run (and on Retry). */}
+            {stepId === 'neutralize_alexa' && stepState[step] !== STEP_STATE.DONE && !running && (
+              <div style={{ marginBottom: 10 }}>
+                <Toggle
+                  label="Also hide Tier 2"
+                  sub="Amazon's cloud, smart-home radio and telemetry apps. Best once Tier 1 has been checked on this Show (Wi-Fi and Bluetooth still work from its Settings); unticked on a later run, they are unhidden."
+                  value={hideTier2} onChange={setHideTier2}/>
+                {stepState[step] === STEP_STATE.PENDING && (
+                  <Pill onClick={() => runStep(step)}>Neutralise Alexa</Pill>
+                )}
+              </div>
+            )}
+
             {/* WiFi configuration */}
             {stepId === 'wifi' && stepState[step] !== STEP_STATE.DONE && !running && (
               <WifiPanel
@@ -5477,7 +6166,7 @@ function ProvisionWizard({ onClose, knownDevices }) {
                 onScan={() => scanWifi(adb).then(nets => setWifiNetworks(nets)).catch(e => addLog(`Scan failed: ${e.message}`, LOG_TONE.ERROR))}
                 networks={wifiNetworks}
                 onConnect={() => { if (wifiSsid) runStep(step); }}
-                onSkip={() => { markStep(step, STEP_STATE.DONE); setStep(step + 1); }}
+                onSkip={() => { markStep(step, STEP_STATE.DONE); setStep(_nextStep(step + 1, platform)); }}
                 onAbort={() => { markStep(step, STEP_STATE.ERROR); addLog('WiFi skipped — provision incomplete.', LOG_TONE.WARN); }}
               />
             )}
@@ -5690,7 +6379,8 @@ const CONFIG_SECTIONS = {
   "ring": ["ledScene", "ledListenColor", "ledThinkColor", "meterAttack", "meterDecay", "meterFloor", "meterGamma", "meterRef", "meterCurve"],
   "advanced": ["buttonSingleTapEvent", "buttonMultiTapMs"],
   "bluetooth": ["bleProxyEnabled"],
-  "timers": ["timerSound", "timerRingSeconds", "timerRingGapSeconds", "alarmSound"]
+  "timers": ["timerSound", "timerRingSeconds", "timerRingGapSeconds", "alarmSound"],
+  "screen": ["screenWake", "screenWakeUrl", "screenWakePassword"]
 };
 
 // Display labels for the section ids, and the reverse key -> section index
@@ -5701,7 +6391,7 @@ const CONFIG_SECTIONS = {
 const SECTION_LABELS = {
   playback: 'Playback', wakeword: 'Wake word', microphones: 'Speech',
   ring: 'Ring', advanced: 'Button', bluetooth: 'Bluetooth',
-  timers: 'Timers',
+  timers: 'Timers', screen: 'Screen',
 };
 const KEY_SECTION = {};
 Object.entries(CONFIG_SECTIONS).forEach(([sid, keys]) => {
@@ -6220,6 +6910,11 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
   // spinner and the speaking meter both fall back to the solid listening
   // colour (em_device._send_led), so their settings would do nothing.
   const animGap = capabilityGap(capabilities, CAPABILITY.LED_ANIM);
+  // No `leds` at all (the Echo Show has no ring): every ring control is moot.
+  const ringGap = capabilityGap(capabilities, CAPABILITY.LEDS);
+  const ringStyle = ringGap ? { opacity: 0.45, pointerEvents: 'none' } : {};
+  const bleGap = capabilityGap(capabilities, CAPABILITY.BLE_PROXY);
+  const screenGap = capabilityGap(capabilities, CAPABILITY.SCREEN_WAKE);
   const [catalog, reloadSounds] = useSounds();
 
   const bands = config.eqBands ?? [0,0,0,0,0,0,0,0];
@@ -6343,10 +7038,11 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
         chips={<ScopeChip tone="controller">Controller</ScopeChip>}
         desc="Colours for the LED ring during conversations — the solid listening ring and the thinking spinner. The red mute ring and cyan volume arc never change; red always means the mics are off."
         scope={scopeEl('ring')} dim={secStyle('ring')}>
-        <div className="em-grid2" style={{ display: 'grid', gridTemplateColumns: '1.4fr 1fr', gap: 24, alignItems: 'start' }}>
+        {ringGap && <div style={{ marginBottom:8, fontFamily:MONO, fontSize:9, color:'var(--warn)' }}>Ring controls unavailable: {ringGap}</div>}
+        <div className="em-grid2" style={{ display: 'grid', gridTemplateColumns: '1.4fr 1fr', gap: 24, alignItems: 'start', ...ringStyle }}>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, ...inputStyle }}>
             {RING_SCENES.map(sc => (
-              <div key={sc.value} {...pressable(() => set('ledScene', sc.value), { disabled, selected: (config.ledScene ?? 'standard') === sc.value })} style={{
+              <div key={sc.value} {...pressable(() => set('ledScene', sc.value), { disabled: disabled || !!ringGap, selected: (config.ledScene ?? 'standard') === sc.value })} style={{
                 background: (config.ledScene ?? 'standard') === sc.value
                   ? 'linear-gradient(160deg,var(--accent-tint),var(--accent-line))'
                   : 'linear-gradient(160deg,var(--raised),var(--surface))',
@@ -6371,7 +7067,7 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
             <div style={inputStyle}>
               <div style={{ fontFamily: MONO, fontSize: 11, color: 'var(--text2)', marginBottom: 8 }}>Custom colours</div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
-                <input type="color" value={config.ledListenColor ?? '#00b400'} disabled={disabled}
+                <input type="color" value={config.ledListenColor ?? '#00b400'} disabled={disabled || !!ringGap}
                   aria-label="Listening colour"
                   onChange={e => set('ledListenColor', e.target.value)}
                   style={{ width: 36, height: 28, padding: 0, border: '1px solid var(--border)', borderRadius: 6, background: 'none', cursor: 'pointer' }}/>
@@ -6449,7 +7145,9 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
         desc="Turns the device into a Home Assistant Bluetooth proxy: it passively listens for BLE advertisements (presence beacons, temperature sensors) and forwards them to HA as a separate ESPHome device — independent of the voice assistant. Enabling permanently switches the Dot's Bluetooth chip away from Android's stack (Bluetooth speaker pairing, never used by EchoMuse, stops being possible)."
         scope={scopeEl('bluetooth')} dim={secStyle('bluetooth')}>
         <div className="em-grid2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0 24px', ...inputStyle }}>
-          <Toggle label="Bluetooth proxy" sub="passive BLE scan → HA (Bermuda, BLE sensors)" value={config.bleProxyEnabled ?? false} onChange={v => set('bleProxyEnabled', v)}/>
+          <Toggle label="Bluetooth proxy" sub={bleGap || 'passive BLE scan → HA (Bermuda, BLE sensors)'}
+            value={!bleGap && (config.bleProxyEnabled ?? false)} disabled={!!bleGap}
+            onChange={v => set('bleProxyEnabled', v)}/>
         </div>
       </Stage>
 
@@ -6474,6 +7172,32 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
             value={config.timerRingSeconds ?? 900} min={30} max={1800} step={30}
             formatValue={v => v >= 60 ? `${Math.round(v/60)} min` : `${v}s`}
             onChange={v => set('timerRingSeconds', v)}/>
+        </div>
+      </Stage>
+
+      {/* 08 SCREEN */}
+      <Stage n="08" title="Screen"
+        chips={<ScopeChip tone="device">Kiosk</ScopeChip>}
+        desc="An Echo Show's screen belongs to its kiosk app (Fully Kiosk Browser), which keeps its own motion wake and screen timeout. With this on, the wake word also lights the screen, through the kiosk's local REST API: enable Remote Administration in Fully's settings and enter its password here. The URL is the kiosk API's root; the default reaches Fully on the Echo Show itself."
+        scope={scopeEl('screen')} dim={secStyle('screen')}>
+        {screenGap && <div style={{ marginBottom:8, fontFamily:MONO, fontSize:9, color:'var(--warn)' }}>Screen controls unavailable: {screenGap}</div>}
+        <div className="em-grid2" style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:'0 24px', ...inputStyle }}>
+          <Toggle label="Light the screen on wake"
+            sub={screenGap || 'turns the kiosk screen on the moment the Echo hears the wake word'}
+            value={!screenGap && (config.screenWake ?? false)} disabled={!!screenGap}
+            onChange={v => set('screenWake', v)}/>
+        </div>
+        <div className="em-grid2" style={{ display:'grid', gridTemplateColumns:'1.6fr 1fr', gap:12, marginTop:8, ...inputStyle }}>
+          <label style={{ fontFamily:MONO, fontSize:8, color:'var(--muted)' }}>kiosk API URL
+            <input type="text" value={config.screenWakeUrl ?? ''} disabled={!!screenGap} placeholder="http://127.0.0.1:2323"
+              onChange={e => set('screenWakeUrl', e.target.value.trim())}
+              style={{ display:'block', width:'100%', marginTop:4, boxSizing:'border-box' }}/>
+          </label>
+          <label style={{ fontFamily:MONO, fontSize:8, color:'var(--muted)' }}>Remote Administration password
+            <input type="password" value={config.screenWakePassword ?? ''} disabled={!!screenGap}
+              autoComplete="new-password" onChange={e => set('screenWakePassword', e.target.value)}
+              style={{ display:'block', width:'100%', marginTop:4, boxSizing:'border-box' }}/>
+          </label>
         </div>
       </Stage>
     </div>

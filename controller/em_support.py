@@ -73,8 +73,9 @@ _DEVICE_FIELDS = (
 )
 
 # Config keys are behaviour, not secrets — but the WiFi credential is neither
-# stored here nor wanted, so the guard is explicit rather than assumed.
-_CONFIG_DENY = ("psk", "password", "token", "secret", "key")
+# stored here nor wanted, so the guard is explicit rather than assumed. A URL
+# (screenWakeUrl, the kiosk API) can name a LAN address.
+_CONFIG_DENY = ("psk", "password", "token", "secret", "key", "url")
 
 # Keys as `db.get_turns` returns them (plus device_id, added by the caller).
 # The text fields (`asr_text`, `stt_raw`, `stt_text`, `response_text`) are
@@ -514,6 +515,8 @@ _PROVISION_PROPS = (
     "ro.product.name",
     "ro.product.device",
     "ro.build.version.name",
+    "ro.build.display.id",
+    "ro.build.lab126.project",
     "ro.build.version.incremental",
     "ro.build.version.release",
     "ro.build.version.sdk",
@@ -523,6 +526,7 @@ _PROVISION_PROPS = (
     "sys.boot_completed",
     "persist.sys.usb.config",
     "persist.wifi.migrate.complete",
+    "persist.boot.oobe",
 )
 
 # `wpa_cli status` keys. The state and the crypto are the diagnostic value;
@@ -556,6 +560,17 @@ class ProvisionProbe(enum.StrEnum):
     MIXER_STREAMS = "mixer_streams"        # ls -l /data/mixer_streams
     ECHOMUSE_RC = "echomuse_rc"            # cat /system/etc/init/echomuse.rc
     SLOT_SUFFIX = "slot_suffix"            # getprop ro.boot.slot_suffix
+    # Echo Show 8 (`crown`) only: docs/echo-show-port-plan.md Phase 4.
+    AUDIOSERVER_SERVICE = "audioserver_service"  # getprop init.svc.audioserver
+    HOME_ACTIVITIES = "home_activities"    # cmd package query-activities HOME
+    HOME_RESOLVED = "home_resolved"        # cmd package resolve-activity HOME
+    HIDDEN_PACKAGES = "hidden_packages"    # counts: pm list packages -u vs visible
+    CROWN_TIERS = "crown_tiers"            # the hide tiers the wizard applied
+    PROVISIONED = "provisioned"            # settings device_provisioned / user_setup_complete
+    AMAZON_GATING = "amazon_gating"        # the privacy mute's state (sysfs)
+    WLAN = "wlan"                          # ip -4 addr show wlan0: is Android on Wi-Fi
+    MIC_DENY = "mic_deny"                  # appops get <pkg> RECORD_AUDIO, the mic-deny list
+    SETTINGS_BUNDLE = "settings_bundle"    # whether KnightSettings has its config bundle
 
 
 class WpaScanRow(TypedDict):

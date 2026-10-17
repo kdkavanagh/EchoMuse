@@ -1,4 +1,5 @@
-// Package als reads the Echo Dot's ambient light sensor.
+// Package als reads the ambient light sensor: the Echo Dot's, and the Echo
+// Show's stk3x1x (see alsPsPath below).
 //
 // Our Dots carry an ams TSL2540 on i2c, which Amazon's Android layer does not
 // expose AT ALL: `dumpsys sensorservice` reports an empty sensor list, there
@@ -35,6 +36,11 @@
 // It succeeds and leaves every als_* attribute in place; the next read enters
 // a show() handler whose driver data is gone and hangs the device hard enough
 // to need a power cycle. Attribute presence does not prove a driver is bound.
+//
+// The Echo Show 8 (crown) carries an stk3x1x at i2c 0-0044 whose driver is
+// neither of the above and not IIO: it publishes the reading as text
+// ("2 lux") at /sys/bus/platform/drivers/als_ps/lux (docs/echo-show-crown.md
+// §3). It is the third source, tried when both buses come up empty.
 //
 // This is its own package because two callers need it at different moments:
 // the register message needs to know whether the sensor EXISTS, to declare
@@ -76,6 +82,13 @@ const iioDriverName = "tsl2584tsv"
 // iio:deviceN, same shape as i2cGlob. A variable only so tests can point it
 // at a fixture directory.
 var iioGlob = "/sys/bus/iio/devices/iio:device*/name"
+
+// alsPsPath is the Show's stk3x1x reading, published by its als_ps platform
+// driver as "<n> lux". A variable only so tests can point it at a fixture.
+var alsPsPath = "/sys/bus/platform/drivers/als_ps/lux"
+
+// alsPsName stands for the als_ps driver in Status.Seen.
+const alsPsName = "als_ps"
 
 // StatusCode is why the sensor is or is not available. Stable identifiers,
 // because the controller and dashboard key off them; the human-readable
@@ -174,6 +187,17 @@ func resolve() string {
 		nameMatched = nameMatched || iioMatched
 		found = iioFound
 	}
+	if found == "" {
+		// The Show: present means the driver's file exists; usable means
+		// it reads as a number, which Present promises.
+		if b, err := os.ReadFile(alsPsPath); err == nil || !os.IsNotExist(err) {
+			seen = append(seen, alsPsName)
+			nameMatched = true
+			if _, ok := parseLux(b); err == nil && ok {
+				found = alsPsPath
+			}
+		}
+	}
 	if found != "" {
 		path = found
 		status = Status{Code: StatusOK, Path: found, Seen: seen}
@@ -186,13 +210,13 @@ func resolve() string {
 	if nameMatched {
 		status = Status{
 			Code:   StatusNoAttribute,
-			Detail: "a known ALS name (" + driverName + " i2c / " + iioDriverName + " iio) is on the bus but exposes no readable lux attribute — the driver has not bound",
+			Detail: "a known ALS (" + driverName + " i2c / " + iioDriverName + " iio / " + alsPsName + " driver) is present but exposes no readable lux attribute — the driver has not bound",
 			Seen:   seen,
 		}
 	} else {
 		status = Status{
 			Code:   StatusNoChip,
-			Detail: "no " + driverName + " on the i2c bus or " + iioDriverName + " on the iio bus — this hardware revision appears not to have the sensor fitted",
+			Detail: "no " + driverName + " on the i2c bus, " + iioDriverName + " on the iio bus or " + alsPsName + " driver — this hardware revision appears not to have the sensor fitted",
 			Seen:   seen,
 		}
 	}
@@ -202,11 +226,11 @@ func resolve() string {
 		// controller, so name which one it is: no chip on either bus at
 		// all, versus a chip present with no driver attribute bound to it.
 		if nameMatched {
-			log.Printf("[als] a known ALS name found but no readable lux attribute — driver not bound; " +
+			log.Printf("[als] a known ALS found but no readable lux attribute — driver not bound; " +
 				"ambient light unavailable")
 		} else {
-			log.Printf("[als] no %s (i2c) or %s (iio) found (saw: %s) — ambient light unavailable, "+
-				"rechecking every %s", driverName, iioDriverName, strings.Join(seen, ","), RetryInterval)
+			log.Printf("[als] no %s (i2c), %s (iio) or %s driver found (saw: %s) — ambient light unavailable, "+
+				"rechecking every %s", driverName, iioDriverName, alsPsName, strings.Join(seen, ","), RetryInterval)
 		}
 	}
 	return ""
@@ -289,11 +313,25 @@ func Lux() *int {
 	if err != nil {
 		return nil
 	}
-	n, err := strconv.Atoi(strings.TrimSpace(string(b)))
-	if err != nil {
+	n, ok := parseLux(b)
+	if !ok {
 		return nil
 	}
 	return &n
+}
+
+// parseLux reads a sensor attribute: a bare integer (als_lux,
+// illuminance0_input) or the Show's "<n> lux".
+func parseLux(b []byte) (int, bool) {
+	fields := strings.Fields(string(b))
+	if len(fields) == 0 || len(fields) > 2 || (len(fields) == 2 && fields[1] != "lux") {
+		return 0, false
+	}
+	n, err := strconv.Atoi(fields[0])
+	if err != nil {
+		return 0, false
+	}
+	return n, true
 }
 
 // ── Change watching ──────────────────────────────────────────────────────────

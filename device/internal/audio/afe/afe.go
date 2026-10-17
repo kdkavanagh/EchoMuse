@@ -1,6 +1,7 @@
-// Package afe decodes the native AFE metadata that the Fire OS 6 mixer's
-// micAsr capture carries in bit 0 of every sample, and summarises it per
-// capture period as an ema.AFERecord (WIRE §3, afe_metadata_v1).
+// Package afe decodes the native AFE metadata that ASR captures carry in
+// bit 0 of every sample (the Dot's mixer micAsr stream, the Echo Show's
+// OpenSL VOICE_RECOGNITION recorder), and summarises it per capture period
+// as an ema.AFERecord (WIRE §3, afe_metadata_v1).
 //
 // The layout is Amazon's v3.3 (docs/alexa-afe.md, "AFE metadata in bit 0
 // (v3.3)"): one 128-bit frame per 128-sample AFE batch (8 ms), most
@@ -17,7 +18,9 @@
 // milliseconds that average 8 per frame but arrive in bursts (steps of 3–16,
 // within ±8 ms of the 8 ms grid), so the decoder uses the counter to count
 // missing frames and the timestamp only to resolve the counter's modulo-64
-// aliasing.
+// aliasing. Each Period also names its last accepted frame's AFE_TIMESTAMP
+// and where that frame ended (Anchor): a capture path without a timestamp
+// of its own (OpenSL on the Show) stamps its periods from it.
 //
 // No cgo and no build tag: host-testable. Decode never allocates.
 package afe
@@ -89,6 +92,18 @@ type Period struct {
 	// Lost the AFE frames those discontinuities skipped (unclamped).
 	Invalid, Syncs, Gaps uint8
 	Lost                 uint32
+	// Anchor locates the period's last accepted frame.
+	Anchor Anchor
+}
+
+// Anchor ties a period to the AFE's clock through the last frame accepted
+// in it. AFE_TIMESTAMP is CLOCK_MONOTONIC milliseconds modulo 65,536
+// (docs/echo-show-crown.md §4.4), so TimestampMs needs unwrapping against a
+// local clock before use.
+type Anchor struct {
+	Valid       bool   // a frame was accepted in this period; the rest is zero otherwise
+	TimestampMs uint16 // the frame's AFE_TIMESTAMP
+	After       int    // samples of the period after the frame's final bit
 }
 
 type state uint8
@@ -251,7 +266,8 @@ func (d *Decoder) continuity(f Frame, p *Period) {
 	}
 }
 
-// finish turns the period's sums into the record's rounded means.
+// finish turns the period's sums into the record's rounded means and
+// anchors the period on its last accepted frame.
 func (d *Decoder) finish(p *Period) {
 	r := &p.Record
 	if r.ERLEFrames > 0 {
@@ -261,4 +277,7 @@ func (d *Decoder) finish(p *Period) {
 		r.RMSMean = uint8((d.rmsSum + d.rmsN/2) / d.rmsN)
 	}
 	r.Lost = uint8(min(p.Lost, 255))
+	if r.Frames > 0 { // accept ran in this period, so since counts only its samples
+		p.Anchor = Anchor{Valid: true, TimestampMs: d.last.TimestampMs, After: int(d.since)}
+	}
 }

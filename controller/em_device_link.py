@@ -146,12 +146,22 @@ class Capability(enum.StrEnum):
     LOCAL_WAKE_CHIME = "local_wake_chime"
     OPEN_RULES = "open_rules_v1"
     AFE_METADATA = "afe_metadata_v1"
+    # Announced by the Dot's firmware only: the Echo Show's own Android stack
+    # owns Wi-Fi and Bluetooth, and its mute is not integrated yet.
+    WIFI_CONTROL = "wifi_control"    # handles wifi_change/wifi_scan/wifi_commit
+    BLE_PROXY = "ble_proxy"          # sends ble_adverts, honours bleProxyEnabled
+    PRIVACY_MUTE = "privacy_mute"    # a hardware privacy mute, reported in privacy
+    # Announced by the Echo Show's firmware only: it lights the kiosk screen
+    # on wake-candidate open when config screenWake says so.
+    SCREEN_WAKE = "screen_wake"
 
 
 class DevicePlatform(enum.StrEnum):
-    """`session.hello.platform` (WIRE §4.1): the system image the firmware runs on."""
+    """`session.hello.platform` (WIRE §4.1): the system image the firmware runs on.
+    One firmware binary runs on every member; it picks its backends at runtime."""
 
-    FIREOS6 = "fireos6"   # Android 7.1.2 `biscuit_puffin`: headless, toybox only
+    FIREOS6 = "fireos6"               # Echo Dot 2nd gen, Android 7.1.2 `biscuit_puffin`: headless, toybox only
+    FIREOS6_CROWN = "fireos6_crown"   # Echo Show 8 1st gen `crown`, Fire OS 6 with the full Android framework
 
 
 class RejectReason(enum.StrEnum):
@@ -274,7 +284,10 @@ class SessionHello:
     one this controller does not know (see `_platform`); `platform_sent` is
     what it sent, for the refusal log. `os_version` is the Fire OS build the
     device runs (`ro.build.version.name`), separate from `firmware_version`,
-    the EchoMuse binary; None when not reported.
+    the EchoMuse binary; None when not reported. `volume_available` is False
+    when `volume.level` is JSON null: the device (an Echo Show whose Android
+    volume check failed) has no volume control this session and ignores
+    `volume_set` and `startupVolume`; `volume_level` is then None.
     """
 
     protocols: tuple[int, ...]
@@ -287,6 +300,7 @@ class SessionHello:
     ambient_light_status: dict[str, object] | None = None
     muted: bool | None = None
     volume_level: int | None = None
+    volume_available: bool = True
     alerts: dict[str, object] = field(default_factory=dict)
     assets: tuple[str, ...] = ()
 
@@ -319,6 +333,7 @@ class SessionHello:
             muted=muted if isinstance(muted, bool) else None,
             volume_level=(int(level) if isinstance(level, (int, float))
                           and not isinstance(level, bool) else None),
+            volume_available=not ("level" in volume and level is None),
             alerts=_object(body.get("alerts")) or {},
             assets=(tuple(a for a in assets if isinstance(a, str))
                     if isinstance(assets, list) else ()),

@@ -48,5 +48,13 @@ Deeper technical references live elsewhere:
   focus, stop/snooze and loops), the alert sounds, and the 284-file LED
   animation corpus including the plain-text 12-LED DSL compared with
   EchoMuse's parametric `led_anim`.
+- [echo-show-crown.md](echo-show-crown.md) — the Echo Show 8 (1st gen,
+  `crown`) compared with the Dot: framework image, audio path through
+  AudioFlinger and Amazon's AFE (with measured echo cancellation), hardware,
+  the LineageOS 18.1 port, and which Amazon packages would take the mic,
+  speaker or screen back.
+- [echo-show-port-plan.md](echo-show-port-plan.md) — the plan and its
+  implementation status for running EchoMuse on the Show as a voice satellite
+  beside a kiosk, with Wi-Fi and Bluetooth left to the device.
 - [CLAUDE.md](../CLAUDE.md) — codebase orientation for developers (and AI
   assistants).

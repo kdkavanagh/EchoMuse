@@ -23,6 +23,7 @@ pytest.importorskip("aiohttp")
 pytest.importorskip("websockets")
 
 import em_api  # noqa: E402
+from em_device_link import DevicePlatform  # noqa: E402
 
 PAYLOADS = Path(__file__).resolve().parents[1] / "device_payloads"
 START_SERVER = PAYLOADS / "start_server.sh"
@@ -164,8 +165,8 @@ def dev_shell(monkeypatch) -> Shell:
     return rec
 
 
-def _debloat():
-    live = SimpleNamespace(device_id="DEV1")
+def _debloat(platform: DevicePlatform = DevicePlatform.FIREOS6):
+    live = SimpleNamespace(device_id="DEV1", platform=platform)
     asyncio.run(em_api._sync_debloat(None, live, "DEV1"))
 
 
@@ -185,7 +186,7 @@ def test_debloat_runs_the_start_scripts_denylist(dev_shell):
 
 
 def test_debloat_syncs_a_stale_script_first(dev_shell, bindir, tmp_path):
-    dev_shell.replies = [("NEW=$(", "SCRIPT_SYNCED"), (" debloat", "DEBLOAT_WAITING:puffin\n"
+    dev_shell.replies = [("NEW=$(", "PAYLOAD_SYNCED"), (" debloat", "DEBLOAT_WAITING:puffin\n"
                          f"DEBLOAT_STOPPED:{len(DENYLIST) - 1} STILL_RUNNING:puffin\n")]
     _debloat()
     assert dev_shell.transfers == [(f"{START}.new", "755")]
@@ -198,7 +199,7 @@ def test_debloat_syncs_a_stale_script_first(dev_shell, bindir, tmp_path):
     _link(bindir, "md5sum", "mv", "chmod", "rm")
     landed = tmp_path / "start_server.sh"
     (tmp_path / "start_server.sh.new").write_bytes(START_SERVER.read_bytes())
-    assert "SCRIPT_SYNCED" in _sh(verify.replace(START, str(landed)), bindir)
+    assert "PAYLOAD_SYNCED" in _sh(verify.replace(START, str(landed)), bindir)
     assert landed.read_bytes() == START_SERVER.read_bytes()
 
 
@@ -240,10 +241,10 @@ esac""")
     return state
 
 
-def _start_server(bindir: Path, state: Path) -> tuple[int, str, str]:
+def _start_server(bindir: Path, state: Path, script: Path = START_SERVER) -> tuple[int, str, str]:
     env = {"PATH": f"{bindir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
            "STATE": str(state)}
-    proc = subprocess.Popen([SH, str(START_SERVER), "debloat"], env=env, text=True,
+    proc = subprocess.Popen([SH, str(script), "debloat"], env=env, text=True,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             start_new_session=True)
     try:
@@ -285,3 +286,287 @@ def test_debloat_mode_names_what_is_still_running(bindir, device):
         len(DENYLIST) - 1, ("puffin", "dnsmasq"))
 
 
+# ── Echo Show 8 (`crown`): the hide lists and the mic-deny list ──────────────
+
+SCRIPT = START_SERVER.read_text()
+CROWN_STOPLIST = re.search(r'^CROWN_STOPLIST="([^"]+)"', SCRIPT, re.M).group(1).split()
+TIER1 = em_api.crown_hide_packages(em_api.HideTier.ONE)
+TIER2 = em_api.crown_hide_packages(em_api.HideTier.TWO)
+MIC_DENY = em_api.crown_mic_deny_packages()
+LISTS = {f"{em_api.CROWN_ETC_DIR}/{name}": hashlib.md5((PAYLOADS / name).read_bytes()).hexdigest()
+         for name in [*em_api.CROWN_HIDE_LISTS.values(), em_api.CROWN_MIC_DENY_LIST]}
+
+# Findings §9.3: what the Show itself needs, and what its owner needs to
+# manage Wi-Fi and Bluetooth from the device. The last three are measured
+# (2026-10-17): hidden, amazon.speech.sim crash-loops KnightSystemUI and
+# kindle.otter.oobe takes every Settings page down; the keyboard is the only
+# input method.
+KEEP_PACKAGES = {
+    "android", "com.android.systemui", "com.android.settings", "com.android.packageinstaller",
+    "com.android.shell", "com.android.bluetooth", "com.amazon.webview.chromium",
+    "com.amazon.webview", "com.amazon.knightwebview", "com.amazon.knight.ecs",
+    "com.amazon.knight.hds", "com.amazon.NativeAccessorProxyServices",
+    "com.amazon.device.echoaudioservice", "com.amazon.knight.btavrcp",
+    "amazon.speech.sim", "com.amazon.kindle.otter.oobe", "com.amazon.bluestone.keyboard",
+}
+KEEP_SERVICES = {
+    "audioserver", "media", "cameraserver", "aal", "wpa_supplicant", "p2p_supplicant", "netd",
+    "dhcpcd", "wmt_launcher", "perfmonitord", "perfrecoveryd", "securetime", "kisd", "healthd",
+    "mixer", "wifisvc", "zygote", "surfaceflinger", "servicemanager",
+}
+PACKAGE_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+")
+
+
+def test_package_list_drops_comments_and_blank_lines():
+    assert em_api._package_list("# a comment\n\n  com.a.b  \n# com.c.d\ncom.e.f\n") \
+        == ["com.a.b", "com.e.f"]
+
+
+@pytest.mark.parametrize("pkgs", [TIER1, TIER2, MIC_DENY], ids=["tier1", "tier2", "mic_deny"])
+def test_each_list_is_one_package_name_per_line(pkgs):
+    """start_server.sh reads the first word of each line; a trailing comment
+    would make the wizard (which takes the whole line) act on something else."""
+    assert pkgs, "the list is empty"
+    assert [p for p in pkgs if not PACKAGE_NAME.fullmatch(p)] == []
+    assert len(set(pkgs)) == len(pkgs), "a package listed twice"
+
+
+def test_tiers_do_not_overlap():
+    assert not set(TIER1) & set(TIER2)
+
+
+def test_tier1_holds_the_screen_and_the_re_enablers():
+    for pkg in ("com.amazon.ds2.oobe.efd", "com.amazon.paladin",
+                "com.amazon.ambienthome", "com.amazon.device.rdmapplication",
+                "com.amazon.venezia", "com.amazon.diode", "com.amazon.settings.windfall"):
+        assert pkg in TIER1, pkg
+
+
+def test_hide_lists_never_name_what_the_show_keeps():
+    assert not (set(TIER1) | set(TIER2)) & KEEP_PACKAGES
+
+
+def test_alexas_wake_engine_and_the_keyboard_lose_the_mic_instead():
+    """Kept visible (hiding them breaks the Show), so their microphone is denied."""
+    assert {"amazon.speech.sim", "com.amazon.bluestone.keyboard"} <= set(MIC_DENY)
+
+
+def test_mic_deny_never_names_a_hidden_package():
+    """A hidden package records nothing: the list is for the ones that stay."""
+    assert not set(MIC_DENY) & (set(TIER1) | set(TIER2))
+
+
+def test_the_wizards_never_hide_guard_matches_the_lists():
+    """dashboard.jsx refuses to hide (and unhides) _CROWN_KEEP_VISIBLE; every
+    one of them is kept here, and no list names one."""
+    jsx = (PAYLOADS.parent / "static" / "dashboard.jsx").read_text()
+    block = re.search(r"const _CROWN_KEEP_VISIBLE = Object\.freeze\(\{(.*?)\n\}\);", jsx, re.S)
+    assert block, "dashboard.jsx no longer defines _CROWN_KEEP_VISIBLE"
+    guarded = set(re.findall(r"^\s*'([\w.]+)':", block.group(1), re.M))
+    assert guarded == {"amazon.speech.sim", "com.amazon.kindle.otter.oobe"}
+    assert guarded <= KEEP_PACKAGES
+    assert not guarded & (set(TIER1) | set(TIER2))
+
+
+def test_crown_stoplist_never_stops_audio_or_the_network():
+    """audioserver owns both PCMs and the AEC; Wi-Fi is the device's own."""
+    assert CROWN_STOPLIST and not set(CROWN_STOPLIST) & KEEP_SERVICES
+
+
+def test_crown_paths_match_between_script_and_controller():
+    assert re.search(r"^EM_ETC=(\S+)$", SCRIPT, re.M).group(1) == em_api.CROWN_ETC_DIR
+    tiers = re.search(r"^CROWN_TIERS=\$EM_ETC/(\S+)$", SCRIPT, re.M).group(1)
+    assert f"{em_api.CROWN_ETC_DIR}/{tiers}" == em_api.CROWN_TIERS_PATH
+    for tier, name in em_api.CROWN_HIDE_LISTS.items():
+        assert f'{tier}) echo "$EM_ETC/{name}" ;;' in SCRIPT
+    assert re.search(r"^CROWN_MIC_DENY=\$EM_ETC/(\S+)$", SCRIPT, re.M).group(1) \
+        == em_api.CROWN_MIC_DENY_LIST
+
+
+# ── crown: _sync_debloat ─────────────────────────────────────────────────────
+
+def _in_sync() -> list[tuple[str, str]]:
+    return [(START, f"{START_MD5}  {START}")] + [(p, f"{md5}  {p}") for p, md5 in LISTS.items()]
+
+
+QUIET = "HIDE_REASSERTED: STILL_VISIBLE:\nMIC_REASSERTED: STILL_ALLOWED:\n"
+STOPPED_ALL = f"DEBLOAT_STOPPED:{len(CROWN_STOPLIST)} STILL_RUNNING:\n"
+
+
+def _warnings(dev_shell) -> list[str]:
+    return [m for level, m in dev_shell.logs if level == em_api.db.LogLevel.WARN]
+
+
+def test_crown_debloat_checks_every_list_before_the_script_mode(dev_shell):
+    dev_shell.replies = [(" debloat", "HIDE_REASSERTED:com.amazon.paladin STILL_VISIBLE:\n"
+                          "MIC_REASSERTED: STILL_ALLOWED:\n" + STOPPED_ALL)] + _in_sync()
+    _debloat(DevicePlatform.FIREOS6_CROWN)
+    assert dev_shell.commands == [em_api._md5_of(START), *map(em_api._md5_of, LISTS), DEBLOAT]
+    assert dev_shell.transfers == []
+    assert _warnings(dev_shell) == ["debloat: re-hid 1 package(s) that had become visible "
+                                    "again: com.amazon.paladin"]
+    assert f"{len(CROWN_STOPLIST)} listed, none running" in dev_shell.logs[-1][1]
+
+
+def test_crown_debloat_pushes_stale_lists(dev_shell):
+    dev_shell.replies = [(" debloat", QUIET + STOPPED_ALL),
+                         (START, f"{START_MD5}  {START}"), ("NEW=$(", "PAYLOAD_SYNCED")]
+    _debloat(DevicePlatform.FIREOS6_CROWN)
+    assert dev_shell.transfers == [(f"{p}.new", "644") for p in LISTS]
+    assert dev_shell.commands[-1] == DEBLOAT
+    assert dev_shell.logs[-1][0] == em_api.db.LogLevel.INFO
+
+
+def test_crown_debloat_names_what_pm_refused(dev_shell):
+    dev_shell.replies = [(" debloat", "HIDE_REASSERTED: STILL_VISIBLE:com.amazon.d3,com.amazon.adep\n"
+                          "MIC_REASSERTED: STILL_ALLOWED:\n" + STOPPED_ALL)] + _in_sync()
+    _debloat(DevicePlatform.FIREOS6_CROWN)
+    assert _warnings(dev_shell) == ["debloat: the package manager refused to hide "
+                                    "com.amazon.d3, com.amazon.adep"]
+
+
+def test_crown_debloat_names_microphones_it_had_to_deny_or_could_not(dev_shell):
+    dev_shell.replies = [(" debloat", "HIDE_REASSERTED: STILL_VISIBLE:\n"
+                          "MIC_REASSERTED:amazon.speech.sim STILL_ALLOWED:\n" + STOPPED_ALL)] + _in_sync()
+    _debloat(DevicePlatform.FIREOS6_CROWN)
+    assert _warnings(dev_shell) == ["debloat: denied the microphone again to amazon.speech.sim, "
+                                    "which had it allowed"]
+
+    dev_shell.logs.clear()
+    dev_shell.replies[0] = (" debloat", "HIDE_REASSERTED: STILL_VISIBLE:\nMIC_REASSERTED: "
+                            "STILL_ALLOWED:com.amazon.bluestone.keyboard\n" + STOPPED_ALL)
+    _debloat(DevicePlatform.FIREOS6_CROWN)
+    assert _warnings(dev_shell) == ["debloat: could not deny the microphone to "
+                                    "com.amazon.bluestone.keyboard"]
+
+
+# ── crown: start_server.sh debloat ───────────────────────────────────────────
+
+@pytest.fixture
+def crown(tmp_path: Path, bindir: Path) -> SimpleNamespace:
+    """A fake Show: init's service states, the packages pm shows (`pkg.<name>`
+    files) and hides (`hidden.<name>`), RECORD_AUDIO app-op modes
+    (`appops.<name>`), the installed lists in a stand-in for EM_ETC, and
+    tools that record what ran."""
+    state = tmp_path / "state"
+    state.mkdir()
+    etc = tmp_path / "etc"
+    etc.mkdir()
+    for svc in {*CROWN_STOPLIST, *DENYLIST}:
+        (state / svc).write_text("running\n")
+    for name in [*em_api.CROWN_HIDE_LISTS.values(), em_api.CROWN_MIC_DENY_LIST]:
+        shutil.copy(PAYLOADS / name, etc / name)
+    _tool(bindir, "getprop", """case "$1" in
+  ro.product.device) echo crown ;;
+  init.svc.*) cat "$STATE/${1#init.svc.}" 2>/dev/null ;;
+esac""")
+    _tool(bindir, "stop", 'echo "$1" >> "$STATE/stopped"\n'
+                          '[ -e "$STATE/$1.stubborn" ] || echo stopped > "$STATE/$1"')
+    _tool(bindir, "pm", """if [ "$1 $2" = "list packages" ]; then
+  for f in "$STATE"/pkg.*; do [ -e "$f" ] && echo "package:${f##*/pkg.}"; done
+  if [ "$3" = -u ]; then
+    for f in "$STATE"/hidden.*; do [ -e "$f" ] && echo "package:${f##*/hidden.}"; done
+  fi
+elif [ "$1" = hide ]; then
+  echo "$2" >> "$STATE/hid"
+  if [ -e "$STATE/refuse.$2" ]; then echo "Error: java.lang.SecurityException"; exit 1; fi
+  mv "$STATE/pkg.$2" "$STATE/hidden.$2"
+  echo "Package $2 new hidden state: true"
+fi""")
+    _tool(bindir, "appops", """if [ "$1 $3" = "get RECORD_AUDIO" ]; then
+  if [ -e "$STATE/appops.$2" ]; then echo "RECORD_AUDIO: $(cat "$STATE/appops.$2"); time=+1m"
+  else echo "No operations."; fi
+elif [ "$1 $3" = "set RECORD_AUDIO" ]; then
+  echo "$2" >> "$STATE/denied"
+  [ -e "$STATE/refuse-op.$2" ] || echo "$4" > "$STATE/appops.$2"
+fi""")
+    _tool(bindir, "sleep", "exit 0")
+    for leak in ("mount", "tinymix", "wpa_cli", "pidof"):
+        _tool(bindir, leak, 'echo "$0 $*" >> "$STATE/leaked"')
+    _tool(bindir, "ifconfig", 'echo "$0 $*" >> "$STATE/leaked"; kill -9 $PPID')
+    # Visible: a Tier 1 and a Tier 2 package, the kiosk, OTA's .override
+    # without OTA itself, a package whose name extends a hidden listed one,
+    # the never-hidden packages, and the keyboard.
+    for pkg in ("com.amazon.paladin", "com.amazon.logan", "de.ozerov.fully",
+                "com.amazon.device.software.ota.override", "com.amazon.alarms.extra",
+                "amazon.speech.sim", "com.amazon.kindle.otter.oobe",
+                "com.amazon.bluestone.keyboard"):
+        (state / f"pkg.{pkg}").touch()
+    script = tmp_path / "start_server.sh"
+    script.write_text(SCRIPT.replace(em_api.CROWN_ETC_DIR, str(etc)))
+    return SimpleNamespace(state=state, etc=etc, script=script, bindir=bindir)
+
+
+def _crown_debloat(crown: SimpleNamespace, tiers: str | None) -> list[str]:
+    if tiers is not None:
+        (crown.etc / "crown_tiers").write_text(tiers + "\n")
+    rc, out, err = _start_server(crown.bindir, crown.state, crown.script)
+    assert rc == 0, err
+    assert _lines(crown.state / "leaked") == [], "the Show's debloat touched the Dot's tools"
+    return out.splitlines()
+
+
+def test_crown_debloat_rehides_tier1_and_stops_the_crown_list(crown):
+    lines = _crown_debloat(crown, "1")
+    assert _lines(crown.state / "stopped") == CROWN_STOPLIST
+    assert _lines(crown.state / "hid") == ["com.amazon.paladin",
+                                            "com.amazon.device.software.ota.override"]
+    assert (crown.state / "pkg.com.amazon.logan").exists(), "Tier 2 was not applied"
+    for pkg in ("amazon.speech.sim", "com.amazon.kindle.otter.oobe"):
+        assert (crown.state / f"pkg.{pkg}").exists(), f"{pkg} must never be hidden"
+    assert lines[-3] == ("HIDE_REASSERTED:com.amazon.paladin,"
+                         "com.amazon.device.software.ota.override STILL_VISIBLE:")
+    assert lines[-1] == f"DEBLOAT_STOPPED:{len(CROWN_STOPLIST)} STILL_RUNNING:"
+    assert em_api._parse_hide_result("\n".join(lines)) == em_api.HideResult(
+        ("com.amazon.paladin", "com.amazon.device.software.ota.override"), ())
+
+
+def test_crown_debloat_rehides_tier2_only_when_applied(crown):
+    _crown_debloat(crown, "1 2")
+    assert "com.amazon.logan" in _lines(crown.state / "hid")
+    assert not (crown.state / "pkg.com.amazon.logan").exists()
+
+
+def test_crown_debloat_hides_and_denies_nothing_before_the_wizard_applied_a_tier(crown):
+    lines = _crown_debloat(crown, None)
+    assert _lines(crown.state / "hid") == []
+    assert _lines(crown.state / "denied") == []
+    assert lines[-3:-1] == ["HIDE_REASSERTED: STILL_VISIBLE:", "MIC_REASSERTED: STILL_ALLOWED:"]
+    assert _lines(crown.state / "stopped") == CROWN_STOPLIST
+
+
+def test_crown_debloat_names_what_pm_refused_and_what_init_kept(crown):
+    (crown.state / "refuse.com.amazon.paladin").touch()
+    (crown.state / "ahe.stubborn").touch()
+    lines = _crown_debloat(crown, "1")
+    assert lines[-3] == ("HIDE_REASSERTED:com.amazon.device.software.ota.override "
+                         "STILL_VISIBLE:com.amazon.paladin")
+    assert "DEBLOAT_WAITING:ahe" in lines
+    assert lines[-1] == f"DEBLOAT_STOPPED:{len(CROWN_STOPLIST) - 1} STILL_RUNNING:ahe"
+
+
+def test_crown_debloat_denies_the_listed_microphones_with_tier1(crown):
+    installed = [p for p in MIC_DENY if (crown.state / f"pkg.{p}").exists()]
+    lines = _crown_debloat(crown, "1")
+    assert _lines(crown.state / "denied") == installed
+    for pkg in installed:
+        assert (crown.state / f"appops.{pkg}").read_text().strip() == "ignore"
+    assert lines[-2] == f"MIC_REASSERTED:{','.join(installed)} STILL_ALLOWED:"
+    assert em_api._parse_mic_result("\n".join(lines)) == em_api.MicDenyResult(tuple(installed), ())
+
+
+def test_crown_debloat_leaves_denied_microphones_alone(crown):
+    """The mode persists, so the boot after the wizard's has nothing to do."""
+    for pkg in MIC_DENY:
+        (crown.state / f"appops.{pkg}").write_text("ignore\n")
+    lines = _crown_debloat(crown, "1")
+    assert _lines(crown.state / "denied") == []
+    assert lines[-2] == "MIC_REASSERTED: STILL_ALLOWED:"
+
+
+def test_crown_debloat_names_a_microphone_it_could_not_deny(crown):
+    (crown.state / "refuse-op.amazon.speech.sim").touch()
+    (crown.state / "pkg.com.amazon.bluestone.keyboard").unlink()   # not on this build
+    lines = _crown_debloat(crown, "1")
+    assert _lines(crown.state / "denied") == ["amazon.speech.sim"]
+    assert lines[-2] == "MIC_REASSERTED: STILL_ALLOWED:amazon.speech.sim"

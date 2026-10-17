@@ -208,6 +208,27 @@ func TestSyncMidStreamWithFramesSpanningPeriods(t *testing.T) {
 	}
 }
 
+// A period's anchor is its last accepted frame: its AFE_TIMESTAMP and how
+// many of the period's samples follow its final bit. On the stream's own
+// phase that frame ends the period; joined 77 samples in, every frame's
+// final bit (shifted sample 128k+50) has 77 samples of its period after it.
+func TestAnchorNamesTheLastFrame(t *testing.T) {
+	bits := loadBits(t, "rw")
+	for _, shift := range []int{0, 77} {
+		got := decodeAll(&Decoder{}, pcm(bits[shift:], 10))
+		for i, p := range got[1 : len(got)-1] {
+			k := 10*(i+1) + 9 // the last frame ending in period i+1
+			want := Anchor{Valid: true, TimestampMs: frameAt(t, bits, k).TimestampMs, After: shift}
+			if p.Anchor != want {
+				t.Fatalf("shift %d, period %d: anchor %+v, want %+v", shift, i+1, p.Anchor, want)
+			}
+		}
+	}
+	if p := decodeAll(&Decoder{}, make([]int16, 5*period)); p[4].Anchor != (Anchor{}) {
+		t.Fatalf("silence anchored: %+v", p[4].Anchor)
+	}
+}
+
 // One corrupted frame costs exactly that frame: the next one is on the old
 // grid with the counter it predicts, so the lock resumes without a sync or
 // a gap.

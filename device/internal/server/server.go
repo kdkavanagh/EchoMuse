@@ -1,6 +1,8 @@
-// Package server owns the Dot's physical controls: layered LED ring, ADC
-// privacy mute, codec DAC volume, speaker amp and headphone routing. Audio
-// epochs, mixer, focus, wake and alerts belong to internal/supervisor.
+// Package server owns the device's physical controls: on the Dot the
+// layered LED ring, ADC privacy mute, codec DAC volume, speaker amp and
+// headphone routing; on the Show Android's STREAM_MUSIC volume
+// (androidHardware) and nothing else. Audio epochs, mixer, focus, wake and
+// alerts belong to internal/supervisor.
 package server
 
 import (
@@ -25,10 +27,25 @@ import (
 const defaultStatePath = "/data/local/etc/echomuse/state.json"
 
 // Config wires the physical server. Nil Hardware selects Dot tinymix/GPIO;
-// an empty StatePath selects the persistent device path.
+// an empty StatePath selects the persistent device path. The zero value of
+// the remaining fields is the Dot.
 type Config struct {
 	Hardware  Hardware
 	StatePath string
+	// NoPrivacyMute: the device has no privacy mute the firmware integrates
+	// (the Show until Phase 7). Persisted mute is not restored, MuteToggle
+	// does nothing and IsMuted stays false.
+	NoPrivacyMute bool
+	// VolumeAuthoritative: Hardware's level is live device state that
+	// outlives this process (Android's STREAM_MUSIC index on the Show).
+	// Volume starts seeded from it, so the controller's startupVolume never
+	// overrides it and the first session reports it.
+	VolumeAuthoritative bool
+	// VolumeUnavailable, when set, is why volume control is disabled for
+	// this run: no level is ever applied and no change is reported
+	// (volume_state), and session.hello's volume level is null, which the
+	// dashboard shows as volume unavailable.
+	VolumeUnavailable string
 }
 
 // Server is safe for concurrent use.
@@ -57,8 +74,8 @@ func New(cfg Config) *Server {
 	}
 	r := newRing()
 	s := &Server{hw: hw, ring: r}
-	s.volume = newVolumeController(hw, r)
-	s.mute = newMuteController(hw, r, path)
+	s.volume = newVolumeController(hw, r, cfg.VolumeAuthoritative, cfg.VolumeUnavailable)
+	s.mute = newMuteController(hw, r, path, !cfg.NoPrivacyMute)
 	return s
 }
 
@@ -134,6 +151,16 @@ func (s *Server) SeedVolume(level int)                 { s.volume.seed(level) }
 func (s *Server) CancelVolumeDisplay()                 { s.ring.cancelVolume() }
 func (s *Server) VolumeState() (int, bool)             { return s.volume.state() }
 func (s *Server) SetVolumeChangeCallback(cb func(int)) { s.volume.setCallback(cb) }
+
+// ExternalVolumeChange records a volume change made outside the firmware
+// and already in effect (the Show's volume keys or kiosk moving Android's
+// index): reported like a button press, never written back.
+func (s *Server) ExternalVolumeChange(level int) { s.volume.external(level) }
+
+// VolumeUnavailable is why volume control is disabled for this run
+// (Config.VolumeUnavailable), or "" when it works; session.hello then
+// carries a null level.
+func (s *Server) VolumeUnavailable() string { return s.volume.disabled }
 
 func (s *Server) MuteToggle()                         { s.mute.toggle() }
 func (s *Server) IsMuted() bool                       { return s.mute.isMuted() }

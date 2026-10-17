@@ -491,6 +491,151 @@ Based on a review of Office turns 433–476 (`docs/turn-latency-review.md`,
   during the answer erases the answer's part. With **Save utterances** off,
   no microphone audio leaves the Dot after the request, as before.
 
+### Echo Show 8 (`crown`)
+
+- **The controller admits the Echo Show 8 (1st gen, `crown`).** Its firmware
+  is the same bundled binary the Dots run, choosing its audio backend at
+  runtime, and reports `platform: fireos6_crown` in `session.hello`; the
+  controller admits `fireos6` and `fireos6_crown` and refuses any other
+  platform with `protocol`. Updates, **Deploy all** and the install queue
+  push it the same firmware, the same way.
+- **Four new optional capabilities** (docs/protocol-v1.md §4.1):
+  `wifi_control`, `ble_proxy` and `privacy_mute`, announced by Dot firmware
+  only, and `screen_wake`, announced by the Echo Show only. On an Echo Show,
+  Android owns Wi-Fi and Bluetooth and mute is not integrated yet. What each
+  absent capability turns off, with the reason shown:
+  - **Wi-Fi** change and scan (device page, Config tab): disabled, and the
+    API refuses them (`409 not_supported`, "Wi-Fi changes unavailable: …").
+  - **Bluetooth proxy** toggle: disabled. The controller drops `ble_adverts`
+    from such a device and runs no Home Assistant Bluetooth proxy for it.
+  - **Mute** (Status tab, and the Muted state on cards): unavailable rather
+    than off. The `muted` device field is null for such a device.
+
+  The reason is "managed by the device" for Wi-Fi and the Bluetooth proxy on
+  an Echo Show and "mute not supported on this device yet" for its mute. A Dot
+  on firmware predating these capabilities shows "firmware update available"
+  until it takes the bundled firmware, and until then its Wi-Fi and
+  Bluetooth-proxy controls are disabled and its mute is shown unavailable.
+- **The Echo Show has no ring and no action button.** The Ring and Button
+  settings are disabled for it ("no LED ring on this device", "no action
+  button on this device"), and the controller sends LED messages only to a
+  device announcing `leds`.
+- **Screen settings (new section, Echo Show only).** **Light the screen on
+  wake** (`screenWake`, off by default) makes the Echo Show turn its kiosk
+  screen on when it hears the wake word, through Fully Kiosk Browser's local
+  REST API at `screenWakeUrl` (default `http://127.0.0.1:2323`, the kiosk on
+  the device itself) with `screenWakePassword`. The keys are sent only to a
+  device announcing `screen_wake`. A Dot shows them disabled ("no screen on
+  this device"). The support bundle redacts the URL and the password.
+- **Device page:** the Status tab shows the **Platform** (Echo Dot 2nd gen or
+  Echo Show 8 1st gen) and **Mute**. The device API adds `platform` and
+  `capability_gaps` (each absent capability's reason). The support bundle
+  adds `platform`.
+- **Echo Show volume that cannot be verified is shown unavailable.** The
+  Echo Show's volume is Android's; when its firmware's startup check of the
+  Android volume calls fails, its `session.hello` carries `volume.level` null
+  for that run. The controller then sends it no `volume_set` and no
+  `startupVolume`, ignores any `volume_state`, gives Home Assistant's media
+  player no volume slider and an unknown level, and the Status tab shows
+  Volume "unavailable — volume control unavailable: Android volume check
+  failed (see device log)". The device API adds `volume_gap` with that reason
+  and reports `volume` null.
+- A volume change on the device (buttons, or the Echo Show's volume keys) no
+  longer flashes a raw 0–127 level as a percentage on the Status tab until
+  the next refresh.
+- **Firmware: one binary, platform chosen at start.** The firmware detects
+  the image (`libmixerAPI.so` is the Dot; `ro.product.device=crown` with
+  `libOpenSLES.so` is the Echo Show) and refuses to start on anything else,
+  with a log line naming what it found. On the Echo Show it never runs the
+  Dot's Wi-Fi management, clock setting, BLE scanner, LED ring, buttons,
+  headphone routing or `tinymix`, leaving the network, Bluetooth and clock
+  to Android, and writes heap profiles to `/data/local/tmp/echomuse` (no
+  `/tmp` there). Stats from an Echo Show carry no SSID, BSSID, link speed or
+  frequency: those came from `wpa_supplicant`, which Android owns there.
+- **Echo Show volume is Android's music volume.** Dashboard volume maps
+  proportionally onto Android's `STREAM_MUSIC` index (0–30) through
+  `IAudioService` (`service call audio`, transaction codes pinned for build
+  NS65741/8146 and checked at every start); the volume keys and the kiosk
+  move the same index, and their changes are reported back like a Dot's
+  button presses. Android's index is kept across restarts: the stored
+  startup volume is not re-applied over it. If the start-up check fails the
+  firmware logs why, leaves volume alone (no changes applied or reported)
+  and sends its hello volume level as `null`, so the dashboard shows volume
+  as unavailable rather than a level it cannot set.
+- **Echo Show ambient light** is read from its `stk3x1x` (`als_ps` driver)
+  and announced as `ambient_light` when it reads.
+- **Echo Show audio goes through Android's own audio stack** (OpenSL ES,
+  `internal/opensl`; libOpenSLES is loaded at run time, so the Dot's binary
+  is unaffected). Capture is a `VOICE_RECOGNITION` recorder, which Amazon's
+  AFE echo-cancels and tags with its v3.3 metadata, decoded into the same
+  per-period records as the Dot's. Each 80 ms period is stamped from the
+  metadata's `AFE_TIMESTAMP` (CLOCK_MONOTONIC ms, unwrapped against the read
+  completion; the completion while the decoder is unlocked), never later
+  than its delivery and never stepping back. A recorder that errors or goes
+  1.5 s without a buffer is replaced, and its loss counted as drops. So is a
+  new one silent for 2 s: when another app already records, Android 7.1
+  gives our recorder no audio while OpenSL reports success, and only a fresh
+  start recovers it, so capture returns within about 2 s of the other app
+  stopping (log lines rate-limited). Output is a 48 kHz mono player on
+  `STREAM_MUSIC` holding two 2,048-frame buffers, and each completion is
+  stamped at its estimated playout from the queue depth and a 40 ms
+  pipeline lower bound, which `device/tools/sl_latency` (new, hand-run)
+  measures through the firmware's own audio path. The Dot's render play
+  clock moved to the shared `internal/audio/playclock` unchanged.
+- **The provisioning wizard provisions an Echo Show 8.** `connect_android`
+  tells the two apart (`biscuit_puffin` or `crown`, Android 7.1.x, a root adb
+  shell), warns off the tested build per device (`NS6569/6009` on the Dot,
+  `NS65741/8146` on the Show), and refuses a Show that is not already on
+  Wi-Fi, which is joined on the device itself. The Show's steps are
+  `connect_android → check_home → install_boot_hook → install_em →
+  neutralize_alexa → reboot → reconnect → verify_service → confirm_link`;
+  the Dot's are unchanged, and each device's other steps show as not
+  applicable. **Check Kiosk** refuses until a non-Amazon home app is
+  offered (`cmd package query-activities`), switching on Fully Kiosk's
+  `.LauncherReplacement`, which ships disabled, when Fully is installed.
+  The boot hook is one `/system/etc/init/echomuse.rc` (uid 0, group `audio`;
+  single partition, nothing mirrored). **Neutralise Alexa** marks setup
+  complete; repairs Amazon's Settings app, whose pages all crash on a Show
+  never registered with Amazon (no config bundle), with one broadcast
+  (`com.amazon.dcp.sso.broadcast.CORPFMHasChanged` to the explicit
+  `AccountPropertyChangeReceiver`; that receiver's account-removed action
+  factory-resets the device and is never sent); makes the chosen kiosk the
+  default home app (`cmd package set-home-activity`); `pm hide`s the Tier 1
+  list, plus Tier 2 when its switch is on (off by default; switched off on a
+  later run, Tier 2 is unhidden), never the package holding every enabled
+  keyboard and never `amazon.speech.sim` or `com.amazon.kindle.otter.oobe`
+  (hidden, they crash-loop SystemUI and every Settings page; the wizard
+  unhides them if an earlier list hid them); denies the microphone to the
+  Amazon apps that stay (`appops set <package> RECORD_AUDIO ignore`: Alexa's
+  wake engine and Amazon's dictation keyboard) and verifies it; then checks
+  that home resolves to the kiosk, which can only hold once Amazon's setup
+  screen is hidden. It logs the Show's Wi-Fi and Bluetooth Settings
+  components to add to the kiosk. Failure diagnostics on a Show collect
+  `audioserver`, the home activities, hidden-package counts, the applied
+  tiers, setup state, the mute's `amazon-gating` state, `wlan0`, the
+  microphone app ops and the Settings bundle instead of the Dot's `wpa_cli`
+  and mixer probes. Undo: docs/rooting.md.
+- **Hide and mic-deny lists are controller payloads** (`device_payloads/
+  crown_hide_packages.txt`, Tier 1, 26 packages; `crown_hide_packages_tier2.txt`;
+  `crown_mic_deny_packages.txt`), served to the wizard by
+  `GET /api/provision/crown_lists` and installed on the Show in
+  `/data/local/etc/echomuse/` beside `crown_tiers` (the tiers applied). Every
+  firmware update and **Re-apply debloat** sync them to an Echo Show by md5,
+  then the script re-applies them; the device log names any package
+  re-hidden or refused, and any microphone denied again or still allowed.
+- **`start_server.sh` has an Echo Show branch** (chosen by
+  `ro.product.device=crown`): it waits for `audioserver`, stops the Show's
+  native Amazon services (`CROWN_STOPLIST`), holds the wake lock, re-hides
+  any listed package that has become visible again and, while Tier 1 is
+  applied, re-denies any listed microphone whose app op is no longer
+  `ignore`, and runs the same supervisor with its log in
+  `/data/local/tmp/echomuse/server.log`. It never touches `tinymix`,
+  `wpa_supplicant`, `audioserver` or the Dot's denylist.
+  `start_server.sh debloat` on a Show does the same re-hiding, re-denying
+  and stopping and reports `HIDE_REASSERTED:… STILL_VISIBLE:…` and
+  `MIC_REASSERTED:… STILL_ALLOWED:…` before its result line. The Dot's path
+  is unchanged.
+
 ### Earlier in this release
 
 - ASR gain: the STT copy sent to Home Assistant is amplified by
