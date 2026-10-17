@@ -47,6 +47,7 @@ import em_samples
 import em_wakeclips
 import em_ambient
 import em_pause_asr
+import em_text_fix
 import em_volume
 import em_sounds
 import em_device_assets
@@ -1750,6 +1751,17 @@ def _validate_config(values: Mapping[str, object],
             em_pause_asr.parse_pause_asr(values[em_pause_asr.PAUSE_ASR_KEY])
         except ValueError as err:
             return _error(ErrorCode.INVALID_CONFIG, f"{em_pause_asr.PAUSE_ASR_KEY}: {err}", 400)
+    if em_text_fix.MODE_KEY in values:
+        try:
+            em_text_fix.parse_mode(values[em_text_fix.MODE_KEY])
+        except ValueError as err:
+            return _error(ErrorCode.INVALID_CONFIG, f"{em_text_fix.MODE_KEY}: {err}", 400)
+    for key in (em_text_fix.TERMS_KEY, em_text_fix.PHRASES_KEY):
+        if key in values:
+            try:
+                em_text_fix.parse_list(values[key])
+            except ValueError as err:
+                return _error(ErrorCode.INVALID_CONFIG, f"{key}: {err}", 400)
     if em_wake_rules.OPEN_RULES_KEY in values or em_wake_rules.SHADOW_RULES_KEY in values:
         # The baseline of the model this write selects (else the fleet's); a
         # device's own model may differ, and session.ready drops any extra

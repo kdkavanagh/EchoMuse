@@ -353,12 +353,35 @@ Then the request goes to one of four places:
 4. **Everything else**, including every other timer command: on to Home
    Assistant.
 
+Before "everything else" goes on, **transcript correction** (`em_text_fix`)
+may repair it. Speech-to-text sometimes gets a request almost right ("plate
+cherub rock", "what time is" with the last word lost, "watch flex"); Home
+Assistant's built-in sentences then do not recognise it and it goes to the
+conversation agent. The controller tries a few bounded repairs: a misheard
+name, a leftover piece of the wake word, a misheard or cut-short request it
+knows from your automation triggers, earlier requests or your preferred
+phrases, number words. It accepts one only if Home Assistant's own sentence
+matcher, which runs nothing, fully understands it, nothing you said
+explicitly (not, on/off, numbers, the action, a room it had recognised) was
+changed, it is not a lock or alarm command, and no different reading is about
+as likely. Text the matcher already understands is never touched, and answers
+to a question are sent as heard. By default it only records what it would
+have done (**Shadow**); see
+[configuration.md](configuration.md#08--transcript-correction).
+
+**Benefit:** a near miss reaches Home Assistant's fast local intents instead
+of the conversation agent. **Caveat:** the matcher accepting a repair shows
+Home Assistant can run it, not that it is what you said; that is why the
+rules refuse anything that changes what you said explicitly, and why Shadow
+comes first.
+
 ## Stage 10 — Understanding and action
 
-The cleaned text goes to Home Assistant in an **intent-to-speech** run, with
-the speaker's HA device and any ongoing conversation. Home Assistant's
-conversation agent, local intents, timers, and chosen TTS voice all apply as
-normal, and every turn shows up in HA's pipeline debug view.
+The cleaned text, or its correction under **On**, goes to Home Assistant in an
+**intent-to-speech** run, with the speaker's HA device and any ongoing
+conversation. Home Assistant's conversation agent, local intents, timers, and
+chosen TTS voice all apply as normal, and every turn shows up in HA's pipeline
+debug view.
 
 The controller allows 30 seconds for an answer (an LLM agent may call
 tools). A request is **never resent**: if the connection drops after it was

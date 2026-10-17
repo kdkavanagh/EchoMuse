@@ -19,7 +19,7 @@ import logging
 import os
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol, TypedDict, TypeGuard
@@ -87,10 +87,29 @@ class HaFeature(StrEnum):
 
 
 class VocabEvent(StrEnum):
-    """Registry events that rebuild the vocabulary snapshot (§16.7)."""
+    """Registry events that rebuild the vocabulary snapshot (§16.7). A device rename changes
+    the full name of every entity on it that has no name of its own, and a device's area is
+    the area of each entity without one."""
     ENTITY_REGISTRY_UPDATED = "entity_registry_updated"
     AREA_REGISTRY_UPDATED = "area_registry_updated"
     FLOOR_REGISTRY_UPDATED = "floor_registry_updated"
+    DEVICE_REGISTRY_UPDATED = "device_registry_updated"
+
+
+class TriggerEvent(StrEnum):
+    """Events after which HA's sentence triggers may have changed (§16.8): an automation
+    reload (every automation edit reloads), and service calls that enable or disable an
+    automation or reload the conversation agent's sentences (`call_service`, filtered by
+    TRIGGER_SERVICES)."""
+    AUTOMATION_RELOADED = "automation_reloaded"
+    CALL_SERVICE = "call_service"
+
+
+# (domain, service) calls that change which sentence triggers HA listens for.
+TRIGGER_SERVICES: frozenset[tuple[str, str]] = frozenset({
+    ("automation", "turn_on"), ("automation", "turn_off"), ("automation", "toggle"),
+    ("automation", "reload"), ("conversation", "reload"),
+})
 
 
 class PipelineEventType(StrEnum):
@@ -304,15 +323,31 @@ _TERMINAL = (RunRejected, RunFailed, RunEnded, RunLost)
 
 
 @dataclass(frozen=True, slots=True)
+class SlotValue:
+    """One filled slot of a recognition (`details`): HA's resolved `value` (an entity, area or
+    floor name as HA spells it, a domain, a number) and the words of the sentence it matched."""
+    value: str
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
 class SentenceRecognition:
     """HA's built-in sentence matcher on one sentence (`conversation/agent/homeassistant/debug`).
     `match`: a sentence trigger, or an intent with every slot filled; `unfilled_slots`: the
     closest intent left slots unmatched; `source`: `trigger`, `builtin` or `custom`;
-    `template`: the sentence template that matched, or came closest."""
+    `template`: the sentence template that matched, or came closest.
+
+    For an intent (never for a sentence trigger, which reports nothing more): `intent` its
+    name, `details` its filled slots, `unmatched` the words each unfilled slot was left with,
+    and `targets` the entity ids it matched."""
     match: bool
     unfilled_slots: bool
     source: str | None
     template: str
+    intent: str | None = None
+    details: Mapping[str, SlotValue] = field(default_factory=dict)
+    unmatched: Mapping[str, str] = field(default_factory=dict)
+    targets: tuple[str, ...] = ()
 
 
 def _sentence_recognition(value: object) -> SentenceRecognition | None:
@@ -321,10 +356,36 @@ def _sentence_recognition(value: object) -> SentenceRecognition | None:
     if not isinstance(value, dict):
         raise HaError("bad_response", f"recognition: {value!r}")
     unmatched = value.get("unmatched_slots")
-    return SentenceRecognition(match=value.get("match") is True,
-                               unfilled_slots=isinstance(unmatched, dict) and bool(unmatched),
-                               source=_opt_str(value.get("source")),
-                               template=str(value.get("sentence_template") or ""))
+    intent = value.get("intent")
+    details = value.get("details")
+    targets = value.get("targets")
+    return SentenceRecognition(
+        match=value.get("match") is True,
+        unfilled_slots=isinstance(unmatched, dict) and bool(unmatched),
+        source=_opt_str(value.get("source")),
+        template=str(value.get("sentence_template") or ""),
+        intent=_opt_str(intent.get("name")) if isinstance(intent, dict) else None,
+        details={slot: SlotValue(str(d.get("value")), str(d.get("text") or ""))
+                 for slot, d in details.items() if isinstance(d, dict) and d.get("value") is not None}
+        if isinstance(details, dict) else {},
+        unmatched={slot: str(text) for slot, text in unmatched.items() if text is not None}
+        if isinstance(unmatched, dict) else {},
+        targets=tuple(sorted(targets)) if isinstance(targets, dict) else (),
+    )
+
+
+def effective_language(pipeline: Mapping[str, object]) -> str | None:
+    """The language a pipeline's intent stage hands HA's sentence matcher, by HA's own rule
+    (assist_pipeline PipelineRun.recognize_intent): its conversation language, except `*`
+    (an agent for every language), which falls back to the STT, TTS, then pipeline language."""
+    conversation = pipeline.get("conversation_language")
+    if conversation != "*":
+        return conversation if isinstance(conversation, str) and conversation else None
+    for key in ("stt_language", "tts_language", "language"):
+        value = pipeline.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
 
 
 # ── Vocabulary (§16.7) ───────────────────────────────────────────────────────
@@ -705,8 +766,15 @@ class HaClient:
         self._disconnect_listeners: list[Callable[[], None]] = []
         self._background: set[asyncio.Task[None]] = set()
         self._vocab_listener: Callable[[Vocabulary], None] | None = None
+        self._vocab_stale: Callable[[], None] | None = None
         self._vocab_task: asyncio.Task[None] | None = None
         self._vocab_dirty = False
+
+    @property
+    def generation(self) -> int:
+        """Counts authenticated connections: anything learned from HA belongs to the one it
+        was learned on, and HA forgets every subscription when it drops."""
+        return self._generation
 
     # ── lifecycle ──
 
@@ -1177,17 +1245,53 @@ class HaClient:
         return response
 
     async def recognize(self, sentences: Sequence[str], device_id: str | None, *,
+                        language: str | None = None,
                         timeout: float = COMMAND_TIMEOUT_S) -> list[SentenceRecognition | None]:
         """HA's built-in sentence matcher on each sentence, without running anything: the
         stock `conversation/agent/homeassistant/debug` command behind HA's Assist debugger.
         A matching sentence trigger is reported, never fired. None: nothing recognized
-        (§16.6 completeness)."""
-        result = await self.command({"type": "conversation/agent/homeassistant/debug",
-                                     "sentences": list(sentences), "device_id": device_id}, timeout=timeout)
+        (§16.6 completeness). `language` None: HA's configured language."""
+        msg: dict[str, object] = {"type": "conversation/agent/homeassistant/debug",
+                                  "sentences": list(sentences), "device_id": device_id}
+        if language is not None:
+            msg["language"] = language
+        result = await self.command(msg, timeout=timeout)
         results = result.get("results") if isinstance(result, dict) else None
         if not isinstance(results, list) or len(results) != len(sentences):
             raise HaError("bad_response", f"recognize: {result!r}")
         return [_sentence_recognition(r) for r in results]
+
+    async def pipeline_language(self, pipeline_id: str, *, timeout: float = COMMAND_TIMEOUT_S) -> str | None:
+        """The language the pipeline's intent stage matches sentences in (`effective_language`)."""
+        pipeline = await self.command({"type": "assist_pipeline/pipeline/get", "pipeline_id": pipeline_id},
+                                      timeout=timeout)
+        if not isinstance(pipeline, dict):
+            raise HaError("bad_response", f"pipeline/get: {pipeline!r}")
+        return effective_language(pipeline)
+
+    async def trigger_sentences(self) -> list[str]:
+        """The sentence templates of every conversation trigger HA listens for now (stock
+        `conversation/sentences/list`): enabled automations only, as written, hassil syntax."""
+        result = await self.command({"type": "conversation/sentences/list"})
+        sentences = result.get("trigger_sentences") if isinstance(result, dict) else None
+        if not isinstance(sentences, list):
+            raise HaError("bad_response", f"sentences/list: {result!r}")
+        return [s for s in sentences if isinstance(s, str)]
+
+    def track_triggers(self, on_change: Callable[[], None]) -> None:
+        """Call `on_change` at once whenever HA's sentence triggers may have changed
+        (TriggerEvent, TRIGGER_SERVICES); subscribed again at every connect."""
+        def service_called(data: HaMessage) -> None:
+            if (data.get("domain"), data.get("service")) in TRIGGER_SERVICES:
+                on_change()
+
+        async def subscribe() -> None:
+            await self.subscribe_events(TriggerEvent.AUTOMATION_RELOADED, lambda _data: on_change())
+            await self.subscribe_events(TriggerEvent.CALL_SERVICE, service_called)
+
+        self.add_connect_listener(subscribe)
+        if self.connected:
+            self._spawn(subscribe(), "HA trigger events")
 
     async def warm_recognizer(self, device_id: str | None, *, timeout: float = COMMAND_TIMEOUT_S) -> None:
         """Run HA's sentence matcher once so it is resident, not paged out after idle, when a
@@ -1337,10 +1441,13 @@ class HaClient:
             self._vocab_listener(vocab)
         return vocab
 
-    def track_vocabulary(self, on_change: Callable[[Vocabulary], None]) -> None:
+    def track_vocabulary(self, on_change: Callable[[Vocabulary], None],
+                         on_stale: Callable[[], None] | None = None) -> None:
         """Keep `self.vocabulary` current: rebuilt at every connect and, debounced,
-        after each registry-updated event."""
+        after each registry-updated event. `on_stale` hears each such event at once,
+        before the rebuild it schedules."""
         self._vocab_listener = on_change
+        self._vocab_stale = on_stale
         self.add_connect_listener(self._vocab_on_connect)
         if self.connected:
             self._spawn(self._vocab_on_connect(), "HA vocabulary")
@@ -1351,6 +1458,8 @@ class HaClient:
         await self.refresh_vocabulary()
 
     def _vocab_changed(self, _data: HaMessage) -> None:
+        if self._vocab_stale is not None:
+            self._vocab_stale()
         self._vocab_dirty = True
         if self._vocab_task is None or self._vocab_task.done():
             self._vocab_task = asyncio.create_task(self._vocab_debounced())

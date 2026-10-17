@@ -27,21 +27,21 @@ EQ and Bluetooth settings.
 
 A section on *Fleet* is shown dimmed and read-only, so you can see what it
 inherits. The banner above the sections reads `Following fleet config`, or
-`Local override (2 of 7)` with the overridden sections named, and **Revert all
+`Local override (2 of 8)` with the overridden sections named, and **Revert all
 to fleet** puts every section back. Switching a section to *Device* starts it
 from the current fleet values.
 
 The Config tab opens with the device's **network (WiFi)** settings, which are
-always per device, then the seven sections in this order: **Playback**, **Wake
+always per device, then the eight sections in this order: **Playback**, **Wake
 word**, **Speech**, **Ring**, **Button**, **Bluetooth**, **Timers &
-alarms**. A control that needs something the device's firmware does not
-announce is shown disabled with the reason.
+alarms**, **Transcript correction**. A control that needs something the
+device's firmware does not announce is shown disabled with the reason.
 
 ### Other device tabs
 
 - **Status** — IP, firmware, WiFi network, ESPHome port, `Online` or `Offline
   · last seen …`, current volume, link mode (`wss (TLS)` or `plain ws`), and
-  whether the config is `Fleet` or `Local override (n of 7)`. **Resources**
+  whether the config is `Fleet` or `Local override (n of 8)`. **Resources**
   shows CPU (with the number of cores awake, because the Dot parks idle cores
   and the percentage is a share of the awake ones), RAM, storage, WiFi signal,
   **Latency** (round trip to the device; amber from 200 ms, red from 1 s) and
@@ -627,6 +627,121 @@ restart loses running timers, as it does for Home Assistant's own satellites.
 
 ---
 
+## 08 — Transcript correction
+
+Home Assistant's speech-to-text sometimes gets a request almost right: "plate
+cherub rock" for "play Cherub Rock", "watch flex" for "watch Plex", "what time
+is" with the last word lost, or "Ophelia, what's the weather" with the wake
+word left in. Home Assistant's built-in sentences do not recognise such text,
+so it goes to your conversation agent instead, which is slower and, if it is
+an LLM, may do something else. Transcript correction repairs the request
+before it is sent.
+
+It works only on what reaches Home Assistant's conversation agent, after the
+controller's own handling (answers to its questions, "say that again", alarms,
+cancelling timers) has seen the request as heard. It repairs only text Home
+Assistant's sentence matcher does not already understand, and only into text
+that matcher fully understands, checked with the matcher itself, which runs
+nothing. The full rules are in
+[post-afe-audio-architecture.md §16.8](post-afe-audio-architecture.md#168-transcript-correction).
+
+Repairs it can make:
+
+| Kind | Example | Where the right text comes from |
+|---|---|---|
+| A misheard name | "set the living room lights to glow" → "…to Low" | Home Assistant's entity, area and floor names and aliases, and your preferred terms |
+| Leftover wake word | "ophelia, what's the weather" → "what's the weather" | The wake word |
+| A misheard request | "plate cherub rock" → "play cherub rock", "watch flex" → "watch plex" | Your automations' sentence triggers, requests Home Assistant answered before, and your preferred phrases |
+| A request cut short | "what time is" → "what time is it", "watch you" → "watch youtube tv" | The same |
+| Numbers as words | "set the kitchen lights to fifty percent" → "…to 50 percent" | — |
+
+It never:
+
+- changes text Home Assistant already understands;
+- drops or adds "not", "on"/"off" and other direction words, or a number or
+  unit, and never replaces an action word it heard with another ("pause" for
+  "play"). It can supply a missing action word only from a whole known
+  request: one of your preferred phrases, an automation trigger, or a request
+  Home Assistant answered before;
+- changes a room or device Home Assistant had already recognised;
+- applies a correction to a lock, alarm panel, door, gate or garage command
+  (Shadow still records it);
+- guesses between two different readings that are about as likely ("shower"
+  as "shower mode" or "shower time"): it sends the request as heard;
+- touches an answer to a question (a follow-up in a conversation, or a reply
+  to "AM or PM?"), which only makes sense in that conversation.
+
+### Mode
+
+| Mode | What happens |
+|---|---|
+| **Off** | Nothing. |
+| **Shadow** (default) | Works out the correction and records what **On** would have sent, but sends the request as heard and never waits for it. |
+| **On** | Sends the correction when one passes every check within 0.1 s of the final transcript; otherwise sends the request as heard. |
+
+Start with **Shadow**, read the **Correction** line of a few days of turns in
+**Activity**, and switch to **On** when you agree with what it would have done.
+An error, Home Assistant being unreachable, or a correction that is not ready
+in time never fails a request: it is sent as heard.
+
+### Preferred terms and preferred phrases
+
+Two ranked lists, highest preference first: drag (or ↑/↓) to reorder.
+
+- **Preferred terms** (`transcriptFixTerms`) — names and words you use that
+  Home Assistant does not know: titles, app names ("Plex", "Cherub Rock",
+  "YouTube TV"). A term can replace a misheard name inside a request, but it
+  is never a command by itself and never repairs the action word: "plate
+  cherub rock" needs the phrase below.
+- **Preferred phrases** (`transcriptFixPhrases`) — whole requests you make
+  ("watch Plex", "play Cherub Rock"), including ones you have not made yet.
+  A misheard or cut-short request can be repaired into one.
+
+```json
+{
+  "transcriptFix": "shadow",
+  "transcriptFixTerms": ["Plex", "Cherub Rock", "YouTube TV"],
+  "transcriptFixPhrases": ["watch Plex", "play Cherub Rock"]
+}
+```
+
+Order matters only between spellings of the same request: when two
+candidates mean the same thing, the higher-ranked entry's spelling wins. A
+preference never makes a weak guess good enough, never decides between two
+different requests, and never overrides the rules above. Entity, area and
+floor names belong in Home Assistant (with aliases), not here; the controller
+already uses them.
+
+Each list holds up to 200 entries of up to 120 characters, each with at least
+one letter or digit. Entries that differ only in case, spaces or punctuation
+("YouTube TV", "youtube t.v.") are duplicates and are rejected. The lists
+change only this correction: they do not teach or bias any speech-to-text
+model.
+
+### What you see in Activity
+
+A turn's detail shows a **Correction** stage after Home Assistant's
+transcription: heard → proposed → sent, whether it was applied and why (for
+example "shadow: would have sent", "HA already understood the heard text",
+"ambiguous", "security command — never applied automatically", "follow-up —
+bypassed"), the kind of repair and where its text came from, its scores and
+preference, and whether it was ready within the 0.1 s. The turns API returns
+the same as `stt_fix`. The transcript as heard is always kept (`stt_text`).
+
+### Good to know
+
+- Requests Home Assistant answered before count as known requests for every
+  speaker, as sent (a correction that was applied, the transcript otherwise).
+  Shadow proposals never do.
+- After a change in Home Assistant (a renamed entity, a new area, an edited
+  automation trigger) or a reconnect, correction is unavailable for a moment
+  while its tables are rebuilt; requests are sent as heard meanwhile.
+- Corrections are checked in your pipeline's language, for this speaker's Home
+  Assistant device. A request Home Assistant's matcher accepts can still go to
+  your conversation agent, depending on your pipeline.
+
+---
+
 ## The Alerts tab
 
 Per device, available once its firmware speaks protocol v1:
@@ -800,6 +915,9 @@ Once the whole fleet shows `wss (TLS)`, set `REQUIRE_DEVICE_TLS=1`.
 | Timers & alarms | Default alarm sound | `alarmSound` | empty (Default) |
 | Timers & alarms | Gap between repeats | `timerRingGapSeconds` | 2 s |
 | Timers & alarms | Timer ring limit | `timerRingSeconds` | 900 s (15 min) |
+| Transcript correction | Mode | `transcriptFix` | `shadow` |
+| Transcript correction | Preferred terms | `transcriptFixTerms` | empty |
+| Transcript correction | Preferred phrases | `transcriptFixPhrases` | empty |
 | — (device state) | Volume on the Status tab | `startupVolume` | 85 |
 
 ---
@@ -870,7 +988,8 @@ browser the first time you connect a Dot over USB.
   transcript to its conversation agent — all over your LAN. While you speak,
   the controller's running transcript also goes to Home Assistant's own
   sentence matcher, which only compares it with your local sentences and
-  runs nothing. What happens next
+  runs nothing, and so do the final transcript and its candidate corrections
+  while **Transcript correction** is not off. What happens next
   is up to your Assist pipeline: if it uses a cloud speech-to-text engine or
   conversation agent, Home Assistant sends the audio or text there. EchoMuse
   itself sends it nowhere else.

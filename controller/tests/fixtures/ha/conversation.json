@@ -269,5 +269,15 @@
         null
       ]
     }
+  },
+  "sentences_list": {
+    "source": "homeassistant/components/conversation/http.py (websocket_list_sentences: trigger_sentences of the enabled conversation triggers); captured from the live HA 2026.8.1 on 2026-10-17, first templates",
+    "request": {"type": "conversation/sentences/list"},
+    "result": {"trigger_sentences": [
+      "[what is|what's|whats|how is|how's|hows|tell me] the (weather|forecast) [like]",
+      "[what is|what's|whats|how is|how's|hows|tell me] the (weather|forecast) [like] {when}",
+      "what time is it",
+      "(play|played|plays) {query}"
+    ]}
   }
 }

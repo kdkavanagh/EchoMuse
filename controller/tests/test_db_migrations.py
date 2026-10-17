@@ -7,6 +7,7 @@ import sqlite3
 import pytest
 
 import em_db
+import em_text_fix
 
 VER = "SELECT value FROM system_config WHERE key = 'schema_version'"
 
@@ -345,6 +346,43 @@ def test_v30_adds_response_latency_and_older_turns_read_unmeasured(tmp_path):
     assert int(c.execute(VER).fetchone()[0]) == len(em_db.MIGRATIONS)
     # History kept; a row from before the measurement is unmeasured (NULL), never a zero latency.
     assert c.execute("SELECT turn_uuid, first_audio_ms, response_latency_ms FROM turns").fetchone() == ("t-1", 900, None)
+
+
+def test_v34_adds_the_correction_record_and_history_reads_only_what_ha_answered(tmp_path):
+    p = str(tmp_path / "v33.db")
+    c = sqlite3.connect(p)
+    for sql in em_db.MIGRATIONS[:33]:
+        c.executescript(sql)
+    c.execute("INSERT INTO turns (device_id, ts, outcome, intent_local, response_type, stt_text) "
+              "VALUES ('D', 1.0, 'ha', 1, 'action_done', 'watch plex')")
+    c.commit()
+    c.close()
+
+    em_db.init(p)
+    try:
+        assert em_db.get_text_fix_history(10) == [(1, 1.0, "watch plex", None)]   # older rows have no record
+        applied = json.dumps({"applied": True, "sent": "play cherub rock"})
+        shadow = json.dumps({"applied": False, "sent": "Plate cherub rock.", "proposed": "play cherub rock"})
+        rows = [
+            ("ha", 1, "action_done", "Plate cherub rock.", applied),     # 2: sent the correction
+            ("ha", 1, "action_done", "Plate cherub rock.", shadow),      # 3: a shadow proposal, sent as heard
+            ("ha", 1, "error", "turn on the bedroom lice", None),        # 4: HA's own agent failed
+            ("ha", 0, "action_done", "what's the news", None),           # 5: answered by the conversation agent
+            ("alarm", None, None, "set an alarm for 7", None),           # 6: an EchoMuse local route
+            ("ha", 1, "query_answer", "what time is it", None),          # 7: a later turn
+        ]
+        for i, (outcome, local, rtype, text, fix) in enumerate(rows, start=2):
+            em_db.insert_turn("D", {"ts": float(i), "outcome": outcome, "intent_local": local,
+                                    "response_type": rtype, "stt_text": text, "stt_fix": fix})
+        history = em_db.get_text_fix_history(10, before_id=7)
+        assert [row[0] for row in history] == [3, 2, 1]
+        assert [em_text_fix.sent_text(text, fix) for _, _, text, fix in history] == [
+            "Plate cherub rock.", "play cherub rock", "watch plex"]
+        assert em_db.get_turns("D", limit=1)[0]["stt_fix"] is None
+        assert json.loads(em_db.get_turns("D", limit=6)[0]["stt_fix"])["sent"] == "play cherub rock"
+    finally:
+        em_db._conn.close()
+        em_db._conn = None
 
 
 def test_connect_alerts_shares_database_but_not_connection(tmp_path):

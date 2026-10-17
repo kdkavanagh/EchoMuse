@@ -613,6 +613,35 @@ Based on a review of Office turns 433–476 (`docs/turn-latency-review.md`,
   listening ring, the thinking spinner and the speaking meter show as for any
   wake; a sounding alert still outranks them. The LEDs need the firmware
   update the dashboard offers; the chime needs only the controller.
+- **Transcript correction (schema v34).** Home Assistant's speech-to-text
+  sometimes gets a request almost right ("plate cherub rock", "watch flex",
+  "what time is" with the last word lost, "ophelia, what's the weather" with
+  the wake word left in), and Home Assistant then hands it to the conversation
+  agent. The controller can now repair such a transcript just before the
+  intent run, after its own routes (reply choices, "say that again", alarms,
+  timer cancels) have seen it as heard. It proposes a repaired name, a removed
+  wake-word remnant, a known request completed or matched (from your
+  automations' sentence triggers, requests Home Assistant answered before, and
+  your own phrases), or digits for number words, and accepts one only if Home
+  Assistant's own sentence matcher, which runs nothing, fully understands it
+  in the pipeline's language for this speaker; nothing said explicitly (not,
+  on/off, numbers, units, the action, a room or device already recognised)
+  changed; it is not a lock, alarm, door, gate or garage command; and no
+  other reading comes within 0.05. Text the matcher already understands, and
+  answers to a question, are sent as heard. Config → **Transcript correction**
+  (`transcriptFix`): **Shadow** (default) records what would have been sent
+  and still sends the transcript as heard; **On** sends a repair that is ready
+  within 0.1 s of the final transcript; **Off** does nothing. Two ranked
+  lists, **Preferred terms** (`transcriptFixTerms`) and **Preferred phrases**
+  (`transcriptFixPhrases`), add your own titles and requests; they rank
+  candidates and never train speech-to-text. Each turn records the outcome in
+  `stt_fix` (heard, proposed, sent, the rule, Home Assistant's verdicts, why it
+  was or was not applied, cache and timing), shown as **Correction** in
+  Activity's turn detail; `stt_text` keeps the transcript as heard. Replayed
+  over the last three weeks' 211 Home Assistant turns, 11 would have been
+  repaired (every one with a known intent correctly) and 3 left alone as
+  ambiguous. New dependency: `hassil==3.11.0`, the version Home Assistant
+  2026.8.1 ships, to expand trigger sentences.
 
 ### Earlier in this release
 

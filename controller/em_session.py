@@ -122,6 +122,9 @@ from em_speech_worker import (
     VoiceSnapshot,
 )
 from em_stt_copy import STT_TAIL_SILENCE, asr_gain_for, stt_copy
+from em_text_fix import FixConfig, FixOutcome, FixRecord, TextFixMode, fix_config, fix_key
+from em_text_fix import Reason as FixReason
+from em_text_fix_service import NotReady, TextFixService
 from em_utterance import (
     PREROLL,
     REPLY_KINDS,
@@ -184,6 +187,11 @@ PLAYBACK_POLL_S = 0.05           # dialog output start/progress check while it w
 RECOGNIZE_TIMEOUT_S = 2.0
 # "Say that again" replays the last voice-turn output only this long after it ended (§16.7).
 REPEAT_WINDOW_S = 120.0
+# Transcript correction (§16.8). With `transcriptFix` on, the most correction may add between
+# the final transcript and dispatch; past it the original goes and a later result is dropped.
+# A pause's or a shadow computation gives up after FIX_COMPUTE_LIMIT_S.
+FINAL_DEADLINE_S = 0.1
+FIX_COMPUTE_LIMIT_S = 10.0
 
 # A committed turn's response lease (§4.4) carries its AFE records, and while `saveUtterances` is on
 # its mic, on through the response: at most this long after the commit, and this long past the
@@ -453,6 +461,7 @@ class TurnRow(TypedDict, total=False):
     decision_trace: str | None
     afe_evidence: str | None          # AfeEvidence JSON; None: the device lacks afe_metadata_v1
     afe_series: str | None            # AfeSeries JSON; None: unavailable or no data
+    stt_fix: str | None               # FixRecord JSON (§16.8); None: no correction ran
 
 
 class _AlertAct(TypedDict):
@@ -481,6 +490,7 @@ class ActorDeps:
     record_continuation: Callable[[int, str], Awaitable[None]]   # (row id, final follow-up outcome)
     media_playing: Callable[[], bool]               # the device's own content player is playing (§6.3)
     pause_media: Callable[[], Awaitable[None]]      # pause it; applied when dialog focus ends (§18.1)
+    text_fix: TextFixService | None = None          # transcript correction (§16.8); None: none
 
 
 @dataclass(frozen=True)
@@ -941,6 +951,11 @@ class _Turn:
     reopened: list[UtteranceTrace] = field(default_factory=list)   # a reply's utterances before a gap
     local_only: bool = False                  # a media-context wake that lost arbitration: acts on a local command only
     voice: VoiceSnapshot | None = None        # Silero state at its utterance's latest pause finalize (§16.6)
+    # Transcript correction (§16.8): the newest pause's job by (utterance id, key), the shadow
+    # computation, and the record that becomes turns.stt_fix.
+    fix_job: tuple[tuple[str, str], asyncio.Task[FixOutcome | None]] | None = None
+    fix_task: asyncio.Task[None] | None = None
+    stt_fix: FixRecord | None = None
 
 
 @dataclass
@@ -1910,6 +1925,7 @@ class SessionActor:
         except (HaError, HaUnavailable) as err:
             error = str(err)
         self._post(P_SPEECH, _Recognized(utterance_id, text, klass, round((loop.time() - started) * 1000), error))
+        self._speculate(utterance_id, text)
 
     def _recognized(self, answer: _Recognized) -> None:
         turn = self._turn
@@ -1922,6 +1938,189 @@ class SessionActor:
             await self.deps.ha.warm_recognizer(self.deps.ha_device_id(), timeout=RECOGNIZE_TIMEOUT_S)
         except (HaError, HaUnavailable) as err:
             log.debug("[%s] HA sentence matcher warm-up failed: %s", self.device_id, err)
+
+    # --- transcript correction (§16.8) ----------------------------------------------------------
+
+    def _fix_config(self) -> FixConfig:
+        """The effective `transcriptFix` settings. The API validates every write, so a bad stored
+        value means a hand-edited database: correction stays off until it is fixed."""
+        try:
+            return fix_config(self._config())
+        except ValueError as err:
+            log.warning("[%s] transcript correction settings: %s; off", self.device_id, err)
+            return FixConfig()
+
+    @staticmethod
+    def _fix_bypassed(turn: _Turn) -> bool:
+        """A follow-up is no standalone command, and HA's matcher has no conversation context:
+        a reply turn, a wake or button turn that inherited a question, and any turn in an HA
+        conversation are sent as heard."""
+        return turn.trigger in REPLY_KINDS or turn.expectation is not None or turn.conversation_id is not None
+
+    def _fix_wanted(self, turn: _Turn) -> bool:
+        return (self.deps.text_fix is not None and not self._fix_bypassed(turn)
+                and self._fix_config().mode != TextFixMode.OFF)
+
+    @staticmethod
+    def _fix_wake(turn: _Turn) -> str | None:
+        """The wake phrase whose residue a lead-in may be: a wake turn's only."""
+        return turn.model.wake_phrase if turn.trigger == UtteranceKind.WAKE and turn.model is not None else None
+
+    def _speculate(self, utterance_id: str, text: str) -> None:
+        """Begin correcting a stable prefix once its endpoint verdict is posted. Only the newest
+        prefix's job is kept: a newer one cancels it. Nothing here waits on or feeds the endpoint."""
+        turn = self._turn
+        if turn is None or turn.utterance.utterance_id != utterance_id or not self._fix_wanted(turn):
+            return
+        key = (utterance_id, fix_key(text))
+        if turn.fix_job is not None:
+            if turn.fix_job[0] == key:
+                return
+            turn.fix_job[1].cancel()
+        turn.fix_job = (key, self._spawn(self._fix_job(turn, key[1], self._fix_config())))
+
+    async def _fix_job(self, turn: _Turn, key: str, config: FixConfig) -> FixOutcome | None:
+        """A pause's correction, under the context it began in: the pipeline the satellite's
+        select chooses now, its language, this Dot's HA device. None: nothing usable."""
+        service = self.deps.text_fix
+        assert service is not None
+        try:
+            async with asyncio.timeout(FIX_COMPUTE_LIMIT_S):
+                pipeline = await self.deps.pipeline_id()
+                found, language = await self._fix_language(pipeline)
+                if not found:
+                    return None
+                context = service.context(config, self.deps.ha_device_id(), pipeline, language, self._fix_wake(turn))
+                return await service.correct(key, context, config)
+        except (NotReady, HaError, HaUnavailable, TimeoutError) as err:
+            log.debug("[%s] pause correction of %r: %s", self.device_id, key, err)
+            return None
+
+    async def _fix_language(self, pipeline: str) -> tuple[bool, str | None]:
+        """(known, the pipeline's effective language): a match in any other language proves nothing."""
+        try:
+            return True, await self.deps.ha.pipeline_language(pipeline, timeout=RECOGNIZE_TIMEOUT_S)
+        except (HaError, HaUnavailable) as err:
+            log.debug("[%s] pipeline %s language: %s", self.device_id, pipeline, err)
+            return False, None
+
+    def _fix_holds(self, outcome: FixOutcome) -> bool:
+        """Whether a result may be used now: its tables, HA connection, settings and device current."""
+        service = self.deps.text_fix
+        context = outcome.context
+        return (service is not None and service.valid(context) and self._fix_config().digest == context.config
+                and self.deps.ha_device_id() == context.device)
+
+    async def _fix_outcome(self, turn: _Turn, key: str, config: FixConfig, pipeline: str,
+                           language: asyncio.Task[tuple[bool, str | None]],
+                           job: asyncio.Task[FixOutcome | None] | None) -> tuple[FixOutcome, str]:
+        """The final text's correction and where it came from: the pause's result when its whole
+        context matches the dispatch's ("hit"), else computed now ("miss"). Neither is waited for
+        past the caller's deadline: both run shielded."""
+        service = self.deps.text_fix
+        assert service is not None
+        found, lang = await asyncio.shield(language)
+        if not found:
+            raise NotReady("pipeline language unknown")
+        context = service.context(config, self.deps.ha_device_id(), pipeline, lang, self._fix_wake(turn))
+        if job is not None and not job.cancelled():
+            speculated = await asyncio.shield(job)
+            if speculated is not None and speculated.context == context:
+                return speculated, "hit"
+        return await service.correct(key, context, config), "miss"
+
+    def _fix_lookup(self, turn: _Turn, pipeline: str) -> asyncio.Task[tuple[bool, str | None]] | None:
+        """The pipeline's language, looked up while STT runs when this turn's text will be corrected."""
+        return self._spawn(self._fix_language(pipeline)) if self._fix_wanted(turn) else None
+
+    async def _corrected(self, turn: _Turn, text: str, pipeline: str,
+                         language: asyncio.Task[tuple[bool, str | None]] | None) -> str | None:
+        """The text to dispatch: the original, unless `transcriptFix` is on and a correction was
+        validated within FINAL_DEADLINE_S and still holds (§16.8). An error, a timeout or a stale
+        result sends the original. None: the turn is no longer current; dispatch nothing."""
+        config = self._fix_config()
+        if self.deps.text_fix is None or config.mode == TextFixMode.OFF:
+            return text
+        if self._fix_bypassed(turn):
+            turn.stt_fix = FixRecord(config.mode, text, text, FixReason.CONTEXTUAL)
+            return text
+        key = fix_key(text)
+        job = (turn.fix_job[1] if turn.fix_job is not None
+               and turn.fix_job[0] == (turn.utterance.utterance_id, key) else None)
+        if language is None:
+            language = self._spawn(self._fix_language(pipeline))
+        if config.mode == TextFixMode.SHADOW:
+            turn.fix_task = self._spawn(self._fix_shadow(turn, text, key, config, pipeline, language, job))
+            return text
+        record = turn.stt_fix = FixRecord(config.mode, text, text, FixReason.TIMEOUT)
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        try:
+            async with asyncio.timeout(FINAL_DEADLINE_S):
+                outcome, record.cache = await self._fix_outcome(turn, key, config, pipeline, language, job)
+        except Exception as err:
+            record.latency_ms = round((loop.time() - started) * 1000)
+            record.deadline_met = not isinstance(err, TimeoutError)
+            if isinstance(err, TimeoutError):
+                log.info("[%s] correction of %r not ready in %.0f ms; sent as heard", self.device_id, key,
+                         FINAL_DEADLINE_S * 1000)
+            elif isinstance(err, NotReady):
+                record.reason, record.error = FixReason.NOT_READY, str(err)
+            else:
+                if not isinstance(err, (HaError, HaUnavailable)):
+                    log.exception("[%s] correction of %r failed; sent as heard", self.device_id, key)
+                record.reason, record.error = FixReason.ERROR, str(err) or type(err).__name__
+            return text if self._current(turn) else None
+        record.outcome = outcome
+        record.latency_ms = round((loop.time() - started) * 1000)
+        record.deadline_met = True
+        if not self._current(turn):
+            return None
+        if not self._fix_holds(outcome):
+            record.reason = FixReason.STALE
+            return text
+        selected = outcome.decision.selected
+        if selected is None:
+            record.reason = outcome.decision.reason
+            return text
+        record.reason, record.applied, record.sent = FixReason.APPLIED, True, selected.candidate.text
+        log.info("[%s] transcript corrected (%s): %r → %r", self.device_id, selected.candidate.rule, text,
+                 record.sent)
+        return record.sent
+
+    async def _fix_shadow(self, turn: _Turn, text: str, key: str, config: FixConfig, pipeline: str,
+                          language: asyncio.Task[tuple[bool, str | None]],
+                          job: asyncio.Task[FixOutcome | None] | None) -> None:
+        """What `on` would have sent, computed beside the turn and never waited for by it (§16.8);
+        the record says whether it would have been ready within FINAL_DEADLINE_S."""
+        record = turn.stt_fix = FixRecord(config.mode, text, text, FixReason.NOT_READY)
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        try:
+            async with asyncio.timeout(FIX_COMPUTE_LIMIT_S):
+                outcome, record.cache = await self._fix_outcome(turn, key, config, pipeline, language, job)
+        except NotReady as err:
+            record.error = str(err)
+            return
+        except TimeoutError:
+            record.reason = FixReason.TIMEOUT
+            return
+        except Exception as err:
+            if not isinstance(err, (HaError, HaUnavailable)):
+                log.exception("[%s] shadow correction of %r failed", self.device_id, key)
+            record.reason, record.error = FixReason.ERROR, str(err) or type(err).__name__
+            return
+        record.outcome = outcome
+        record.latency_ms = round((loop.time() - started) * 1000)
+        record.deadline_met = record.latency_ms <= FINAL_DEADLINE_S * 1000
+        if not self._fix_holds(outcome):
+            record.reason = FixReason.STALE
+            return
+        selected = outcome.decision.selected
+        record.reason = FixReason.WOULD_APPLY if selected is not None else outcome.decision.reason
+        if selected is not None:
+            log.info("[%s] transcript correction (shadow, %s): %r → %r", self.device_id, selected.candidate.rule,
+                     text, selected.candidate.text)
 
     def _measure_wake(self, turn: _Turn, runtime: _Runtime) -> None:
         """Peak cell level over the accepted candidate's support: the STT copy's gain anchor."""
@@ -2169,6 +2368,7 @@ class SessionActor:
             return
         try:
             pipeline = await self.deps.pipeline_id()
+            language = self._fix_lookup(turn, pipeline)
             started = time.monotonic()
             final = await self.deps.ha.run_stt(pipeline, self.deps.ha_device_id(), heard)
         except (HaUnavailable, HaError) as exc:
@@ -2209,11 +2409,15 @@ class SessionActor:
         if cancel is not None and (cancel.all or (cancel.start is None and cancel.name is None)) \
                 and await self._cancel_timer(turn, cancel):
             return
+        # Local routes above read the transcript as heard; only what goes to HA is corrected.
+        sent = await self._corrected(turn, text, pipeline, language)
+        if sent is None:
+            return
         turn.outcome = TurnOutcome.HA
         self.awaiting_intent = True
         started = time.monotonic()
         try:
-            run = await self.deps.ha.run_intent_tts(pipeline, self.deps.ha_device_id(), text,
+            run = await self.deps.ha.run_intent_tts(pipeline, self.deps.ha_device_id(), sent,
                                                     turn.conversation_id)
         except (HaUnavailable, HaError) as exc:
             # Nothing was dispatched, so nothing can have executed.
@@ -3334,6 +3538,9 @@ class SessionActor:
             row["afe_series"] = series.dumps()
         else:
             row["afe_series"] = None
+        if turn.fix_task is not None and not turn.fix_task.done():
+            await asyncio.wait({turn.fix_task}, timeout=FIX_COMPUTE_LIMIT_S)   # the shadow's record
+        row["stt_fix"] = turn.stt_fix.dumps() if turn.stt_fix is not None else None
         try:
             row_id = await self.deps.persist_turn(row)
         except Exception:

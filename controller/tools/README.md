@@ -29,3 +29,13 @@ docker exec echomuse-controller python /tmp/devshell.py "<shell command>" ["<ano
   multi-megabyte files; **deletes the destination first** unless
   `--resume`, since resuming on size alone will append to a different file
   and then report success. Success means md5 agreement, nothing less.
+
+**text_fix_replay.py** replays transcript correction (SPEC §16.8) over the
+household's own turns. `record SNAPSHOT` runs in the container (it reads the
+database and asks HA's non-executing debug matcher about every original and
+candidate); `replay SNAPSHOT [--held-out 0.3] [--labels LABELS.json]` needs
+neither HA nor models and reports the earlier (tuning) and later (held-out)
+turns separately. The image does not carry it: `docker cp
+controller/tools/text_fix_replay.py echomuse-controller:/app/tools/`, then
+`docker exec echomuse-controller python /app/tools/text_fix_replay.py …`.
+The snapshot holds household data: keep it out of the repository.

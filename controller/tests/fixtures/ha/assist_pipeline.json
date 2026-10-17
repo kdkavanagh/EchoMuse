@@ -570,5 +570,14 @@
         "timestamp": "2026-09-23T11:30:00.123456+00:00"
       }
     ]
+  },
+  "pipeline_get": {
+    "source": "homeassistant/components/assist_pipeline/websocket_api.py (pipeline/get); captured from the live HA 2026.8.1 on 2026-10-17: an LLM agent for every language ('*') whose intent stage matches in its STT language",
+    "request": {"type": "assist_pipeline/pipeline/get", "pipeline_id": "01hnpec9vt52ec4dkkxqa89z46"},
+    "result": {"conversation_engine": "conversation.claude_conversation", "conversation_language": "*",
+               "language": "en", "name": "STT", "stt_engine": "stt.faster_whisper", "stt_language": "en",
+               "tts_engine": "tts.elevenlabs_text_to_speech", "tts_language": "en", "tts_voice": "Xb7hH8MSUJpSbSDYk0k2",
+               "wake_word_entity": null, "wake_word_id": null, "prefer_local_intents": true,
+               "id": "01hnpec9vt52ec4dkkxqa89z46"}
   }
 }

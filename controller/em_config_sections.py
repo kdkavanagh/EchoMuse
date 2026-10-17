@@ -31,6 +31,7 @@ class SectionId(StrEnum):
     ADVANCED = "advanced"
     BLUETOOTH = "bluetooth"
     TIMERS = "timers"
+    TRANSCRIPT = "transcript"
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +61,10 @@ SECTIONS: dict[SectionId, Section] = {
     # Separate from "ring" (the LED ring) so a device can take its own alert
     # sounds without forking its LED scene.
     SectionId.TIMERS: Section("Timers", ("timerSound", "timerRingSeconds", "timerRingGapSeconds", "alarmSound")),
+    # Transcript correction (§16.8). The terms and phrases are household-wide
+    # unless a device overrides this section.
+    SectionId.TRANSCRIPT: Section("Transcript correction", ("transcriptFix", "transcriptFixTerms",
+                                                            "transcriptFixPhrases")),
 }
 
 # Keys that live in the config dict but are device STATE, not settings: they

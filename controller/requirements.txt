@@ -15,3 +15,6 @@ onnxruntime==1.20.1
 sherpa-onnx==1.13.8
 # Vendored ESPHome protobuf messages
 protobuf>=4.21.0
+# Sentence-template expansion for transcript correction (em_text_fix, §16.8):
+# the version HA 2026.8.1 itself ships, so a trigger expands as HA parses it.
+hassil==3.11.0

@@ -1660,7 +1660,7 @@ Target the installed **HA 2026.8.1** [H4][H5][H6]. There is no custom integratio
 - The satellite's stock pipeline select chooses the pipeline; the stock `assist_pipeline/pipeline/list` command maps its name (or “preferred”) to a pipeline ID.
 - Besides the existing media player, button event, and ambient-light entities, the emulated device exposes three stock ESPHome entities: binary sensor “Alert ringing”; button “Stop alert”, which ends whatever is ringing (timer or alarm) exactly like the physical button; and text sensor “Voice state”, the actor state's phase (`ActorState.phase`: `idle` for `IDLE`/`CLOSING`, `listening` for `ARMED`/`LISTENING`/`END_PENDING`, `thinking` for `COMMITTED`/`THINKING`, `speaking` for `SPEAKING`), the same projection the LED ring and dashboard use. A reply turn is `ARMED` from the drain, so it reads `listening` throughout its window. It exists because wake, button and EchoMuse reply-expectation turns are websocket runs, which never move HA's own assist-satellite state. The calendar entity shows the next alarm.
 
-**Sentence matcher.** The section 16.6 completeness query is the stock `conversation/agent/homeassistant/debug` command behind HA's Assist debugger: `{"sentences": [...], "device_id": "<HA device>"}` returns one result per sentence in order, `null` when nothing is recognized, else `match`, `source` (`trigger`, `builtin`, `custom`), `sentence_template`, and for intents `unmatched_slots`. It recognizes without executing. The startup probe asks it about one sentence (feature `recognizer`). HA caches recognition by text and its process may have its matcher paged out after idle, so when a wake candidate opens the controller sends one throwaway sentence with a random suffix; it matches nothing and changes nothing, and the command's own queries a second later find the matcher resident.
+**Sentence matcher.** The section 16.6 completeness query is the stock `conversation/agent/homeassistant/debug` command behind HA's Assist debugger: `{"sentences": [...], "device_id": "<HA device>"}`, plus `"language"` when given, returns one result per sentence in order, `null` when nothing is recognized, else `match`, `source` (`trigger`, `builtin`, `custom`), `sentence_template`, and for intents `intent.name`, `details` (each filled slot's `value` and `text`), `targets` (the matched entity IDs), and `unmatched_slots` (the words each unfilled slot was left with). A sentence trigger reports only the first three. It recognizes without executing. Without `language` HA uses its configured language: the completeness query sends none, and transcript correction (section 16.8) sends the pipeline's effective language. The startup probe asks it about one sentence (feature `recognizer`). HA caches recognition by text and its process may have its matcher paged out after idle, so when a wake candidate opens the controller sends one throwaway sentence with a random suffix; it matches nothing and changes nothing, and the command's own queries a second later find the matcher resident.
 
 **Voice turns** (wake, button, EchoMuse reply expectations, and `continue_conversation`) run in this order:
 
@@ -1684,11 +1684,13 @@ Target the installed **HA 2026.8.1** [H4][H5][H6]. There is no custom integratio
    ```
 
    `HassTimerStatus` returns every device's timers in `speech_slots.timers`, each with its `device_id`. HA answers a failed intent with HTTP 200 and `response_type` `error`. The startup probe runs `HassTimerStatus`, which changes nothing. Everything else goes to step 3, including every other timer command, which HA's local timer intents answer.
+
+   **Transcript correction** (section 16.8) comes last, on what is left for step 3: the routes above read the transcript as heard, and only the text step 3 sends may be a correction. Follow-ups are sent as heard, and the ESPHome reply path is never corrected.
 3. **Intent through TTS:**
 
    ```json
    {"type":"assist_pipeline/run","start_stage":"intent","end_stage":"tts",
-    "input":{"text":"<transcript after wake-phrase removal>"},"pipeline":"<id>",
+    "input":{"text":"<transcript after wake-phrase removal, or its section 16.8 correction>"},"pipeline":"<id>",
     "device_id":"<HA device>","conversation_id":"<id or null>","timeout":30}
    ```
 
@@ -1849,9 +1851,121 @@ For each, `request_id` is exactly `"{{ context.id }}|<action>|{{ args | tojson }
   Two speakers with intent runs in flight at once therefore make an empty `speaker` ambiguous, and the model asks. HA gives scripts no device context to do better.
 - **Installation.** `POST /api/config/script/config/<object_id>`, then `script.reload`, then `homeassistant/expose_entity` with `assistants: ["conversation"]`. The controller records the SHA-256 of what it wrote. If a script's current config differs from that hash (a user edit), it does not overwrite it and reports a warning. It upgrades only when `echomuse_revision` changes and the hash still matches.
 
-**Vocabulary for the grammar.** Exposed entity IDs from `homeassistant/expose_entity/list`, their names and aliases from `config/entity_registry/get_entries`, plus `config/area_registry/list` and `config/floor_registry/list`. Refresh at connect and on `entity_registry_updated`, `area_registry_updated`, and `floor_registry_updated` events.
+**Vocabulary for the grammar.** Exposed entity IDs from `homeassistant/expose_entity/list`, their names and aliases from `config/entity_registry/get_entries`, device names and areas from `config/device_registry/list` (as HA's `async_get_full_entity_name` does, an entity without a user-set name is called by its device's name joined with its own, and an entity without an area is in its device's), plus `config/area_registry/list` and `config/floor_registry/list`. Refresh at connect and on `entity_registry_updated`, `area_registry_updated`, `floor_registry_updated`, and `device_registry_updated` events, debounced 1 s. Transcript correction (section 16.8) uses the same snapshot.
 
 **Sounds.** The sound catalog lives in the controller only. Config values name catalog sounds by ID; the alert engine resolves an ID to its asset's SHA-256 when it writes an event or sends `alert.ring`, and an ID that no longer resolves becomes `builtin:fallback` and is flagged. EchoMuse alarm events reference a sound by SHA-256 in their `echomuse:` line. Other alarm events use the endpoint's effective `alarmSound`, and timer rings its effective `timerSound`: the device override if set, else the fleet value. The device fetches assets by hash with its cache snapshot or `alert.ring`, and a missing asset rings the fallback tone.
+
+### 16.8 Transcript correction
+
+HA's STT sometimes gets a command almost right: a word misheard (“plate cherub rock”, “watch flex”), the last word dropped (“what time is”), or what is left of a wake word in front (“ophelia, what's the weather”). Text HA's built-in agent does not understand goes to the pipeline's conversation agent, which may be an LLM: seconds slower, and free to do something else. Transcript correction repairs such a transcript before step 3 of section 16.7 sends it, and uses HA's own non-executing sentence matcher to accept a repair. `em_text_fix` is the pure core (tables, rules, preservation, acceptance, preference, the record); `em_text_fix_service` owns the tables' lifecycle and the HA calls; the session actor (`_speculate`, `_fix_job`, `_corrected`, `_fix_shadow`, `_fix_outcome`) owns the turn plumbing.
+
+**Position.** In the committed turn, after wake-phrase removal and every step 2 route (reply choices, repeat, alarm grammar, alarm question, timer cancel), immediately before the step 3 intent run. The routes read the transcript as heard. Local commands (step 0) and the ESPHome reply path, where HA transcribes and runs the reply itself, are never corrected. One run is dispatched, once; a correction never resubmits.
+
+**Modes** (`transcriptFix`, per device with a fleet default; section 18.4):
+
+| Mode | Work per turn | Text step 3 sends |
+|---|---|---|
+| `off` | none; `stt_fix` stays NULL | as heard |
+| `shadow` (default) | computes the correction beside the turn and records what `on` would have sent and whether it would have been ready in time; the turn never waits for it | as heard |
+| `on` | waits at most `FINAL_DEADLINE_S` = 100 ms after the final transcript for a result | the selected correction when one is eligible and its context still holds; otherwise as heard |
+
+An error, a timeout, a stale result or tables not yet built send the transcript as heard and never fail the turn. A stored value the API would reject (a hand-edited database) turns correction off for that device, with a warning. A settings change applies from the next turn and makes any result computed under the old settings stale.
+
+**Bypass.** A follow-up is not a standalone command, and the debug matcher has no conversation context. A reply turn, a wake or button turn that inherited an expectation, and any turn carrying a conversation ID are sent as heard, recorded with reason `contextual`, with nothing computed and no pause speculation.
+
+**Language and device.** Every matcher call carries the satellite's HA device ID and the selected pipeline's effective language, by HA's own rule (`PipelineRun.recognize_intent`): the pipeline's `conversation_language`, or, when that is `*`, its `stt_language`, `tts_language`, then `language`. The pipeline is read with stock `assist_pipeline/pipeline/get` for the pipeline the satellite's select chooses; the lookup starts with the STT run. When the language cannot be read the turn records `not_ready`: a match in another language proves nothing.
+
+**Text.** Every rule reads the canonical text (`fix_key`, the stable prefix's normalization): lowercase, edge punctuation trimmed, whitespace collapsed. A text with fewer than 4 letters or digits gets no proposal. The text sent is the candidate's own: canonical words, with an inserted name in its HA or user spelling.
+
+**Similarity** is the better of two ratios, 1 − edit distance ÷ longer length: on the letters and digits, and on a rough sound key (`ph`→`f`, `ck`→`k`, `gh`→`g`, `wh`→`w`, `kn`→`n`, `wr`→`r`, `qu`→`kw`, `x`→`ks`, `q`→`k`, `z`→`s`, `ce`/`ci`/`cy`→`se`/`si`/`sy`, `c`→`k`, `v`→`f`, `dg`→`j`, `th`→`t`; doubled letters collapsed; vowels, `h`, `w` and `y` after the first letter dropped). The phrase rule also compares the text with every vowel-less word of 1–4 letters said as letter names (“rmv” → “ar em vee”). Similarity is a retrieval and scoring heuristic, not a probability that the correction is what was meant.
+
+**Rules.** Thresholds are on raw evidence, never including preference:
+
+| Rule | Proposes | Threshold | `source` |
+|---|---|---|---|
+| `numbers` | Number words (`zero`–`nineteen`, `twenty`…`ninety` with an optional `one`–`nine`) → digits of the same value | — (raw 1.0) | `numbers` |
+| `lead_in` | Wake turns only: drop the first 1–3 words when they sound like the wake phrase or a tail of it (at least 3 letters), leaving at least 4 letters | `LEAD_IN_MIN` 0.75 | `wake` |
+| `slot` | When the original's closest intent left `name`, `area` or `floor` unmatched: replace the words it was left with by an HA name of that kind (alias included), restricted to the domain, area and floor the original already filled; the best 5 | `SLOT_MIN` 0.75 | `entity`, `area`, `floor` |
+| `name` | Any 1–4-word span (at least 4 letters, not only stopwords) → an HA entity, area or floor name or alias, or a user term. Letters are compared without spaces, so joined and split words match | `NAME_MIN` 0.80 | `entity`, `area`, `floor`, `user_term` |
+| `phrase` | The whole text → a user phrase, a trigger sentence, or a history entry | `PHRASE_MIN` 0.85 | `user_phrase`, `trigger`, `history` |
+| `cutoff` | A text whose letters are a proper head or tail of a known phrase's (same three sources) → that phrase | coverage (heard letters ÷ phrase letters) ≥ `CUTOFF_MIN_COVERAGE` 0.5 | as `phrase` |
+
+A cut-off's evidence is its coverage; its raw similarity is recorded only. Every other rule's evidence is its raw similarity.
+
+**Preservation**, checked before HA sees a candidate (failure: status `not_preserved`, with the reason). Protected words are negations, command verbs in any inflection, polarity words (on/off, up/down, louder, locked, …), numbers by value, and units (`em_text_fix.NEGATIONS`, `VERBS`, `POLARITY`, `UNITS`).
+
+- `slot`, `name`, `lead_in`: the words replaced or removed contain no protected word, and `lead_in` removes no word of an HA name.
+- `phrase`, `cutoff`, `numbers`: the same negations, numbers and units as the original. For `phrase` and `cutoff` also: no verb or polarity word of the original dropped, no polarity word added, every word of an HA name in the original (3+ letters, not a stopword) kept, and a verb added only by `phrase` and only when the original has no verb at all (a garbled command word). General verb guessing is excluded: in the prototype replay it turned “house” into “pause” and “say that again” into “play that again”.
+
+**Validation.** Preserved candidates are merged by canonical text (keeping the better rank) and ordered by rank, then evidence. The first `VALIDATE_LIMIT` = 8 distinct letter strings go to HA's matcher in one debug call, after the call on the original; the rest are held. Each matcher call has 5 s.
+
+**Acceptance** of each validated candidate; the first check that fails sets its status:
+
+1. `no_match`: HA does not fully match it.
+2. `catch_all`: it matched only through free text and its rule is not `lead_in`, `phrase` or `cutoff`. Free text is a trigger whose template has a `{list}` or `{wildcard}` (`play {query}`), an intent whose name slot is itself free text (`HassStartTimer`, `HassBroadcast`, `HassShoppingListAddItem`, `HassListAddItem`, `HassListCompleteItem`, `HassMediaSearchAndPlay`, `HassRespond`), or any filled slot outside `em_text_fix.STRUCTURED_SLOTS` (the target, state, level, color, unit and duration slots; `search_query`, `item` and `message` are free text).
+3. `unresolved`: a `slot` or `name` candidate whose insertion HA did not resolve: an entity must be HA's `name` slot and among the matched targets, an area or floor HA's `area` or `floor` slot, and a user term literally a slot value (or, for a trigger, in its template).
+4. `changed_resolved`: a `name`, `area`, `floor`, `domain` or `device_class` the original's intent had filled is changed, or cannot be shown kept, by the same slot value (names and aliases compared by entity, area or floor ID) or by every matched target lying in it.
+5. `security`: the original (also with its letters spelled out), or the candidate, contains a security word (arm, alarm, lock, unlock, door, gate, garage, security, burglar, intruder, deadbolt, and their forms), or HA's verdict has domain `lock` or `alarm_control_panel`, device class `garage`, `door`, `gate` or `lock`, or a target in those domains. Never applied; shadow records it.
+6. `ok`.
+
+**Decision**, in order (the turn's `reason`):
+
+- The original fully matches: `original_matched`. Text HA already understands is never changed, and no candidate is generated.
+- No candidate to validate: `no_candidate`. None HA matches: `no_valid_candidate`.
+- Matched candidates are grouped by interpretation: an intent's name, its slots with names, areas and floors reduced to IDs, and its targets; a trigger's template (and, for a catch-all trigger, the text itself). Spellings of one interpretation are one choice. Groups rank by their best evidence. When the runner-up group, whatever its status, or a held candidate comes within `AMBIGUITY_MARGIN` = 0.05 of the leader: `ambiguous` (“shower” between “shower mode” and “shower time”).
+- The leading group has no `ok` member: `security` if one is a security command, else `no_valid_candidate`.
+- Otherwise its `ok` member of highest rank is selected: `applied` under `on`, `would_apply` under `shadow`.
+
+**Preference.** User lists rank, they do not decide. A candidate whose text is user phrase *i* of *n* (0 = first) gets `PHRASE_PREFERENCE` × (*n* − *i*) ÷ *n* = up to 0.02; one that contains user term *i* of *m* (as a span of up to 6 words; the best-placed term only) gets `TERM_PREFERENCE` × (*m* − *i*) ÷ *m* = up to 0.01; the sum is capped at `PREFERENCE_CAP` = 0.02, so repeats add nothing. Rank = evidence + preference. Preference is added after preservation; thresholds and ambiguity read evidence alone, so it cannot lift a candidate over a threshold, break a tie between interpretations, or override protection. It decides the order candidates are validated in and which spelling of the winning interpretation is sent; `preference_changed` records when evidence alone would have chosen another. User terms are name-rule targets and user phrases are phrase and cut-off sources; a term never supplies a verb, so a request whose command word needs repair needs a full phrase (`play Cherub Rock`).
+
+**Tables.** An immutable `em_text_fix.Tables` snapshot, numbered by a revision:
+
+| Layer | Source |
+|---|---|
+| Trigger sentences | Stock `conversation/sentences/list` (`trigger_sentences`: enabled automations' sentence triggers, as written), expanded with hassil 3.11.0, the version HA 2026.8.1 ships: at most 5,000 sentences per template and 100,000 in all. Templates with a `{list}` or `{wildcard}`, and any hassil cannot parse, are left to HA's matcher. HA's built-in intent sentences are not expanded; they are reached through the slot and name rules and validation |
+| Names | The section 16.7 vocabulary snapshot: Assist-exposed entities' full names and aliases with their domain and area, areas and aliases with their floor, floors and aliases |
+| History | The newest `HISTORY_LIMIT` = 5,000 eligible turns of every device (`em_db.get_text_fix_history`): `outcome` `ha`, `intent_local` 1, `response_type` neither empty nor `error`, non-empty `stt_text`. The text is what the turn sent: an applied correction's `sent`, else `stt_text`, so shadow proposals never enter. Entries are merged by letters keeping the newest turn ID and timestamp as provenance; repetition adds no weight. A newly persisted eligible turn joins at once: the history layer is rebuilt off the event loop and published under a new revision |
+| User lists | The device's effective `transcriptFixTerms` and `transcriptFixPhrases`, built per content and order |
+
+Phrase layers are looked up by letter trigrams and sound-key bigrams (a q-gram count filter) and by sorted letters and reversed letters for head and tail completion; names by length. Tables build on one dedicated thread and candidates are computed on another, both off the event loop. On the live tables (about 35,000 phrases) a build takes about 1 s.
+
+**Invalidation.** Each of these at once withdraws the tables (corrections report `not_ready`) and bumps the revision:
+
+- registry events (`em_ha_client.VocabEvent`): `entity_registry_updated`, `area_registry_updated`, `floor_registry_updated`, `device_registry_updated`; the vocabulary refresh they trigger invalidates again with the new snapshot;
+- trigger changes (`em_ha_client.TriggerEvent`, subscribed at every connect): `automation_reloaded` (every automation edit reloads), and `call_service` for `automation.turn_on`, `automation.turn_off`, `automation.toggle`, `automation.reload` and `conversation.reload`;
+- HA disconnect. Every connect refreshes the vocabulary, which invalidates again.
+
+A rebuild starts `REBUILD_DEBOUNCE_S` = 1.5 s after the latest invalidation, needs a current vocabulary and a live connection, fetches the trigger sentences and the history, builds, and publishes only if neither the revision nor the HA connection changed meanwhile; a newer invalidation's rebuild replaces it. Reconnecting is not a refresh barrier: until a rebuild publishes, nothing from the old connection is used.
+
+**Context and staleness.** Every result carries the context it was computed in: HA connection, tables revision, HA device ID, pipeline, language, config digest (of mode, terms and phrases) and wake phrase. It is used only while the tables are current at that revision on the same connection, and the device's settings and HA device ID are unchanged; otherwise the turn records `stale` and sends the transcript as heard. A computation starts only on current tables (else `not_ready`). Under `on`, a turn that stopped being current while it waited dispatches nothing.
+
+**Pause speculation.** When the actor posts a section 16.6 sentence-matcher answer for a stable prefix (text the grammar classes `unknown`, with `recognizer` available), it then starts correcting that prefix under the context of that moment. The endpoint never waits on or reads it. Only the newest prefix's job is kept, and it gives up after `FIX_COMPUTE_LIMIT_S` = 10 s. At dispatch, the job is reused (`cache` `hit`) when it is the same utterance, the final transcript's canonical text equals the prefix's, and its whole context equals the dispatch's; otherwise the correction is computed then (`miss`).
+
+**Deadline.** Under `on`, `FINAL_DEADLINE_S` (100 ms) covers whatever is still out when the final transcript has passed the routes: the language lookup, the pause job, or a whole computation. On expiry the transcript is sent as heard, the turn records `timeout` with `deadline_met` false, and the late result is discarded. A shadow computation has up to 10 s and records `deadline_met` = its latency ≤ 100 ms; the turn row is written once it is done.
+
+**Record.** `turns.stt_fix` (schema 34, nullable TEXT) holds `em_text_fix.FixRecord` as JSON, and the turns API (`/api/devices/{id}/turns`) and `turn_complete` push carry it as that string. It is NULL when correction is off or the turn ended before step 3. `stt_raw` and `stt_text` always keep the transcript as heard; an applied correction appears only in `sent`.
+
+| Field | Meaning |
+|---|---|
+| `mode` | `shadow` or `on` |
+| `reason` | `applied`, `would_apply`, `original_matched`, `no_candidate`, `no_valid_candidate`, `ambiguous`, `security`, `contextual`, `not_ready`, `timeout`, `error`, `stale` |
+| `original`, `proposed`, `sent`, `applied` | The transcript as heard (wake phrase removed), the best candidate HA accepted (eligible or not; null if none), the text step 3 sent, and whether that was a correction |
+| `rule`, `source`, `raw`, `coverage`, `preference`, `rank`, `status` | The proposal's evidence, when there is one |
+| `preference_changed` | User preference chose the spelling sent |
+| `verdict` | HA's matcher on the original and on the proposal: `match`, `source`, `template`, and for intents `intent`, `slots`, `unmatched` |
+| `candidates` | Up to 6: validated ones by rank, then those rejected before HA, each with its status and detail |
+| `context`, `compute_ms` | Connection, tables revision, config digest, pipeline and language; the computation's own time |
+| `cache`, `latency_ms`, `deadline_met`, `error` | Pause result reused or not; time from the final transcript to the result; whether it was within 100 ms; what failed |
+
+**Measured** with `tools/text_fix_replay.py` on the live corpus (211 HA turns, 2026-09-27 → 2026-10-17, each turn with only earlier history; HA's verdicts recorded from its non-executing matcher): 166 already matched; 11 corrections would apply: lead-in “ophelia, what's the weather”, phrase “plate cherub rock” → “play cherub rock” (history), cut-off “what time is” → “what time is it” (6), “watch you” → “watch youtube tv”, slot “set the living room lights to glow” → “…to Low”, phrase “watch flex” → “watch plex”; 3 ambiguous (“shower”, “rmv alarm”, “arm v alarm”). Of the 9 with a labelled intent, 9 were right and none wrong; the 64 latest turns, held out, had 3 corrections, all right. “youtube tv” is left as heard: completing it would add the verb “watch”. A proposal took a median 19 ms of CPU, at most about 100 ms.
+
+**Limitations.**
+
+- Nothing biases or trains ASR. The lists change neither Kroko, a pause server, nor HA's STT.
+- Security-state commands and follow-ups are never corrected automatically.
+- HA's acceptance shows the corrected text is executable, not that it is what was said.
+- A corrected text may still go to an LLM: the pipeline's agent, `prefer_local_intents`, language and conversation decide what runs it.
+- Corrections never feed the endpoint. A garbled command word in a request no trigger, history entry or user phrase knows is not repaired, and an almost empty transcript (“st”) is not completed.
 
 ## 17. Resolved questions
 
@@ -1872,6 +1986,7 @@ For each, `request_id` is exactly `"{{ context.id }}|<action>|{{ args | tojson }
 | Speaker gating? | None in the initial implementation; speaker takeover is backlog (section 19.1) | Only a two-clip sanity test exists [P1]; published approaches use trained per-frame models |
 | TV-room endpoint? | Grammar-complete background-speech route; background speech ≥10 dB down counts as pause after `needs_more`/`unknown` text; bounded retry | Equal-level voices are not separable from one stream; speech ≥10 dB down is, and a 1,792 ms pause outlasts soft stretches inside a command |
 | Completeness beyond the grammar? | HA's built-in sentence matcher (`conversation/agent/homeassistant/debug`), only for text the grammar leaves `unknown`; a probe word separates `complete` from wildcard-`extendable` | It knows the user's own sentences and triggers; 20 of 38 `unknown` turns become `complete` or `extendable`; recognizes without executing [H6] |
+| Correct misheard transcripts? | After the step 2 routes, repair a command HA's matcher does not understand with six bounded rules, and send a repair only when HA's matcher fully accepts it, it keeps everything the original said explicitly, it is not a security-state command, and no other interpretation comes within 0.05; `shadow` by default (section 16.8) | Of 211 recent HA turns, 166 already matched, 11 would be repaired (every labelled one right) and 3 abstained as ambiguous; a matcher check recognizes without executing [H6] |
 | Unsolicited follow-up? | Not implemented | No available directedness/NTT model |
 | Native AFE metadata? | Decoded on the device and carried as evidence under `afe_metadata_v1`; no decision reads it. Direction/wake-time energy: `unavailable` | v3.3 validated per frame on the device (section 4.5); no measurement yet relates a field to an outcome |
 | Presentation timing? | Estimated callback/sample accounting plus 150 ms drain guard | No measured DAC timestamp API; guard is a release gate |
@@ -1943,7 +2058,7 @@ The fleet-wide cutover (section 12) deletes everything REMOVED or REPLACED. No o
 | `em_api` config application (`owwModel`, `owwSpeexNs`, endpoint/VAD/timer keys) | Pushes removed keys to live devices | MODIFIED | Per §18.4 key table |
 | `em_start.py` add-on option map `oww_model`, `oww_threshold` | Add-on → env bridge | MODIFIED | Remove both; the add-on uses the Supervisor token (§16.7) |
 | `em_db`, `em_config_sections` | Defaults, sections, migrations | MODIFIED | §18.4 |
-| — | — | NEW | `em_audio_timeline` (EMA1 parse, cell records, epochs, uplink leases, per-lease timelines, clock fit), `em_speech_worker` (executor, VAD, on-demand reference scoring, ASR), `em_attribution` (reference comparison, pure), `em_endpoint_policy` (reducer, pure), `em_wake_phrase` (removal rule, pure), `em_session` (actor), `em_alerts` (alert engine, journal, calendar encoding, merge, delivery), `em_ha_client` (stock websocket/REST: pipeline runs, calendar, events, provisioning, vocabulary), `em_wake_registry`, `em_device_assets`; package `echomuse_grammar/` (controller only) |
+| — | — | NEW | `em_audio_timeline` (EMA1 parse, cell records, epochs, uplink leases, per-lease timelines, clock fit), `em_speech_worker` (executor, VAD, on-demand reference scoring, ASR), `em_attribution` (reference comparison, pure), `em_endpoint_policy` (reducer, pure), `em_wake_phrase` (removal rule, pure), `em_session` (actor), `em_alerts` (alert engine, journal, calendar encoding, merge, delivery), `em_ha_client` (stock websocket/REST: pipeline runs, calendar, events, provisioning, vocabulary, sentence triggers, pipeline language), `em_text_fix` (transcript correction: tables, rules, preservation, acceptance, preference, record; pure), `em_text_fix_service` (correction tables' lifecycle, invalidation and HA calls, §16.8), `em_wake_registry`, `em_device_assets`; package `echomuse_grammar/` (controller only) |
 
 ### 18.2 Device firmware (`device/`)
 
@@ -1997,6 +2112,7 @@ The fleet-wide cutover (section 12) deletes everything REMOVED or REPLACED. No o
 | Activity: turn list, utterance playback, wake clips | RETAINED | — |
 | `CONFIG_SECTIONS` mirror, `onDeviceMode`, `bcresnetCapable`/`triggerCapable`/shadow props | MODIFIED / REMOVED | Mirror follows §18.4; shadow/trigger props removed |
 | — | NEW | Alert panel: active timers from the controller's display copy; this endpoint's alarm schedules and occurrences from its HA calendar; alarm delivery state (`stored_in_ha`/`armed_on_endpoint`/`delivery_pending`), pending journal operations, clock/wakelock health, and HA provisioning status. Alarm create and cancel go through the alert engine; HA's calendar UI remains the full alarm editor |
+| — | NEW | Config section “Transcript correction”: mode Off / Shadow / On, and ranked “Preferred terms” and “Preferred phrases” list editors (add, edit, remove, reorder; first = highest preference). Activity turn detail: a “Correction” stage after HA's transcription showing heard → proposed → sent, applied or not with the reason, rule and source, evidence, preference, cache and deadline (§16.8) |
 
 ### 18.4 Configuration and persisted data
 
@@ -2016,9 +2132,10 @@ Per-key decisions (`em_db.DEFAULT_DEVICE_CONFIG` and `em_config_sections.SECTION
 | — | NEW | `alarmSound`: the sound for alarm events without an `echomuse:` line and for new alarms; fleet value with an optional device override, like `timerSound` |
 | — | NEW | `wakeOpenRules` (extra live open rules, default none, at most 4) and `wakeShadowRules` (shadow rules, at most 8, default five idle rules): lists of `{profile, windows, combine, threshold}` sent in `session.ready` to `open_rules_v1` devices (§5.2) |
 | — | NEW | `pauseAsr`: `{engine, host, port, model, language}`, the §16.6 pause server; default `{"kroko", "", 10300, "", "en"}`. `engine` is `kroko` or `wyoming`; `wyoming` needs a host name or IP address; `port` 1–65535; empty `model` or `language` leaves the choice to the server |
+| — | NEW | `transcriptFix` (`off`, `shadow`, `on`; default `shadow`), `transcriptFixTerms` and `transcriptFixPhrases` (ordered string lists, highest preference first, default empty): §16.8 transcript correction. A list holds at most 200 entries of at most 120 characters each after collapsing whitespace, each with a letter or digit; entries whose letters and digits match casefolded are duplicates and rejected. The API answers a bad value with 400 `INVALID_CONFIG` and `"<key>: <reason>"` |
 | `wakeArbitrationMs`, `wakeSound`, `saveWakeClips`, `nsAsr`, `saveUtterances`, `duckDb`, `eqBands`, `eqLoudness`, `buttonSingleTapEvent`, `buttonMultiTapMs`, `bleProxyEnabled`, `ledScene`, `ledListenColor`, `ledThinkColor`, `meter*`; state key `startupVolume` | RETAINED | EQ applies to controller-rendered content/dialog, not to device-executed alerts |
 
-Sections after cutover: `wakeword` = `wakeModel`, `saveWakeClips`, `wakeArbitrationMs`, `wakeSound`, `wakeOpenRules`, `wakeShadowRules`; `microphones` = `nsAsr`, `saveUtterances`, `extendedUtterances`, `pauseAsr`; `advanced` = `buttonSingleTapEvent`, `buttonMultiTapMs`; `timers` = `timerSound`, `timerRingSeconds`, `timerRingGapSeconds`, `alarmSound`; `playback`, `ring`, `bluetooth` unchanged. A `replyOnset` key (the reply onset gate it tuned is gone, section 16.6) is deleted from every config by migration 31 and rejected by the API.
+Sections after cutover: `wakeword` = `wakeModel`, `saveWakeClips`, `wakeArbitrationMs`, `wakeSound`, `wakeOpenRules`, `wakeShadowRules`; `microphones` = `nsAsr`, `saveUtterances`, `extendedUtterances`, `pauseAsr`; `advanced` = `buttonSingleTapEvent`, `buttonMultiTapMs`; `timers` = `timerSound`, `timerRingSeconds`, `timerRingGapSeconds`, `alarmSound`; `transcript` = `transcriptFix`, `transcriptFixTerms`, `transcriptFixPhrases`; `playback`, `ring`, `bluetooth` unchanged. A `replyOnset` key (the reply onset gate it tuned is gone, section 16.6) is deleted from every config by migration 31 and rejected by the API. Schema 34 adds the nullable `turns.stt_fix` (section 16.8).
 
 Append **one** migration after the current last entry (schema 21 → 22; `MIGRATIONS` stays append-only). In one transaction including its Python fixup:
 
@@ -2035,6 +2152,7 @@ Environment/add-on: `OWW_MODEL`, `OWW_THRESHOLD`, and add-on options `oww_model`
 
 - **Controller image:** remove `openwakeword==0.6.0` (Dockerfile `--no-deps` install and `download_models()`), `speexdsp-ns`, `tqdm`, `scikit-learn`, and `requests` (no controller module imports the last three). Keep `onnxruntime`, `numpy`, `scipy` (EQ), the DTLN models, and the hash-checked `onnxruntime-android` 1.19.2 extraction of `jni/armeabi-v7a/libonnxruntime.so`, now served to devices as a speech asset (§16.5). Add `sherpa-onnx==1.13.8` and the hash-pinned speech bundle (§16.6). The Dockerfile `COPY` list drops `em_shadow`, `em_oww_assets`, `em_oww_models`, `em_endpoint`, `em_turnclock`, and adds the new modules.
 - **Home Assistant:** no custom integration and no HA core patch. The controller provisions stock objects only, through stock APIs: one Local Calendar per endpoint, five alarm scripts exposed to Assist, and the satellite's VAD-sensitivity setting (§16.7).
+- **Transcript correction:** `hassil==3.11.0`, pinned to the version HA 2026.8.1 ships, so a trigger template expands as HA parses it (§16.8). Moving the HA target moves this pin.
 - **Speech bundle licensing:** the image or first-start downloader must ship the Kroko model's CC-BY-SA attribution (link to `huggingface.co/Banafo/Kroko-ASR`). Silero v5 (MIT) and sherpa-onnx (Apache-2.0) keep their notices. The bundle is fetched and hash-checked, never retrained in this repository.
 - **Controller tests:** remove `test_shadow.py`, `test_endpoint.py`, `test_turnclock.py`; replace `test_oww_assets.py` with `em_device_assets` tests. Add: `test_alerts.py` (calendar encoding, journal ordering, merge table, restore guard, backlog expiry, crash points before and after each write), `test_alert_wire.py` (snapshot/delta objects and the canonical digest), `test_ha_client.py` (every section 16.7 message shape against fixtures recorded from HA 2026.8.1), `test_alert_scripts.py` (the five generated scripts and `request_id` construction), `test_uplink.py` (lease table, backfill grid alignment, duplicate samples), `test_endpoint_policy.py` (every reducer route, `pending` revocation, no-input, retry), `test_wake_phrase.py` (the section 16.6 cases), and `test_grammar_conformance.py` (the conformance corpus). Replace `test_oww_models.py` with registry tests. Modify `test_wake_scorer.py` (drop openWakeWord), `test_button.py`, `test_player.py`, `test_capabilities.py`, `test_config_sections.py`, `test_config_guard.py`, `test_db_migrations.py` (the new migration), `test_db_instrumentation.py`, `test_deploy.py` (COPY list, add-on threshold pin), `test_sounds.py`, and the `conftest.py` scope note. Keep the rest. New pure modules (`em_attribution`, `em_endpoint_policy`, `em_session`, `echomuse_grammar`) are tested with evidence fixtures only, so the suite still needs just pytest, numpy, and scipy.
 - **Device tests:** remove the openWakeWord `wakeword` stream and shadow tests and their fixtures; keep and adapt the `wakeword/bcresnet` and `wakeword/ort` tests; add tests for detector candidate rules, the hop grid, latched thresholds, overruns, lease backfill from rings, cell records, the reference FIR's alignment, the alert journal and snapshot install (including crash points), and the alert executor's queue, expiry, and snooze child identity; modify `slspeaker` mix/stream tests, `cue_test`, and `client/data_race_test`.

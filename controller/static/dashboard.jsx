@@ -269,6 +269,12 @@ const RULE_COMBINE_LABEL = Object.freeze({
 // Who transcribes an utterance at a pause (§16.6), config `pauseAsr`; mirrors
 // em_pause_asr.PauseAsrEngine.
 const PAUSE_ASR_ENGINE = Object.freeze({ KROKO: 'kroko', WYOMING: 'wyoming' });
+// Transcript correction (§16.8), config `transcriptFix`; mirrors
+// em_text_fix.TextFixMode. The two vocabulary lists' limits mirror
+// em_text_fix.MAX_LIST_ENTRIES / MAX_ENTRY_CHARS.
+const TEXT_FIX_MODE = Object.freeze({ OFF: 'off', SHADOW: 'shadow', ON: 'on' });
+const TEXT_FIX_MAX_ENTRIES = 200;
+const TEXT_FIX_MAX_CHARS = 120;
 
 // "idle · 2-window average ≥ 0.95" — a rule as the dashboard names it.
 function wakeRuleText(r) {
@@ -1226,6 +1232,122 @@ const PLAYBACK_ENDS = Object.freeze({
   [PLAYBACK_END.FENCED]:           'superseded',
 });
 
+// Transcript correction (§16.8): a turn's `stt_fix`, the JSON string
+// em_text_fix.FixRecord writes (null: correction was off, or the turn never
+// reached it). Malformed JSON is ignored rather than shown half-read.
+function parseTextFix(raw) {
+  if (raw == null) return null;
+  try {
+    const v = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    return v && typeof v === 'object' && !Array.isArray(v) ? v : null;
+  } catch (e) { return null; }
+}
+// em_text_fix.Reason — why the turn sent what it sent: [words, color].
+const TEXT_FIX_REASONS = Object.freeze({
+  applied:            ['the correction was sent', 'var(--ok)'],
+  would_apply:        ['shadow: would have sent', 'var(--accent)'],
+  original_matched:   ["Home Assistant's matcher already understood the heard text", 'var(--muted)'],
+  no_candidate:       ['nothing to propose', 'var(--muted)'],
+  no_valid_candidate: ["no candidate kept what was said and passed Home Assistant's matcher", 'var(--muted)'],
+  ambiguous:          ['ambiguous: interpretations too close to choose between', 'var(--warn)'],
+  security:           ['a lock, alarm, door or gate command: never applied automatically', 'var(--warn)'],
+  contextual:         ['a follow-up in a conversation: bypassed', 'var(--muted)'],
+  not_ready:          ["not ready: tables not built or Home Assistant's matcher unavailable", 'var(--warn)'],
+  timeout:            ['not ready within 100 ms of the final transcript', 'var(--warn)'],
+  error:              ['failed', 'var(--error)'],
+  stale:              ['computed under a context that no longer held', 'var(--warn)'],
+});
+// em_text_fix.Rule / Source / Status.
+const TEXT_FIX_RULES = Object.freeze({
+  slot: 'slot name', name: 'name span', lead_in: 'wake-word lead-in',
+  phrase: 'whole phrase', cutoff: 'cut-off phrase', numbers: 'number words',
+});
+const TEXT_FIX_SOURCES = Object.freeze({
+  trigger: 'an HA trigger sentence', history: 'an earlier request HA answered',
+  user_phrase: 'a preferred phrase', user_term: 'a preferred term', entity: 'an HA entity name',
+  area: 'an HA area', floor: 'an HA floor', wake: 'the wake phrase', numbers: 'digits',
+});
+const TEXT_FIX_STATUSES = Object.freeze({
+  ok: 'eligible', not_preserved: 'drops or changes what was said',
+  not_validated: 'not checked (past the validation limit)', no_match: "HA's matcher does not accept it",
+  catch_all: 'matched only by a free-text slot or wildcard', unresolved: 'the name did not resolve to its target',
+  changed_resolved: 'changes a slot HA had resolved', security: 'a security command',
+});
+const fixWord = (map, k) => (k == null ? '—' : map[k] || String(k).replace(/_/g, ' '));
+
+function TextFixEvidence({ fix: f, quote }) {
+  const [open, setOpen] = useState(false);
+  const muted = { color: 'var(--muted)' };
+  const [reason, color] = TEXT_FIX_REASONS[f.reason] || [fixWord({}, f.reason), 'var(--muted)'];
+  const num = v => (typeof v === 'number' ? v.toFixed(2) : '—');
+  const candidates = Array.isArray(f.candidates) ? f.candidates : [];
+  const verdicts = f.verdict && typeof f.verdict === 'object' ? f.verdict : null;
+  const verdict = v => (!v ? 'not asked'
+    : v.match ? `matched${v.intent ? ` ${v.intent}` : ''}${v.template ? ` via “${v.template}”` : ''}` : 'no match');
+  const proposed = f.proposed != null;
+  const timing = [
+    f.cache && `cache ${f.cache}`,
+    typeof f.latency_ms === 'number' && `${f.latency_ms} ms after the final transcript`,
+    f.deadline_met != null && (f.deadline_met ? 'within the 100 ms deadline' : 'missed the 100 ms deadline'),
+    typeof f.compute_ms === 'number' && `computed in ${f.compute_ms} ms`,
+  ].filter(Boolean);
+  return (
+    <>
+      <div>
+        heard {quote(f.original)}
+        {' → '}{proposed ? <>proposed {quote(f.proposed)}</> : <span style={muted}>no proposal</span>}
+        {' → '}sent {quote(f.sent)}
+      </div>
+      <div>
+        <span style={{ color: f.applied ? 'var(--ok)' : 'var(--text2)' }}>{f.applied ? 'applied' : 'not applied'}</span>
+        {' · '}<span style={{ color }}>{reason}</span>
+        {f.mode && <span style={muted}> · mode {f.mode}</span>}
+      </div>
+      {proposed && (
+        <div style={muted}>
+          {[`${fixWord(TEXT_FIX_RULES, f.rule)} from ${fixWord(TEXT_FIX_SOURCES, f.source)}`,
+            `similarity ${num(f.raw)}`,
+            f.coverage != null && `coverage ${num(f.coverage)}`,
+            f.status && f.status !== 'ok' && fixWord(TEXT_FIX_STATUSES, f.status),
+            f.preference_changed ? 'your preference chose this spelling'
+              : f.preference > 0 ? `preference +${f.preference.toFixed(3)} (did not change the choice)` : null,
+          ].filter(Boolean).join(' · ')}
+        </div>
+      )}
+      {timing.length > 0 && <div style={muted}>{timing.join(' · ')}</div>}
+      {f.error && <div style={{ color: 'var(--error)' }}>{f.error}</div>}
+      {(candidates.length > 0 || verdicts) && (
+        <div style={{ marginTop: 2 }}>
+          <DisclosureToggle open={open} onToggle={() => setOpen(o => !o)}>
+            Evidence{candidates.length ? ` · ${candidates.length} candidate${candidates.length === 1 ? '' : 's'}` : ''}
+          </DisclosureToggle>
+          {open && (
+            <div style={{ marginTop: 4 }}>
+              {verdicts && (
+                <div style={muted}>
+                  HA on the heard text: {verdict(verdicts.original)}
+                  {proposed && <> · on the proposal: {verdict(verdicts.proposed)}</>}
+                </div>
+              )}
+              {candidates.map((c, i) => (
+                <div key={i} style={{ display: 'grid', gridTemplateColumns: '1fr auto', columnGap: 8 }}>
+                  <span>{quote(c.text)} <span style={muted}>{fixWord(TEXT_FIX_RULES, c.rule)} from {fixWord(TEXT_FIX_SOURCES, c.source)}</span></span>
+                  <span style={{ ...muted, textAlign: 'right' }}>
+                    {[`${num(c.raw)}`, c.coverage != null && `cov ${num(c.coverage)}`,
+                      c.preference > 0 && `pref +${c.preference.toFixed(3)}`, `rank ${num(c.rank)}`].filter(Boolean).join(' · ')}
+                    {' · '}<span style={{ color: c.status === 'ok' ? 'var(--ok)' : 'var(--muted)' }}>{fixWord(TEXT_FIX_STATUSES, c.status)}</span>
+                    {c.detail ? ` (${c.detail})` : ''}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </>
+  );
+}
+
 // A turn's native AFE evidence (turns.afe_evidence) as its per-period chart:
 // null is unavailable — the Echo did not report it. The span summaries stay in
 // the decision trace and the turns API.
@@ -1758,6 +1880,7 @@ function TurnDetail({ turn: t, turns, deviceId, onSelect, playback }) {
   // Turns that ran an HA intent: its conversation run, or EchoMuse's HassTimerStatus/HassCancelTimer.
   const handledByHa = t.outcome === TURN_OUTCOME.HA || t.outcome === TURN_OUTCOME.TIMER;
   const agent = t.intent_local == null ? null : t.intent_local ? "HA's built-in agent" : 'the conversation agent';
+  const fix = parseTextFix(t.stt_fix);
   return (
     <div style={{ marginTop: 10, background: 'var(--hairline)', border: '1px solid var(--track)', borderRadius: 6, padding: '8px 12px', fontFamily: MONO, fontSize: 10, color: 'var(--text2)', lineHeight: 1.7 }}>
       <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', paddingBottom: 4 }}>
@@ -1796,9 +1919,12 @@ function TurnDetail({ turn: t, turns, deviceId, onSelect, playback }) {
         {quote(t.stt_raw ?? t.stt_text)}
         <div style={{ color: 'var(--muted)' }}>
           speech-to-text {fmtS(t.stt_ms)}
-          {t.stt_raw != null && t.stt_text != null && t.stt_text !== t.stt_raw && <> · sent on as {quote(t.stt_text)} (wake word removed)</>}
+          {t.stt_raw != null && t.stt_text != null && t.stt_text !== t.stt_raw && <> · {fix?.applied ? 'wake word removed' : 'sent on as'} {quote(t.stt_text)}{fix?.applied ? '' : ' (wake word removed)'}</>}
+          {fix?.applied && <> · <span style={{ color: 'var(--ok)' }}>corrected before sending</span></>}
         </div>
       </>)}
+
+      {fix && stage('Correction', <TextFixEvidence key={t.turn_id} fix={fix} quote={quote}/>)}
 
       {t.outcome && !legacy && stage('Handled by', <>
         {TURN_HANDLERS[t.outcome] || t.outcome.replace(/_/g, ' ')}
@@ -5794,7 +5920,8 @@ const CONFIG_SECTIONS = {
   "ring": ["ledScene", "ledListenColor", "ledThinkColor", "meterAttack", "meterDecay", "meterFloor", "meterGamma", "meterRef", "meterCurve"],
   "advanced": ["buttonSingleTapEvent", "buttonMultiTapMs"],
   "bluetooth": ["bleProxyEnabled"],
-  "timers": ["timerSound", "timerRingSeconds", "timerRingGapSeconds", "alarmSound"]
+  "timers": ["timerSound", "timerRingSeconds", "timerRingGapSeconds", "alarmSound"],
+  "transcript": ["transcriptFix", "transcriptFixTerms", "transcriptFixPhrases"]
 };
 
 // Display labels for the section ids, and the reverse key -> section index
@@ -5805,7 +5932,7 @@ const CONFIG_SECTIONS = {
 const SECTION_LABELS = {
   playback: 'Playback', wakeword: 'Wake word', microphones: 'Speech',
   ring: 'Ring', advanced: 'Button', bluetooth: 'Bluetooth',
-  timers: 'Timers',
+  timers: 'Timers', transcript: 'Transcript correction',
 };
 const KEY_SECTION = {};
 Object.entries(CONFIG_SECTIONS).forEach(([sid, keys]) => {
@@ -6195,6 +6322,168 @@ function PauseAsrControls({ value, onChange }) {
   );
 }
 
+// Transcript correction (§16.8), config `transcriptFix`.
+const TEXT_FIX_MODE_OPTIONS = Object.freeze([
+  [TEXT_FIX_MODE.OFF, 'Off'], [TEXT_FIX_MODE.SHADOW, 'Shadow'], [TEXT_FIX_MODE.ON, 'On'],
+]);
+const TEXT_FIX_MODE_HELP = Object.freeze({
+  [TEXT_FIX_MODE.OFF]:    'no correction work: every request goes to Home Assistant as heard',
+  [TEXT_FIX_MODE.SHADOW]: 'records what On would have sent on each turn in Activity, without changing what is sent',
+  [TEXT_FIX_MODE.ON]:     "sends a correction only when Home Assistant's sentence matcher accepts it and it is ready within 100 ms of the final transcript; otherwise the request as heard",
+});
+
+// `transcriptFixTerms` / `transcriptFixPhrases`: ordered, highest preference
+// first, exactly in the stored order. The checks mirror
+// em_text_fix.parse_list, so a list the API would refuse never reaches the
+// config: an entry is committed only once it passes, and until then the
+// reason stands beside the field. Display case is kept; duplicates are judged
+// on letters and digits alone, casefolded (em_text_fix.match_key), so
+// "YouTube TV" duplicates "youtube t.v.".
+const textFixEntry = s => String(s).split(/\s+/).filter(Boolean).join(' ');
+const textFixKey = s => s.toLowerCase().replace(/ß/g, 'ss').replace(/[^a-z0-9]/g, '');
+function textFixEntryError(entry, list, self = -1) {
+  const key = textFixKey(entry);
+  if (!key) return 'entries must contain a letter or digit';
+  if ([...entry].length > TEXT_FIX_MAX_CHARS) return `entries are at most ${TEXT_FIX_MAX_CHARS} characters`;
+  const dup = list.findIndex((x, i) => i !== self && textFixKey(textFixEntry(x)) === key);
+  return dup < 0 ? null : `“${entry}” duplicates “${list[dup]}” (#${dup + 1})`;
+}
+function textFixListError(list) {
+  if (list.length > TEXT_FIX_MAX_ENTRIES) return `at most ${TEXT_FIX_MAX_ENTRIES} entries`;
+  for (let i = 0; i < list.length; i++) {
+    if (typeof list[i] !== 'string') return 'must be a list of strings';
+    const err = textFixEntryError(textFixEntry(list[i]), list.slice(0, i));
+    if (err) return err;
+  }
+  return null;
+}
+
+// One ordered list: add at the bottom, click an entry to edit it (Enter or
+// leaving the field commits, Escape cancels), × removes, and drag a row
+// (HTML5 drag-and-drop) or press its ↑/↓ to reorder. A drop puts the dragged
+// entry at the target row's place; the accent line shows which side.
+function TextFixListEditor({ label, sub, noun, placeholder, items, onChange, disabled }) {
+  const list = Array.isArray(items) ? items : [];
+  const [draft, setDraft] = useState('');
+  const [draftError, setDraftError] = useState(null);
+  const [editing, setEditing] = useState(null);   // { index, text, error }
+  const [drag, setDrag] = useState(null);         // { from, over }
+  const listKey = list.join('\n');
+  // A list replaced underneath (scope switch, fleet reload) ends any edit.
+  useEffect(() => { setEditing(null); setDrag(null); }, [listKey]);
+  const listError = textFixListError(list);
+  const full = list.length >= TEXT_FIX_MAX_ENTRIES;
+  const busy = disabled || editing != null;
+  const commit = next => { if (!textFixListError(next)) onChange(next); };
+
+  function add() {
+    const entry = textFixEntry(draft);
+    if (!entry) return;
+    const err = full ? `at most ${TEXT_FIX_MAX_ENTRIES} entries` : textFixEntryError(entry, list);
+    if (err) { setDraftError(err); return; }
+    commit([...list, entry]);
+    setDraft(''); setDraftError(null);
+  }
+  function saveEdit() {
+    if (!editing) return;
+    const entry = textFixEntry(editing.text);
+    if (entry === list[editing.index]) { setEditing(null); return; }
+    const err = textFixEntryError(entry, list, editing.index);
+    if (err) { setEditing({ ...editing, error: err }); return; }
+    commit(list.map((x, i) => (i === editing.index ? entry : x)));
+    setEditing(null);
+  }
+  function move(from, to) {
+    if (from === to || to < 0 || to >= list.length) return;
+    const next = [...list];
+    next.splice(to, 0, next.splice(from, 1)[0]);
+    commit(next);
+  }
+  function remove(i) { setEditing(null); commit(list.filter((_, j) => j !== i)); }
+
+  const field = { display:'block', width:'100%', boxSizing:'border-box' };
+  const error = { fontFamily:MONO, fontSize:9, color:'var(--error)', marginTop:3 };
+  const glyph = on => ({ background:'none', border:'none', padding:'0 3px', fontFamily:MONO, fontSize:11,
+    color:on ? 'var(--text2)' : 'var(--muted)', opacity:on ? 1 : 0.4, cursor:on ? 'pointer' : 'default' });
+  const line = edge => `2px solid ${edge ? 'var(--accent)' : 'transparent'}`;
+  return (
+    <div style={{ marginBottom:16 }}>
+      <span style={{ fontFamily:MONO, fontSize:11, color:'var(--text2)' }}>{label}</span>
+      <span style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)', marginLeft:8 }}>{sub}</span>
+      <div role="list" aria-label={label} style={{ marginTop:8 }}>
+        {list.length === 0 && <div style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)', padding:'3px 0' }}>none</div>}
+        {list.map((x, i) => {
+          const isEditing = editing?.index === i;
+          const target = drag != null && drag.over === i && drag.from !== i;
+          return (
+            <div key={`${i}:${x}`} role="listitem"
+              draggable={!busy}
+              onDragStart={e => {
+                e.dataTransfer.effectAllowed = 'move';
+                e.dataTransfer.setData('text/plain', x);   // Firefox starts no drag without data
+                setDrag({ from: i, over: i });
+              }}
+              onDragOver={e => {
+                if (!drag) return;   // a drag from elsewhere is not a reorder
+                e.preventDefault();
+                e.dataTransfer.dropEffect = 'move';
+                if (drag.over !== i) setDrag({ ...drag, over: i });
+              }}
+              onDrop={e => { if (!drag) return; e.preventDefault(); move(drag.from, i); setDrag(null); }}
+              onDragEnd={() => setDrag(null)}
+              style={{ display:'grid', gridTemplateColumns:'12px 30px 1fr auto', gap:6, alignItems:'center', padding:'2px 0',
+                borderTop:line(target && drag.from > i), borderBottom:line(target && drag.from < i),
+                opacity:drag?.from === i ? 0.4 : 1 }}>
+              <span aria-hidden="true" title={busy ? undefined : 'Drag to reorder'}
+                style={{ fontFamily:MONO, fontSize:11, color:'var(--muted)', cursor:busy ? 'default' : 'grab' }}>⠿</span>
+              <span title={i === 0 ? 'highest preference' : undefined}
+                style={{ fontFamily:MONO, fontSize:9, textAlign:'right', color:i === 0 ? 'var(--accent)' : 'var(--muted)' }}>#{i + 1}</span>
+              {isEditing ? (
+                <div>
+                  <input type="text" autoFocus value={editing.text} aria-label={`Edit ${noun} #${i + 1}`}
+                    aria-invalid={!!editing.error}
+                    onChange={e => setEditing({ index: i, text: e.target.value, error: null })}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter') { e.preventDefault(); saveEdit(); }
+                      else if (e.key === 'Escape') { e.preventDefault(); setEditing(null); }
+                    }}
+                    onBlur={saveEdit} style={field}/>
+                  {editing.error && <div style={error}>{editing.error} — not saved</div>}
+                </div>
+              ) : (
+                <span {...pressable(() => setEditing({ index: i, text: x, error: null }), { disabled: busy })}
+                  title={busy ? undefined : 'Edit'} aria-label={`Edit ${noun} #${i + 1}: ${x}`}
+                  style={{ fontFamily:SANS, fontSize:12, color:'var(--text)', overflowWrap:'anywhere', cursor:busy ? 'default' : 'text' }}>{x}</span>
+              )}
+              <span style={{ display:'flex', gap:2 }}>
+                <button type="button" disabled={busy || i === 0} onClick={() => move(i, i - 1)}
+                  title="Move up (higher preference)" aria-label={`Move ${noun} “${x}” up`} style={glyph(!busy && i > 0)}>↑</button>
+                <button type="button" disabled={busy || i === list.length - 1} onClick={() => move(i, i + 1)}
+                  title="Move down (lower preference)" aria-label={`Move ${noun} “${x}” down`} style={glyph(!busy && i < list.length - 1)}>↓</button>
+                {/* mousedown kept from blurring an open edit, which would commit it first. */}
+                <button type="button" disabled={disabled} onMouseDown={e => e.preventDefault()} onClick={() => remove(i)}
+                  title="Remove" aria-label={`Remove ${noun} “${x}”`} style={glyph(!disabled)}>×</button>
+              </span>
+            </div>
+          );
+        })}
+      </div>
+      <div style={{ display:'grid', gridTemplateColumns:'1fr auto', gap:8, alignItems:'center', marginTop:8 }}>
+        <input type="text" value={draft} disabled={disabled || full} placeholder={placeholder}
+          aria-label={`Add a ${noun}`} aria-invalid={!!draftError}
+          onChange={e => { setDraft(e.target.value); setDraftError(null); }}
+          onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); add(); } }} style={field}/>
+        <Pill small disabled={disabled || full || !textFixEntry(draft)} onClick={add}>+ Add</Pill>
+      </div>
+      {draftError && <div style={error}>{draftError}</div>}
+      <div style={{ fontFamily:MONO, fontSize:9, color:'var(--muted)', marginTop:4 }}>
+        {list.length} of {TEXT_FIX_MAX_ENTRIES}{full ? ' (full)' : ''} · #1 weighs most; drag a row or use ↑ ↓ to reorder
+      </div>
+      {listError && <div style={error}>The stored list is invalid ({listError}); edits are held until it is fixed.</div>}
+    </div>
+  );
+}
+
 // The sound catalog (GET /api/sounds).
 function useSounds() {
   return useCatalog('/api/sounds', SOUND_CATALOG_EMPTY);
@@ -6340,6 +6629,8 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
   const [advRing, setAdvRing] = useState(false);
 
   const inputStyle = disabled ? { opacity: 0.45, pointerEvents: 'none' } : {};
+  // em_db.DEFAULT_DEVICE_CONFIG: shadow until someone chooses.
+  const fixMode = Object.values(TEXT_FIX_MODE).includes(config.transcriptFix) ? config.transcriptFix : TEXT_FIX_MODE.SHADOW;
 
 
   // Ordered by how often each section gets touched: playback and wake word
@@ -6578,6 +6869,32 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
             value={config.timerRingSeconds ?? 900} min={30} max={1800} step={30}
             formatValue={v => v >= 60 ? `${Math.round(v/60)} min` : `${v}s`}
             onChange={v => set('timerRingSeconds', v)}/>
+        </div>
+      </Stage>
+
+      {/* 08 TRANSCRIPT CORRECTION (section id "transcript") */}
+      <Stage n="08" title="Transcript correction"
+        chips={<><ScopeChip tone="controller">Controller</ScopeChip><ScopeChip tone="controller">HA matcher</ScopeChip></>}
+        desc="After Home Assistant's speech-to-text and EchoMuse's own commands, a misheard request can be repaired before Home Assistant runs it. Candidates come from HA's trigger sentences, its entity, area and floor names, requests it answered before, and the terms and phrases below; HA's own sentence matcher must fully accept one without running it. Text HA already understands is never changed, and follow-ups and lock, alarm, door or gate commands are never corrected. Each turn's correction is shown in Activity."
+        scope={scopeEl('transcript')} dim={secStyle('transcript')}>
+        <div style={inputStyle}>
+          <div role="group" aria-label="Transcript correction mode" style={{ display:'flex', alignItems:'center', gap:6, flexWrap:'wrap' }}>
+            <span style={{ fontFamily:MONO, fontSize:11, color:'var(--text2)', marginRight:4 }}>Mode</span>
+            {TEXT_FIX_MODE_OPTIONS.map(([m, label]) => (
+              <Pill key={m} small accent={fixMode === m} disabled={disabled} onClick={() => set('transcriptFix', m)}>{label}</Pill>
+            ))}
+          </div>
+          <div style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)', marginTop:6, lineHeight:1.6 }}>{TEXT_FIX_MODE_HELP[fixMode]}</div>
+        </div>
+        <div className="em-grid2" style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:'0 24px', marginTop:16, alignItems:'start', ...inputStyle }}>
+          <TextFixListEditor label="Preferred terms" noun="term" placeholder="Plex, YouTube TV, Cherub Rock"
+            sub="titles, apps and names to prefer when a word was misheard; a term is never a command and never changes a verb on its own"
+            items={config.transcriptFixTerms} disabled={disabled}
+            onChange={v => set('transcriptFixTerms', v)}/>
+          <TextFixListEditor label="Preferred phrases" noun="phrase" placeholder="watch Plex"
+            sub="complete commands you say often, matched against the whole request"
+            items={config.transcriptFixPhrases} disabled={disabled}
+            onChange={v => set('transcriptFixPhrases', v)}/>
         </div>
       </Stage>
     </div>

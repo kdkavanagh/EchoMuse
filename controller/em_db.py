@@ -231,6 +231,14 @@ DEFAULT_DEVICE_CONFIG: DeviceConfig = {
     # at every pause; "wyoming" also sends it to that Wyoming ASR server and
     # judges completeness on its words. Empty model/language: the server's.
     "pauseAsr": {"engine": "kroko", "host": "", "port": 10300, "model": "", "language": "en"},
+    # Transcript correction (§16.8, em_text_fix): "off" does nothing; "shadow"
+    # records what a correction would have been and sends the transcript as
+    # heard; "on" sends an eligible correction HA's matcher accepts. Terms and
+    # phrases rank candidates, highest preference first; they never train the
+    # ASR and never authorize a command by themselves.
+    "transcriptFix":    "shadow",
+    "transcriptFixTerms": [],
+    "transcriptFixPhrases": [],
     # Alert sounds are em_sounds catalog IDs. Empty = the fleet "default"
     # upload if present, else the device's built-in fallback tone (§16.5).
     # timerSound rings HA timers; alarmSound rings alarm events without their
@@ -1077,6 +1085,18 @@ MIGRATIONS: list[str] = [
     """
     ALTER TABLE devices ADD COLUMN update_queued_at INTEGER;
     UPDATE system_config SET value = '33' WHERE key = 'schema_version';
+    """,
+
+    # ── v34 — transcript correction record ───────────────────────────────────
+    #
+    # `stt_fix` is em_text_fix.FixRecord JSON (§16.8): the transcript as heard,
+    # the proposed correction, what was sent, the rule and its evidence, HA's
+    # matcher verdicts, why it was or was not applied, the revisions and the
+    # latency. stt_raw and stt_text keep the transcript; an applied correction
+    # appears only here. NULL: correction off, a local route, or older rows.
+    """
+    ALTER TABLE turns ADD COLUMN stt_fix TEXT;
+    UPDATE system_config SET value = '34' WHERE key = 'schema_version';
     """,
 ]
 
@@ -2168,7 +2188,8 @@ def get_device_logs(
 # trace arrived in schema 22, the per-stage Activity detail in schema 24, the
 # follow-up question detail in schema 25, the stored trace JSON and
 # time-to-first-audio in schema 26, native AFE evidence in schema 28, its
-# per-period series in schema 29 and the response latency in schema 30.
+# per-period series in schema 29, the response latency in schema 30 and the
+# transcript correction record in schema 34.
 _TURN_COLUMNS = {
     "trigger":            "trigger_type",
     "wake_model":         "wake_model",
@@ -2207,6 +2228,7 @@ _TURN_COLUMNS = {
     "decision_trace":     "decision_trace",  # §11.3 trace JSON; newest TRACE_RETENTION rows only
     "afe_evidence":       "afe_evidence",    # em_afe.AfeEvidence JSON; NULL = unavailable
     "afe_series":         "afe_series",      # em_afe.AfeSeries JSON; newest TRACE_RETENTION rows only
+    "stt_fix":            "stt_fix",         # em_text_fix.FixRecord JSON; NULL = no correction ran
 }
 
 # Written but not returned by get_turns (nor pushed as turn_complete): at
@@ -2357,6 +2379,21 @@ def get_turns(
             rec[col] = row[col]
         out.append(rec)
     return out
+
+
+def get_text_fix_history(limit: int, before_id: Optional[int] = None) -> list[tuple[int, float, str, Optional[str]]]:
+    """(id, ts, stt_text, stt_fix) of the newest `limit` turns, every device's, whose text
+    HA's own agent answered without error: em_text_fix.history_eligible, in SQL. Newest
+    first; `before_id` limits a replay to turns before the one it evaluates."""
+    rows = _q(
+        "SELECT id, ts, stt_text, stt_fix FROM turns "
+        "WHERE outcome = 'ha' AND intent_local = 1 AND response_type IS NOT NULL "
+        "AND response_type != '' AND response_type != 'error' "
+        "AND stt_text IS NOT NULL AND stt_text != '' AND id < ? "
+        "ORDER BY id DESC LIMIT ?",
+        (before_id if before_id is not None else 2**62, limit),
+    )
+    return [(row["id"], row["ts"], row["stt_text"], row["stt_fix"]) for row in rows]
 
 
 def get_response_latencies(device_id: str, since: float) -> list[tuple[float, int]]:

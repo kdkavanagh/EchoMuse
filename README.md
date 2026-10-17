@@ -21,7 +21,10 @@ hear the answer through the Dot's speaker.
   when you have finished speaking; Home Assistant's own pipeline then
   transcribes, runs the intent and speaks the answer. The wake word is removed
   from the transcript, not cut out of the audio, so "Ophelia turn off the
-  lights" said in one breath keeps its first word.
+  lights" said in one breath keeps its first word. A near-miss transcript
+  ("plate cherub rock") can be repaired before Assist sees it, only into text
+  Home Assistant's own sentence matcher fully understands; by default this
+  only records what it would have done.
 - **Wake models** — the dashboard keeps a registry of BCResNet models
   (ONNX graph + JSON sidecar). Upload one, it is validated and probed, and you
   choose when it becomes the fleet's model; each Dot fetches it by hash.

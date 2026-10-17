@@ -1,0 +1,784 @@
+{
+ "source": [
+  "homeassistant/components/conversation/http.py (websocket_hass_agent_debug: sentences, language, device_id)",
+  "homeassistant/components/conversation/default_agent.py (async_debug_recognize: intent, slots, details, targets, match, sentence_template, unmatched_slots, source)",
+  "Captured from the live HA 2026.8.1 on 2026-10-17 with the Living Room satellite device, language en; templates are a subset of conversation/sentences/list, the vocabulary a subset of the exposed entities with every area and floor; history turn ids and texts are fixture provenance"
+ ],
+ "device_id": "3f368295035110ee35fcc33e3360a56f",
+ "language": "en",
+ "templates": [
+  "[what is|what's|whats|how is|how's|hows|tell me] the (weather|forecast) [like]",
+  "what time is it",
+  "what time is it now",
+  "(what's|whats|what is) the time",
+  "tell me the time",
+  "(play|played|plays) {query}",
+  "(turn|switch) on [the] [(living room|master bedroom|bedroom|office)] (tv|t v|television) [in [the] (living room|master bedroom|bedroom|office)]",
+  "(turn|switch) [the] [(living room|master bedroom|bedroom|office)] (tv|t v|television) on [in [the] (living room|master bedroom|bedroom|office)]",
+  "(turn|switch|shut) off [the] [(living room|master bedroom|bedroom|office)] (tv|t v|television) [in [the] (living room|master bedroom|bedroom|office)]",
+  "(turn|switch|shut) [the] [(living room|master bedroom|bedroom|office)] (tv|t v|television) off [in [the] (living room|master bedroom|bedroom|office)]",
+  "(watch|watched|watches|put on|turn on|open) [the] (youtube|you tube) (tv|t v) [on [the] [(living room|master bedroom|bedroom|office)] (tv|t v|television)] [in [the] (living room|master bedroom|bedroom|office)]",
+  "(watch|watched|watches|put on|turn on|open) [the] youtubetv [on [the] [(living room|master bedroom|bedroom|office)] (tv|t v|television)] [in [the] (living room|master bedroom|bedroom|office)]",
+  "(watch|watched|watches|put on|turn on|open) [the] plex [on [the] [(living room|master bedroom|bedroom|office)] (tv|t v|television)] [in [the] (living room|master bedroom|bedroom|office)]",
+  "(watch|watched|watches|put on|turn on|open) [the] netflix [on [the] [(living room|master bedroom|bedroom|office)] (tv|t v|television)] [in [the] (living room|master bedroom|bedroom|office)]",
+  "[(i'm|im|i am) (going to|gonna)] take a shower",
+  "[(i'm|im|i am)] taking a shower",
+  "[(it's|its|it is)] (shower time|showertime)",
+  "shower (mode|scene)",
+  "[(can|could|would) you] [please] (arm|armed) [the] (alarm|alarm system|security [system]|security alarm|house alarm|home alarm|burglar alarm) [please]",
+  "[(can|could|would) you] [please] (arm|armed) [the] (alarm|alarm system|security [system]|security alarm|house alarm|home alarm|burglar alarm) [(in|to|for)] away [mode] [please]",
+  "[(can|could|would) you] [please] (disarm|disarmed|dis arm|unarm) [the] (alarm|alarm system|security [system]|security alarm|house alarm|home alarm|burglar alarm) [please]",
+  "[(can|could|would) you] [please] (turn off|deactivate|disable) [the] (alarm system|security [system]|security alarm|house alarm|home alarm|burglar alarm) [please]"
+ ],
+ "vocabulary": {
+  "entities": [
+   [
+    "binary_sensor.front_door",
+    "binary_sensor",
+    [
+     "Front Door"
+    ],
+    "office"
+   ],
+   [
+    "cover.garage_door",
+    "cover",
+    [
+     "Garage Door"
+    ],
+    "garage"
+   ],
+   [
+    "light.front_door_foyer_lights",
+    "light",
+    [
+     "Front Door Foyer Lights"
+    ],
+    "office"
+   ],
+   [
+    "light.kitchen_ceiling_lights",
+    "light",
+    [
+     "Kitchen Ceiling Lights"
+    ],
+    "kitchen"
+   ],
+   [
+    "light.kitchen_island_lights",
+    "light",
+    [
+     "Kitchen Island Lights"
+    ],
+    "kitchen"
+   ],
+   [
+    "light.kitchen_led_strips",
+    "light",
+    [
+     "Kitchen LED Strips"
+    ],
+    "kitchen"
+   ],
+   [
+    "media_player.apple_tv",
+    "media_player",
+    [
+     "Home Theater",
+     "apple tv"
+    ],
+    "home_theater"
+   ],
+   [
+    "media_player.kitchen",
+    "media_player",
+    [
+     "Kitchen"
+    ],
+    "kitchen"
+   ],
+   [
+    "scene.living_room_lights_bright",
+    "scene",
+    [
+     "Living Room - Lights - Bright",
+     "Bright"
+    ],
+    "living_room"
+   ],
+   [
+    "scene.living_room_lights_low",
+    "scene",
+    [
+     "Living Room - Lights - Low",
+     "Low",
+     "Dim"
+    ],
+    "living_room"
+   ],
+   [
+    "scene.living_room_lights_medium",
+    "scene",
+    [
+     "Living Room - Lights - Medium",
+     "Medium"
+    ],
+    "living_room"
+   ],
+   [
+    "scene.living_room_lights_movie_time",
+    "scene",
+    [
+     "Living Room - Lights - Movie Time",
+     "Movie Time",
+     "Movie"
+    ],
+    "living_room"
+   ],
+   [
+    "switch.remote_watch_apple_tv",
+    "switch",
+    [
+     "Remote Watch Apple TV"
+    ],
+    "living_room"
+   ]
+  ],
+  "areas": [
+   [
+    "garage",
+    [
+     "Garage"
+    ],
+    "1st_floor"
+   ],
+   [
+    "guest_bedroom",
+    [
+     "Guest Bedroom"
+    ],
+    "3rd_floor"
+   ],
+   [
+    "home_theater",
+    [
+     "Home Theater"
+    ],
+    null
+   ],
+   [
+    "kids_bedroom",
+    [
+     "Kids Bedroom"
+    ],
+    "3rd_floor"
+   ],
+   [
+    "kitchen",
+    [
+     "Kitchen"
+    ],
+    "2nd_floor"
+   ],
+   [
+    "living_room",
+    [
+     "Living Room"
+    ],
+    "2nd_floor"
+   ],
+   [
+    "master_bathroom",
+    [
+     "Master Bathroom",
+     "Bathroom"
+    ],
+    "4th_floor"
+   ],
+   [
+    "master_bedroom",
+    [
+     "Master Bedroom",
+     "Bedroom"
+    ],
+    "4th_floor"
+   ],
+   [
+    "office",
+    [
+     "Office"
+    ],
+    "1st_floor"
+   ],
+   [
+    "server_room",
+    [
+     "Server Room"
+    ],
+    "3rd_floor"
+   ],
+   [
+    "utility_closet",
+    [
+     "Utility Closet"
+    ],
+    "1st_floor"
+   ],
+   [
+    "area_occupancy_detection",
+    [
+     "Area Occupancy Detection"
+    ],
+    null
+   ],
+   [
+    "stairwell",
+    [
+     "Stairwell"
+    ],
+    null
+   ]
+  ],
+  "floors": [
+   [
+    "4th_floor",
+    [
+     "4th Floor"
+    ]
+   ],
+   [
+    "3rd_floor",
+    [
+     "3rd Floor"
+    ]
+   ],
+   [
+    "2nd_floor",
+    [
+     "2nd Floor"
+    ]
+   ],
+   [
+    "1st_floor",
+    [
+     "1st Floor"
+    ]
+   ]
+  ]
+ },
+ "history": [
+  [
+   520,
+   1790000000.0,
+   "play cherub rock"
+  ],
+  [
+   600,
+   1790000100.0,
+   "turn off the kitchen ceiling lights"
+  ],
+  [
+   601,
+   1790000200.0,
+   "unlock the front door"
+  ],
+  [
+   602,
+   1790000300.0,
+   "set a timer for 5 minutes"
+  ]
+ ],
+ "recognitions": {
+  "what time is": null,
+  "what time is it": {
+   "match": true,
+   "source": "trigger",
+   "sentence_template": "what time is it"
+  },
+  "what time is it now": {
+   "match": true,
+   "source": "trigger",
+   "sentence_template": "what time is it now"
+  },
+  "watch you": null,
+  "watch youtube tv": {
+   "match": true,
+   "source": "trigger",
+   "sentence_template": "(watch|watched|watches|put on|turn on|open) [the] (youtube|you tube) (tv|t v) [on [the] [(living room|master bedroom|bedroom|office)] (tv|t v|television)] [in [the] (living room|master bedroom|bedroom|office)]"
+  },
+  "watch flex": null,
+  "watch plex": {
+   "match": true,
+   "source": "trigger",
+   "sentence_template": "(watch|watched|watches|put on|turn on|open) [the] plex [on [the] [(living room|master bedroom|bedroom|office)] (tv|t v|television)] [in [the] (living room|master bedroom|bedroom|office)]"
+  },
+  "plate cherub rock": null,
+  "play cherub rock": {
+   "match": true,
+   "source": "trigger",
+   "sentence_template": "(play|played|plays) {query}"
+  },
+  "set the living room lights to glow": {
+   "intent": {
+    "name": "HassTurnOn"
+   },
+   "slots": {
+    "area": "living room",
+    "domain": "scene"
+   },
+   "details": {
+    "area": {
+     "name": "area",
+     "value": "Living Room",
+     "text": "living room"
+    },
+    "domain": {
+     "name": "domain",
+     "value": "scene",
+     "text": ""
+    }
+   },
+   "targets": {},
+   "match": false,
+   "sentence_template": "(set|turn|switch|put|change) [the] {area} (light|lights|lighting) (to|on) [the] {name} [scene|setting|level|mode]",
+   "unmatched_slots": {
+    "name": "glow"
+   },
+   "source": "custom",
+   "file": "en/scene_levels.yaml"
+  },
+  "set the Living Room - Lights - Low glow": {
+   "intent": {
+    "name": "HassLightSet"
+   },
+   "slots": {
+    "area": "Living Room",
+    "domain": "light"
+   },
+   "details": {
+    "area": {
+     "name": "area",
+     "value": "Living Room",
+     "text": "Living Room"
+    },
+    "domain": {
+     "name": "domain",
+     "value": "light",
+     "text": ""
+    }
+   },
+   "targets": {},
+   "match": false,
+   "sentence_template": "[<numeric_value_set>] [<the>] {area} [to] {brightness}[([ ]%)| percent]",
+   "unmatched_slots": {
+    "brightness": "- Lights - Low glow"
+   },
+   "source": "builtin"
+  },
+  "set the Living Room - Lights - Low to glow": {
+   "intent": {
+    "name": "HassSetPosition"
+   },
+   "slots": {},
+   "details": {},
+   "targets": {},
+   "match": false,
+   "sentence_template": "set [the] {name} [position] to {position}[ percent]",
+   "unmatched_slots": {
+    "name": "Living Room   Lights   Low ",
+    "position": "glow"
+   },
+   "source": "builtin"
+  },
+  "set Living Room lights to glow": {
+   "intent": {
+    "name": "HassTurnOn"
+   },
+   "slots": {
+    "area": "Living Room",
+    "domain": "scene"
+   },
+   "details": {
+    "area": {
+     "name": "area",
+     "value": "Living Room",
+     "text": "Living Room"
+    },
+    "domain": {
+     "name": "domain",
+     "value": "scene",
+     "text": ""
+    }
+   },
+   "targets": {},
+   "match": false,
+   "sentence_template": "(set|turn|switch|put|change) [the] {area} (light|lights|lighting) (to|on) [the] {name} [scene|setting|level|mode]",
+   "unmatched_slots": {
+    "name": "glow"
+   },
+   "source": "custom",
+   "file": "en/scene_levels.yaml"
+  },
+  "set Living Room - Lights - Low to glow": {
+   "intent": {
+    "name": "HassSetPosition"
+   },
+   "slots": {},
+   "details": {},
+   "targets": {},
+   "match": false,
+   "sentence_template": "set [the] {name} [position] to {position}[ percent]",
+   "unmatched_slots": {
+    "name": "Living Room   Lights   Low ",
+    "position": "glow"
+   },
+   "source": "builtin"
+  },
+  "set the living room lights to Low": {
+   "intent": {
+    "name": "HassTurnOn"
+   },
+   "slots": {
+    "area": "living room",
+    "name": "Low",
+    "domain": "scene"
+   },
+   "details": {
+    "area": {
+     "name": "area",
+     "value": "Living Room",
+     "text": "living room"
+    },
+    "name": {
+     "name": "name",
+     "value": "Low",
+     "text": "Low"
+    },
+    "domain": {
+     "name": "domain",
+     "value": "scene",
+     "text": ""
+    }
+   },
+   "targets": {
+    "scene.living_room_lights_low": {
+     "matched": true
+    }
+   },
+   "match": true,
+   "sentence_template": "(set|turn|switch|put|change) [the] {area} (light|lights|lighting) (to|on) [the] {name} [scene|setting|level|mode]",
+   "unmatched_slots": {},
+   "source": "custom",
+   "file": "en/scene_levels.yaml"
+  },
+  "turn on the sony tv": {
+   "intent": {
+    "name": "HassTurnOn"
+   },
+   "slots": {},
+   "details": {},
+   "targets": {},
+   "match": false,
+   "sentence_template": "<turn> ([<the>] {name} [scene];on)",
+   "unmatched_slots": {
+    "name": "sony tv"
+   },
+   "source": "builtin"
+  },
+  "say that again": null,
+  "house": null,
+  "shower": null,
+  "shower mode": {
+   "match": true,
+   "source": "trigger",
+   "sentence_template": "shower (mode|scene)"
+  },
+  "shower time": {
+   "match": true,
+   "source": "trigger",
+   "sentence_template": "[(it's|its|it is)] (shower time|showertime)"
+  },
+  "shower scene": {
+   "match": true,
+   "source": "trigger",
+   "sentence_template": "shower (mode|scene)"
+  },
+  "take a shower": {
+   "match": true,
+   "source": "trigger",
+   "sentence_template": "[(i'm|im|i am) (going to|gonna)] take a shower"
+  },
+  "don't disarm the security alarm please": null,
+  "turn on the living room television in the bathroom": {
+   "intent": {
+    "name": "HassTurnOn"
+   },
+   "slots": {
+    "area": "bathroom"
+   },
+   "details": {
+    "area": {
+     "name": "area",
+     "value": "Bathroom",
+     "text": "bathroom"
+    }
+   },
+   "targets": {},
+   "match": false,
+   "sentence_template": "turn on [the] {name} in [the] {area}",
+   "unmatched_slots": {
+    "name": "living room television "
+   },
+   "source": "builtin"
+  },
+  "turn on Living Room television in the bathroom": {
+   "intent": {
+    "name": "HassTurnOn"
+   },
+   "slots": {
+    "area": "bathroom"
+   },
+   "details": {
+    "area": {
+     "name": "area",
+     "value": "Bathroom",
+     "text": "bathroom"
+    }
+   },
+   "targets": {},
+   "match": false,
+   "sentence_template": "turn on [the] {name} in [the] {area}",
+   "unmatched_slots": {
+    "name": "Living Room television "
+   },
+   "source": "builtin"
+  },
+  "turn on the living room television in Bathroom": {
+   "intent": {
+    "name": "HassTurnOn"
+   },
+   "slots": {
+    "area": "Bathroom"
+   },
+   "details": {
+    "area": {
+     "name": "area",
+     "value": "Bathroom",
+     "text": "Bathroom"
+    }
+   },
+   "targets": {},
+   "match": false,
+   "sentence_template": "turn on [the] {name} in [the] {area}",
+   "unmatched_slots": {
+    "name": "living room television "
+   },
+   "source": "builtin"
+  },
+  "rmv alarm": null,
+  "arm alarm": {
+   "match": true,
+   "source": "trigger",
+   "sentence_template": "[(can|could|would) you] [please] (arm|armed) [the] (alarm|alarm system|security [system]|security alarm|house alarm|home alarm|burglar alarm) [please]"
+  },
+  "arm alarm away": {
+   "match": true,
+   "source": "trigger",
+   "sentence_template": "[(can|could|would) you] [please] (arm|armed) [the] (alarm|alarm system|security [system]|security alarm|house alarm|home alarm|burglar alarm) [(in|to|for)] away [mode] [please]"
+  },
+  "arm home alarm": {
+   "match": true,
+   "source": "trigger",
+   "sentence_template": "[(can|could|would) you] [please] (arm|armed) [the] (alarm|alarm system|security [system]|security alarm|house alarm|home alarm|burglar alarm) [please]"
+  },
+  "arm home alarm away": {
+   "match": true,
+   "source": "trigger",
+   "sentence_template": "[(can|could|would) you] [please] (arm|armed) [the] (alarm|alarm system|security [system]|security alarm|house alarm|home alarm|burglar alarm) [(in|to|for)] away [mode] [please]"
+  },
+  "arm house alarm": {
+   "match": true,
+   "source": "trigger",
+   "sentence_template": "[(can|could|would) you] [please] (arm|armed) [the] (alarm|alarm system|security [system]|security alarm|house alarm|home alarm|burglar alarm) [please]"
+  },
+  "arm house alarm away": {
+   "match": true,
+   "source": "trigger",
+   "sentence_template": "[(can|could|would) you] [please] (arm|armed) [the] (alarm|alarm system|security [system]|security alarm|house alarm|home alarm|burglar alarm) [(in|to|for)] away [mode] [please]"
+  },
+  "arm the alarm": {
+   "match": true,
+   "source": "trigger",
+   "sentence_template": "[(can|could|would) you] [please] (arm|armed) [the] (alarm|alarm system|security [system]|security alarm|house alarm|home alarm|burglar alarm) [please]"
+  },
+  "arm the alarm away": {
+   "match": true,
+   "source": "trigger",
+   "sentence_template": "[(can|could|would) you] [please] (arm|armed) [the] (alarm|alarm system|security [system]|security alarm|house alarm|home alarm|burglar alarm) [(in|to|for)] away [mode] [please]"
+  },
+  "ophelia, what's the weather": null,
+  "what's the weather": {
+   "match": true,
+   "source": "trigger",
+   "sentence_template": "[what is|what's|whats|how is|how's|hows|tell me] the (weather|forecast) [like]"
+  },
+  "turn on the kitchen ceiling light": {
+   "intent": {
+    "name": "HassTurnOn"
+   },
+   "slots": {},
+   "details": {},
+   "targets": {},
+   "match": false,
+   "sentence_template": "<turn> on [<the>] {name} <light>",
+   "unmatched_slots": {
+    "name": "kitchen ceiling "
+   },
+   "source": "builtin"
+  },
+  "turn on the Kitchen Ceiling Lights": {
+   "intent": {
+    "name": "HassTurnOn"
+   },
+   "slots": {
+    "name": "Kitchen Ceiling Lights"
+   },
+   "details": {
+    "name": {
+     "name": "name",
+     "value": "Kitchen Ceiling Lights",
+     "text": "Kitchen Ceiling Lights"
+    }
+   },
+   "targets": {
+    "light.kitchen_ceiling_lights": {
+     "matched": true
+    }
+   },
+   "match": true,
+   "sentence_template": "<turn> on [<the>] {name}",
+   "unmatched_slots": {},
+   "source": "builtin"
+  },
+  "turn on Kitchen Ceiling Lights": {
+   "intent": {
+    "name": "HassTurnOn"
+   },
+   "slots": {
+    "name": "Kitchen Ceiling Lights"
+   },
+   "details": {
+    "name": {
+     "name": "name",
+     "value": "Kitchen Ceiling Lights",
+     "text": "Kitchen Ceiling Lights"
+    }
+   },
+   "targets": {
+    "light.kitchen_ceiling_lights": {
+     "matched": true
+    }
+   },
+   "match": true,
+   "sentence_template": "<turn> on [<the>] {name}",
+   "unmatched_slots": {},
+   "source": "builtin"
+  },
+  "turn on the Kitchen Island Lights": {
+   "intent": {
+    "name": "HassTurnOn"
+   },
+   "slots": {
+    "name": "Kitchen Island Lights"
+   },
+   "details": {
+    "name": {
+     "name": "name",
+     "value": "Kitchen Island Lights",
+     "text": "Kitchen Island Lights"
+    }
+   },
+   "targets": {
+    "light.kitchen_island_lights": {
+     "matched": true
+    }
+   },
+   "match": true,
+   "sentence_template": "<turn> on [<the>] {name}",
+   "unmatched_slots": {},
+   "source": "builtin"
+  },
+  "turn on Kitchen ceiling light": {
+   "intent": {
+    "name": "HassTurnOn"
+   },
+   "slots": {},
+   "details": {},
+   "targets": {},
+   "match": false,
+   "sentence_template": "<turn> on [<the>] {name} <light>",
+   "unmatched_slots": {
+    "name": "Kitchen ceiling "
+   },
+   "source": "builtin"
+  },
+  "lock the front door": {
+   "intent": {
+    "name": "HassTurnOn"
+   },
+   "slots": {},
+   "details": {},
+   "targets": {},
+   "match": false,
+   "sentence_template": "lock [the] {name}",
+   "unmatched_slots": {
+    "name": "front door"
+   },
+   "source": "builtin"
+  },
+  "lock Front Door": {
+   "intent": {
+    "name": "HassTurnOn"
+   },
+   "slots": {},
+   "details": {},
+   "targets": {},
+   "match": false,
+   "sentence_template": "lock [the] {name}",
+   "unmatched_slots": {
+    "name": "Front Door"
+   },
+   "source": "builtin"
+  },
+  "set a timer for 5 minuets": {
+   "intent": {
+    "name": "HassStartTimer"
+   },
+   "slots": {},
+   "details": {},
+   "targets": {},
+   "match": false,
+   "sentence_template": "set [a|an] timer for <tmr_dur>",
+   "unmatched_slots": {
+    "minutes": "5 minuets"
+   },
+   "source": "custom",
+   "file": "en/timers.yaml"
+  },
+  "set a timer for 6 minuets": {
+   "intent": {
+    "name": "HassStartTimer"
+   },
+   "slots": {},
+   "details": {},
+   "targets": {},
+   "match": false,
+   "sentence_template": "set [a|an] timer for <tmr_dur>",
+   "unmatched_slots": {
+    "minutes": "6 minuets"
+   },
+   "source": "custom",
+   "file": "en/timers.yaml"
+  }
+ }
+}

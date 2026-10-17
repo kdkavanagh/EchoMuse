@@ -65,6 +65,8 @@ import em_session
 import em_shell
 import em_sounds
 import em_speech_worker
+import em_text_fix
+import em_text_fix_service
 import em_volume
 import em_wake_registry
 from em_audio_timeline import AFE_PERIOD_SAMPLES, AfeRecord
@@ -135,6 +137,7 @@ _shell = em_shell.ShellBroker()
 _loop_lag_peak_ms: float = 0.0
 
 _ha: em_ha_client.HaClient | None = None
+_text_fix: em_text_fix_service.TextFixService | None = None
 _alerts: em_alerts.AlertEngine | None = None
 _registry: em_wake_registry.WakeRegistry | None = None
 _assets: em_device_assets.DeviceAssets | None = None
@@ -440,6 +443,7 @@ class _Host:
                 db.set_turn_continuation, row_id, outcome),
             media_playing=lambda: em_player.is_playing(device_id),
             pause_media=lambda: em_player.pause(device_id),
+            text_fix=_text_fix,
         )
         return em_session.SessionActor(device_id, deps)
 
@@ -545,7 +549,22 @@ async def _persist_turn(device_id: str, record: Mapping[str, object]) -> int:
     turn_id = await asyncio.to_thread(db.insert_turn, device_id, record)
     pushed = {k: v for k, v in record.items() if k not in db.TURN_WRITE_ONLY_COLUMNS}
     await api.push_turn_complete(device_id, {**pushed, "turn_id": turn_id})
+    text = record.get("stt_text")
+    if (_text_fix is not None and isinstance(text, str) and text
+            and em_text_fix.history_eligible(record.get("outcome"), record.get("intent_local"),
+                                             record.get("response_type"))):
+        fix = record.get("stt_fix")
+        ts = record.get("ts")
+        _text_fix.add_history(em_text_fix.HistoryEntry(
+            em_text_fix.sent_text(text, fix if isinstance(fix, str) else None), turn_id,
+            float(ts) if isinstance(ts, (int, float)) else time.time()))
     return turn_id
+
+
+async def _text_fix_history() -> list[em_text_fix.HistoryEntry]:
+    """Every device's requests HA's own agent answered without error, as sent (§16.8)."""
+    rows = await asyncio.to_thread(db.get_text_fix_history, em_text_fix_service.HISTORY_LIMIT)
+    return [em_text_fix.HistoryEntry(em_text_fix.sent_text(text, fix), row_id, ts) for row_id, ts, text, fix in rows]
 
 
 async def _stop_alert(device_id: str) -> None:
@@ -1271,7 +1290,7 @@ def _route_observation(obs: em_speech_worker.Observation) -> None:
 
 
 async def main() -> None:
-    global _ha, _alerts, _registry, _assets, _firmware, _worker
+    global _ha, _text_fix, _alerts, _registry, _assets, _firmware, _worker
     log.info("EchoMuse Controller %s", api.CONTROLLER_VERSION)
     db.init(DB_PATH)
     auth.maybe_generate_bootstrap_token()
@@ -1281,6 +1300,7 @@ async def main() -> None:
         raise SystemExit("Home Assistant is not configured: set HA_URL and HA_TOKEN "
                          "(or run as the add-on with homeassistant_api: true)")
     ha = _ha = em_ha_client.HaClient(endpoint)
+    text_fix = _text_fix = em_text_fix_service.TextFixService(ha, _text_fix_history)
     advertised_ip = _advertised_ip()
 
     try:
@@ -1318,7 +1338,13 @@ async def main() -> None:
 
     ha.add_connect_listener(_on_ha_connected)
     ha.add_disconnect_listener(_on_ha_disconnected)
-    ha.track_vocabulary(lambda vocab: log.info("HA vocabulary: %d targets", len(vocab.targets())))
+
+    def vocabulary_changed(vocab: em_ha_client.Vocabulary) -> None:
+        log.info("HA vocabulary: %d targets", len(vocab.targets()))
+        text_fix.on_vocabulary(vocab)
+
+    ha.track_vocabulary(vocabulary_changed, on_stale=text_fix.on_registry_stale)
+    text_fix.start()
     await ha.start()
     await engine.start()
     background: list[asyncio.Task[None]] = [
@@ -1372,6 +1398,7 @@ async def main() -> None:
             await device.close()
         await engine.close()
         await worker.close()
+        text_fix.close()
         await ha.close()
         await azc.async_unregister_service(info)
         await azc.async_close()

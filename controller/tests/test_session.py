@@ -27,9 +27,11 @@ from em_audio_timeline import (
     build_packet,
 )
 from em_device_link import AckStatus, CommandAck, Envelope, MessageType
-from em_ha_client import HaUnavailable, IntentEnded, RunEnded, SentenceRecognition, TtsReady
+from em_ha_client import HaUnavailable, IntentEnded, RunEnded, SentenceRecognition, TtsReady, Vocabulary
 from em_pause_asr import PauseDecode, WyomingServer
 from em_session import ActorDeps, SessionActor
+from em_text_fix import build_tables
+from em_text_fix_service import TextFixService
 from em_speech_worker import (
     AsrPayload,
     EchoPayload,
@@ -204,10 +206,31 @@ class FakeHa:
         self.recognitions: dict[str, SentenceRecognition] = {}   # sentence → answer; absent: None
         self.recognized: list[tuple[str, ...]] = []
         self.warmups = 0
+        # Transcript correction (§16.8): the matcher in a pipeline's language.
+        self.connected = True
+        self.generation = 1
+        self.language = "en"
+        self.calls: list[tuple[tuple[str, ...], str | None, str | None]] = []   # every recognize, in order
+        self.fix_delay = 0.0
+        self.fix_error: Exception | None = None
+        self.on_fix = lambda sentences: None
 
-    async def recognize(self, sentences, device_id, *, timeout):
-        self.recognized.append(tuple(sentences))
+    async def recognize(self, sentences, device_id, *, language=None, timeout):
+        self.calls.append((tuple(sentences), device_id, language))
+        if language is None:
+            self.recognized.append(tuple(sentences))
+        else:
+            await asyncio.sleep(self.fix_delay)
+            if self.fix_error is not None:
+                raise self.fix_error
+            self.on_fix(sentences)
         return [self.recognitions.get(s) for s in sentences]
+
+    def fix_calls(self):
+        return [c for c in self.calls if c[2] is not None]
+
+    async def pipeline_language(self, pipeline_id, *, timeout):
+        return self.language
 
     async def warm_recognizer(self, device_id, *, timeout):
         self.warmups += 1
@@ -449,7 +472,7 @@ class Device:
 
 
 class Harness:
-    def __init__(self, config=None, afe=False, no_input_chime=True, announcement_chime=True):
+    def __init__(self, config=None, afe=False, no_input_chime=True, announcement_chime=True, text_fix=False):
         self.link = FakeLink()
         self.render = FakeRender()
         self.worker = FakeWorker()
@@ -485,13 +508,21 @@ class Harness:
             for e in self.reply_events:
                 yield e
 
+        self.text_fix = None
+        if text_fix:
+            async def no_history():
+                return []
+
+            self.text_fix = TextFixService(self.ha, no_history)
+            self.text_fix.tables = build_tables(Vocabulary((), (), ()), ["(watch|put on) [the] plex"], [], 1)
+
         self.actor = SessionActor("dev1", ActorDeps(
             ha=self.ha, worker=self.worker, registry=FakeRegistry(), alerts=self.alerts, arbiter=self.arbiter,
             config=lambda: self.config, ha_device_id=lambda: "hadev", recognizer=lambda: self.ha.recognizer,
             pipeline_id=pipeline,
             vocabulary=lambda: None, esphome_reply=esphome_reply, persist_turn=persist,
             record_continuation=record_continuation, media_playing=lambda: self.media_playing,
-            pause_media=pause_media))
+            pause_media=pause_media, text_fix=self.text_fix))
         self.worker.actor = self.actor
         self.actor.add_listener(self.events.append)
         self.device = Device(self.actor, afe)
@@ -2297,5 +2328,168 @@ def test_an_interrupted_announcement_chime_drops_the_announcement():
         acquired = [b["lease_id"] for b, _ in h.link.of("focus.acquire") if b["focus"] == "dialog_output"]
         released = [b["lease_id"] for b, _ in h.link.of("focus.release")]
         assert len(acquired) == 1 and acquired == released
+        await h.actor.close()
+    run(main())
+
+
+# --- transcript correction (§16.8) -----------------------------------------------------------------
+
+WATCH_FLEX = [("▁WATCH", PRESS + 2_500), ("▁FLEX", PRESS + 6_000)]
+PLEX = SentenceRecognition(True, False, "trigger", "(watch|put on) [the] plex")
+
+
+def fix_harness(mode: str, **kw) -> Harness:
+    """A Dot whose transcript is "Watch Flex." against tables holding the trigger
+    "(watch|put on) [the] plex", which HA's matcher accepts as "watch plex"."""
+    h = Harness(config={"transcriptFix": mode}, text_fix=True, **kw)
+    h.ha.stt_text = "Watch Flex."
+    h.ha.recognitions = {"watch plex": PLEX}
+    h.ha.next_run = FakeRun([IntentEnded("OK.", None, False, "action_done", True),
+                             TtsReady("http://ha/tts/1", False), RunEnded()])
+    return h
+
+
+async def watch_flex(h: Harness) -> None:
+    h.worker.vad = speech(QUESTION)
+    h.device.level = levels(QUESTION)
+    h.worker.tokens = WATCH_FLEX
+    await h.start()
+    h.actor.button_turn(button())
+    await h.settle()
+    await h.feed(PRESS - 4_800, PRESS + 50_000)
+
+
+async def finished_fix(h: Harness) -> dict | None:
+    await h.wait_for(lambda: h.render.streams)
+    h.render.streams[0].finish("drained")
+    await h.wait_for(lambda: h.rows, timeout=10)
+    row = h.rows[0]
+    assert row["stt_text"] == "Watch Flex."               # the transcript is kept as heard
+    return json.loads(row["stt_fix"]) if row["stt_fix"] is not None else None
+
+
+def test_off_does_no_correction_work():
+    async def main():
+        h = fix_harness("off")
+        await watch_flex(h)
+        assert await finished_fix(h) is None
+        assert h.ha.intents == [("Watch Flex.", None)] and h.ha.fix_calls() == []
+        await h.actor.close()
+    run(main())
+
+
+def test_on_sends_the_validated_correction_matched_in_the_pipelines_language_for_this_satellite():
+    async def main():
+        h = fix_harness("on")
+        await watch_flex(h)
+        record = await finished_fix(h)
+        assert h.ha.intents == [("watch plex", None)]
+        assert record["applied"] is True and record["reason"] == "applied"
+        assert (record["original"], record["proposed"], record["sent"]) == ("Watch Flex.", "watch plex", "watch plex")
+        assert record["rule"] == "phrase" and record["source"] == "trigger" and record["deadline_met"] is True
+        assert h.ha.fix_calls() and all(dev == "hadev" and lang == "en" for _, dev, lang in h.ha.fix_calls())
+        await h.actor.close()
+    run(main())
+
+
+def test_shadow_sends_the_original_at_once_and_records_what_on_would_have_sent():
+    async def main():
+        h = fix_harness("shadow")
+        h.ha.fix_delay = 1.0
+        await watch_flex(h)
+        await h.wait_for(lambda: h.ha.intents, timeout=0.5)   # dispatch never waits for the correction
+        assert h.ha.intents == [("Watch Flex.", None)]
+        record = await finished_fix(h)
+        assert record["reason"] == "would_apply" and record["applied"] is False
+        assert (record["proposed"], record["sent"]) == ("watch plex", "Watch Flex.")
+        assert record["deadline_met"] is False and record["latency_ms"] >= 1_000
+        await h.actor.close()
+    run(main())
+
+
+@pytest.mark.parametrize("fault, reason", [("slow", "timeout"), ("error", "error"), ("stale", "stale")])
+def test_on_sends_the_original_when_the_correction_is_late_fails_or_goes_stale(fault, reason):
+    async def main():
+        h = fix_harness("on")
+        if fault == "slow":
+            h.ha.fix_delay = 0.3
+        elif fault == "error":
+            h.ha.fix_error = HaUnavailable("connection lost")
+        else:
+            # The tables change while HA validates the candidate (a registry event, say).
+            h.ha.on_fix = lambda sentences: "watch plex" in sentences and h.text_fix.invalidate("test")
+        await watch_flex(h)
+        record = await finished_fix(h)
+        assert h.ha.intents == [("Watch Flex.", None)]
+        assert record["reason"] == reason and record["applied"] is False and record["sent"] == "Watch Flex."
+        await h.actor.close()
+    run(main())
+
+
+def test_a_turn_interrupted_while_its_correction_runs_dispatches_nothing(monkeypatch):
+    monkeypatch.setattr(em_session, "FINAL_DEADLINE_S", 5.0)
+
+    async def main():
+        h = fix_harness("on")
+        h.ha.fix_delay = 0.5
+        await watch_flex(h)
+        await h.wait_for(lambda: h.ha.fix_calls())
+        h.actor.on_message(envelope("privacy.changed", {"muted": True, "capture_epoch": None, "physical_seq": 2}))
+        await asyncio.sleep(0.8)
+        await h.settle()
+        assert h.terminals() == ["muted"] and h.ha.intents == []
+        await h.actor.close()
+    run(main())
+
+
+def test_a_pause_result_is_reused_and_the_endpoint_never_waits_for_it():
+    async def main():
+        h = fix_harness("on")
+        h.ha.recognizer = True
+        await watch_flex(h)
+        record = await finished_fix(h)
+        assert record["cache"] == "hit" and h.ha.intents == [("watch plex", None)]
+        # Each prefix's endpoint question went first; its correction asked only after it.
+        for prefix in ("watch", "watch flex"):
+            asked = next(i for i, (s, _, lang) in enumerate(h.ha.calls) if s[0] == prefix and lang is None)
+            fixed = [i for i, (s, _, lang) in enumerate(h.ha.calls) if s == (prefix,) and lang is not None]
+            assert all(i > asked for i in fixed)
+        assert any(s == ("watch flex",) and lang == "en" for s, _, lang in h.ha.calls)
+        await h.actor.close()
+    run(main())
+
+
+def test_local_routes_read_the_transcript_as_heard_and_are_never_corrected():
+    async def main():
+        h = Harness(config={"transcriptFix": "on"}, text_fix=True)
+        h.ha.stt_text = "Set an alarm for 7 AM."
+        h.alerts.set_result = {"ok": True, "first_due": "2030-01-02T07:00:00+00:00", "days": []}
+        await button_turn(h, PRESS + 50_000)
+        await h.wait_for(lambda: h.render.streams)
+        h.render.streams[0].finish("drained")
+        await h.wait_for(lambda: h.rows)
+        assert h.rows[0]["outcome"] == "alarm" and h.rows[0]["stt_fix"] is None and h.ha.fix_calls() == []
+        await h.actor.close()
+    run(main())
+
+
+def test_an_answer_in_a_conversation_is_sent_as_heard():
+    async def main():
+        h = Harness(config={"transcriptFix": "on"}, text_fix=True)
+        drain = await question_drained(h)                     # HA asked "Which TV?" in conv-1
+        answer = (drain + 16_000, drain + 25_728)
+        h.worker.vad = speech(answer)
+        h.device.level = levels(answer)
+        h.worker.tokens = [("▁LIVING", answer[0] + 3_000), ("▁ROOM", answer[0] + 6_000)]
+        h.ha.stt_text = "The living groom."
+        h.ha.next_run = FakeRun([IntentEnded("Turned off.", "conv-1", False, "action_done", False),
+                                 TtsReady("http://ha/tts/2", False), RunEnded()])
+        fixes = len(h.ha.fix_calls())
+        await h.feed(drain, drain + 100_000)
+        await h.wait_for(lambda: len(h.render.streams) == 2)
+        assert h.ha.intents[1] == ("The living groom.", "conv-1") and len(h.ha.fix_calls()) == fixes
+        h.render.streams[1].finish("drained")
+        await h.wait_for(lambda: len(h.rows) == 2)
+        assert json.loads(h.rows[1]["stt_fix"])["reason"] == "contextual"
         await h.actor.close()
     run(main())

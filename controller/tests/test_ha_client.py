@@ -39,7 +39,8 @@ FIXTURE_DIR = Path(__file__).parent / "fixtures" / "ha"
 FIXTURES = {p.stem: json.loads(p.read_text()) for p in FIXTURE_DIR.glob("*.json")}
 # conversation/agent/homeassistant/debug as recorded, by sentence; HA recognizes nothing else (None).
 RECOGNITIONS = {sentence: result
-                for key, case in FIXTURES["conversation"].items() if key != "source"
+                for key, case in FIXTURES["conversation"].items()
+                if key != "source" and case["request"]["type"] == "conversation/agent/homeassistant/debug"
                 for sentence, result in zip(case["request"]["sentences"], case["result"]["results"])}
 PIPELINE_ID = "01hnpec9vt52ec4dkkxqa89z46"
 DEVICE_ID = "b285ec5e94b98f4c1cbeabf926be4b77"
@@ -229,6 +230,14 @@ class FakeHA:
             return
         if kind == "conversation/agent/homeassistant/debug":
             await ws.send_json(_result(msg_id, {"results": [RECOGNITIONS.get(s) for s in msg["sentences"]]}))
+            return
+        if kind == "conversation/sentences/list":
+            await ws.send_json(_result(msg_id, FIXTURES["conversation"]["sentences_list"]["result"]))
+            return
+        if kind == "assist_pipeline/pipeline/get":
+            case = FIXTURES["assist_pipeline"]["pipeline_get"]
+            assert msg["pipeline_id"] == case["request"]["pipeline_id"]
+            await ws.send_json(_result(msg_id, case["result"]))
             return
         raise AssertionError(f"unhandled websocket request: {msg}")
 
@@ -699,4 +708,54 @@ def test_warm_up_sentence_is_new_each_time():
             await client.warm_recognizer(DEVICE_ID)
             sent = [r["sentences"] for r in fake.requests if r["type"] == "conversation/agent/homeassistant/debug"]
             assert len(sent) == 2 and sent[0] != sent[1]
+    run(scenario())
+
+
+def test_recognition_reads_an_intents_slots_targets_and_unmatched_words_in_the_language_asked():
+    async def scenario():
+        async with running() as (fake, client):
+            unpause, play = await client.recognize(["play", "play zqxj"], DEVICE_ID, language="en")
+            _, probe = await client.recognize(["what time is it", "what time is it zqxj"], DEVICE_ID)
+            sent = [r for r in fake.requests if r["type"] == "conversation/agent/homeassistant/debug"]
+            assert sent[0]["language"] == "en" and "language" not in sent[1]   # None: HA's own language
+            assert unpause.intent == "HassMediaUnpause" and unpause.details["area"].value == "Living Room"
+            assert "media_player.hifi_2" in unpause.targets and list(unpause.targets) == sorted(unpause.targets)
+            assert (play.intent, play.details, play.targets) == (None, {}, ())   # a trigger says no more
+            assert probe.unmatched == {"device_class": "time ", "state": "it zqxj"}
+            assert probe.details["domain"].value == "cover" and not probe.match and probe.unfilled_slots
+    run(scenario())
+
+
+def test_the_pipelines_intent_language_and_the_trigger_sentences():
+    async def scenario():
+        async with running() as (fake, client):
+            # An agent for every language ("*") matches sentences in the pipeline's STT language.
+            assert await client.pipeline_language(PIPELINE_ID) == "en"
+            assert await client.trigger_sentences() == FIXTURES["conversation"]["sentences_list"]["result"][
+                "trigger_sentences"]
+    run(scenario())
+    assert ha_mod.effective_language({"conversation_language": "de", "stt_language": "en"}) == "de"
+    assert ha_mod.effective_language({"conversation_language": "*", "stt_language": "",
+                                      "tts_language": "en-GB", "language": "en"}) == "en-GB"
+
+
+def test_trigger_changes_are_heard_from_reloads_and_automation_switches_only():
+    async def scenario():
+        async with running() as (fake, client):
+            changes = []
+            client.track_triggers(lambda: changes.append(1))
+            for _ in range(50):
+                if len(fake.subscriptions.get("call_service", [])) and fake.subscriptions.get("automation_reloaded"):
+                    break
+                await asyncio.sleep(0.01)
+            await fake.emit("call_service", {"domain": "light", "service": "turn_on", "service_data": {}})
+            await fake.emit("call_service", {"domain": "automation", "service": "turn_off", "service_data": {}})
+            await fake.emit("call_service", {"domain": "conversation", "service": "reload", "service_data": {}})
+            await fake.emit("automation_reloaded", {})
+            for _ in range(50):
+                if len(changes) >= 3:
+                    break
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)
+            assert len(changes) == 3
     run(scenario())
