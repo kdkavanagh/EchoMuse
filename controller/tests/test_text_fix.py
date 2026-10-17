@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import functools
 import json
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -19,7 +18,6 @@ import pytest
 pytest.importorskip("hassil")
 
 import em_text_fix_service
-from em_text_fix_search import PhraseSearch
 from em_ha_client import (
     SentenceRecognition,
     SlotValue,
@@ -451,109 +449,113 @@ def test_added_history_is_retrieved_without_a_full_rebuild(monkeypatch):
     asyncio.run(main())
 
 
-# --- phrase search (the dashboard's finder) -------------------------------------------------
+# --- trying a transcript (the dashboard's tester) ------------------------------------------
 
 
-def found(result) -> list[tuple[str, str]]:
-    return [(m.entry.text, m.entry.kind) for m in result.matches]
+class TrialHa(FakeHa):
+    """FakeHa plus the pipeline lookups a trial makes."""
+
+    async def resolve_pipeline(self, pipeline_id):
+        return "preferred"
+
+    async def satellite_pipeline_id(self, device_id):
+        return f"pipeline-of-{device_id}"
+
+    async def pipeline_language(self, pipeline_id, *, timeout=None):
+        return "en"
 
 
-def test_search_ranks_word_prefixes_then_substrings_then_subsequences():
-    phrases = ("pale ale", "replay the news", "play Cherub Rock")
-    result = PhraseSearch().search(None, "pla", (), phrases)
-    assert [text for text, _ in found(result)] == ["play Cherub Rock", "replay the news", "pale ale"]
-    assert [m.entry.position for m in result.matches] == [2, 1, 0]
+@pytest.fixture
+def controller(tmp_path, monkeypatch):
+    """em_controller with one speaker, DOT, matched to the fixture's HA satellite, and HA
+    answered by the fixture's recorded verdicts. The correction service starts in the test's
+    own event loop (`start`)."""
+    import em_controller
+    import em_db
+
+    em_db.init(str(tmp_path / "t.db"))
+    em_db.register_new_device("DOT", "10.0.0.9", "fw", None)
+    em_db.approve_device("DOT", "Office")
+    ha = TrialHa()
+    monkeypatch.setattr(em_controller, "_ha", ha)
+    monkeypatch.setattr(em_controller, "_ha_identity", {"DOT": em_controller.HaIdentity(DEVICE, None)})
+    monkeypatch.setattr(em_controller, "_registry", type("R", (), {
+        "for_config": lambda self, config: type("M", (), {"wake_phrase": "ophelia"})()})())
+
+    async def start():
+        service, _ = await ready_service(monkeypatch, ha=ha)
+        monkeypatch.setattr(em_controller, "_text_fix", service)
+        return service
+
+    yield em_controller, ha, start
+    em_db._conn.close()
+    em_db._conn = None
 
 
-def test_search_matches_words_in_any_order_and_marks_what_matched():
-    result = PhraseSearch().search(tables(), "plex watch", (), ())
-    best = result.matches[0]
-    assert (best.entry.text, best.entry.kind) == ("watch plex", "trigger")
-    assert best.spans == ((0, 5), (6, 10))
-    loose = PhraseSearch().search(None, "wtch plx", ("Plex",), ("watch Plex",)).matches
-    assert [m.entry.text for m in loose] == ["watch Plex"]
-    assert "".join(loose[0].entry.text[a:b] for a, b in loose[0].spans).lower() == "wtchplx"
+def test_a_tried_transcript_shows_what_on_would_send_in_the_speakers_context(controller):
+    em_controller, ha, start = controller
+
+    async def main():
+        service = await start()
+        plex = await em_controller.trial_transcript("DOT", "Watch Flex.", True)
+        dot_calls = list(ha.calls)
+        ha.calls.clear()
+        alarm = await em_controller.trial_transcript("DOT", "RMV alarm.", False)
+        ha.calls.clear()
+        fleet = await em_controller.trial_transcript(None, "Watch Flex.", True)
+        service.close()
+        return plex, dot_calls, alarm, fleet, list(ha.calls)
+
+    plex, dot_calls, alarm, fleet, fleet_calls = asyncio.run(main())
+    assert plex.mode == TextFixMode.SHADOW            # the speaker's own setting, reported beside it
+    record = plex.record.as_dict()
+    assert (record["applied"], record["reason"], record["sent"]) == (True, "applied", "watch plex")
+    assert (plex.satellite, plex.pipeline, plex.language, plex.wake_phrase) == (
+        DEVICE, f"pipeline-of-{DEVICE}", "en", "ophelia")
+    assert dot_calls and all((device, language) == (DEVICE, "en") for _, device, language in dot_calls)
+    # "RMV alarm" reaches "arm the alarm", and also arming away: too close to choose.
+    record = alarm.record.as_dict(candidates=30)
+    assert (record["applied"], record["reason"], record["sent"]) == (False, "ambiguous", "RMV alarm.")
+    matched = {c["matched"] for c in record["candidates"] if c["status"] == "ok"}
+    assert any("away" in t for t in matched) and any("away" not in t for t in matched)
+    assert alarm.wake_phrase is None
+    assert (fleet.satellite, fleet.pipeline) == (None, "preferred")
+    assert fleet_calls and all(device is None for _, device, _ in fleet_calls)
 
 
-def test_a_triggers_wordings_collapse_into_its_best_one():
-    result = PhraseSearch().search(tables(), "plex", (), ())
-    triggers = [m for m in result.matches if m.entry.kind == "trigger"]
-    assert len({m.entry.template for m in triggers}) == len(triggers) == 1
-    plex = triggers[0]
-    assert plex.entry.text == "open plex"           # the shortest wording that says it
-    wordings = [p for p in tables().triggers.phrases if p.template == plex.entry.template]
-    assert plex.variants == len(wordings) > 1
+@pytest.mark.parametrize("text, route", [("set an alarm for 7 am", "alarm"), ("say that again", "repeat")])
+def test_a_transcript_an_echomuse_route_takes_is_never_corrected(controller, text, route):
+    em_controller, ha, start = controller
+
+    async def main():
+        service = await start()
+        ha.calls.clear()
+        trial = await em_controller.trial_transcript("DOT", text, True)
+        service.close()
+        return trial
+
+    trial = asyncio.run(main())
+    assert (trial.route, trial.record) == (route, None) and ha.calls == []
 
 
-def test_search_covers_every_source_and_says_how_much_it_searched():
-    t = tables()
-    s = PhraseSearch()
-    assert {k for m in s.search(t, "play", ("Cherub Rock",), ("watch Plex",)).matches
-            for k in [m.entry.kind]} >= {"wildcard", "history"}
-    assert ("Kitchen", "area") in found(s.search(t, "kitchen", (), ()))
-    assert ("Cherub Rock", "user_term") in found(s.search(t, "cherub", ("Cherub Rock",), ()))
-    counts = s.search(t, "", ("Cherub Rock",), ("watch Plex",)).counts
-    assert counts["trigger"] == len(t.triggers) and counts["history"] == len(t.history)
-    assert counts["wildcard"] == len(t.skipped_templates) and counts["user_term"] == counts["user_phrase"] == 1
-
-
-def test_typing_ahead_or_back_gives_what_a_fresh_search_gives():
-    t = tables()
-    typed = PhraseSearch()
-    word = "watch the plex"
-    for query in [word[:k] for k in range(1, len(word) + 1)] + ["watch", "w", "plex watch", "zz", "pl"]:
-        a, b = typed.search(t, query, (), ("watch Plex",)), PhraseSearch().search(t, query, (), ("watch Plex",))
-        assert [(m.entry, m.spans, m.variants) for m in a.matches] == [(m.entry, m.spans, m.variants)
-                                                                       for m in b.matches]
-        assert a.total == b.total
-
-
-def test_new_history_is_searchable_at_once():
-    s = PhraseSearch()
-    t = tables(history=False)
-    assert not s.search(t, "cherub", (), ()).matches
-    later = build_tables(vocabulary(), [], [HistoryEntry("play cherub rock", 9, 9.0)], 2)
-    t2 = replace(t, history=later.history, revision=2)
-    [hit] = s.search(t2, "cherub", (), ()).matches
-    assert (hit.entry.kind, hit.entry.turn_id) == ("history", 9)
-
-
-def test_the_api_searches_the_devices_saved_lists_or_the_fleets(tmp_path, monkeypatch):
+def test_the_trial_api_reports_what_stops_a_trial():
     aiohttp = pytest.importorskip("aiohttp")
     from aiohttp.test_utils import make_mocked_request
 
     import em_api
-    import em_db
+    from em_ha_client import HaUnavailable
 
-    em_db.init(str(tmp_path / "t.db"))
-    try:
-        em_db.register_new_device("DOT", "10.0.0.9", "fw", None)
-        em_db.approve_device("DOT", "Office")
-        em_db.set_global_device_config({**em_db.get_global_device_config_raw(),
-                                        "transcriptFixPhrases": ["watch Netflix"]})
-        em_db.set_device_config_sections("DOT", ["transcript"])
-        em_db.set_device_config("DOT", {"transcriptFixPhrases": ["watch Plex"]})
+    async def call(body: dict, failure: Exception | None = None):
+        async def trial_transcript(device_id, text, wake):
+            raise failure
 
-        async def main():
-            service, _ = await ready_service(monkeypatch)
-            app = aiohttp.web.Application()
-            app[em_api.SERVICES] = type("S", (), {"text_fix": lambda self: service})()
+        app = aiohttp.web.Application()
+        app[em_api.SERVICES] = type("S", (), {"trial_transcript": lambda self, *a: trial_transcript(*a)})()
+        request = make_mocked_request("POST", "/api/text_fix/trial", app=app)
+        request._read_bytes = json.dumps(body).encode()
+        response = await em_api._post_text_fix_trial.__wrapped__(request)
+        return response.status, json.loads(response.text)["code"]
 
-            async def get(query: str) -> dict:
-                request = make_mocked_request("GET", f"/api/text_fix/phrases?{query}", app=app)
-                response = await em_api._get_text_fix_phrases.__wrapped__(request)
-                assert response.status == 200
-                return json.loads(response.text)
-
-            device = await get("q=watch&device_id=DOT")
-            fleet = await get("q=watch")
-            service.close()
-            return device, fleet
-
-        device, fleet = asyncio.run(main())
-        assert device["ready"] and ("watch Plex", "user_phrase") in {(r["text"], r["kind"]) for r in device["results"]}
-        assert "watch Netflix" not in {r["text"] for r in device["results"] if r["kind"] == "user_phrase"}
-        assert {r["text"] for r in fleet["results"] if r["kind"] == "user_phrase"} == {"watch Netflix"}
-    finally:
-        em_db._conn.close()
-        em_db._conn = None
+    assert asyncio.run(call({"text": "rmv alarm", "wake": "yes"})) == (400, "invalid_input")
+    assert asyncio.run(call({"text": "rmv alarm"}, NotReady("tables not ready"))) == (503, "not_ready")
+    assert asyncio.run(call({"text": "rmv alarm"}, HaUnavailable("down"))) == (502, "ha_unavailable")

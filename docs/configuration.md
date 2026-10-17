@@ -716,22 +716,26 @@ one letter or digit. Entries that differ only in case, spaces or punctuation
 change only this correction: they do not teach or bias any speech-to-text
 model.
 
-### Search known phrases
+### Try a transcript
 
-Below the lists, **Search known phrases** looks through everything the
-correction can match against, as you type: your saved preferred phrases and
-terms (this speaker's, or the fleet's on the fleet page; unsaved edits are not
-included), your automations' trigger sentences, requests Home Assistant
-answered before, and Home Assistant's entity, area and floor names. It is a
-fuzzy finder: each word you type must appear, in any order, as the start of a
-word, anywhere in a word, or as letters in order ("wtch plx" finds "watch
-plex"). The matched letters are highlighted. A trigger written with
-alternatives (`(watch|put on) [the] plex`) shows as its best-matching wording
-with a count of the other wordings that match, and a trigger with a
-`{wildcard}` (`play {query}`) shows as written, since Home Assistant fills in
-its words. The search works whichever way the section is scoped, and for
-non-administrators too. Until Home Assistant is connected and the tables are
-built, it searches your lists only.
+Below the lists, **Try a transcript** shows what the correction would do with
+text you type, as you type: write what speech-to-text heard ("RMV alarm") and
+it shows heard → proposed → would send, whether On would apply it and why,
+and every candidate with its scores, whether it kept what was said, and what
+Home Assistant's sentence matcher accepted it as. For "RMV alarm" that is
+"arm the alarm" and "arm the alarm away", too close to choose between, so it
+would be sent as heard.
+
+It tries the text as a standalone command on this speaker, with the saved
+settings (unsaved edits are not included): its preferred lists, its Home
+Assistant satellite (so a room-less command finds this speaker's room), and
+its pipeline's language. On the fleet page it uses the fleet settings and no
+room. **After the wake word** (on by default) also lets it drop leftover
+wake-word sounds at the start, as a wake turn would. Text EchoMuse handles
+itself (alarms, "say that again") is shown as such, since correction never
+sees it. Only Home Assistant's matcher is asked, which recognizes without
+running anything, and the result does not depend on the Mode: it is what On
+would send.
 
 ### What you see in Activity
 

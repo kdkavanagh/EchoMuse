@@ -1274,10 +1274,13 @@ const TEXT_FIX_STATUSES = Object.freeze({
 });
 const fixWord = (map, k) => (k == null ? '—' : map[k] || String(k).replace(/_/g, ' '));
 
-function TextFixEvidence({ fix: f, quote }) {
-  const [open, setOpen] = useState(false);
+// A turn's correction record (turns.stt_fix). `trial`: a tried transcript's record, as On
+// would send it (POST /api/text_fix/trial): worded as what would happen, with no mode.
+function TextFixEvidence({ fix: f, quote, trial = false, defaultOpen = false }) {
+  const [open, setOpen] = useState(defaultOpen);
   const muted = { color: 'var(--muted)' };
-  const [reason, color] = TEXT_FIX_REASONS[f.reason] || [fixWord({}, f.reason), 'var(--muted)'];
+  const [reason, color] = trial && f.reason === 'applied' ? ['On would send the correction', 'var(--ok)']
+    : TEXT_FIX_REASONS[f.reason] || [fixWord({}, f.reason), 'var(--muted)'];
   const num = v => (typeof v === 'number' ? v.toFixed(2) : '—');
   const candidates = Array.isArray(f.candidates) ? f.candidates : [];
   const verdicts = f.verdict && typeof f.verdict === 'object' ? f.verdict : null;
@@ -1295,12 +1298,14 @@ function TextFixEvidence({ fix: f, quote }) {
       <div>
         heard {quote(f.original)}
         {' → '}{proposed ? <>proposed {quote(f.proposed)}</> : <span style={muted}>no proposal</span>}
-        {' → '}sent {quote(f.sent)}
+        {' → '}{trial ? 'would send' : 'sent'} {quote(f.sent)}
       </div>
       <div>
-        <span style={{ color: f.applied ? 'var(--ok)' : 'var(--text2)' }}>{f.applied ? 'applied' : 'not applied'}</span>
+        <span style={{ color: f.applied ? 'var(--ok)' : 'var(--text2)' }}>
+          {f.applied ? (trial ? 'would apply' : 'applied') : (trial ? 'would not apply' : 'not applied')}
+        </span>
         {' · '}<span style={{ color }}>{reason}</span>
-        {f.mode && <span style={muted}> · mode {f.mode}</span>}
+        {f.mode && !trial && <span style={muted}> · mode {f.mode}</span>}
       </div>
       {proposed && (
         <div style={muted}>
@@ -1330,7 +1335,10 @@ function TextFixEvidence({ fix: f, quote }) {
               )}
               {candidates.map((c, i) => (
                 <div key={i} style={{ display: 'grid', gridTemplateColumns: '1fr auto', columnGap: 8 }}>
-                  <span>{quote(c.text)} <span style={muted}>{fixWord(TEXT_FIX_RULES, c.rule)} from {fixWord(TEXT_FIX_SOURCES, c.source)}</span></span>
+                  <span>
+                    {quote(c.text)} <span style={muted}>{fixWord(TEXT_FIX_RULES, c.rule)} from {fixWord(TEXT_FIX_SOURCES, c.source)}</span>
+                    {c.matched && <span style={muted} title={c.matched}> · HA: {c.intent || 'trigger'} “{c.matched}”</span>}
+                  </span>
                   <span style={{ ...muted, textAlign: 'right' }}>
                     {[`${num(c.raw)}`, c.coverage != null && `cov ${num(c.coverage)}`,
                       c.preference > 0 && `pref +${c.preference.toFixed(3)}`, `rank ${num(c.rank)}`].filter(Boolean).join(' · ')}
@@ -6485,116 +6493,98 @@ function TextFixListEditor({ label, sub, noun, placeholder, items, onChange, dis
   );
 }
 
-// Fuzzy search over what transcript correction knows (GET /api/text_fix/phrases, §16.8):
-// the saved preferred phrases and terms of this device (the fleet's in the fleet view), HA's
-// trigger sentences, the requests HA answered before, and HA's entity, area and floor names.
-// Results follow the typing, debounced; a response to an older query is dropped.
-const TEXT_FIX_KINDS = Object.freeze({
-  user_phrase: 'your phrase', user_term: 'your term', trigger: 'HA trigger', wildcard: 'HA trigger, any words',
-  history: 'earlier request', entity: 'entity', area: 'area', floor: 'floor',
+// Try a transcript (POST /api/text_fix/trial, §16.8): what transcript correction would send for
+// text heard as a standalone command on this speaker (the fleet's settings in the fleet view),
+// as On would, with the saved settings. Only Home Assistant's sentence matcher is asked; nothing
+// runs. Results follow the typing, debounced; a response to an older input is dropped.
+const TEXT_FIX_TRIAL_DEBOUNCE_MS = 400;
+const LOCAL_ROUTES = Object.freeze({   // em_session.LocalRoute
+  repeat: '“say that again”', alarm: 'an alarm request', alarm_query: 'a question about alarms',
+  timer_cancel: 'a timer cancel',
 });
-const TEXT_FIX_SEARCH_DEBOUNCE_MS = 120;
-const TEXT_FIX_SEARCH_LIMIT = 50;
 
-function Highlighted({ text, spans }) {
-  const out = [];
-  let at = 0;
-  for (const [start, end] of spans || []) {
-    if (start > at) out.push(text.slice(at, start));
-    out.push(<b key={start} style={{ color:'var(--accent)', fontWeight:700 }}>{text.slice(start, end)}</b>);
-    at = end;
-  }
-  if (at < text.length) out.push(text.slice(at));
-  return <>{out}</>;
-}
-
-function TextFixPhraseSearch({ deviceId }) {
-  const [query, setQuery] = useState('');
-  const [result, setResult] = useState(null);     // the last response, for `shown`
-  const [shown, setShown] = useState('');         // the query `result` answers
+function TextFixTester({ deviceId }) {
+  const [text, setText] = useState('');
+  const [wake, setWake] = useState(true);
+  const [trial, setTrial] = useState(null);
   const [error, setError] = useState(null);
+  const [busy, setBusy] = useState(false);
   const seq = useRef(0);
+  const timer = useRef(null);
+
+  const run = useCallback(async (t, w, mine) => {
+    if (!t.trim()) { setTrial(null); setError(null); setBusy(false); return; }
+    setBusy(true);
+    try {
+      const r = await API.post('/api/text_fix/trial', { text: t, wake: w, ...(deviceId ? { device_id: deviceId } : {}) });
+      if (mine !== seq.current) return;
+      setTrial(r); setError(null);
+    } catch (e) {
+      if (mine !== seq.current) return;
+      setTrial(null); setError(e?.error || e?.message || 'failed');
+    } finally {
+      if (mine === seq.current) setBusy(false);
+    }
+  }, [deviceId]);
 
   useEffect(() => {
     const mine = ++seq.current;
-    const timer = setTimeout(async () => {
-      const params = new URLSearchParams({ q: query, limit: String(TEXT_FIX_SEARCH_LIMIT) });
-      if (deviceId) params.set('device_id', deviceId);
-      try {
-        const r = await API.get(`/api/text_fix/phrases?${params}`);
-        if (mine !== seq.current) return;
-        setResult(r); setShown(query); setError(null);
-      } catch (e) {
-        if (mine !== seq.current) return;
-        setError(e?.error || e?.message || 'search failed');
-      }
-    }, query ? TEXT_FIX_SEARCH_DEBOUNCE_MS : 0);
-    return () => clearTimeout(timer);
-  }, [query, deviceId]);
+    timer.current = setTimeout(() => run(text, wake, mine), text.trim() ? TEXT_FIX_TRIAL_DEBOUNCE_MS : 0);
+    return () => clearTimeout(timer.current);
+  }, [text, wake, run]);
 
-  const counts = result?.counts || {};
-  const n = k => (counts[k] || 0).toLocaleString();
-  const names = (counts.entity || 0) + (counts.area || 0) + (counts.floor || 0);
-  const rows = result?.results || [];
-  const small = { fontFamily:MONO, fontSize:9, color:'var(--muted)' };
-  const detail = r => {
-    if (r.kind === 'wildcard') return "left to HA's matcher: the {…} parts take any words";
-    if (r.kind === 'trigger') return `${r.template}${r.variants > 1 ? ` · ${r.variants.toLocaleString()} matching wordings` : ''}`;
-    if (r.kind === 'history') return `turn #${r.turn_id}${r.ts ? ` · ${new Date(r.ts * 1000).toLocaleDateString()}` : ''}`;
-    if (r.kind === 'user_phrase' || r.kind === 'user_term') return `#${r.position + 1} in your list`;
-    return (r.ids || []).join(', ');
-  };
+  const now = () => { clearTimeout(timer.current); run(text, wake, ++seq.current); };
+  const muted = { color: 'var(--muted)' };
+  const small = { fontFamily: MONO, fontSize: 10, color: 'var(--text2)', lineHeight: 1.6 };
+  const quote = s => (s ? <span style={{ color: 'var(--text)' }}>“{s}”</span> : <span style={muted}>—</span>);
+  const rec = trial?.record;
+  const routeNote = trial?.route && (trial.route === 'timer_cancel'
+    ? 'EchoMuse cancels a running timer itself; with none running, it goes to Home Assistant as below.'
+    : `EchoMuse handles this itself as ${LOCAL_ROUTES[trial.route] || trial.route}: correction never sees it.`);
+  const context = trial && [
+    deviceId ? (trial.satellite ? "matched as this speaker's HA satellite" : 'no HA satellite matched: no room context')
+      : "fleet settings, HA's preferred pipeline, no room context",
+    `language ${trial.language || "HA's default"}`,
+    trial.wake_phrase ? `as a wake turn (“${trial.wake_phrase}”)` : 'not a wake turn',
+    rec?.context?.tables != null && `tables r${rec.context.tables}`,
+  ].filter(Boolean).join(' · ');
   return (
-    <div style={{ marginTop:4 }}>
-      <span style={{ fontFamily:MONO, fontSize:11, color:'var(--text2)' }}>Search known phrases</span>
-      <span style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)', marginLeft:8 }}>
-        what correction can match against: your saved lists and what Home Assistant knows
+    <div style={{ marginTop: 14 }}>
+      <span style={{ fontFamily: MONO, fontSize: 11, color: 'var(--text2)' }}>Try a transcript</span>
+      <span style={{ fontFamily: MONO, fontSize: 10, color: 'var(--muted)', marginLeft: 8 }}>
+        type what speech-to-text heard to see what On would send, with the saved settings; nothing runs
       </span>
-      <input type="search" value={query} placeholder="watch plex, what time, kitchen…"
-        aria-label="Search known phrases" onChange={e => setQuery(e.target.value)}
-        onKeyDown={e => { if (e.key === 'Escape') { e.preventDefault(); setQuery(''); } }}
-        style={{ display:'block', width:'100%', boxSizing:'border-box', marginTop:8 }}/>
-      <div style={{ ...small, marginTop:4 }}>
-        {result ? <>
-          {n('user_phrase')} of your phrases · {n('user_term')} terms · {n('trigger')} HA trigger wordings
-          {counts.wildcard ? ` (+${n('wildcard')} any-words templates)` : ''} · {n('history')} earlier requests · {names.toLocaleString()} names
-        </> : 'loading…'}
+      <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginTop: 8 }}>
+        <input type="text" value={text} placeholder="RMV alarm" aria-label="Transcript to try" maxLength={300}
+          onChange={e => setText(e.target.value)}
+          onKeyDown={e => {
+            if (e.key === 'Enter') { e.preventDefault(); now(); }
+            if (e.key === 'Escape') { e.preventDefault(); setText(''); }
+          }}
+          style={{ flex: 1, minWidth: 0 }}/>
+        <label style={{ ...small, display: 'flex', gap: 5, alignItems: 'center', whiteSpace: 'nowrap' }}
+          title="A wake turn may also drop leftover wake-word sounds at the start">
+          <input type="checkbox" checked={wake} onChange={e => setWake(e.target.checked)}/>after the wake word
+        </label>
       </div>
-      {result && !result.ready && (
-        <div style={{ ...small, color:'var(--warn)', marginTop:4 }}>
-          Correction tables are not built (Home Assistant not connected, or still loading): searching your saved lists only.
-        </div>
-      )}
-      {error && <div style={{ ...small, color:'var(--error)', marginTop:4 }}>{error}</div>}
-      {shown && result && (
-        <div role="list" aria-label="Matching phrases"
-          style={{ marginTop:8, maxHeight:320, overflowY:'auto', border:'1px solid var(--border)', borderRadius:6 }}>
-          {rows.length === 0 && <div style={{ ...small, padding:'8px 10px' }}>no match for “{shown}”</div>}
-          {rows.map((r, i) => {
-            const mine = r.kind === 'user_phrase' || r.kind === 'user_term';
-            return (
-              <div key={`${r.kind}:${r.text}:${i}`} role="listitem"
-                style={{ display:'grid', gridTemplateColumns:'1fr auto', gap:'2px 10px', padding:'5px 10px',
-                  borderTop:i ? '1px solid var(--border)' : 'none' }}>
-                <span style={{ fontFamily:SANS, fontSize:12, color:'var(--text)', overflowWrap:'anywhere' }}>
-                  <Highlighted text={r.text} spans={r.spans}/>
-                </span>
-                <span style={{ fontFamily:MONO, fontSize:9, color:mine ? 'var(--accent)' : 'var(--text2)', whiteSpace:'nowrap' }}>
-                  {TEXT_FIX_KINDS[r.kind] || r.kind}
-                </span>
-                <span title={detail(r)} style={{ ...small, gridColumn:'1 / -1', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
-                  {detail(r)}
-                </span>
+      <div aria-live="polite" style={{ ...small, marginTop: 8, minHeight: 16 }}>
+        {busy && !trial && !error && <span style={muted}>asking Home Assistant's matcher…</span>}
+        {error && <div style={{ color: 'var(--error)' }}>{error}</div>}
+        {trial && (
+          <div style={{ opacity: busy ? 0.6 : 1 }}>
+            {routeNote && <div style={{ color: 'var(--warn)' }}>{routeNote}</div>}
+            {rec && <TextFixEvidence key={trial.text} fix={rec} quote={quote} trial defaultOpen/>}
+            <div style={muted}>{context}</div>
+            {trial.mode !== 'on' && (
+              <div style={muted}>
+                {deviceId ? 'This speaker' : 'The fleet'} is set to {trial.mode === 'shadow'
+                  ? 'Shadow: it records what On would send and sends the transcript as heard.'
+                  : 'Off: no correction runs.'}
               </div>
-            );
-          })}
-          {result.total > rows.length && (
-            <div style={{ ...small, padding:'6px 10px', borderTop:'1px solid var(--border)' }}>
-              best {rows.length} of {result.total.toLocaleString()} matches; type more to narrow
-            </div>
-          )}
-        </div>
-      )}
+            )}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -6992,7 +6982,7 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
         chips={<><ScopeChip tone="controller">Controller</ScopeChip><ScopeChip tone="controller">HA matcher</ScopeChip></>}
         desc="After Home Assistant's speech-to-text and EchoMuse's own commands, a misheard request can be repaired before Home Assistant runs it. Candidates come from HA's trigger sentences, its entity, area and floor names, requests it answered before, and the terms and phrases below; HA's own sentence matcher must fully accept one without running it. Text HA already understands is never changed, and follow-ups are never corrected. Each turn's correction is shown in Activity."
         scope={scopeEl('transcript')} dim={secStyle('transcript')}
-        after={<TextFixPhraseSearch deviceId={deviceId}/>}>
+        after={<TextFixTester deviceId={deviceId}/>}>
         <div style={inputStyle}>
           <div role="group" aria-label="Transcript correction mode" style={{ display:'flex', alignItems:'center', gap:6, flexWrap:'wrap' }}>
             <span style={{ fontFamily:MONO, fontSize:11, color:'var(--text2)', marginRight:4 }}>Mode</span>

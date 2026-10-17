@@ -1178,11 +1178,22 @@ def _verdict(v: SentenceRecognition | None) -> dict[str, object] | None:
     return out
 
 
-def _candidate(c: Candidate, status: Status, detail: str | None = None) -> dict[str, object]:
-    return {"text": c.text, "rule": c.rule, "source": c.source, "raw": round(c.raw, 3),
-            "coverage": None if c.coverage is None else round(c.coverage, 3),
-            "preference": round(c.preference, 4), "rank": round(c.rank, 4), "status": status,
-            **({"detail": detail} if detail else {}), **({"template": c.template} if c.template else {})}
+def _candidate(c: Candidate, status: Status, detail: str | None = None,
+               verdict: SentenceRecognition | None = None) -> dict[str, object]:
+    """One candidate as recorded; `matched`/`intent`: what HA's matcher accepted it as."""
+    out: dict[str, object] = {
+        "text": c.text, "rule": c.rule, "source": c.source, "raw": round(c.raw, 3),
+        "coverage": None if c.coverage is None else round(c.coverage, 3),
+        "preference": round(c.preference, 4), "rank": round(c.rank, 4), "status": status}
+    if detail:
+        out["detail"] = detail
+    if c.template:
+        out["template"] = c.template
+    if verdict is not None and verdict.match:
+        out["matched"] = verdict.template
+        if verdict.intent is not None:
+            out["intent"] = verdict.intent
+    return out
 
 
 RECORD_CANDIDATES: Final = 6
@@ -1202,7 +1213,8 @@ class FixRecord:
     deadline_met: bool | None = None    # whether `on` would have had it within FINAL_DEADLINE_S
     error: str | None = None
 
-    def as_dict(self) -> dict[str, object]:
+    def as_dict(self, candidates: int = RECORD_CANDIDATES) -> dict[str, object]:
+        """The record; `candidates`: how many to list, those HA was asked about first."""
         out: dict[str, object] = {"mode": self.mode, "reason": self.reason, "original": self.original,
                                   "proposed": None, "sent": self.sent, "applied": self.applied}
         o = self.outcome
@@ -1216,10 +1228,10 @@ class FixRecord:
                            preference=round(c.preference, 4), rank=round(c.rank, 4), status=p.status)
             out["preference_changed"] = d.preference_changed
             out["verdict"] = {"original": _verdict(o.original), "proposed": _verdict(p.verdict if p else None)}
-            shown = sorted(d.checked, key=lambda ch: -ch.candidate.rank)[:RECORD_CANDIDATES]
-            out["candidates"] = [_candidate(ch.candidate, ch.status, ch.detail) for ch in shown] + [
+            shown = sorted(d.checked, key=lambda ch: -ch.candidate.rank)[:candidates]
+            out["candidates"] = [_candidate(ch.candidate, ch.status, ch.detail, ch.verdict) for ch in shown] + [
                 _candidate(r.candidate, r.status, r.detail)
-                for r in d.rejected[:max(0, RECORD_CANDIDATES - len(shown))]]
+                for r in d.rejected[:max(0, candidates - len(shown))]]
             ctx = o.context
             out["context"] = {"connection": ctx.connection, "tables": ctx.tables, "config": ctx.config,
                               "pipeline": ctx.pipeline, "language": ctx.language}
@@ -1231,3 +1243,11 @@ class FixRecord:
 
     def dumps(self) -> str:
         return json.dumps(self.as_dict(), separators=(",", ":"))
+
+
+def trial_record(text: str, outcome: FixOutcome) -> FixRecord:
+    """What `on` would record and send for `text` heard as a standalone command."""
+    selected = outcome.decision.selected
+    if selected is None:
+        return FixRecord(TextFixMode.ON, text, text, outcome.decision.reason, outcome=outcome)
+    return FixRecord(TextFixMode.ON, text, selected.candidate.text, Reason.APPLIED, applied=True, outcome=outcome)

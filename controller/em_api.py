@@ -48,7 +48,6 @@ import em_wakeclips
 import em_ambient
 import em_pause_asr
 import em_text_fix
-import em_text_fix_search
 import em_text_fix_service
 import em_volume
 import em_sounds
@@ -359,7 +358,8 @@ class ControllerServices(Protocol):
     def registry(self) -> em_wake_registry.WakeRegistry: ...
     def device_assets(self) -> em_device_assets.DeviceAssets: ...
     def firmware(self) -> em_firmware.BundledFirmware: ...
-    def text_fix(self) -> em_text_fix_service.TextFixService: ...
+    async def trial_transcript(self, device_id: str | None, text: str,
+                               wake: bool) -> em_text_fix_service.Trial: ...
     def ha_status(self) -> dict[em_ha_client.HaFeature, FeatureStatusWire]: ...
     def speech_worker_status(self) -> SpeechWorkerStatus: ...
     def loop_lag_peak_ms(self) -> float: ...
@@ -514,7 +514,7 @@ async def create_app(services: ControllerServices) -> web.Application:
     app.router.add_patch("/api/system/config",  _patch_system_config)
     app.router.add_get("/api/ha/status",        _get_ha_status)
     app.router.add_get("/api/speech/wyoming",   _get_wyoming_info)
-    app.router.add_get("/api/text_fix/phrases", _get_text_fix_phrases)
+    app.router.add_post("/api/text_fix/trial",  _post_text_fix_trial)
 
     # Provisioning
     app.router.add_get("/api/provision/start_script", _get_provision_start_script)
@@ -552,6 +552,7 @@ class ErrorCode(enum.StrEnum):
     DEVICE_NOT_FOUND = "device_not_found"
     DEVICE_OFFLINE = "device_offline"
     EMPTY_UPLOAD = "empty_upload"
+    HA_UNAVAILABLE = "ha_unavailable"
     INTERNAL_ERROR = "internal_error"
     INVALID_CONFIG = "invalid_config"
     INVALID_CREDENTIALS = "invalid_credentials"
@@ -576,6 +577,7 @@ class ErrorCode(enum.StrEnum):
     NOT_CAPTURING = "not_capturing"
     NOT_CONNECTED = "not_connected"
     NOT_FOUND = "not_found"
+    NOT_READY = "not_ready"
     RECORDING_AMBIENT = "recording_ambient"
     REMOVED_CONFIG_KEY = "removed_config_key"
     SCAN_FAILED = "scan_failed"
@@ -3966,56 +3968,40 @@ async def _get_wyoming_info(request: web.Request) -> web.Response:
     return _ok({"programs": [asdict(program) for program in programs]})
 
 
+TRIAL_MAX_CHARS = 300      # a tried transcript
+TRIAL_CANDIDATES = 30     # candidates listed in a trial's record
+
+
 @auth.require_auth
-async def _get_text_fix_phrases(request: web.Request) -> web.Response:
-    """GET /api/text_fix/phrases?q=&device_id=&limit= — fuzzy search over what transcript
-    correction knows (§16.8): the saved preferred phrases and terms of the device (its
-    effective config) or, without `device_id`, of the fleet, and the published tables.
-    `ready` false: the tables are not built, and only the lists are searched."""
-    query = request.query.get("q", "")
-    try:
-        limit = int(request.query.get("limit", "50"))
-    except ValueError:
-        return _error(ErrorCode.INVALID_PARAM, "limit must be an integer", 400)
-    if not 1 <= limit <= em_text_fix_search.MAX_RESULTS:
-        return _error(ErrorCode.INVALID_PARAM, f"limit must be 1–{em_text_fix_search.MAX_RESULTS}", 400)
-    device_id = request.query.get("device_id")
-    loop = asyncio.get_running_loop()
+async def _post_text_fix_trial(request: web.Request) -> web.Response:
+    """POST /api/text_fix/trial {text, device_id?, wake?} — what transcript correction would
+    send for `text` heard as a standalone command on this speaker (without `device_id`: the
+    fleet's settings, HA's preferred pipeline, no satellite), as `on` would (§16.8); `wake`
+    (default true) tries it as a wake turn. Asks only HA's non-executing matcher. `record`
+    is the turn record `on` would write; null when an EchoMuse route takes the text first."""
+    body = await _json_body(request)
+    text = _require_str(body, "text")
+    if len(text) > TRIAL_MAX_CHARS:
+        return _error(ErrorCode.INVALID_INPUT, f"text is at most {TRIAL_MAX_CHARS} characters", 400)
+    device_id = body.get("device_id")
+    if device_id is not None and not isinstance(device_id, str):
+        return _error(ErrorCode.INVALID_INPUT, "device_id must be a string", 400)
+    wake = body.get("wake", True)
+    if not isinstance(wake, bool):
+        return _error(ErrorCode.INVALID_INPUT, "wake must be true or false", 400)
     if device_id:
         await _device_row(device_id)
-        config = await loop.run_in_executor(None, db.get_effective_device_config, device_id)
-    else:
-        config = await loop.run_in_executor(None, db.get_global_device_config)
     try:
-        fix = em_text_fix.fix_config(config)
-    except ValueError:
-        fix = em_text_fix.FixConfig()     # a hand-edited database; correction is off for it too
-    service = request.app[SERVICES].text_fix()
-    result = await service.search(query, fix, limit)
-    tables = service.current()
+        trial = await request.app[SERVICES].trial_transcript(device_id or None, text, wake)
+    except em_text_fix_service.NotReady as err:
+        return _error(ErrorCode.NOT_READY, f"Transcript correction is not ready: {err}", 503)
+    except (em_ha_client.HaError, em_ha_client.HaUnavailable) as err:
+        return _error(ErrorCode.HA_UNAVAILABLE, f"Home Assistant: {str(err) or type(err).__name__}", 502)
     return _ok({
-        "ready": tables is not None, "revision": tables.revision if tables is not None else None,
-        "total": result.total, "counts": result.counts,
-        "results": [_phrase_match(m) for m in result.matches],
+        "text": trial.text, "mode": trial.mode, "route": trial.route, "satellite": trial.satellite,
+        "pipeline": trial.pipeline, "language": trial.language, "wake_phrase": trial.wake_phrase,
+        "record": trial.record.as_dict(candidates=TRIAL_CANDIDATES) if trial.record is not None else None,
     })
-
-
-def _phrase_match(m: em_text_fix_search.Match) -> dict[str, object]:
-    e = m.entry
-    out: dict[str, object] = {"text": e.text, "source": e.source, "kind": e.kind, "score": m.score,
-                              "spans": [list(s) for s in m.spans]}
-    if e.template is not None:
-        out["template"] = e.template
-    if e.group is not None:
-        out["variants"] = m.variants
-    if e.position is not None:
-        out["position"] = e.position
-    if e.turn_id is not None:
-        out.update(turn_id=e.turn_id, ts=e.ts)
-    if e.ids:
-        out["ids"] = list(e.ids)
-    return out
-
 
 
 @auth.require_admin

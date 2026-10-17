@@ -573,6 +573,33 @@ async def _text_fix_history() -> list[em_text_fix.HistoryEntry]:
     return [em_text_fix.HistoryEntry(em_text_fix.sent_text(text, fix), row_id, ts) for row_id, ts, text, fix in rows]
 
 
+async def trial_transcript(device_id: str | None, text: str, wake: bool) -> em_text_fix_service.Trial:
+    """What transcript correction would do with `text` heard as a standalone command on this
+    speaker (None: the fleet's settings, HA's preferred pipeline, no satellite), under `on`:
+    the speaker's settings, satellite, pipeline and its language, and with `wake` its wake
+    phrase (§16.8). Only HA's non-executing matcher is asked. NotReady, HaError, HaUnavailable."""
+    service, ha = text_fix(), _ha_client()
+    raw = (_effective_config(device_id) if device_id is not None
+           else await asyncio.to_thread(db.get_global_device_config))
+    try:
+        config = em_text_fix.fix_config(raw)
+    except ValueError:
+        config = em_text_fix.FixConfig()      # a hand-edited database: correction is off for it
+    identity = _ha_identity.get(device_id) if device_id is not None else None
+    satellite = identity.device_id if identity is not None else None
+    pipeline = await (_pipeline_id(device_id) if device_id is not None else ha.resolve_pipeline(None))
+    language = await ha.pipeline_language(pipeline)
+    wake_phrase = registry().for_config(raw).wake_phrase if wake else None
+    command = em_session.local_route(text)
+    route = em_session.route_kind(command) if command is not None else None
+    record = None
+    if route in (None, em_session.LocalRoute.TIMER_CANCEL):    # a cancel with no timer goes to HA
+        context = service.context(config, satellite, pipeline, language, wake_phrase)
+        outcome = await service.correct(em_text_fix.fix_key(text), context, config)
+        record = em_text_fix.trial_record(text, outcome)
+    return em_text_fix_service.Trial(text, config.mode, route, satellite, pipeline, language, wake_phrase, record)
+
+
 async def _stop_alert(device_id: str) -> None:
     result = await alerts().dismiss_alert(device_id, source=em_alerts.ActSource.ENTITY)
     if not result["ok"]:
@@ -1223,8 +1250,9 @@ class Services:
     def firmware(self) -> em_firmware.BundledFirmware:
         return firmware()
 
-    def text_fix(self) -> em_text_fix_service.TextFixService:
-        return text_fix()
+    async def trial_transcript(self, device_id: str | None, text: str,
+                               wake: bool) -> em_text_fix_service.Trial:
+        return await trial_transcript(device_id, text, wake)
 
     def ha_status(self) -> dict[em_ha_client.HaFeature, api.FeatureStatusWire]:
         return ha_status()

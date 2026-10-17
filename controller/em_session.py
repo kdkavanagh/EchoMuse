@@ -51,6 +51,7 @@ from echomuse_grammar import (
     Meridiem,
     MissingSlot,
     RelativeDay,
+    RepeatRequest,
     TimerCancel,
 )
 from em_afe import AfeEvidence, AfeSeries, TurnStage, series_range, turn_evidence, turn_series
@@ -394,6 +395,44 @@ CANDIDATE_TAG = "candidate:"     # submit_echo tag prefix for a candidate compar
 WAKE_CHIME = "builtin:wake_chime"
 NO_INPUT_CHIME = "builtin:no_input_chime"
 ANNOUNCEMENT_CHIME = "builtin:announcement_chime"
+
+
+class LocalRoute(enum.StrEnum):
+    """The EchoMuse routes a standalone command's transcript takes before HA (§16.7 step 2)."""
+    REPEAT = "repeat"
+    ALARM = "alarm"
+    ALARM_QUERY = "alarm_query"
+    TIMER_CANCEL = "timer_cancel"
+
+
+LocalCommand = RepeatRequest | AlarmParse | AlarmQuery | TimerCancel
+
+
+def local_route(text: str) -> LocalCommand | None:
+    """The EchoMuse command a transcript is, in the order `_run_committed` tries them; None:
+    it goes to HA (after transcript correction, §16.8). A timer cancel that names no timer
+    goes to HA after all when no timer is running."""
+    if (repeat := echomuse_grammar.parse_repeat(text)) is not None:
+        return repeat
+    if (alarm := echomuse_grammar.parse_alarm(text)) is not None:
+        return alarm
+    if (question := echomuse_grammar.parse_alarm_query(text)) is not None:
+        return question
+    cancel = echomuse_grammar.parse_timer_cancel(text)
+    if cancel is not None and (cancel.all or (cancel.start is None and cancel.name is None)):
+        return cancel
+    return None
+
+
+def route_kind(command: LocalCommand) -> LocalRoute:
+    if isinstance(command, RepeatRequest):
+        return LocalRoute.REPEAT
+    if isinstance(command, AlarmParse):
+        return LocalRoute.ALARM
+    if isinstance(command, AlarmQuery):
+        return LocalRoute.ALARM_QUERY
+    return LocalRoute.TIMER_CANCEL
+
 
 
 def _stream_url(url: str) -> AsyncIterator[np.ndarray]:
@@ -2394,20 +2433,17 @@ class SessionActor:
         if exp is not None and exp.choices:
             await self._answer_choice(turn, exp, exp.choices, text)
             return
-        if echomuse_grammar.parse_repeat(text) is not None:
+        command = local_route(text)
+        if isinstance(command, RepeatRequest):
             await self._repeat(turn)
             return
-        alarm = echomuse_grammar.parse_alarm(text)
-        if alarm is not None:
-            await self._alarm(turn, alarm)
+        if isinstance(command, AlarmParse):
+            await self._alarm(turn, command)
             return
-        question = echomuse_grammar.parse_alarm_query(text)
-        if question is not None:
-            await self._alarm_query(turn, question)
+        if isinstance(command, AlarmQuery):
+            await self._alarm_query(turn, command)
             return
-        cancel = echomuse_grammar.parse_timer_cancel(text)
-        if cancel is not None and (cancel.all or (cancel.start is None and cancel.name is None)) \
-                and await self._cancel_timer(turn, cancel):
+        if isinstance(command, TimerCancel) and await self._cancel_timer(turn, command):
             return
         # Local routes above read the transcript as heard; only what goes to HA is corrected.
         sent = await self._corrected(turn, text, pipeline, language)

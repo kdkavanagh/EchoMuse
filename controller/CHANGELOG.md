@@ -642,15 +642,15 @@ Based on a review of Office turns 433–476 (`docs/turn-latency-review.md`,
   repaired (every one with a known intent correctly) and 3 left alone as
   ambiguous. New dependency: `hassil==3.11.0`, the version Home Assistant
   2026.8.1 ships, to expand trigger sentences.
-- **Search known phrases.** Config → **Transcript correction** has a
-  fuzzy finder over everything correction can match against: your saved
-  preferred phrases and terms, your automations' trigger sentences (a
-  trigger with alternatives shows once, with how many of its wordings
-  match), requests Home Assistant answered before, and Home Assistant's
-  entity, area and floor names. Results update as you type, with the
-  matched letters highlighted; words match in any order, and letters in
-  order ("wtch plx" finds "watch plex"). It is usable whatever the section's
-  scope and by non-administrators (`GET /api/text_fix/phrases`).
+- **Try a transcript.** Config → **Transcript correction** has a box where
+  you type what speech-to-text heard ("RMV alarm") and see, as you type,
+  what On would send on that speaker: the proposed correction, whether it
+  would apply and why, and every candidate with what Home Assistant's
+  sentence matcher accepted it as. It uses the saved settings, the
+  speaker's Home Assistant satellite and its pipeline's language, asks only
+  the matcher (nothing runs), and says when EchoMuse itself handles the
+  text. Activity's correction evidence now also shows what Home Assistant
+  matched each candidate as (`POST /api/text_fix/trial`).
 
 ### Earlier in this release
 

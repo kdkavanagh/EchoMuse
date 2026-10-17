@@ -19,7 +19,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 from em_ha_client import HaClient, Vocabulary
 from em_text_fix import (
@@ -27,17 +27,18 @@ from em_text_fix import (
     FixConfig,
     FixContext,
     FixOutcome,
+    FixRecord,
     HistoryEntry,
     Reason,
     Request,
     Tables,
+    TextFixMode,
     build_history,
     build_tables,
     decide,
     propose,
     user_vocabulary,
 )
-from em_text_fix_search import PhraseSearch, SearchResult
 
 log = logging.getLogger("em_text_fix")
 
@@ -48,6 +49,22 @@ HISTORY_LIMIT = 5_000           # newest eligible turns loaded into the history
 
 class NotReady(Exception):
     """No current tables, HA's matcher unavailable, or the context no longer holds."""
+
+
+@dataclass(frozen=True)
+class Trial:
+    """A transcript tried as a standalone command on one speaker (the dashboard's tester):
+    what `on` would send. `route`: the EchoMuse route that takes it before HA
+    (em_session.LocalRoute), None for HA; `record`: None when a route other than a timer
+    cancel takes it, since correction never sees it."""
+    text: str
+    mode: TextFixMode             # the speaker's actual `transcriptFix`
+    route: str | None
+    satellite: str | None         # the HA device whose context the matcher used
+    pipeline: str
+    language: str | None
+    wake_phrase: str | None       # tried as a wake turn: the lead-in rule's phrase
+    record: FixRecord | None
 
 
 class TextFixService:
@@ -63,13 +80,6 @@ class TextFixService:
         self._history_build: asyncio.Task[None] | None = None
         self._cpu = ThreadPoolExecutor(max_workers=1, thread_name_prefix="text-fix")
         self._builder = ThreadPoolExecutor(max_workers=1, thread_name_prefix="text-fix-build")
-        self._search = PhraseSearch()
-
-    async def search(self, query: str, config: FixConfig, limit: int) -> SearchResult:
-        """The dashboard's phrase search over `config`'s saved lists and the published tables.
-        Runs off the event loop, never on the executor corrections use."""
-        return await asyncio.to_thread(self._search.search, self.current(), query, config.terms,
-                                       config.phrases, limit)
 
     # ── lifecycle ──
 
