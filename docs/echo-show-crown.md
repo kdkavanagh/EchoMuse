@@ -1,6 +1,6 @@
 # Echo Show 8 (1st gen, `crown`): findings
 
-**Status:** exploration, 2026-10-16, updated 2026-10-17. Everything below was read from one rooted unit, G6G16D12143203LD. The OpenSL test of §4.4, the Phase 0 probes of §10 (files in `/data/local/tmp`, `STREAM_MUSIC` volume, screen sleep, a test `.rc` in `/system/etc/init` for two reboots) and the firmware runs of §10.7 were temporary and removed or restored afterwards. One change is kept, as plan §0 authorised: the Phase 3 neutralisation of §9.5 (Fully Kiosk and a replacement keyboard installed, the provisioned flags set, Tier 1 hidden, two microphones denied through appops, KnightSettings' config bundle installed), reversible with `pm unhide` and `appops set … default`. On 2026-10-17 the user joined the device to Wi-Fi from the device itself (§5).
+**Status:** exploration, 2026-10-16, updated 2026-10-17. Everything below was read from one rooted unit, G6G16D12143203LD. Sections 1–7, 9 and 10 describe the unit on Fire OS 6574.1; the probes there were temporary, and the Phase 3 state of §9.5 was kept until the flash. **Since 2026-10-17 the unit runs LineageOS 18.1**, first v0.6 (§8.4–8.5), now a local build (`18.1-20261017-UNOFFICIAL-crown`) of lineage-18.1 that ships the NS6571 `libasp.so` with `libtensorflowlite_c.so` and `libedgeflow_core_neon.so` (amazon-oss/android_device_amazon_crown draft PR #2). On it `VOICE_RECOGNITION` carries v3.3 metadata again: 37,467 of 37,470 frames valid over 5 min. Root adb is seeded in `/system/build.prop` and `/adb_keys`; the Fire OS state, including §9.5, was wiped. NS6570 or NS6571 through TWRP is the way back (§8.5).
 **Purpose:** compare the Show with the Echo Dot Gen 2 as documented in [fireos6-port.md](fireos6-port.md), [alexa-afe.md](alexa-afe.md), [afe-metadata.md](afe-metadata.md) and the other `alexa-*.md` notes. This feeds [echo-show-port-plan.md](echo-show-port-plan.md).
 **Notation:** [INFERENCE] marks a conclusion that was not observed directly.
 
@@ -20,7 +20,7 @@
    - A touchscreen and two cameras.
 5. **Wi-Fi, Bluetooth, time and volume belong to the Android framework**, not to Amazon daemons.
 6. **The device is unregistered.** Alexa's wake engine (`amazon.speech.sim`) waits for account registration, so nothing held the microphone in OOBE. Since §9.5 the OOBE is hidden, Fully Kiosk is HOME, and SIM stays installed (KnightSystemUI needs it) with its microphone denied through appops. Section 9 lists what is hidden and why.
-7. **LineageOS 18.1 for crown ships Amazon's audio HAL, `libasp.so` and the full tuning set.** Since 2026-09-27 it routes plain mic captures into Amazon's voice processing. Whether `VOICE_RECOGNITION` reaches the ASR pipeline there is likely but not measured (§8).
+7. **LineageOS 18.1 v0.6 for crown ships an older Amazon audio HAL and `libasp.so` than stock, with the current tuning set** (§8). Measured on this unit (§8.4, §8.5): `VOICE_RECOGNITION` from uid 0 reaches the ASR pipeline, but carries **no bit-0 metadata** and cancels 5–11 dB less than stock. uid 0 is the audio policy's assistant, so no app can silence it. AAudio's timestamps leave a constant echo offset of 88 ms, where OpenSL's lag moves 50–60 ms between opens. An init service in `u:r:su:s0` records at boot and survives updates through addon.d. The mute button gates the mic in the kernel, but a tap clears the light without restoring the mic.
 
 ## 1. Identity and boot
 
@@ -212,11 +212,11 @@ A root process (uid 0, `u:r:su:s0`) opened the recorder and delivered audio with
 
 - **Repos and release:** `amazon-oss/android_device_amazon_crown` (lineage-18.1), `android_hardware_amazon` (lineage-18.1) and `android_device_amazon_mt8163-common`. Release `lineage-18.1-crown-v0.6` came out 2026-10-14.
 - **Kernel:** a 4.9 kernel taken from Amazon's Android 9 MT8163 tablets, with Android 9 blobs.
-- **Audio blobs:** `proprietary-files.txt:3-65` lists Amazon's `audio.primary.mt8163.so` (installed as `audio.primary_amazon.mt8163.so`), `libasp.so`, `libaspclient.so` and all of `audio-algorithms/`. They come from Fire OS NS6571/6190, so the hashes differ from this unit.
+- **Audio blobs:** `proprietary-files.txt:3-65` lists Amazon's `audio.primary.mt8163.so` (installed as `audio.primary_amazon.mt8163.so`), `libasp.so`, `libaspclient.so`, `libmediaextension.so` and all of `audio-algorithms/`. The HAL and the three libraries are **older** than this unit's stock: device a5b8429 and vendor 393ae56 pinned them to a Fire OS from before Alexa Plus. That `libasp.so` is 1,120,316 B with no TFLite dependency; stock's is 2,041,912 B. Only the `audio-algorithms` configs are NS6571 files. §8.4 has the hashes read on the device.
 - **Audio wrapper:** `vendor.prop` sets `ro.hardware.audio.primary=amazon_wrapper`, and `hardware/amazon/audio/hal/legacy/` wraps the Amazon HAL.
-  - `5dca03c` (2026-09-27), "Run Amazon's capture processing for mic captures": remaps `MIC`/`CAMCORDER` to `VOICE_COMMUNICATION`, because "the HAL has no pipeline for plain mics". It can be switched off with `amazon_noise_suppression=off`.
-  - `27b5346` (2026-10-14) passes the voice-call volume to ASP. `VOICE_RECOGNITION` is not remapped.
-  - The same batch reverted the +40 dB mic PGA boost (`d7cb939`).
+  - `5dca03c` (2026-09-27), "Run Amazon's capture processing for mic captures": remaps `MIC`/`CAMCORDER` to `VOICE_COMMUNICATION`, because "the HAL has no pipeline for plain mics". It is in v0.6 and cannot be switched off there: the switch, `amazon_noise_suppression=off`, came with `80a06c0` (2026-10-15), and v0.6's wrapper has no such key (§8.4).
+  - `27b5346` (committed 2026-10-14 19:01Z, after the v0.6 release at 15:40:58Z) passes the voice-call volume to ASP, but only in the Android 9 (`v28`) wrapper; crown builds the legacy one. `VOICE_RECOGNITION` is not remapped.
+  - The same batch reverted the +40 dB mic PGA boost (`d7cb939`). v0.6's raw mic level equals stock's (§8.4).
 - **Camera:** configured in the device trees since `3b57c27` / `a2c1cb1` (2026-09-04).
 - **Port notes:** SELinux permissive, deep sleep disabled, the mute button doubles as the power button, the battery is faked at 100%.
 
@@ -232,12 +232,190 @@ Measured on `lineage-18.1-crown-v0.5`, before the 09-27 wrapper change:
 
 ### 8.3 Open
 
-`VOICE_RECOGNITION` → ASR pipeline 0 on LineageOS is likely, because the wrapper passes the source through to the same HAL, but it is not measured. Also open:
-- whether the bit-0 metadata survives;
-- whether a root native recorder is allowed under Android 11's concurrent-capture rules;
-- whether the ASR path behaves without the Fire OS volume plumbing (crown's ASR path has no per-volume tables, so mainly `VOLUME` and the AVL would be affected [INFERENCE]).
+§8.4 answers the old questions (ASR routing, metadata, root capture under Android 11's rules, the ASR path without Fire OS's volume plumbing). Still open:
+- Double talk with a real talker over playback, and how to detect it without `DTD` (no metadata on v0.6).
+- Capture policy with an assistant role holder set (§8.4's table holds only while none is), and beside a privacy-sensitive capture such as a WebView `getUserMedia`.
+- AAudio `setPrivacySensitive(true)`, and the two long-run hazards AudioPolicy11 read in the sources: the HAL's 32-bit capture counter wraps after about 74.6 h of capture (AAudio stamps then go wrong until the stream is recreated), and audioserver aborts on `mRsmpInRear` overflow after about 37 h unless patch `frameworks/av/0004` is in. Neither long run was made.
+- Whether a later build (80a06c0, newer Amazon blobs) brings back the v3.3 metadata or stock's AEC depth.
+- Suspend with the screen off and no capture, off USB.
 
-The §4.4 probe answers all of these.
+### 8.4 Measured on lineage-18.1-crown-v0.6 (2026-10-17)
+
+Same unit, after the flash: `18.1-20261014-UNOFFICIAL-crown`, API 30, userdebug, SELinux permissive, adb root (uid 0, `u:r:su:s0`), setup wizard on screen, no Wi-Fi.
+
+**Method.**
+- **Probes:** `slprobe` (OpenSL, 8 × 256 frames; also 4 × 1,280), `aaprobe` (AAudio, `PERFORMANCE_MODE_NONE`, I16, 1,280-frame reads) and `sl_latency`. Stimuli, segments and trims as in §4.4 and §10.1. Besides `decode.py`, bit 0 was scanned for sync `0xA5` at every phase, with a histogram of the version and payload that follow.
+- **Clients:** uid 0 from the adb shell. uid 1000 and the Recorder's uid 10127 came from a throwaway `setgroups`/`setgid`/`setuid` + `exec` helper built with the NDK clang (not in the repo), because uid 0's non-VR captures are silenced (Q3).
+- **Volume:** set with `cmd media_session volume --stream 3 --set N`, read back with `service call audio 16 i32 3`. `sl_latency` reads the index with Fire OS code 8, which is `adjustSuggestedStreamVolume` here, so it ran with a `PATH` shim that forwarded only `service call audio 8` to code 16 and refused everything else.
+- **Cleanup:** `/data/local/tmp` was empty before and after. `STREAM_MUSIC` went back to 5, and `stay_on_while_plugged_in` back to 0 (it was set to 1 for the Recorder test). The two test recordings and their MediaStore rows were deleted, and so were the Recorder's `shared_prefs`, which the test launch had created. Logcat was cleared between runs.
+
+**Blobs on the device** (correction to §8.1):
+
+| File | Size, B | sha1 |
+|---|---|---|
+| `/system/vendor/lib/hw/audio.primary_amazon.mt8163.so` | 1,902,676 | `bb4f93e1…`, the pinned blob |
+| `/system/lib/libasp.so` | 1,120,316 | `f72d0891…`, the pinned blob |
+| `/system/lib/libaspclient.so` | 38,544 | `81df145c…` |
+| `/system/lib/libmediaextension.so` | 17,940 | `296480dc…` |
+| `/system/vendor/lib/hw/audio.primary.amazon_wrapper.so` | 10,140 | `1d081f37…` |
+| `audio-algorithms/AFE.cfg`, `asp.cfg` | — | `efd88d62…`, `b86a635f…` |
+
+- **`libasp.so`:** it NEEDs no TFLite or Edgeflow library, and the image has none. Its only metadata strings belong to the `MetaDataFile` debug dumps (`meta_*.wav`). No `audiosignalprocessor` binder service is registered.
+- **The wrapper** has no `amazon_noise_suppression` key and no "noise" string at all. So `GENERIC` was recorded as remapped, and `UNPROCESSED` from uid 1000 is the raw reference.
+
+**Q1/Q2: routing, format and metadata.** Every request was 16 kHz mono S16 and was granted as asked; thread and track were both 16 kHz mono PCM16, so no converter ran.
+
+| Preset (client) | AudioFlinger input | HAL source → ASP (logcat) | Output |
+|---|---|---|---|
+| `vr`, OpenSL, 256 or 1,280 frames (uid 0) | `AUDIO_INPUT_FLAG_FAST`, HAL frame count 80 (5 ms), FastCapture yes, `Timestamp stats: n=0` | 6 → `ASP/ASR: PipelineAsr … in 6 6 16000 out 1 1 16000 ref delay 0`, `ASP/ER: RegisterReader (asr)` | AEC'd mono. First buffer 202–210 ms after `RECORDING` (stock 197–206); gaps p50 14, p99 34–35, max 44 ms |
+| `vr`, AAudio (uid 0) | flags 0, HAL frame count 320 (20 ms), FastCapture no, timestamps n > 0 | same | same; first read after 250–255 ms |
+| `generic` (`MIC`) | as above, per API | **7** (the wrapper's remap) → `asp_command code=5` (`Current volume 30`), `code=3` (VoIP mode), `ASP/Conversion: PipelineVoice … ref 1` | uid 0: all zeros (`Sil s`, Q3). uid 1000: the VoIP output |
+| `vc` | as above | 7 → `PipelineVoice` | as `generic` |
+| `unprocessed` | as above | 9 → `ASP: Invalid pipeline type: -1` | uid 0: zeros. uid 1000: raw mono, no ASP; first buffer after 457–521 ms |
+
+- **`VOICE_RECOGNITION` reaches the ASR pipeline,** pipeline 0 by the HAL's mapping. This libasp has no `mPipelineId` log line; it logs the pipeline class instead.
+- **There is no bit-0 metadata of any version.**
+  - `decode.py` found 0 valid frames in every capture: 0/1,226 in 10 s, 0/23,726 in 190 s, 0/1,220 through AAudio.
+  - The scan found no phase where more than 13 of about 1,220 frames start with `0xA5`; chance alone gives about 10 at the best of 128 phases. `0xA5` sat at 584 bit offsets, against 613 expected from random bits, and bit 0 has no periodicity (autocorrelation ≤ 0.017). Bit 0 is audio.
+  - So `AFE_TIMESTAMP`, `PLAYBACK_ACTIVE`, `ERLE_RAW`, `DTD`, `DNN_VAD_PROB`, the clip flags and `VOLUME` do not exist on v0.6. The firmware's `afe` decoder and `slmic`'s anchoring have nothing to read (`sl_latency`: `anchored=0 at-completion=440`).
+- **The echo reference is aligned by loopback correlation,** although `asp.cfg` says `"Matching type": "none"`. On every VR or VC open with playback, the log runs `ASP/ER: Loopback signal is zero. Cannot synchronize yet`, then `No match found`, then `Synchronized. Slice n. Removing 7–453 samples`, 1.2–3.2 s after playback starts.
+- **ASP volume:** `setSpeakerVolumeIndex : 30` (`Vol_dB = -43 dB`) on every VC or `MIC` open, and nothing on `STREAM_MUSIC` changes. `ASP_CMD_GET_AFE_PLAYBACK_LATENCY` reports 36.2 ms for the speaker pipeline (`PipelineSpeaker in 1 2 48000`).
+
+**Q4: echo cancellation and mic level.**
+- **Method:** `stimulus.py loud` through an OpenSL player on `STREAM_MUSIC`, with §10.1's segments and trims. Burst onsets came 219–228 ms (raw) and 279–291 ms (VR) after enqueue in slprobe's completion convention; stock's were 226 and 285.
+- **Table:** levels in dBFS, as raw (`UNPROCESSED`, uid 1000) / residual (`VOICE_RECOGNITION`, uid 0) / reduction in dB.
+
+| Index (AudioFlinger dB) | Pink, converged | 1 kHz tone | Sweep top | Gated pink |
+|---|---|---|---|---|
+| 6 (−28) | −33.9 / −57.4 / 24 | −35.4 / −73.0 / 38 (floor) | −39.2 / −51.4 / 12 | −34.9 / −61.6 / 27 |
+| 9 (−17) | −22.6 / −41.2 / 19 | −23.4 / −59.2 / 36 | −27.8 / −28.3 / 1 | −24.8 / −47.0 / 22 |
+| 12 (−8.5) | −21.0 / −41.6 / 21 | −15.5 / −59.8 / 44 | −19.6 / −13.5 / −6 | −23.8 / −41.9 / 18 |
+| 15 (0) | −19.5 / −39.2 / 20 | −12.9 / −56.6 / 44 | −15.3 / −8.2 / −7 | −23.0 / −37.1 / 14 |
+
+- **AudioFlinger's attenuation** (`Stream volumes in dB`, stream 3) follows AOSP's speaker curve, (1, −58) (20, −40) (60, −17) (100, 0), over 0–15, as Platform11 predicted. Stock's curve is on record at one point only, 12/30 = −36 dB (§4.4), so the comparisons below match raw acoustic level instead.
+- **The mic gain and the speaker path at full scale are stock's.**
+  - Raw at 15/15 against stock at 30/30: pink −19.5 / −20.0, tone −12.9 / −12.4, sweep top −15.3 / −15.8, gated pink −23.0 / −23.1 dBFS.
+  - The limiter above −8.5 dB is there too: from 12 to 15, pink rose 1.5 dB and the tone 2.6 dB.
+  - The mic never clipped: raw peaks were −14.4, −9.4, −4.4 and −2.0 dBFS, with no full-scale sample. jxlarrea's +40 dB PGA (§8.2) is not in v0.6.
+- **Cancellation is weaker than stock: the residual sits 5–11 dB higher at equal acoustic level.**
+  - Lineage 12 against stock 24 (raw pink −21.0 / −21.9): residual pink −41.6 / −48.4, tone −59.8 / −66.4, gated pink −41.9 / −52.7.
+  - Lineage 15 against stock 30: pink −39.2 / −48.6, tone −56.6 / −61.8, gated pink −37.1 / −41.9.
+  - Reduction: pink 19–24 dB (stock 27–29), tone 36–44 (stock 37–49), gated pink 14–27 (stock 19–29).
+- **The uncancelled sweep comes out hotter:** at 15 the VR sweep top sits 7 dB over raw (stock +2 at 30), and the VR output hits full scale on 1,029 samples at 12 and 5,473 at 15, all in the sweep (stock: 189 at 30).
+- **Idle floor:** raw −59 to −68 dBFS (the room varied during the session), VR −69 to −73 (stock: −69 raw, −69 to −72 residual).
+- **`VOICE_COMMUNICATION`** (`PipelineVoice`, uid 1000; what the Recorder and every app `MIC` capture get since 5dca03c):
+  - idle −47 to −50 dBFS: its AGC lifts the room 10–20 dB over raw;
+  - during the programme it ducks: pink −60/−52/−40/−73, tone −48/−42/−43/−46, gated pink −59/−65/−66/−65 dBFS at 6/9/12/15;
+  - that is 13–53 dB under raw and not monotonic in volume. Against VR it is lower on the noise programmes at 9–15 (gated pink −65 against −37 to −47) but higher on the tone (−42 to −48 against −57 to −73) and at idle: suppression with AGC rather than cancellation [INFERENCE].
+- **Volume keys:** `KEYCODE_VOLUME_UP`/`DOWN` with nothing playing are dropped (`MediaSessionService: Nothing is playing on the music stream. Skipping volume event`).
+
+**Q3: capture policy.**
+- **(a) A uid 0 `VOICE_RECOGNITION` recorder is allowed,** with no AppOps or permission step.
+- **(b) uid 0 is the audio policy's assistant.**
+  - No app holds `android.app.role.ASSISTANT` (`dumpsys role`), and `voice_interaction_service` and `assistant` are unset.
+  - So `updateAssistantUId` hands its initial `assistantUid = 0` to `setAssistantUid` (LineageOS frameworks_base lineage-18.1 `AudioService.java:1684-1735`); `UidPolicy` also starts at 0.
+  - `updateUidStates_l` (`AudioPolicyService.cpp:474-704`) then treats our recorder as the assistant on TOP. It silences every other capture that is not the assistant's or an accessibility service's, and it allows the assistant only `VOICE_RECOGNITION` and `HOTWORD`.
+
+| First (holding the input) | Second | Second gets | First gets |
+|---|---|---|---|
+| our VR (uid 0) | uid 0 VR | audio | audio, untouched |
+| our VR | uid 0 `generic` | zeros (100 %, `Sil s`) | untouched; the source stays 6 |
+| our VR | app uid 10127 with the Recorder on top: OpenSL `generic`, then `vr` | zeros, both | untouched: 2,737 buffers in 44.0 s |
+| our VR | the Lineage Recorder recording (MediaRecorder, `MIC`, AAC 8 kHz) | a 9.5 s file of digital zero | untouched: 2,489 buffers in 40.0 s |
+| the Lineage Recorder recording | our VR | zeros while ours runs, audio again after it stops (the file: 7 s audio, 9 s zero, 7 s audio) | audio, but from **`PipelineVoice`** (−33 to −57 dBFS, AGC'd): the HAL stream was opened as `VOICE_COMMUNICATION` |
+| app uid 10127, OpenSL `generic` (FAST) | our VR | dead: our start re-patched the input (source 7 → 6), and its `AudioRecord` logged `restoreRecord_l … dead IAudioRecord` three times, then `processAudioBuffer: Error -32 … giving up`. It stayed stalled after ours stopped | audio, from `PipelineVoice` (−39 to −47 dBFS) |
+
+- **This is the opposite of AudioPolicy11's prediction** that a later foreground app silences us. Nothing an app did silenced our VR, and ours silenced every app in either start order. It holds only while no assistant is set [INFERENCE: with an assistant role holder, uid 0 is an ordinary TOP client and that prediction applies].
+- **What does go wrong is sharing.** The ASP pipeline is fixed when the HAL stream opens; the re-patch at each start (`input_source=7` or `6`) does not recreate it. So a VR client that joins an input an app opened with `MIC` gets the VoIP pipeline, without the ASR output, until the input goes to standby. A FAST app recorder can be killed by the re-patch.
+- **Other uids:** uid 0 cannot record `MIC`, `VOICE_COMMUNICATION` or `UNPROCESSED` at all (silenced as the assistant). As uid 2000, OpenSL fails with `Request denied by app op: 27`, because the shell uid is not in the foreground. uid 1000 works.
+- **Silencing gives zeros, not an error:** no callback and no status; `dumpsys media.audio_flinger` shows `Sil s`, and bit 0 is lost. Android 7.1's "the second recorder gets no buffers" (§10.2) no longer applies.
+- **(c) Screen off**, with §10.3's method: one 190 s VR capture, `KEYCODE_SLEEP` at 6 s, `KEYCODE_WAKEUP` at 166 s.
+
+| | Screen on | Screen off (160 s) |
+|---|---|---|
+| `mWakefulness`, display | `Awake`, `ON` | `Asleep`, `OFF` |
+| Capture | running | continuous: 11,863 buffers, 189.81 s of audio in 190.04 s, max gap 44.4 ms, 16,000.1 samples/s |
+| Wake locks | `PARTIAL_WAKE_LOCK 'AudioIn' (uid=1041 ws=WorkSource{0})`, `mHoldingWakeLockSuspendBlocker=true` | same |
+| `suspend_stats` success | 0 | 0 |
+
+Then 60 s with the screen off and no capture: no wake locks and `mHoldingWakeLockSuspendBlocker=false`, but still no suspend (`success: 0`; on mains and connected over USB).
+
+**Q6: timestamps.**
+- **OpenSL has none,** and on LineageOS it takes the FAST path (`flags 0x1`, FastCapture, `Timestamp stats: n=0`), so the HAL's capture position is never read. Without metadata there is no `AFE_TIMESTAMP` either.
+- **AAudio capture** (`PERFORMANCE_MODE_NONE`, `VOICE_RECOGNITION`):
+  - `getTimestamp` succeeded on 747 of 747 reads in 60 s; the implied rate is 16,000.13 Hz (+8 ppm). AudioFlinger's own stats for the thread: n 1,307, err 183.
+  - Each read's stamp scatters 15–16 ms p-p (sd 3.6–4.2 ms) around a straight line, which is one 256-frame ALSA period [INFERENCE]. A fit removes it.
+  - Completion lag (read return − stamped capture time of the read's last frame): min −7.9, median −4.9, max +12.7 ms. A negative lag is physically impossible, so the stamp runs about 5 ms late. The median was −4.5 to −5.0 ms over five opens; `UNPROCESSED` +4.2 ms, `MIC` and `VC` −8.8 ms.
+  - The record track's `Latency` column read −9 to +19 ms with `t`, so the HAL clock is CLOCK_MONOTONIC, as predicted.
+- **AAudio render:**
+  - The first timestamp after start is 72–96 ms off; every later one lies on a single line at exactly 48,000 Hz (the anchor stays constant to 0.1 ms over 19 s).
+  - The 10 priming writes before start return `AAUDIO_ERROR_INVALID_STATE`.
+  - aaprobe's `-m` render rate (−137 to −168 ppm) is an artefact of that first stamp.
+- **Acoustic lag left after both timestamps:** `stimulus.py echo` through AAudio `USAGE_MEDIA` at index 9, 1 kHz burst onsets, both timestamp streams fitted.
+
+| Capture | Run 1, ms | Run 2, ms | Run 3, ms |
+|---|---|---|---|
+| `UNPROCESSED` (uid 1000) | 52.3–52.8 | 52.7–53.1 | 53.0–53.3 |
+| `VOICE_RECOGNITION` (uid 0) | 87.5–88.0 (101.7) | 87.6–89.3 (102.7) | 86.5–89.1 |
+
+In brackets: the third burst, detected late at 21–24 dB SNR once the AEC had converged on 1 kHz. Using each read's own stamp instead of the fit scatters the raw lag by 5–9 ms.
+
+- **The firmware's OpenSL backend** (`sl_latency`; four runs with a tone at index 9, one with noise at index 12):
+  - Every period was stamped at completion, since there is no anchor.
+  - `pcm` lag median per run: +183.7, +128.2, +174.9 and +125.2 ms with the tone, +180.6 with noise. Within a run the bursts spread 20–65 ms; the empty-queue burst read +111 to +130.
+  - Stock (§10.7): +110.4 median (95–137) with a tone, +158.6 with noise.
+- **Recommendation: AAudio for both directions.**
+  - Settings: `PERFORMANCE_MODE_NONE`, I16, `dlopen("libaaudio.so")` (the firmware targets API 22).
+  - With render and capture timestamps, the echo sits at a constant offset from predicted playout: 53 ms raw, 88 ms VR, within 1 ms (raw) and 3 ms (VR) across three opens once both streams are fitted.
+  - OpenSL has lost both of its anchors here (FAST capture without timestamps, and no `AFE_TIMESTAMP`), and its lag moved 50–60 ms between opens.
+  - The 88 ms needs one loopback calibration per build [INFERENCE: it holds ASP's reported 36 ms speaker latency, the amp, the air path and the ASR pipeline].
+
+### 8.5 Platform on lineage-18.1-crown-v0.6 (measured 2026-10-17)
+
+**Flash.** `amonet-crown-v2.0.1`'s kaeru LK boots recovery from `swdl` (p11), where the unit already had TWRP 3.7.0_9-0 (gabontz "OTA-guard" build, SHA-1 `73d91718…`); the `recovery` partition (p10) holds Amazon's NS65741 recovery and is not used. `adb reboot recovery`, then `twrp wipe cache|dalvik|system|data`, `twrp install` of the release zip (SHA-256 `fd25da98…5891e`; it writes only `system` and `boot`). TWRP rebooted itself once, about 20 s after first entering it.
+
+**adb at first boot without the screen.** The build is userdebug with `ro.adb.secure=1` and `persist.sys.usb.config=none`. Before the first boot, from TWRP: `persist.sys.usb.config=adb` and `service.adb.root=1` appended to `/system/system/build.prop`, and the host's `adbkey.pub` installed as `/adb_keys` (`adb_keys_file`). First boot came up with root adb (uid 0, `u:r:su:s0`). adbd also listens on TCP 5555 (`init.mt8163.rc`), key-authenticated. Without these edits a person must enable USB debugging and "Rooted debugging" on screen, and `adb root` must be repeated after each reboot.
+
+**Detection.** `ro.product.device=crown` on both images. LineageOS: `ro.lineage.version=18.1-20261014-UNOFFICIAL-crown`, `ro.build.version.sdk=30`, `ro.build.version.name` empty; `/system/lib/libOpenSLES.so` and `libaaudio.so` present, no `libmixerAPI.so`, ABI list `armeabi-v7a,armeabi`. **Today's `platform.Detect` would classify LineageOS as Fire OS crown** (device name plus OpenSL), and the Fire OS volume check's `service call audio 10 i32 3` is `setStreamVolume` here [INFERENCE from the transaction table; not run]. Detection must test `ro.lineage.version` or the SDK level first.
+
+**Volume.**
+
+| | Fire OS crown (§10.5) | LineageOS |
+|---|---|---|
+| `STREAM_MUSIC` range | 0–30 | 0–15 (AOSP default; no `ro.config.media_vol_steps`) |
+| get / set / max codes | 8 / 3 / 10 | 16 / 10 / 18 (`setStreamVolume(int,int,int,String)`) |
+| Round trip | — | `service call audio 10 i32 3 i32 7 i32 0 s16 com.android.shell` → `service call audio 16 i32 3` read 7 |
+| Shell alternative | — | `cmd media_session volume --stream 3 --set N` works; `--get` prints only to logcat (`System.out`: `volume is 5 in range [0..15]`) |
+| `settings get` cost | ~1 s | 30 ms |
+| `settings_system.xml` | plain XML | plain XML; `volume_music_speaker` and the mtime follow a set within 3 s, a `cmd media_session` set not yet after 1 s |
+| Volume keys | adjust `STREAM_MUSIC` | adjust `STREAM_MUSIC` with the screen awake or while music plays; ignored with the screen off and nothing playing (6 → 5 on `KEYCODE_VOLUME_DOWN` while playing) |
+| ASP `VOLUME` | follows the index | no metadata on v0.6 (§8.4) |
+
+**Boot hook.** A test service in `/system/etc/init/emtest.rc` (`user root`, `group root audio`, `seclabel u:r:su:s0`, started on `sys.boot_completed=1`) ran in `u:r:su:s0` with gid `audio` and recorded `VOICE_RECOGNITION` through AAudio at boot (60 reads, 0 xruns, room floor −68 dBFS). No `adbd` → `su` move is needed: `su` is a defined, permissive domain in this userdebug policy. `/` was remounted rw with `mount -o remount,rw /` (no verity, no overlayfs).
+
+**Surviving an update.** With an addon.d v2 script `/system/addon.d/50-emtest.sh` (Lineage's `backup_file`/`restore_file` for `etc/init/emtest.rc`, plus copying `/adb_keys` and re-appending the two adb properties in `post-restore`), a dirty flash of the same zip in TWRP (`backuptool.sh` backup → `block_image_update` → restore) kept the `.rc`, the addon.d script, `/adb_keys` and the properties; the service ran again on the next boot and adb stayed root. A clean flash (system wiped) keeps nothing. Test files were removed afterwards; the adb properties and `/adb_keys` remain, unprotected by any addon.d script.
+
+**Mute button** (pressed by the user, `VOICE_RECOGNITION` capture of 4 s after each step, `/sys/devices/platform/amazon-gating/state`, gating dmesg and `getevent`).
+
+| Step | Light | `state` | Kernel | Capture |
+|---|---|---|---|---|
+| Baseline | off | 0 | — | −67.9 dBFS, 6.8% zero samples |
+| Hold 1.9 s | red | 1 | `disable MIC with gating mode callback`; pinctrl `mic-disable` | −84.4 dBFS, 97.3% zero |
+| Tap 0.13 s | off | 0 | press events only, no callback | **100% zero** |
+| Hold 1.5 s | off | 0 | `enable MIC`; pinctrl `mic-enable` | −57.3 dBFS, 3.6% zero |
+| Hold, then `adb reboot` | red | 1 after boot | `Failed to enable CAM, GATING Mode is ON`; `cam_pwr_gate_pin` out high | 100% zero |
+| Hold after the reboot | stayed red | 1 | no interrupt counted on the `gating` IRQ | 100% zero |
+| Tap, then hold 1.5 s | off | 0 | tap: events only; hold: `enable MIC` | −59.3 dBFS, 4.0% zero |
+
+- **Muting is real and survives a reboot:** the latch holds and the capture is digital silence.
+- **A tap un-mutes the light but not the mic.** The latch clears in hardware on any press, but the kernel restores the mic GPIO only on a long press, so after a tap the light is off and capture stays at zeros. A firmware on LineageOS must treat `state=0` with a zero-signal capture as muted, or the user must be told to hold the button.
+- The button sends `KEY_POWER` (input device `gating`, `Generic.kl`): a tap sleeps or wakes the screen, a hold opens the power menu.
+- One hold after the reboot registered no interrupt at all; the retry worked. Unexplained.
+- After the reboot `cam_pwr_gate_pin` stayed high (camera power off) once un-muted, jxlarrea's camera symptom (§8.2); not investigated.
+
+**Ambient light.** The Android sensor list has one sensor, "Light Sensor" (`amazon-oss`). The stock sysfs path exists: `/sys/bus/platform/drivers/als_ps/lux`, format `N lux`. With nothing listening it read `0 lux` three times; after `echo 1 > enable_als_polling` it read `15 lux`, and the value stayed cached at 15 after `echo 0`. A reader on LineageOS has to enable polling (or register for the sensor); today's reader would report 0.
+
+**Screen off.** §8.4: 190 s of `VOICE_RECOGNITION` capture, 160 s of it with the screen off, had no gap over 44.4 ms; the device did not suspend (on mains and USB).
 
 ## 9. Alexa takeover surface: what to hide
 

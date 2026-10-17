@@ -137,6 +137,90 @@ buffer completed. `--csv` dumps every frame. `stimulus.py` writes the
 `docs/echo-show-crown.md` §4.4 stimulus (`echo`) or the louder Phase 0
 programme (`loud`).
 
+# aaprobe — AAudio capture/playback timestamp probe (LineageOS 18.1, Echo Show 8 `crown`)
+
+slprobe's AAudio counterpart for Android 11 (API 30, 32-bit userspace). It
+writes the same `PREFIX.raw` and a `PREFIX.ts` in slprobe's format, so
+`slprobe/decode.py` reads it. It also logs AAudio's own capture and render
+timestamps, which puts the two timelines on one clock.
+
+- **Capture:** an AAudio input stream (shared, `-P` performance mode, `-p`
+  input preset, I16 at `-r` Hz × `-c` channels, 16 kHz mono by default), read
+  in blocking reads of `-f` frames (1280 = 80 ms). After each full buffer the
+  probe records `CLOCK_MONOTONIC`, the frames read so far,
+  `AAudioStream_getFramesRead`, `AAudioStream_getTimestamp(CLOCK_MONOTONIC)`
+  (`framePosition`, `timeNanos`, or the error) and `AAudioStream_getXRunCount`.
+  `PREFIX.raw` is the capture exactly as read, bit 0 included (interleaved if
+  `-c` > 1; `decode.py` reads channel 0).
+- **Granted configuration:** printed after open and kept in the `.ts` header:
+  rate, channels, format, buffer capacity, burst, buffer size, input preset,
+  session id, performance and sharing mode, device. AAudio can change the rate
+  (the legacy path takes `AudioRecord`'s), and any resampling destroys the
+  bit-0 metadata, so the probe warns when the rate, channels or preset differ
+  from the request. It refuses a non-I16 stream. A granted 16 kHz does not
+  prove that nothing resampled below AAudio; `decode.py`'s count of valid
+  frames does.
+- **Playback (optional, `-i`):** an AAudio output stream (`-s` usage, `media`
+  by default, optional `/content`) at the stimulus's own rate and channels.
+  It primes with non-blocking writes, starts `-D` ms after capture, and then
+  writes `-b` ms at a time, blocking. Each write is stamped like a read, with
+  `getFramesWritten` and the output timestamp. Stream frame *f* plays at
+  `timeNanos + (f − framePosition) / rate`, on the capture timestamps' clock.
+- **Paths:** AAudio takes the MMAP path only for `-P lowlat` without `-A`
+  (`AudioStreamBuilder::build`). Otherwise it uses the legacy
+  `AudioRecord`/`AudioTrack` path, whose timestamp is the best
+  `ExtendedTimestamp` location AudioFlinger reports
+  (`AudioStreamLegacy::getBestTimestamp`). The legacy path ignores read and
+  write timeouts, so the main thread supervises: it prints a status line per
+  second (reads, RMS, digital-zero fraction, xruns, the last read's
+  completion lag, player state), reports `STALL`/`capture resumed`, and ends
+  the run on `-d`, SIGINT/SIGTERM or a failed read by stopping the streams.
+- **`-m`:** prints every capture timestamp for the first `-x` seconds (`0` =
+  whole run). It then summarizes the window for both streams, on stdout and
+  as `# m` lines in the `.ts`. For each stream it reports how many
+  `getTimestamp` calls succeeded (with the first error), the rate implied by
+  the distinct (`framePosition`, `timeNanos`) pairs and by the call returns
+  (drift, in ppm of the nominal rate), and min/median/max of the
+  **completion lag** (read return − timestamp-derived capture time of the
+  read's last frame) or the **write lead** (timestamp-derived playout time of
+  the write's last frame − write return). It also gives the capture frame at
+  which stimulus frame 0 plays. Frame positions and the probe's own frame
+  count share an origin only while `xruns` stays 0. The summary also counts
+  `getFramesRead`/`getFramesWritten` disagreements.
+
+`.ts` records (full description in the source header). The first three
+columns of `R` and `P` are slprobe's, so `decode.py` parses the file
+unchanged:
+
+```
+T0 <ns>                                       capture requestStart returned
+R <seq> <ns> <total> <framesRead> <res> <pos> <tns> <xruns>
+P <frame> <frames> <ns> <sframe> <framesWritten> <res> <pos> <tns> <xruns>
+PS <ns> / PE <ns>                             output started / stimulus done
+X stall|resumed <ns>, X rerror|perror <res> <ns>
+```
+
+`<res>` is the `getTimestamp` result (0 = `AAUDIO_OK`); `<pos> <tns>` are
+`-1 -1` unless it is 0. `P`'s `<frame>` is the stimulus frame and `<sframe>`
+the output stream frame. `P` stamps are write returns rather than OpenSL
+enqueues, so `decode.py --stim-seg` on an aaprobe capture needs an explicit
+`--latency`.
+
+`build_tools.sh` builds it with the same NDK's API 30 clang
+(`armv7a-linux-androideabi30-clang`, `-laaudio`); it only has to run on
+Android 11. Options: `aaprobe -h`.
+
+```bash
+adb push build/aaprobe /data/local/tmp/aaprobe
+adb shell /data/local/tmp/aaprobe -p vr -m -x 10 -d 10 -o /data/local/tmp/aa      # capture only
+python3 tools/slprobe/stimulus.py loud loud.wav
+adb push loud.wav /data/local/tmp/
+adb shell /data/local/tmp/aaprobe -p vr -d 29 -m -x 0 -i /data/local/tmp/loud.wav -o /data/local/tmp/aa
+adb pull /data/local/tmp/aa.raw /data/local/tmp/aa.ts .
+python3 tools/slprobe/decode.py aa      # metadata validity is the resampling test
+adb shell 'rm /data/local/tmp/aaprobe /data/local/tmp/loud.wav /data/local/tmp/aa.*'
+```
+
 # sl_latency — render-to-capture lag through the firmware's own audio path (Echo Show 8, `crown`)
 
 Measures what `internal/opensl`'s `playPipelineNs` is a bound for

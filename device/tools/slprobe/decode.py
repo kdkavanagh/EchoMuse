@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Decode an slprobe capture: PREFIX.raw (S16LE mono) + PREFIX.ts.
+"""Decode an slprobe or aaprobe capture: PREFIX.raw (S16LE) + PREFIX.ts.
 
 Recovers Amazon's v3.3 AFE metadata from bit 0 with the firmware decoder's
 rule (device/internal/audio/afe/afe.go): one 128-bit frame per 128 samples,
@@ -21,6 +21,12 @@ takes a capture sample's time as its buffer's completion, so the latency is
 the onset's delay in that convention: about 0.226 s for GENERIC and 0.285 s
 for VOICE_RECOGNITION (the ASP path adds about 60 ms), measured on
 G6G16D12143203LD from 1 kHz burst onsets; the default follows the preset.
+
+aaprobe (device/tools/aaprobe) writes the same files with AAudio timestamp
+columns appended to its R and P lines, which this decoder skips (aaprobe -m
+summarizes them); a capture of more than one channel is read on channel 0.
+Its P stamps are write returns, not OpenSL enqueues, so --stim-seg needs an
+explicit --latency for it.
 
   decode.py /tmp/cap                     # 1 s windows
   decode.py /tmp/cap --stim-seg loud.seg # stimulus segments
@@ -106,11 +112,16 @@ def main():
     hdr, t0, rec, play, ps, pe, events, marks = read_ts(a.prefix + ".ts")
     rate = int(hdr.get("rate", 16000))
     per = int(hdr.get("frames", 256))
+    ch = int(hdr.get("channels", 1))
     pcm = np.fromfile(a.prefix + ".raw", dtype="<i2")
+    if ch > 1:
+        pcm = pcm[:len(pcm) // ch * ch].reshape(-1, ch)[:, 0]
     bits = (pcm & 1).astype(np.uint8)
     lvl = (pcm & ~1).astype(np.float64) / 32768.0
+    queue = f" x {hdr['nbuf']}" if "nbuf" in hdr else ""
     print(f"{a.prefix}: {len(pcm)} samples ({len(pcm) / rate:.2f} s), preset {hdr.get('preset')}, "
-          f"{per}-frame buffers x {hdr.get('nbuf')}, context {hdr.get('context')}")
+          f"{per}-frame buffers{queue}" + (f", channel 0 of {ch}" if ch > 1 else "")
+          + f", context {hdr.get('context')}")
 
     # Capture timing.
     if len(rec):
@@ -191,6 +202,8 @@ def main():
         ns0 = rec[0, 1]
         k, c = np.polyfit((rec[:, 1] - ns0).astype(np.float64), ((rec[:, 0] + 1) * per).astype(np.float64), 1)
 
+        if a.latency is None and hdr.get("api") == "aaudio":
+            sys.exit("--stim-seg on an aaprobe capture needs --latency (the defaults are slprobe's)")
         latency = a.latency if a.latency is not None else (0.285 if hdr.get("preset") == "3" else 0.226)
 
         def stim_to_cap(t):

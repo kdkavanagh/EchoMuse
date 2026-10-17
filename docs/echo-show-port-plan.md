@@ -1,6 +1,6 @@
 # Echo Show 8 (`crown`) port: plan
 
-**Status:** 2026-10-17. Phases 0–5 are implemented in the tree, and Phase 3 is applied on G6G16D12143203LD (findings §9.5). §6 lists what is done, what was measured on the device, and what still needs the user.
+**Status:** 2026-10-17. Phases 0–5 are implemented in the tree and were measured on G6G16D12143203LD under Fire OS. That unit has since been flashed to LineageOS 18.1 v0.6 to answer Phase 6's questions (findings §8.4–8.5), so the Fire OS phases can no longer be re-run on it without returning to stock. §6 lists the status.
 **Evidence:** [echo-show-crown.md](echo-show-crown.md). Section numbers written as "findings §N" refer to it.
 **Goal:**
 - The Show is an EchoMuse voice satellite: wake word, capture, replies, timers and alarms.
@@ -15,10 +15,7 @@
 
 ## 0. Current state and authorisation (2026-10-17)
 
-**Device state.**
-- **Wi-Fi:** joined by the user from the device itself; one saved network; `wlan0` 192.168.3.159. EchoMuse played no part, consistent with decision 7.
-- **Clock:** the wall clock moved from the build-time floor to the correct date after joining. The time source was not identified.
-- **Setup:** OOBE hidden by Phase 3 (`device_provisioned=1`, `user_setup_complete=1`); Fully Kiosk 1.61.4 (free) is HOME and Simple Keyboard the IME. Still unregistered (findings §6, §9.5).
+**Device state.** LineageOS 18.1 since 2026-10-17: a local lineage-18.1 build with the NS6571 `libasp.so` (findings status line; upstream draft PR amazon-oss/android_device_amazon_crown#2), root adb over USB seeded from TWRP (findings §8.5). Setup wizard on screen, no Wi-Fi, no kiosk. The Fire OS state (Wi-Fi joined from the device, Phase 3 applied, Fully Kiosk and Simple Keyboard) was wiped by the flash.
 
 **Authorised.**
 - Writes to `/system`, for example Phase 0 item 5's test `.rc`. Test artefacts are removed after each test.
@@ -41,7 +38,7 @@
 | Phase 3 | yes, with the free Fully build | the Fully PLUS licence (camera motion detection) for that acceptance item |
 | Phase 4 code | yes | a real wizard run (WebUSB in the user's browser) |
 | Phase 5 code, docs, tests | yes | — |
-| Phase 6 (LineageOS) | — | backup and reflash |
+| Phase 6 (LineageOS) | measurements done (findings §8.4–8.5) | the mute button (done with the user); a decision to build the variant |
 | Decisions: §5 open questions, platform name `fireos6_crown` | — | yes |
 
 ## 1. Why this is a port
@@ -230,20 +227,33 @@ Rebuild the findings §4.4 probe as `device/tools/slprobe` (C, built by `build_t
 
 **Acceptance:** CI green (pytest, `go test`, `go vet`, mypy). The dashboard shows the Show with ring controls disabled, and Wi-Fi and BLE proxy controls disabled with "managed by the device".
 
-### Phase 6 (optional): LineageOS 18.1 variant
+### Phase 6 (optional): LineageOS 18.1 variant, alongside Fire OS
 
-Gated on the Phase 0 probe re-run on LineageOS v0.6 or later. This needs a full `dd` backup first and a reflash (findings §8):
-1. Does `VOICE_RECOGNITION` reach pipeline 0 through `amazon_wrapper`?
-2. Does the metadata survive?
-3. Is a root native recorder permitted under Android 11?
+LineageOS is a third platform beside the Dot and Fire OS crown, not a replacement. The gate questions were measured on v0.6 (findings §8.4–8.5):
 
-If all three hold, add a platform value with an AAudio backend: `AAudioStreamBuilder_setInputPreset(VOICE_RECOGNITION)` and real `AAudioStream_getTimestamp` on both directions. That replaces decision 4's metadata anchoring.
+| Question | Answer on v0.6 | Consequence |
+|---|---|---|
+| Does `VOICE_RECOGNITION` reach Amazon's ASR pipeline? | Yes: `PipelineAsr`, 16 kHz mono S16, no converter | the capture path is the same as on Fire OS |
+| Does the bit-0 metadata survive? | **No metadata at all** (0 valid frames, no sync byte at any phase); the blobs are older than stock's | no `afe_metadata_v1`, no `AFE_TIMESTAMP` anchoring, no `PLAYBACK_ACTIVE`/`DTD` evidence |
+| Echo cancellation and mic level | Mic gain and full-volume speaker level within 0.5 dB of stock; cancellation 5–11 dB weaker (pink 19–24 dB vs 27–29) | more echo leaks into wake and barge-in; the controller's attribution carries more of the load |
+| Is a root native recorder allowed? | Yes; uid 0 is the policy's assistant, so it is never silenced, and every app capture gets zeros while it runs. An app that opened the mic first leaves us on the voice-call pipeline | the kiosk can't use the mic while EchoMuse records; `getUserMedia` in the dashboard gets silence |
+| Timestamps | AAudio capture and render `getTimestamp` work; the echo sits 88 ms (VR) after predicted playout, stable within 3 ms across opens. OpenSL has none and drifts 50–60 ms between opens | backend: AAudio both directions, `dlopen("libaaudio.so")`, `PERFORMANCE_MODE_NONE`, a per-build latency constant |
+| Volume | `STREAM_MUSIC` 0–15; codes 16 get, 10 set (with a package string), 18 max; `settings` is cheap | a second `androidvol` code table and scale |
+| Boot hook and updates | `seclabel u:r:su:s0` works directly (no `adbd` → `su` move); an addon.d v2 script keeps the `.rc` across a LineageOS update | `.rc` + `/system/addon.d/NN-echomuse.sh`; a clean flash needs the wizard again |
+| Mute | Kernel gates the mic on a long press, latch survives reboot; a tap clears the light but leaves the mic at zeros | `privacy_mute` is possible: read `amazon-gating/state`, and tell the user to hold the button to un-mute |
+| Ambient light | Same sysfs `lux`, but stale until `enable_als_polling=1` | the reader enables polling on LineageOS |
+| Root adb for the wizard | userdebug, but USB debugging and "Rooted debugging" are off by default; `adb root` is not persistent | the wizard needs the user to enable both on screen once, or the TWRP seeding of findings §8.5 |
+
+**Before any LineageOS device meets the current firmware:** `platform.Detect` classifies LineageOS as Fire OS crown (`ro.product.device=crown` plus OpenSL), and the Fire OS volume check's `service call audio 10` is `setStreamVolume` there. The wizard's NS65741 build pin keeps the firmware off LineageOS today; the variant must detect `ro.lineage.version` first.
+
+Still open on LineageOS: double talk, capture policy with an assistant role holder set, the long-run counter wrap and resampler hazards (findings §8.3), whether a later build brings the metadata back, and a multi-day soak.
 
 ### Phase 7 (deferred): Mute
 
 - Phase 0 item 4: what the `amazon-gating` button does to capture at the source.
 - The `amazon-gating` reader (decision 9): privacy blocks capture and is reported.
-- Note jxlarrea's finding that a long press latches camera power off until mains is removed (findings §8.2). On stock this is Amazon's driver behaviour, untested here.
+- jxlarrea's camera-power latch (findings §8.2) reproduces on LineageOS: after a reboot while muted, camera power stays off once un-muted (findings §8.5). On stock it is Amazon's driver behaviour, untested here.
+- On LineageOS a tap clears the light without restoring the mic (findings §8.5); check whether stock's driver does the same.
 
 **Acceptance:** mute in both directions, and across a reboot, never shows a live mic while muted.
 
@@ -282,4 +292,5 @@ If all three hold, add a platform value with an AAudio backend: `AAudioStreamBui
 | 3 | `crown_hide_packages.txt` (26), `crown_hide_packages_tier2.txt`, `crown_mic_deny_packages.txt` | Tier 1 applied and corrected, 25-minute soak clean (findings §9.5) | Fully motion wake (PLUS), joining another Wi-Fi network and pairing Bluetooth on screen, a power-cycle cold boot, Tier 2 |
 | 4 | `start_server.sh` crown branch, `.rc`, wizard steps in `dashboard.jsx`, crown diagnostics probes | the `.rc` stanza and the `su` move (findings §10.4) | a real wizard run, then a cold boot talking to the controller |
 | 5 | `DevicePlatform.FIREOS6_CROWN`, capabilities `wifi_control`, `ble_proxy`, `privacy_mute`, `screen_wake`, capability gaps in the dashboard, null volume, docs | — | the dashboard against the live Show |
-| 6, 7 | — | — | LineageOS reflash; mute |
+| 6 | — | all gate questions (findings §8.4–8.5) | decide whether to build the LineageOS variant |
+| 7 | — | the LineageOS mute behaviour (findings §8.5) | mute on stock Fire OS |
