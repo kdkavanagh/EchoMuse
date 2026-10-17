@@ -468,21 +468,21 @@ class _Host:
                           f"Connected from {device.ip} version={device.firmware_version}")
         await api.notify_device_connected(_shell, did, device.firmware_version, firmware=firmware())
         await esphome.device_connected(
-            did, label=device.label, capabilities=device.capabilities,
+            did, label=device.label, capabilities=device.capabilities, platform=device.platform,
             hooks=esphome.Hooks(
                 announce=lambda url, pre, pre_url, sc: device.actor.announce(
                     url, preannounce=pre, preannounce_url=pre_url, start_conversation=sc),
-                set_volume=lambda level: device.send(MessageType.VOLUME_SET, {"level": level}),
+                set_volume=device.set_volume,
                 stop_alert=lambda: _stop_alert(did),
                 timer_event=functools.partial(alerts().on_timer_event, did),
                 attached=lambda: _satellite_attached(did),
             ),
             volume=None if device.volume is None else _ha_volume(device.volume),
+            volume_control=device.volume_available,
             ambient_lux=lux if isinstance(lux := (device.stats or {}).get("ambientLux"), int) else None,
             voice_phase=device.actor.state.phase,
         )
-        await em_ble_proxy.device_connected(did)
-        await em_ble_proxy.reconcile(did)
+        await em_ble_proxy.device_connected(did, ble_proxy=device.ble_proxy_capable)
         await _provision(device)
         await _restore_modes(device)
 

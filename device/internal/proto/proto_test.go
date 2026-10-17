@@ -59,18 +59,57 @@ func TestHelloAmbientLightStatus(t *testing.T) {
 	}
 }
 
-// session.hello names the image as the controller parses it: always
-// "fireos6", always present on the wire.
+// session.hello names the image as the controller parses it: "fireos6" on
+// the Dot, "fireos6_crown" on the Fire OS Show, "lineage18_crown" on the
+// LineageOS Show, always present on the wire.
 func TestHelloPlatform(t *testing.T) {
-	var m map[string]json.RawMessage
-	b, err := json.Marshal(SessionHello{Platform: PlatformFireOS6})
-	if err != nil {
-		t.Fatal(err)
+	for p, want := range map[Platform]string{
+		PlatformFireOS6: `"fireos6"`, PlatformFireOS6Crown: `"fireos6_crown"`, PlatformLineage18Crown: `"lineage18_crown"`,
+	} {
+		var m map[string]json.RawMessage
+		b, err := json.Marshal(SessionHello{Platform: p})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(b, &m); err != nil {
+			t.Fatal(err)
+		}
+		if got := string(m["platform"]); got != want {
+			t.Errorf("platform encodes as %s, want %s", got, want)
+		}
 	}
-	if err := json.Unmarshal(b, &m); err != nil {
-		t.Fatal(err)
+}
+
+// The optional platform capabilities carry the names the controller gates
+// its Wi-Fi, BLE proxy, mute and screen wake controls on.
+func TestPlatformCapabilityNames(t *testing.T) {
+	for c, want := range map[Capability]string{
+		CapWifiControl: "wifi_control", CapBLEProxy: "ble_proxy",
+		CapPrivacyMute: "privacy_mute", CapScreenWake: "screen_wake",
+	} {
+		if string(c) != want {
+			t.Errorf("capability %q, want %q", c, want)
+		}
 	}
-	if got := string(m["platform"]); got != `"fireos6"` {
-		t.Errorf("platform encodes as %s, want \"fireos6\"", got)
+}
+
+// hello volume.level is a number, or JSON null (never omitted) when the
+// device cannot control volume this run.
+func TestHelloVolumeEncoding(t *testing.T) {
+	level := 85
+	for _, tc := range []struct {
+		v    Volume
+		want string
+	}{
+		{Volume{Level: &level, Seeded: true}, `{"level":85,"seeded":true}`},
+		{Volume{}, `{"level":null,"seeded":false}`},
+	} {
+		got, err := json.Marshal(tc.v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != tc.want {
+			t.Errorf("volume encodes as %s, want %s", got, tc.want)
+		}
 	}
 }

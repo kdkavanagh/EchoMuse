@@ -633,13 +633,16 @@ def test_the_wizard_probe_list_matches_the_allowlist():
 
     Parsed out of the JSX because the dashboard compiles to a single classic
     script with no module boundary to import across, the same reason
-    CONFIG_SECTIONS is mirror-checked rather than shared.
+    CONFIG_SECTIONS is mirror-checked rather than shared. The wizard keeps
+    the common probes in `_PROVISION_PROBES` and each platform's own in
+    `_PROVISION_PROBES_<PLATFORM>`; every block counts.
     """
     jsx = (Path(__file__).resolve().parent.parent
            / "static" / "dashboard.jsx").read_text()
-    block = re.search(r"const _PROVISION_PROBES = \{(.*?)\n  \};", jsx, re.S)
-    assert block, "dashboard.jsx no longer defines _PROVISION_PROBES"
-    in_jsx = set(re.findall(r"^\s*([a-z_]+):", block.group(1), re.M))
+    blocks = re.findall(r"const _PROVISION_PROBES(?:_[A-Z]+)? = \{(.*?)\n  \};", jsx, re.S)
+    assert blocks, "dashboard.jsx no longer defines _PROVISION_PROBES"
+    in_jsx = {name for block in blocks
+              for name in re.findall(r"^\s*([a-z][a-z0-9_]*):", block, re.M)}
     in_py = {str(p) for p in S.ProvisionProbe}
 
     assert not (in_jsx - in_py), (
@@ -648,3 +651,12 @@ def test_the_wizard_probe_list_matches_the_allowlist():
     assert not (in_py - in_jsx), (
         f"em_support allows {sorted(in_py - in_jsx)}, which the wizard never "
         f"collects")
+
+
+def test_config_redaction_hides_the_kiosk_url_and_password():
+    """screenWakeUrl (an Echo Show's kiosk API) can name a LAN address, and
+    the bundle carries no network identifiers; its password is a credential."""
+    out = S.redact_config({"screenWake": True, "screenWakeUrl": "http://192.168.3.159:2323",
+                           "screenWakePassword": "hunter2"})
+    assert out == {"screenWake": True, "screenWakeUrl": "<redacted>",
+                   "screenWakePassword": "<redacted>"}

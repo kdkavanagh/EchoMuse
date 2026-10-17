@@ -1,10 +1,11 @@
 """The device firmware bundled with this controller.
 
-The controller installs exactly one firmware build on Dots: the `server`
-binary in FIRMWARE_DIR, with the `version` file beside it naming the string
-compiled into it as client.Version (what the Dot reports in session.hello
-`firmware_version`). The image carries both at /app/firmware; bare metal
-points FIRMWARE_DIR at device/build, which device/compile.sh fills.
+The controller installs exactly one firmware build on every device, the Dot
+and the Echo Show alike (the binary picks its platform at runtime): the
+`server` binary in FIRMWARE_DIR, with the `version` file beside it naming the
+string compiled into it as client.Version (what a device reports in
+session.hello `firmware_version`). The image carries both at /app/firmware;
+bare metal points FIRMWARE_DIR at device/build, which device/compile.sh fills.
 """
 
 from __future__ import annotations

@@ -1,7 +1,8 @@
 // Package config holds the controller-tunable device settings carried by the
 // retained `config` message (WIRE §4.8): startupVolume, duckDb,
-// bleProxyEnabled and wakeSound. Wake model, runtime, thresholds and hop
-// arrive in session.ready instead (SPEC §16.1, §18.2).
+// bleProxyEnabled, wakeSound and, for screen_wake devices, screenWake,
+// screenWakeUrl and screenWakePassword. Wake model, runtime, thresholds and
+// hop arrive in session.ready instead (SPEC §16.1, §18.2).
 package config
 
 import (
@@ -16,14 +17,19 @@ const (
 	// DefaultDuckDB is duckDb (SPEC §6.2): dialog ducks content by this
 	// much, and the provisional duck uses the same depth (§16.6).
 	DefaultDuckDB = -18.0
+	// DefaultScreenWakeURL is Fully Kiosk's local REST API on the Show.
+	DefaultScreenWakeURL = "http://127.0.0.1:2323"
 )
 
 // Message is the `config` body. Absent fields leave the current value.
 type Message struct {
-	StartupVolume   *int     `json:"startupVolume,omitempty"`
-	DuckDB          *float64 `json:"duckDb,omitempty"`
-	BLEProxyEnabled *bool    `json:"bleProxyEnabled,omitempty"`
-	WakeSound       *bool    `json:"wakeSound,omitempty"`
+	StartupVolume      *int     `json:"startupVolume,omitempty"`
+	DuckDB             *float64 `json:"duckDb,omitempty"`
+	BLEProxyEnabled    *bool    `json:"bleProxyEnabled,omitempty"`
+	WakeSound          *bool    `json:"wakeSound,omitempty"`
+	ScreenWake         *bool    `json:"screenWake,omitempty"`
+	ScreenWakeURL      *string  `json:"screenWakeUrl,omitempty"`
+	ScreenWakePassword *string  `json:"screenWakePassword,omitempty"`
 }
 
 // Values is one consistent snapshot of the settings.
@@ -34,6 +40,12 @@ type Values struct {
 	// WakeSound plays the wake chime locally the moment an idle wake
 	// candidate opens (local_wake_chime).
 	WakeSound bool
+	// ScreenWake lights the kiosk screen through Fully Kiosk's REST API at
+	// ScreenWakeURL when a wake candidate opens (screen_wake). Off by
+	// default.
+	ScreenWake         bool
+	ScreenWakeURL      string
+	ScreenWakePassword string
 }
 
 // Device is the live configuration. It is safe for concurrent use.
@@ -43,18 +55,23 @@ type Device struct {
 }
 
 // New returns the configuration seeded from the environment
-// (STARTUP_VOLUME, DUCK_DB, BLE_PROXY_ENABLED, WAKE_SOUND) or the defaults.
+// (STARTUP_VOLUME, DUCK_DB, BLE_PROXY_ENABLED, WAKE_SOUND, SCREEN_WAKE,
+// SCREEN_WAKE_URL, SCREEN_WAKE_PASSWORD) or the defaults.
 func New() *Device {
 	return &Device{v: Values{
-		StartupVolume:   envInt("STARTUP_VOLUME", DefaultStartupVolume),
-		DuckDB:          envFloat("DUCK_DB", DefaultDuckDB),
-		BLEProxyEnabled: envBool("BLE_PROXY_ENABLED", false),
-		WakeSound:       envBool("WAKE_SOUND", false),
+		StartupVolume:      envInt("STARTUP_VOLUME", DefaultStartupVolume),
+		DuckDB:             envFloat("DUCK_DB", DefaultDuckDB),
+		BLEProxyEnabled:    envBool("BLE_PROXY_ENABLED", false),
+		WakeSound:          envBool("WAKE_SOUND", false),
+		ScreenWake:         envBool("SCREEN_WAKE", false),
+		ScreenWakeURL:      envString("SCREEN_WAKE_URL", DefaultScreenWakeURL),
+		ScreenWakePassword: os.Getenv("SCREEN_WAKE_PASSWORD"),
 	}}
 }
 
 // Apply merges a pushed message and returns the result. A startupVolume
-// below zero is ignored; duckDb above zero would amplify and is clamped to 0.
+// below zero is ignored; duckDb above zero would amplify and is clamped to 0;
+// an empty screenWakeUrl restores the default.
 func (d *Device) Apply(m Message) Values {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -69,6 +86,18 @@ func (d *Device) Apply(m Message) Values {
 	}
 	if m.WakeSound != nil {
 		d.v.WakeSound = *m.WakeSound
+	}
+	if m.ScreenWake != nil {
+		d.v.ScreenWake = *m.ScreenWake
+	}
+	if m.ScreenWakeURL != nil {
+		d.v.ScreenWakeURL = *m.ScreenWakeURL
+		if d.v.ScreenWakeURL == "" {
+			d.v.ScreenWakeURL = DefaultScreenWakeURL
+		}
+	}
+	if m.ScreenWakePassword != nil {
+		d.v.ScreenWakePassword = *m.ScreenWakePassword
 	}
 	return d.v
 }
@@ -97,6 +126,13 @@ func envFloat(key string, def float64) float64 {
 func envBool(key string, def bool) bool {
 	if b, err := strconv.ParseBool(os.Getenv(key)); err == nil {
 		return b
+	}
+	return def
+}
+
+func envString(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
 	}
 	return def
 }

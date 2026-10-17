@@ -16,6 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Iterable, Mapping
+from urllib.parse import urlsplit
 
 # A config scope as stored (JSON object): values are whatever each key holds.
 DeviceConfig = dict[str, Any]
@@ -32,6 +33,7 @@ class SectionId(StrEnum):
     BLUETOOTH = "bluetooth"
     TIMERS = "timers"
     TRANSCRIPT = "transcript"
+    SCREEN = "screen"
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +67,9 @@ SECTIONS: dict[SectionId, Section] = {
     # household-wide unless a device overrides this section.
     SectionId.TRANSCRIPT: Section("Transcript correction", ("transcriptFix", "transcriptFixTerms",
                                                             "transcriptFixPhrases", "transcriptFixPronunciations")),
+    # The kiosk screen of a `screen_wake` device (the Echo Show): lit through
+    # the kiosk's local REST API when a wake candidate opens.
+    SectionId.SCREEN: Section("Screen", ("screenWake", "screenWakeUrl", "screenWakePassword")),
 }
 
 # Keys that live in the config dict but are device STATE, not settings: they
@@ -136,3 +141,47 @@ def wake_sound(cfg: Mapping[str, object]) -> bool:
     on acceptance and the `wakeSound` pushed to a `local_wake_chime` device.
     Only JSON true counts: the device decodes the key as a strict boolean."""
     return cfg.get("wakeSound") is True
+
+
+# Fully Kiosk's local REST API on the device itself: the kiosk runs on the
+# Echo Show it lights, so loopback reaches it whatever the network.
+SCREEN_WAKE_URL_DEFAULT = "http://127.0.0.1:2323"
+
+
+def screen_wake(cfg: Mapping[str, object]) -> dict[str, object]:
+    """The keys pushed to a `screen_wake` device in `config`: `screenWake` a
+    strict boolean as for wakeSound, and the kiosk API's URL and password as
+    strings, the defaults standing in for a missing or mistyped value."""
+    url, password = cfg.get("screenWakeUrl"), cfg.get("screenWakePassword")
+    return {
+        "screenWake": cfg.get("screenWake") is True,
+        "screenWakeUrl": url if isinstance(url, str) and url else SCREEN_WAKE_URL_DEFAULT,
+        "screenWakePassword": password if isinstance(password, str) else "",
+    }
+
+
+def screen_wake_error(values: Mapping[str, object]) -> str | None:
+    """Why the screen-wake keys in a config write are invalid, or None. The
+    device requests `{screenWakeUrl}/?cmd=screenOn…`, so the URL names the
+    kiosk API's root: http(s), a host, and no path, query or fragment."""
+    if "screenWake" in values and not isinstance(values["screenWake"], bool):
+        return "screenWake must be boolean"
+    if "screenWakeUrl" in values and not _kiosk_root(values["screenWakeUrl"]):
+        return ("screenWakeUrl must be the kiosk API's http:// or https:// root, "
+                f"with no path or trailing slash, e.g. {SCREEN_WAKE_URL_DEFAULT}")
+    if "screenWakePassword" in values and not isinstance(values["screenWakePassword"], str):
+        return "screenWakePassword must be a string"
+    return None
+
+
+def _kiosk_root(url: object) -> bool:
+    """An http(s) URL naming a host (and port) and nothing below the root."""
+    if not isinstance(url, str) or any(ch.isspace() for ch in url):
+        return False
+    try:
+        parts = urlsplit(url)
+        port = parts.port   # ValueError: not a number, or outside 0-65535
+    except ValueError:
+        return False
+    return (parts.scheme in ("http", "https") and bool(parts.hostname) and port != 0
+            and not (parts.path or parts.query or parts.fragment))

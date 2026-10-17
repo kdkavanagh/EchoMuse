@@ -312,3 +312,45 @@ def test_config_form_does_not_reference_a_device_it_never_receives():
         "(and which does not exist in the fleet-config view). Pass what the control "
         "needs explicitly.\n  " + "\n  ".join(offenders)
     )
+
+
+# ─── Screen wake (Echo Show) ─────────────────────────────────────────────────
+
+def test_screen_wake_defaults_are_off_and_point_at_the_kiosk_on_the_device():
+    defaults = {k: em_db.DEFAULT_DEVICE_CONFIG[k] for k in cs.SECTIONS[cs.SectionId.SCREEN].keys}
+    assert defaults == {"screenWake": False, "screenWakeUrl": "http://127.0.0.1:2323",
+                        "screenWakePassword": ""}
+    assert cs.screen_wake(em_db.DEFAULT_DEVICE_CONFIG) == defaults
+    assert cs.screen_wake_error(defaults) is None
+
+
+def test_screen_wake_push_is_strictly_typed():
+    # As for wakeSound, only JSON true is on; a mistyped URL or password
+    # falls back to the default rather than reaching the device.
+    assert cs.screen_wake({"screenWake": "true", "screenWakeUrl": 5, "screenWakePassword": None}) == {
+        "screenWake": False, "screenWakeUrl": "http://127.0.0.1:2323", "screenWakePassword": ""}
+    assert cs.screen_wake({"screenWake": True, "screenWakeUrl": "https://show.lan:2323",
+                           "screenWakePassword": "p w&d"}) == {
+        "screenWake": True, "screenWakeUrl": "https://show.lan:2323", "screenWakePassword": "p w&d"}
+
+
+@pytest.mark.parametrize("values, ok", [
+    ({"screenWakeUrl": "http://192.168.3.159:2323"}, True),
+    ({"screenWakeUrl": "https://show.lan"}, True),
+    ({"screenWakeUrl": "http://127.0.0.1:2323/"}, False),        # the device appends /?cmd=…
+    ({"screenWakeUrl": "http://127.0.0.1:2323/fully"}, False),
+    ({"screenWakeUrl": "http://127.0.0.1:2323?cmd=screenOn"}, False),
+    ({"screenWakeUrl": "ftp://127.0.0.1"}, False),
+    ({"screenWakeUrl": "127.0.0.1:2323"}, False),
+    ({"screenWakeUrl": "http://127.0.0.1:99999"}, False),
+    ({"screenWakeUrl": "http://127.0.0.1:0"}, False),
+    ({"screenWakeUrl": "http://exa mple:2323"}, False),
+    ({"screenWakeUrl": ""}, False),
+    ({"screenWakeUrl": None}, False),
+    ({"screenWake": "yes"}, False),
+    ({"screenWake": True}, True),
+    ({"screenWakePassword": 1234}, False),
+    ({"screenWakePassword": "1234"}, True),
+])
+def test_screen_wake_validation(values, ok):
+    assert (cs.screen_wake_error(values) is None) is ok

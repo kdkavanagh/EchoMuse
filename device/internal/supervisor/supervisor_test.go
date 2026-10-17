@@ -304,12 +304,32 @@ type harness struct {
 	pcm  []int16
 	// afeOptIn is the next session.ready's afe_metadata.
 	afeOptIn bool
+	// screenOns records Config.ScreenOn calls as "url password".
+	screenMu  sync.Mutex
+	screenOns []string
 }
 
 type opts struct {
 	noWakeLock bool
 	ambient    bool
 	afe        bool // the mic decodes AFE metadata (Config.AFEMetadata)
+	crown      bool // the Echo Show (fireos6_crown) instead of the Dot
+	lineage    bool // with crown: the LineageOS Show (lineage18_crown)
+	// volumeUnavailable: the Show's Android volume check failed
+	// (server.Config.VolumeUnavailable).
+	volumeUnavailable string
+}
+
+func (h *harness) screenOn(url, password string) {
+	h.screenMu.Lock()
+	h.screenOns = append(h.screenOns, url+" "+password)
+	h.screenMu.Unlock()
+}
+
+func (h *harness) screenCalls() []string {
+	h.screenMu.Lock()
+	defer h.screenMu.Unlock()
+	return append([]string(nil), h.screenOns...)
 }
 
 func newHarness(t *testing.T, o opts) *harness {
@@ -334,10 +354,19 @@ func newHarness(t *testing.T, o opts) *harness {
 	h := &harness{t: t, hw: &fakeHW{dac: 90}, pcm: make([]int16, 1280),
 		gate: gateSink{writes: make(chan struct{}), done: make(chan struct{})}}
 	h.now.Store(int64(1000 * time.Second))
-	h.phys = server.New(server.Config{Hardware: h.hw, StatePath: filepath.Join(dir, "state.json")})
+	platform := proto.PlatformFireOS6
+	if o.crown {
+		platform = proto.PlatformFireOS6Crown
+		if o.lineage {
+			platform = proto.PlatformLineage18Crown
+		}
+	}
+	h.phys = server.New(server.Config{Hardware: h.hw, StatePath: filepath.Join(dir, "state.json"),
+		NoPrivacyMute: o.crown, VolumeAuthoritative: o.crown && o.volumeUnavailable == "", VolumeUnavailable: o.volumeUnavailable})
 	s, err := Assemble(Config{
-		DeviceID: "dev", FirmwareVersion: "v3.0.0-test", BootID: "boot",
+		DeviceID: "dev", FirmwareVersion: "v3.0.0-test", BootID: "boot", Platform: platform,
 		AmbientReadable: func() bool { return o.ambient },
+		ScreenOn:        h.screenOn,
 		Mic:             &fakeMic{closed: make(chan struct{})},
 		AFEMetadata:     o.afe,
 		Physical:        h.phys, DeviceConfig: config.New(),
@@ -910,50 +939,177 @@ func TestAlertFocusRoutesDACAndVolumeButtons(t *testing.T) {
 	}
 }
 
-// WIRE §4.1 session.hello: the v1 capability set plus retained hardware
-// capabilities; alert_cache_v1 only with a working wakelock; ambient_light
-// only when readable.
+// WIRE §4.1 session.hello: the v1 capability set plus the platform's
+// capabilities (the Dot: ring, buttons, Wi-Fi, BLE proxy, privacy mute; the
+// Show: screen wake); alert_cache_v1 only with a working wakelock;
+// ambient_light only when readable.
 func TestHelloCapabilities(t *testing.T) {
-	has := func(caps []proto.Capability, c proto.Capability) bool {
-		for _, x := range caps {
-			if x == c {
-				return true
-			}
+	common := []proto.Capability{"audio_timeline_v1", "uplink_leases_v1", "device_wake_v1", "render_reference_v1",
+		"render_progress_v1", "focus_leases_v1", "alert_cache_v1", "turn_protocol_v1",
+		"alert_prefetch", "local_wake_chime", "no_input_chime", "announcement_chime", "open_rules_v1"}
+	for _, tc := range []struct {
+		name     string
+		o        opts
+		platform proto.Platform
+		extra    []proto.Capability
+	}{
+		{"dot", opts{}, proto.PlatformFireOS6,
+			[]proto.Capability{"leds", "led_anim", "buttons", "button_hold", "wifi_control", "ble_proxy", "privacy_mute"}},
+		{"show", opts{crown: true}, proto.PlatformFireOS6Crown, []proto.Capability{"screen_wake"}},
+		{"lineage show", opts{crown: true, lineage: true}, proto.PlatformLineage18Crown, []proto.Capability{"screen_wake"}},
+	} {
+		h := newHarness(t, tc.o)
+		hello := h.s.Hello()
+		want := slices.Sorted(slices.Values(append(slices.Clone(common), tc.extra...)))
+		if got := slices.Sorted(slices.Values(hello.Capabilities)); !slices.Equal(got, want) {
+			t.Errorf("%s: capabilities\n got %v\nwant %v", tc.name, got, want)
 		}
-		return false
-	}
-	h := newHarness(t, opts{})
-	hello := h.s.Hello()
-	for _, c := range []proto.Capability{"audio_timeline_v1", "uplink_leases_v1", "device_wake_v1", "render_reference_v1",
-		"render_progress_v1", "focus_leases_v1", "alert_cache_v1", "turn_protocol_v1", "leds", "led_anim", "buttons", "button_hold",
-		"alert_prefetch"} {
-		if !has(hello.Capabilities, c) {
-			t.Errorf("missing %s in %v", c, hello.Capabilities)
+		if hello.Protocols[0] != 1 || hello.BootID != "boot" || hello.Assets == nil || hello.Privacy.Muted {
+			t.Errorf("%s: hello %+v", tc.name, hello)
 		}
-	}
-	if has(hello.Capabilities, "ambient_light") {
-		t.Error("ambient_light without a readable sensor")
-	}
-	if hello.Protocols[0] != 1 || hello.BootID != "boot" || hello.Assets == nil || hello.Privacy.Muted {
-		t.Errorf("hello %+v", hello)
-	}
-	if a := hello.Alerts; a.Wakeup != "ok" {
-		t.Errorf("alerts %+v", a)
-	}
-	if hello.Platform != proto.PlatformFireOS6 {
-		t.Errorf("platform %q", hello.Platform)
-	}
+		if a := hello.Alerts; a.Wakeup != "ok" {
+			t.Errorf("%s: alerts %+v", tc.name, a)
+		}
+		if hello.Platform != tc.platform {
+			t.Errorf("%s: platform %q", tc.name, hello.Platform)
+		}
 
-	h2 := newHarness(t, opts{noWakeLock: true, ambient: true})
-	hello = h2.s.Hello()
-	if has(hello.Capabilities, "alert_cache_v1") {
-		t.Error("alert_cache_v1 announced without a wakelock")
+		o := tc.o
+		o.noWakeLock, o.ambient = true, true
+		hello = newHarness(t, o).s.Hello()
+		if slices.Contains(hello.Capabilities, "alert_cache_v1") {
+			t.Errorf("%s: alert_cache_v1 announced without a wakelock", tc.name)
+		}
+		if a := hello.Alerts; a.Wakeup != "alarm_wakeup_unavailable" {
+			t.Errorf("%s: wakeup %q", tc.name, a.Wakeup)
+		}
+		if !slices.Contains(hello.Capabilities, "ambient_light") {
+			t.Errorf("%s: ambient_light missing with a readable sensor", tc.name)
+		}
 	}
-	if a := hello.Alerts; a.Wakeup != "alarm_wakeup_unavailable" {
-		t.Errorf("wakeup %q", a.Wakeup)
+}
+
+// An image the supervisor has no capability table for is refused.
+func TestAssembleRefusesUnknownPlatform(t *testing.T) {
+	dir := t.TempDir()
+	speech, _ := assets.Open(filepath.Join(dir, "speech"))
+	sounds, _ := assets.Open(filepath.Join(dir, "sounds"))
+	_, err := Assemble(Config{
+		DeviceID: "dev", Platform: "fireos5", Mic: &fakeMic{closed: make(chan struct{})},
+		Physical:     server.New(server.Config{Hardware: &fakeHW{}, StatePath: filepath.Join(dir, "state.json")}),
+		DeviceConfig: config.New(), SpeechStore: speech, AlertStore: sounds,
+	}, Deps{Sink: gateSink{}, LoadModel: func(wakeword.Paths) (detector.Scorer, error) { return nil, os.ErrNotExist }})
+	if err == nil {
+		t.Fatal("unknown platform assembled")
 	}
-	if !has(hello.Capabilities, "ambient_light") {
-		t.Error("ambient_light missing with a readable sensor")
+}
+
+// The Show leaves Wi-Fi to Android: wifi_change/commit/scan reach none of
+// the hooks there, while the Dot delivers them.
+func TestWifiMessagesOnlyOnWifiControlPlatforms(t *testing.T) {
+	for _, crown := range []bool{false, true} {
+		h := newHarness(t, opts{crown: crown})
+		var calls []string
+		h.s.cfg.Retained.WifiChange = func(ssid, _ string) { calls = append(calls, "change "+ssid) }
+		h.s.cfg.Retained.WifiCommit = func() { calls = append(calls, "commit") }
+		h.s.cfg.Retained.WifiScan = func() { calls = append(calls, "scan") }
+		h.ready()
+		h.control(proto.TypeWifiChange, 0, map[string]string{"ssid": "home", "psk": "secret123"})
+		h.control(proto.TypeWifiCommit, 0, map[string]any{})
+		h.control(proto.TypeWifiScan, 0, map[string]any{})
+		want := []string{"change home", "commit", "scan"}
+		if crown {
+			want = nil
+		}
+		if !slices.Equal(calls, want) {
+			t.Errorf("crown=%v: hooks ran %v, want %v", crown, calls, want)
+		}
+	}
+}
+
+// screen_wake: on the Show with config screenWake on, every candidate open
+// asks the kiosk to light the screen with the configured URL and password,
+// connected or not; off by default, and never on the Dot.
+func TestScreenWakeOnCandidateOpen(t *testing.T) {
+	on, url, pw := true, "http://127.0.0.1:2323", "secret"
+	for _, tc := range []struct {
+		name   string
+		crown  bool
+		enable bool
+		lost   bool
+		want   []string
+	}{
+		{name: "show, off by default", crown: true},
+		{name: "show, on", crown: true, enable: true, want: []string{url + " " + pw}},
+		{name: "show, on, no session", crown: true, enable: true, lost: true, want: []string{url + " " + pw}},
+		{name: "dot, on", enable: true},
+	} {
+		h := newHarness(t, opts{crown: tc.crown})
+		h.ready()
+		if tc.enable {
+			h.control(proto.TypeConfig, 0, config.Message{ScreenWake: &on, ScreenWakeURL: &url, ScreenWakePassword: &pw})
+		}
+		if tc.lost {
+			h.s.Lost(client.LostTimeout)
+		}
+		h.s.onCandidate(detector.Candidate{CandidateID: "c1", LeaseID: "L1"})
+		if got := h.screenCalls(); !slices.Equal(got, tc.want) {
+			t.Errorf("%s: ScreenOn calls %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// session.hello's volume: a number on the Dot (unseeded until the config
+// push) and on a Show whose Android volume check passed (seeded: Android's
+// index is live state, reported after ready); null on a Show whose check
+// failed, which then ignores volume_set and startupVolume and reports no
+// volume_state.
+func TestHelloVolumeAvailability(t *testing.T) {
+	volumeJSON := func(h *harness) string {
+		t.Helper()
+		b, err := json.Marshal(h.s.Hello())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(b, &m); err != nil {
+			t.Fatal(err)
+		}
+		return string(m["volume"])
+	}
+	startup := 100
+	for _, tc := range []struct {
+		name      string
+		o         opts
+		hello     string
+		readyVol  []any // volume_state levels right after ready
+		volumeSet bool  // volume_set and startupVolume take effect
+	}{
+		{"dot", opts{}, `{"level":90,"seeded":false}`, nil, true},
+		{"show", opts{crown: true}, `{"level":90,"seeded":true}`, []any{float64(90)}, true},
+		{"show, check failed", opts{crown: true, volumeUnavailable: "getStreamMaxVolume answered 15"},
+			`{"level":null,"seeded":false}`, nil, false},
+	} {
+		h := newHarness(t, tc.o)
+		if got := volumeJSON(h); got != tc.hello {
+			t.Errorf("%s: hello volume %s, want %s", tc.name, got, tc.hello)
+		}
+		h.ready()
+		var levels []any
+		for _, m := range h.sess.of(proto.TypeVolumeState) {
+			levels = append(levels, m.body["level"])
+		}
+		if !slices.Equal(levels, tc.readyVol) {
+			t.Errorf("%s: volume_state after ready %v, want %v", tc.name, levels, tc.readyVol)
+		}
+		h.control(proto.TypeConfig, 0, config.Message{StartupVolume: &startup})
+		h.control(proto.TypeVolumeSet, 0, map[string]int{"level": 60})
+		if changed := h.hw.DAC() == 60; changed != tc.volumeSet {
+			t.Errorf("%s: DAC %d after volume_set 60", tc.name, h.hw.DAC())
+		}
+		if n := len(h.sess.of(proto.TypeVolumeState)); !tc.volumeSet && n != 0 {
+			t.Errorf("%s: %d volume_state reports while unavailable", tc.name, n)
+		}
 	}
 }
 

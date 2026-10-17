@@ -95,6 +95,7 @@ jobs:
         run: |
           node controller/tests/wifi_scan.test.mjs
           node controller/tests/provision_wizard.test.mjs
+          node controller/tests/capability_gap.test.mjs
 
   device-tests:
     name: Device Go tests
@@ -110,10 +111,12 @@ jobs:
       # cmd/ imports the hardware bindings, which carry //go:build server
       # (device builds pass -tags server) — listing cmd on a host platform
       # fails package setup. Wildcards skip tag-excluded packages, so
-      # internal/... + pkg/... covers every host-testable package.
+      # internal/... + pkg/... + tools/... covers every host-testable package
+      # (tools/capture_mics and bf_capture are modules of their own, outside
+      # the pattern; tools/sl_latency/latency is the firmware module's).
       - name: Run go test
         working-directory: device
-        run: go test ./internal/... ./pkg/...
+        run: go test ./internal/... ./pkg/... ./tools/...
 
   python-deps-audit:
     name: Python dependency audit
@@ -186,4 +189,4 @@ jobs:
           cache-dependency-path: device/go.sum
       - name: Run go vet
         working-directory: device
-        run: go vet ./internal/... ./pkg/...
+        run: go vet ./internal/... ./pkg/... ./tools/...

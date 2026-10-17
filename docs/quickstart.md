@@ -1,6 +1,7 @@
 # EchoMuse Quickstart
 
-EchoMuse turns an Amazon Echo Dot (2nd generation) into a **fully local voice
+EchoMuse turns an Amazon Echo Dot (2nd generation), or an Echo Show 8 (1st
+generation), into a **fully local voice
 assistant** — no Amazon account, no cloud, no audio leaving your house. The
 Dot becomes a "satellite": it listens for the wake word itself, and a small
 server on your network (the **controller**) handles each request and talks to
@@ -17,7 +18,7 @@ pretending it's easy.
 
 | Thing | Why |
 |---|---|
-| Amazon Echo Dot 2nd gen ("biscuit") | The hardware being repurposed. Second-hand ones are cheap. |
+| Amazon Echo Dot 2nd gen ("biscuit") | The hardware being repurposed. Second-hand ones are cheap. An Echo Show 8 1st gen ("crown") works too: see [Using an Echo Show 8](#using-an-echo-show-8). |
 | A computer that's always on (a home server, NAS, Raspberry-Pi-class box or better) | Runs the controller. Docker recommended. |
 | Home Assistant | Does the assistant work: speech-to-text, understanding, text-to-speech, timers, and the calendar that holds your alarms. You need a working [Assist pipeline](https://www.home-assistant.io/voice_control/) with a speech-to-text and a text-to-speech engine. |
 | A Home Assistant **administrator** account | The controller connects to Home Assistant with a long-lived access token from an admin user (not needed for the add-on install). |
@@ -47,6 +48,74 @@ in Android.
 
 You only do this once per device. Everything afterwards — updates,
 configuration, even a remote terminal — happens over WiFi from the dashboard.
+
+### Using an Echo Show 8
+
+The Echo Show 8 1st gen (2019, "crown") runs the same EchoMuse firmware as a
+voice satellite, but keeps its screen: Android stays, showing a kiosk app of
+your choice (Fully Kiosk Browser with a Home Assistant dashboard, say), and
+EchoMuse hides Amazon's Alexa apps rather than replacing the system. Its
+unlock is R0rt1z2's crown thread, and [rooting](rooting.md#echo-show-8-1st-gen-crown)
+has everything EchoMuse adds to it. Before you run the wizard on a Show:
+
+- **Unlock and root it** per the thread (the adb shell must be root).
+- **Join Wi-Fi on the Show itself**, from its setup screen or Settings.
+  EchoMuse does not configure the Show's Wi-Fi or Bluetooth; they stay the
+  device's own, and the wizard refuses a Show that is not on a network.
+- **Install your kiosk** with adb. The wizard refuses to hide Amazon's
+  launchers until a home-screen app other than Amazon's exists, since the
+  Show would otherwise boot to a blank screen. Fully Kiosk Browser's home
+  screen ships switched off; the wizard switches it on for you.
+- **In the kiosk, leave the microphone alone**: Fully Kiosk's acoustic
+  (sound) detection stays off, and do not use an Assist microphone in the
+  dashboard page. The Show allows one recording at a time, and EchoMuse
+  holds it. Fully's camera motion detection, screen timeout and screensaver
+  are fine.
+- **Put the Show's own Settings pages in the kiosk.** Its Wi-Fi and
+  Bluetooth are managed from its Settings from now on. Add these two to
+  Fully Kiosk's app launcher (or your kiosk's equivalent); Android's generic
+  Wi-Fi settings link does not open on this build:
+  `com.android.settings/.Settings$WifiSettingsActivity` and
+  `com.android.settings/.Settings$BluetoothSettingsActivity`.
+
+The wizard then checks the kiosk, installs the boot hook and the firmware,
+and **neutralises Alexa**: it marks Amazon's setup complete, repairs
+Amazon's Settings app (on a Show never registered with Amazon its pages
+crash until it is given its configuration), makes your kiosk the home
+screen, hides Amazon's Alexa apps with `pm hide`, and denies the microphone
+to the two Amazon apps that must stay installed (Alexa's wake engine and
+Amazon's dictation keyboard). All of it is reversible;
+[rooting](rooting.md#to-undo-it-on-the-show) has the undo. A second, optional tier
+(Amazon's cloud, smart-home radio and telemetry apps) is a switch on that
+step, off by default. There is no Wi-Fi step and no second slot to mirror.
+
+Optionally, a Show can light its screen when it hears the wake word, through
+the kiosk's local API (Fully Kiosk's Remote Admin): off by default, set per
+device in the dashboard.
+
+#### On LineageOS 18.1
+
+The Show can also run LineageOS 18.1 instead of Fire OS: Android without any
+Amazon apps, so there is nothing to neutralise and the screen is entirely
+yours. EchoMuse needs **our build** (it carries the Amazon audio front end
+whose metadata EchoMuse reads; upstream releases do not, and the wizard
+refuses them), flashed from TWRP after the same amonet-crown unlock;
+[rooting](rooting.md#echo-show-8-on-lineageos-181) has the build, the flash
+and the accepted risks (an unofficial ROM with SELinux permissive). Before
+you run the wizard:
+
+- **Join Wi-Fi on the Show itself** during LineageOS's setup.
+- **Switch on adb**: tap Build number in Settings → About seven times, then
+  switch on **USB debugging** and **Rooted debugging** in Developer options,
+  and allow your computer's key when the Show asks. The wizard restarts adb
+  as root itself, each time it connects.
+- **Install your kiosk** and make it the home app. While EchoMuse records,
+  the kiosk gets no microphone.
+
+The wizard then installs the boot hook (plus a small addon.d script that
+keeps it across LineageOS updates) and the firmware, reboots, and waits for
+the Show to reach the controller. There is no kiosk check, no Alexa step and
+no Wi-Fi step.
 
 ## Step 2 — Make a Home Assistant token
 
@@ -148,8 +217,10 @@ Once approved, the Dot connects fully: you'll see it as **online**, with its
 volume, settings, and a live status.
 
 A Dot that never appears as pending was refused: the controller admits only
-Dots running Fire OS 6 with protocol v1 firmware. Run the wizard on it (after
-moving it to Fire OS 6, if needed); a Dot the controller already knows is
+Dots running Fire OS 6, and Echo Show 8s running Fire OS 6 or LineageOS 18.1,
+with protocol v1 firmware. Run the
+wizard on it (after
+moving it to Fire OS 6, if needed); a device the controller already knows is
 re-adopted with **Continue**, keeping its name and settings.
 
 ## Step 6 — Connect it to Home Assistant
@@ -229,15 +300,19 @@ The LED ring tells you what's happening (full list in
 - **Terminal**: each device page has a full remote terminal (for the
   curious; you never *need* it).
 - **Volume**: buttons on the Dot, the dashboard slider, or Home Assistant's
-  media player card — they all stay in sync.
+  media player card — they all stay in sync. On an Echo Show the volume keys
+  are Android's, and stay in sync the same way.
 - **Interrupting**: say the wake word while it's talking and it stops and
-  listens. The mute button also cuts it off instantly (and mutes).
+  listens. The mute button also cuts it off instantly (and mutes). On an
+  Echo Show, mute is not supported by EchoMuse yet, and the dashboard says so.
 - **Bluetooth proxy** (optional): each Dot can double as a Home Assistant
   Bluetooth proxy — passively picking up BLE advertisements (presence
   beacons, BLE sensors) and feeding them to HA as a *separate* ESPHome
   device, independent of the voice assistant. Enable it per device in the
   Config tab (Bluetooth section); it appears in HA as "<name> BT Proxy". See
-  [configuration.md](configuration.md).
+  [configuration.md](configuration.md). An Echo Show's Bluetooth and Wi-Fi
+  are the device's own (its Settings), so those controls show as managed by
+  the device.
 
 ## When something doesn't work
 

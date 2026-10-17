@@ -255,6 +255,13 @@ DEFAULT_DEVICE_CONFIG: DeviceConfig = {
     # BLE proxy over the raw HCI transport (em_ble_proxy). Enabling durably
     # disables the Android Bluetooth stack on the device.
     "bleProxyEnabled":  False,
+    # Light the kiosk screen of a `screen_wake` device (the Echo Show) when a
+    # wake candidate opens, through the kiosk's local REST API (Fully Kiosk's
+    # `screenOn`). Off by default: the kiosk owns the screen, and its own
+    # motion wake and timeout already manage it.
+    "screenWake":       False,
+    "screenWakeUrl":    em_config_sections.SCREEN_WAKE_URL_DEFAULT,
+    "screenWakePassword": "",
     # EQ applies to controller-rendered content and dialog, not to device-
     # executed alerts (§18.4).
     "eqBands":          [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],

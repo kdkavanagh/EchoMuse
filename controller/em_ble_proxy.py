@@ -15,11 +15,16 @@ JSON; em_controller hands each batch to forward_adverts(), which re-encodes
 it as BluetoothLERawAdvertisementsResponse for the subscribed HA connection.
 
 Lifecycle: a proxy server exists only while the device's effective config
-has bleProxyEnabled. reconcile() is the single entry point — called at
-startup, on device config pushes (em_api), and indirectly via
-device_connected/device_disconnected. Enabled + device online → listener
-up; enabled + offline → mDNS registered but port down (HA shows
-unavailable, same as the voice satellite); disabled → nothing exists.
+has bleProxyEnabled and its last session announced the `ble_proxy`
+capability. reconcile() is the single entry point — called at startup, on
+device config pushes (em_api), and by device_connected; device_disconnected
+only takes the listener down.
+Enabled + device online → listener up; enabled + offline → mDNS registered
+but port down (HA shows unavailable, same as the voice satellite); disabled,
+or a device without `ble_proxy` (the Echo Show, whose Bluetooth is Android's;
+a Dot on firmware predating the capability) → nothing exists. A device this
+controller has not seen connect since it started counts as capable until it
+does.
 
 Identity: MAC is the voice satellite's serial-derived MAC with the second
 nibble XOR'd (locally-administered bit flipped) — deterministic, stable,
@@ -230,6 +235,7 @@ class DeviceBleProxyServer:
 
 _proxies: dict[str, DeviceBleProxyServer] = {}
 _online: set[str] = set()   # device_ids with a live /control connection
+_incapable: set[str] = set()   # device_ids whose last session lacked ble_proxy
 _host: str = "0.0.0.0"
 
 
@@ -261,7 +267,7 @@ async def reconcile(device_id: str) -> None:
     if row is not None and row.approved:
         label = row.label or f"EchoMuse {device_id[-8:]}"
         cfg = await asyncio.to_thread(db.get_effective_device_config, device_id)
-        enabled = bool(cfg.get("bleProxyEnabled", False))
+        enabled = bool(cfg.get("bleProxyEnabled", False)) and device_id not in _incapable
 
     proxy = _proxies.get(device_id)
 
@@ -332,12 +338,15 @@ async def stop_ble_proxy_servers() -> None:
     _proxies.clear()
 
 
-async def device_connected(device_id: str) -> None:
-    """Called by em_controller when the physical device connects."""
+async def device_connected(device_id: str, *, ble_proxy: bool) -> None:
+    """Called by em_controller when the physical device connects; `ble_proxy`:
+    the session announced the capability."""
     _online.add(device_id)
-    proxy = _proxies.get(device_id)
-    if proxy is not None:
-        await proxy.start(_host)
+    if ble_proxy:
+        _incapable.discard(device_id)
+    else:
+        _incapable.add(device_id)
+    await reconcile(device_id)
 
 
 async def device_disconnected(device_id: str) -> None:

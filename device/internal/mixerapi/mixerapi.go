@@ -87,7 +87,7 @@
 // processing/IPC latency offset, not a jump or a different epoch. So ts is
 // used directly as each native block's end time (reframe.go backdates each
 // period from it). Whether ts marks a block's first or last sample could not be told
-// apart (16 ms blocks); playclock.go's constants were measured against ts
+// apart (16 ms blocks); playclock.go's constant was measured against ts
 // read as the end, the conservative reading for them. micRaw, by contrast,
 // returns ts=0 and is not used.
 //
@@ -103,7 +103,7 @@
 // chunk is waiting in Player, so at most one chunk plus one write sits
 // in front of the mixer's own queue. Each write's completion is stamped
 // at its estimated playout time on the capture ts scale, from the queue
-// depth read at handoff (playclock.go).
+// depth read at handoff (internal/audio/playclock, playclock.go here).
 //
 // # Native transfer size
 //
@@ -183,6 +183,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/wilbowes/EchoMuse/internal/audio/playclock"
 	"github.com/wilbowes/EchoMuse/internal/monoclock"
 )
 
@@ -510,7 +511,7 @@ func (r *Recorder) Close() {
 // the pump hands one over only while fewer than playQueueBlocks blocks wait
 // in the mixer's queue, which paces the caller at playback rate (see the
 // package doc's "Backpressure"). Completions carry the estimated playout
-// time of each write's last byte (playclock.go).
+// time of each write's last byte (internal/audio/playclock).
 type Player struct {
 	lib    *Lib
 	handle unsafe.Pointer
@@ -529,8 +530,8 @@ type Player struct {
 
 	wake chan struct{}
 
-	clock       playClock // pump goroutine only
-	underflowMs uint64    // pump goroutine only: total since open
+	clock       playclock.Clock // pump goroutine only
+	underflowMs uint64          // pump goroutine only: total since open
 
 	onComplete atomic.Pointer[func(int64)]
 }
@@ -562,7 +563,7 @@ func (l *Lib) NewPlayer(rateHz, ch, bits int, maxWriteBytes int) (*Player, error
 		maxWrite:   maxWriteBytes,
 		acc:        make([]byte, 0, chunkBytes+maxWriteBytes),
 		wake:       make(chan struct{}, 1),
-		clock:      newPlayClock(chunkBytes, int64(rateHz*ch*bits/8)),
+		clock:      playclock.New(chunkBytes, int64(rateHz*ch*bits/8), playPipelineNs),
 	}
 	p.cond = sync.NewCond(&p.mu)
 	go p.pump()
@@ -656,11 +657,11 @@ func (p *Player) pump() {
 		p.cond.Broadcast()
 		p.mu.Unlock()
 
-		startNs := p.clock.chunk(handoffNs, ahead)
+		startNs := p.clock.Chunk(handoffNs, ahead)
 		if fired > 0 {
 			fn := p.onComplete.Load()
 			for _, end := range ends[:fired] {
-				doneNs := p.clock.completion(startNs, end-chunkStart)
+				doneNs := p.clock.Completion(startNs, end-chunkStart)
 				if fn != nil {
 					(*fn)(doneNs)
 				}
@@ -687,7 +688,7 @@ func (p *Player) awaitQueueRoom() bool {
 
 // writeChunk performs one native Get/fill/Release round-trip. It reports
 // how many released blocks were still queued ahead of this one and the
-// CLOCK_MONOTONIC time the release returned, which playClock turns into a
+// CLOCK_MONOTONIC time the release returned, which the play clock turns into a
 // playout estimate.
 func (p *Player) writeChunk(chunk []byte) (ahead int, handoffNs int64, err error) {
 	var status C.int

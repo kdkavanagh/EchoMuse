@@ -93,19 +93,23 @@ func fakeBus(t *testing.T, devices map[string]bool) {
 	mu.Lock()
 	path, lastScan, reported = "", time.Time{}, false
 	status = Status{Code: StatusUnknown}
+	pollAlsPs, pollFailed = false, false
 	mu.Unlock()
 
-	oldI2C, oldIIO := i2cGlob, iioGlob
+	oldI2C, oldIIO, oldAlsPs, oldPoll := i2cGlob, iioGlob, alsPsPath, alsPsPollPath
 	i2cGlob = filepath.Join(root, "*", "name")
-	// No IIO fixture in this helper — point it at an empty root so a stray
-	// real IIO device on the host (or a leftover test fixture) can never
-	// make the i2c-only fixtures match through the fallback.
+	// No IIO or als_ps fixture in this helper — point both at empty roots
+	// so a stray real sensor on the host (or a leftover test fixture) can
+	// never make the i2c-only fixtures match through a fallback.
 	iioGlob = filepath.Join(t.TempDir(), "*", "name")
+	alsPsPath = filepath.Join(t.TempDir(), "als_ps", "lux")
+	alsPsPollPath = filepath.Join(filepath.Dir(alsPsPath), "enable_als_polling")
 	t.Cleanup(func() {
-		i2cGlob, iioGlob = oldI2C, oldIIO
+		i2cGlob, iioGlob, alsPsPath, alsPsPollPath = oldI2C, oldIIO, oldAlsPs, oldPoll
 		mu.Lock()
 		path, lastScan, reported = "", time.Time{}, false
 		status = Status{Code: StatusUnknown}
+		pollAlsPs, pollFailed = false, false
 		mu.Unlock()
 	})
 }
@@ -289,5 +293,93 @@ func TestStatusNoAttributeFromIIO(t *testing.T) {
 	}
 	if Present() {
 		t.Fatal("Present() must be false with no readable illuminance0_input")
+	}
+}
+
+// ── The Show's als_ps driver ("<n> lux", docs/echo-show-crown.md §3) ────────
+
+func TestParseLux(t *testing.T) {
+	for in, want := range map[string]int{"2 lux\n": 2, "42\n": 42, "0 lux": 0, " 1234 lux \n": 1234} {
+		if got, ok := parseLux([]byte(in)); !ok || got != want {
+			t.Errorf("parseLux(%q) = %d, %v; want %d", in, got, ok, want)
+		}
+	}
+	for _, bad := range []string{"", "\n", "lux", "x lux", "2 lx", "2 lux now", "2.5 lux"} {
+		if got, ok := parseLux([]byte(bad)); ok {
+			t.Errorf("parseLux(%q) = %d, want rejected", bad, got)
+		}
+	}
+}
+
+// writeAlsPs puts the Show's als_ps attribute in place with content.
+func writeAlsPs(t *testing.T, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(alsPsPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(alsPsPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The Show shape: neither bus carries a known ALS, the stk3x1x's driver
+// publishes "2 lux". It resolves, is Present, reads, and Seen names it
+// alongside the bus devices.
+func TestStatusOKFromAlsPs(t *testing.T) {
+	fakeBus(t, map[string]bool{"tlv320aic3101": false, "rt5616": false})
+	writeAlsPs(t, "2 lux\n")
+	got := Report()
+	if got.Code != StatusOK || got.Path != alsPsPath {
+		t.Fatalf("code = %q path %q, want ok at %s (detail %q)", got.Code, got.Path, alsPsPath, got.Detail)
+	}
+	if len(got.Seen) != 3 || got.Seen[2] != "als_ps" {
+		t.Fatalf("Seen = %v, want both i2c devices then als_ps", got.Seen)
+	}
+	if !Present() {
+		t.Fatal("Present() must be true with a readable als_ps")
+	}
+	if lux := Lux(); lux == nil || *lux != 2 {
+		t.Fatalf("Lux() = %v, want 2", lux)
+	}
+	writeAlsPs(t, "309 lux\n")
+	if lux := Lux(); lux == nil || *lux != 309 {
+		t.Fatalf("Lux() = %v after a change, want 309", lux)
+	}
+}
+
+// On LineageOS the driver's polling is off until someone switches it on, so
+// with EnablePolling the reader writes 1 to enable_als_polling before it
+// first reads; on Fire OS (no EnablePolling) it never writes there.
+func TestAlsPsPolling(t *testing.T) {
+	fakeBus(t, nil)
+	writeAlsPs(t, "0 lux\n")
+	if !Present() {
+		t.Fatal("Present() must be true with a readable als_ps")
+	}
+	if _, err := os.Stat(alsPsPollPath); !os.IsNotExist(err) {
+		t.Fatalf("polling switched without EnablePolling: %v", err)
+	}
+
+	fakeBus(t, nil)
+	writeAlsPs(t, "0 lux\n")
+	EnablePolling()
+	if !Present() {
+		t.Fatal("Present() must be true with a readable als_ps")
+	}
+	if b, err := os.ReadFile(alsPsPollPath); err != nil || string(b) != "1" {
+		t.Fatalf("enable_als_polling = %q, %v; want \"1\"", b, err)
+	}
+}
+
+// An als_ps attribute that does not read as a level is not announced.
+func TestStatusNoAttributeFromUnreadableAlsPs(t *testing.T) {
+	fakeBus(t, nil)
+	writeAlsPs(t, "error\n")
+	got := Report()
+	if got.Code != StatusNoAttribute {
+		t.Fatalf("code = %q, want %q", got.Code, StatusNoAttribute)
+	}
+	if Present() {
+		t.Fatal("Present() must be false when als_ps does not read as a level")
 	}
 }

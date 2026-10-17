@@ -29,6 +29,8 @@ type volumeController struct {
 
 	media  int
 	seeded bool
+	// disabled is why volume control is off ("" when it works).
+	disabled string
 
 	alertID    string
 	alertLevel int
@@ -37,19 +39,24 @@ type volumeController struct {
 	onMedia func(int)
 }
 
-func newVolumeController(hw Hardware, r *ring) *volumeController {
+func newVolumeController(hw Hardware, r *ring, authoritative bool, disabled string) *volumeController {
 	if hw == nil {
 		hw = systemHardware{}
 	}
 	if r == nil {
 		r = newRing()
 	}
+	fallback := (volumeButtonFloor + volumeMax) / 2
+	if disabled != "" {
+		log.Printf("[volume] volume control disabled: %s", disabled)
+		return &volumeController{hw: hw, ring: r, media: fallback, disabled: disabled}
+	}
 	level, err := hw.ReadDAC()
 	if err != nil {
-		level = (volumeButtonFloor + volumeMax) / 2
+		level, authoritative = fallback, false
 		log.Printf("[volume] read DAC: %v; using %d", err, level)
 	}
-	return &volumeController{hw: hw, ring: r, media: clamp(level)}
+	return &volumeController{hw: hw, ring: r, media: clamp(level), seeded: authoritative}
 }
 
 func (v *volumeController) setCallback(cb func(int)) {
@@ -69,7 +76,7 @@ func (v *volumeController) state() (level int, seeded bool) {
 // overwriting it.
 func (v *volumeController) seed(level int) {
 	v.mu.Lock()
-	if v.seeded {
+	if v.seeded || v.disabled != "" {
 		v.mu.Unlock()
 		return
 	}
@@ -84,6 +91,11 @@ func (v *volumeController) seed(level int) {
 
 func (v *volumeController) setMedia(level int, show bool) {
 	v.mu.Lock()
+	if v.disabled != "" {
+		v.mu.Unlock()
+		log.Printf("[volume] volume_set %d ignored: %s", level, v.disabled)
+		return
+	}
 	v.seeded = true
 	v.setMediaLocked(clamp(level))
 	cb, out := v.onMedia, v.media
@@ -96,6 +108,31 @@ func (v *volumeController) setMedia(level int, show bool) {
 	}
 }
 
+// external records a change made outside the firmware and already applied
+// (internal/androidvol's Watch on the Show), so nothing is written back.
+// During a foreground alert it moves only the occurrence's level, as a
+// volume button would; otherwise it is media volume, reported.
+func (v *volumeController) external(level int) {
+	level = clamp(level)
+	v.mu.Lock()
+	if v.disabled != "" {
+		v.mu.Unlock()
+		return
+	}
+	if v.alert {
+		v.alertLevel = level
+		v.mu.Unlock()
+		return
+	}
+	v.seeded = true
+	v.media = level
+	cb := v.onMedia
+	v.mu.Unlock()
+	if cb != nil {
+		cb(level)
+	}
+}
+
 func (v *volumeController) setMediaLocked(level int) {
 	v.media = level
 	if !v.alert {
@@ -105,6 +142,10 @@ func (v *volumeController) setMediaLocked(level int) {
 
 func (v *volumeController) step(delta int) {
 	v.mu.Lock()
+	if v.disabled != "" {
+		v.mu.Unlock()
+		return
+	}
 	if v.alert {
 		v.alertLevel = clampToButtonBand(v.alertLevel + delta)
 		v.applyLocked(v.alertLevel)
@@ -129,6 +170,9 @@ func (v *volumeController) step(delta int) {
 func (v *volumeController) setAlert(active bool, id string, foreground bool, volume *float64) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	if v.disabled != "" {
+		return
+	}
 	want := active && foreground
 	if want {
 		if id != v.alertID {

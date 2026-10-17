@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -87,16 +88,23 @@ type Config struct {
 	DeviceID        string
 	FirmwareVersion string
 	BootID          string
-	IP              func() string
+	// Platform is the detected image (internal/platform); it names the
+	// hello's platform and selects the platform capabilities.
+	Platform proto.Platform
+	IP       func() string
 	// AmbientStatus is the retained als.Report() object (nil: null);
 	// AmbientReadable gates the ambient_light capability.
 	AmbientStatus   func() *als.Status
 	AmbientReadable func() bool
+	// ScreenOn asks the kiosk to light the screen (kiosk.Waker.ScreenOn);
+	// required on a screen_wake platform, unused elsewhere. It must return
+	// at once.
+	ScreenOn func(url, password string)
 
 	Mic pkgmic.Microphone
 	// AFEMetadata: Mic's blocks carry decoded native AFE metadata
-	// (Block.AFE; slmic's micAsr decode). Only then may a hello
-	// announce afe_metadata_v1.
+	// (Block.AFE; the capture backend's micAsr / VOICE_RECOGNITION decode).
+	// Only then may a hello announce afe_metadata_v1.
 	AFEMetadata  bool
 	Physical     *server.Server
 	DeviceConfig *config.Device
@@ -131,6 +139,8 @@ type playbackState struct {
 type Supervisor struct {
 	cfg Config
 	now func() int64
+	// platformCaps are cfg.Platform's capabilities (platformCapabilities).
+	platformCaps []proto.Capability
 
 	mix  *render.Mixer
 	fm   *focus.Manager
@@ -207,6 +217,13 @@ func Assemble(cfg Config, d Deps) (*Supervisor, error) {
 		cfg.SpeechStore == nil || cfg.AlertStore == nil || d.Sink == nil || d.LoadModel == nil {
 		return nil, errors.New("supervisor: incomplete configuration")
 	}
+	platformCaps, ok := platformCapabilities[cfg.Platform]
+	if !ok {
+		return nil, fmt.Errorf("supervisor: unknown platform %q", cfg.Platform)
+	}
+	if slices.Contains(platformCaps, proto.CapScreenWake) && cfg.ScreenOn == nil {
+		return nil, errors.New("supervisor: screen_wake platform without ScreenOn")
+	}
 	if cfg.NowMonoNS == nil {
 		cfg.NowMonoNS = monoclock.Now
 	}
@@ -220,7 +237,7 @@ func Assemble(cfg Config, d Deps) (*Supervisor, error) {
 		cfg.AmbientReadable = func() bool { return false }
 	}
 	s := &Supervisor{
-		cfg: cfg, now: cfg.NowMonoNS,
+		cfg: cfg, now: cfg.NowMonoNS, platformCaps: platformCaps,
 		micRing: ring.NewMic(), refRing: ring.NewReference(), cellRing: ring.NewCells(), afeRing: ring.NewAFE(),
 		afe:        afeState{first: make(chan struct{})},
 		timeline:   capture.NewTimeline(),

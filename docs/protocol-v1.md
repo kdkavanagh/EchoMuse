@@ -1,6 +1,7 @@
 # EchoMuse device protocol v1 — wire reference
 
-This is the exact wire contract between the Dot firmware (`device/`) and the
+This is the exact wire contract between the device firmware (`device/`, one
+binary for the Echo Dot and the Echo Show) and the
 controller (`controller/`). It implements
 [post-afe-audio-architecture.md](post-afe-audio-architecture.md) §16.1; where
 that document names a field in prose, this file fixes its JSON spelling. Both
@@ -89,7 +90,8 @@ AFE record (kind 5, 14 bytes, all u8), sent only in a session whose
 AFE's per-frame metadata over capture period `k`, samples `[1280k,
 1280k+1280)` of the capture epoch; the header epoch is the mic capture epoch.
 The Fire OS 6 AFE writes one 128-bit v3.3 frame into bit 0 of every 128
-samples of `micAsr` (8 ms; [alexa-afe.md](alexa-afe.md) "AFE metadata in bit
+samples of the ASR capture (the mixer's `micAsr` on the Dot, the OpenSL
+`VOICE_RECOGNITION` capture on the Echo Show; 8 ms; [alexa-afe.md](alexa-afe.md) "AFE metadata in bit
 0"); a frame belongs to the period in which its last sample arrives, so a
 period holds at most 10. Raw values keep the AFE's scales.
 
@@ -136,7 +138,8 @@ is never filled.
 {"capabilities":["audio_timeline_v1","uplink_leases_v1","device_wake_v1",
   "render_reference_v1","render_progress_v1","focus_leases_v1","alert_cache_v1",
   "turn_protocol_v1","leds","led_anim","buttons","button_hold","alert_prefetch","local_wake_chime",
-  "no_input_chime","announcement_chime","open_rules_v1","ambient_light","afe_metadata_v1"],
+  "no_input_chime","announcement_chime","open_rules_v1","ambient_light","afe_metadata_v1",
+  "wifi_control","ble_proxy","privacy_mute"],
  "platform":"fireos6",
  "firmware_version":"v3.0.0","os_version":"Fire OS 6.5.6.9 (NS6569/6009)",
  "boot_id":"<proc boot_id>","protocols":[1],
@@ -147,9 +150,19 @@ is never filled.
  "assets":["<sha256>",…],
  "volume":{"level":120,"seeded":false}}
 ```
+An Echo Show (`"platform":"fireos6_crown"` or `"lineage18_crown"`) announces the eight required
+capabilities (`alert_cache_v1` under the same wakelock condition) plus
+`alert_prefetch`, `local_wake_chime`, `open_rules_v1`, `afe_metadata_v1`,
+`ambient_light` when its sensor is readable, and `screen_wake`: no `leds`,
+`led_anim`, `buttons` or `button_hold` (it has no ring and no action button),
+and none of the three Dot-only capabilities below.
 `alert_cache_v1` is withheld when the wakelock cannot be acquired
 (`alerts.wakeup = "alarm_wakeup_unavailable"`). `ambient_light` only when the
 sensor is readable. `ambient_light_status` is the legacy `als.Report()` object.
+`volume.level` is the device's volume 0–127, or JSON `null` (never omitted)
+when the device cannot control volume this run: `"volume":{"level":null,
+"seeded":false}` is the Echo Show whose Android volume check failed at start
+(§4.8). A Dot always sends a number.
 `local_wake_chime`: the device plays the wake chime itself at candidate open
 when `config` `wakeSound` is true (§4.4).
 `no_input_chime`: `render.start` accepts the earcon `local_asset`
@@ -163,20 +176,47 @@ other device.
 them, names the opening rule in `wake.candidate.rule` and reports shadow
 counters in `wake.stats.shadow` (§4.4; architecture §5.2).
 `afe_metadata_v1`: the capture carries the native AFE's per-frame metadata
-(the mixer's `micAsr`, format v3.3) and the device's decoder is validating
+(the ASR capture's bit 0, format v3.3; see §3) and the device's decoder is validating
 it. The firmware announces it only when a frame validated in the 2 s before
 the hello; right after start the hello waits up to 1 s for the first decoded
 capture period. With `session.ready`
 `afe_metadata`, the device serves the `afe` stream (§3, §4.5) and reports
 `wake.stats.afe` (§4.4). The values are evidence: no controller decision uses
 them (architecture §4.5).
-`platform`: the system image the firmware runs on, always `fireos6` (Fire OS
-6, Android 7.1.2 `biscuit_puffin`), the only image EchoMuse supports. It is
-not a capability and selects no protocol behaviour; it is an admission check.
-The controller refuses a hello that omits it or names anything else with
-`session.rejected` reason `protocol`, logging the value sent: firmware built
-from this tree runs audio on no other image, so admitting such a device would
-only offer it an update that breaks it.
+`wifi_control`, `ble_proxy`, `privacy_mute`: announced by firmware on the Dot
+(`fireos6`) only. `wifi_control`: the device handles `wifi_change`,
+`wifi_scan` and `wifi_commit` and reports `wifi_result`/`wifi_scan_result`
+(§4.8); the controller sends none of them to a device without it and refuses
+the dashboard's Wi-Fi change and scan. `ble_proxy`: the device scans BLE when
+`config` `bleProxyEnabled` is true and sends `ble_adverts`; the controller
+drops `ble_adverts` from a device without it (logged once per session) and
+runs no Home Assistant Bluetooth proxy for it. `privacy_mute`: the device has
+a hardware privacy mute and reports it in `privacy.muted` and
+`privacy.changed`; without it the controller shows mute as unavailable, never
+as off. On the Echo Show the device's own Android stack owns Wi-Fi and
+Bluetooth, and its mute is not integrated yet (`privacy.muted` is always
+false there).
+`screen_wake`: announced by firmware on the Echo Show (`fireos6_crown`, `lineage18_crown`) only.
+With `config` `screenWake` true the device lights the kiosk screen when a wake
+candidate opens, with
+`GET {screenWakeUrl}/?cmd=screenOn&type=json&password={screenWakePassword, URL-encoded}`
+to the kiosk's local REST API (Fully Kiosk Browser's Remote Administration):
+asynchronous, 2 s timeout, failures logged rate-limited, never delaying or
+blocking the wake.
+`platform`: the system image the firmware runs on: `fireos6` (Echo Dot 2nd
+gen, Fire OS 6, Android 7.1.2 `biscuit_puffin`), `fireos6_crown` (Echo Show 8
+1st gen `crown`, Fire OS 6 with the full Android framework) or
+`lineage18_crown` (the same Echo Show 8 on LineageOS 18.1, Android 11, with no
+Amazon apps). One firmware binary runs on all three and picks its audio
+backend and hardware bindings at runtime. It is not a capability and selects
+no protocol behaviour; it is an
+admission check, and it decides which reason the dashboard gives for an absent
+optional capability ("managed by the device" or "no LED ring on this device"
+on an Echo Show, "firmware update available" on an older Dot). The controller
+refuses a hello that omits it or names anything else with `session.rejected`
+reason `protocol`, logging the value sent: firmware built from this tree runs
+audio on no other image, so admitting such a device would only offer it an
+update that breaks it.
 `firmware_version` is the EchoMuse firmware; `os_version` is the system image's
 own build name (`ro.build.version.name`), which the firmware runs on and never
 changes. Empty when the property cannot be read. Descriptive only: the
@@ -518,8 +558,35 @@ fields unchanged:
 - D→C: `volume_state`, `ambient_light`, `log`, `wifi_result`,
   `wifi_scan_result`, `ble_adverts`, `stats`, `pong`.
 
-`config` keys after cutover: `startupVolume`, `duckDb`, `bleProxyEnabled`, and
-`wakeSound` (JSON boolean) only to a device announcing `local_wake_chime`.
+`config` keys after cutover: `startupVolume`, `duckDb`, `bleProxyEnabled`,
+`wakeSound` (JSON boolean) only to a device announcing `local_wake_chime`, and
+`screenWake` (JSON boolean, default false), `screenWakeUrl` (string, default
+`http://127.0.0.1:2323`, the kiosk API's root with no path) and
+`screenWakePassword` (string, default empty) only to a device announcing
+`screen_wake` (§4.1).
+
+Volume levels (`volume_set`, `volume_state`, a non-null hello `volume.level`,
+`startupVolume`) are 0–127 on every platform. The Echo Show's volume is
+Android's `STREAM_MUSIC` index, shared with its volume keys and the kiosk:
+0–30 on Fire OS (`fireos6_crown`), 0–15 on LineageOS (`lineage18_crown`). Its
+firmware maps proportionally to the image's maximum, index =
+round(level × max / 127) and level = round(index × 127 / max), and pins the
+`service call audio` codes per image (Fire OS: get 8, set 3, max 10;
+LineageOS: get 16, set 10, max 18). Android's index is the live state there: once
+the firmware's startup check of those codes passes
+(the image's maximum index, and a get / set-same / get round trip), hello
+`volume.seeded` is already true, so `startupVolume` is never applied over it,
+and the device sends `volume_state` with Android's level right after
+`session.ready`. Key presses and kiosk changes are reported as `volume_state`
+(during a foreground alert they move only the alert's level, as the Dot's
+buttons do). If the check fails, volume control is off for that firmware run
+(re-checked only at the next start): hello carries `"volume":{"level":null,
+"seeded":false}`, `volume_set` and `startupVolume` are ignored (logged) and no
+`volume_state` is sent. The controller then shows the device's volume as
+unavailable, with the reason "volume control unavailable: Android volume check
+failed (see device log)", sends it no `volume_set` (Home Assistant volume
+commands are refused or ignored) and reports no level to Home Assistant.
+`bleProxyEnabled` is ignored there (logged).
 
 ## 5. Transport rules
 

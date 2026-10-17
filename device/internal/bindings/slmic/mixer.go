@@ -24,8 +24,6 @@ const (
 	// AUDIO_SOURCE_VOICE_RECOGNITION, the HAL's ASP pipeline
 	// (docs/fireos6-port.md §2.1).
 	mixerStreamName = "micAsr"
-
-	periodFrames = 1280 // §4.1: 80 ms periods
 )
 
 // MixerMicrophone is the libmixerAPI capture stream: see internal/mixerapi's
