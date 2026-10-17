@@ -17,12 +17,13 @@ jobs:
       # Pure-logic modules plus the device link, HA client, auth and BT proxy,
       # which need websockets, aiohttp, bcrypt, zeroconf and protobuf, and
       # transcript correction, which expands HA's sentence templates with
-      # hassil (pinned as in requirements.txt). Model runtimes (onnxruntime,
-      # sherpa-onnx) are not installed; their tests skip via importorskip.
+      # hassil and pronounces words with cmudict (both pinned as in
+      # requirements.txt). Model runtimes (onnxruntime, sherpa-onnx) are not
+      # installed; their tests skip via importorskip.
       - name: Install test dependencies
         run: >
           pip install pytest numpy scipy websockets==16.0 aiohttp==3.13.5
-          bcrypt==5.0.0 zeroconf==0.149.17 "protobuf>=4.21.0" hassil==3.11.0
+          bcrypt==5.0.0 zeroconf==0.149.17 "protobuf>=4.21.0" hassil==3.11.0 cmudict==1.1.3
       - name: Run pytest
         working-directory: controller
         run: python -m pytest tests/ -v
@@ -74,7 +75,7 @@ jobs:
         run: >
           pip install mypy==2.3.1 numpy==2.4.4 websockets==16.0 aiohttp==3.13.5
           bcrypt==5.0.0 cryptography==44.0.1 zeroconf==0.149.17
-          "protobuf>=4.21.0" types-protobuf hassil==3.11.0
+          "protobuf>=4.21.0" types-protobuf hassil==3.11.0 cmudict==1.1.3
       # Settings and the checked file set live in controller/mypy.ini.
       - name: Run mypy
         working-directory: controller

@@ -17,7 +17,9 @@ import pytest
 
 pytest.importorskip("hassil")
 
+import em_phonetics
 import em_text_fix_service
+from em_phonetics import Lexicon, PronunciationSource, best_similarity, parse_guides
 from em_ha_client import (
     SentenceRecognition,
     SlotValue,
@@ -29,6 +31,7 @@ from em_ha_client import (
 )
 from em_text_fix import (
     AMBIGUITY_MARGIN,
+    PHRASE_MIN,
     PREFERENCE_CAP,
     Candidate,
     FixConfig,
@@ -41,6 +44,7 @@ from em_text_fix import (
     Status,
     TextFixMode,
     build_tables,
+    compile_phonetic,
     decide,
     fix_config,
     fix_key,
@@ -48,7 +52,6 @@ from em_text_fix import (
     parse_mode,
     propose,
     sent_text,
-    similarity,
     user_vocabulary,
 )
 from em_text_fix_service import NotReady, TextFixService
@@ -71,17 +74,27 @@ def tables(history: bool = True):
     return build_tables(vocabulary(), FIXTURE["templates"], HISTORY if history else [], 1)
 
 
+@functools.cache
+def phonetic(history: bool = True, guides: tuple[tuple[str, str], ...] = ()):
+    return compile_phonetic(tables(history), Lexicon(guides))
+
+
 def recognized(sentence: str) -> SentenceRecognition | None:
     assert sentence in FIXTURE["recognitions"], f"no recorded verdict for {sentence!r}: re-record the fixture"
     return _sentence_recognition(FIXTURE["recognitions"][sentence])
 
 
-def correct(text: str, *, wake: str | None = None, terms=(), phrases=(), history: bool = True):
+def proposed(text: str, *, wake: str | None = None, terms=(), phrases=(), history: bool = True, guides=()):
     key = fix_key(text)
-    t = tables(history)
-    original = recognized(key)
-    proposal = propose(Request(key, wake), original, t, user_vocabulary(tuple(terms), tuple(phrases)))
-    decision = decide(proposal, [recognized(c.text) for c in proposal.validate], original, t)
+    guides = parse_guides(dict(guides))
+    user = user_vocabulary(tuple(terms), tuple(phrases), Lexicon(guides))
+    return propose(Request(key, wake), recognized(key), tables(history), phonetic(history, guides), user)
+
+
+def correct(text: str, **kw):
+    proposal = proposed(text, **kw)
+    original = recognized(proposal.text)
+    decision = decide(proposal, [recognized(c.text) for c in proposal.validate], original, tables(kw.get("history", True)))
     return decision, proposal
 
 
@@ -94,6 +107,13 @@ def rejected(proposal: Proposal, text: str) -> str:
     raise AssertionError(f"{text!r} was not rejected: {[r.candidate.text for r in proposal.rejected]}")
 
 
+def unrecognized(text: str, *, phrases=()) -> Proposal:
+    """The proposal for `text` if HA's matcher recognized nothing of it (no slot to fill):
+    for near misses that preservation must reject before HA is ever asked."""
+    lexicon = Lexicon()
+    return propose(Request(fix_key(text)), None, tables(), phonetic(), user_vocabulary((), tuple(phrases), lexicon))
+
+
 # --- eligible corrections -------------------------------------------------------------------
 
 
@@ -102,6 +122,8 @@ def rejected(proposal: Proposal, text: str) -> str:
     ("watch you", "watch youtube tv", Rule.CUTOFF, Source.TRIGGER),             # turn 673
     ("Watch Flex.", "watch plex", Rule.PHRASE, Source.TRIGGER),                 # turn 770
     ("Plate cherub rock.", "play cherub rock", Rule.PHRASE, Source.HISTORY),    # turn 532
+    ("RMV alarm.", "arm the alarm", Rule.PHRASE, Source.TRIGGER),               # turn 773
+    ("arm v alarm.", "arm the alarm", Rule.PHRASE, Source.TRIGGER),             # turn 777
 ])
 def test_a_misheard_command_becomes_the_known_phrase_ha_accepts(heard, sent, rule, source):
     decision, _ = correct(heard)
@@ -112,7 +134,7 @@ def test_a_misheard_command_becomes_the_known_phrase_ha_accepts(heard, sent, rul
     if rule == Rule.CUTOFF:
         assert chosen.candidate.coverage >= 0.5 and fix_key(heard) in chosen.candidate.text
     else:
-        assert chosen.candidate.raw >= 0.85
+        assert chosen.candidate.raw >= PHRASE_MIN
 
 
 def test_what_time_is_it_and_what_time_is_it_now_are_two_triggers_the_better_covered_one_wins():
@@ -152,7 +174,7 @@ def test_text_with_no_safe_correction_is_left_alone(heard):
 def test_text_ha_already_understands_is_never_changed():
     original = recognized("what time is it")
     assert original is not None and original.match
-    assert propose(Request("what time is it"), original, tables(), user_vocabulary((), ())).validate == ()
+    assert proposed("what time is it").validate == ()
     assert decide(Proposal("what time is it", (), (), ()), [], original, tables()).reason == Reason.ORIGINAL_MATCHED
 
 
@@ -165,38 +187,42 @@ def test_shower_is_ambiguous_between_shower_mode_and_shower_time():
 
 
 def test_near_empty_text_proposes_nothing():
+    lexicon = Lexicon()
     for text in ("st", "Ophelia."):
-        proposal = propose(Request(fix_key(text)), None, tables(), user_vocabulary((), ()))
+        proposal = propose(Request(fix_key(text)), None, tables(), phonetic(), user_vocabulary((), (), lexicon))
         assert proposal.validate == () and proposal.rejected == ()
 
 
 # --- hard negatives -------------------------------------------------------------------------
 
 
-def test_a_negation_is_never_dropped():
-    decision, proposal = correct("don't disarm the security alarm please")
-    assert rejected(proposal, "can you disarm the security alarm please") == "negation"
+def test_a_negation_is_never_dropped_or_added():
+    # "can" and "can't" sound alike (one segment apart): the phrase is proposed, and refused.
+    proposal = unrecognized("you can stop the music", phrases=["you can't stop the music"])
+    assert rejected(proposal, "you can't stop the music") == "negation"
+    decision, _ = correct("don't disarm the security alarm please")
     assert decision.selected is None
 
 
-def test_on_is_never_swapped_for_off():
-    decision, proposal = correct("turn on the kitchen ceiling light")
-    assert rejected(proposal, "turn off the kitchen ceiling lights") in ("drops an action", "adds a polarity")
+def test_a_direction_is_never_dropped():
+    # "louder" and "lower" sound alike; only the first says which way.
+    proposal = unrecognized("make it louder", phrases=["make it lower"])
+    assert rejected(proposal, "make it lower") == "drops an action"
+    decision, _ = correct("turn on the kitchen ceiling light")
     assert decision.selected.candidate.text == "turn on the Kitchen Ceiling Lights"
 
 
 def test_lock_is_never_swapped_for_unlock():
     decision, proposal = correct("lock the front door")
-    assert rejected(proposal, "unlock the front door") == "drops an action"
-    assert decision.selected is None
+    assert decision.selected is None and not any("unlock" in c.text for c in proposal.validate)
 
 
-@pytest.mark.parametrize("heard, detail", [("set a timer for 5 minuets", "unit"),
-                                           ("set a timer for 6 minuets", "number")])
-def test_a_number_or_unit_is_never_changed(heard, detail):
-    decision, proposal = correct(heard)
-    assert rejected(proposal, "set a timer for 5 minutes") == detail
-    assert decision.selected is None
+def test_a_number_or_unit_is_never_changed():
+    # "fifteen" and "fifty" differ in one segment; "minute" and "minutes" in one.
+    proposal = unrecognized("set a timer for fifteen minutes", phrases=["set a timer for fifty minutes"])
+    assert rejected(proposal, "set a timer for fifty minutes") == "number"
+    proposal = unrecognized("set a timer for one minute", phrases=["set a timer for one minutes"])
+    assert rejected(proposal, "set a timer for one minutes") == "unit"
 
 
 def test_a_room_ha_already_resolved_is_never_replaced():
@@ -214,12 +240,20 @@ def test_a_room_ha_already_resolved_is_never_replaced():
     assert decision.checked[0].status == Status.CHANGED_RESOLVED and decision.selected is None
 
 
-def test_rmv_alarm_is_ambiguous_between_arming_and_arming_away():
-    # Turn 773: "arm the alarm" heard as "RMV alarm". HA accepts both modes' triggers.
-    decision, _ = correct("RMV alarm.")
-    templates = {ch.verdict.template for ch in decision.checked if ch.status == Status.OK}
-    assert any("away" in t for t in templates) and any("away" not in t for t in templates)
-    assert decision.reason == Reason.AMBIGUOUS and decision.selected is None
+def test_arming_at_home_is_heard_in_v_and_rmv_and_arming_away_is_not():
+    # Turns 773 and 777: "arm the alarm" heard as "RMV alarm" and "arm v alarm". "v" is said
+    # like "the" (DH IY, its CMUdict variant) but one voiced fricative apart; "away" was
+    # never said, so the away trigger is far from both.
+    lexicon = Lexicon()
+
+    def alike(a: str, b: str) -> float:
+        return best_similarity(lexicon.pronounce(a).variants(), lexicon.pronounce(b).variants())
+
+    assert alike("v", "the") >= PHRASE_MIN and alike("rmv", "arm the") >= PHRASE_MIN
+    assert alike("v", "the away") < PHRASE_MIN and alike("rmv", "arm the away") < PHRASE_MIN
+    for heard in ("RMV alarm.", "arm v alarm."):
+        texts = [c.text for c in proposed(heard).validate]
+        assert "arm the alarm" in texts and not any("away" in t for t in texts)
 
 
 def test_a_catch_all_match_validates_a_full_phrase_but_not_a_name_insertion():
@@ -245,32 +279,34 @@ def test_preference_never_changes_raw_evidence_and_is_capped():
     plain, _ = correct("watch flex")
     preferred, _ = correct("watch flex", terms=["Plex", "YouTube TV"], phrases=["watch Plex"])
     a, b = plain.selected.candidate, preferred.selected.candidate
-    assert a.text == b.text == "watch plex" and a.raw == b.raw
+    assert fix_key(a.text) == fix_key(b.text) == "watch plex" and a.raw == b.raw
     assert a.preference == 0 and 0 < b.preference <= PREFERENCE_CAP
 
 
 def test_higher_entries_weigh_more_and_repeats_add_nothing():
-    user = user_vocabulary(("Plex", "Netflix"), ())
+    lexicon = Lexicon()
+    user = user_vocabulary(("Plex", "Netflix"), (), lexicon)
     assert user.preference("watch plex") > user.preference("watch netflix") > 0
-    assert user_vocabulary(("Netflix", "Plex"), ()).preference("watch netflix") == user.preference("watch plex")
+    assert user_vocabulary(("Netflix", "Plex"), (), lexicon).preference("watch netflix") == user.preference("watch plex")
     assert user.preference("plex plex plex plex") == user.preference("watch plex")
-    many = user_vocabulary(tuple(f"term{i}" for i in range(50)), tuple(["term0 term1 term2"]))
+    many = user_vocabulary(tuple(f"term{i}" for i in range(50)), tuple(["term0 term1 term2"]), lexicon)
     assert many.preference("term0 term1 term2") == PREFERENCE_CAP
 
 
 def test_preference_orders_retrieval_of_equally_similar_phrases():
-    # "watch alex" and "watch plex" are equally close to "watch flex": the user's order decides
-    # which HA is asked about first.
-    for phrases in (("watch Plex", "watch Alex"), ("watch Alex", "watch Plex")):
-        proposal = propose(Request("watch flex"), recognized("watch flex"), tables(), user_vocabulary((), phrases))
-        user = [c.text for c in proposal.validate if c.text in ("watch plex", "watch alex")]
+    # "plecks", pronounced by a guide exactly as "plex", is exactly as close to "watch flex":
+    # the user's order decides which HA is asked about first.
+    guides = {"plecks": "P L EH K S"}
+    for phrases in (("watch Plex", "watch Plecks"), ("watch Plecks", "watch Plex")):
+        proposal = proposed("watch flex", phrases=phrases, guides=guides)
+        user = [c.text for c in proposal.validate if c.text in ("watch plex", "watch plecks")]
         assert user == [fix_key(p) for p in phrases]
 
 
 def test_preference_picks_among_spellings_of_one_interpretation_only():
     verdict = SentenceRecognition(True, False, "trigger", "(watch|put on) [the] plex")
     trigger = Candidate("watch plex", Rule.PHRASE, Source.TRIGGER, 0.90)
-    user = user_vocabulary((), ("put on the Plex",))
+    user = user_vocabulary((), ("put on the Plex",), Lexicon())
     spelled = Candidate("put on the plex", Rule.PHRASE, Source.USER_PHRASE, 0.89,
                         preference=user.preference("put on the plex"))
     decision = decide(Proposal("wach plex", (trigger, spelled), (), ()), [verdict, verdict], None, tables())
@@ -283,8 +319,10 @@ def test_preference_picks_among_spellings_of_one_interpretation_only():
 
 def test_preference_cannot_lift_a_phrase_below_the_threshold():
     phrase = "watch the Plex channel"
-    assert similarity("watch flex", phrase) < 0.85
-    proposal = propose(Request("watch flex"), recognized("watch flex"), tables(), user_vocabulary(("Plex",), (phrase,)))
+    lexicon = Lexicon()
+    changed = best_similarity(lexicon.pronounce("flex").variants(), lexicon.pronounce("the plex channel").variants())
+    assert changed < PHRASE_MIN
+    proposal = proposed("watch flex", terms=["Plex"], phrases=[phrase])
     assert fix_key(phrase) not in [c.text for c in proposal.validate + proposal.held]
 
 
@@ -294,17 +332,19 @@ def test_preference_cannot_erase_ambiguity():
 
 
 def test_preference_cannot_bypass_protected_words():
-    decision, proposal = correct("turn on the kitchen ceiling light", phrases=["turn off the kitchen ceiling lights"])
-    assert rejected(proposal, "turn off the kitchen ceiling lights") in ("drops an action", "adds a polarity")
-    assert "off" not in decision.selected.candidate.text.split()
+    # The user's own phrase, as close as it is, still may not drop the direction said.
+    proposal = unrecognized("make it louder", phrases=["make it lower", "make it louder please"])
+    assert rejected(proposal, "make it lower") == "drops an action"
+    assert "make it lower" not in [c.text for c in proposal.validate + proposal.held]
 
 
 # --- settings and history -------------------------------------------------------------------
 
 
 def test_settings_parse_and_reject_what_the_api_rejects():
-    assert fix_config({"transcriptFix": "on", "transcriptFixTerms": ["  Cherub   Rock "],
-                       "transcriptFixPhrases": []}) == FixConfig(TextFixMode.ON, ("Cherub Rock",), ())
+    assert fix_config({"transcriptFix": "on", "transcriptFixTerms": ["  Cherub   Rock "], "transcriptFixPhrases": [],
+                       "transcriptFixPronunciations": {"YouTubeTV": "Y UW1 T UW2 B T IY1 V IY1"}}) == FixConfig(
+        TextFixMode.ON, ("Cherub Rock",), (), (("youtubetv", "Y UW T UW B T IY V IY"),))
     assert fix_config({}) == FixConfig(TextFixMode.OFF)
     with pytest.raises(ValueError, match="one of"):
         parse_mode("maybe")
@@ -314,6 +354,65 @@ def test_settings_parse_and_reject_what_the_api_rejects():
         parse_list(["  ", "Plex"])
     with pytest.raises(ValueError, match="list of strings"):
         parse_list("Plex")
+    with pytest.raises(ValueError, match="unknown phoneme 'Q'"):
+        parse_guides({"plex": "P L EH Q S"})
+    with pytest.raises(ValueError, match="one word"):
+        parse_guides({"youtube tv": "Y UW T UW B T IY V IY"})
+    with pytest.raises(ValueError, match="listed twice"):
+        parse_guides({"Plex": "P L EH K S", "plex": "P L EH K S"})
+
+
+# --- pronunciations -------------------------------------------------------------------------
+
+
+def test_a_word_is_said_by_its_guide_then_the_dictionary_then_its_letters():
+    guided = Lexicon(parse_guides({"the": "DH IY", "youtubetv": "Y UW T UW B T IY V IY"}))
+    assert Lexicon().word("youtubetv") is None                       # not in CMUdict, has vowels
+    assert guided.word("youtubetv").source == PronunciationSource.GUIDE
+    assert Lexicon().word("the").arpabet == ("DH AH", "DH IY")       # CMUdict: AH however stressed
+    assert guided.word("the").arpabet == ("DH IY",)                  # a guide replaces the dictionary
+    assert Lexicon().word("rmv").source == PronunciationSource.LETTERS
+    assert Lexicon().word("rmv").arpabet == ("AA R EH M V IY",)
+
+
+def test_text_with_a_word_that_has_no_pronunciation_is_never_compared_by_sound():
+    # "youtubetv" (a trigger's spelling) has no pronunciation until a guide gives it one: its
+    # phrases are listed as unknown and have no pronunciation to retrieve them by.
+    plain = phonetic()
+    texts = [p.text for p in tables().triggers.phrases]
+    owners = [i for i, t in enumerate(texts) if "youtubetv" in t.split()]
+    assert owners and plain.unknown["youtubetv"] == len(owners)
+    assert not set(owners) & set(plain.triggers.layer.owners.tolist())
+    guided = phonetic(guides=(("youtubetv", "Y UW T UW B T IY V IY"),))
+    assert "youtubetv" not in guided.unknown and set(owners) <= set(guided.triggers.layer.owners.tolist())
+
+
+def test_words_the_heard_text_and_a_phrase_share_never_dilute_the_evidence():
+    # "turn off the other tv" against "turn off the office tv" or "turn office tv off": the
+    # whole texts sound alike, the one word that differs does not.
+    lexicon = Lexicon()
+    whole = best_similarity(lexicon.pronounce("turn off the other tv").variants(),
+                            lexicon.pronounce("turn off the office tv").variants())
+    assert whole >= PHRASE_MIN
+    texts = [c.text for c in proposed("turn off the other tv").validate]
+    assert not any("office" in t for t in texts)
+
+
+def test_the_batched_distance_is_the_scalar_one():
+    rng = __import__("random").Random(7)
+    n = len(em_phonetics.SEGMENTS)
+    rows = [bytes(rng.randrange(n) for _ in range(rng.randint(1, 14))) for _ in range(200)]
+    layer = em_phonetics.PhoneticLayer.build([[r] for r in rows])
+    for minimum in (0.0, 0.5, 0.75):
+        for _ in range(15):
+            query = bytes(rng.randrange(n) for _ in range(rng.randint(1, 14)))
+            found = layer.search([query], minimum)
+            for owner, row in enumerate(rows):
+                expected = em_phonetics.similarity(query, row)
+                if expected >= minimum + 1e-4:
+                    assert found[owner] == pytest.approx(expected, abs=1e-4)
+                elif expected < minimum - 1e-4:
+                    assert owner not in found
 
 
 def test_history_is_what_was_sent_and_repetition_earns_nothing():
@@ -513,11 +612,13 @@ def test_a_tried_transcript_shows_what_on_would_send_in_the_speakers_context(con
     assert (plex.satellite, plex.pipeline, plex.language, plex.wake_phrase) == (
         DEVICE, f"pipeline-of-{DEVICE}", "en", "ophelia")
     assert dot_calls and all((device, language) == (DEVICE, "en") for _, device, language in dot_calls)
-    # "RMV alarm" reaches "arm the alarm", and also arming away: too close to choose.
+    # "RMV alarm" is "arm the alarm"; the tester shows how each word was pronounced.
     record = alarm.record.as_dict(candidates=30)
-    assert (record["applied"], record["reason"], record["sent"]) == (False, "ambiguous", "RMV alarm.")
-    matched = {c["matched"] for c in record["candidates"] if c["status"] == "ok"}
-    assert any("away" in t for t in matched) and any("away" not in t for t in matched)
+    assert (record["applied"], record["reason"], record["sent"]) == (True, "applied", "arm the alarm")
+    assert not any("away" in (c.get("matched") or "") for c in record["candidates"] if c["status"] == "ok")
+    assert [(w, f.source if f else None) for w, f in zip(alarm.heard.words, alarm.heard.found)] == [
+        ("rmv", "letters"), ("alarm", "dictionary")]
+    assert alarm.proposed is not None and alarm.proposed.words == ("arm", "the", "alarm")
     assert alarm.wake_phrase is None
     assert (fleet.satellite, fleet.pipeline) == (None, "preferred")
     assert fleet_calls and all(device is None for _, device, _ in fleet_calls)

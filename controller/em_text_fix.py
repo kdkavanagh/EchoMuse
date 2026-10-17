@@ -8,13 +8,17 @@ A correction is proposed only for text HA's sentence matcher does not already un
 from six rules (`Rule`), and is applied only when HA's matcher fully accepts it under the
 turn's own context, it preserves everything the original said explicitly (negation,
 polarity, actions, numbers, units, named targets, and every slot HA had resolved), and
-no competing interpretation comes within AMBIGUITY_MARGIN of it. Similarity here is a
-retrieval and scoring heuristic, not a probability that the correction is what was meant.
+no competing interpretation comes within AMBIGUITY_MARGIN of it.
+
+The rules that ask what a misheard text was meant to say (slot, name, lead-in, phrase)
+compare pronunciations (em_phonetics): CMUdict and the user's pronunciation guides, by
+phoneme edit distance weighted by articulatory features. Text with a word that has no
+pronunciation is never compared by sound. Similarity is a retrieval and scoring
+heuristic, not a probability that the correction is what was meant.
 
 Every rule reads only the canonical text (`fix_key`): lowercase, edge punctuation trimmed,
 whitespace collapsed, exactly what the endpoint's stable prefix is. So a correction
-computed at a pause holds for a final transcript with the same key. Letters spelled as
-an acronym ("RMV") are recognized by having no vowel, not by their case.
+computed at a pause holds for a final transcript with the same key.
 """
 
 from __future__ import annotations
@@ -26,12 +30,16 @@ import json
 import re
 from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from functools import lru_cache
 from typing import Final
 
+import numpy as np
+import numpy.typing as npt
+
 from em_ha_client import SentenceRecognition, Vocabulary
+from em_phonetics import Lexicon, PhoneticLayer, Pronounced, best_similarity, parse_guides, tokens
 from em_wake_phrase import normalize_command
 
 # ── Configuration ────────────────────────────────────────────────────────────
@@ -39,6 +47,7 @@ from em_wake_phrase import normalize_command
 MODE_KEY: Final = "transcriptFix"
 TERMS_KEY: Final = "transcriptFixTerms"
 PHRASES_KEY: Final = "transcriptFixPhrases"
+PRONUNCIATIONS_KEY: Final = "transcriptFixPronunciations"
 MAX_LIST_ENTRIES: Final = 200
 MAX_ENTRY_CHARS: Final = 120
 
@@ -92,15 +101,20 @@ def parse_list(raw: object) -> tuple[str, ...]:
 
 @dataclass(frozen=True, slots=True)
 class FixConfig:
-    """One device's effective correction settings."""
+    """One device's effective correction settings. `pronunciations`: (word, ARPAbet) guides."""
     mode: TextFixMode = TextFixMode.OFF
     terms: tuple[str, ...] = ()
     phrases: tuple[str, ...] = ()
+    pronunciations: tuple[tuple[str, str], ...] = ()
+    lexicon: Lexicon = field(init=False, compare=False, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "lexicon", Lexicon(self.pronunciations))
 
     @property
     def digest(self) -> str:
         """Identifies these settings in a result's context and its record."""
-        blob = json.dumps([self.mode, self.terms, self.phrases], separators=(",", ":"))
+        blob = json.dumps([self.mode, self.terms, self.phrases, self.pronunciations], separators=(",", ":"))
         return hashlib.sha256(blob.encode()).hexdigest()[:12]
 
 
@@ -109,22 +123,12 @@ def fix_config(cfg: Mapping[str, object]) -> FixConfig:
     stored value means a hand-edited database: ValueError, and the caller turns it off."""
     raw_mode = cfg.get(MODE_KEY, TextFixMode.OFF.value)
     return FixConfig(parse_mode(raw_mode), parse_list(cfg.get(TERMS_KEY, [])),
-                     parse_list(cfg.get(PHRASES_KEY, [])))
+                     parse_list(cfg.get(PHRASES_KEY, [])), parse_guides(cfg.get(PRONUNCIATIONS_KEY, {})))
 
 
 # ── Text features ────────────────────────────────────────────────────────────
 
-_TOKEN = re.compile(r"[a-z0-9]+(?:'[a-z]+)?|%")
 _NOT_LETTER = re.compile(r"[^a-z0-9]")
-_SOUND = (("ph", "f"), ("ck", "k"), ("gh", "g"), ("wh", "w"), ("kn", "n"), ("wr", "r"), ("qu", "kw"),
-          ("x", "ks"), ("q", "k"), ("z", "s"), ("ce", "se"), ("ci", "si"), ("cy", "sy"), ("c", "k"),
-          ("v", "f"), ("dg", "j"), ("th", "t"))
-_DOUBLED = re.compile(r"(.)\1+")
-_LATER_VOWELS = re.compile(r"[aeiouyhw]")
-_LETTER_NAMES = dict(zip("abcdefghijklmnopqrstuvwxyz",
-                         "ay bee see dee ee ef gee aitch eye jay kay el em en oh pee cue ar es tee you vee "
-                         "doubleyou ex why zee".split()))
-_SPELLED = re.compile(r"[b-df-hj-np-tv-xz]{1,4}")   # no vowel (nor y): letters, not a word
 
 
 def fix_key(text: str) -> str:
@@ -133,79 +137,8 @@ def fix_key(text: str) -> str:
     return normalize_command(text)
 
 
-def tokens(text: str) -> tuple[str, ...]:
-    """Words, numbers, and `%`, casefolded; apostrophes inside a word are kept."""
-    return tuple(_TOKEN.findall(text.casefold().replace("\u2019", "'")))
-
-
 def letters(text: str) -> str:
     return _NOT_LETTER.sub("", text.casefold())
-
-
-def sound_key(text: str) -> str:
-    """A rough sound key: ph→f, c→k/s, v→f, th→t, …; doubled letters collapsed; vowels
-    (and h, w, y) after the first letter dropped."""
-    s = letters(text)
-    for a, b in _SOUND:
-        s = s.replace(a, b)
-    s = _DOUBLED.sub(r"\1", s)
-    return s[:1] + _LATER_VOWELS.sub("", s[1:])
-
-
-def spoken_letters(text: str) -> str:
-    """`text` with each vowel-less word of 1–4 letters said as letter names: decoders write
-    some words as letters ("arm the" → "RMV", "the" → "v")."""
-    return " ".join(" ".join(_LETTER_NAMES[c] for c in w) if _SPELLED.fullmatch(w) else w
-                    for w in tokens(text))
-
-
-def _distance(a: str, b: str, limit: int) -> int:
-    """Edit distance (unit costs), or limit + 1 once it must exceed `limit`."""
-    if len(a) < len(b):
-        a, b = b, a
-    la, lb = len(a), len(b)
-    if la - lb > limit:
-        return limit + 1
-    if lb == 0:
-        return la
-    over = limit + 1
-    prev = [j if j <= limit else over for j in range(lb + 1)]
-    for i in range(1, la + 1):
-        ca = a[i - 1]
-        lo, hi = max(1, i - limit), min(lb, i + limit)
-        cur = [over] * (lb + 1)
-        cur[0] = i if i <= limit else over
-        best = cur[0]
-        for j in range(lo, hi + 1):
-            v = prev[j - 1] + (ca != b[j - 1])
-            if prev[j] + 1 < v:
-                v = prev[j] + 1
-            if cur[j - 1] + 1 < v:
-                v = cur[j - 1] + 1
-            cur[j] = v if v <= limit else over
-            if v < best:
-                best = v
-        if best > limit:
-            return over
-        prev = cur
-    return prev[lb]
-
-
-def _ratio(a: str, b: str, minimum: float = 0.0) -> float:
-    """1 − distance/longer length; 0.0 when below `minimum`."""
-    longest = max(len(a), len(b), 1)
-    limit = int((1.0 - minimum) * longest + 1e-9)
-    d = _distance(a, b, limit)
-    return 0.0 if d > limit else 1.0 - d / longest
-
-
-def similarity(a: str, b: str, minimum: float = 0.0) -> float:
-    """The better of the letter and sound-key ratios (0–1); 0.0 when both are below `minimum`."""
-    return _similarity(letters(a), sound_key(a), letters(b), sound_key(b), minimum)
-
-
-def _similarity(la: str, sa: str, lb: str, sb: str, minimum: float) -> float:
-    return max(_ratio(la, lb, minimum), _ratio(sa, sb, minimum))
 
 
 # ── Protected content ────────────────────────────────────────────────────────
@@ -373,12 +306,18 @@ class Reason(StrEnum):
     STALE = "stale"                        # computed under a context that no longer holds
 
 
-# Rule thresholds (§16.8 table). Raw similarity, never including preference.
-SLOT_MIN: Final = 0.75
+# Rule thresholds (§16.8 table): how alike what a candidate replaces sounds to what replaces
+# it (em_phonetics), never including preference: leading words and the wake phrase's end;
+# for a slot, a span or a phrase, only the words that differ between the replaced text and
+# the replacement (_changed): words in both never dilute it. A slot value is a short name,
+# where one segment is a large share ("glow" for "low" is 0.75), and the slot's domain, area
+# and floor already narrow its names.
+SLOT_MIN: Final = 0.70
 NAME_MIN: Final = 0.80
-PHRASE_MIN: Final = 0.85
+PHRASE_MIN: Final = 0.70
 CUTOFF_MIN_COVERAGE: Final = 0.5
 LEAD_IN_MIN: Final = 0.75
+MIN_TAIL_PHONEMES: Final = 3      # the shortest end of the wake phrase a lead-in may be (segments)
 MIN_LETTERS: Final = 4
 MAX_LEAD_WORDS: Final = 3
 MAX_SPAN_WORDS: Final = 4
@@ -408,7 +347,7 @@ class Candidate:
     text: str
     rule: Rule
     source: Source
-    raw: float                       # raw similarity (cut-off: of the whole texts, reported only)
+    raw: float                       # phonetic similarity (cut-off: of the whole texts, reported only)
     coverage: float | None = None    # cut-off: the share of the phrase's letters heard
     preference: float = 0.0
     target: Target | None = None
@@ -431,7 +370,6 @@ class Candidate:
 class Phrase:
     text: str                        # canonical
     letters: str
-    sound: str
     source: Source
     template: str | None = None      # trigger
     position: int | None = None      # user phrase: 0 = highest preference
@@ -439,19 +377,12 @@ class Phrase:
     ts: float | None = None
 
 
-def _grams(s: str, n: int) -> frozenset[str]:
-    return frozenset(s[i:i + n] for i in range(len(s) - n + 1)) if len(s) >= n else frozenset({s} if s else ())
-
-
 @dataclass(frozen=True)
 class PhraseLayer:
-    """Complete phrases with their lookup tables: letter trigrams and sound-key bigrams for
-    similarity retrieval (q-gram count filter), sorted letters and reversed letters for
-    head/tail completion."""
+    """Complete phrases, one per letter string, with their letters sorted forwards and
+    reversed for head/tail completion (the cut-off rule). Their pronunciations are searched
+    through a PhoneticLayer whose owners are these phrases' positions."""
     phrases: tuple[Phrase, ...]
-    _letter_grams: Mapping[str, tuple[int, ...]]
-    _sound_grams: Mapping[str, tuple[int, ...]]
-    _gram_counts: tuple[tuple[int, int], ...]   # (distinct letter trigrams, distinct sound bigrams)
     _heads: tuple[str, ...]
     _head_ids: tuple[int, ...]
     _tails: tuple[str, ...]
@@ -465,48 +396,13 @@ class PhraseLayer:
             if p.letters and p.letters not in kept:
                 kept[p.letters] = p
         items = tuple(kept.values())
-        letter_grams: dict[str, list[int]] = {}
-        sound_grams: dict[str, list[int]] = {}
-        counts: list[tuple[int, int]] = []
-        for i, p in enumerate(items):
-            lg, sg = _grams(p.letters, 3), _grams(p.sound, 2)
-            counts.append((len(lg), len(sg)))
-            for g in lg:
-                letter_grams.setdefault(g, []).append(i)
-            for g in sg:
-                sound_grams.setdefault(g, []).append(i)
         heads = sorted((p.letters, i) for i, p in enumerate(items))
         tails = sorted((p.letters[::-1], i) for i, p in enumerate(items))
-        return cls(items, {g: tuple(v) for g, v in letter_grams.items()},
-                   {g: tuple(v) for g, v in sound_grams.items()}, tuple(counts),
-                   tuple(h for h, _ in heads), tuple(i for _, i in heads),
+        return cls(items, tuple(h for h, _ in heads), tuple(i for _, i in heads),
                    tuple(t for t, _ in tails), tuple(i for _, i in tails))
 
     def __len__(self) -> int:
         return len(self.phrases)
-
-    def near(self, letter_key: str, sound: str, minimum: float) -> set[int]:
-        """Phrases that may be within `minimum` similarity: a distinct q-gram survives each
-        edit unless one of its q positions changed, so a match keeps at least
-        max(distinct grams) − k·q of them, k the edits the threshold allows."""
-        out: set[int] = set()
-        for key, n, grams, which in ((letter_key, 3, self._letter_grams, 0), (sound, 2, self._sound_grams, 1)):
-            mine = _grams(key, n)
-            if not mine:
-                continue
-            counts: Counter[int] = Counter()
-            for g in mine:
-                counts.update(grams.get(g, ()))
-            for i, common in counts.items():
-                p = self.phrases[i]
-                other = p.letters if which == 0 else p.sound
-                longest = max(len(key), len(other))
-                k = int((1.0 - minimum) * longest + _EPS)
-                if abs(len(key) - len(other)) > k:
-                    continue
-                if common >= max(len(mine), self._gram_counts[i][which]) - k * n:
-                    out.add(i)
-        return out
 
     def completions(self, letter_key: str, min_coverage: float) -> Iterator[int]:
         """Phrases whose letters start or end with `letter_key` and are longer, covering at
@@ -527,7 +423,7 @@ def _phrase(text: str, source: Source, *, template: str | None = None, position:
     key = letters(canonical)
     if not key:
         return None
-    return Phrase(canonical, key, sound_key(canonical), source, template, position, turn_id, ts)
+    return Phrase(canonical, key, source, template, position, turn_id, ts)
 
 
 def expand_triggers(templates: Sequence[str], *, per_template: int = 5_000,
@@ -604,38 +500,9 @@ def build_history(entries: Iterable[HistoryEntry]) -> PhraseLayer:
 @dataclass(frozen=True, slots=True)
 class Name:
     text: str
-    letters: str
-    sound: str
     target: Target
     domain: str | None = None            # entity
     area_ids: frozenset[str] = frozenset()
-
-
-@dataclass(frozen=True)
-class NameIndex:
-    names: tuple[Name, ...]
-    _by_letters: Mapping[int, tuple[int, ...]]
-    _by_sound: Mapping[int, tuple[int, ...]]
-
-    @classmethod
-    def build(cls, names: Iterable[Name]) -> NameIndex:
-        items = tuple(n for n in names if n.letters)
-        by_letters: dict[int, list[int]] = {}
-        by_sound: dict[int, list[int]] = {}
-        for i, n in enumerate(items):
-            by_letters.setdefault(len(n.letters), []).append(i)
-            by_sound.setdefault(len(n.sound), []).append(i)
-        return cls(items, {k: tuple(v) for k, v in by_letters.items()},
-                   {k: tuple(v) for k, v in by_sound.items()})
-
-    def near(self, letter_key: str, sound: str, minimum: float) -> set[int]:
-        out: set[int] = set()
-        for key, buckets in ((letter_key, self._by_letters), (sound, self._by_sound)):
-            n = len(key)
-            lo, hi = int(n * minimum - _EPS) if n else 0, int(n / max(minimum, _EPS) + _EPS)
-            for length in range(max(lo, 1), hi + 1):
-                out.update(buckets.get(length, ()))
-        return out
 
 
 @dataclass(frozen=True)
@@ -645,7 +512,7 @@ class Tables:
     revision: int
     triggers: PhraseLayer
     history: PhraseLayer
-    names: NameIndex
+    names: tuple[Name, ...]
     name_words: frozenset[str]                 # every word of an HA name (≥ 3 letters, not a stopword)
     entity_ids_by_name: Mapping[str, frozenset[str]]
     area_id_by_name: Mapping[str, str]
@@ -657,7 +524,7 @@ class Tables:
     @property
     def summary(self) -> dict[str, int]:
         return {"revision": self.revision, "triggers": len(self.triggers), "history": len(self.history),
-                "names": len(self.names.names), "catch_all_templates": len(self.skipped_templates)}
+                "names": len(self.names), "catch_all_templates": len(self.skipped_templates)}
 
 
 def build_tables(vocabulary: Vocabulary, templates: Sequence[str], history: Iterable[HistoryEntry],
@@ -679,22 +546,22 @@ def build_tables(vocabulary: Vocabulary, templates: Sequence[str], history: Iter
     for e in vocabulary.entities:
         for n in e.names:
             ids = frozenset(entity_ids[n.casefold()])
-            names.append(Name(n, letters(n), sound_key(n), Target(TargetKind.ENTITY, ids, n), e.domain,
+            names.append(Name(n, Target(TargetKind.ENTITY, ids, n), e.domain,
                               frozenset({e.area_id}) if e.area_id else frozenset()))
     for a in vocabulary.areas:
         for n in a.names:
             area_ids.setdefault(n.casefold(), a.area_id)
-            names.append(Name(n, letters(n), sound_key(n), Target(TargetKind.AREA, frozenset({a.area_id}), n),
-                              None, frozenset({a.area_id})))
+            names.append(Name(n, Target(TargetKind.AREA, frozenset({a.area_id}), n), None, frozenset({a.area_id})))
     for f in vocabulary.floors:
         for n in f.names:
             floor_ids.setdefault(n.casefold(), f.floor_id)
-            names.append(Name(n, letters(n), sound_key(n), Target(TargetKind.FLOOR, frozenset({f.floor_id}), n),
-                              None, frozenset(floor_areas.get(f.floor_id, ()))))
+            names.append(Name(n, Target(TargetKind.FLOOR, frozenset({f.floor_id}), n), None,
+                              frozenset(floor_areas.get(f.floor_id, ()))))
+    names = [n for n in names if letters(n.text)]
     words = {w for n in names for w in tokens(n.text) if len(w) >= 3 and w not in STOPWORDS}
     return Tables(
         revision=revision, triggers=PhraseLayer.build(triggers), history=build_history(history),
-        names=NameIndex.build(names), name_words=frozenset(words),
+        names=tuple(names), name_words=frozenset(words),
         entity_ids_by_name={k: frozenset(v) for k, v in entity_ids.items()},
         area_id_by_name=area_ids, floor_id_by_name=floor_ids,
         entity_area={e.entity_id: e.area_id for e in vocabulary.entities}, area_floor=area_floor,
@@ -703,12 +570,99 @@ def build_tables(vocabulary: Vocabulary, templates: Sequence[str], history: Iter
 
 
 @dataclass(frozen=True)
+class Sounds:
+    """Texts' pronunciations (owners in order) and, for the phrase rule's anchor, the texts
+    each content word (not a stopword) occurs in, by spelling and by each pronunciation."""
+    layer: PhoneticLayer
+    anchors: Mapping[str | bytes, npt.NDArray[np.intp]]
+    count: int
+    unknown: Counter[str]                # words with no pronunciation, by how many texts use them
+
+    @classmethod
+    def of(cls, lexicon: Lexicon, texts: Sequence[str]) -> Sounds:
+        variants: list[tuple[bytes, ...]] = []
+        unknown: Counter[str] = Counter()
+        index: dict[str | bytes, list[int]] = {}
+        for owner, text in enumerate(texts):
+            said = lexicon.pronounce(text)
+            variants.append(said.variants())
+            unknown.update(said.unknown)
+            for key in _anchor_keys(said):
+                index.setdefault(key, []).append(owner)
+        return cls(PhoneticLayer.build(variants), {k: np.unique(np.array(v, dtype=np.intp)) for k, v in index.items()},
+                   len(texts), unknown)
+
+    def anchored(self, said: Pronounced) -> npt.NDArray[np.bool_] | None:
+        """The texts sharing a content word with `said`, as spelled or as pronounced; None
+        (every text) when `said` has at most one content word, where nothing could anchor."""
+        keys = _anchor_keys(said)
+        if len({k for k in keys if isinstance(k, str)}) <= 1:
+            return None
+        allowed = np.zeros(self.count, dtype=np.bool_)
+        for key in keys:
+            if (owners := self.anchors.get(key)) is not None:
+                allowed[owners] = True
+        return allowed
+
+
+def _anchor_keys(said: Pronounced) -> list[str | bytes]:
+    keys: list[str | bytes] = []
+    for word, found in zip(said.words, said.found):
+        if word not in STOPWORDS:
+            keys.append(word)
+            keys.extend(found.alternatives if found is not None else ())
+    return keys
+
+
+@dataclass(frozen=True)
+class Phonetic:
+    """The tables' phrases and names as pronunciations under one lexicon, for the rules
+    that compare by sound. Owners index tables.triggers.phrases, tables.history.phrases and
+    tables.names."""
+    lexicon: Lexicon
+    triggers: Sounds
+    history: Sounds
+    names: Sounds
+    sources: tuple[PhraseLayer, PhraseLayer, tuple[Name, ...]]
+
+    @property
+    def unknown(self) -> Counter[str]:
+        """Words of HA's trigger sentences, earlier requests and names with no pronunciation,
+        by how many of those texts use them."""
+        return self.triggers.unknown + self.history.unknown + self.names.unknown
+
+    def compiled_from(self, tables: Tables, lexicon: Lexicon) -> bool:
+        return self.lexicon == lexicon and all(a is b for a, b in zip(self.sources, _sources(tables)))
+
+
+def _sources(tables: Tables) -> tuple[PhraseLayer, PhraseLayer, tuple[Name, ...]]:
+    return (tables.triggers, tables.history, tables.names)
+
+
+def compile_phonetic(tables: Tables, lexicon: Lexicon, previous: Phonetic | None = None) -> Phonetic:
+    """`tables` pronounced under `lexicon`: CPU work, run off the event loop. A part whose
+    source and lexicon are unchanged from `previous` is reused (a history update recompiles
+    only the history)."""
+    sources = _sources(tables)
+    texts = ([p.text for p in tables.triggers.phrases], [p.text for p in tables.history.phrases],
+             [n.text for n in tables.names])
+    reuse = previous if previous is not None and previous.lexicon == lexicon else None
+    held = (reuse.triggers, reuse.history, reuse.names) if reuse is not None else None
+    parts = [held[k] if reuse is not None and held is not None and reuse.sources[k] is sources[k]
+             else Sounds.of(lexicon, texts[k]) for k in range(3)]
+    return Phonetic(lexicon, parts[0], parts[1], parts[2], sources)
+
+
+@dataclass(frozen=True)
 class UserVocabulary:
-    """The ordered `transcriptFixTerms` and `transcriptFixPhrases`, highest preference first."""
+    """The ordered `transcriptFixTerms` and `transcriptFixPhrases`, highest preference first,
+    and their pronunciations (owners index term_names and phrase_layer.phrases)."""
     terms: tuple[str, ...]
     phrases: tuple[str, ...]
-    term_names: NameIndex
+    term_names: tuple[Name, ...]
     phrase_layer: PhraseLayer
+    term_sounds: Sounds
+    phrase_sounds: Sounds
 
     def preference(self, text: str) -> float:
         """The capped preference of a candidate's text: an exact user phrase by position, plus
@@ -735,12 +689,12 @@ def _span_letters(words: Sequence[str], longest: int = 6) -> set[str]:
 
 
 @lru_cache(maxsize=16)
-def user_vocabulary(terms: tuple[str, ...], phrases: tuple[str, ...]) -> UserVocabulary:
-    term_names = NameIndex.build(
-        Name(t, letters(t), sound_key(t), Target(TargetKind.TERM, frozenset({letters(t)}), t)) for t in terms)
+def user_vocabulary(terms: tuple[str, ...], phrases: tuple[str, ...], lexicon: Lexicon) -> UserVocabulary:
+    term_names = tuple(Name(t, Target(TargetKind.TERM, frozenset({letters(t)}), t)) for t in terms if letters(t))
     layer = PhraseLayer.build(p for i, text in enumerate(phrases)
                               if (p := _phrase(text, Source.USER_PHRASE, position=i)) is not None)
-    return UserVocabulary(terms, phrases, term_names, layer)
+    return UserVocabulary(terms, phrases, term_names, layer, Sounds.of(lexicon, [n.text for n in term_names]),
+                          Sounds.of(lexicon, [p.text for p in layer.phrases]))
 
 
 # ── Proposal ─────────────────────────────────────────────────────────────────
@@ -782,38 +736,72 @@ def _digits(text: str) -> str:
     return _NUMBER_RUN.sub(value, text)
 
 
-def _wake_residue(span: str, wake_phrase: str) -> float:
-    """How much a leading span sounds like the wake phrase or its tail (what is left of a
-    wake word whose start the transcript lost)."""
-    span_letters = letters(span)
-    wake = letters(wake_phrase)
-    if len(span_letters) < 3 or not wake:
-        return 0.0
-    span_sound = sound_key(span_letters)
-    best = 0.0
-    for k in range(3, len(wake) + 1):
-        tail = wake[-k:]
-        best = max(best, _similarity(span_letters, span_sound, tail, sound_key(tail), LEAD_IN_MIN))
-    return best
-
-
 def _replace_words(text: str, words: str, new: str) -> str | None:
     m = re.search(r"(?<![\w'])" + r"\s+".join(re.escape(w) for w in words.split()) + r"(?![\w'])", text)
     return None if m is None else text[:m.start()] + new + text[m.end():]
 
 
+def _changed(heard: Sequence[str], phrase: Sequence[str], lexicon: Lexicon) -> tuple[str, str]:
+    """The words of `heard` not in `phrase` and those of `phrase` not in `heard` (each as
+    often as the other lacks it, in order), each side's joined: what a candidate replaces,
+    and with what. A word in both is never changed, wherever it stands ("turn off the tv"
+    and "turn the tv off" change nothing), and two words are the same when spelled alike or
+    sharing a pronunciation (CMUdict says "tv" as "television" too)."""
+    groups: list[set[bytes]] = []
+    ids: dict[str, int] = {}
+
+    def ident(word: str) -> int:
+        if word not in ids:
+            found = lexicon.word(word)
+            said = set(found.alternatives) if found is not None else set()
+            ids[word] = next((i for i, g in enumerate(groups) if said & g), len(groups))
+            if ids[word] == len(groups):
+                groups.append(said)
+            else:
+                groups[ids[word]] |= said
+        return ids[word]
+
+    mine, theirs = [ident(w) for w in heard], [ident(w) for w in phrase]
+    shared = Counter(mine) & Counter(theirs)
+
+    def rest(words: Sequence[str], keys: Sequence[int]) -> str:
+        left = Counter(shared)
+        out = []
+        for word, key in zip(words, keys):
+            if left[key] > 0:
+                left[key] -= 1
+            else:
+                out.append(word)
+        return " ".join(out)
+
+    return rest(heard, mine), rest(phrase, theirs)
+
+
 class _Proposer:
     def __init__(self, request: Request, original: SentenceRecognition | None, tables: Tables,
-                 user: UserVocabulary) -> None:
+                 phonetic: Phonetic, user: UserVocabulary) -> None:
         self.text = request.text
         self.request = request
         self.original = original
         self.tables = tables
+        self.phonetic = phonetic
         self.user = user
         self.words = self.text.split()
-        self.tokens = tokens(self.text)
-        self.protected = _Protected.of(self.tokens)
         self.out: list[Candidate] = []
+
+    def sounds(self, text: str) -> tuple[bytes, ...]:
+        """`text`'s pronunciations; () when a word of it has none."""
+        return self.phonetic.lexicon.pronounce(text).variants()
+
+    def alike(self, replaced: str, replacement: str) -> tuple[float, str]:
+        """How alike the words that differ between `replaced` and `replacement` sound, and
+        those words of `replaced`: the evidence of every rule that replaces words. Words they
+        share do not dilute it ("other tv" and "Apple TV" are "other" and "apple"). 0.0 when
+        only one side has words that differ, or one of them has no pronunciation."""
+        mine, theirs = _changed(tokens(replaced), tokens(replacement), self.phonetic.lexicon)
+        if not mine and not theirs:
+            return 1.0, mine
+        return (best_similarity(self.sounds(mine), self.sounds(theirs)) if mine and theirs else 0.0), mine
 
     def run(self) -> list[Candidate]:
         self.numbers()
@@ -833,15 +821,20 @@ class _Proposer:
             self.add(Candidate(fixed, Rule.NUMBERS, Source.NUMBERS, 1.0))
 
     def lead_in(self) -> None:
+        """Leading words that sound like the wake phrase or its end (what is left of a wake
+        word whose start the transcript lost) are dropped."""
         wake = self.request.wake_phrase
         if not wake:
+            return
+        tails = tuple({v[-n:] for v in self.sounds(wake) for n in range(MIN_TAIL_PHONEMES, len(v) + 1)})
+        if not tails:
             return
         for k in range(1, min(MAX_LEAD_WORDS, len(self.words) - 1) + 1):
             span = " ".join(self.words[:k])
             rest = " ".join(self.words[k:])
             if len(letters(rest)) < MIN_LETTERS:
                 break
-            raw = _wake_residue(span, wake)
+            raw = best_similarity(self.sounds(span), tails)
             if raw >= LEAD_IN_MIN - _EPS:
                 self.add(Candidate(fix_key(rest), Rule.LEAD_IN, Source.WAKE, raw, replaced=span))
 
@@ -858,74 +851,83 @@ class _Proposer:
             if slot not in ("name", "area", "floor") or not letters(heard):
                 continue
             kind = {"name": TargetKind.ENTITY, "area": TargetKind.AREA, "floor": TargetKind.FLOOR}[slot]
-            scored: list[tuple[float, Name]] = []
-            for n in t.names.names:
+
+            def fits(n: Name) -> bool:
                 if n.target.kind != kind:
-                    continue
+                    return False
                 if kind == TargetKind.ENTITY and domain is not None and n.domain != domain:
-                    continue
+                    return False
                 if kind == TargetKind.ENTITY and area is not None and area not in n.area_ids:
-                    continue
-                if kind in (TargetKind.ENTITY, TargetKind.AREA) and floor is not None and not any(
-                        t.area_floor.get(a) == floor for a in n.area_ids):
-                    continue
-                s = _similarity(letters(heard), sound_key(heard), n.letters, n.sound, SLOT_MIN)
-                if s >= SLOT_MIN - _EPS:
-                    scored.append((s, n))
-            for s, n in sorted(scored, key=lambda x: (-x[0], x[1].text))[:5]:
+                    return False
+                return floor is None or kind == TargetKind.FLOOR or any(
+                    t.area_floor.get(a) == floor for a in n.area_ids)
+
+            allowed = np.fromiter((fits(n) for n in t.names), dtype=np.bool_, count=len(t.names))
+            scored = [(self.alike(heard, t.names[idx].text)[0], t.names[idx])
+                      for idx in self.phonetic.names.layer.search(self.sounds(heard), SLOT_MIN, allowed)]
+            for s, n in sorted((x for x in scored if x[0] >= SLOT_MIN - _EPS), key=lambda x: (-x[0], x[1].text))[:5]:
                 fixed = _replace_words(self.text, fix_key(heard), n.text)
                 if fixed is not None:
                     self.add(Candidate(fixed, Rule.SLOT, Source(n.target.kind.value), s, target=n.target,
                                        replaced=fix_key(heard)))
 
     def spans(self) -> None:
-        sources: tuple[tuple[NameIndex, Source | None], ...] = (
-            (self.tables.names, None), (self.user.term_names, Source.USER_TERM))
+        """A span of 1–4 words → a known name or user term. A span starts and ends with a word
+        that is not a stopword (a name's edge is a content word), is not itself a known name
+        or term (it was heard right), and leaves some of the command: a name never replaces
+        all of it."""
+        layers: tuple[tuple[tuple[Name, ...], Sounds, Source | None], ...] = (
+            (self.tables.names, self.phonetic.names, None),
+            (self.user.term_names, self.user.term_sounds, Source.USER_TERM))
+        known = {letters(n.text) for names, _, _ in layers for n in names}
         for i in range(len(self.words)):
             for j in range(i + 1, min(len(self.words), i + MAX_SPAN_WORDS) + 1):
-                span = " ".join(self.words[i:j])
-                span_tokens = tokens(span)
-                key = letters(span)
-                if len(key) < MIN_LETTERS or all(w in STOPWORDS for w in span_tokens):
+                if j - i == len(self.words):
                     continue
-                sound = sound_key(span)
-                for index, source in sources:
-                    for idx in index.near(key, sound, NAME_MIN):
-                        n = index.names[idx]
-                        if fix_key(n.text) == fix_key(span):
-                            continue
-                        s = 1.0 if n.letters == key else _similarity(key, sound, n.letters, n.sound, NAME_MIN)
-                        if s < NAME_MIN - _EPS:
+                span = " ".join(self.words[i:j])
+                edge = tokens(span)
+                if (len(letters(span)) < MIN_LETTERS or not edge or edge[0] in STOPWORDS or edge[-1] in STOPWORDS
+                        or letters(span) in known):
+                    continue
+                said = self.sounds(span)
+                if not said:
+                    continue
+                for names, sounds, source in layers:
+                    for idx in sounds.layer.search(said, NAME_MIN):
+                        n = names[idx]
+                        s = self.alike(span, n.text)[0]
+                        if fix_key(n.text) == fix_key(span) or s < NAME_MIN - _EPS:
                             continue
                         fixed = " ".join(self.words[:i] + [n.text] + self.words[j:])
                         self.add(Candidate(fixed, Rule.NAME, source or Source(n.target.kind.value), s,
                                            target=n.target, replaced=span))
 
     def phrases(self) -> None:
+        """The whole command → a known phrase, judged on the words that differ. A phrase must
+        share a content word with what was heard (its anchor), unless the heard text has only
+        one; the rest must sound alike. Candidates are retrieved at PHRASE_MIN by the
+        similarity of the whole texts (PhoneticLayer.search), which is at least that of their
+        differing words since the shared ones only add matched segments. A name, slot or span
+        is retrieved the same way."""
         key = letters(self.text)
         if len(key) < MIN_LETTERS:
             return
-        sound = sound_key(self.text)
-        spoken = spoken_letters(self.text)
-        views = [(key, sound)]
-        if fix_key(spoken) != self.text:
-            views.append((letters(spoken), sound_key(spoken)))
-        for layer in (self.user.phrase_layer, self.tables.triggers, self.tables.history):
-            found: set[int] = set()
-            for k, s in views:
-                found |= layer.near(k, s, PHRASE_MIN)
-            for idx in found:
+        heard = self.phonetic.lexicon.pronounce(self.text)
+        said = heard.variants()
+        layers = ((self.user.phrase_layer, self.user.phrase_sounds), (self.tables.triggers, self.phonetic.triggers),
+                  (self.tables.history, self.phonetic.history))
+        for layer, sounds in layers:
+            for idx in (sounds.layer.search(said, PHRASE_MIN, sounds.anchored(heard)) if said else {}):
                 p = layer.phrases[idx]
                 if p.text == self.text:
                     continue
-                raw = max(_similarity(k, s, p.letters, p.sound, PHRASE_MIN) for k, s in views)
+                raw, mine = self.alike(self.text, p.text)
                 if raw >= PHRASE_MIN - _EPS:
-                    self.add(Candidate(p.text, Rule.PHRASE, p.source, raw, template=p.template))
+                    self.add(Candidate(p.text, Rule.PHRASE, p.source, raw, replaced=mine, template=p.template))
             for idx in layer.completions(key, CUTOFF_MIN_COVERAGE):
                 p = layer.phrases[idx]
-                coverage = len(key) / len(p.letters)
-                self.add(Candidate(p.text, Rule.CUTOFF, p.source, similarity(self.text, p.text),
-                                   coverage=coverage, template=p.template))
+                self.add(Candidate(p.text, Rule.CUTOFF, p.source, best_similarity(said, self.sounds(p.text)),
+                                   coverage=len(key) / len(p.letters), template=p.template))
 
 
 def _preserved(c: Candidate, original: _Protected, original_tokens: Sequence[str],
@@ -960,7 +962,7 @@ def _preserved(c: Candidate, original: _Protected, original_tokens: Sequence[str
     return None
 
 
-def propose(request: Request, original: SentenceRecognition | None, tables: Tables,
+def propose(request: Request, original: SentenceRecognition | None, tables: Tables, phonetic: Phonetic,
             user: UserVocabulary) -> Proposal:
     """Candidates for text HA's matcher did not fully accept: preserved ones, best first,
     the first VALIDATE_LIMIT distinct letter strings to validate."""
@@ -971,7 +973,7 @@ def propose(request: Request, original: SentenceRecognition | None, tables: Tabl
     protected = _Protected.of(words)
     best: dict[str, Candidate] = {}
     rejected: list[Rejected] = []
-    for c in _Proposer(request, original, tables, user).run():
+    for c in _Proposer(request, original, tables, phonetic, user).run():
         why = _preserved(c, protected, words, tables.name_words)
         if why is not None:
             rejected.append(Rejected(c, Status.NOT_PRESERVED, why))

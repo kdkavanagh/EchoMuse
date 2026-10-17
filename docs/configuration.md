@@ -669,6 +669,14 @@ It never:
 - touches an answer to a question (a follow-up in a conversation, or a reply
   to "AM or PM?"), which only makes sense in that conversation.
 
+A guess is judged by how alike the words it changes sound, not how alike they
+are spelled: "watch flex" and "watch Plex" differ only in "flex" against
+"plex". Pronunciations come from the CMU Pronouncing Dictionary and from your
+own [pronunciations](#pronunciations). Numbers are read as words, and a short
+run of consonants ("RMV") as its letter names. A request or name with a word
+that has none of these is never compared by sound; it can only be completed
+when cut short.
+
 ### Mode
 
 | Mode | What happens |
@@ -716,27 +724,76 @@ one letter or digit. Entries that differ only in case, spaces or punctuation
 change only this correction: they do not teach or bias any speech-to-text
 model.
 
+### Pronunciations
+
+For words the dictionary does not know, or says differently from the way you
+do: brand names, coined names, words written together ("youtubetv",
+"winix", "unmute"). Each row is a word and how it sounds, in ARPAbet, the
+phoneme spelling the dictionary uses. A pronunciation replaces the
+dictionary's for that word, for every speaker using these settings
+(`transcriptFixPronunciations`).
+
+```json
+{
+  "transcriptFixPronunciations": {
+    "plex": "P L EH K S",
+    "youtubetv": "Y UW T UW B T IY V IY",
+    "winix": "W IH N IH K S"
+  }
+}
+```
+
+The easiest way to write one is to borrow from words the dictionary knows:
+type a similar word or two in **Try a transcript** ("win nix"), which shows
+each word's phonemes, and join them. The symbols:
+
+| Vowels | | Consonants | | | |
+|---|---|---|---|---|---|
+| AA **o**dd | AY h**i**de | B **b**e | HH **h**e | N **n**o | T **t**ea |
+| AE **a**t | EH **E**d | CH **ch**eese | JH **g**ee | NG pi**ng** | TH **th**eta |
+| AH h**u**t | ER h**ur**t | D **d**ee | K **k**ey | P **p**ee | V **v**ee |
+| AO **ou**ght | EY **a**te | DH **th**ee | L **l**ee | R **r**ead | W **w**e |
+| AW c**ow** | IH **i**t | F **f**ee | M **m**e | S **s**ea | Y **y**ield |
+| IY **ea**t | OW **oa**t | G **g**reen | | SH **sh**e | Z **z**ee |
+| OY t**oy** | UH h**oo**d | | | | ZH sei**z**ure |
+| UW t**wo** | | | | | |
+
+Separate phonemes with spaces. Stress digits as the dictionary writes them
+("EH1") are accepted and ignored, and AX (a weak "uh") counts as AH. Up to 200
+words; a word is a single word of letters and digits (an apostrophe inside is
+fine), up to 40 characters, listed once regardless of case, with at most 30
+phonemes. A pronunciation changes only this correction: it does not teach any
+speech-to-text model.
+
+Below the editor, **Home Assistant's words with no pronunciation** lists the
+words of your automations' sentence triggers, entity, area and floor names,
+and requests Home Assistant answered before that have none, most used first.
+Any trigger sentence or name containing one is never matched by sound, so
+this is where to start. Click a word to add a row for it.
+
 ### Try a transcript
 
-Below the lists, **Try a transcript** shows what the correction would do with
+Below the pronunciations, **Try a transcript** shows what the correction would do with
 text you type, as you type: write what speech-to-text heard ("RMV alarm") and
 it shows heard → proposed → would send, whether On would apply it and why,
 and every candidate with its scores, whether it kept what was said, and what
-Home Assistant's sentence matcher accepted it as. "RMV alarm" finds your alarm
-automation's sentences for arming at home ("arm the alarm") and arming away
-("arm the alarm away"), too close to choose between, so it would be sent as
-heard.
+Home Assistant's sentence matcher accepted it as. Under the text it shows
+each word's pronunciation and where it came from (your pronunciation, the
+dictionary, a number, letter names, or none), and the same for the proposal.
+"RMV alarm" sounds like "arm the alarm" ("rmv" said as letters, AA R EH M V
+IY, against "arm the", AA R M DH IY), so it finds your alarm automation's
+"arm the alarm".
 
 It tries the text as a standalone command on this speaker, with the saved
-settings (unsaved edits are not included): its preferred lists, its Home
-Assistant satellite (so a room-less command finds this speaker's room), and
-its pipeline's language. On the fleet page it uses the fleet settings and no
-room. **After the wake word** (on by default) also lets it drop leftover
-wake-word sounds at the start, as a wake turn would. Text EchoMuse handles
-itself (alarms, "say that again") is shown as such, since correction never
-sees it. Only Home Assistant's matcher is asked, which recognizes without
-running anything, and the result does not depend on the Mode: it is what On
-would send.
+settings (unsaved edits are not included): its preferred lists and
+pronunciations, its Home Assistant satellite (so a room-less command finds
+this speaker's room), and its pipeline's language. On the fleet page it uses
+the fleet settings and no room. **After the wake word** (on by default) also
+lets it drop leftover wake-word sounds at the start, as a wake turn would.
+Text EchoMuse handles itself (alarms, "say that again") is shown as such,
+since correction never sees it. Only Home Assistant's matcher is asked, which
+recognizes without running anything, and the result does not depend on the
+Mode: it is what On would send.
 
 ### What you see in Activity
 
@@ -938,6 +995,7 @@ Once the whole fleet shows `wss (TLS)`, set `REQUIRE_DEVICE_TLS=1`.
 | Transcript correction | Mode | `transcriptFix` | `shadow` |
 | Transcript correction | Preferred terms | `transcriptFixTerms` | empty |
 | Transcript correction | Preferred phrases | `transcriptFixPhrases` | empty |
+| Transcript correction | Pronunciations | `transcriptFixPronunciations` | empty |
 | — (device state) | Volume on the Status tab | `startupVolume` | 85 |
 
 ---

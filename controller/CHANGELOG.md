@@ -638,8 +638,8 @@ Based on a review of Office turns 433–476 (`docs/turn-latency-review.md`,
   `stt_fix` (heard, proposed, sent, the rule, Home Assistant's verdicts, why it
   was or was not applied, cache and timing), shown as **Correction** in
   Activity's turn detail; `stt_text` keeps the transcript as heard. Replayed
-  over the last three weeks' 211 Home Assistant turns, 11 would have been
-  repaired (every one with a known intent correctly) and 3 left alone as
+  over the last three weeks' 211 Home Assistant turns, 13 would have been
+  repaired (every one with a known intent correctly) and 1 left alone as
   ambiguous. New dependency: `hassil==3.11.0`, the version Home Assistant
   2026.8.1 ships, to expand trigger sentences.
 - **Try a transcript.** Config → **Transcript correction** has a box where
@@ -651,6 +651,19 @@ Based on a review of Office turns 433–476 (`docs/turn-latency-review.md`,
   the matcher (nothing runs), and says when EchoMuse itself handles the
   text. Activity's correction evidence now also shows what Home Assistant
   matched each candidate as (`POST /api/text_fix/trial`).
+- **Transcript correction compares how words sound.** A guess is judged by
+  how alike the words it changes sound, as phonemes from the CMU Pronouncing
+  Dictionary compared by articulatory features, instead of by spelling and a
+  rough sound key, and words the guess shares with the heard text no longer
+  count. "rmv alarm" and "arm v alarm" now correct to "arm the alarm", and
+  look-alikes that only shared a word ("the other tv" → "office tv") are no
+  longer proposed. Config → **Transcript correction** gains
+  **Pronunciations** (`transcriptFixPronunciations`): your own ARPAbet
+  spelling for words the dictionary lacks or says differently ("plex" →
+  `P L EH K S`), with Home Assistant's words that have none listed beneath
+  (`GET /api/text_fix/unknown_words`). **Try a transcript** shows each
+  word's pronunciation and where it came from. New dependency:
+  `cmudict==1.1.3`.
 
 ### Earlier in this release
 

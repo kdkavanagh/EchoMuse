@@ -235,10 +235,12 @@ DEFAULT_DEVICE_CONFIG: DeviceConfig = {
     # records what a correction would have been and sends the transcript as
     # heard; "on" sends an eligible correction HA's matcher accepts. Terms and
     # phrases rank candidates, highest preference first; they never train the
-    # ASR and never authorize a command by themselves.
+    # ASR and never authorize a command by themselves. Pronunciations map a word
+    # to ARPAbet phonemes, in place of CMUdict's (em_phonetics).
     "transcriptFix":    "shadow",
     "transcriptFixTerms": [],
     "transcriptFixPhrases": [],
+    "transcriptFixPronunciations": {},
     # Alert sounds are em_sounds catalog IDs. Empty = the fleet "default"
     # upload if present, else the device's built-in fallback tone (§16.5).
     # timerSound rings HA timers; alarmSound rings alarm events without their

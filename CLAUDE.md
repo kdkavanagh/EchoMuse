@@ -85,10 +85,10 @@ Tests only cover pure-Go logic — hardware-dependent code is not testable on th
 
 ```bash
 cd controller
-python -m pytest tests/        # needs: pytest numpy scipy websockets aiohttp bcrypt zeroconf protobuf hassil — not the full requirements.txt
+python -m pytest tests/        # needs: pytest numpy scipy websockets aiohttp bcrypt zeroconf protobuf hassil cmudict — not the full requirements.txt
 ```
 
-Controller tests cover pure-logic modules plus the device link, HA client, auth and BT proxy, which need `websockets`, `aiohttp`, `bcrypt`, `zeroconf` and `protobuf`, and transcript correction, which expands HA's sentence templates with `hassil` (CI installs exactly `pytest numpy scipy websockets aiohttp bcrypt zeroconf protobuf hassil`, hassil at the version HA 2026.8.1 ships). Tests that load real models (`test_speech_worker`, parts of `test_wake_registry`/`test_wake_scorer`) skip without `onnxruntime`/`sherpa-onnx`. Keep new tests in that shape: evidence fixtures, not live models or a live HA. The suites (plus `go vet` and mypy) run in CI on every push/PR (`.github/workflows/ci.yml`).
+Controller tests cover pure-logic modules plus the device link, HA client, auth and BT proxy, which need `websockets`, `aiohttp`, `bcrypt`, `zeroconf` and `protobuf`, and transcript correction, which expands HA's sentence templates with `hassil` and pronounces words with `cmudict` (CI installs exactly `pytest numpy scipy websockets aiohttp bcrypt zeroconf protobuf hassil cmudict`, hassil at the version HA 2026.8.1 ships). Tests that load real models (`test_speech_worker`, parts of `test_wake_registry`/`test_wake_scorer`) skip without `onnxruntime`/`sherpa-onnx`. Keep new tests in that shape: evidence fixtures, not live models or a live HA. The suites (plus `go vet` and mypy) run in CI on every push/PR (`.github/workflows/ci.yml`).
 
 **Type check the controller (host):**
 

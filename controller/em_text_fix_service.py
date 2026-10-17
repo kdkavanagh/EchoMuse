@@ -7,6 +7,10 @@ in the meantime, so an in-flight build from an old connection or an old registry
 lands. Reconnecting is not a refresh barrier: until the rebuild publishes, corrections
 report `not_ready`.
 
+Pronunciations (em_text_fix.Phonetic) are compiled per lexicon, off the loop, the first time
+one is needed for the published tables, and again, for every lexicon in use, when the
+tables move on; a part whose source did not change is reused.
+
 `correct()` computes one correction under a `FixContext`: HA's matcher on the original,
 candidates off the event loop, HA's matcher on the candidates, then acceptance. Whether
 the result may still be used is the caller's to check with `valid()` at the moment of use.
@@ -17,11 +21,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Awaitable, Callable, Sequence
+from collections import Counter
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 
-from em_ha_client import HaClient, Vocabulary
+from em_ha_client import HaClient, SentenceRecognition, Vocabulary
+from em_phonetics import Lexicon, Pronounced
 from em_text_fix import (
     Decision,
     FixConfig,
@@ -29,12 +35,15 @@ from em_text_fix import (
     FixOutcome,
     FixRecord,
     HistoryEntry,
+    Phonetic,
+    Proposal,
     Reason,
     Request,
     Tables,
     TextFixMode,
     build_history,
     build_tables,
+    compile_phonetic,
     decide,
     propose,
     user_vocabulary,
@@ -45,6 +54,7 @@ log = logging.getLogger("em_text_fix")
 REBUILD_DEBOUNCE_S = 1.5        # after an invalidation, before the tables are rebuilt
 RECOGNIZE_TIMEOUT_S = 5.0       # each matcher call of a correction
 HISTORY_LIMIT = 5_000           # newest eligible turns loaded into the history
+MAX_LEXICONS = 4                # compiled pronunciations kept, the most recently used
 
 
 class NotReady(Exception):
@@ -64,13 +74,25 @@ class Trial:
     pipeline: str
     language: str | None
     wake_phrase: str | None       # tried as a wake turn: the lead-in rule's phrase
+    heard: Pronounced             # the text's words and their pronunciations
+    proposed: Pronounced | None   # the proposed correction's
     record: FixRecord | None
 
 
+def _propose(request: Request, original: SentenceRecognition | None, tables: Tables, phonetic: Phonetic,
+             config: FixConfig) -> Proposal:
+    """Candidates, in the CPU executor: the user's lists are pronounced here on first use."""
+    return propose(request, original, tables, phonetic,
+                   user_vocabulary(config.terms, config.phrases, config.lexicon))
+
+
 class TextFixService:
-    def __init__(self, ha: HaClient, load_history: Callable[[], Awaitable[Sequence[HistoryEntry]]]) -> None:
+    def __init__(self, ha: HaClient, load_history: Callable[[], Awaitable[Sequence[HistoryEntry]]],
+                 lexicons: Callable[[], Iterable[Lexicon]] = lambda: ()) -> None:
+        """`lexicons`: those of the speakers' current settings, compiled ahead of their turns."""
         self._ha = ha
         self._load_history = load_history
+        self._lexicons = lexicons
         self.revision = 0
         self.tables: Tables | None = None
         self._vocabulary: Vocabulary | None = None
@@ -78,6 +100,9 @@ class TextFixService:
         self._history: list[HistoryEntry] = []
         self._rebuild: asyncio.Task[None] | None = None
         self._history_build: asyncio.Task[None] | None = None
+        self._phonetic: dict[str, Phonetic] = {}             # by lexicon digest, least recently used first
+        self._compiling: dict[tuple[str, int], asyncio.Future[Phonetic]] = {}
+        self._warming: set[asyncio.Task[Phonetic]] = set()
         self._cpu = ThreadPoolExecutor(max_workers=1, thread_name_prefix="text-fix")
         self._builder = ThreadPoolExecutor(max_workers=1, thread_name_prefix="text-fix-build")
 
@@ -90,7 +115,7 @@ class TextFixService:
         self._ha.track_triggers(lambda: self.invalidate("sentence triggers changed"))
 
     def close(self) -> None:
-        for task in (self._rebuild, self._history_build):
+        for task in (self._rebuild, self._history_build, *self._warming):
             if task is not None:
                 task.cancel()
         self._cpu.shutdown(wait=False, cancel_futures=True)
@@ -143,6 +168,7 @@ class TextFixService:
         self._history = history
         self.tables = tables
         log.info("transcript fix tables %s in %.1f s", tables.summary, time.monotonic() - started)
+        self._warm()
         for entry in later:
             self.add_history(entry)
 
@@ -163,8 +189,62 @@ class TextFixService:
                 return
             self.revision += 1
             self.tables = tables = replace(tables, history=layer, revision=self.revision)
+            self._warm()
             if len(self._history) == len(entries):
                 return
+
+    # ── pronunciations ──
+
+    async def phonetic(self, tables: Tables, lexicon: Lexicon) -> Phonetic:
+        """`tables` pronounced under `lexicon`; compiled off the loop when not yet done for
+        these tables, reusing the parts that did not change."""
+        held = self._phonetic.get(lexicon.digest)
+        if held is not None and held.compiled_from(tables, lexicon):
+            self._phonetic[lexicon.digest] = self._phonetic.pop(lexicon.digest)     # most recently used
+            return held
+        key = (lexicon.digest, tables.revision)
+        future = self._compiling.get(key)
+        if future is None:
+            future = asyncio.get_running_loop().run_in_executor(self._builder, compile_phonetic, tables, lexicon,
+                                                                 held)
+            self._compiling[key] = future
+            future.add_done_callback(lambda _f: self._compiling.pop(key, None))
+        phonetic = await asyncio.shield(future)
+        now, published = self._phonetic.get(lexicon.digest), self.tables
+        if now is None or published is None or not now.compiled_from(published, lexicon):
+            self._phonetic.pop(lexicon.digest, None)          # never replace one for the published tables
+            self._phonetic[lexicon.digest] = phonetic
+            while len(self._phonetic) > MAX_LEXICONS:
+                self._phonetic.pop(next(iter(self._phonetic)))
+        return phonetic
+
+    def _warm(self) -> None:
+        """Compile the published tables for every lexicon in use or held, before a turn needs it."""
+        tables = self.tables
+        if tables is None:
+            return
+        lexicons = {p.lexicon.digest: p.lexicon for p in self._phonetic.values()}
+        try:
+            lexicons.update((x.digest, x) for x in self._lexicons())
+        except Exception:
+            log.exception("transcript fix: lexicons in use")
+        for lexicon in lexicons.values():
+            task = asyncio.get_running_loop().create_task(self.phonetic(tables, lexicon))
+            self._warming.add(task)
+            task.add_done_callback(self._warmed)
+
+    def _warmed(self, task: asyncio.Task[Phonetic]) -> None:
+        self._warming.discard(task)
+        if not task.cancelled() and (err := task.exception()) is not None:
+            log.error("transcript fix pronunciations not compiled: %s", err)
+
+    async def unknown_words(self, lexicon: Lexicon) -> Counter[str]:
+        """Words of HA's trigger sentences, earlier requests and names with no pronunciation
+        under `lexicon`, by how many of those texts use them. NotReady without tables."""
+        tables = self.current()
+        if tables is None:
+            raise NotReady("tables not ready")
+        return (await self.phonetic(tables, lexicon)).unknown
 
     # ── corrections ──
 
@@ -194,15 +274,15 @@ class TextFixService:
             raise NotReady("context no longer current")
         loop = asyncio.get_running_loop()
         started = loop.time()
+        phonetic = await self.phonetic(tables, config.lexicon)
         [original] = await self._ha.recognize([key], context.device, language=context.language,
                                               timeout=RECOGNIZE_TIMEOUT_S)
         decision: Decision
         if original is not None and original.match:
             decision = Decision(Reason.ORIGINAL_MATCHED)
         else:
-            user = user_vocabulary(config.terms, config.phrases)
-            proposal = await loop.run_in_executor(self._cpu, propose, Request(key, context.wake_phrase),
-                                                  original, tables, user)
+            proposal = await loop.run_in_executor(self._cpu, _propose, Request(key, context.wake_phrase),
+                                                  original, tables, phonetic, config)
             verdicts = (await self._ha.recognize([c.text for c in proposal.validate], context.device,
                                                  language=context.language, timeout=RECOGNIZE_TIMEOUT_S)
                         if proposal.validate else [])

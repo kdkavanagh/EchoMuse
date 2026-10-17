@@ -1,6 +1,6 @@
 """Replay transcript correction (em_text_fix, SPEC §16.8) over the household's own turns.
 
-    text_fix_replay.py record SNAPSHOT [--db /app/data/echomuse.db]
+    text_fix_replay.py record SNAPSHOT [--db /app/data/echomuse.db] [--pronunciations GUIDES.json]
     text_fix_replay.py replay SNAPSHOT [--held-out 0.3] [--labels LABELS.json] [--show N]
 
 `record` runs inside the controller container (it needs HA_URL/HA_TOKEN or the
@@ -8,7 +8,8 @@ Supervisor token, and the database). It freezes HA's trigger templates and vocab
 every HA-routed turn with its HA device and history provenance, and HA's verdict on each
 original and on every candidate the policy proposes, asked of HA's non-executing debug
 matcher (`conversation/agent/homeassistant/debug`) in the pipeline's language. Nothing is
-executed. The snapshot holds household data: keep it out of the repository.
+executed. `--pronunciations` is a `transcriptFixPronunciations` object ({word: ARPAbet});
+the snapshot keeps it. The snapshot holds household data: keep it out of the repository.
 
 `replay` needs neither HA nor models: it re-runs the policy on the snapshot, each turn
 with only the history of earlier turns, and reports by reason, rule, source and device,
@@ -27,6 +28,7 @@ import sqlite3
 import sys
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import em_ha_client as ha_mod  # noqa: E402
 import em_text_fix as tf  # noqa: E402
+from em_phonetics import Lexicon, parse_guides  # noqa: E402
 
 TURNS_SQL = ("SELECT id, ts, device_id, trigger_type, stt_text, outcome, intent_local, response_type, {fix} "
              "FROM turns WHERE stt_text IS NOT NULL AND stt_text != '' ORDER BY id")
@@ -57,7 +60,7 @@ def _request(turn: Mapping[str, Any]) -> tf.Request:
     return tf.Request(tf.fix_key(turn["stt_text"]), WAKE_PHRASE if turn["trigger_type"] == "wake" else None)
 
 
-async def record(path: Path, db_path: str) -> None:
+async def record(path: Path, db_path: str, guides: tuple[tuple[str, str], ...]) -> None:
     client = ha_mod.HaClient(ha_mod.HaEndpoint.from_env() or sys.exit("HA is not configured"))
     await client.start()
     await client.wait_connected(15)
@@ -78,7 +81,9 @@ async def record(path: Path, db_path: str) -> None:
     turns = [dict(r) for r in con.execute(TURNS_SQL.format(fix=fix))]
     devices = {t["device_id"]: by_mac.get(ha_mod.format_mac(serialno_to_mac(t["device_id"]))) for t in turns}
     base = tf.build_tables(vocab, templates, [], 0)
-    user = tf.user_vocabulary((), ())
+    lexicon = Lexicon(guides)
+    user = tf.user_vocabulary((), (), lexicon)
+    phonetic: tf.Phonetic | None = None
     verdicts: dict[str, dict[str, Any]] = {}
 
     async def ask(sentences: Sequence[str], device: str | None) -> None:
@@ -101,11 +106,12 @@ async def record(path: Path, db_path: str) -> None:
         original = ha_mod._sentence_recognition(verdicts[device or ""][request.text])
         if original is not None and original.match:
             continue
-        tables = tf.Tables(**{**base.__dict__, "history": tf.build_history(_history(turns, turn["id"]))})
-        proposal = tf.propose(request, original, tables, user)
+        tables = replace(base, history=tf.build_history(_history(turns, turn["id"])))
+        phonetic = tf.compile_phonetic(tables, lexicon, phonetic)
+        proposal = tf.propose(request, original, tables, phonetic, user)
         await ask([c.text for c in proposal.validate], device)
     await client.close()
-    snapshot = {"language": language, "templates": templates,
+    snapshot = {"language": language, "templates": templates, "pronunciations": dict(guides),
                 "vocabulary": {"entities": [[e.entity_id, e.domain, list(e.names), e.area_id] for e in vocab.entities],
                                "areas": [[a.area_id, list(a.names), a.floor_id] for a in vocab.areas],
                                "floors": [[f.floor_id, list(f.names)] for f in vocab.floors]},
@@ -122,7 +128,9 @@ def replay(path: Path, held_out: float, labels: Mapping[str, str], show: int) ->
     snap: Snapshot = json.loads(path.read_text())
     turns = [t for t in snap["turns"] if t["outcome"] == "ha"]
     base = tf.build_tables(_vocabulary(snap["vocabulary"]), snap["templates"], [], 0)
-    user = tf.user_vocabulary((), ())
+    lexicon = Lexicon(parse_guides(snap.get("pronunciations", {})))
+    user = tf.user_vocabulary((), (), lexicon)
+    phonetic: tf.Phonetic | None = None
     split = turns[int(len(turns) * (1 - held_out))]["id"] if turns and held_out > 0 else None
     groups: dict[str, list[dict[str, Any]]] = {"tuning": [], "held-out": []}
     for turn in turns:
@@ -138,8 +146,9 @@ def replay(path: Path, held_out: float, labels: Mapping[str, str], show: int) ->
         row: dict[str, Any] = {"id": turn["id"], "device": turn["device_id"][-4:], "text": request.text}
         try:
             original = verdict(request.text)
-            tables = tf.Tables(**{**base.__dict__, "history": tf.build_history(_history(snap["turns"], turn["id"]))})
-            proposal = tf.propose(request, original, tables, user)
+            tables = replace(base, history=tf.build_history(_history(snap["turns"], turn["id"])))
+            phonetic = tf.compile_phonetic(tables, lexicon, phonetic)
+            proposal = tf.propose(request, original, tables, phonetic, user)
             decision = tf.decide(proposal, [verdict(c.text) for c in proposal.validate], original, tables)
         except Unrecorded as err:
             row["reason"] = f"unrecorded: {err}"
@@ -180,6 +189,7 @@ def main(argv: Sequence[str]) -> None:
     rec = sub.add_parser("record")
     rec.add_argument("snapshot", type=Path)
     rec.add_argument("--db", default="/app/data/echomuse.db")
+    rec.add_argument("--pronunciations", type=Path)
     rep = sub.add_parser("replay")
     rep.add_argument("snapshot", type=Path)
     rep.add_argument("--held-out", type=float, default=0.3)
@@ -187,7 +197,8 @@ def main(argv: Sequence[str]) -> None:
     rep.add_argument("--show", type=int, default=50)
     args = parser.parse_args(argv)
     if args.command == "record":
-        asyncio.run(record(args.snapshot, args.db))
+        guides = parse_guides(json.loads(args.pronunciations.read_text())) if args.pronunciations else ()
+        asyncio.run(record(args.snapshot, args.db, guides))
     else:
         labels = json.loads(args.labels.read_text()) if args.labels else {}
         replay(args.snapshot, args.held_out, labels, args.show)

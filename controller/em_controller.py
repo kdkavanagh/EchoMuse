@@ -23,6 +23,7 @@ import os
 import socket
 import ssl
 import time
+from collections import Counter
 from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,6 +58,7 @@ import em_esphome as esphome
 import em_firmware
 import em_ha_client
 import em_linkauth
+import em_phonetics
 import em_pki
 import em_player
 import em_render
@@ -573,18 +575,32 @@ async def _text_fix_history() -> list[em_text_fix.HistoryEntry]:
     return [em_text_fix.HistoryEntry(em_text_fix.sent_text(text, fix), row_id, ts) for row_id, ts, text, fix in rows]
 
 
+def _fix_settings(raw: Mapping[str, object]) -> em_text_fix.FixConfig:
+    try:
+        return em_text_fix.fix_config(raw)
+    except ValueError:
+        return em_text_fix.FixConfig()      # a hand-edited database: correction is off for it
+
+
+async def _fix_settings_for(device_id: str | None) -> tuple[em_text_fix.FixConfig, Mapping[str, object]]:
+    """A speaker's effective correction settings and config; None: the fleet's."""
+    raw = (_effective_config(device_id) if device_id is not None
+           else await asyncio.to_thread(db.get_global_device_config))
+    return _fix_settings(raw), raw
+
+
+def _lexicons() -> list[em_phonetics.Lexicon]:
+    """The pronunciation lexicons of every speaker's settings, compiled ahead of its turns (§16.8)."""
+    return [_fix_settings(_effective_config(device_id)).lexicon for device_id in list(_devices)]
+
+
 async def trial_transcript(device_id: str | None, text: str, wake: bool) -> em_text_fix_service.Trial:
     """What transcript correction would do with `text` heard as a standalone command on this
     speaker (None: the fleet's settings, HA's preferred pipeline, no satellite), under `on`:
     the speaker's settings, satellite, pipeline and its language, and with `wake` its wake
     phrase (§16.8). Only HA's non-executing matcher is asked. NotReady, HaError, HaUnavailable."""
     service, ha = text_fix(), _ha_client()
-    raw = (_effective_config(device_id) if device_id is not None
-           else await asyncio.to_thread(db.get_global_device_config))
-    try:
-        config = em_text_fix.fix_config(raw)
-    except ValueError:
-        config = em_text_fix.FixConfig()      # a hand-edited database: correction is off for it
+    config, raw = await _fix_settings_for(device_id)
     identity = _ha_identity.get(device_id) if device_id is not None else None
     satellite = identity.device_id if identity is not None else None
     pipeline = await (_pipeline_id(device_id) if device_id is not None else ha.resolve_pipeline(None))
@@ -597,7 +613,18 @@ async def trial_transcript(device_id: str | None, text: str, wake: bool) -> em_t
         context = service.context(config, satellite, pipeline, language, wake_phrase)
         outcome = await service.correct(em_text_fix.fix_key(text), context, config)
         record = em_text_fix.trial_record(text, outcome)
-    return em_text_fix_service.Trial(text, config.mode, route, satellite, pipeline, language, wake_phrase, record)
+    proposed = record.outcome.decision.proposed if record is not None and record.outcome is not None else None
+    heard = await asyncio.to_thread(config.lexicon.pronounce, text)      # CMUdict may not be read yet
+    said = await asyncio.to_thread(config.lexicon.pronounce, proposed.candidate.text) if proposed else None
+    return em_text_fix_service.Trial(text, config.mode, route, satellite, pipeline, language, wake_phrase,
+                                     heard, said, record)
+
+
+async def unknown_words(device_id: str | None) -> Counter[str]:
+    """Words of HA's trigger sentences, earlier requests and names with no pronunciation under
+    this speaker's (None: the fleet's) guides (§16.8). NotReady without tables."""
+    config, _ = await _fix_settings_for(device_id)
+    return await text_fix().unknown_words(config.lexicon)
 
 
 async def _stop_alert(device_id: str) -> None:
@@ -1254,6 +1281,9 @@ class Services:
                                wake: bool) -> em_text_fix_service.Trial:
         return await trial_transcript(device_id, text, wake)
 
+    async def unknown_words(self, device_id: str | None) -> Counter[str]:
+        return await unknown_words(device_id)
+
     def ha_status(self) -> dict[em_ha_client.HaFeature, api.FeatureStatusWire]:
         return ha_status()
 
@@ -1337,7 +1367,7 @@ async def main() -> None:
         raise SystemExit("Home Assistant is not configured: set HA_URL and HA_TOKEN "
                          "(or run as the add-on with homeassistant_api: true)")
     ha = _ha = em_ha_client.HaClient(endpoint)
-    text_fix = _text_fix = em_text_fix_service.TextFixService(ha, _text_fix_history)
+    text_fix = _text_fix = em_text_fix_service.TextFixService(ha, _text_fix_history, _lexicons)
     advertised_ip = _advertised_ip()
 
     try:

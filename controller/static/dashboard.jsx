@@ -5929,7 +5929,7 @@ const CONFIG_SECTIONS = {
   "advanced": ["buttonSingleTapEvent", "buttonMultiTapMs"],
   "bluetooth": ["bleProxyEnabled"],
   "timers": ["timerSound", "timerRingSeconds", "timerRingGapSeconds", "alarmSound"],
-  "transcript": ["transcriptFix", "transcriptFixTerms", "transcriptFixPhrases"]
+  "transcript": ["transcriptFix", "transcriptFixTerms", "transcriptFixPhrases", "transcriptFixPronunciations"]
 };
 
 // Display labels for the section ids, and the reverse key -> section index
@@ -6494,6 +6494,181 @@ function TextFixListEditor({ label, sub, noun, placeholder, items, onChange, dis
   );
 }
 
+// `transcriptFixPronunciations`: {word: ARPAbet}, the pronunciation the correction compares a
+// word by, in place of CMUdict's (em_phonetics). The checks mirror em_phonetics.parse_guides.
+// Below the guides, the words of Home Assistant's trigger sentences, earlier requests and names
+// that have no pronunciation under the saved guides (GET /api/text_fix/unknown_words): text
+// with one is never compared by sound; clicking one starts its guide.
+const ARPABET = Object.freeze([   // CMU Pronouncing Dictionary symbols, with CMU's example words
+  ['AA', 'odd'], ['AE', 'at'], ['AH', 'hut'], ['AO', 'ought'], ['AW', 'cow'], ['AY', 'hide'], ['B', 'be'],
+  ['CH', 'cheese'], ['D', 'dee'], ['DH', 'thee'], ['EH', 'Ed'], ['ER', 'hurt'], ['EY', 'ate'], ['F', 'fee'],
+  ['G', 'green'], ['HH', 'he'], ['IH', 'it'], ['IY', 'eat'], ['JH', 'gee'], ['K', 'key'], ['L', 'lee'],
+  ['M', 'me'], ['N', 'knee'], ['NG', 'ping'], ['OW', 'oat'], ['OY', 'toy'], ['P', 'pee'], ['R', 'read'],
+  ['S', 'sea'], ['SH', 'she'], ['T', 'tea'], ['TH', 'theta'], ['UH', 'hood'], ['UW', 'two'], ['V', 'vee'],
+  ['W', 'we'], ['Y', 'yield'], ['Z', 'zee'], ['ZH', 'seizure'],
+]);
+const ARPABET_SYMBOLS = new Set([...ARPABET.map(([s]) => s), 'AX']);
+const TEXT_FIX_MAX_GUIDES = 200;
+const TEXT_FIX_MAX_GUIDE_PHONEMES = 30;
+const TEXT_FIX_MAX_WORD_CHARS = 40;
+const guideWord = s => String(s).trim().toLowerCase().replace(/\u2019/g, "'");
+const guidePhonemes = s => String(s).trim().split(/\s+/).filter(Boolean).map(p => p.toUpperCase()).join(' ');
+function guideError(word, phonemes, guides, self = null) {
+  if (!/^[a-z0-9]+(?:'[a-z]+)?$/.test(word) || word.length > TEXT_FIX_MAX_WORD_CHARS)
+    return `“${word}” is not one word of letters and digits (at most ${TEXT_FIX_MAX_WORD_CHARS})`;
+  if (word !== self && Object.keys(guides).some(w => guideWord(w) === word)) return `“${word}” already has a pronunciation`;
+  const symbols = phonemes.split(' ').filter(Boolean);
+  if (!symbols.length) return 'type its phonemes, e.g. P L EH K S';
+  const bad = symbols.find(p => { const m = /^([A-Z]+)([012]?)$/.exec(p); return !m || !ARPABET_SYMBOLS.has(m[1]); });
+  if (bad) return `unknown phoneme “${bad}”`;
+  if (symbols.length > TEXT_FIX_MAX_GUIDE_PHONEMES) return `at most ${TEXT_FIX_MAX_GUIDE_PHONEMES} phonemes`;
+  return null;
+}
+
+function TextFixPronunciationEditor({ guides, onChange, disabled, deviceId }) {
+  const map = guides && typeof guides === 'object' && !Array.isArray(guides) ? guides : {};
+  const words = Object.keys(map).sort();
+  const [draft, setDraft] = useState({ word: '', phonemes: '', error: null });
+  const [editing, setEditing] = useState(null);   // { word, phonemes, error }
+  const [unknown, setUnknown] = useState(null);   // [{word, count}] | {error}
+  const [showAll, setShowAll] = useState(false);
+  const [reference, setReference] = useState(false);
+  const phonemesRef = useRef(null);
+  const saved = JSON.stringify(map);
+  const full = words.length >= TEXT_FIX_MAX_GUIDES;
+
+  useEffect(() => {
+    let live = true;
+    const params = deviceId ? `?device_id=${encodeURIComponent(deviceId)}` : '';
+    API.get(`/api/text_fix/unknown_words${params}`)
+      .then(r => { if (live) setUnknown(r.words || []); })
+      .catch(e => { if (live) setUnknown({ error: e?.error || e?.message || 'unavailable' }); });
+    return () => { live = false; };
+  }, [deviceId, saved]);
+  useEffect(() => { setEditing(null); }, [saved]);
+
+  function add() {
+    const word = guideWord(draft.word), phonemes = guidePhonemes(draft.phonemes);
+    if (!word) return;
+    const err = full ? `at most ${TEXT_FIX_MAX_GUIDES} words` : guideError(word, phonemes, map);
+    if (err) { setDraft({ ...draft, error: err }); return; }
+    onChange({ ...map, [word]: phonemes });
+    setDraft({ word: '', phonemes: '', error: null });
+  }
+  function saveEdit() {
+    if (!editing) return;
+    const phonemes = guidePhonemes(editing.phonemes);
+    if (phonemes === guidePhonemes(map[editing.word])) { setEditing(null); return; }
+    const err = guideError(editing.word, phonemes, map, editing.word);
+    if (err) { setEditing({ ...editing, error: err }); return; }
+    onChange({ ...map, [editing.word]: phonemes });
+    setEditing(null);
+  }
+  function remove(word) {
+    setEditing(null);
+    const next = { ...map };
+    delete next[word];
+    onChange(next);
+  }
+  function start(word) {
+    setDraft({ word, phonemes: '', error: null });
+    setTimeout(() => phonemesRef.current?.focus(), 0);
+  }
+
+  const small = { fontFamily:MONO, fontSize:10, color:'var(--muted)', lineHeight:1.6 };
+  const error = { fontFamily:MONO, fontSize:9, color:'var(--error)', marginTop:3 };
+  const glyph = on => ({ background:'none', border:'none', padding:'0 3px', fontFamily:MONO, fontSize:11,
+    color:on ? 'var(--text2)' : 'var(--muted)', opacity:on ? 1 : 0.4, cursor:on ? 'pointer' : 'default' });
+  const missing = Array.isArray(unknown) ? unknown : [];
+  const shown = showAll ? missing : missing.slice(0, 24);
+  return (
+    <div style={{ marginTop:4 }}>
+      <span style={{ fontFamily:MONO, fontSize:11, color:'var(--text2)' }}>Pronunciations</span>
+      <span style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)', marginLeft:8 }}>
+        how a word sounds, in ARPAbet: misheard words are matched by sound, and a word with no pronunciation never is
+      </span>
+      <div role="list" aria-label="Pronunciations" style={{ marginTop:8 }}>
+        {words.length === 0 && <div style={{ ...small, padding:'3px 0' }}>none: every word is said as the CMU dictionary says it</div>}
+        {words.map(word => (
+          <div key={word} role="listitem"
+            style={{ display:'grid', gridTemplateColumns:'minmax(90px, 160px) 1fr auto', gap:8, alignItems:'center', padding:'2px 0' }}>
+            <span style={{ fontFamily:SANS, fontSize:12, color:'var(--text)', overflowWrap:'anywhere' }}>{word}</span>
+            {editing?.word === word ? (
+              <div>
+                <input type="text" autoFocus value={editing.phonemes} aria-label={`Phonemes of ${word}`}
+                  aria-invalid={!!editing.error}
+                  onChange={e => setEditing({ word, phonemes: e.target.value, error: null })}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter') { e.preventDefault(); saveEdit(); }
+                    else if (e.key === 'Escape') { e.preventDefault(); setEditing(null); }
+                  }}
+                  onBlur={saveEdit} style={{ width:'100%', boxSizing:'border-box', fontFamily:MONO }}/>
+                {editing.error && <div style={error}>{editing.error} — not saved</div>}
+              </div>
+            ) : (
+              <span {...pressable(() => setEditing({ word, phonemes: map[word], error: null }), { disabled })}
+                title={disabled ? undefined : 'Edit'} aria-label={`Edit the phonemes of ${word}: ${map[word]}`}
+                style={{ fontFamily:MONO, fontSize:11, color:'var(--text2)', cursor:disabled ? 'default' : 'text' }}>{map[word]}</span>
+            )}
+            <button type="button" disabled={disabled} onMouseDown={e => e.preventDefault()} onClick={() => remove(word)}
+              title="Remove" aria-label={`Remove the pronunciation of ${word}`} style={glyph(!disabled)}>×</button>
+          </div>
+        ))}
+      </div>
+      <div style={{ display:'grid', gridTemplateColumns:'minmax(90px, 160px) 1fr auto', gap:8, alignItems:'center', marginTop:8 }}>
+        <input type="text" value={draft.word} disabled={disabled || full} placeholder="youtubetv" aria-label="Word"
+          onChange={e => setDraft({ ...draft, word: e.target.value, error: null })}
+          onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); phonemesRef.current?.focus(); } }}
+          style={{ width:'100%', boxSizing:'border-box' }}/>
+        <input type="text" ref={phonemesRef} value={draft.phonemes} disabled={disabled || full} placeholder="Y UW T UW B T IY V IY"
+          aria-label="Its phonemes" aria-invalid={!!draft.error}
+          onChange={e => setDraft({ ...draft, phonemes: e.target.value, error: null })}
+          onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); add(); } }}
+          style={{ width:'100%', boxSizing:'border-box', fontFamily:MONO }}/>
+        <Pill small disabled={disabled || full || !draft.word.trim()} onClick={add}>+ Add</Pill>
+      </div>
+      {draft.error && <div style={error}>{draft.error}</div>}
+      <div style={{ ...small, marginTop:4 }}>
+        {words.length} of {TEXT_FIX_MAX_GUIDES} · a guide replaces the dictionary's pronunciation of its word · to borrow a
+        similar word's phonemes, type it in Try a transcript below
+      </div>
+      <div style={{ marginTop:4 }}>
+        <DisclosureToggle open={reference} onToggle={() => setReference(o => !o)}>ARPAbet symbols</DisclosureToggle>
+        {reference && (
+          <div style={{ ...small, marginTop:4, display:'grid', gridTemplateColumns:'repeat(auto-fill, minmax(110px, 1fr))', gap:'0 12px' }}>
+            {ARPABET.map(([s, example]) => <span key={s}><b style={{ color:'var(--text2)' }}>{s}</b> {example}</span>)}
+            <span style={{ gridColumn:'1 / -1' }}>Stress digits (EH1) are allowed and ignored; AX is the same as AH.</span>
+          </div>
+        )}
+      </div>
+      <div style={{ ...small, marginTop:10 }}>
+        {unknown == null ? 'checking Home Assistant’s words…'
+          : unknown.error ? `Home Assistant’s words could not be checked: ${unknown.error}`
+          : missing.length === 0 ? 'Every word in Home Assistant’s trigger sentences, names and earlier requests has a pronunciation.'
+          : <>
+              {missing.length} word{missing.length === 1 ? '' : 's'} in Home Assistant’s trigger sentences, names and earlier
+              requests {missing.length === 1 ? 'has' : 'have'} no pronunciation, so text with {missing.length === 1 ? 'it' : 'them'} is
+              never matched by sound{disabled ? '' : '; click one to add its pronunciation'}:
+            </>}
+      </div>
+      {missing.length > 0 && (
+        <div style={{ display:'flex', flexWrap:'wrap', gap:6, marginTop:6 }}>
+          {shown.map(({ word, count }) => (
+            <span key={word} title={`in ${count} of Home Assistant’s trigger wordings, names and requests`}>
+              <Pill small disabled={disabled || full} onClick={() => start(word)}>
+                {word} <span style={{ color:'var(--muted)' }}>{count}</span>
+              </Pill>
+            </span>
+          ))}
+          {missing.length > shown.length && (
+            <Pill small onClick={() => setShowAll(true)}>+{missing.length - shown.length} more</Pill>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Try a transcript (POST /api/text_fix/trial, §16.8): what transcript correction would send for
 // text heard as a standalone command on this speaker (the fleet's settings in the fleet view),
 // as On would, with the saved settings. Only Home Assistant's sentence matcher is asked; nothing
@@ -6575,6 +6750,8 @@ function TextFixTester({ deviceId }) {
           <div style={{ opacity: busy ? 0.6 : 1 }}>
             {routeNote && <div style={{ color: 'var(--warn)' }}>{routeNote}</div>}
             {rec && <TextFixEvidence key={trial.text} fix={rec} quote={quote} trial defaultOpen/>}
+            <Sounded label="heard sounds like" words={trial.heard_words}/>
+            {trial.proposed_words && <Sounded label="proposal sounds like" words={trial.proposed_words}/>}
             <div style={muted}>{context}</div>
             {trial.mode !== 'on' && (
               <div style={muted}>
@@ -6586,6 +6763,28 @@ function TextFixTester({ deviceId }) {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+// How the trial's words were pronounced (em_phonetics), each with where it came from; a word
+// with none is marked: text with it is never compared by sound.
+const PRONUNCIATION_SOURCES = Object.freeze({ guide: 'your guide', dictionary: 'CMU dictionary',
+  number: 'number', letters: 'said as letters' });
+function Sounded({ label, words }) {
+  if (!Array.isArray(words) || !words.length) return null;
+  return (
+    <div style={{ color: 'var(--muted)' }}>
+      {label}{' '}
+      {words.map((w, i) => (
+        <span key={i} title={w.source ? PRONUNCIATION_SOURCES[w.source] || w.source : 'no pronunciation: add one under Pronunciations'}
+          style={{ marginRight: 8, whiteSpace: 'nowrap' }}>
+          <span style={{ color: w.source ? 'var(--text2)' : 'var(--error)' }}>{w.word}</span>{' '}
+          {w.source
+            ? <span>/{w.phonemes.join(' | ')}/{w.source !== 'dictionary' ? ` (${PRONUNCIATION_SOURCES[w.source] || w.source})` : ''}</span>
+            : <span style={{ color: 'var(--error)' }}>no pronunciation</span>}
+        </span>
+      ))}
     </div>
   );
 }
@@ -7002,6 +7201,10 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
             sub="complete commands you say often, matched against the whole request"
             items={config.transcriptFixPhrases} disabled={disabled}
             onChange={v => set('transcriptFixPhrases', v)}/>
+        </div>
+        <div style={{ marginTop:4, ...inputStyle }}>
+          <TextFixPronunciationEditor guides={config.transcriptFixPronunciations} disabled={disabled} deviceId={deviceId}
+            onChange={v => set('transcriptFixPronunciations', v)}/>
         </div>
       </Stage>
     </div>

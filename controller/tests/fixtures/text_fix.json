@@ -779,6 +779,26 @@
    },
    "source": "custom",
    "file": "en/timers.yaml"
+  },
+  "arm v alarm": null,
+  "turn off the other tv": {
+   "intent": {
+    "name": "HassTurnOff"
+   },
+   "slots": {},
+   "details": {},
+   "targets": {},
+   "match": false,
+   "sentence_template": "turn off [the] {name}",
+   "unmatched_slots": {
+    "name": "other tv"
+   },
+   "source": "builtin"
+  },
+  "watch Plex": {
+   "match": true,
+   "source": "trigger",
+   "sentence_template": "(watch|watched|watches|put on|turn on|open) [the] plex [on [the] [(living room|master bedroom|bedroom|office)] (tv|t v|television)] [in [the] (living room|master bedroom|bedroom|office)]"
   }
  }
 }

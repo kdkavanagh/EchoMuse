@@ -18,3 +18,6 @@ protobuf>=4.21.0
 # Sentence-template expansion for transcript correction (em_text_fix, §16.8):
 # the version HA 2026.8.1 itself ships, so a trigger expands as HA parses it.
 hassil==3.11.0
+# The CMU Pronouncing Dictionary: how transcript correction tells what a misheard
+# word sounds like (em_phonetics, §16.8).
+cmudict==1.1.3

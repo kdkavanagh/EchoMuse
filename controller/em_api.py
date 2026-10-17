@@ -21,6 +21,7 @@ import shutil
 import tempfile
 import time
 import zipfile
+from collections import Counter
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import date
@@ -47,6 +48,7 @@ import em_samples
 import em_wakeclips
 import em_ambient
 import em_pause_asr
+import em_phonetics
 import em_text_fix
 import em_text_fix_service
 import em_volume
@@ -360,6 +362,7 @@ class ControllerServices(Protocol):
     def firmware(self) -> em_firmware.BundledFirmware: ...
     async def trial_transcript(self, device_id: str | None, text: str,
                                wake: bool) -> em_text_fix_service.Trial: ...
+    async def unknown_words(self, device_id: str | None) -> Counter[str]: ...
     def ha_status(self) -> dict[em_ha_client.HaFeature, FeatureStatusWire]: ...
     def speech_worker_status(self) -> SpeechWorkerStatus: ...
     def loop_lag_peak_ms(self) -> float: ...
@@ -515,6 +518,7 @@ async def create_app(services: ControllerServices) -> web.Application:
     app.router.add_get("/api/ha/status",        _get_ha_status)
     app.router.add_get("/api/speech/wyoming",   _get_wyoming_info)
     app.router.add_post("/api/text_fix/trial",  _post_text_fix_trial)
+    app.router.add_get("/api/text_fix/unknown_words", _get_text_fix_unknown_words)
 
     # Provisioning
     app.router.add_get("/api/provision/start_script", _get_provision_start_script)
@@ -1768,6 +1772,11 @@ def _validate_config(values: Mapping[str, object],
                 em_text_fix.parse_list(values[key])
             except ValueError as err:
                 return _error(ErrorCode.INVALID_CONFIG, f"{key}: {err}", 400)
+    if em_text_fix.PRONUNCIATIONS_KEY in values:
+        try:
+            em_phonetics.parse_guides(values[em_text_fix.PRONUNCIATIONS_KEY])
+        except ValueError as err:
+            return _error(ErrorCode.INVALID_CONFIG, f"{em_text_fix.PRONUNCIATIONS_KEY}: {err}", 400)
     if em_wake_rules.OPEN_RULES_KEY in values or em_wake_rules.SHADOW_RULES_KEY in values:
         # The baseline of the model this write selects (else the fleet's); a
         # device's own model may differ, and session.ready drops any extra
@@ -4000,8 +4009,33 @@ async def _post_text_fix_trial(request: web.Request) -> web.Response:
     return _ok({
         "text": trial.text, "mode": trial.mode, "route": trial.route, "satellite": trial.satellite,
         "pipeline": trial.pipeline, "language": trial.language, "wake_phrase": trial.wake_phrase,
+        "heard_words": _said(trial.heard),
+        "proposed_words": _said(trial.proposed) if trial.proposed is not None else None,
         "record": trial.record.as_dict(candidates=TRIAL_CANDIDATES) if trial.record is not None else None,
     })
+
+
+def _said(said: em_phonetics.Pronounced) -> list[dict[str, object]]:
+    """Each word, where its pronunciation came from (null: it has none) and its ARPAbet ones."""
+    return [{"word": word, "source": found.source if found is not None else None,
+             "phonemes": list(found.arpabet) if found is not None else []}
+            for word, found in zip(said.words, said.found)]
+
+
+@auth.require_auth
+async def _get_text_fix_unknown_words(request: web.Request) -> web.Response:
+    """GET /api/text_fix/unknown_words?device_id= — words of HA's trigger sentences, earlier
+    requests and names that have no pronunciation under this speaker's guides (without
+    `device_id`, the fleet's), most used first: text with one is never compared by sound
+    (§16.8). Not ready: 503 `not_ready`."""
+    device_id = request.query.get("device_id") or None
+    if device_id is not None:
+        await _device_row(device_id)
+    try:
+        words = await request.app[SERVICES].unknown_words(device_id)
+    except em_text_fix_service.NotReady as err:
+        return _error(ErrorCode.NOT_READY, f"Transcript correction is not ready: {err}", 503)
+    return _ok({"words": [{"word": word, "count": count} for word, count in words.most_common()]})
 
 
 @auth.require_admin
