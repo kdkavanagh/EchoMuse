@@ -28,9 +28,9 @@ func (s *Supervisor) LocalOperation(op alerts.LocalOperation) {
 }
 
 // AlertFocus implements alerts.EventSink. The occurrence's DAC level, amp
-// routing and LED indication follow it (§16.5, §11.2); focus learns which
-// occurrence heads the queue, which drives background budgets and
-// content pause (§6.2).
+// routing, LED indication and the companion's stop zone follow it (§16.5,
+// §11.2); focus learns which occurrence heads the queue, which drives
+// background budgets and content pause (§6.2).
 func (s *Supervisor) AlertFocus(f alerts.AlertFocus) {
 	s.alertForeground.Store(f.Active && f.Foreground)
 	s.cfg.Physical.SetAlertAudio(f.Active, f.ID, f.Foreground, f.Volume)
@@ -41,6 +41,7 @@ func (s *Supervisor) AlertFocus(f alerts.AlertFocus) {
 		s.alertFocusID = f.ID
 	}
 	s.mu.Unlock()
+	s.updateZone()
 	switch {
 	case f.Active:
 		s.fm.AlertActive(f.ID)

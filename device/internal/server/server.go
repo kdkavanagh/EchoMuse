@@ -62,7 +62,8 @@ type Server struct {
 }
 
 // New builds the physical server and restores persisted privacy state. LED
-// hardware is attached later by InitLEDs after the native boot sequence.
+// hardware is attached later: the Dot's ring by InitLEDs after the native
+// boot sequence, any other display by AttachLEDs.
 func New(cfg Config) *Server {
 	hw := cfg.Hardware
 	if hw == nil {
@@ -95,6 +96,10 @@ func (s *Server) InitLEDs() error {
 	}
 	return nil
 }
+
+// AttachLEDs attaches a ring display other than the Dot's I2C ring (the
+// LineageOS Show's companion bar) and paints the current state on it.
+func (s *Server) AttachLEDs(c led.Controller) { s.ring.SetController(c) }
 
 // SetLEDs applies a retained controller frame. Local privacy/alert/link/volume
 // layers may hide it but retain it for hand-back.

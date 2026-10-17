@@ -115,6 +115,25 @@ func TestShowKeyChangeDuringAlertMovesOnlyTheOccurrence(t *testing.T) {
 	}
 }
 
+// On a Show with a ring display attached (the LineageOS companion bar),
+// Android's own volume panel is the volume UI: a key or dashboard change
+// never paints the arc over the ring (docs/echo-show-companion-plan.md
+// decision 12). The arc follows only the Dot's volume buttons.
+func TestShowVolumeChangeNeverPaintsTheArc(t *testing.T) {
+	s, _, _ := newShowServer(t, 12, "")
+	leds := &fakeLEDs{}
+	s.AttachLEDs(leds)
+	s.SetLinkState(LinkUp)
+	black := blackFrame()
+	s.ExternalVolumeChange(110)
+	s.SetVolume(90)
+	for i, l := range leds.frame() {
+		if l != black[i] {
+			t.Fatalf("volume change painted %v", leds.frame())
+		}
+	}
+}
+
 // When the mechanism failed its startup check, nothing is applied or
 // reported and the server says why (hello then carries a null level).
 func TestShowVolumeUnavailable(t *testing.T) {

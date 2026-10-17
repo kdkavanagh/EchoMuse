@@ -278,6 +278,7 @@ func (s *Supervisor) focusAcquire(env proto.Envelope) {
 	}
 	s.mu.Unlock()
 	s.ack(env, proto.AckAccepted, "")
+	s.updateZone()
 }
 
 func (s *Supervisor) focusRenew(env proto.Envelope) {
@@ -302,6 +303,9 @@ func (s *Supervisor) focusRelease(env proto.Envelope) {
 		s.mu.Unlock()
 	}
 	s.ackErr(env, err, focusCode)
+	if err == nil {
+		s.updateZone()
+	}
 }
 
 // applyFocus hands a focus decision to the mixer and alert executor.
@@ -311,7 +315,8 @@ func (s *Supervisor) applyFocus(out focus.Output) {
 }
 
 // focusLeaseExpired clears controller-driven dialog LEDs once the last
-// dialog lease has lapsed (§11.2: remote dialog indicators have leases).
+// dialog lease has lapsed (§11.2: remote dialog indicators have leases),
+// and the companion's cancel zone with them.
 func (s *Supervisor) focusLeaseExpired(l focus.Lease) {
 	s.mu.Lock()
 	delete(s.leases, l.ID)
@@ -319,6 +324,7 @@ func (s *Supervisor) focusLeaseExpired(l focus.Lease) {
 	s.mu.Unlock()
 	if empty {
 		s.cfg.Physical.ClearControllerLEDs()
+		s.updateZone()
 	}
 }
 

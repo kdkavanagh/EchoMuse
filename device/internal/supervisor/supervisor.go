@@ -69,6 +69,7 @@ type Session interface {
 	Ack(messageID string, status proto.AckStatus, errCode *proto.AckCode) error
 	Audio() client.AudioSink
 	Assets() assets.Transport
+	Controller() string // host:port the session was dialled at
 }
 
 // RetainedHooks carry retained non-audio commands (WIRE §4.8) to their
@@ -96,10 +97,15 @@ type Config struct {
 	// AmbientReadable gates the ambient_light capability.
 	AmbientStatus   func() *als.Status
 	AmbientReadable func() bool
-	// ScreenOn asks the kiosk to light the screen (kiosk.Waker.ScreenOn);
-	// required on a screen_wake platform, unused elsewhere. It must return
+	// ScreenOn lights the screen: the kiosk's (kiosk.Waker.ScreenOn) with
+	// config screenWakeUrl and screenWakePassword on the Fire OS Show, the
+	// companion app's on a screen_overlay platform, which ignores both.
+	// Required on a screen_wake platform, unused elsewhere. It must return
 	// at once.
 	ScreenOn func(url, password string)
+	// Companion is the screen app's link (companion.Server); required on a
+	// screen_overlay platform, nil elsewhere.
+	Companion Companion
 
 	Mic pkgmic.Microphone
 	// AFEMetadata: Mic's blocks carry decoded native AFE metadata
@@ -133,9 +139,10 @@ type playbackState struct {
 
 // Supervisor implements client.Handler and alerts.EventSink.
 //
-// Lock order: capMu → announceMu → mu. Components are never called with mu
-// held; announceMu serializes epoch announcements with session publication
-// so every stream.open follows session.ready exactly once per session.
+// Lock order: capMu → announceMu → mu, and zoneMu → mu. Components are
+// never called with mu held; announceMu serializes epoch announcements with
+// session publication so every stream.open follows session.ready exactly
+// once per session; zoneMu keeps companion zone updates in order.
 type Supervisor struct {
 	cfg Config
 	now func() int64
@@ -201,6 +208,9 @@ type Supervisor struct {
 	soundWant    map[string]bool // alert sounds no armed alarm needs: previews, prefetched timer sounds
 	pressEpoch   proto.NullU64
 	pressSample  proto.NullU64
+	controller   string // host:port of the controller last reached
+
+	zoneMu sync.Mutex
 
 	lastMask        atomic.Uint32 // final-mix mask of the latest tap
 	alertForeground atomic.Bool
@@ -223,6 +233,9 @@ func Assemble(cfg Config, d Deps) (*Supervisor, error) {
 	}
 	if slices.Contains(platformCaps, proto.CapScreenWake) && cfg.ScreenOn == nil {
 		return nil, errors.New("supervisor: screen_wake platform without ScreenOn")
+	}
+	if slices.Contains(platformCaps, proto.CapScreenOverlay) && cfg.Companion == nil {
+		return nil, errors.New("supervisor: screen_overlay platform without Companion")
 	}
 	if cfg.NowMonoNS == nil {
 		cfg.NowMonoNS = monoclock.Now

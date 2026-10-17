@@ -37,12 +37,12 @@ const (
 // shell_close). Hello, Rejected, Ready, Control and Lost run on the link's
 // control goroutine in order; RenderAudio runs on the audio receive goroutine.
 type Handler interface {
-	Hello() proto.SessionHello              // fresh snapshot per attempt
-	Ready(s *Session, r proto.SessionReady) // session established
-	Rejected(reason proto.RejectReason)     // session.rejected; the link retries after 10 s
-	Lost(reason LostReason)                 // all sockets closed; s is dead
-	Control(env proto.Envelope)             // every other C→D message
-	RenderAudio(h ema.Header, pcm []byte)   // validated kind-3 frame; pcm borrowed for the call
+	Hello() proto.SessionHello                             // fresh snapshot per attempt
+	Ready(s *Session, r proto.SessionReady)                // session established
+	Rejected(reason proto.RejectReason, controller string) // session.rejected by the controller at host:port; the link retries after 10 s
+	Lost(reason LostReason)                                // all sockets closed; s is dead
+	Control(env proto.Envelope)                            // every other C→D message
+	RenderAudio(h ema.Header, pcm []byte)                  // validated kind-3 frame; pcm borrowed for the call
 }
 
 // Config identifies the endpoint and where its credentials live.
@@ -147,14 +147,15 @@ func (l *Link) find(ctx context.Context) (*discovery.ServerInfo, error) {
 // connect runs one session attempt to completion.
 func (l *Link) connect(ctx context.Context, server *discovery.ServerInfo) error {
 	creds := loadLinkCreds(l.cfg.CAPath, l.cfg.TokenPath)
-	base := "ws://" + server.Addr
+	addr, scheme := server.Addr, "ws://"
 	if creds.tlsConf != nil {
 		if server.TLSPort > 0 {
-			base = "wss://" + net.JoinHostPort(server.Host, strconv.Itoa(server.TLSPort))
+			addr, scheme = net.JoinHostPort(server.Host, strconv.Itoa(server.TLSPort)), "wss://"
 		} else {
 			log.Printf("[client] CA installed but the controller offers no tls_port; dialling plain ws")
 		}
 	}
+	base := scheme + addr
 	dialer := creds.dialer()
 
 	ctrl, _, err := dialer.DialContext(ctx, base+proto.PathControl, creds.header())
@@ -163,7 +164,7 @@ func (l *Link) connect(ctx context.Context, server *discovery.ServerInfo) error 
 	}
 	ctrl.SetReadLimit(proto.MaxControlBytes)
 	stop := context.AfterFunc(ctx, func() { ctrl.Close() })
-	ready, err := l.handshake(ctrl)
+	ready, err := l.handshake(ctrl, addr)
 	if !stop() || err != nil {
 		ctrl.Close()
 		if err == nil {
@@ -194,15 +195,15 @@ func (l *Link) connect(ctx context.Context, server *discovery.ServerInfo) error 
 	l.shell.endpoint = shellEndpoint{base: base, deviceID: l.cfg.DeviceID, dialer: dialer, header: creds.header()}
 	l.shell.mu.Unlock()
 
-	s := newSession(ctx, l, ready.SessionID, ctrl, audio, newAssetTransport(assetsConn, dialAssets))
+	s := newSession(ctx, l, ready.SessionID, addr, ctrl, audio, newAssetTransport(assetsConn, dialAssets))
 	reason := s.run(func() { l.h.Ready(s, ready) })
 	l.h.Lost(reason)
 	return fmt.Errorf("client: session %s lost: %s", ready.SessionID, reason)
 }
 
-// handshake sends session.hello and waits for session.ready or
-// session.rejected (WIRE §1, §4.1).
-func (l *Link) handshake(ctrl *websocket.Conn) (proto.SessionReady, error) {
+// handshake sends session.hello to the controller at addr and waits for
+// session.ready or session.rejected (WIRE §1, §4.1).
+func (l *Link) handshake(ctrl *websocket.Conn, addr string) (proto.SessionReady, error) {
 	var ready proto.SessionReady
 	hello, err := marshalEnvelope(l.cfg.DeviceID, nil, proto.TypeSessionHello, uuid.NewV4().String(), 0, l.h.Hello())
 	if err != nil {
@@ -232,7 +233,7 @@ func (l *Link) handshake(ctrl *websocket.Conn) (proto.SessionReady, error) {
 		if err := json.Unmarshal(env.Body, &rej); err != nil {
 			return ready, fmt.Errorf("client: session.rejected body: %w", err)
 		}
-		l.h.Rejected(rej.Reason)
+		l.h.Rejected(rej.Reason, addr)
 		return ready, fmt.Errorf("%w: %s", errRejected, rej.Reason)
 	case proto.TypeSessionReady:
 		if err := json.Unmarshal(env.Body, &ready); err != nil {

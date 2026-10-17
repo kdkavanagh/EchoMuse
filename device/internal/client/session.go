@@ -39,8 +39,9 @@ type controlWrite struct {
 // Session is one established v1 session, valid from Handler.Ready until
 // Handler.Lost. Its methods are safe for concurrent use.
 type Session struct {
-	link *Link
-	id   string
+	link       *Link
+	id         string
+	controller string // host:port the session was dialled at
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -57,18 +58,19 @@ type Session struct {
 	wg       sync.WaitGroup
 }
 
-func newSession(parent context.Context, l *Link, id string, ctrl, audio *websocket.Conn, at *assetTransport) *Session {
+func newSession(parent context.Context, l *Link, id, controller string, ctrl, audio *websocket.Conn, at *assetTransport) *Session {
 	ctx, cancel := context.WithCancel(parent)
 	s := &Session{
-		link:     l,
-		id:       id,
-		ctx:      ctx,
-		cancel:   cancel,
-		ctrl:     ctrl,
-		audio:    audio,
-		assets:   at,
-		controlQ: make(chan controlWrite, controlQueueDepth),
-		lostWhy:  make(chan LostReason, 1),
+		link:       l,
+		id:         id,
+		controller: controller,
+		ctx:        ctx,
+		cancel:     cancel,
+		ctrl:       ctrl,
+		audio:      audio,
+		assets:     at,
+		controlQ:   make(chan controlWrite, controlQueueDepth),
+		lostWhy:    make(chan LostReason, 1),
 	}
 	s.sink = newSocketAudioSink(audio, l.t.write, s.fail)
 	s.lastRx.Store(monoclock.Now())
@@ -77,6 +79,9 @@ func newSession(parent context.Context, l *Link, id string, ctrl, audio *websock
 
 // ID is the controller-assigned session ID.
 func (s *Session) ID() string { return s.id }
+
+// Controller is the host:port the session's sockets were dialled at.
+func (s *Session) Controller() string { return s.controller }
 
 // Audio is the uplink frame sink on the audio socket.
 func (s *Session) Audio() AudioSink { return s.sink }

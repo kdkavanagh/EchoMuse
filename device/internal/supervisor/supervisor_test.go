@@ -21,6 +21,7 @@ import (
 	"github.com/wilbowes/EchoMuse/internal/audio/afe"
 	"github.com/wilbowes/EchoMuse/internal/audio/ema"
 	"github.com/wilbowes/EchoMuse/internal/client"
+	"github.com/wilbowes/EchoMuse/internal/companion"
 	"github.com/wilbowes/EchoMuse/internal/config"
 	"github.com/wilbowes/EchoMuse/internal/cue"
 	"github.com/wilbowes/EchoMuse/internal/proto"
@@ -77,6 +78,8 @@ func (f *fakeSession) Ack(id string, status proto.AckStatus, code *proto.AckCode
 	f.mu.Unlock()
 	return nil
 }
+
+func (f *fakeSession) Controller() string { return "10.0.0.2:8767" }
 
 func (f *fakeSession) Audio() client.AudioSink { return nopAudio{} }
 
@@ -137,6 +140,39 @@ type missingAssets struct{}
 
 func (missingAssets) Fetch(context.Context, string, int64, io.Writer) (int64, error) {
 	return 0, assets.ErrNotFound
+}
+
+// fakeCompanion records the zones and link statuses the supervisor sets.
+type fakeCompanion struct {
+	mu       sync.Mutex
+	zones    []companion.Zone
+	statuses []companion.Status
+}
+
+func (f *fakeCompanion) SetZone(z companion.Zone) {
+	f.mu.Lock()
+	f.zones = append(f.zones, z)
+	f.mu.Unlock()
+}
+
+func (f *fakeCompanion) SetLink(st companion.Status) {
+	f.mu.Lock()
+	f.statuses = append(f.statuses, st)
+	f.mu.Unlock()
+}
+
+// zoneChanges is the zone sequence without repeats (the server sends only
+// changes).
+func (f *fakeCompanion) zoneChanges() []companion.Zone {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Compact(slices.Clone(f.zones))
+}
+
+func (f *fakeCompanion) lastStatus() companion.Status {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.statuses[len(f.statuses)-1]
 }
 
 // servedAssets is a controller holding exactly these assets by SHA-256.
@@ -307,6 +343,8 @@ type harness struct {
 	// screenOns records Config.ScreenOn calls as "url password".
 	screenMu  sync.Mutex
 	screenOns []string
+	// comp is the LineageOS Show's companion link; nil elsewhere.
+	comp *fakeCompanion
 }
 
 type opts struct {
@@ -355,10 +393,13 @@ func newHarness(t *testing.T, o opts) *harness {
 		gate: gateSink{writes: make(chan struct{}), done: make(chan struct{})}}
 	h.now.Store(int64(1000 * time.Second))
 	platform := proto.PlatformFireOS6
+	var comp Companion
 	if o.crown {
 		platform = proto.PlatformFireOS6Crown
 		if o.lineage {
 			platform = proto.PlatformLineage18Crown
+			h.comp = &fakeCompanion{}
+			comp = h.comp
 		}
 	}
 	h.phys = server.New(server.Config{Hardware: h.hw, StatePath: filepath.Join(dir, "state.json"),
@@ -367,6 +408,7 @@ func newHarness(t *testing.T, o opts) *harness {
 		DeviceID: "dev", FirmwareVersion: "v3.0.0-test", BootID: "boot", Platform: platform,
 		AmbientReadable: func() bool { return o.ambient },
 		ScreenOn:        h.screenOn,
+		Companion:       comp,
 		Mic:             &fakeMic{closed: make(chan struct{})},
 		AFEMetadata:     o.afe,
 		Physical:        h.phys, DeviceConfig: config.New(),
@@ -941,8 +983,9 @@ func TestAlertFocusRoutesDACAndVolumeButtons(t *testing.T) {
 
 // WIRE §4.1 session.hello: the v1 capability set plus the platform's
 // capabilities (the Dot: ring, buttons, Wi-Fi, BLE proxy, privacy mute; the
-// Show: screen wake); alert_cache_v1 only with a working wakelock;
-// ambient_light only when readable.
+// Fire OS Show: screen wake; the LineageOS Show: the companion's ring,
+// button and overlay, and screen wake); alert_cache_v1 only with a working
+// wakelock; ambient_light only when readable.
 func TestHelloCapabilities(t *testing.T) {
 	common := []proto.Capability{"audio_timeline_v1", "uplink_leases_v1", "device_wake_v1", "render_reference_v1",
 		"render_progress_v1", "focus_leases_v1", "alert_cache_v1", "turn_protocol_v1",
@@ -956,7 +999,8 @@ func TestHelloCapabilities(t *testing.T) {
 		{"dot", opts{}, proto.PlatformFireOS6,
 			[]proto.Capability{"leds", "led_anim", "buttons", "button_hold", "wifi_control", "ble_proxy", "privacy_mute"}},
 		{"show", opts{crown: true}, proto.PlatformFireOS6Crown, []proto.Capability{"screen_wake"}},
-		{"lineage show", opts{crown: true, lineage: true}, proto.PlatformLineage18Crown, []proto.Capability{"screen_wake"}},
+		{"lineage show", opts{crown: true, lineage: true}, proto.PlatformLineage18Crown,
+			[]proto.Capability{"leds", "led_anim", "buttons", "button_hold", "screen_wake", "screen_overlay"}},
 	} {
 		h := newHarness(t, tc.o)
 		hello := h.s.Hello()
@@ -986,6 +1030,69 @@ func TestHelloCapabilities(t *testing.T) {
 		if !slices.Contains(hello.Capabilities, "ambient_light") {
 			t.Errorf("%s: ambient_light missing with a readable sensor", tc.name)
 		}
+	}
+}
+
+// A screen_overlay platform cannot run without its companion link.
+func TestAssembleRefusesScreenOverlayWithoutCompanion(t *testing.T) {
+	dir := t.TempDir()
+	speech, _ := assets.Open(filepath.Join(dir, "speech"))
+	sounds, _ := assets.Open(filepath.Join(dir, "sounds"))
+	_, err := Assemble(Config{
+		DeviceID: "dev", Platform: proto.PlatformLineage18Crown, Mic: &fakeMic{closed: make(chan struct{})},
+		ScreenOn:     func(string, string) {},
+		Physical:     server.New(server.Config{Hardware: &fakeHW{}, StatePath: filepath.Join(dir, "state.json")}),
+		DeviceConfig: config.New(), SpeechStore: speech, AlertStore: sounds,
+	}, Deps{Sink: gateSink{}, LoadModel: func(wakeword.Paths) (detector.Scorer, error) { return nil, os.ErrNotExist }})
+	if err == nil {
+		t.Fatal("screen_overlay platform assembled without Companion")
+	}
+}
+
+// docs/echo-show-companion-plan.md decision 9: the touch zone is stop while
+// an alert holds foreground focus, else cancel while a dialog focus lease is
+// held, else none, across a turn, an alert ringing over it, the alert
+// yielding to the dialog, the turn ending, and a session loss.
+func TestCompanionZonesFollowAlertAndDialogFocus(t *testing.T) {
+	h := newHarness(t, opts{crown: true, lineage: true})
+	h.ready()
+	h.expectAck(h.control(proto.TypeFocusAcquire, 3, proto.FocusAcquire{LeaseID: "f1", Owner: "turn", Focus: "dialog_input", TTLMs: 3000}), proto.AckAccepted, "")
+	h.s.AlertFocus(alerts.AlertFocus{Active: true, ID: "a1", Kind: "timer", Foreground: true})
+	h.s.AlertFocus(alerts.AlertFocus{Active: true, ID: "a1", Kind: "timer", Foreground: false})
+	h.expectAck(h.control(proto.TypeFocusRelease, 3, proto.FocusRelease{LeaseID: "f1"}), proto.AckAccepted, "")
+	h.s.AlertFocus(alerts.AlertFocus{Active: true, ID: "a1", Kind: "timer", Foreground: true})
+	h.s.AlertFocus(alerts.AlertFocus{})
+	h.expectAck(h.control(proto.TypeFocusAcquire, 4, proto.FocusAcquire{LeaseID: "f2", Owner: "turn2", Focus: "dialog_output", TTLMs: 3000}), proto.AckAccepted, "")
+	h.s.Lost(client.LostTimeout)
+	want := []companion.Zone{
+		companion.ZoneCancel, companion.ZoneStop, companion.ZoneCancel, companion.ZoneNone,
+		companion.ZoneStop, companion.ZoneNone, companion.ZoneCancel, companion.ZoneNone,
+	}
+	if got := h.comp.zoneChanges(); !slices.Equal(got, want) {
+		t.Fatalf("zones\n got %v\nwant %v", got, want)
+	}
+}
+
+// The companion shows the controller link: pending approval with the
+// controller that answered, up with the session's controller, then down
+// with the loss reason, still naming the last controller.
+func TestCompanionLinkStatus(t *testing.T) {
+	h := newHarness(t, opts{crown: true, lineage: true})
+	h.s.Rejected(proto.RejectPendingApproval, "10.0.0.9:8770")
+	if got, want := h.comp.lastStatus(), (companion.Status{Link: companion.LinkPending, Reason: "pending_approval", Controller: "10.0.0.9:8770"}); got != want {
+		t.Fatalf("rejected: %+v, want %+v", got, want)
+	}
+	h.ready()
+	if got, want := h.comp.lastStatus(), (companion.Status{Link: companion.LinkUp, Controller: "10.0.0.2:8767"}); got != want {
+		t.Fatalf("ready: %+v, want %+v", got, want)
+	}
+	h.s.Lost(client.LostTimeout)
+	if got, want := h.comp.lastStatus(), (companion.Status{Link: companion.LinkDown, Reason: "session_lost", Controller: "10.0.0.2:8767"}); got != want {
+		t.Fatalf("lost: %+v, want %+v", got, want)
+	}
+	h.s.Rejected(proto.RejectUnauthorized, "10.0.0.2:8767")
+	if got, want := h.comp.lastStatus(), (companion.Status{Link: companion.LinkDown, Reason: "unauthorized", Controller: "10.0.0.2:8767"}); got != want {
+		t.Fatalf("unauthorized: %+v, want %+v", got, want)
 	}
 }
 
@@ -1028,23 +1135,27 @@ func TestWifiMessagesOnlyOnWifiControlPlatforms(t *testing.T) {
 }
 
 // screen_wake: on the Show with config screenWake on, every candidate open
-// asks the kiosk to light the screen with the configured URL and password,
-// connected or not; off by default, and never on the Dot.
+// asks ScreenOn to light the screen (the kiosk with the configured URL and
+// password on Fire OS, the companion app on LineageOS), connected or not;
+// off by default, and never on the Dot.
 func TestScreenWakeOnCandidateOpen(t *testing.T) {
 	on, url, pw := true, "http://127.0.0.1:2323", "secret"
 	for _, tc := range []struct {
-		name   string
-		crown  bool
-		enable bool
-		lost   bool
-		want   []string
+		name    string
+		crown   bool
+		lineage bool
+		enable  bool
+		lost    bool
+		want    []string
 	}{
 		{name: "show, off by default", crown: true},
 		{name: "show, on", crown: true, enable: true, want: []string{url + " " + pw}},
 		{name: "show, on, no session", crown: true, enable: true, lost: true, want: []string{url + " " + pw}},
+		{name: "lineage show, off by default", crown: true, lineage: true},
+		{name: "lineage show, on, no session", crown: true, lineage: true, enable: true, lost: true, want: []string{url + " " + pw}},
 		{name: "dot, on", enable: true},
 	} {
-		h := newHarness(t, opts{crown: tc.crown})
+		h := newHarness(t, opts{crown: tc.crown, lineage: tc.lineage})
 		h.ready()
 		if tc.enable {
 			h.control(proto.TypeConfig, 0, config.Message{ScreenWake: &on, ScreenWakeURL: &url, ScreenWakePassword: &pw})

@@ -7,6 +7,7 @@ import (
 	"slices"
 
 	"github.com/wilbowes/EchoMuse/internal/client"
+	"github.com/wilbowes/EchoMuse/internal/companion"
 	"github.com/wilbowes/EchoMuse/internal/config"
 	"github.com/wilbowes/EchoMuse/internal/platform"
 	"github.com/wilbowes/EchoMuse/internal/proto"
@@ -23,17 +24,22 @@ var v1Capabilities = []proto.Capability{
 
 // platformCapabilities are the hardware and platform capabilities each
 // image implements (§18.2; docs/echo-show-port-plan.md decisions 6, 7;
-// docs/echo-show-lineage-plan.md §3). The Dot keeps its ring, buttons,
-// Wi-Fi management, BLE proxy and privacy mute; on the Show, on either OS,
-// Android owns Wi-Fi, Bluetooth and the keys, there is no ring, mute is
-// deferred and the kiosk screen can be woken.
+// docs/echo-show-lineage-plan.md §3; docs/echo-show-companion-plan.md
+// decision 8). The Dot keeps its ring, buttons, Wi-Fi management, BLE
+// proxy and privacy mute; on the Show, on either OS, Android owns Wi-Fi,
+// Bluetooth and the keys, mute is deferred and the kiosk screen can be
+// woken. On LineageOS the companion app's bar is the ring and its touch
+// zone the action button.
 var platformCapabilities = map[proto.Platform][]proto.Capability{
 	proto.PlatformFireOS6: {
 		proto.CapLEDs, proto.CapLEDAnim, proto.CapButtons, proto.CapButtonHold,
 		proto.CapWifiControl, proto.CapBLEProxy, proto.CapPrivacyMute,
 	},
-	proto.PlatformFireOS6Crown:   {proto.CapScreenWake},
-	proto.PlatformLineage18Crown: {proto.CapScreenWake},
+	proto.PlatformFireOS6Crown: {proto.CapScreenWake},
+	proto.PlatformLineage18Crown: {
+		proto.CapLEDs, proto.CapLEDAnim, proto.CapButtons, proto.CapButtonHold,
+		proto.CapScreenWake, proto.CapScreenOverlay,
+	},
 }
 
 // has reports whether this platform implements c.
@@ -132,6 +138,7 @@ func (s *Supervisor) ready(sess Session, r proto.SessionReady) {
 		s.logSend(proto.TypeVolumeState, 0, volumeState{Level: level})
 	}
 	s.cfg.Physical.SetLinkState(server.LinkUp)
+	s.companionLink(companion.LinkUp, "", sess.Controller())
 	s.activate(ctx, sess, r)
 	if s.cfg.Retained.Ready != nil {
 		s.cfg.Retained.Ready()
@@ -139,12 +146,14 @@ func (s *Supervisor) ready(sess Session, r proto.SessionReady) {
 }
 
 // Rejected implements client.Handler; pending approval pulses white.
-func (s *Supervisor) Rejected(reason proto.RejectReason) {
+func (s *Supervisor) Rejected(reason proto.RejectReason, controller string) {
 	if reason == proto.RejectPendingApproval {
 		s.cfg.Physical.SetLinkState(server.LinkPending)
+		s.companionLink(companion.LinkPending, string(reason), controller)
 		return
 	}
 	s.cfg.Physical.SetLinkState(server.LinkDown)
+	s.companionLink(companion.LinkDown, string(reason), controller)
 }
 
 // Lost implements client.Handler: every dialog/uplink lease and network
@@ -156,6 +165,7 @@ func (s *Supervisor) Lost(reason client.LostReason) {
 	log.Printf("[session] lost: %s", reason)
 	inFlight := s.endSession()
 	s.cfg.Physical.SetLinkState(server.LinkDown)
+	s.companionLink(companion.LinkDown, string(reason), "")
 	s.mu.Lock()
 	s.offCancel()
 	s.offCtx, s.offCancel = context.WithCancel(context.Background())
@@ -189,6 +199,7 @@ func (s *Supervisor) endSession() bool {
 	s.mix.EndSession()
 	s.ex.ClockSessionLost()
 	s.cfg.Physical.ClearControllerLEDs()
+	s.updateZone()
 	return inFlight
 }
 

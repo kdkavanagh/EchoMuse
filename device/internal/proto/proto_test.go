@@ -81,15 +81,43 @@ func TestHelloPlatform(t *testing.T) {
 }
 
 // The optional platform capabilities carry the names the controller gates
-// its Wi-Fi, BLE proxy, mute and screen wake controls on.
+// its Wi-Fi, BLE proxy, mute, screen wake and companion controls on.
 func TestPlatformCapabilityNames(t *testing.T) {
 	for c, want := range map[Capability]string{
 		CapWifiControl: "wifi_control", CapBLEProxy: "ble_proxy",
 		CapPrivacyMute: "privacy_mute", CapScreenWake: "screen_wake",
+		CapScreenOverlay: "screen_overlay",
 	} {
 		if string(c) != want {
 			t.Errorf("capability %q, want %q", c, want)
 		}
+	}
+}
+
+// stats.companion is omitted off a screen_overlay device; on one, every
+// unknown field is JSON null, never omitted.
+func TestStatsCompanionEncoding(t *testing.T) {
+	b, err := json.Marshal(Stats{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m["companion"]; ok {
+		t.Errorf("companion present without health: %s", b)
+	}
+	linked := false
+	b, err = json.Marshal(Stats{Companion: &CompanionStats{Linked: &linked}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(m["companion"]); got != `{"version":null,"linked":false,"overlay":null,"error":null}` {
+		t.Errorf("companion encodes as %s", got)
 	}
 }
 

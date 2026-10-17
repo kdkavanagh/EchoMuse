@@ -154,9 +154,10 @@ func (s *Supervisor) localWakeChime(c detector.Candidate, alertActive bool) bool
 	return true
 }
 
-// screenWake asks the kiosk to light the screen (screen_wake, config
-// screenWake) at every candidate open; the request is asynchronous and its
-// failures never touch the wake path.
+// screenWake lights the screen through ScreenOn (screen_wake, config
+// screenWake) at every candidate open: the kiosk's REST API, or the
+// companion app on a screen_overlay platform. The request is asynchronous
+// and its failures never touch the wake path.
 func (s *Supervisor) screenWake() {
 	if !s.has(proto.CapScreenWake) {
 		return

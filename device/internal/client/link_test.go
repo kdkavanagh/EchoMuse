@@ -57,11 +57,11 @@ func (r *recorder) Hello() proto.SessionHello {
 	r.hellos <- time.Now()
 	return proto.SessionHello{Capabilities: []proto.Capability{proto.CapAudioTimeline}, Protocols: []int{proto.Version}}
 }
-func (r *recorder) Ready(s *Session, _ proto.SessionReady) { r.ready <- s }
-func (r *recorder) Rejected(reason proto.RejectReason)     { r.rejected <- reason }
-func (r *recorder) Lost(reason LostReason)                 { r.lost <- reason }
-func (r *recorder) Control(env proto.Envelope)             { r.control <- env }
-func (r *recorder) RenderAudio(h ema.Header, _ []byte)     { r.audio <- h }
+func (r *recorder) Ready(s *Session, _ proto.SessionReady)       { r.ready <- s }
+func (r *recorder) Rejected(reason proto.RejectReason, _ string) { r.rejected <- reason }
+func (r *recorder) Lost(reason LostReason)                       { r.lost <- reason }
+func (r *recorder) Control(env proto.Envelope)                   { r.control <- env }
+func (r *recorder) RenderAudio(h ema.Header, _ []byte)           { r.audio <- h }
 
 // controller is an in-process fake of the controller's device listener.
 type controller struct {

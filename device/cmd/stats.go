@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/wilbowes/EchoMuse/internal/bindings/als"
+	"github.com/wilbowes/EchoMuse/internal/companion"
 	"github.com/wilbowes/EchoMuse/internal/proto"
 	"github.com/wilbowes/EchoMuse/internal/wifi"
 )
@@ -33,11 +34,15 @@ import (
 // the firmware never touches it (docs/echo-show-port-plan.md decision 7), so
 // those fields are absent and the rest (RSSI from /proc/net/wireless, wlan0
 // counters, CPU, memory, thermals) are read the same way.
+//
+// companion is the LineageOS Show's app health (stats.companion); nil
+// elsewhere, which omits the field.
 type statsCollector struct {
-	wpaCLI bool
-	mu     sync.Mutex
-	net    netCounters
-	link   linkInfoCache
+	wpaCLI    bool
+	companion *companion.Health
+	mu        sync.Mutex
+	net       netCounters
+	link      linkInfoCache
 }
 
 // collect reads one stats body.
@@ -56,7 +61,7 @@ func (c *statsCollector) collect() proto.Stats {
 		ssid = wifi.CurrentSSID()
 	}
 	cpuC, maxC, coreLimit := thermals()
-	return proto.Stats{
+	st := proto.Stats{
 		AmbientLux:       als.Lux(),
 		CPUTempC:         cpuC,
 		MaxTempC:         maxC,
@@ -79,6 +84,10 @@ func (c *statsCollector) collect() proto.Stats {
 		TxDropped:        txDrop,
 		RxCrcErrors:      rxCrc,
 	}
+	if c.companion != nil {
+		st.Companion = c.companion.Stats()
+	}
+	return st
 }
 
 // ─── Network telemetry ────────────────────────────────────────────────────────

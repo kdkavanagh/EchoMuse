@@ -98,9 +98,16 @@ const (
 	// privacy.muted false).
 	CapPrivacyMute Capability = "privacy_mute"
 	// CapScreenWake: on wake-candidate open the device lights the kiosk
-	// screen through Fully Kiosk's local REST API when config screenWake is
-	// on (the Show).
+	// screen when config screenWake is on (the Show): through Fully Kiosk's
+	// local REST API, or through the companion app on a screen_overlay
+	// device.
 	CapScreenWake Capability = "screen_wake"
+	// CapScreenOverlay: the device keeps the EchoMuse companion app running
+	// as a light bar over the kiosk, painting the composited ring there and
+	// taking touches in its stop/cancel zone as action-button presses; it
+	// lights the screen through the app, not Fully's REST API (the
+	// LineageOS Show). Whether the app is up right now is stats.companion.
+	CapScreenOverlay Capability = "screen_overlay"
 )
 
 // Platform is session.hello's platform: the system image this firmware runs
@@ -650,6 +657,21 @@ type Stats struct {
 	CoresOnline      int              `json:"coresOnline,omitempty"`
 	CoresTotal       int              `json:"coresTotal,omitempty"`
 	ThermalCoreLimit int              `json:"thermalCoreLimit,omitempty"`
+	// Companion is the screen app's health; present only on a
+	// screen_overlay device.
+	Companion *CompanionStats `json:"companion,omitempty"`
+}
+
+// CompanionStats is stats.companion: each field null when unknown.
+type CompanionStats struct {
+	// Version is the app's version from its last hello this run.
+	Version *string `json:"version"`
+	// Linked: an app connection is up past hello.
+	Linked *bool `json:"linked"`
+	// Overlay is the app's last reported SYSTEM_ALERT_WINDOW op state.
+	Overlay *bool `json:"overlay"`
+	// Error is the last installer or link error, null when none.
+	Error *string `json:"error"`
 }
 
 // WifiResult is the retained wifi_result body; error is always present, ""
