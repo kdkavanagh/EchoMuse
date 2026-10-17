@@ -44,6 +44,88 @@ RUN make clean && \
 
 WORKDIR /sdk
 
+# ── Companion app ────────────────────────────────────────────────────────────
+#
+# The Echo Show's light bar and touch surface on LineageOS 18.1
+# (docs/echo-show-companion-plan.md). The firmware stage below embeds this
+# APK, so every firmware carries its own app and every path that delivers a
+# firmware (adoption, OTA, rollback, auto-rollback) delivers the app with it.
+#
+# Pinned like everything that reaches a device: the JDK image by the digest
+# of its multi-arch index (resolved to linux/amd64 here), and the two SDK
+# zips from dl.google.com by SHA-256, as the ORT AAR is below. Google's
+# repository2-1.xml publishes only SHA-1s; the SHA-256s were computed on
+# download and the files' SHA-1s matched that index (build-tools 2076ea81…,
+# platform e7c62809…). build-tools r30.0.3 and platform android-30 are the
+# Show's API (Android 11); moving either is a change to test on the unit.
+#
+# No Gradle, no AndroidX: javac, d8, aapt2, zipalign and apksigner directly.
+# aapt2 and zipalign are linux-x86_64 binaries, hence linux/amd64 as for the
+# compiler stage; d8 and apksigner are jars run on this JDK.
+FROM --platform=linux/amd64 eclipse-temurin:17-jdk@sha256:fe947d993c32dd9cf651a4353a6ed723c2370b3a9d034ea4cab4775404ea531a AS companion
+WORKDIR /android
+# Unpacked with the JDK's jar tool (the image has no unzip), keeping only
+# what the build runs; jar drops the executable bits.
+RUN set -e; \
+    curl -sfL -o build-tools.zip https://dl.google.com/android/repository/build-tools_r30.0.3-linux.zip; \
+    echo "24593500aa95d2f99fb4f10658aae7e65cb519be6cd33fa164f15f27f3c4a2d6  build-tools.zip" | sha256sum -c -; \
+    curl -sfL -o platform.zip https://dl.google.com/android/repository/platform-30_r03.zip; \
+    echo "f3f5b75744dbf6ee6ed3e8174a71e513bfee502d0bc3463ea97e517bff68d84e  platform.zip" | sha256sum -c -; \
+    jar xf build-tools.zip android-11/aapt2 android-11/zipalign android-11/lib64/libc++.so \
+      android-11/lib/d8.jar android-11/lib/apksigner.jar; \
+    mv android-11 build-tools; \
+    chmod +x build-tools/aapt2 build-tools/zipalign; \
+    jar xf platform.zip android-11/android.jar; \
+    mv android-11/android.jar .; \
+    rmdir android-11; \
+    rm build-tools.zip platform.zip
+
+# The version is `cmp-` plus a hash of every file under device/companion, by
+# the firmware's recipe, and it is the APK's versionName: the firmware
+# reinstalls whenever the installed app's differs (decision 4). The tests are
+# part of the app's sources and so of its hash.
+#
+# core/ is the link codec and the status text, pure Java: it is compiled and
+# tested alone on the JDK first, so a failing test, or an android.* import
+# creeping into core/, fails the image. app/ is the Android side.
+#
+# The signing key is generated per build and discarded (decision 3): no
+# secret lives in the repository, and since the firmware reinstalls on any
+# version change, a new key is just another reinstall. versionCode stays 1.
+WORKDIR /build
+COPY device/companion/ ./companion/
+RUN set -e; \
+    VERSION="cmp-$(find companion -type f -print0 \
+      | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -c1-12)"; \
+    BT=/android/build-tools; \
+    SDK=/android/android.jar; \
+    javac --release 8 -encoding UTF-8 -d test-classes \
+      $(find companion/core companion/test -name '*.java'); \
+    java -cp test-classes org.echomuse.companion.LinkTest; \
+    $BT/aapt2 compile --dir companion/res -o res.zip; \
+    $BT/aapt2 link -o unsigned.apk -I $SDK --manifest companion/AndroidManifest.xml \
+      --java gen --version-name "$VERSION" --version-code 1 res.zip; \
+    javac --release 8 -encoding UTF-8 -classpath $SDK -d classes \
+      $(find companion/core companion/app gen -name '*.java'); \
+    java -cp $BT/lib/d8.jar com.android.tools.r8.D8 --release --min-api 30 --lib $SDK \
+      --output . $(find classes -name '*.class'); \
+    jar -u -M -f unsigned.apk classes.dex; \
+    $BT/zipalign -p 4 unsigned.apk aligned.apk; \
+    keytool -genkeypair -keystore signing.p12 -storetype PKCS12 -storepass echomuse \
+      -alias companion -keyalg RSA -keysize 2048 -validity 36500 -dname "CN=EchoMuse companion"; \
+    mkdir -p /out; \
+    java -jar $BT/lib/apksigner.jar sign --ks signing.p12 --ks-pass pass:echomuse \
+      --ks-key-alias companion --v1-signing-enabled false --v2-signing-enabled true \
+      --v3-signing-enabled true --v4-signing-enabled false --out /out/companion.apk aligned.apk; \
+    rm signing.p12; \
+    java -jar $BT/lib/apksigner.jar verify --min-sdk-version 30 /out/companion.apk; \
+    printf '%s\n' "$VERSION" > /out/companion_version
+
+# companion.apk and companion_version alone, for inspecting the app by hand
+# (`--target companion-out --output type=local,dest=…`).
+FROM scratch AS companion-out
+COPY --from=companion /out/ /
+
 # ── Device firmware ──────────────────────────────────────────────────────────
 #
 # The firmware this controller installs, and the only one: provisioning and
@@ -51,19 +133,28 @@ WORKDIR /sdk
 # each controller image with the firmware from the same tree.
 #
 # The version is a hash of the firmware's own sources (Dockerfile.dockerignore
-# keeps tests out of the context), so it moves exactly when the firmware does:
-# a controller-only change rebuilds an image whose firmware the Dots already
-# run, and the dashboard offers them no update. It is compiled in as
+# keeps Go tests out of the context), so it moves exactly when the firmware
+# does: a controller-only change rebuilds an image whose firmware the Dots
+# already run, and the dashboard offers them no update. It is compiled in as
 # client.Version, which the Dot reports in session.hello, and written beside
 # the binary for the controller to compare.
+#
+# The companion app is part of the firmware (internal/companion embeds it),
+# so its sources are part of the hash too. The built app.apk and app.version
+# are not: the APK is signed with a per-build key, and hashing it would give
+# two builds of the same tree different versions.
 FROM compiler AS firmware
 COPY device/go.mod device/go.sum ./
 RUN go mod download
 COPY device/cmd/ ./cmd/
 COPY device/internal/ ./internal/
 COPY device/pkg/ ./pkg/
+COPY device/companion/ ./companion/
+COPY --from=companion /out/companion.apk ./internal/companion/app.apk
+COPY --from=companion /out/companion_version ./internal/companion/app.version
 RUN set -e; \
-    VERSION="fw-$(find go.mod go.sum cmd internal pkg -type f -print0 \
+    VERSION="fw-$(find go.mod go.sum cmd internal pkg companion -type f \
+      ! -path 'internal/companion/app.*' -print0 \
       | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -c1-12)"; \
     mkdir -p /out; \
     CGO_CFLAGS="-Wno-deprecated-declarations -Wno-null-dereference" go build \

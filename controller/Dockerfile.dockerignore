@@ -10,10 +10,16 @@
 !device/cmd/
 !device/internal/
 !device/pkg/
-# Tests are not firmware: kept out so they neither rebuild it nor move its
-# source-hash version.
+!device/companion/
+# Go tests are not firmware: kept out so they neither rebuild it nor move its
+# source-hash version. device/companion/test stays in: the companion stage
+# runs those tests, and they are part of the app's version.
 device/**/*_test.go
 device/**/testdata
+# Built from device/companion by the companion stage; a stale local copy
+# must not reach the image.
+device/internal/companion/app.apk
+device/internal/companion/app.version
 controller/tests
 controller/data
 controller/echomuse.db*

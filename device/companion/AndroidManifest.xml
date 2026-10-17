@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The EchoMuse companion for the Echo Show on LineageOS 18.1
+  (docs/echo-show-companion-plan.md). The firmware installs it, grants
+  SYSTEM_ALERT_WINDOW with appops and starts LinkService with
+  `am start-foreground-service` as root, so the service need not be exported.
+  No activity, ever: the kiosk pulls itself back to the front about a second
+  after losing focus, and an activity would fight it. No boot receiver: the
+  firmware owns the app's life (decision 5). versionName (cmp-…) and
+  versionCode come from aapt2 link in the image's companion stage.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="org.echomuse.companion">
+
+    <uses-sdk android:minSdkVersion="30" android:targetSdkVersion="30" />
+
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+
+    <application
+        android:label="EchoMuse"
+        android:icon="@drawable/ic_notification"
+        android:allowBackup="false">
+        <service
+            android:name=".LinkService"
+            android:exported="false" />
+    </application>
+</manifest>

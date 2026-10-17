@@ -118,6 +118,20 @@ jobs:
         working-directory: device
         run: go test ./internal/... ./pkg/... ./tools/...
 
+  companion-build:
+    name: Companion app build and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The Echo Show companion app (device/companion), built by the image's
+      # `companion` stage exactly as the firmware embeds it: the link codec
+      # tests on the JDK (a failure fails the stage), then compile, package,
+      # sign and verify. Only that stage; the firmware and the controller
+      # image are not built here. ubuntu-latest is x86-64, which aapt2 and
+      # zipalign need.
+      - name: Build the companion stage
+        run: docker build -f controller/Dockerfile --target companion .
+
   python-deps-audit:
     name: Python dependency audit
     runs-on: ubuntu-latest
