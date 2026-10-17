@@ -1284,7 +1284,8 @@ function TextFixEvidence({ fix: f, quote, trial = false, defaultOpen = false }) 
   const num = v => (typeof v === 'number' ? v.toFixed(2) : '—');
   const candidates = Array.isArray(f.candidates) ? f.candidates : [];
   const verdicts = f.verdict && typeof f.verdict === 'object' ? f.verdict : null;
-  const verdict = v => (!v ? 'not asked'
+  // A record's verdict is null when HA's matcher recognized nothing (it is always asked).
+  const verdict = v => (!v ? 'nothing recognized'
     : v.match ? `matched${v.intent ? ` ${v.intent}` : ''}${v.template ? ` via “${v.template}”` : ''}` : 'no match');
   const proposed = f.proposed != null;
   const timing = [

@@ -722,9 +722,10 @@ Below the lists, **Try a transcript** shows what the correction would do with
 text you type, as you type: write what speech-to-text heard ("RMV alarm") and
 it shows heard → proposed → would send, whether On would apply it and why,
 and every candidate with its scores, whether it kept what was said, and what
-Home Assistant's sentence matcher accepted it as. For "RMV alarm" that is
-"arm the alarm" and "arm the alarm away", too close to choose between, so it
-would be sent as heard.
+Home Assistant's sentence matcher accepted it as. "RMV alarm" finds your alarm
+automation's sentences for arming at home ("arm the alarm") and arming away
+("arm the alarm away"), too close to choose between, so it would be sent as
+heard.
 
 It tries the text as a standalone command on this speaker, with the saved
 settings (unsaved edits are not included): its preferred lists, its Home
