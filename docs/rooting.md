@@ -519,6 +519,11 @@ writes:
 4. Reboots, reconnects (restarting `adbd` as root again), waits for
    `init.svc.echomuse` and `init.svc.audioserver` to read `running`, and
    waits for the Show to reach the controller.
+5. Waits up to 60 s for the EchoMuse app (below) to link to the firmware
+   with its overlay allowed, as the device's stats report it (or, while the
+   Show is pending approval and sends none, as adb reads it on the device).
+   On failure it shows the firmware's `[companion]` log lines and
+   `dumpsys package org.echomuse.companion`.
 
 There is no kiosk check, no Alexa neutralisation, no Wi-Fi step and no
 second slot.
@@ -547,6 +552,19 @@ server's scratch space in `/data/local/tmp/echomuse`, waits for
 packages and denies no microphones: none of them are Amazon's here. The
 dashboard's **Re-apply debloat** is disabled for this Show, with the reason.
 
+The firmware also carries the **EchoMuse app** (`org.echomuse.companion`,
+[echo-show-companion-plan.md](echo-show-companion-plan.md)) inside its own
+binary. At every start, and whenever the app has been away for 30 s, it
+installs the app when the installed version differs from its own (removing
+the old one first), allows it to draw over other apps, and starts it. The app
+has no launcher icon and no activity: only the firmware starts it, and it
+shows a silent, persistent notification while it runs. It draws the light
+bar along the bottom edge of the screen, over the kiosk and its screensaver,
+and takes touches there during a turn or a ringing alert
+([quickstart](quickstart.md)). A firmware update or rollback brings that
+firmware's app with it. A rollback to firmware from before the app leaves
+the app installed, showing nothing and reading "EchoMuse is not running".
+
 ### LineageOS updates
 
 `/system/addon.d/50-echomuse.sh` is a LineageOS addon.d (v2) script of the
@@ -564,13 +582,16 @@ wizard again.
 | Where | What |
 |---|---|
 | `/system` | Two files: `/system/etc/init/echomuse.rc` and `/system/addon.d/50-echomuse.sh` |
-| `/data` | The firmware and startup script (`/data/local/bin`); TLS credentials and the supervisor log (`/data/local/etc/echomuse`); the server log (`/data/local/tmp/echomuse`) |
+| `/data` | The firmware and startup script (`/data/local/bin`); TLS credentials and the supervisor log (`/data/local/etc/echomuse`); the server log (`/data/local/tmp/echomuse`); the EchoMuse app, installed as `org.echomuse.companion` with its overlay permission |
 
 ### To undo it on LineageOS
+
+Stop the service first, so the firmware does not install the app again:
 
 ```bash
 adb root
 adb shell 'stop echomuse; mount -o remount,rw / && rm /system/etc/init/echomuse.rc /system/addon.d/50-echomuse.sh && mount -o remount,ro /'
+adb shell pm uninstall org.echomuse.companion
 adb reboot
 ```
 

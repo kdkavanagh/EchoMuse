@@ -877,6 +877,51 @@ Based on a review of Office turns 433–476 (`docs/turn-latency-review.md`,
   the accepted risks (an unofficial ROM, SELinux permissive, adbd on TCP 5555
   with key authorisation) and the undo: docs/rooting.md.
 
+### Echo Show 8 on LineageOS: the EchoMuse app
+
+A LineageOS Show now shows what a Dot's ring shows, and takes touch in place
+of the action button (docs/echo-show-companion-plan.md).
+
+- **The firmware carries and installs the EchoMuse app.** The APK
+  (`org.echomuse.companion`) is built in the controller image and embedded in
+  the firmware binary, so adoption, updates, queued updates, rollback and
+  auto-rollback each bring their firmware's app with no separate delivery.
+  On a LineageOS Show the firmware reinstalls the app whenever the installed
+  version differs from its own, allows its overlay, and restarts it after
+  30 s away; an app failure never stops the firmware. The Dot and the Fire
+  OS Show carry it and never install it.
+- **A light bar on screen.** The ring compositor's frame is drawn as a
+  12-segment bar along the bottom edge, over the kiosk: wake, listening,
+  thinking, speaking, timers, alerts and link state, as on a Dot's ring.
+  The app has no launcher icon, and shows a silent, persistent notification
+  with the link state and the firmware and app versions.
+- **Touch is the action button.** During a turn or a ringing alert the
+  bottom band takes touches: a tap cancels the turn or stops the alert on the
+  device, a hold of 750 ms or more is Home Assistant's `long` event. Nothing
+  is touchable while idle.
+- **Screen wake through the app.** With **Light the screen on wake** on, the
+  app turns the screen on at candidate open itself; the kiosk API is not
+  called, and the dashboard disables its URL and password there with the
+  reason "the EchoMuse app lights the screen". The controller still pushes
+  them, for older LineageOS firmware.
+- **Capabilities.** A LineageOS Show now announces `leds`, `led_anim`,
+  `buttons`, `button_hold` and the new `screen_overlay`, so the controller
+  sends it LEDs, the Ring section and the button settings are enabled, and
+  its touches follow the action-button policy. On LineageOS firmware from
+  before the app they read "firmware update available"; the Fire OS Show
+  keeps "no LED ring on this device" and "no action button on this device".
+  `em_device` keeps per-platform optional sets for this.
+- **App health on the Status tab.** Device `stats` carry `companion`
+  (`version`, `linked`, `overlay`, `error`; docs/protocol-v1.md §4.8), and
+  the Status tab shows it in a Companion app panel: an unknown value reads
+  "unavailable", and a device that reports none shows no panel.
+- **The wizard verifies the app.** A LineageOS Show's adoption ends with
+  `verify_companion`, which waits up to 60 s for a fresh stats report with
+  the app linked and its overlay allowed (read over adb while the Show is
+  pending approval and sends no stats). On failure it shows the firmware's
+  `[companion]` log lines and `dumpsys package org.echomuse.companion`. Undo
+  adds `pm uninstall org.echomuse.companion` (docs/rooting.md).
+
 ### Earlier in this release
 
 - ASR gain: the STT copy sent to Home Assistant is amplified by

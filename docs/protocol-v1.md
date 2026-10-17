@@ -153,9 +153,12 @@ is never filled.
 An Echo Show (`"platform":"fireos6_crown"` or `"lineage18_crown"`) announces the eight required
 capabilities (`alert_cache_v1` under the same wakelock condition) plus
 `alert_prefetch`, `local_wake_chime`, `open_rules_v1`, `afe_metadata_v1`,
-`ambient_light` when its sensor is readable, and `screen_wake`: no `leds`,
-`led_anim`, `buttons` or `button_hold` (it has no ring and no action button),
-and none of the three Dot-only capabilities below.
+`ambient_light` when its sensor is readable, and `screen_wake`, and none of
+the three Dot-only capabilities below. On Fire OS that is all: no `leds`,
+`led_anim`, `buttons` or `button_hold` (it has no ring and no action button).
+On LineageOS the firmware also announces `leds`, `led_anim`, `buttons`,
+`button_hold` and `screen_overlay`, statically: its companion app
+(`docs/echo-show-companion-plan.md`) is the ring and the button.
 `alert_cache_v1` is withheld when the wakelock cannot be acquired
 (`alerts.wakeup = "alarm_wakeup_unavailable"`). `ambient_light` only when the
 sensor is readable. `ambient_light_status` is the legacy `als.Report()` object.
@@ -203,6 +206,14 @@ candidate opens, with
 to the kiosk's local REST API (Fully Kiosk Browser's Remote Administration):
 asynchronous, 2 s timeout, failures logged rate-limited, never delaying or
 blocking the wake.
+`screen_overlay`: announced by firmware on a LineageOS Show
+(`lineage18_crown`) only. The device has an on-screen light bar and touch
+zones, both driven by its ring compositor: the bar shows what a Dot's ring
+would, and a touch in an active zone is a `button.action` (§4.6). It lights
+the screen at candidate open itself, so `screenWakeUrl` and
+`screenWakePassword` are unused there; the controller still sends them to
+every `screen_wake` device, which older LineageOS firmware needs. Whether the
+app is up right now is health in `stats.companion` (§4.8), not a capability.
 `platform`: the system image the firmware runs on: `fireos6` (Echo Dot 2nd
 gen, Fire OS 6, Android 7.1.2 `biscuit_puffin`), `fireos6_crown` (Echo Show 8
 1st gen `crown`, Fire OS 6 with the full Android framework) or
@@ -211,8 +222,9 @@ Amazon apps). One firmware binary runs on all three and picks its audio
 backend and hardware bindings at runtime. It is not a capability and selects
 no protocol behaviour; it is an
 admission check, and it decides which reason the dashboard gives for an absent
-optional capability ("managed by the device" or "no LED ring on this device"
-on an Echo Show, "firmware update available" on an older Dot). The controller
+optional capability ("managed by the device" on an Echo Show, "no LED ring on
+this device" on a Fire OS Show, "firmware update available" on an older Dot or
+an older LineageOS Show). The controller
 refuses a hello that omits it or names anything else with `session.rejected`
 reason `protocol`, logging the value sent: firmware built from this tree runs
 audio on no other image, so admitting such a device would only offer it an
@@ -587,6 +599,17 @@ unavailable, with the reason "volume control unavailable: Android volume check
 failed (see device log)", sends it no `volume_set` (Home Assistant volume
 commands are refused or ignored) and reports no level to Home Assistant.
 `bleProxyEnabled` is ignored there (logged).
+
+`stats` carries `companion` on a LineageOS Show (`lineage18_crown`) only,
+omitted elsewhere: the companion app's health,
+`{"version":"cmp-…"|null,"linked":bool|null,"overlay":bool|null,"error":"…"|null}`.
+`version` is the app version from its last link hello (null if it has not
+linked this run); `linked` is true while an app connection is up past its
+hello, false otherwise; `overlay` is the overlay permission state the app
+last reported (null until it reports); `error` is the last installer or link
+error, null when there is none. Null is unknown: the controller passes the
+object through as reported and the dashboard shows a null value as
+unavailable, never as no.
 
 ## 5. Transport rules
 

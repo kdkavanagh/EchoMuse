@@ -96,8 +96,8 @@ device in the dashboard.
 #### On LineageOS 18.1
 
 The Show can also run LineageOS 18.1 instead of Fire OS: Android without any
-Amazon apps, so there is nothing to neutralise and the screen is entirely
-yours. EchoMuse needs **our build** (it carries the Amazon audio front end
+Amazon apps, so there is nothing to neutralise and the screen is yours, but
+for EchoMuse's light bar. EchoMuse needs **our build** (it carries the Amazon audio front end
 whose metadata EchoMuse reads; upstream releases do not, and the wizard
 refuses them), flashed from TWRP after the same amonet-crown unlock;
 [rooting](rooting.md#echo-show-8-on-lineageos-181) has the build, the flash
@@ -113,9 +113,29 @@ you run the wizard:
   the kiosk gets no microphone.
 
 The wizard then installs the boot hook (plus a small addon.d script that
-keeps it across LineageOS updates) and the firmware, reboots, and waits for
-the Show to reach the controller. There is no kiosk check, no Alexa step and
-no Wi-Fi step.
+keeps it across LineageOS updates) and the firmware, reboots, waits for
+the Show to reach the controller, and checks that the EchoMuse app is up.
+There is no kiosk check, no Alexa step and no Wi-Fi step.
+
+The firmware installs and starts the **EchoMuse app** itself, and keeps it
+current with every firmware update. It has no launcher icon; you see it as:
+
+- **The light bar**: a 12-segment bar along the bottom edge of the screen,
+  showing what a Dot's ring would (the table in Step 7), drawn over your
+  kiosk and its screensaver. It is dark while there is nothing to show.
+- **Touch**: during a turn and while an alert rings, the bottom band of the
+  screen is the action button. A tap cancels the turn, or stops the ringing
+  alert (the band then reads "Stop"); a hold is the button's long press in
+  Home Assistant. While idle nothing there is touchable, and every touch
+  reaches the kiosk.
+- **A notification**: a silent, persistent one with the link state and the
+  firmware and app versions, which Android requires while the app runs.
+
+With **Light the screen on wake** on, the app turns the screen on at the
+wake word itself, so the kiosk API URL and password are not used (the
+dashboard disables them). It does not dismiss the kiosk's screensaver: the
+bar shows over it. The app's health (linked, version, overlay allowed, last
+error) is on the device's Status tab.
 
 ## Step 2 — Make a Home Assistant token
 

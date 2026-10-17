@@ -156,6 +156,10 @@ class Capability(enum.StrEnum):
     # Announced by the Echo Show's firmware only: it lights the kiosk screen
     # on wake-candidate open when config screenWake says so.
     SCREEN_WAKE = "screen_wake"
+    # Announced by a LineageOS Show's firmware: its companion app shows the
+    # ring compositor's frame as an on-screen light bar and turns touches in
+    # its zones into button.action; screenWakeUrl/Password go unused there.
+    SCREEN_OVERLAY = "screen_overlay"
 
 
 class DevicePlatform(enum.StrEnum):

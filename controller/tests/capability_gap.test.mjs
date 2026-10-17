@@ -8,7 +8,8 @@
 // boundary, so the alternative is a second copy that drifts.
 //
 // The platform-dependent reasons ("managed by the device" on an Echo Show,
-// "firmware update available" on an older Dot) are the controller's
+// "no LED ring on this device" on a Fire OS Show, "firmware update available"
+// on an older Dot or LineageOS Show) are the controller's
 // (em_device.capability_gap, sent as `capability_gaps`); the dashboard must
 // show those first and fall back to its own per-capability text.
 
@@ -47,11 +48,16 @@ const code = [
   liftConst("CAPABILITY"),
   liftConst("CAPABILITY_REASONS"),
   liftConst("PLATFORM_LABEL"),
+  liftConst("SCREEN_OVERLAY_REASON"),
   liftFunctionDecl("capabilityGap"),
   liftFunctionDecl("liveCapabilities"),
-  "export { CAPABILITY, CAPABILITY_REASONS, PLATFORM_LABEL, capabilityGap, liveCapabilities };",
+  liftFunctionDecl("kioskApiGap"),
+  liftFunctionDecl("companionRows"),
+  "export { CAPABILITY, CAPABILITY_REASONS, PLATFORM_LABEL, capabilityGap, liveCapabilities,",
+  "         kioskApiGap, companionRows };",
 ].join("\n");
-const { CAPABILITY, CAPABILITY_REASONS, PLATFORM_LABEL, capabilityGap, liveCapabilities } = await import(
+const { CAPABILITY, CAPABILITY_REASONS, PLATFORM_LABEL, capabilityGap, liveCapabilities,
+        kioskApiGap, companionRows } = await import(
   "data:text/javascript;base64," + Buffer.from(code).toString("base64"));
 
 let failures = 0;
@@ -73,29 +79,64 @@ const REQUIRED = ["audio_timeline_v1", "uplink_leases_v1", "device_wake_v1", "re
   for (const p of platforms) check(`${p} has a platform label`, typeof PLATFORM_LABEL[p], "string");
 }
 
-// An Echo Show as /api/devices reports it (em_api._merge_device), on either
-// image: the controller names the same reasons for both.
-for (const platform of ["fireos6_crown", "lineage18_crown"]) {
-  const show = {
-    connected: true, platform,
-    capabilities: [...REQUIRED, "local_wake_chime", "open_rules_v1", "screen_wake"],
+// Each Echo Show image as /api/devices reports it (em_api._merge_device).
+// Both leave Wi-Fi, BLE and mute to the device; only Fire OS's lacks the ring
+// and the button, which a LineageOS Show's companion app puts on screen.
+const SHOW = [...REQUIRED, "local_wake_chime", "open_rules_v1", "screen_wake"];
+const SHOW_GAPS = {
+  wifi_control: "managed by the device", ble_proxy: "managed by the device",
+  privacy_mute: "mute not supported on this device yet",
+};
+const SHOWS = {
+  fireos6_crown: {
+    connected: true, platform: "fireos6_crown", capabilities: SHOW,
     capability_gaps: {
+      ...SHOW_GAPS,
       leds: "no LED ring on this device", led_anim: "no LED ring on this device",
       buttons: "no action button on this device", button_hold: "no action button on this device",
-      wifi_control: "managed by the device", ble_proxy: "managed by the device",
-      privacy_mute: "mute not supported on this device yet",
     },
-  };
+  },
+  lineage18_crown: {
+    connected: true, platform: "lineage18_crown",
+    capabilities: [...SHOW, "leds", "led_anim", "buttons", "button_hold", "screen_overlay"],
+    capability_gaps: SHOW_GAPS,
+  },
+};
+for (const [platform, show] of Object.entries(SHOWS)) {
   const s = liveCapabilities(show);
   check(`${platform}: Wi-Fi is managed by the device`, capabilityGap(s, CAPABILITY.WIFI_CONTROL), "managed by the device");
   check(`${platform}: BLE proxy is managed by the device`, capabilityGap(s, CAPABILITY.BLE_PROXY), "managed by the device");
   check(`${platform}: mute is not supported yet`, capabilityGap(s, CAPABILITY.PRIVACY_MUTE), "mute not supported on this device yet");
-  check(`${platform}: no ring, so no ring animation either`, capabilityGap(s, CAPABILITY.LED_ANIM), "no LED ring on this device");
-  check(`${platform}: the ring controls are gated on leds`, capabilityGap(s, CAPABILITY.LEDS), "no LED ring on this device");
-  check(`${platform}: no action button`, capabilityGap(s, CAPABILITY.BUTTON_HOLD), "no action button on this device");
   check(`${platform}: screen wake is available`, capabilityGap(s, CAPABILITY.SCREEN_WAKE), null);
   check(`${platform}: the AFE controls fall back to the dashboard's own reason`,
         capabilityGap(s, CAPABILITY.AFE_METADATA), CAPABILITY_REASONS[CAPABILITY.AFE_METADATA]);
+}
+{
+  const s = liveCapabilities(SHOWS.fireos6_crown);
+  check("fireos6_crown: no ring, so no ring animation either", capabilityGap(s, CAPABILITY.LED_ANIM), "no LED ring on this device");
+  check("fireos6_crown: the ring controls are gated on leds", capabilityGap(s, CAPABILITY.LEDS), "no LED ring on this device");
+  check("fireos6_crown: no action button", capabilityGap(s, CAPABILITY.BUTTON_HOLD), "no action button on this device");
+  check("fireos6_crown: the kiosk API lights the screen", kioskApiGap(s), null);
+}
+{
+  const s = liveCapabilities(SHOWS.lineage18_crown);
+  check("lineage18_crown: the ring controls are available", capabilityGap(s, CAPABILITY.LEDS), null);
+  check("lineage18_crown: ring animation is available", capabilityGap(s, CAPABILITY.LED_ANIM), null);
+  check("lineage18_crown: the action button is available", capabilityGap(s, CAPABILITY.BUTTON_HOLD), null);
+  check("lineage18_crown: the app lights the screen, not the kiosk API", kioskApiGap(s),
+        "the EchoMuse app lights the screen");
+}
+{
+  // LineageOS firmware from before the companion app.
+  const UPDATE = "firmware update available";
+  const s = liveCapabilities({
+    connected: true, platform: "lineage18_crown", capabilities: SHOW,
+    capability_gaps: { ...SHOW_GAPS, leds: UPDATE, led_anim: UPDATE, buttons: UPDATE,
+                       button_hold: UPDATE, screen_overlay: UPDATE },
+  });
+  check("older lineage18_crown: the ring waits for the update", capabilityGap(s, CAPABILITY.LEDS), UPDATE);
+  check("older lineage18_crown: the button waits for the update", capabilityGap(s, CAPABILITY.BUTTON_HOLD), UPDATE);
+  check("older lineage18_crown: the kiosk API still lights the screen", kioskApiGap(s), null);
 }
 // A Dot on firmware predating the Dot-only capabilities and led_anim.
 const olderDot = {
@@ -104,6 +145,7 @@ const olderDot = {
   capability_gaps: {
     wifi_control: "firmware update available", ble_proxy: "firmware update available",
     privacy_mute: "firmware update available", screen_wake: "no screen on this device",
+    screen_overlay: "no screen on this device",
   },
 };
 const d = liveCapabilities(olderDot);
@@ -114,15 +156,38 @@ check("older Dot: no screen", capabilityGap(d, CAPABILITY.SCREEN_WAKE), "no scre
 check("older Dot: led_anim keeps the dashboard's reason",
       capabilityGap(d, CAPABILITY.LED_ANIM), CAPABILITY_REASONS[CAPABILITY.LED_ANIM]);
 check("older Dot: the ring itself is available", capabilityGap(d, CAPABILITY.LEDS), null);
+check("older Dot: no screen, so no screen overlay", capabilityGap(d, CAPABILITY.SCREEN_OVERLAY), "no screen on this device");
+check("older Dot: no screen, so no kiosk API", kioskApiGap(d), "no screen on this device");
 
 // Nothing is gated without a live session to ask: the fleet view, or an
 // offline device whose settings apply when it returns.
 check("offline: nothing gated", liveCapabilities({ ...olderDot, connected: false }), null);
 check("fleet view: nothing gated", capabilityGap(null, CAPABILITY.WIFI_CONTROL), null);
+check("fleet view: the kiosk API is not gated", kioskApiGap(null), null);
 // A response from a controller predating capability_gaps still gates.
 check("no gaps object: generic reason",
       capabilityGap(liveCapabilities({ connected: true, capabilities: REQUIRED }), CAPABILITY.WIFI_CONTROL),
       "needs the wifi_control capability — update this Echo");
+
+// The Status tab's companion-app rows (stats.companion, LineageOS Show only):
+// none at all without the field, and a null value is "unavailable", never a
+// "no" the device did not say.
+const text = rows => rows && rows.map(([label, value]) => `${label}=${value}`).join(", ");
+check("Dot stats: no companion rows", companionRows({ cpuPct: 4, companion: null }), null);
+check("no stats: no companion rows", companionRows(null), null);
+check("app never linked this run",
+      text(companionRows({ companion: { version: null, linked: false, overlay: null, error: null } })),
+      "Linked=Not linked, App version=unavailable, Overlay=unavailable, Last error=none");
+check("app linked, overlay allowed",
+      text(companionRows({ companion: { version: "cmp-0123456789ab", linked: true, overlay: true, error: null } })),
+      "Linked=Linked, App version=cmp-0123456789ab, Overlay=Allowed, Last error=none");
+check("overlay revoked, installer error",
+      text(companionRows({ companion: { version: "cmp-0123456789ab", linked: true, overlay: false,
+                                        error: "pm install: exit 1" } })),
+      "Linked=Linked, App version=cmp-0123456789ab, Overlay=Not allowed, Last error=pm install: exit 1");
+check("unknown link state is unavailable",
+      text(companionRows({ companion: { version: null, linked: null, overlay: null, error: null } })),
+      "Linked=unavailable, App version=unavailable, Overlay=unavailable, Last error=none");
 
 if (failures) {
   console.error(`${failures} check(s) failed`);

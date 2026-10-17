@@ -61,7 +61,7 @@ STATS_KEYS = (
     "wifiRssi", "wifiSsid", "linkSpeedMbps", "wifiFreqMhz", "wifiBssid",
     "txBytes", "rxBytes", "txErrors", "txDropped", "rxCrcErrors", "ble",
     "cpuTempC", "maxTempC", "coresOnline", "coresTotal", "thermalCoreLimit",
-    "ambientLux",
+    "ambientLux", "companion",
 )
 DEVICE_CONFIG_KEYS = ("startupVolume", "duckDb", "bleProxyEnabled")
 DEFAULT_DUCK_DB = -18.0
@@ -107,42 +107,55 @@ VOLUME_UNAVAILABLE = "volume control unavailable: Android volume check failed (s
 
 
 # Capabilities a platform lacks by design, and why. A Fire OS 6 Dot's
-# firmware announces wifi_control, ble_proxy and privacy_mute; the Echo Show's
-# announces screen_wake and none of the ring, button, network or mute ones,
-# on Fire OS and on LineageOS alike.
+# firmware announces wifi_control, ble_proxy and privacy_mute and has no
+# screen; the Echo Show's announces screen_wake and none of the network or
+# mute ones, on Fire OS and on LineageOS alike. Only Fire OS's Show lacks the
+# ring and the button: a LineageOS Show's companion app paints the ring as an
+# on-screen light bar and turns touches into button presses
+# (docs/echo-show-companion-plan.md).
 _NOT_ON_ECHO_SHOW: dict[Capability, CapabilityGap] = {
-    Capability.LEDS: CapabilityGap.NO_RING,
-    Capability.LED_ANIM: CapabilityGap.NO_RING,
-    Capability.BUTTONS: CapabilityGap.NO_BUTTON,
-    Capability.BUTTON_HOLD: CapabilityGap.NO_BUTTON,
     Capability.WIFI_CONTROL: CapabilityGap.MANAGED_BY_DEVICE,
     Capability.BLE_PROXY: CapabilityGap.MANAGED_BY_DEVICE,
     Capability.PRIVACY_MUTE: CapabilityGap.MUTE_NOT_SUPPORTED,
 }
 _NOT_ON_PLATFORM: dict[DevicePlatform, dict[Capability, CapabilityGap]] = {
-    DevicePlatform.FIREOS6: {Capability.SCREEN_WAKE: CapabilityGap.NO_SCREEN},
-    DevicePlatform.FIREOS6_CROWN: _NOT_ON_ECHO_SHOW,
+    DevicePlatform.FIREOS6: {Capability.SCREEN_WAKE: CapabilityGap.NO_SCREEN,
+                             Capability.SCREEN_OVERLAY: CapabilityGap.NO_SCREEN},
+    DevicePlatform.FIREOS6_CROWN: {
+        **_NOT_ON_ECHO_SHOW,
+        Capability.LEDS: CapabilityGap.NO_RING,
+        Capability.LED_ANIM: CapabilityGap.NO_RING,
+        Capability.BUTTONS: CapabilityGap.NO_BUTTON,
+        Capability.BUTTON_HOLD: CapabilityGap.NO_BUTTON,
+    },
     DevicePlatform.LINEAGE18_CROWN: _NOT_ON_ECHO_SHOW,
 }
-# Optional capabilities newer than some firmware in the field on a platform
-# that has them: absent there, the bundled firmware brings them.
-_PLATFORM_OPTIONAL: frozenset[Capability] = frozenset({
-    Capability.WIFI_CONTROL, Capability.BLE_PROXY, Capability.PRIVACY_MUTE,
-    Capability.SCREEN_WAKE,
-})
+# Optional capabilities newer than some firmware in the field on each
+# platform that has them: absent there, the bundled firmware brings them.
+_PLATFORM_OPTIONAL: dict[DevicePlatform, frozenset[Capability]] = {
+    DevicePlatform.FIREOS6: frozenset({
+        Capability.WIFI_CONTROL, Capability.BLE_PROXY, Capability.PRIVACY_MUTE,
+    }),
+    DevicePlatform.FIREOS6_CROWN: frozenset({Capability.SCREEN_WAKE}),
+    DevicePlatform.LINEAGE18_CROWN: frozenset({
+        Capability.SCREEN_WAKE, Capability.LEDS, Capability.LED_ANIM,
+        Capability.BUTTONS, Capability.BUTTON_HOLD, Capability.SCREEN_OVERLAY,
+    }),
+}
 
 
 def capability_gap(platform: DevicePlatform | None, capabilities: Iterable[str],
                    capability: Capability) -> CapabilityGap | None:
     """Why `capability` is missing from a session's announced set: the
-    platform lacks it by design, or it is one of `_PLATFORM_OPTIONAL` and the
-    firmware predates it. None when it is present, when no session names a
-    platform, or when the dashboard's own per-capability reason applies (an
-    older Dot firmware without led_anim, say)."""
+    platform lacks it by design, or it is in the platform's
+    `_PLATFORM_OPTIONAL` and the firmware predates it. None when it is
+    present, when no session names a platform, or when the dashboard's own
+    per-capability reason applies (an older Dot firmware without led_anim,
+    say)."""
     if platform is None or capability in capabilities:
         return None
     reason = _NOT_ON_PLATFORM[platform].get(capability)
-    if reason is None and capability in _PLATFORM_OPTIONAL:
+    if reason is None and capability in _PLATFORM_OPTIONAL[platform]:
         return CapabilityGap.FIRMWARE_UPDATE
     return reason
 
@@ -933,7 +946,7 @@ class Device:
             if self.link is None or self.link.closed:
                 continue
             if not self.leds_capable:
-                self._cue = None    # a device without `leds` (the Echo Show) has no ring to paint
+                self._cue = None    # a device without `leds` (a Fire OS Show) has no ring to paint
                 continue
             if self._cue:
                 cue, self._cue = self._cue, None

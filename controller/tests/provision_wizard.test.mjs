@@ -505,12 +505,16 @@ for (const id of ['check_home', 'neutralize_alexa']) {
 }
 // docs/echo-show-lineage-plan.md Phase L4: no Amazon apps, so no kiosk
 // check and no neutralisation; Wi-Fi is Android's, one system partition.
+// docs/echo-show-companion-plan.md Phase C5: the firmware's app is verified last.
 const LINEAGE_STEPS = ['connect_android', 'install_boot_hook', 'install_em', 'reboot',
-                       'reconnect', 'verify_service', 'confirm_link'];
-check("the LineageOS Show's step list is Phase L4's",
+                       'reconnect', 'verify_service', 'confirm_link', 'verify_companion'];
+check("the LineageOS Show's step list is Phase L4's plus verify_companion",
   _stepsFor('lineage18_crown').join() === LINEAGE_STEPS.join(), _stepsFor('lineage18_crown').join());
 for (const id of ['check_home', 'neutralize_alexa', 'wifi', 'mirror_boot_hook']) {
   check(`${id} is not applicable on the LineageOS Show`, !_stepsFor('lineage18_crown').includes(id));
+}
+for (const platform of ['fireos6', 'fireos6_crown']) {
+  check(`verify_companion is not applicable on ${platform}`, !_stepsFor(platform).includes('verify_companion'));
 }
 check("before connect_android every step shows", _stepsFor(null).length === _WIZARD_STEPS.length);
 
@@ -534,7 +538,11 @@ check("the LineageOS Show goes from connect_android to install_boot_hook",
   _nextStep(idx('connect_android') + 1, 'lineage18_crown') === idx('install_boot_hook'));
 check("the LineageOS Show goes from install_em to reboot",
   _nextStep(idx('install_em') + 1, 'lineage18_crown') === idx('reboot'));
-check("the LineageOS Show ends at confirm_link", _lastStep('lineage18_crown') === idx('confirm_link'));
+check("the LineageOS Show ends at verify_companion", _lastStep('lineage18_crown') === idx('verify_companion'));
+check("the LineageOS Show goes from confirm_link to verify_companion",
+  _nextStep(idx('confirm_link') + 1, 'lineage18_crown') === idx('verify_companion'));
+check("the Dot ends at mirror_boot_hook, past verify_companion",
+  _nextStep(idx('mirror_boot_hook') + 1, 'fireos6') === _WIZARD_STEPS.length);
 
 // Every step needs a label a human reads, and names where it runs.
 _WIZARD_STEPS.forEach(s => check(`${s.id} has a label`, !!s.label));
@@ -559,6 +567,41 @@ check("both Shows log under /data/local/tmp/echomuse, the Dot to /tmp",
   _serverLog('lineage18_crown') === '/data/local/tmp/echomuse/server.log'
   && _serverLog('fireos6_crown') === '/data/local/tmp/echomuse/server.log'
   && _serverLog('fireos6') === '/tmp/server.log');
+
+// ─── verify_companion's evidence ────────────────────────────────────────────
+
+const { _companionReady, _companionOnDevice } = await lift(
+  [liftConst("_COMPANION_PORT"), liftFunctionDecl("_companionReady"), liftFunctionDecl("_companionOnDevice"),
+   "export { _companionReady, _companionOnDevice };"]);
+
+check("stats.companion linked with the overlay allowed passes",
+  _companionReady({ version: 'cmp-0123456789ab', linked: true, overlay: true, error: null }));
+for (const companion of [null, undefined, { linked: true, overlay: null }, { linked: false, overlay: true },
+                         { linked: null, overlay: null }]) {
+  check(`stats.companion ${JSON.stringify(companion)} does not pass`, !_companionReady(companion));
+}
+{
+  // /proc/net/tcp6 with the app (uid 10123) connected from ::ffff:127.0.0.1
+  // to the firmware's 127.0.0.1:8771 (0x2243), whose own row is uid 0.
+  const HEAD = '  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode';
+  const APP  = '   0: 0000000000000000FFFF00000100007F:A1B2 0000000000000000FFFF00000100007F:2243 01 00000000:00000000 00:00000000 00000000 10123        0 4242 1';
+  const FW   = '   1: 0100007F:2243 0100007F:A1B2 01 00000000:00000000 00:00000000 00000000     0        0 4243 1';
+  const ALLOW = 'SYSTEM_ALERT_WINDOW: allow; time=+1m2s ago';
+  const on = (tcp, uid, ops) => JSON.stringify(_companionOnDevice(tcp, uid, ops));
+  check("the app's established connection and the allowed op read as linked with the overlay",
+    on([HEAD, APP, FW].join('\n'), '10123', ALLOW) === '{"linked":true,"overlay":true}');
+  check("the firmware's own row is not the app's",
+    on([HEAD, FW].join('\n'), '10123', ALLOW) === '{"linked":false,"overlay":true}');
+  check("another uid's connection to the port is not the app's",
+    on([HEAD, APP].join('\n'), '10124', ALLOW) === '{"linked":false,"overlay":true}');
+  check("a connection not yet established is not linked",
+    on(APP.replace(':2243 01 ', ':2243 02 '), '10123', ALLOW) === '{"linked":false,"overlay":true}');
+  check("no app installed (no uid) is not linked",
+    on(APP, '', ALLOW) === '{"linked":false,"overlay":true}');
+  check("a denied or default op is no overlay",
+    on(APP, '10123', 'SYSTEM_ALERT_WINDOW: ignore') === '{"linked":true,"overlay":false}'
+    && on(APP, '10123', 'No operations.') === '{"linked":true,"overlay":false}');
+}
 
 // ─── Boot hook content + idempotency ───────────────────────────────────────
 

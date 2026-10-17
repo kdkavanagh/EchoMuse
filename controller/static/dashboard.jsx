@@ -116,6 +116,7 @@ const CAPABILITY = Object.freeze({
   BLE_PROXY:       'ble_proxy',
   PRIVACY_MUTE:    'privacy_mute',
   SCREEN_WAKE:     'screen_wake',
+  SCREEN_OVERLAY:  'screen_overlay',
 });
 
 // em_device_link.DevicePlatform — the image a device's session runs on.
@@ -338,8 +339,9 @@ function _emitEvent(msg) {
 // (§11.1). Features are gated on the capability set the device announced in
 // session.hello, never on its firmware version. The controller's own reason
 // (`capability_gaps`, em_device.capability_gap) comes first: it knows the
-// platform, so an Echo Show reads "managed by the device" or "no LED ring on
-// this device" where an older Dot reads "firmware update available".
+// platform, so an Echo Show reads "managed by the device", a Fire OS Show "no
+// LED ring on this device", where an older Dot or an older LineageOS Show
+// reads "firmware update available".
 const CAPABILITY_REASONS = Object.freeze({
   [CAPABILITY.DEVICE_WAKE]:     'this firmware has no on-device wake detector — update it',
   [CAPABILITY.RENDER_PROGRESS]: 'this firmware cannot play device-local sounds — update it',
@@ -364,6 +366,33 @@ function capabilityGap(capabilities, cap) {
 // controller's reason for each absent one whose reason depends on the platform.
 function liveCapabilities(d) {
   return d.connected ? { names: d.capabilities || [], gaps: d.capability_gaps || {} } : null;
+}
+
+// Why the kiosk API URL and password are disabled: no screen_wake, or a
+// device whose companion app lights the screen itself (screen_overlay), where
+// they go unused (docs/echo-show-companion-plan.md decision 10). The toggle
+// stays on screen_wake alone.
+const SCREEN_OVERLAY_REASON = 'the EchoMuse app lights the screen';
+function kioskApiGap(capabilities) {
+  return capabilityGap(capabilities, CAPABILITY.SCREEN_WAKE)
+    || (capabilities?.names.includes(CAPABILITY.SCREEN_OVERLAY) ? SCREEN_OVERLAY_REASON : null);
+}
+
+// The Status rows for a LineageOS Show's companion app, from
+// `stats.companion` (protocol-v1 §stats): null when the device reports none,
+// so a device without the app shows no row at all. A null value is unknown
+// and reads "unavailable", never "no"; only `error` uses null for "none".
+function companionRows(stats) {
+  const c = stats?.companion;
+  if (c == null) return null;
+  const known = (v, yes, no) => v == null ? ['unavailable', 'var(--muted)']
+    : v ? [yes, 'var(--ok)'] : [no, 'var(--warn)'];
+  return [
+    ['Linked', ...known(c.linked, 'Linked', 'Not linked')],
+    ['App version', c.version ?? 'unavailable', c.version == null ? 'var(--muted)' : undefined],
+    ['Overlay', ...known(c.overlay, 'Allowed', 'Not allowed')],
+    ['Last error', c.error ?? 'none', c.error == null ? undefined : 'var(--error)'],
+  ];
 }
 
 // Simulated LED colour for a device the controller cannot use: offline.
@@ -3878,6 +3907,23 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                     </Panel>
                   );
                 })()}
+                {/* A LineageOS Show's companion app (stats.companion): the
+                    light bar and touch zones. Health, not a capability — the
+                    app can be down while the session is up. */}
+                {(() => {
+                  const rows = companionRows(s);
+                  const cells = part => part.map(([label, text, color]) => (
+                    <React.Fragment key={label}>{row(label, text, color)}</React.Fragment>
+                  ));
+                  return rows && (
+                    <Panel label="Companion app">
+                      <div className="em-grid2" style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:'0 24px' }}>
+                        <div>{cells(rows.slice(0, 2))}</div>
+                        <div>{cells(rows.slice(2))}</div>
+                      </div>
+                    </Panel>
+                  );
+                })()}
               </div>
             );
           })()}
@@ -4898,6 +4944,31 @@ function _serverLog(platform) {
   return _isShow(platform) ? '/data/local/tmp/echomuse/server.log' : '/tmp/server.log';
 }
 
+// The EchoMuse app on a LineageOS Show (docs/echo-show-companion-plan.md):
+// the firmware installs and starts it, and listens for it on loopback port
+// _COMPANION_PORT.
+const _COMPANION_PKG = 'org.echomuse.companion';
+const _COMPANION_PORT = 8771;
+
+// Whether `stats.companion` says the app is linked with its overlay allowed.
+function _companionReady(companion) {
+  return companion?.linked === true && companion?.overlay === true;
+}
+
+// The same two facts read on the device itself, for a device pending
+// approval, which has no session and so no stats: an established connection
+// from the app's uid to the firmware's port in /proc/net/tcp{,6} (`tcp`,
+// whose rows carry the uid in their eighth field), and the overlay op allowed
+// in `appops get` (`ops`).
+function _companionOnDevice(tcp, uid, ops) {
+  const port = _COMPANION_PORT.toString(16).toUpperCase().padStart(4, '0');
+  const linked = /^\d+$/.test(uid) && (tcp || '').split('\n').some(line => {
+    const f = line.trim().split(/\s+/);
+    return f.length > 7 && f[2].endsWith(`:${port}`) && f[3] === '01' && f[7] === uid;
+  });
+  return { linked, overlay: /SYSTEM_ALERT_WINDOW: allow\b/.test(ops || '') };
+}
+
 // WiFi security labels, used in the network picker and in error messages.
 // Module scope so WifiPanel and the wizard's step runners share one set.
 const _SECURITY_LABEL = {
@@ -4949,6 +5020,7 @@ const _SECURITY_LABEL = {
 //  install_boot_hook  — echomuse.rc + addon.d script, / remounted rw then ro
 //  install_em         — push bundled firmware + startup script        [auto]
 //  reboot, reconnect, verify_service (echomuse + audioserver), confirm_link
+//  verify_companion   — the firmware's app linked, overlay allowed     [auto]
 //
 // `id` is also what a diagnostics upload names the failed step by.
 const _ALL_PLATFORMS = Object.values(WIZARD_PLATFORM);
@@ -4981,6 +5053,8 @@ const _WIZARD_STEPS = [
     crownDesc: 'Wait for the Echo Show to reach this controller over its Wi-Fi (a new device shows up pending approval).' },
   { id: 'mirror_boot_hook',  label: 'Mirror Boot Hook',  on: [WIZARD_PLATFORM.DOT],
     desc: 'Now that the hooked slot is proven, write the same hook to the other system slot, so a bootloader fallback still runs EchoMuse.' },
+  { id: 'verify_companion',  label: 'Verify App',        on: [WIZARD_PLATFORM.CROWN_LINEAGE],
+    desc: "Wait for the EchoMuse app, which the firmware installs and starts, to link to the firmware with its overlay allowed: the light bar and touch zones along the bottom of the screen." },
 ];
 
 // Whether a step runs for `platform` (null before connect_android: all do).
@@ -5016,7 +5090,7 @@ function _stepDesc(step, platform) {
 // that need no input, and steps with their own input panel.
 const CONNECT_STEPS = new Set(['connect_android', 'reconnect']);
 const AUTO_STEPS = new Set(['check_home', 'install_boot_hook', 'install_em', 'verify_service',
-                            'confirm_link', 'mirror_boot_hook']);
+                            'confirm_link', 'mirror_boot_hook', 'verify_companion']);
 const INPUT_STEPS = new Set(['wifi']);
 
 // ── WifiPanel ──
@@ -6538,6 +6612,77 @@ function ProvisionWizard({ onClose, knownDevices }) {
                    + `init.svc.${audio}=${audioState || '(unset)'}.`);
   }
 
+  // The EchoMuse app on a LineageOS Show is the firmware's to install and
+  // start (docs/echo-show-companion-plan.md decision 5), so this step waits
+  // for the firmware to report it: `stats.companion`, read through the
+  // controller. Stats arrive at session ready and every 30 s after, and a
+  // device's last stats outlive its session, so only a report other than the
+  // one on hand when the step first saw the device counts: a report from
+  // before the reboot must not pass it. A device pending approval has no
+  // session and so no stats; for it the same two facts are read over adb
+  // (_companionOnDevice).
+  async function runVerifyCompanion(c) {
+    const serial = (await c.shell('getprop ro.serialno')).trim();
+    if (!serial) throw new Error('Could not read the device serial (ro.serialno).');
+    addLog(`Waiting for the EchoMuse app on ${serial} to link with its overlay allowed…`);
+    const TIMEOUT_MS = 60000;
+    const started = Date.now();
+    const fmt = v => v == null ? 'unavailable' : String(v);
+    let baseline, health = null, note = 'no report yet', lastNote = -1;
+    while (Date.now() - started < TIMEOUT_MS) {
+      let d = null;
+      try {
+        d = (await API.get('/api/devices')).find(x => x.device_id === serial) || null;
+      } catch (e) {
+        addLog(`  Could not read /api/devices (${e.error || e.message || e}) — retrying.`, LOG_TONE.WARN);
+      }
+      const after = `after ${Math.round((Date.now() - started) / 1000)}s`;
+      if (d?.connected) {
+        const report = JSON.stringify(d.stats ?? null);
+        if (baseline === undefined) baseline = report;
+        if (report !== baseline) {
+          health = d.stats?.companion ?? null;
+          note = health ? `linked=${fmt(health.linked)}, overlay=${fmt(health.overlay)}`
+                        : 'the stats report carries no companion health';
+          if (_companionReady(health)) {
+            addLog(`EchoMuse app ${health.version || '(version unavailable)'} linked, overlay allowed `
+                 + `(${after}).`, LOG_TONE.OK);
+            return;
+          }
+        } else {
+          note = 'waiting for a stats report from this session';
+        }
+      } else if (d && !d.approved) {
+        const uid = (await c.shell(`stat -c %u /data/data/${_COMPANION_PKG} 2>/dev/null`)).trim();
+        health = _companionOnDevice(await c.shell('cat /proc/net/tcp /proc/net/tcp6 2>/dev/null'), uid,
+                                    await c.shell(`appops get ${_COMPANION_PKG} SYSTEM_ALERT_WINDOW 2>&1`));
+        note = `pending approval, read on the device: linked=${health.linked}, overlay=${health.overlay}`;
+        if (_companionReady(health)) {
+          addLog(`EchoMuse app linked, overlay allowed (${after}; read on the device, since ${serial} `
+               + 'is pending approval — its Status tab shows the app once approved).', LOG_TONE.OK);
+          return;
+        }
+      } else {
+        note = d ? 'approved but not connected' : 'not known to this controller';
+      }
+      const elapsed = Math.floor((Date.now() - started) / 1000);
+      if (elapsed - lastNote >= 15) {
+        lastNote = elapsed;
+        addLog(`  [${elapsed}s] ${note}`);
+      }
+      await new Promise(r => setTimeout(r, 3000));
+    }
+    const serverLog = _serverLog(platformRef.current);
+    const lines = await c.shell(`grep -F '[companion]' ${serverLog} 2>&1 | tail -n 25`);
+    addLog(`[companion] lines from ${serverLog}:\n${lines || '(none)'}`, LOG_TONE.WARN);
+    const pkg = await c.shell(`dumpsys package ${_COMPANION_PKG} 2>&1 | grep -E `
+      + `'Package \\[|versionName|versionCode|userId=|lastUpdateTime|installed=|SYSTEM_ALERT_WINDOW'`);
+    addLog(`dumpsys package ${_COMPANION_PKG}:\n${pkg || '(not installed)'}`, LOG_TONE.WARN);
+    throw new Error(`The EchoMuse app did not report linked with its overlay allowed within `
+                  + `${TIMEOUT_MS / 1000}s (${note}). EchoMuse itself is running and reached this `
+                  + 'controller; the firmware retries the app every 30 s, so fix the cause above, then Retry.');
+  }
+
   // ── Step executor ──
 
   async function runStep(stepIdx) {
@@ -6580,6 +6725,7 @@ function ProvisionWizard({ onClose, knownDevices }) {
         case 'verify_service':    await runVerifyService(c); break;
         case 'confirm_link':      await runConfirmLink(c); break;
         case 'mirror_boot_hook':  await runMirrorBootHook(c); break;
+        case 'verify_companion':  await runVerifyCompanion(c); break;
       }
       if (abandoned()) return;
       markStep(stepIdx, STEP_STATE.DONE);
@@ -7962,11 +8108,12 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
   // spinner and the speaking meter both fall back to the solid listening
   // colour (em_device._send_led), so their settings would do nothing.
   const animGap = capabilityGap(capabilities, CAPABILITY.LED_ANIM);
-  // No `leds` at all (the Echo Show has no ring): every ring control is moot.
+  // No `leds` at all (a Fire OS Show has no ring): every ring control is moot.
   const ringGap = capabilityGap(capabilities, CAPABILITY.LEDS);
   const ringStyle = ringGap ? { opacity: 0.45, pointerEvents: 'none' } : {};
   const bleGap = capabilityGap(capabilities, CAPABILITY.BLE_PROXY);
   const screenGap = capabilityGap(capabilities, CAPABILITY.SCREEN_WAKE);
+  const kioskGap = kioskApiGap(capabilities);
   const [catalog, reloadSounds] = useSounds();
 
   const bands = config.eqBands ?? [0,0,0,0,0,0,0,0];
@@ -8263,7 +8410,7 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
       {/* 09 SCREEN */}
       <Stage n="09" title="Screen"
         chips={<ScopeChip tone="device">Kiosk</ScopeChip>}
-        desc="An Echo Show's screen belongs to its kiosk app (Fully Kiosk Browser), which keeps its own motion wake and screen timeout. With this on, the wake word also lights the screen, through the kiosk's local REST API: enable Remote Administration in Fully's settings and enter its password here. The URL is the kiosk API's root; the default reaches Fully on the Echo Show itself."
+        desc="An Echo Show's screen belongs to its kiosk app (Fully Kiosk Browser), which keeps its own motion wake and screen timeout. With this on, the wake word also lights the screen, through the kiosk's local REST API: enable Remote Administration in Fully's settings and enter its password here. The URL is the kiosk API's root; the default reaches Fully on the Echo Show itself. On LineageOS, firmware with the EchoMuse app lights the screen through the app and needs neither."
         scope={scopeEl('screen')} dim={secStyle('screen')}>
         {screenGap && <div style={{ marginBottom:8, fontFamily:MONO, fontSize:9, color:'var(--warn)' }}>Screen controls unavailable: {screenGap}</div>}
         <div className="em-grid2" style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:'0 24px', ...inputStyle }}>
@@ -8274,16 +8421,17 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
         </div>
         <div className="em-grid2" style={{ display:'grid', gridTemplateColumns:'1.6fr 1fr', gap:12, marginTop:8, ...inputStyle }}>
           <label style={{ fontFamily:MONO, fontSize:8, color:'var(--muted)' }}>kiosk API URL
-            <input type="text" value={config.screenWakeUrl ?? ''} disabled={!!screenGap} placeholder="http://127.0.0.1:2323"
+            <input type="text" value={config.screenWakeUrl ?? ''} disabled={!!kioskGap} placeholder="http://127.0.0.1:2323"
               onChange={e => set('screenWakeUrl', e.target.value.trim())}
               style={{ display:'block', width:'100%', marginTop:4, boxSizing:'border-box' }}/>
           </label>
           <label style={{ fontFamily:MONO, fontSize:8, color:'var(--muted)' }}>Remote Administration password
-            <input type="password" value={config.screenWakePassword ?? ''} disabled={!!screenGap}
+            <input type="password" value={config.screenWakePassword ?? ''} disabled={!!kioskGap}
               autoComplete="new-password" onChange={e => set('screenWakePassword', e.target.value)}
               style={{ display:'block', width:'100%', marginTop:4, boxSizing:'border-box' }}/>
           </label>
         </div>
+        {kioskGap && !screenGap && <div style={{ marginTop:6, fontFamily:MONO, fontSize:9, color:'var(--muted)' }}>Kiosk API unused: {kioskGap}</div>}
       </Stage>
     </div>
   );

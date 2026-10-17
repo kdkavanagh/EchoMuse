@@ -56,10 +56,13 @@
 | `alert_prefetch`, `local_wake_chime`, `open_rules_v1` | yes |
 | `afe_metadata_v1` | yes (decision 6) |
 | `ambient_light` | when the sensor reads (decision 8) |
-| `screen_wake` | yes (Fully's REST API, as on Fire OS crown) |
-| `leds`, `led_anim`, `buttons`, `button_hold` | no |
+| `screen_wake` | yes (Fully's REST API, as on Fire OS crown; with the companion app, the app lights the screen instead) |
+| `leds`, `led_anim`, `buttons`, `button_hold` | no; firmware with the companion app announces them: an on-screen light bar and touch zones ([echo-show-companion-plan.md](echo-show-companion-plan.md) decision 8) |
+| `screen_overlay` | with the companion app only; older firmware reads "firmware update available" |
 | `wifi_control`, `ble_proxy` | no; dashboard reason "managed by the device" |
 | `privacy_mute` | no; reason "mute not supported on this device yet" |
+
+The ring, the action button and screen wake on this image are the companion app's, specified in [echo-show-companion-plan.md](echo-show-companion-plan.md).
 
 ## 4. Phases
 

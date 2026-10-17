@@ -175,16 +175,21 @@ def test_admission_refuses_a_hello_naming_no_platform(caplog):
 
 
 # What each image's current firmware announces (decisions 6 and 7 of the
-# Echo Show port plan, §3 of the LineageOS plan), and a Dot on firmware
-# predating the Dot-only three. The Show announces the same set on both images.
+# Echo Show port plan, §3 of the LineageOS plan, decision 8 of the companion
+# plan), a Dot on firmware predating the Dot-only three, and a LineageOS Show
+# on firmware predating the companion app, which announced the Fire OS set.
 DOT = ALL_V1 + ["leds", "led_anim", "buttons", "button_hold", "alert_prefetch",
                 "local_wake_chime", "open_rules_v1", "ambient_light", "afe_metadata_v1",
                 "wifi_control", "ble_proxy", "privacy_mute"]
 DOT_OLDER = [c for c in DOT if c not in ("wifi_control", "ble_proxy", "privacy_mute")]
-SHOW = ALL_V1 + ["alert_prefetch", "local_wake_chime", "open_rules_v1", "afe_metadata_v1",
-                 "ambient_light", "screen_wake"]
-SHOWS = ["fireos6_crown", "lineage18_crown"]
-DEVICES = [("fireos6", DOT), ("fireos6", DOT_OLDER), *((show, SHOW) for show in SHOWS)]
+FIREOS_SHOW = ALL_V1 + ["alert_prefetch", "local_wake_chime", "open_rules_v1", "afe_metadata_v1",
+                        "ambient_light", "screen_wake"]
+COMPANION = ["leds", "led_anim", "buttons", "button_hold", "screen_overlay"]
+LINEAGE_SHOW = FIREOS_SHOW + COMPANION
+LINEAGE_SHOW_OLDER = FIREOS_SHOW
+SHOWS = [("fireos6_crown", FIREOS_SHOW), ("lineage18_crown", LINEAGE_SHOW)]
+SHOW_CAPS = dict(SHOWS)
+DEVICES = [("fireos6", DOT), ("fireos6", DOT_OLDER), *SHOWS, ("lineage18_crown", LINEAGE_SHOW_OLDER)]
 
 
 async def _session(caps, platform, store=None, host=None, **extra):
@@ -200,22 +205,31 @@ async def _session(caps, platform, store=None, host=None, **extra):
 
 RING, BUTTON = "no LED ring on this device", "no action button on this device"
 UPDATE, MANAGED = "firmware update available", "managed by the device"
+NO_SCREEN = "no screen on this device"
 
 
-SHOW_GAPS = {"leds": RING, "led_anim": RING, "buttons": BUTTON, "button_hold": BUTTON,
-             "wifi_control": MANAGED, "ble_proxy": MANAGED,
+SHOW_GAPS = {"wifi_control": MANAGED, "ble_proxy": MANAGED,
              "privacy_mute": "mute not supported on this device yet"}
+FIREOS_SHOW_GAPS = {**SHOW_GAPS, "leds": RING, "led_anim": RING, "buttons": BUTTON,
+                    "button_hold": BUTTON}
+DOT_GAPS = {"screen_wake": NO_SCREEN, "screen_overlay": NO_SCREEN}
 
 
 @pytest.mark.parametrize("platform, caps, gaps", [
-    ("fireos6", DOT, {"screen_wake": "no screen on this device"}),
-    ("fireos6", DOT_OLDER, {"screen_wake": "no screen on this device", "wifi_control": UPDATE,
-                            "ble_proxy": UPDATE, "privacy_mute": UPDATE}),
-    *((show, SHOW, SHOW_GAPS) for show in SHOWS),
-    *((show, [c for c in SHOW if c != "screen_wake"], {**SHOW_GAPS, "screen_wake": UPDATE})
-      for show in SHOWS),
+    ("fireos6", DOT, DOT_GAPS),
+    ("fireos6", DOT_OLDER, {**DOT_GAPS, "wifi_control": UPDATE, "ble_proxy": UPDATE,
+                            "privacy_mute": UPDATE}),
+    # A Fire OS Show has no ring or button, and never an app to paint them.
+    ("fireos6_crown", FIREOS_SHOW, FIREOS_SHOW_GAPS),
+    ("fireos6_crown", [c for c in FIREOS_SHOW if c != "screen_wake"],
+     {**FIREOS_SHOW_GAPS, "screen_wake": UPDATE}),
+    # A LineageOS Show's companion app brings them; older firmware lacks it.
+    ("lineage18_crown", LINEAGE_SHOW, SHOW_GAPS),
+    ("lineage18_crown", [c for c in LINEAGE_SHOW if c != "screen_wake"],
+     {**SHOW_GAPS, "screen_wake": UPDATE}),
+    ("lineage18_crown", LINEAGE_SHOW_OLDER, {**SHOW_GAPS, **{c: UPDATE for c in COMPANION}}),
     # Absent elsewhere, the dashboard's own per-capability reason applies.
-    ("fireos6", [c for c in DOT if c != "led_anim"], {"screen_wake": "no screen on this device"}),
+    ("fireos6", [c for c in DOT if c != "led_anim"], DOT_GAPS),
 ])
 def test_capability_gaps_name_the_reason_the_platform_gives(platform, caps, gaps):
     async def scenario():
@@ -230,7 +244,7 @@ def test_no_session_no_gap():
 
 
 @pytest.mark.parametrize("platform, caps, reason", [
-    *((show, SHOW, MANAGED) for show in SHOWS), ("fireos6", DOT_OLDER, UPDATE)])
+    *((show, caps, MANAGED) for show, caps in SHOWS), ("fireos6", DOT_OLDER, UPDATE)])
 def test_wifi_change_and_scan_are_refused_with_the_reason(platform, caps, reason, monkeypatch):
     pytest.importorskip("aiohttp")
     from aiohttp import web
@@ -306,8 +320,11 @@ def test_mute_is_shown_only_from_a_privacy_mute_device(platform, caps):
 SCREEN = {"screenWake": True, "screenWakeUrl": "http://192.168.3.159:2323", "screenWakePassword": "pw"}
 
 
+# The kiosk URL and password still go to a screen_overlay device: older
+# LineageOS firmware, without the app, lights the screen through them.
 @pytest.mark.parametrize("platform, caps, pushed", [
-    *((show, SHOW, SCREEN) for show in SHOWS), ("fireos6", DOT, {}), ("fireos6", DOT_OLDER, {})])
+    *((show, caps, SCREEN) for show, caps in SHOWS), ("lineage18_crown", LINEAGE_SHOW_OLDER, SCREEN),
+    ("fireos6", DOT, {}), ("fireos6", DOT_OLDER, {})])
 def test_screen_wake_config_goes_only_to_a_screen_wake_device(platform, caps, pushed):
     async def scenario():
         store = FakeStore()
@@ -320,12 +337,71 @@ def test_screen_wake_config_goes_only_to_a_screen_wake_device(platform, caps, pu
 
 
 @pytest.mark.parametrize("platform, caps, painted", [
-    ("fireos6", DOT, True), ("fireos6", DOT_OLDER, True), *((show, SHOW, False) for show in SHOWS)])
+    ("fireos6", DOT, True), ("fireos6", DOT_OLDER, True), ("fireos6_crown", FIREOS_SHOW, False),
+    # The companion app's light bar is the LineageOS Show's ring.
+    ("lineage18_crown", LINEAGE_SHOW, True), ("lineage18_crown", LINEAGE_SHOW_OLDER, False)])
 def test_the_ring_is_painted_only_on_a_device_with_leds(platform, caps, painted):
     async def scenario():
         device, link, *_ = await _session(caps, platform)
         await settle()
         assert any(kind in ("leds", "led_anim") for kind, _ in link.sent) is painted
+        await device.close()
+    run(scenario())
+
+
+def _press(seq, **kw):
+    return envelope("button.action", {"click_type": 138, "down": False, "held_ms": 120, "muted": False,
+                                      "physical_seq": seq, "occurrence_id": None, "handled": None, **kw})
+
+
+def test_a_lineageos_show_touch_follows_the_action_button_policy():
+    # The companion app's touch zones reach the firmware's action-button
+    # path, so the controller sees the Dot's button.action and decides alike.
+    async def scenario():
+        device, _, host, sink = await _session(LINEAGE_SHOW, "lineage18_crown")
+        sink.on_message(_press(1))                                         # tap → turn
+        sink.on_message(_press(2, handled="alert_stopped", occurrence_id="o"))  # stopped on the device
+        sink.on_message(_press(3, held_ms=900))                            # hold → HA long press
+        await settle()
+        device.actor.turn_active = True
+        sink.on_message(_press(4))                                         # tap in a turn → cancel
+        await settle()
+        assert [t["physical_seq"] for t in device.actor.turns] == [1]
+        assert device.actor.cancels == ["interrupted"]
+        assert [e for e in host.events if e[0] == "button_event"] == [("button_event", "long")]
+        await device.close()
+    run(scenario())
+
+
+def test_a_lineageos_show_tap_may_fire_the_single_tap_event():
+    # buttonSingleTapEvent needs button_hold, which the companion firmware announces.
+    async def scenario():
+        store = FakeStore()
+        store.configs["DEV1"] = {"duckDb": -18.0, "buttonSingleTapEvent": True}
+        device, _, host, sink = await _session(LINEAGE_SHOW, "lineage18_crown", store)
+        sink.on_message(_press(1))
+        await settle()
+        assert device.actor.turns == []
+        assert ("button_event", "single") in host.events
+        await device.close()
+    run(scenario())
+
+
+COMPANION_HEALTH = {"version": "cmp-0123456789ab", "linked": True, "overlay": None, "error": None}
+
+
+@pytest.mark.parametrize("platform, caps, body, companion", [
+    ("lineage18_crown", LINEAGE_SHOW, {"cpuPct": 12.5, "companion": COMPANION_HEALTH}, COMPANION_HEALTH),
+    # A device without the app sends no `companion`: the dashboard shows no row.
+    ("fireos6", DOT, {"cpuPct": 12.5}, None)])
+def test_companion_health_passes_through_stats(platform, caps, body, companion):
+    async def scenario():
+        device, _, host, sink = await _session(caps, platform)
+        sink.on_message(envelope("stats", body))
+        await settle()
+        assert device.stats["companion"] == companion
+        assert device.stats["cpuPct"] == 12.5
+        assert {"stats": device.stats} in host.pushed
         await device.close()
     run(scenario())
 
@@ -345,7 +421,7 @@ def test_the_dashboard_device_json_carries_the_platform_reasons(platform, debloa
     em_db.approve_device("DEV1", "Kitchen")
 
     async def scenario():
-        device, *_ = await _session(SHOW, platform)
+        device, *_ = await _session(SHOW_CAPS[platform], platform)
         monkeypatch.setattr(em_api, "_devices", {"DEV1": device})
         out = em_api._merge_device(em_db.get_device("DEV1"))
         assert out["platform"] == platform
@@ -367,8 +443,8 @@ def test_the_dashboard_device_json_carries_the_platform_reasons(platform, debloa
 
 
 @pytest.mark.parametrize("platform, caps, gap", [
-    ("fireos6", DOT, None), ("fireos6_crown", SHOW, None),
-    ("lineage18_crown", SHOW, "nothing to debloat: LineageOS has no Amazon apps or services")])
+    ("fireos6", DOT, None), ("fireos6_crown", FIREOS_SHOW, None),
+    ("lineage18_crown", LINEAGE_SHOW, "nothing to debloat: LineageOS has no Amazon apps or services")])
 def test_only_a_lineageos_show_has_nothing_to_debloat(platform, caps, gap):
     async def scenario():
         device, *_ = await _session(caps, platform)
@@ -388,7 +464,7 @@ def test_re_apply_debloat_is_refused_with_the_reason_on_lineageos(monkeypatch):
     monkeypatch.setattr(em_api, "_spawn", lambda coro, name: spawned.append(name) or coro.close())
 
     async def scenario():
-        device, link, *_ = await _session(SHOW, "lineage18_crown")
+        device, link, *_ = await _session(LINEAGE_SHOW, "lineage18_crown")
         monkeypatch.setattr(em_api, "_devices", {"DEV1": device})
         request = make_mocked_request("POST", "/api/devices/DEV1/debloat",
                                       match_info={"id": "DEV1"}, app=web.Application())
@@ -459,7 +535,7 @@ def test_a_device_without_volume_control_is_sent_no_volume(volume, available, ca
     async def scenario():
         store = FakeStore()
         store.configs["DEV1"] = {"duckDb": -18.0, "startupVolume": 85}
-        device, link, _, sink = await _session(SHOW, "fireos6_crown", store, volume=volume)
+        device, link, _, sink = await _session(FIREOS_SHOW, "fireos6_crown", store, volume=volume)
         assert device.volume_available is available
         assert device.volume_gap == (None if available else VOLUME_GAP)
         assert device.volume == (40 if available else None)
@@ -487,7 +563,7 @@ def test_the_dashboard_shows_no_volume_level_without_volume_control(tmp_path, mo
     em_db.approve_device("DEV1", "Kitchen")
 
     async def scenario():
-        device, *_ = await _session(SHOW, "fireos6_crown", volume=NO_VOLUME)
+        device, *_ = await _session(FIREOS_SHOW, "fireos6_crown", volume=NO_VOLUME)
         monkeypatch.setattr(em_api, "_devices", {"DEV1": device})
         out = em_api._merge_device(em_db.get_device("DEV1"))
         assert (out["volume"], out["volume_gap"]) == (None, VOLUME_GAP)
