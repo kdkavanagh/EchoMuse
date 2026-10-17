@@ -46,11 +46,12 @@ function liftFunctionDecl(name) {
 const code = [
   liftConst("CAPABILITY"),
   liftConst("CAPABILITY_REASONS"),
+  liftConst("PLATFORM_LABEL"),
   liftFunctionDecl("capabilityGap"),
   liftFunctionDecl("liveCapabilities"),
-  "export { CAPABILITY, CAPABILITY_REASONS, capabilityGap, liveCapabilities };",
+  "export { CAPABILITY, CAPABILITY_REASONS, PLATFORM_LABEL, capabilityGap, liveCapabilities };",
 ].join("\n");
-const { CAPABILITY, CAPABILITY_REASONS, capabilityGap, liveCapabilities } = await import(
+const { CAPABILITY, CAPABILITY_REASONS, PLATFORM_LABEL, capabilityGap, liveCapabilities } = await import(
   "data:text/javascript;base64," + Buffer.from(code).toString("base64"));
 
 let failures = 0;
@@ -63,17 +64,39 @@ function check(name, actual, expected) {
 const REQUIRED = ["audio_timeline_v1", "uplink_leases_v1", "device_wake_v1", "render_reference_v1",
                   "render_progress_v1", "focus_leases_v1", "alert_cache_v1", "turn_protocol_v1"];
 
-// An Echo Show as /api/devices reports it (em_api._merge_device).
-const show = {
-  connected: true, platform: "fireos6_crown",
-  capabilities: [...REQUIRED, "local_wake_chime", "open_rules_v1", "screen_wake"],
-  capability_gaps: {
-    leds: "no LED ring on this device", led_anim: "no LED ring on this device",
-    buttons: "no action button on this device", button_hold: "no action button on this device",
-    wifi_control: "managed by the device", ble_proxy: "managed by the device",
-    privacy_mute: "mute not supported on this device yet",
-  },
-};
+// Every platform the controller admits has a label on the Status tab.
+{
+  const py = readFileSync(join(HERE, "..", "em_device_link.py"), "utf8");
+  const block = py.slice(py.indexOf("class DevicePlatform("), py.indexOf("class RejectReason("));
+  const platforms = [...block.matchAll(/^\s+[A-Z0-9_]+ = "([a-z0-9_]+)"/gm)].map(m => m[1]);
+  check("DevicePlatform is read", platforms.length > 0, true);
+  for (const p of platforms) check(`${p} has a platform label`, typeof PLATFORM_LABEL[p], "string");
+}
+
+// An Echo Show as /api/devices reports it (em_api._merge_device), on either
+// image: the controller names the same reasons for both.
+for (const platform of ["fireos6_crown", "lineage18_crown"]) {
+  const show = {
+    connected: true, platform,
+    capabilities: [...REQUIRED, "local_wake_chime", "open_rules_v1", "screen_wake"],
+    capability_gaps: {
+      leds: "no LED ring on this device", led_anim: "no LED ring on this device",
+      buttons: "no action button on this device", button_hold: "no action button on this device",
+      wifi_control: "managed by the device", ble_proxy: "managed by the device",
+      privacy_mute: "mute not supported on this device yet",
+    },
+  };
+  const s = liveCapabilities(show);
+  check(`${platform}: Wi-Fi is managed by the device`, capabilityGap(s, CAPABILITY.WIFI_CONTROL), "managed by the device");
+  check(`${platform}: BLE proxy is managed by the device`, capabilityGap(s, CAPABILITY.BLE_PROXY), "managed by the device");
+  check(`${platform}: mute is not supported yet`, capabilityGap(s, CAPABILITY.PRIVACY_MUTE), "mute not supported on this device yet");
+  check(`${platform}: no ring, so no ring animation either`, capabilityGap(s, CAPABILITY.LED_ANIM), "no LED ring on this device");
+  check(`${platform}: the ring controls are gated on leds`, capabilityGap(s, CAPABILITY.LEDS), "no LED ring on this device");
+  check(`${platform}: no action button`, capabilityGap(s, CAPABILITY.BUTTON_HOLD), "no action button on this device");
+  check(`${platform}: screen wake is available`, capabilityGap(s, CAPABILITY.SCREEN_WAKE), null);
+  check(`${platform}: the AFE controls fall back to the dashboard's own reason`,
+        capabilityGap(s, CAPABILITY.AFE_METADATA), CAPABILITY_REASONS[CAPABILITY.AFE_METADATA]);
+}
 // A Dot on firmware predating the Dot-only capabilities and led_anim.
 const olderDot = {
   connected: true, platform: "fireos6",
@@ -83,18 +106,6 @@ const olderDot = {
     privacy_mute: "firmware update available", screen_wake: "no screen on this device",
   },
 };
-
-const s = liveCapabilities(show);
-check("Show: Wi-Fi is managed by the device", capabilityGap(s, CAPABILITY.WIFI_CONTROL), "managed by the device");
-check("Show: BLE proxy is managed by the device", capabilityGap(s, CAPABILITY.BLE_PROXY), "managed by the device");
-check("Show: mute is not supported yet", capabilityGap(s, CAPABILITY.PRIVACY_MUTE), "mute not supported on this device yet");
-check("Show: no ring, so no ring animation either", capabilityGap(s, CAPABILITY.LED_ANIM), "no LED ring on this device");
-check("Show: the ring controls are gated on leds", capabilityGap(s, CAPABILITY.LEDS), "no LED ring on this device");
-check("Show: no action button", capabilityGap(s, CAPABILITY.BUTTON_HOLD), "no action button on this device");
-check("Show: screen wake is available", capabilityGap(s, CAPABILITY.SCREEN_WAKE), null);
-check("Show: the AFE controls fall back to the dashboard's own reason",
-      capabilityGap(s, CAPABILITY.AFE_METADATA), CAPABILITY_REASONS[CAPABILITY.AFE_METADATA]);
-
 const d = liveCapabilities(olderDot);
 check("older Dot: Wi-Fi waits for the update", capabilityGap(d, CAPABILITY.WIFI_CONTROL), "firmware update available");
 check("older Dot: BLE proxy waits for the update", capabilityGap(d, CAPABILITY.BLE_PROXY), "firmware update available");
@@ -106,7 +117,7 @@ check("older Dot: the ring itself is available", capabilityGap(d, CAPABILITY.LED
 
 // Nothing is gated without a live session to ask: the fleet view, or an
 // offline device whose settings apply when it returns.
-check("offline: nothing gated", liveCapabilities({ ...show, connected: false }), null);
+check("offline: nothing gated", liveCapabilities({ ...olderDot, connected: false }), null);
 check("fleet view: nothing gated", capabilityGap(null, CAPABILITY.WIFI_CONTROL), null);
 // A response from a controller predating capability_gaps still gates.
 check("no gaps object: generic reason",

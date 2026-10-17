@@ -108,18 +108,21 @@ VOLUME_UNAVAILABLE = "volume control unavailable: Android volume check failed (s
 
 # Capabilities a platform lacks by design, and why. A Fire OS 6 Dot's
 # firmware announces wifi_control, ble_proxy and privacy_mute; the Echo Show's
-# announces screen_wake and none of the ring, button, network or mute ones.
+# announces screen_wake and none of the ring, button, network or mute ones,
+# on Fire OS and on LineageOS alike.
+_NOT_ON_ECHO_SHOW: dict[Capability, CapabilityGap] = {
+    Capability.LEDS: CapabilityGap.NO_RING,
+    Capability.LED_ANIM: CapabilityGap.NO_RING,
+    Capability.BUTTONS: CapabilityGap.NO_BUTTON,
+    Capability.BUTTON_HOLD: CapabilityGap.NO_BUTTON,
+    Capability.WIFI_CONTROL: CapabilityGap.MANAGED_BY_DEVICE,
+    Capability.BLE_PROXY: CapabilityGap.MANAGED_BY_DEVICE,
+    Capability.PRIVACY_MUTE: CapabilityGap.MUTE_NOT_SUPPORTED,
+}
 _NOT_ON_PLATFORM: dict[DevicePlatform, dict[Capability, CapabilityGap]] = {
     DevicePlatform.FIREOS6: {Capability.SCREEN_WAKE: CapabilityGap.NO_SCREEN},
-    DevicePlatform.FIREOS6_CROWN: {
-        Capability.LEDS: CapabilityGap.NO_RING,
-        Capability.LED_ANIM: CapabilityGap.NO_RING,
-        Capability.BUTTONS: CapabilityGap.NO_BUTTON,
-        Capability.BUTTON_HOLD: CapabilityGap.NO_BUTTON,
-        Capability.WIFI_CONTROL: CapabilityGap.MANAGED_BY_DEVICE,
-        Capability.BLE_PROXY: CapabilityGap.MANAGED_BY_DEVICE,
-        Capability.PRIVACY_MUTE: CapabilityGap.MUTE_NOT_SUPPORTED,
-    },
+    DevicePlatform.FIREOS6_CROWN: _NOT_ON_ECHO_SHOW,
+    DevicePlatform.LINEAGE18_CROWN: _NOT_ON_ECHO_SHOW,
 }
 # Optional capabilities newer than some firmware in the field on a platform
 # that has them: absent there, the bundled firmware brings them.
@@ -142,6 +145,21 @@ def capability_gap(platform: DevicePlatform | None, capabilities: Iterable[str],
     if reason is None and capability in _PLATFORM_OPTIONAL:
         return CapabilityGap.FIRMWARE_UPDATE
     return reason
+
+
+# Why a platform has nothing to debloat. start_server.sh's `debloat` mode
+# (the dashboard's Re-apply debloat, and every firmware update) stops
+# Amazon's services and re-hides Alexa on the Fire OS images; LineageOS ships
+# neither (docs/echo-show-lineage-plan.md decision 10), so the controller
+# never runs it there.
+DEBLOAT_NOT_APPLICABLE = "nothing to debloat: LineageOS has no Amazon apps or services"
+_NO_DEBLOAT: frozenset[DevicePlatform] = frozenset({DevicePlatform.LINEAGE18_CROWN})
+
+
+def debloat_gap(platform: DevicePlatform | None) -> str | None:
+    """Why a device on `platform` has nothing to debloat; None on a Fire OS
+    image, and when no session names a platform."""
+    return DEBLOAT_NOT_APPLICABLE if platform in _NO_DEBLOAT else None
 
 
 class Actor(Protocol):
@@ -526,6 +544,11 @@ class Device:
     def volume_gap(self) -> str | None:
         """Why this session has no volume control, or None when it has one."""
         return None if self.volume_available else VOLUME_UNAVAILABLE
+
+    @property
+    def debloat_gap(self) -> str | None:
+        """Why this device has nothing to debloat (module `debloat_gap`)."""
+        return debloat_gap(self.platform)
 
     async def set_volume(self, level: int) -> None:
         """`volume_set` (0..127), the one path every volume change takes (HA's

@@ -45,6 +45,7 @@ log = logging.getLogger("echomuse.esphome")
 ESPHOME_DEVICE_MODELS: dict[DevicePlatform, str] = {
     DevicePlatform.FIREOS6: "Echo Dot Gen 2 (biscuit)",
     DevicePlatform.FIREOS6_CROWN: "Echo Show 8 Gen 1 (crown)",
+    DevicePlatform.LINEAGE18_CROWN: "Echo Show 8 Gen 1 (crown, LineageOS)",
 }
 ESPHOME_DEVICE_MODEL = ESPHOME_DEVICE_MODELS[DevicePlatform.FIREOS6]
 ESPHOME_PROJECT_VERSION = os.environ.get("ESPHOME_PROJECT_VERSION", CONTROLLER_VERSION)

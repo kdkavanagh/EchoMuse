@@ -14,9 +14,10 @@ not report Fire OS 6. A Dot on Fire OS 5 (amonet-biscuit v1) has to move to
 Fire OS 6 first; see [Moving a Dot from Fire OS 5](#moving-a-dot-from-fire-os-5).
 
 **The Echo Show 8 (1st gen, `crown`)** is a different device with its own
-unlock, and everything about it is in its own section:
-[Echo Show 8 (1st gen, crown)](#echo-show-8-1st-gen-crown). The rest of this
-page is the Dot.
+unlock, and everything about it is in its own sections:
+[Echo Show 8 (1st gen, crown)](#echo-show-8-1st-gen-crown) on Fire OS, and
+[Echo Show 8 on LineageOS 18.1](#echo-show-8-on-lineageos-181). The rest of
+this page is the Dot.
 
 ## Hardware
 
@@ -430,6 +431,154 @@ holding Volume Up while the Show powers on (the thread's `boot-recovery.sh`
 does the same). Anything below that is the unlock's territory, and
 R0rt1z2's crown thread covers it.
 
+## Echo Show 8 on LineageOS 18.1
+
+> **You do this at your own risk. We accept no responsibility for negative
+> outcomes experienced.**
+
+The same Echo Show 8 1st gen can run LineageOS 18.1 (Android 11) instead of
+Fire OS, with the same EchoMuse firmware and the same controller, which
+reports it as `lineage18_crown`. There are no Amazon apps, so there is
+nothing to neutralise: the screen is yours (install your kiosk and make it
+the home app), and Wi-Fi, Bluetooth, the clock and the volume keys stay
+Android's. The plan and the measurements behind it are in
+[echo-show-lineage-plan.md](echo-show-lineage-plan.md) and
+[echo-show-crown.md §8](echo-show-crown.md#8-lineageos-181-for-crown).
+
+**Only our build.** EchoMuse needs the LineageOS 18.1 build for crown from
+our fork, which ships Amazon's NS6571 `libasp.so` (with
+`libtensorflowlite_c.so` and `libedgeflow_core_neon.so`), the audio front end
+that writes the metadata the firmware reads: branch `crown-ns6571-asp` of
+[kdkavanagh/android_device_amazon_crown](https://github.com/kdkavanagh/android_device_amazon_crown/tree/crown-ns6571-asp)
+and of
+[kdkavanagh/android_vendor_amazon_crown](https://github.com/kdkavanagh/android_vendor_amazon_crown/tree/crown-ns6571-asp),
+in place of upstream's device and vendor repositories in a lineage-18.1
+build for crown. Upstream's releases (v0.6) carry another `libasp.so`, with
+no metadata, and the wizard refuses them: it checks
+`/system/lib/libasp.so`'s SHA-1, `e3816eb3efd4654c708d3891a5f907b79f3ebce3`.
+
+**Accepted risks.** This is an unofficial ROM: a `userdebug` build with
+SELinux permissive. Once adb is on, `adbd` also listens on TCP port 5555
+(the device tree's `init.mt8163.rc`), and keeps key authorisation there:
+anyone holding a key you allowed gets a root shell over your network, so
+allow only computers you trust. While EchoMuse records, the kiosk gets no
+microphone (uid 0 is Android's assistant there): Fully Kiosk's acoustic
+detection and a dashboard's Assist button stop working.
+
+### Flashing it
+
+1. **Unlock with amonet-crown**, per
+   [R0rt1z2's crown thread](https://xdaforums.com/t/unlock-root-twrp-unbrick-amazon-echo-show-8-1st-gen-2019-crown.4766687/),
+   as for Fire OS above. Its kaeru bootloader patch boots TWRP, from the
+   `swdl` partition on the unit this was measured on (amonet-crown v2.0.1,
+   TWRP 3.7.0_9-0); the `recovery` partition keeps Amazon's recovery and is
+   not used.
+2. **Boot TWRP** (`adb reboot recovery`). On the measured unit TWRP rebooted
+   itself once, about 20 s after first entering it; enter it again.
+3. **Wipe and install**: `twrp wipe cache`, `twrp wipe dalvik`,
+   `twrp wipe system`, `twrp wipe data`, then `twrp install` of the build's
+   zip (pushed to the device first). The zip writes only `system` and `boot`.
+4. **Boot it** and go through LineageOS's setup. Join Wi-Fi on the Show
+   itself: EchoMuse never configures it, and the wizard refuses a Show that
+   is not on a network.
+5. **Switch on adb.** In Settings → About, tap Build number seven times;
+   then in Developer options (Settings → System) switch on
+   **USB debugging** and **Rooted debugging**. Plug the Show in and allow
+   your computer's key when the Show asks.
+6. **Install your kiosk** (`adb install`) and choose it as the home app in
+   LineageOS's settings. The wizard does not check for a kiosk here.
+
+`adb root` does not survive a reboot on this build: `adbd` comes back
+unprivileged every time. The wizard runs it for you (adb's `root:` service)
+whenever it connects, and reconnects to the restarted `adbd` by itself.
+
+**Without the screen.** For a headless install, adb can be seeded from TWRP
+before the first boot instead of step 5 (measured,
+[echo-show-crown.md §8.5](echo-show-crown.md#85-platform-on-lineage-181-crown-v06-measured-2026-10-17)):
+append `persist.sys.usb.config=adb` and `service.adb.root=1` to
+`/system/system/build.prop`, and install your computer's `adbkey.pub` as
+`/adb_keys`. The first boot then comes up with root adb. EchoMuse's addon.d
+script does not keep these across a LineageOS update.
+
+### What the wizard does
+
+All from the running system, with no partition, boot image or recovery
+writes:
+
+1. Checks the device: `crown`, `ro.lineage.version` set, Android 11, our
+   `libasp.so` (by its SHA-1), a root adb shell (it asks `adbd` to restart as
+   root first, and refuses with the Developer options to switch on if
+   `adbd` will not), and an address on `wlan0`.
+2. Installs the boot hook: `mount -o remount,rw /` (the system partition is
+   the root here, with no verity and no overlayfs), writes
+   `/system/etc/init/echomuse.rc` (mode 0644) and
+   `/system/addon.d/50-echomuse.sh` (mode 0755), and remounts `/` read-only.
+   Both are skipped when already in place, byte for byte.
+3. Installs the firmware, `start_server.sh` and the device-link TLS
+   credentials, as on the other devices.
+4. Reboots, reconnects (restarting `adbd` as root again), waits for
+   `init.svc.echomuse` and `init.svc.audioserver` to read `running`, and
+   waits for the Show to reach the controller.
+
+There is no kiosk check, no Alexa neutralisation, no Wi-Fi step and no
+second slot.
+
+### What runs at boot
+
+`echomuse.rc` starts `start_server.sh` once Android has finished booting:
+
+```
+service echomuse /system/bin/sh /data/local/bin/start_server.sh
+    class late_start
+    user root
+    group root audio inet
+    seclabel u:r:su:s0
+    disabled
+
+on property:sys.boot_completed=1
+    start echomuse
+```
+
+Unlike Fire OS, init may start it in `su` directly (a permissive domain in
+this `userdebug` policy), so the script makes no move between domains. It
+recognises LineageOS by `ro.lineage.version`, keeps its logs and the
+server's scratch space in `/data/local/tmp/echomuse`, waits for
+`audioserver`, and takes a wake lock. It stops no services, hides no
+packages and denies no microphones: none of them are Amazon's here. The
+dashboard's **Re-apply debloat** is disabled for this Show, with the reason.
+
+### LineageOS updates
+
+`/system/addon.d/50-echomuse.sh` is a LineageOS addon.d (v2) script of the
+same shape as LineageOS's own `50-lineage.sh`: around the system write of a
+LineageOS update, it backs up `/system/etc/init/echomuse.rc` and restores
+it, and nothing else. A dirty flash of a build therefore keeps the boot
+hook (measured with a script of this shape,
+[echo-show-crown.md §8.5](echo-show-crown.md#85-platform-on-lineage-181-crown-v06-measured-2026-10-17)).
+The firmware, its state and its logs are on `/data`, which an update does
+not touch. A clean flash (system and data wiped) keeps nothing: run the
+wizard again.
+
+### What EchoMuse writes on LineageOS
+
+| Where | What |
+|---|---|
+| `/system` | Two files: `/system/etc/init/echomuse.rc` and `/system/addon.d/50-echomuse.sh` |
+| `/data` | The firmware and startup script (`/data/local/bin`); TLS credentials and the supervisor log (`/data/local/etc/echomuse`); the server log (`/data/local/tmp/echomuse`) |
+
+### To undo it on LineageOS
+
+```bash
+adb root
+adb shell 'stop echomuse; mount -o remount,rw / && rm /system/etc/init/echomuse.rc /system/addon.d/50-echomuse.sh && mount -o remount,ro /'
+adb reboot
+```
+
+`/data/local/bin`, `/data/local/etc/echomuse` and `/data/local/tmp/echomuse`
+can then be deleted. Switch Rooted debugging and USB debugging off again in
+Developer options when you no longer need them. Going back to Fire OS is the
+crown thread's "Going back to FireOS".
+
 ## Credits
 
 - **R0rt1z2** — [amonet-biscuit](https://xdaforums.com/t/unlock-root-twrp-unbrick-amazon-echo-dot-2nd-gen-2016-biscuit.4761416/):
@@ -437,6 +586,8 @@ R0rt1z2's crown thread covers it.
   [amonet-crown](https://xdaforums.com/t/unlock-root-twrp-unbrick-amazon-echo-show-8-1st-gen-2019-crown.4766687/),
   the same for the Echo Show 8 1st gen (with k4y0z, FieryFlames, bengris32
   and TheVancedGamer)
+- **amazon-oss** — [LineageOS 18.1 for crown](https://github.com/amazon-oss/android_device_amazon_crown)
+  (device, vendor and `mt8163-common` trees), which our fork builds on
 - **Dragon863** — [EchoCLI](https://github.com/Dragon863/EchoCLI): tethered root research
 - **Binozo** — [GoTinyAlsa](https://github.com/Binozo/GoTinyAlsa) and the original EchoGo SDK
 

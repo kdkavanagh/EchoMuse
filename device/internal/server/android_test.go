@@ -7,11 +7,19 @@ import (
 	"testing"
 )
 
-// fakeStream is Android's STREAM_MUSIC index.
+// fakeStream is Android's STREAM_MUSIC index; max 0 stands for Fire OS's 30.
 type fakeStream struct {
 	mu    sync.Mutex
 	index int
+	max   int
 	sets  []int
+}
+
+func (f *fakeStream) MaxIndex() int {
+	if f.max == 0 {
+		return 30
+	}
+	return f.max
 }
 
 func (f *fakeStream) Index() (int, error) { f.mu.Lock(); defer f.mu.Unlock(); return f.index, nil }
@@ -37,8 +45,8 @@ func newShowServer(t *testing.T, index int, statePath string) (*Server, *fakeStr
 	return s, vol, &reported
 }
 
-// The wire level maps to the STREAM_MUSIC index proportionally, and the
-// Show's codec, amp and LED calls touch nothing.
+// The wire level maps to the STREAM_MUSIC index proportionally over the
+// build's range, and the Show's codec, amp and LED calls touch nothing.
 func TestAndroidHardwareMapsLevelToIndex(t *testing.T) {
 	vol := &fakeStream{index: 12}
 	hw := NewAndroidHardware(vol)
@@ -48,6 +56,16 @@ func TestAndroidHardwareMapsLevelToIndex(t *testing.T) {
 	for level, index := range map[int]int{85: 20, 127: 30, 0: 0, 200: 30, -3: 0} {
 		if err := hw.SetDAC(level); err != nil || vol.index != index {
 			t.Errorf("SetDAC(%d) set index %d (%v), want %d", level, vol.index, err, index)
+		}
+	}
+	lineage := &fakeStream{index: 5, max: 15}
+	lhw := NewAndroidHardware(lineage)
+	if l, err := lhw.ReadDAC(); err != nil || l != 42 {
+		t.Fatalf("LineageOS ReadDAC = %d, %v; want 42", l, err)
+	}
+	for level, index := range map[int]int{85: 10, 127: 15, 0: 0, 200: 15} {
+		if err := lhw.SetDAC(level); err != nil || lineage.index != index {
+			t.Errorf("LineageOS SetDAC(%d) set index %d (%v), want %d", level, lineage.index, err, index)
 		}
 	}
 	n := vol.setCount()

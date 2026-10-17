@@ -87,6 +87,12 @@ var iioGlob = "/sys/bus/iio/devices/iio:device*/name"
 // driver as "<n> lux". A variable only so tests can point it at a fixture.
 var alsPsPath = "/sys/bus/platform/drivers/als_ps/lux"
 
+// alsPsPollPath switches the als_ps driver's polling on. Fire OS's sensor
+// stack keeps it on; on LineageOS 18.1 nothing does, and lux then reads a
+// stale cache ("0 lux" until the first poll; docs/echo-show-crown.md §8.5).
+// Write-only: reading it is an I/O error. A variable for the tests.
+var alsPsPollPath = "/sys/bus/platform/drivers/als_ps/enable_als_polling"
+
 // alsPsName stands for the als_ps driver in Status.Seen.
 const alsPsName = "als_ps"
 
@@ -142,7 +148,19 @@ var (
 	lastScan time.Time // when we last looked, for the retry interval
 	reported bool      // absence logged once, not every retry
 	status   = Status{Code: StatusUnknown, Detail: "i2c bus not scanned yet"}
+	// pollAlsPs: switch the als_ps driver's polling on before reading it
+	// (EnablePolling); pollFailed logs a failed switch once.
+	pollAlsPs, pollFailed bool
 )
+
+// EnablePolling makes the reader switch the Show's als_ps polling on before
+// it first reads the sensor, which LineageOS needs (alsPsPollPath). Call it
+// before the first Present, Report, Lux or Watch.
+func EnablePolling() {
+	mu.Lock()
+	pollAlsPs = true
+	mu.Unlock()
+}
 
 // resolve finds the sensor BY NAME, not by i2c address.
 //
@@ -190,6 +208,12 @@ func resolve() string {
 	if found == "" {
 		// The Show: present means the driver's file exists; usable means
 		// it reads as a number, which Present promises.
+		if pollAlsPs {
+			if err := os.WriteFile(alsPsPollPath, []byte("1"), 0o644); err != nil && !pollFailed {
+				pollFailed = true
+				log.Printf("[als] switching als_ps polling on: %v; the reading may be stale", err)
+			}
+		}
 		if b, err := os.ReadFile(alsPsPath); err == nil || !os.IsNotExist(err) {
 			seen = append(seen, alsPsName)
 			nameMatched = true

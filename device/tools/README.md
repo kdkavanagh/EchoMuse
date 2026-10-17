@@ -223,13 +223,24 @@ adb shell 'rm /data/local/tmp/aaprobe /data/local/tmp/loud.wav /data/local/tmp/a
 
 # sl_latency — render-to-capture lag through the firmware's own audio path (Echo Show 8, `crown`)
 
-Measures what `internal/opensl`'s `playPipelineNs` is a bound for
-(`docs/echo-show-port-plan.md` decision 4, Phase 1): how the firmware's render
+Measures what the render binding's latency constant is a bound for
+(`internal/opensl`'s `playPipelineNs` on Fire OS, `docs/echo-show-port-plan.md`
+decision 4; `slspeaker.aaudioRenderLatencyNs` on LineageOS,
+`docs/echo-show-lineage-plan.md` decision 5): how the firmware's render
 stamps line up with its capture stamps. It is Go inside the firmware module
-and opens audio exactly as the firmware does (`slmic.OpenOpenSL`,
-`slspeaker.NewOpenSL`): one `VOICE_RECOGNITION` recorder, capture periods
-stamped from `AFE_TIMESTAMP`, and an OpenSL player on `STREAM_MUSIC` fed
-`render.SinkFrames` writes, stamped from the queue depth.
+and opens audio exactly as the firmware does on the backend `-backend` names
+(`auto`, the default, takes the image's own):
+
+- `opensl` (Fire OS): `slmic.OpenOpenSL` and `slspeaker.NewOpenSL`, one
+  `VOICE_RECOGNITION` recorder with capture periods stamped from
+  `AFE_TIMESTAMP`, and an OpenSL player on `STREAM_MUSIC` stamped from the
+  queue depth;
+- `aaudio` (LineageOS): `slmic.OpenAAudio` and `slspeaker.NewAAudio`, a
+  `VOICE_RECOGNITION` input stamped from a fit through AAudio's capture
+  timestamps, and a `USAGE_MEDIA` output stamped from its presentation
+  timestamps.
+
+Both are fed `render.SinkFrames` writes.
 
 - **Run:** a silent lead-in, then `-n` bursts (`-burst` long, a `-freq` Hz
   tone or white noise at `-level` dBFS peak), each starting a write, `-gap`
@@ -253,17 +264,23 @@ stamped from `AFE_TIMESTAMP`, and an OpenSL player on `STREAM_MUSIC` fed
 - **Report:** one row per burst (lags in ms; `pcm_lag` must never be
   negative, which the report flags), the lag summaries, `pcm − pa`, the AFE
   decoder's totals (periods, frames, invalid, syncs, gaps, lost), how many
-  periods were stamped from `AFE_TIMESTAMP` or at completion, the mic's
-  drops, and the distribution of read completion − `AFE_TIMESTAMP`.
-- **`-index N`** sets `STREAM_MUSIC` for the run through `service call
-  audio` and restores it afterwards (also on Ctrl-C). **`-o PREFIX`** writes
-  `PREFIX.raw` (the capture as delivered, bit 0 included),
-  `PREFIX.periods.csv` (per period: first sample, stamp, completion, anchor)
-  and `PREFIX.writes.csv` (per write: burst, stall, completion stamp).
+  periods were stamped from their anchor (`AFE_TIMESTAMP`, or the AAudio
+  fit) or at completion, the mic's drops, the distribution of read
+  completion − `AFE_TIMESTAMP`, and of read completion − anchored stamp with
+  how many stamps were held at their completion.
+- **`-index N`** sets `STREAM_MUSIC` (0–30 on Fire OS, 0–15 on LineageOS) for
+  the run through `service call audio` with the image's binder codes
+  (`internal/androidvol`) and restores it afterwards (also on Ctrl-C).
+  **`-o PREFIX`** writes `PREFIX.raw` (the capture as delivered, bit 0
+  included), `PREFIX.periods.csv` (per period: first sample, stamp,
+  completion, anchor) and `PREFIX.writes.csv` (per write: burst, stall,
+  completion stamp).
 
 Stop `echomuse` first: on Android 7.1 the first recorder holds the input and
 a later one gets no buffers (findings §10.2), and the tool gives up after
-5 s without one. Its pure-Go half, `tools/sl_latency/latency`, has host tests
+5 s without one; on Android 11 both uid 0 recorders get audio (findings
+§8.4 Q3), but the firmware's playback would land in the measurement. Its
+pure-Go half, `tools/sl_latency/latency`, has host tests
 (`go test ./tools/...`).
 
 ```bash

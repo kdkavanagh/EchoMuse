@@ -43,8 +43,6 @@ const (
 
 	// openslRetry paces re-open attempts that fail outright.
 	openslRetry = 500 * time.Millisecond
-
-	periodNs = periodFrames * sampleNs
 )
 
 // OpenSLMicrophone is the Echo Show's capture stream: an OpenSL ES recorder

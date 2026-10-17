@@ -527,6 +527,7 @@ _PROVISION_PROPS = (
     "persist.sys.usb.config",
     "persist.wifi.migrate.complete",
     "persist.boot.oobe",
+    "ro.lineage.version",   # an Echo Show 8 on LineageOS; absent on Fire OS
 )
 
 # `wpa_cli status` keys. The state and the crypto are the diagnostic value;
@@ -571,6 +572,9 @@ class ProvisionProbe(enum.StrEnum):
     WLAN = "wlan"                          # ip -4 addr show wlan0: is Android on Wi-Fi
     MIC_DENY = "mic_deny"                  # appops get <pkg> RECORD_AUDIO, the mic-deny list
     SETTINGS_BUNDLE = "settings_bundle"    # whether KnightSettings has its config bundle
+    # Echo Show 8 on LineageOS 18.1 only: docs/echo-show-lineage-plan.md Phase L4.
+    LIBASP_SHA1 = "libasp_sha1"            # sha1sum /system/lib/libasp.so: our build's NS6571 AFE?
+    ADDOND_SCRIPT = "addond_script"        # ls -l /system/addon.d/50-echomuse.sh
 
 
 class WpaScanRow(TypedDict):

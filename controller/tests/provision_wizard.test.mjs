@@ -8,7 +8,9 @@
 // gives: the dashboard compiles to a single classic script with no module
 // boundary, so the alternative is a second copy that drifts.
 
-import { readFileSync } from "fs";
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from "fs";
+import { spawnSync } from "child_process";
+import { tmpdir } from "os";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 
@@ -37,7 +39,8 @@ function liftArrow(name) {
 
 // A `const NAME = …;` declaration of any shape, to its terminating `;` at
 // bracket depth 0 (the same scan as liftArrow). Column-aligned `NAME  =`
-// declarations count too.
+// declarations count too. A template literal is skipped whole: the boot
+// hook payloads are shell text, full of brackets and `;;`.
 function liftConst(name) {
   const m = new RegExp(`const ${name} +=`).exec(src);
   const start = m ? m.index : -1;
@@ -45,7 +48,10 @@ function liftConst(name) {
   let depth = 0;
   for (let i = start; i < src.length; i++) {
     const ch = src[i];
-    if (ch === "{" || ch === "(" || ch === "[") depth++;
+    if (ch === "`") {
+      for (i++; i < src.length && src[i] !== "`"; i++) if (src[i] === "\\") i++;
+    }
+    else if (ch === "{" || ch === "(" || ch === "[") depth++;
     else if (ch === "}" || ch === ")" || ch === "]") depth--;
     else if (ch === ";" && depth === 0) return src.slice(start, i + 1);
   }
@@ -112,13 +118,26 @@ check("an error with no message does not throw", _isDisconnectError({}) === fals
 
 // ─── Platform check (connect_android) ───────────────────────────────────────
 //
-// A rooted Fire OS 6 Dot or a rooted Echo Show 8 passes, and says which it
-// is; everything else is refused before connect_android trusts the shell.
+// A rooted Fire OS 6 Dot, a rooted Echo Show 8 or an Echo Show 8 on our
+// LineageOS build with root adb passes, and says which it is; everything
+// else is refused before connect_android trusts the shell.
 
-const WIZARD_PLATFORM_SRC = [liftConst("WIZARD_PLATFORM"), liftConst("WIZARD_PLATFORM_NAME")];
-const { classifyDevice, WIZARD_PLATFORM } = await lift(
+const WIZARD_PLATFORM_SRC = [liftConst("WIZARD_PLATFORM"), liftConst("WIZARD_PLATFORM_NAME"),
+                             liftFunctionDecl("_isShow"), liftConst("_LINEAGE_LIBASP_SHA1"),
+                             liftFunctionDecl("_isOurLibasp")];
+const { classifyDevice, WIZARD_PLATFORM, _isOurLibasp } = await lift(
   [...WIZARD_PLATFORM_SRC, liftFunctionDecl("classifyDevice"),
-   "export { classifyDevice, WIZARD_PLATFORM };"]);
+   "export { classifyDevice, WIZARD_PLATFORM, _isOurLibasp };"]);
+
+// The wizard provisions exactly the images the controller admits.
+{
+  const py = readFileSync(join(HERE, "..", "em_device_link.py"), "utf8");
+  const block = py.slice(py.indexOf("class DevicePlatform("), py.indexOf("class RejectReason("));
+  const admitted = [...block.matchAll(/^\s+[A-Z0-9_]+ = "([a-z0-9_]+)"/gm)].map(m => m[1]).sort();
+  check("WIZARD_PLATFORM is em_device_link.DevicePlatform",
+    admitted.length > 0 && Object.values(WIZARD_PLATFORM).sort().join() === admitted.join(),
+    `${Object.values(WIZARD_PLATFORM).sort()} vs ${admitted}`);
+}
 
 function refusal(opts) {
   try { classifyDevice(opts); } catch (e) { return e; }
@@ -177,8 +196,73 @@ check("the Show is recognised by ro.product.device alone",
   check("anything else is refused",
     threw && /Wrong device/.test(threw.message), threw && threw.message);
   const show9 = refusal({ ...SHOW, release: '9' });
-  check("a crown on another Android (LineageOS) is refused",
+  check("a crown on another Android, not LineageOS, is refused",
     show9 && /Wrong device/.test(show9.message), show9 && show9.message);
+  const show11 = refusal({ ...SHOW, release: '11' });
+  check("a crown on Android 11 without ro.lineage.version is refused",
+    show11 && /Wrong device/.test(show11.message), show11 && show11.message);
+}
+
+// The Show on our LineageOS 18.1 build (docs/echo-show-crown.md §8.5): no
+// Fire OS build name, ro.lineage.version set, and sha1sum's line for the
+// NS6571 libasp.so (docs/echo-show-lineage-plan.md §1 "ROM").
+const OUR_LIBASP = 'e3816eb3efd4654c708d3891a5f907b79f3ebce3  /system/lib/libasp.so';
+const LINEAGE = { release: '11', productName: 'lineage_crown', productDevice: 'crown', uid: '0',
+                  lineageVersion: '18.1-20261017-UNOFFICIAL-crown', libaspSha1: OUR_LIBASP };
+
+check("our LineageOS build, rooted, passes as the LineageOS Show",
+  refusal(LINEAGE) === null && classifyDevice(LINEAGE) === 'lineage18_crown');
+check("the LineageOS Show is recognised by ro.product.device alone",
+  classifyDevice({ ...LINEAGE, productName: 'something' }) === WIZARD_PLATFORM.CROWN_LINEAGE);
+check("ro.lineage.version decides between the two Show images",
+  classifyDevice({ ...SHOW, lineageVersion: '' }) === WIZARD_PLATFORM.CROWN);
+check("our libasp.so is recognised from sha1sum's line", _isOurLibasp(OUR_LIBASP));
+check("our libasp.so is recognised from the bare hash, in either case",
+  _isOurLibasp('E3816EB3EFD4654C708D3891A5F907B79F3EBCE3'));
+for (const out of ['e3816eb3', 'e3816eb3  /system/lib/libasp.so',
+                   'sha1sum: /system/lib/libasp.so: No such file or directory', '', undefined]) {
+  check(`not our libasp.so: ${out === undefined ? '(undefined)' : out || '(empty)'}`, !_isOurLibasp(out));
+}
+
+{
+  // Upstream v0.6 ships another libasp.so, with no metadata encoder.
+  const upstream = { ...LINEAGE, libaspSha1: '0123456789abcdef0123456789abcdef01234567  /system/lib/libasp.so' };
+  const threw = refusal(upstream);
+  check("an upstream LineageOS build is refused",
+    threw && threw.message.includes('0123456789abcdef'), threw && threw.message);
+  check("the upstream refusal names our fork's branches",
+    threw && threw.message.includes('crown-ns6571-asp')
+    && threw.message.includes('kdkavanagh/android_device_amazon_crown')
+    && threw.message.includes('kdkavanagh/android_vendor_amazon_crown'), threw && threw.message);
+  const missing = refusal({ ...LINEAGE, libaspSha1: 'sha1sum: /system/lib/libasp.so: No such file or directory' });
+  check("a LineageOS build without libasp.so is refused the same way",
+    missing && missing.message.includes('crown-ns6571-asp'), missing && missing.message);
+  const both = refusal({ ...upstream, uid: '2000' });
+  check("the ROM is named before root: root on the wrong build would not help",
+    both && both.message.includes('crown-ns6571-asp') && !both.message.includes('Rooted debugging'),
+    both && both.message);
+}
+
+{
+  // LineageOS 18.1's adbd (system/core adb/daemon/restart_service.cpp) while
+  // Rooted debugging is off.
+  const reply = 'ADB Root access is disabled by system setting - enable in Settings -> System -> Developer options';
+  const threw = refusal({ ...LINEAGE, uid: '2000', rootReply: reply });
+  check("a LineageOS Show without root adb is refused",
+    threw && threw.message.includes('id -u = "2000"'), threw && threw.message);
+  check("the refusal names the Developer options to switch on",
+    threw && threw.message.includes('Developer options') && threw.message.includes('"USB debugging"')
+    && threw.message.includes('"Rooted debugging"'), threw && threw.message);
+  check("the refusal quotes adbd's answer to adb root",
+    threw && threw.message.includes(reply), threw && threw.message);
+  check("the LineageOS refusal is not the Fire OS one",
+    threw && !/boot-root/.test(threw.message), threw && threw.message);
+}
+
+{
+  const threw = refusal({ ...LINEAGE, release: '12' });
+  check("LineageOS on another Android than 11 is refused",
+    threw && threw.message.includes('LineageOS 18.1 (Android 11)'), threw && threw.message);
 }
 
 // ─── Tested-build pin ───────────────────────────────────────────────────────
@@ -190,6 +274,10 @@ const { untestedBuild } = await lift(
   [...WIZARD_PLATFORM_SRC, liftConst("_TESTED_FIREOS6_BUILD"), liftConst("_TESTED_FIREOS6_NAME"),
    liftConst("_TESTED_CROWN_BUILD"), liftConst("_TESTED_CROWN_NAME"),
    liftFunctionDecl("untestedBuild"), "export { untestedBuild };"]);
+
+// LineageOS has no Fire OS build id; its pin is the libasp.so hash.
+check("the LineageOS Show is never flagged against a Fire OS pin",
+  untestedBuild('lineage18_crown', ['', 'lineage_crown-userdebug 11 RQ3A.211001.001 eng.kyle']) === null);
 
 check("the Dot on NS6569/6009 is not flagged",
   untestedBuild('fireos6', ['Fire OS 6.5.6.9 (NS6569/6009)', '']) === null);
@@ -384,11 +472,12 @@ for (const out of ["", "Error: Could not access the Package Manager. Is the syst
 
 // ─── Step list ──────────────────────────────────────────────────────────────
 
-const { _WIZARD_STEPS, _stepsFor, _nextStep, _lastStep, _stepApplies } = await lift(
-  [...WIZARD_PLATFORM_SRC, liftConst("_BOTH_PLATFORMS"), liftConst("_WIZARD_STEPS"),
+const { _WIZARD_STEPS, _stepsFor, _nextStep, _lastStep, _stepApplies, _stepDesc, _serverLog } = await lift(
+  [...WIZARD_PLATFORM_SRC, liftConst("_ALL_PLATFORMS"), liftConst("_WIZARD_STEPS"),
    liftFunctionDecl("_stepApplies"), liftFunctionDecl("_stepsFor"),
    liftFunctionDecl("_nextStep"), liftFunctionDecl("_lastStep"),
-   "export { _WIZARD_STEPS, _stepsFor, _nextStep, _lastStep, _stepApplies };"]);
+   liftFunctionDecl("_stepDesc"), liftFunctionDecl("_serverLog"),
+   "export { _WIZARD_STEPS, _stepsFor, _nextStep, _lastStep, _stepApplies, _stepDesc, _serverLog };"]);
 
 check('connect_android is the first step', _WIZARD_STEPS[0]?.id === 'connect_android');
 
@@ -414,6 +503,15 @@ for (const id of ['wifi', 'mirror_boot_hook']) {
 for (const id of ['check_home', 'neutralize_alexa']) {
   check(`${id} is not applicable on the Dot`, !_stepsFor('fireos6').includes(id));
 }
+// docs/echo-show-lineage-plan.md Phase L4: no Amazon apps, so no kiosk
+// check and no neutralisation; Wi-Fi is Android's, one system partition.
+const LINEAGE_STEPS = ['connect_android', 'install_boot_hook', 'install_em', 'reboot',
+                       'reconnect', 'verify_service', 'confirm_link'];
+check("the LineageOS Show's step list is Phase L4's",
+  _stepsFor('lineage18_crown').join() === LINEAGE_STEPS.join(), _stepsFor('lineage18_crown').join());
+for (const id of ['check_home', 'neutralize_alexa', 'wifi', 'mirror_boot_hook']) {
+  check(`${id} is not applicable on the LineageOS Show`, !_stepsFor('lineage18_crown').includes(id));
+}
 check("before connect_android every step shows", _stepsFor(null).length === _WIZARD_STEPS.length);
 
 // Advancing skips the other device's steps, in both directions of the list.
@@ -432,19 +530,45 @@ check("the Show ends at confirm_link", _lastStep('fireos6_crown') === idx('confi
 check("the Dot ends at mirror_boot_hook", _lastStep('fireos6') === idx('mirror_boot_hook'));
 check("nothing runs past the Show's last step",
   _nextStep(idx('confirm_link') + 1, 'fireos6_crown') === _WIZARD_STEPS.length);
+check("the LineageOS Show goes from connect_android to install_boot_hook",
+  _nextStep(idx('connect_android') + 1, 'lineage18_crown') === idx('install_boot_hook'));
+check("the LineageOS Show goes from install_em to reboot",
+  _nextStep(idx('install_em') + 1, 'lineage18_crown') === idx('reboot'));
+check("the LineageOS Show ends at confirm_link", _lastStep('lineage18_crown') === idx('confirm_link'));
 
 // Every step needs a label a human reads, and names where it runs.
 _WIZARD_STEPS.forEach(s => check(`${s.id} has a label`, !!s.label));
 _WIZARD_STEPS.forEach(s => check(`${s.id} names its platforms`,
-  Array.isArray(s.on) && s.on.length > 0 && s.on.every(p => p === 'fireos6' || p === 'fireos6_crown')));
+  Array.isArray(s.on) && s.on.length > 0
+  && s.on.every(p => Object.values(WIZARD_PLATFORM).includes(p)), JSON.stringify(s.on)));
 check("_stepApplies treats an unknown platform as all", _stepApplies(_WIZARD_STEPS[1], null));
+
+// Each image reads its own words where they differ, the Fire OS Show's where not.
+{
+  const step = id => _WIZARD_STEPS[idx(id)];
+  check("the LineageOS boot hook step mentions its addon.d script",
+    _stepDesc(step('install_boot_hook'), 'lineage18_crown').includes('addon.d'));
+  check("the Fire OS Show's boot hook step does not",
+    !_stepDesc(step('install_boot_hook'), 'fireos6_crown').includes('addon.d'));
+  check("both Shows wait for audioserver",
+    _stepDesc(step('verify_service'), 'lineage18_crown').includes('audioserver')
+    && _stepDesc(step('verify_service'), 'fireos6_crown').includes('audioserver'));
+  check("the Dot waits for the mixer", _stepDesc(step('verify_service'), 'fireos6').includes('mixer'));
+}
+check("both Shows log under /data/local/tmp/echomuse, the Dot to /tmp",
+  _serverLog('lineage18_crown') === '/data/local/tmp/echomuse/server.log'
+  && _serverLog('fireos6_crown') === '/data/local/tmp/echomuse/server.log'
+  && _serverLog('fireos6') === '/tmp/server.log');
 
 // ─── Boot hook content + idempotency ───────────────────────────────────────
 
-const { _ECHOMUSE_RC, _ECHOMUSE_RC_CROWN, _rcInstalled, _rcFor } = await lift(
+const { _ECHOMUSE_RC, _ECHOMUSE_RC_CROWN, _ECHOMUSE_RC_LINEAGE, _ECHOMUSE_ADDOND_LINEAGE, _ADDOND_PATH,
+        _rcInstalled, _rcFor } = await lift(
   [...WIZARD_PLATFORM_SRC, liftConst("_ECHOMUSE_RC"), liftConst("_ECHOMUSE_RC_CROWN"),
+   liftConst("_ECHOMUSE_RC_LINEAGE"), liftConst("_ADDOND_PATH"), liftConst("_ECHOMUSE_ADDOND_LINEAGE"),
    liftFunctionDecl("_rcFor"), liftFunctionDecl("_rcInstalled"),
-   "export { _ECHOMUSE_RC, _ECHOMUSE_RC_CROWN, _rcInstalled, _rcFor };"]);
+   "export { _ECHOMUSE_RC, _ECHOMUSE_RC_CROWN, _ECHOMUSE_RC_LINEAGE, _ECHOMUSE_ADDOND_LINEAGE, "
+   + "_ADDOND_PATH, _rcInstalled, _rcFor };"]);
 
 for (const [name, rc] of [['Dot', _ECHOMUSE_RC], ['Show', _ECHOMUSE_RC_CROWN]]) {
   check(`the ${name} rc declares the echomuse service against start_server.sh`,
@@ -469,7 +593,76 @@ check("the Dot rc keeps aipc first (the mixer's requirement)",
   }
 }
 check("each platform gets its own rc",
-  _rcFor('fireos6') === _ECHOMUSE_RC && _rcFor('fireos6_crown') === _ECHOMUSE_RC_CROWN);
+  _rcFor('fireos6') === _ECHOMUSE_RC && _rcFor('fireos6_crown') === _ECHOMUSE_RC_CROWN
+  && _rcFor('lineage18_crown') === _ECHOMUSE_RC_LINEAGE);
+
+// docs/echo-show-lineage-plan.md decision 9: init starts the service in
+// `su` itself, measured with a test service of this shape
+// (docs/echo-show-crown.md §8.5); no adbd way in, no move. Byte for byte.
+check("the LineageOS rc is decision 9's, byte for byte",
+  _ECHOMUSE_RC_LINEAGE === 'service echomuse /system/bin/sh /data/local/bin/start_server.sh\n'
+    + '    class late_start\n'
+    + '    user root\n'
+    + '    group root audio inet\n'
+    + '    seclabel u:r:su:s0\n'
+    + '    disabled\n'
+    + '\n'
+    + 'on property:sys.boot_completed=1\n'
+    + '    start echomuse\n', JSON.stringify(_ECHOMUSE_RC_LINEAGE));
+check("a LineageOS Show carrying a Fire OS rc is not up to date",
+  !_rcInstalled(_ECHOMUSE_RC_CROWN, _ECHOMUSE_RC_LINEAGE));
+
+// The addon.d v2 script that keeps the rc across a LineageOS update: Lineage
+// 18.1's own 50-lineage.sh shape, the rc and nothing else.
+{
+  const s = _ECHOMUSE_ADDOND_LINEAGE;
+  check("the addon.d script lives in /system/addon.d", _ADDOND_PATH === '/system/addon.d/50-echomuse.sh');
+  check("the addon.d script is v2 and sources backuptool's functions",
+    s.startsWith('#!/sbin/sh\n') && /^# ADDOND_VERSION=2$/m.test(s)
+    && /^\. \/tmp\/backuptool\.functions$/m.test(s), s);
+  const listed = /^list_files\(\) \{\ncat <<EOF\n([\s\S]*?)\nEOF\n\}$/m.exec(s)?.[1];
+  check("list_files names the rc and nothing else", listed === 'etc/init/echomuse.rc', listed);
+  for (const stage of ['backup', 'restore', 'pre-backup', 'post-backup', 'pre-restore', 'post-restore']) {
+    check(`the addon.d script handles ${stage}`, new RegExp(`^  ${stage}\\)$`, 'm').test(s));
+  }
+  check("the addon.d script ends in a newline", s.endsWith('esac\n'));
+
+  // Run it the way backuptool.sh does, with S and C exported and stand-ins
+  // for backup_file and restore_file that say what they were asked.
+  // backuptool.sh ignores a script's exit status, and 50-lineage.sh's own
+  // restore ends non-zero when nothing was backed up, so only the output
+  // counts.
+  const dir = mkdtempSync(join(tmpdir(), 'em-addond-'));
+  try {
+    writeFileSync(join(dir, 'backuptool.functions'),
+      'backup_file() { echo "backup_file $1"; }\nrestore_file() { echo "restore_file $1 [$2]"; }\n');
+    const script = join(dir, '50-echomuse.sh');
+    writeFileSync(script, s.replace('/tmp/backuptool.functions', join(dir, 'backuptool.functions')));
+    const backupdir = join(dir, 'backup');
+    const run = stage => spawnSync('/bin/sh', [script, stage], {
+      encoding: 'utf8', env: { PATH: process.env.PATH, S: '/system', C: backupdir } });
+    {
+      const r = run('backup');
+      check("backup saves the rc", r.status === 0
+        && r.stdout === 'backup_file /system/etc/init/echomuse.rc\n', JSON.stringify(r));
+    }
+    check("restore without a backup restores nothing", run('restore').stdout === '');
+    mkdirSync(join(backupdir, 'system', 'etc', 'init'), { recursive: true });
+    writeFileSync(join(backupdir, 'system', 'etc', 'init', 'echomuse.rc'), _ECHOMUSE_RC_LINEAGE);
+    {
+      const r = run('restore');
+      check("restore puts the backed-up rc back", r.status === 0
+        && r.stdout === 'restore_file /system/etc/init/echomuse.rc []\n', JSON.stringify(r));
+    }
+    for (const stage of ['pre-backup', 'post-backup', 'pre-restore', 'post-restore']) {
+      const r = run(stage);
+      check(`${stage} does nothing`, r.status === 0 && r.stdout === '' && r.stderr === '',
+        JSON.stringify(r));
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
 
 check("a device already carrying the exact rc is up to date", _rcInstalled(_ECHOMUSE_RC));
 check("a Show already carrying its rc is up to date",

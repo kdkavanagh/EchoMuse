@@ -22,16 +22,18 @@ var v1Capabilities = []proto.Capability{
 }
 
 // platformCapabilities are the hardware and platform capabilities each
-// image implements (§18.2; docs/echo-show-port-plan.md decisions 6, 7). The
-// Dot keeps its ring, buttons, Wi-Fi management, BLE proxy and privacy
-// mute; on the Show Android owns Wi-Fi, Bluetooth and the keys, there is no
-// ring, mute is deferred (Phase 7) and the kiosk screen can be woken.
+// image implements (§18.2; docs/echo-show-port-plan.md decisions 6, 7;
+// docs/echo-show-lineage-plan.md §3). The Dot keeps its ring, buttons,
+// Wi-Fi management, BLE proxy and privacy mute; on the Show, on either OS,
+// Android owns Wi-Fi, Bluetooth and the keys, there is no ring, mute is
+// deferred and the kiosk screen can be woken.
 var platformCapabilities = map[proto.Platform][]proto.Capability{
 	proto.PlatformFireOS6: {
 		proto.CapLEDs, proto.CapLEDAnim, proto.CapButtons, proto.CapButtonHold,
 		proto.CapWifiControl, proto.CapBLEProxy, proto.CapPrivacyMute,
 	},
-	proto.PlatformFireOS6Crown: {proto.CapScreenWake},
+	proto.PlatformFireOS6Crown:   {proto.CapScreenWake},
+	proto.PlatformLineage18Crown: {proto.CapScreenWake},
 }
 
 // has reports whether this platform implements c.

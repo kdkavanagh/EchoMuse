@@ -636,6 +636,73 @@ Based on a review of Office turns 433–476 (`docs/turn-latency-review.md`,
   `MIC_REASSERTED:… STILL_ALLOWED:…` before its result line. The Dot's path
   is unchanged.
 
+### Echo Show 8 on LineageOS 18.1 (`lineage18_crown`)
+
+- **The controller admits an Echo Show 8 running LineageOS 18.1.** Its
+  firmware (the same bundled binary) reports `platform: lineage18_crown`;
+  the controller now admits `fireos6`, `fireos6_crown` and `lineage18_crown`
+  and still refuses any other platform with `protocol`. Its capability gaps
+  are the Fire OS Show's ("managed by the device" for Wi-Fi and the Bluetooth
+  proxy, "mute not supported on this device yet", no ring, no action
+  button), Home Assistant shows it as model "Echo Show 8 Gen 1 (crown,
+  LineageOS)", and the Status tab's Platform reads "Echo Show 8 1st gen ·
+  LineageOS 18.1". Volume on the wire stays 0–127 (Android's index is 0–15
+  there; docs/protocol-v1.md §4.8).
+- **The firmware runs there on AAudio** (docs/echo-show-lineage-plan.md
+  Phases L1–L3). `internal/platform` picks LineageOS by
+  `ro.lineage.version`, and now admits the Fire OS Show only at API 25, so
+  a LineageOS Show can never take the Fire OS path, whose volume check would
+  call `setStreamVolume`. Capture is a `VOICE_RECOGNITION` AAudio stream
+  stamped from a least-squares fit through AAudio's own capture timestamps,
+  5 ms earlier (their measured bias), never after the read completes;
+  render is a `USAGE_MEDIA` AAudio stream stamped at AAudio's presentation
+  time plus 60 ms (`aaudioRenderLatencyNs`). Measured with
+  `sl_latency -backend aaudio` over five opens: no late stamp, the echo
+  40–54 ms after its reference stamp, the per-open medians within 2 ms.
+  The AFE metadata decodes on every open and `afe_metadata_v1` is
+  announced. Volume uses Android 11's binder codes (get 16, set 10, max 18)
+  over `STREAM_MUSIC` 0–15; the light sensor's polling is switched on
+  before it is read (it is off on LineageOS, and the reading then stays at
+  `0 lux`).
+- **The wizard no longer leaves `/data/local/bin` world-writable.** adb's
+  shell runs with umask 000 (measured on the LineageOS Show), so `mkdir -p`
+  created it mode 777; it is now chmod 755 on every image. With SELinux
+  permissive on LineageOS, the file mode is the only thing keeping an app
+  from replacing the binary init runs as root.
+- **No debloat on LineageOS.** There are no Amazon apps or services to stop,
+  hide or deny the microphone, so firmware updates sync `start_server.sh`
+  but never run its `debloat` mode there, **Re-apply debloat** is disabled
+  with the reason "nothing to debloat: LineageOS has no Amazon apps or
+  services", and `POST /api/devices/{id}/debloat` refuses it (`409
+  not_supported`). The device API adds `debloat_gap` with that reason.
+- **`start_server.sh` has a LineageOS branch** (chosen by a non-empty
+  `ro.lineage.version`, tested before `ro.product.device=crown`): logs and
+  scratch space in `/data/local/tmp/echomuse`, a wait for `audioserver` and
+  the wake lock, as on the Fire OS Show, but no move into `su` (init starts
+  it there), no stop list, no hide lists, no microphone denials and no
+  `tinymix`. `start_server.sh debloat` there changes nothing and reports
+  `DEBLOAT_STOPPED:0 STILL_RUNNING:`.
+- **The provisioning wizard provisions a LineageOS Show.** `connect_android`
+  accepts `crown` with `ro.lineage.version` set, Android 11 and our build's
+  `/system/lib/libasp.so` (SHA-1 `e3816eb3…`, the NS6571 audio front end);
+  it refuses another build (upstream's) naming our fork's
+  `crown-ns6571-asp` branches, and a Show not on Wi-Fi. Its adb starts
+  unprivileged after every boot, so the wizard sends adb's `root:` service
+  and reconnects to the restarted `adbd` by USB serial without the picker,
+  at connect and again at reconnect; when `adbd` refuses, the wizard names
+  Developer options' **USB debugging** and **Rooted debugging**. Steps:
+  `connect_android → install_boot_hook → install_em → reboot → reconnect →
+  verify_service → confirm_link`. The boot hook is
+  `/system/etc/init/echomuse.rc` (uid 0, groups `root audio inet`,
+  `seclabel u:r:su:s0`) plus `/system/addon.d/50-echomuse.sh`, an addon.d v2
+  script that keeps the `.rc` across a LineageOS update, both written with
+  `/` remounted read-write and skipped when already in place. No build-pin
+  warning (its pin is the `libasp.so` hash). Failure diagnostics on it
+  collect `audioserver`, `wlan0`, the mute's state, the `libasp.so` SHA-1,
+  the addon.d script and `ro.lineage.version`. Flashing, Developer options,
+  the accepted risks (an unofficial ROM, SELinux permissive, adbd on TCP 5555
+  with key authorisation) and the undo: docs/rooting.md.
+
 ### Earlier in this release
 
 - ASR gain: the STT copy sent to Home Assistant is amplified by

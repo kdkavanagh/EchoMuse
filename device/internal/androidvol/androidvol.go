@@ -1,31 +1,38 @@
 // Package androidvol drives Android's STREAM_MUSIC volume index on the Echo
 // Show, the volume authority there (docs/echo-show-port-plan.md decision 8):
-// the volume keys, the kiosk and EchoMuse all move the same index, 0–30.
+// the volume keys, the kiosk and EchoMuse all move the same index, 0–30 on
+// Fire OS and 0–15 on LineageOS 18.1.
 //
 // Fire OS 7.1's `media` command has no volume subcommand and `settings` is a
 // JVM per call (about 1 s of CPU), so the firmware calls IAudioService over
-// binder with `service call audio`. Transaction codes are AOSP 7.1's order,
-// read from boot-framework.oat's IAudioService$Stub on NS65741/8146 and
-// verified by round trip (docs/echo-show-crown.md §10):
+// binder with `service call audio`. Transaction codes follow each build's
+// IAudioService.aidl order, so they differ per image (Codes):
 //
-//	3  setStreamVolume(int streamType, int index, int flags, String callingPackage)
-//	8  getStreamVolume(int streamType) int
-//	10 getStreamMaxVolume(int streamType) int
+//	                                                   Fire OS (AOSP 7.1)  LineageOS 18.1 (Android 11)
+//	setStreamVolume(int, int index, int flags, String)  3                   10
+//	getStreamVolume(int streamType) int                  8                   16
+//	getStreamMaxVolume(int streamType) int               10                  18
+//
+// Fire OS's were read from boot-framework.oat's IAudioService$Stub on
+// NS65741/8146 (docs/echo-show-crown.md §10.5), LineageOS's from its
+// transaction table (§8.5); each verified by round trip. On Android 11 code
+// 10 is setStreamVolume, so Fire OS's table must never run there
+// (internal/platform requires API 25 for Fire OS).
 //
 // One `service call` costs about 27 ms wall and 18 ms CPU. Pinned codes are
-// only right for that build, so Verify checks them at start (the maximum is
-// 30 and a get/set/get round trip agrees) and volume control is disabled
-// with the reason when it fails. AudioService lives in system_server, which
-// registers it well after audioserver runs at boot, so Verify first waits a
-// bounded time for the "audio" binder service to exist.
+// only right for their build, so Verify checks them at start (the maximum is
+// the table's and a get/set/get round trip agrees) and volume control is
+// disabled with the reason when it fails. AudioService lives in
+// system_server, which registers it well after audioserver runs at boot, so
+// Verify first waits a bounded time for the "audio" binder service to exist.
 //
 // Key-driven changes are noticed without polling binder every second:
 // AudioService persists every index change to the system settings
-// (volume_music_speaker in /data/system/users/0/settings_system.xml) about
-// 0.5 s after it, so the file's modification time is a cheap change
-// trigger. The value itself always comes from getStreamVolume, which
-// reflects a key press immediately, so changes this process made are told
-// apart from key presses exactly.
+// (volume_music_speaker in /data/system/users/0/settings_system.xml, plain
+// XML on both builds) about 0.5 s after it, so the file's modification time
+// is a cheap change trigger. The value itself always comes from
+// getStreamVolume, which reflects a key press immediately, so changes this
+// process made are told apart from key presses exactly.
 package androidvol
 
 import (
@@ -42,18 +49,29 @@ import (
 	"time"
 )
 
+// Codes are one build's IAudioService transaction codes and STREAM_MUSIC's
+// maximum index there.
+type Codes struct {
+	Name             string // the build, for messages
+	Set, Get, GetMax string
+	MaxIndex         int
+}
+
+var (
+	// FireOS is the Fire OS Show's (NS65741/8146, AOSP 7.1).
+	FireOS = Codes{Name: "Fire OS 6 (AOSP 7.1)", Set: "3", Get: "8", GetMax: "10", MaxIndex: 30}
+	// Lineage18 is LineageOS 18.1's (Android 11), with AOSP's default 15
+	// music steps (no ro.config.media_vol_steps on crown).
+	Lineage18 = Codes{Name: "LineageOS 18.1 (Android 11)", Set: "10", Get: "16", GetMax: "18", MaxIndex: 15}
+)
+
 const (
-	// MaxIndex is STREAM_MUSIC's maximum index on the Show.
-	MaxIndex = 30
 	// MaxLevel is the wire volume scale's maximum (volume_set, volume_state).
 	MaxLevel = 127
 
 	streamMusic = "3"
-	codeSet     = "3"
-	codeGet     = "8"
-	codeGetMax  = "10"
 	// callingPackage is setStreamVolume's AppOps package; measured to work
-	// from uid 0, as do "root" and omitting it.
+	// from uid 0 on both builds.
 	callingPackage = "com.android.shell"
 
 	settingsFile = "/data/system/users/0/settings_system.xml"
@@ -63,17 +81,18 @@ const (
 	serviceWait = 90 * time.Second
 )
 
-// IndexForLevel maps a wire level 0..127 to the STREAM_MUSIC index 0..30.
-func IndexForLevel(level int) int {
+// IndexForLevel maps a wire level 0..127 to the STREAM_MUSIC index
+// 0..maxIndex.
+func IndexForLevel(level, maxIndex int) int {
 	level = max(0, min(MaxLevel, level))
-	return int(math.Round(float64(level) * MaxIndex / MaxLevel))
+	return int(math.Round(float64(level) * float64(maxIndex) / MaxLevel))
 }
 
-// LevelForIndex maps a STREAM_MUSIC index 0..30 to the wire level 0..127.
-// LevelForIndex then IndexForLevel returns the index unchanged.
-func LevelForIndex(index int) int {
-	index = max(0, min(MaxIndex, index))
-	return int(math.Round(float64(index) * MaxLevel / MaxIndex))
+// LevelForIndex maps a STREAM_MUSIC index 0..maxIndex to the wire level
+// 0..127. LevelForIndex then IndexForLevel returns the index unchanged.
+func LevelForIndex(index, maxIndex int) int {
+	index = max(0, min(maxIndex, index))
+	return int(math.Round(float64(index) * MaxLevel / float64(maxIndex)))
 }
 
 // parseReply returns the 32-bit words of a `service call` reply parcel:
@@ -141,6 +160,7 @@ func parseVoid(out string) error {
 
 // Control is STREAM_MUSIC's index. It is safe for concurrent use.
 type Control struct {
+	codes Codes
 	// call runs `service call audio <args...>`; a seam for the tests.
 	call func(args ...string) (string, error)
 	// registered runs `service check audio`: whether AudioService exists.
@@ -157,9 +177,10 @@ type Control struct {
 	gen   uint64     // bumped by every set
 }
 
-// New returns the Show's control.
-func New() *Control {
+// New returns the Show's control for the build whose codes are given.
+func New(codes Codes) *Control {
 	return &Control{
+		codes: codes,
 		call: func(args ...string) (string, error) {
 			out, err := exec.Command("service", append([]string{"call", "audio"}, args...)...).CombinedOutput()
 			if err != nil {
@@ -191,9 +212,12 @@ func isFound(out string) bool {
 	return strings.HasSuffix(s, ": found")
 }
 
+// MaxIndex is STREAM_MUSIC's maximum index on this build.
+func (c *Control) MaxIndex() int { return c.codes.MaxIndex }
+
 // Index reads the current STREAM_MUSIC index.
 func (c *Control) Index() (int, error) {
-	out, err := c.call(codeGet, "i32", streamMusic)
+	out, err := c.call(c.codes.Get, "i32", streamMusic)
 	if err != nil {
 		return 0, err
 	}
@@ -201,8 +225,8 @@ func (c *Control) Index() (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("getStreamVolume: %w", err)
 	}
-	if i < 0 || i > MaxIndex {
-		return 0, fmt.Errorf("getStreamVolume: index %d outside 0..%d", i, MaxIndex)
+	if i < 0 || i > c.codes.MaxIndex {
+		return 0, fmt.Errorf("getStreamVolume: index %d outside 0..%d", i, c.codes.MaxIndex)
 	}
 	return i, nil
 }
@@ -210,10 +234,10 @@ func (c *Control) Index() (int, error) {
 // SetIndex sets the STREAM_MUSIC index without showing Android's volume UI
 // (flags 0). The change is never reported by Watch.
 func (c *Control) SetIndex(index int) error {
-	index = max(0, min(MaxIndex, index))
+	index = max(0, min(c.codes.MaxIndex, index))
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	out, err := c.call(codeSet, "i32", streamMusic, "i32", strconv.Itoa(index), "i32", "0", "s16", callingPackage)
+	out, err := c.call(c.codes.Set, "i32", streamMusic, "i32", strconv.Itoa(index), "i32", "0", "s16", callingPackage)
 	if err == nil {
 		err = parseVoid(out)
 	}
@@ -227,13 +251,14 @@ func (c *Control) SetIndex(index int) error {
 }
 
 // Verify checks the pinned codes against this build, once AudioService is
-// registered: getStreamMaxVolume must answer MaxIndex, and setting the
-// current index again must read back unchanged. It changes nothing audible.
+// registered: getStreamMaxVolume must answer the table's maximum, and
+// setting the current index again must read back unchanged. It changes
+// nothing audible.
 func (c *Control) Verify() error {
 	if err := c.waitRegistered(); err != nil {
 		return err
 	}
-	out, err := c.call(codeGetMax, "i32", streamMusic)
+	out, err := c.call(c.codes.GetMax, "i32", streamMusic)
 	if err != nil {
 		return err
 	}
@@ -241,8 +266,9 @@ func (c *Control) Verify() error {
 	if err != nil {
 		return fmt.Errorf("getStreamMaxVolume: %w", err)
 	}
-	if maxIndex != MaxIndex {
-		return fmt.Errorf("getStreamMaxVolume answered %d, want %d: transaction codes do not match this build", maxIndex, MaxIndex)
+	if maxIndex != c.codes.MaxIndex {
+		return fmt.Errorf("getStreamMaxVolume answered %d, want %d: %s's transaction codes do not match this build",
+			maxIndex, c.codes.MaxIndex, c.codes.Name)
 	}
 	before, err := c.Index()
 	if err != nil {

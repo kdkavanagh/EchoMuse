@@ -14,8 +14,8 @@ import (
 
 	"github.com/wilbowes/EchoMuse/internal/audio/afe"
 	"github.com/wilbowes/EchoMuse/internal/audio/clockfit"
-	"github.com/wilbowes/EchoMuse/internal/bindings/slmic"
 	"github.com/wilbowes/EchoMuse/internal/render"
+	pkgmic "github.com/wilbowes/EchoMuse/pkg/mic"
 	"github.com/wilbowes/EchoMuse/tools/sl_latency/latency"
 )
 
@@ -35,7 +35,8 @@ func newRenderClock(writes int) *renderClock {
 	}
 }
 
-// complete runs on the OpenSL callback thread.
+// complete runs on the sink's completion path (the OpenSL callback thread,
+// or the AAudio writer).
 func (r *renderClock) complete(ns int64) {
 	r.mu.Lock()
 	r.done = append(r.done, ns)
@@ -71,13 +72,20 @@ type period struct {
 	first    int   // index of its first sample in the capture
 	stampNs  int64 // Block.MonoNs
 	doneNs   int64 // its read completion
-	anchored bool  // MonoNs came from its AFE frame
+	anchored bool  // MonoNs came from its anchor (AFE frame or AAudio fit)
 	afe      afe.Period
+}
+
+// microphone is the firmware's capture backend under test: OpenSL
+// (slmic.OpenSLMicrophone) or AAudio (slmic.AAudioMicrophone).
+type microphone interface {
+	pkgmic.Microphone
+	Completion() (doneNs int64, anchored bool)
 }
 
 // capturer reads the microphone as the supervisor's capture loop does.
 type capturer struct {
-	mic     *slmic.OpenSLMicrophone
+	mic     microphone
 	first   chan struct{} // closed at the first period
 	capture latency.Capture
 	periods []period
@@ -222,8 +230,8 @@ func (r report) print(w io.Writer, c *capturer, clock *renderClock, drops uint64
 		fmt.Fprintf(w, "note: %d pa lag(s) negative; PA leads the echo in the output, so only pcm_lag must stay ≥ 0\n", negPA)
 	}
 
-	var periods, frames, invalid, syncs, gaps, lost, anchored int
-	var offsets []float64
+	var periods, frames, invalid, syncs, gaps, lost, anchored, held int
+	var offsets, stampLags []float64
 	for _, p := range c.periods {
 		periods++
 		frames += int(p.afe.Record.Frames)
@@ -233,6 +241,10 @@ func (r report) print(w io.Writer, c *capturer, clock *renderClock, drops uint64
 		lost += int(p.afe.Lost)
 		if p.anchored {
 			anchored++
+			stampLags = append(stampLags, float64(p.doneNs-p.stampNs)/1e6)
+			if p.stampNs == p.doneNs {
+				held++
+			}
 		}
 		if off, ok := latency.CompletionOffsetMs(p.doneNs, p.afe.Anchor); ok {
 			offsets = append(offsets, off)
@@ -244,6 +256,11 @@ func (r report) print(w io.Writer, c *capturer, clock *renderClock, drops uint64
 		q := latency.Quantiles(offsets, 0, 0.1, 0.5, 0.9, 1)
 		fmt.Fprintf(w, "[afe] completion − AFE_TIMESTAMP, ms: n=%d min=%.1f p10=%.1f median=%.1f p90=%.1f max=%.1f\n",
 			len(offsets), q[0], q[1], q[2], q[3], q[4])
+	}
+	if len(stampLags) > 0 {
+		q := latency.Quantiles(stampLags, 0, 0.1, 0.5, 0.9, 1)
+		fmt.Fprintf(w, "[stamp] completion − anchored stamp, ms: n=%d min=%.1f p10=%.1f median=%.1f p90=%.1f max=%.1f; held at completion %d\n",
+			len(stampLags), q[0], q[1], q[2], q[3], q[4], held)
 	}
 	fmt.Fprintf(w, "sink: writes=%d completions=%d\n", written, len(clock.completions()))
 }

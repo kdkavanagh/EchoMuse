@@ -3,8 +3,10 @@
 // Command sl_latency measures, on the Echo Show, how the firmware's render
 // stamps line up with its capture stamps: the lag the controller's echo
 // comparison searches (0–500 ms of mic after reference, em_attribution.
-// MAX_LAG). It opens audio exactly as the firmware does (slmic.OpenOpenSL,
-// slspeaker.NewOpenSL), writes render.SinkFrames buffers of silence with
+// MAX_LAG). It opens audio exactly as the firmware does on the image's
+// backend (-backend: OpenSL on Fire OS, slmic.OpenOpenSL and
+// slspeaker.NewOpenSL; AAudio on LineageOS, slmic.OpenAAudio and
+// slspeaker.NewAAudio), writes render.SinkFrames buffers of silence with
 // short bursts at the start of some of them, and finds each burst in the
 // capture.
 //
@@ -23,19 +25,23 @@
 //     noise, which is cancelled less.
 //
 // A negative pcm lag means the capture shows the echo before its render
-// stamp: render stamps are late (opensl.playPipelineNs too large) or
-// capture stamps early. The firmware must never do that.
+// stamp: render stamps are late (opensl.playPipelineNs or
+// slspeaker.aaudioRenderLatencyNs too large) or capture stamps early. The
+// firmware must never do that.
 //
 // Usage (adb root shell on the Show; stop echomuse first, it holds the
 // input and this tool would get no audio):
 //
-//	sl_latency [-n 10] [-gap 2.5s] [-burst 20ms] [-wave tone|noise]
-//	           [-freq 1000] [-level -6] [-lead 3s] [-stall 2.5s] [-tail 2s]
-//	           [-min-snr 12] [-index -1] [-o /data/local/tmp/echomuse/lat]
+//	sl_latency [-backend auto|opensl|aaudio] [-n 10] [-gap 2.5s] [-burst 20ms]
+//	           [-wave tone|noise] [-freq 1000] [-level -6] [-lead 3s]
+//	           [-stall 2.5s] [-tail 2s] [-min-snr 12] [-index -1]
+//	           [-o /data/local/tmp/echomuse/lat]
 //
-// -index sets STREAM_MUSIC for the run and restores it afterwards. -o writes
-// <prefix>.raw (the capture, 16 kHz mono S16LE, as delivered, bit 0
-// included), <prefix>.periods.csv and <prefix>.writes.csv.
+// -backend auto takes the image's own (internal/platform). -index sets
+// STREAM_MUSIC (0..30 on Fire OS, 0..15 on LineageOS) for the run and
+// restores it afterwards. -o writes <prefix>.raw (the capture, 16 kHz mono
+// S16LE, as delivered, bit 0 included), <prefix>.periods.csv and
+// <prefix>.writes.csv.
 package main
 
 import (
@@ -52,6 +58,7 @@ import (
 	"github.com/wilbowes/EchoMuse/internal/androidvol"
 	"github.com/wilbowes/EchoMuse/internal/bindings/slmic"
 	"github.com/wilbowes/EchoMuse/internal/bindings/slspeaker"
+	"github.com/wilbowes/EchoMuse/internal/platform"
 	"github.com/wilbowes/EchoMuse/internal/render"
 	"github.com/wilbowes/EchoMuse/tools/sl_latency/latency"
 )
@@ -61,6 +68,7 @@ import (
 const firstCaptureWait = 5 * time.Second
 
 type options struct {
+	backend                 string
 	n                       int
 	gap, burst, lead, stall time.Duration
 	tail                    time.Duration
@@ -73,6 +81,7 @@ type options struct {
 func parseFlags() options {
 	var o options
 	var wave string
+	flag.StringVar(&o.backend, "backend", "auto", "audio backend: auto (the image's own), opensl or aaudio")
 	flag.IntVar(&o.n, "n", 10, "bursts")
 	flag.DurationVar(&o.gap, "gap", 2500*time.Millisecond, "time between burst starts (PLAYBACK_ACTIVE's hangover is up to 1 s)")
 	flag.DurationVar(&o.burst, "burst", 20*time.Millisecond, "burst length")
@@ -83,7 +92,7 @@ func parseFlags() options {
 	flag.DurationVar(&o.stall, "stall", 2500*time.Millisecond, "writer stall before one extra burst, so the queue runs dry (0: none)")
 	flag.DurationVar(&o.tail, "tail", 2*time.Second, "silence after the last burst")
 	flag.Float64Var(&o.minSNR, "min-snr", latency.DefaultMinSNRdB, "dB a residual burst's match must stand over the room's median to count")
-	flag.IntVar(&o.index, "index", -1, "STREAM_MUSIC index 0..30 for the run, restored afterwards (-1: leave it)")
+	flag.IntVar(&o.index, "index", -1, "STREAM_MUSIC index for the run (0..30 Fire OS, 0..15 LineageOS), restored afterwards (-1: leave it)")
 	flag.StringVar(&o.out, "o", "", "write <prefix>.raw, .periods.csv and .writes.csv")
 	flag.Parse()
 	switch wave {
@@ -112,22 +121,34 @@ func run(o options) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	index, restore, err := volume(o.index)
+	kind, err := platform.Detect()
+	if err != nil {
+		return err
+	}
+	codes := androidvol.FireOS
+	if kind == platform.KindCrownLineage {
+		codes = androidvol.Lineage18
+	}
+	if o.backend == "auto" {
+		o.backend = "opensl"
+		if kind == platform.KindCrownLineage {
+			o.backend = "aaudio"
+		}
+	}
+
+	index, restore, err := volume(codes, o.index)
 	if err != nil {
 		return err
 	}
 	defer restore()
 
-	mic, err := slmic.OpenOpenSL()
+	mic, sink, err := openBackend(o.backend)
 	if err != nil {
 		return err
 	}
 	defer mic.Close()
-	sink, err := slspeaker.NewOpenSL()
-	if err != nil {
-		return err
-	}
 	defer sink.Close()
+	log.Printf("backend %s on %s", o.backend, kind.Platform())
 
 	plan := latency.Plan(o.lead, o.gap, o.n, o.stall, o.tail)
 	clock := newRenderClock(len(plan))
@@ -180,16 +201,47 @@ func waveName(o options) string {
 	return fmt.Sprintf("%.0f Hz tone", o.freq)
 }
 
-// volume reads STREAM_MUSIC and, for index ≥ 0, sets it until restore.
-func volume(index int) (desc string, restore func(), err error) {
-	vol := androidvol.New()
+// openBackend opens the capture and render streams the firmware opens on
+// the named backend.
+func openBackend(backend string) (microphone, render.Sink, error) {
+	switch backend {
+	case "opensl":
+		mic, err := slmic.OpenOpenSL()
+		if err != nil {
+			return nil, nil, err
+		}
+		sink, err := slspeaker.NewOpenSL()
+		if err != nil {
+			mic.Close()
+			return nil, nil, err
+		}
+		return mic, sink, nil
+	case "aaudio":
+		mic, err := slmic.OpenAAudio()
+		if err != nil {
+			return nil, nil, err
+		}
+		sink, err := slspeaker.NewAAudio()
+		if err != nil {
+			mic.Close()
+			return nil, nil, err
+		}
+		return mic, sink, nil
+	}
+	return nil, nil, fmt.Errorf("-backend %q: want auto, opensl or aaudio", backend)
+}
+
+// volume reads STREAM_MUSIC through the build's binder codes and, for
+// index ≥ 0, sets it until restore.
+func volume(codes androidvol.Codes, index int) (desc string, restore func(), err error) {
+	vol := androidvol.New(codes)
 	restore = func() {}
 	prev, err := vol.Index()
 	if index < 0 {
 		if err != nil {
 			return fmt.Sprintf("STREAM_MUSIC index unknown (%v)", err), restore, nil
 		}
-		return fmt.Sprintf("STREAM_MUSIC index %d/%d", prev, androidvol.MaxIndex), restore, nil
+		return fmt.Sprintf("STREAM_MUSIC index %d/%d", prev, vol.MaxIndex()), restore, nil
 	}
 	if err != nil {
 		return "", nil, fmt.Errorf("volume: %w", err)
@@ -207,14 +259,14 @@ func volume(index int) (desc string, restore func(), err error) {
 		}
 		log.Printf("STREAM_MUSIC index restored to %d", prev)
 	}
-	return fmt.Sprintf("STREAM_MUSIC index %d/%d for the run (was %d)", index, androidvol.MaxIndex, prev), restore, nil
+	return fmt.Sprintf("STREAM_MUSIC index %d/%d for the run (was %d)", index, vol.MaxIndex(), prev), restore, nil
 }
 
 // play writes the plan to the sink and records each burst's write and the
 // render clock fit's stamp for its first frame at the moment it was
 // written, as the supervisor's reference tap stamps it. It stops at a write
 // error, which the firmware would answer with a new render epoch.
-func play(ctx context.Context, sink *slspeaker.OpenSLSink, clock *renderClock, plan []latency.Step,
+func play(ctx context.Context, sink render.Sink, clock *renderClock, plan []latency.Step,
 	burst []int16) (bursts []burstRec, written int, err error) {
 	silence := make([]int16, render.SinkFrames)
 	for w, step := range plan {

@@ -3642,7 +3642,13 @@ async def _sync_debloat(shell: em_shell.ShellBroker, live: em_device.Device,
     is then the canonical one: a script predating the mode ignores its
     argument and would run in full, starting a second supervisor beside the
     live one.
+
+    A LineageOS Show has nothing to debloat (em_device.debloat_gap): no
+    Amazon apps, no Amazon services. Nothing runs there; a firmware update
+    still syncs its start script on its own (_sync_start_script).
     """
+    if em_device.debloat_gap(live.platform) is not None:
+        return
     if not await _sync_start_script(shell, live, device_id):
         await push_log_event(device_id, db.LogLevel.WARN, db.LogSource.CONTROLLER,
                              "debloat not applied: start_server.sh could not be brought "
@@ -3988,9 +3994,14 @@ async def _post_debloat(request: web.Request) -> web.Response:
     already running the latest firmware will not be updated again, so it would
     never receive a payload change. Idempotent, so pressing it twice costs a
     pass of `stop` calls on already-stopped services and nothing else.
+    Refused (409 not_supported, with the reason the dashboard shows beside
+    the disabled button) on a device with nothing to debloat: a LineageOS Show.
     """
     device_id = request.match_info["id"]
     live = _require_online(device_id, f"Device not connected: {device_id}")
+    gap = live.debloat_gap
+    if gap is not None:
+        raise ApiError(ErrorCode.NOT_SUPPORTED, f"Debloat unavailable: {gap}", 409)
 
     # No explicit shell release here: _shell_run and _stream_file_to_device
     # each hold a _device_shell session only for their own duration.
@@ -5099,6 +5110,7 @@ class DeviceJson(TypedDict):
     muted: bool | None
     volume: float | None
     volume_gap: str | None
+    debloat_gap: str | None
     ambient: dict[str, object] | None
     alert_state: dict[str, object] | None
     ringing: bool | None
@@ -5185,6 +5197,9 @@ def _merge_device(row: db.DeviceRow) -> DeviceJson:
                                if live is not None and live.volume is not None
                                else _stored_volume(row)),
         "volume_gap":         live.volume_gap if live is not None else None,
+        # Why Re-apply debloat is disabled: a LineageOS Show has nothing to
+        # debloat (em_device.debloat_gap). Null on Fire OS, and while offline.
+        "debloat_gap":        live.debloat_gap if live is not None else None,
         "ambient":            live.ambient if live is not None else None,
         "alert_state":        alert_state,
         "ringing":            (alert_state.get("active") is not None

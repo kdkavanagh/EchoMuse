@@ -110,6 +110,10 @@ const (
 	// PlatformFireOS6Crown is the Echo Show 8 (crown) on Fire OS 6 with the
 	// Android framework: audio through OpenSL ES and AudioFlinger.
 	PlatformFireOS6Crown Platform = "fireos6_crown"
+	// PlatformLineage18Crown is the same Echo Show 8 on LineageOS 18.1
+	// (Android 11): audio through AAudio and AudioFlinger, STREAM_MUSIC
+	// 0..15 behind other binder codes.
+	PlatformLineage18Crown Platform = "lineage18_crown"
 )
 
 // MessageType is an envelope type.

@@ -8,18 +8,19 @@
 //
 // What runs where:
 //
-//	                         Dot (fireos6)           Show (fireos6_crown)
-//	capture / render         libmixerAPI (mixer)     OpenSL ES (AudioFlinger)
-//	mic waits for NTP step   yes (timesync)          no: Android owns the clock
-//	Wi-Fi join/recover/scan  yes (internal/wifi)     no: Android owns Wi-Fi
-//	stop smarthomewifid      yes                     no
-//	BLE proxy scanner        yes (/dev/stpbt)        no: Android owns Bluetooth
-//	LED ring, buttons, jack  yes                     no hardware / Android's keys
-//	volume                   codec DAC (tinymix 61)  STREAM_MUSIC index (androidvol)
-//	privacy mute             yes                     deferred (Phase 7)
-//	screen wake              no                      Fully Kiosk REST (kiosk)
-//	ambient light, stats     yes                     yes (no wpa_cli link stats)
-//	scratch (heap profiles)  /tmp                    /data/local/tmp/echomuse
+//	                         Dot (fireos6)           Show, Fire OS (fireos6_crown)  Show, LineageOS (lineage18_crown)
+//	capture / render         libmixerAPI (mixer)     OpenSL ES (AudioFlinger)       AAudio (AudioFlinger)
+//	mic waits for NTP step   yes (timesync)          no: Android owns the clock     no
+//	Wi-Fi join/recover/scan  yes (internal/wifi)     no: Android owns Wi-Fi         no
+//	stop smarthomewifid      yes                     no                             no
+//	BLE proxy scanner        yes (/dev/stpbt)        no: Android owns Bluetooth     no
+//	LED ring, buttons, jack  yes                     no hardware / Android's keys   no
+//	volume                   codec DAC (tinymix 61)  STREAM_MUSIC 0–30 (androidvol) STREAM_MUSIC 0–15 (androidvol)
+//	privacy mute             yes                     deferred                       deferred
+//	screen wake              no                      Fully Kiosk REST (kiosk)       Fully Kiosk REST (kiosk)
+//	ambient light            yes                     yes                            yes, als_ps polling switched on
+//	stats                    yes                     yes (no wpa_cli link stats)    yes (no wpa_cli link stats)
+//	scratch (heap profiles)  /tmp                    /data/local/tmp/echomuse       /data/local/tmp/echomuse
 package main
 
 import (
@@ -109,8 +110,13 @@ func run() error {
 		// observed busy-looping; stopping it is idempotent.
 		_ = exec.Command("stop", "smarthomewifid").Run()
 	}
-	// Both images are MT8163s under MediaTek's hotplug; the Show already
-	// boots with this floor, so there it changes nothing.
+	if kind == platform.KindCrownLineage {
+		// Nothing on LineageOS keeps the light sensor polling; without
+		// this its lux file is a stale cache (docs/echo-show-crown.md §8.5).
+		als.EnablePolling()
+	}
+	// Every image is an MT8163 under MediaTek's hotplug; the Fire OS Show
+	// already boots with this floor, so there it changes nothing.
 	applyCoreFloor()
 	if err := os.RemoveAll(legacyModelDir); err != nil {
 		log.Printf("remove %s: %v", legacyModelDir, err)
@@ -229,7 +235,7 @@ func run() error {
 	} else if vol != nil {
 		// The volume keys and the kiosk move Android's index; report
 		// those changes as the Dot reports a button press.
-		go vol.Watch(ctx, func(index int) { phys.ExternalVolumeChange(androidvol.LevelForIndex(index)) })
+		go vol.Watch(ctx, func(index int) { phys.ExternalVolumeChange(androidvol.LevelForIndex(index, vol.MaxIndex())) })
 	}
 
 	go als.Watch(ctx, func(lux int) {
@@ -252,14 +258,18 @@ func run() error {
 
 // newPhysical builds the physical server. The Dot drives its codec DAC,
 // ring and privacy mute. On the Show volume is Android's STREAM_MUSIC index
-// (internal/androidvol), whose pinned binder codes are verified here: when
-// the check fails volume control is disabled with the reason and vol is
-// nil. The Show has no privacy mute the firmware integrates yet (Phase 7).
+// (internal/androidvol) behind the image's binder codes, which are verified
+// here: when the check fails volume control is disabled with the reason and
+// vol is nil. The Show has no privacy mute the firmware integrates yet.
 func newPhysical(kind platform.Kind) (phys *server.Server, vol *androidvol.Control) {
 	if kind == platform.KindDot {
 		return server.New(server.Config{}), nil
 	}
-	vol = androidvol.New()
+	codes := androidvol.FireOS
+	if kind == platform.KindCrownLineage {
+		codes = androidvol.Lineage18
+	}
+	vol = androidvol.New(codes)
 	cfg := server.Config{Hardware: server.NewAndroidHardware(vol), NoPrivacyMute: true}
 	if err := vol.Verify(); err != nil {
 		cfg.VolumeUnavailable = "Android STREAM_MUSIC control failed its startup check: " + err.Error()
@@ -271,26 +281,30 @@ func newPhysical(kind platform.Kind) (phys *server.Server, vol *androidvol.Contr
 }
 
 // openAudio opens the platform's capture and render streams: libmixerAPI on
-// the Dot (docs/fireos6-port.md §3), OpenSL ES on the Show
-// (docs/echo-show-port-plan.md decision 3).
+// the Dot (docs/fireos6-port.md §3), OpenSL ES on the Fire OS Show
+// (docs/echo-show-port-plan.md decision 3), AAudio on the LineageOS Show
+// (docs/echo-show-lineage-plan.md decision 3).
 func openAudio(kind platform.Kind) (pkgmic.Microphone, render.Sink, error) {
-	if kind == platform.KindCrown {
-		mic, err := slmic.OpenOpenSL()
-		if err != nil {
-			return nil, nil, err
-		}
-		sink, err := slspeaker.NewOpenSL()
-		if err != nil {
-			mic.Close()
-			return nil, nil, err
-		}
-		return mic, sink, nil
+	var (
+		mic     pkgmic.Microphone
+		err     error
+		newSink func() (render.Sink, error)
+	)
+	switch kind {
+	case platform.KindCrown:
+		mic, err = slmic.OpenOpenSL()
+		newSink = func() (render.Sink, error) { return slspeaker.NewOpenSL() }
+	case platform.KindCrownLineage:
+		mic, err = slmic.OpenAAudio()
+		newSink = func() (render.Sink, error) { return slspeaker.NewAAudio() }
+	default:
+		mic, err = slmic.OpenMixer(timesync.SettledWithin(micClockWait))
+		newSink = func() (render.Sink, error) { return slspeaker.NewMixer() }
 	}
-	mic, err := slmic.OpenMixer(timesync.SettledWithin(micClockWait))
 	if err != nil {
 		return nil, nil, err
 	}
-	sink, err := slspeaker.NewMixer()
+	sink, err := newSink()
 	if err != nil {
 		mic.Close()
 		return nil, nil, err

@@ -56,5 +56,8 @@ Deeper technical references live elsewhere:
 - [echo-show-port-plan.md](echo-show-port-plan.md) — the plan and its
   implementation status for running EchoMuse on the Show as a voice satellite
   beside a kiosk, with Wi-Fi and Bluetooth left to the device.
+- [echo-show-lineage-plan.md](echo-show-lineage-plan.md) — the plan for
+  running EchoMuse on the Show under LineageOS 18.1, as a third platform
+  beside the Dot and Fire OS crown.
 - [CLAUDE.md](../CLAUDE.md) — codebase orientation for developers (and AI
   assistants).

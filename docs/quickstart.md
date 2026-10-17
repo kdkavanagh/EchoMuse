@@ -93,6 +93,30 @@ Optionally, a Show can light its screen when it hears the wake word, through
 the kiosk's local API (Fully Kiosk's Remote Admin): off by default, set per
 device in the dashboard.
 
+#### On LineageOS 18.1
+
+The Show can also run LineageOS 18.1 instead of Fire OS: Android without any
+Amazon apps, so there is nothing to neutralise and the screen is entirely
+yours. EchoMuse needs **our build** (it carries the Amazon audio front end
+whose metadata EchoMuse reads; upstream releases do not, and the wizard
+refuses them), flashed from TWRP after the same amonet-crown unlock;
+[rooting](rooting.md#echo-show-8-on-lineageos-181) has the build, the flash
+and the accepted risks (an unofficial ROM with SELinux permissive). Before
+you run the wizard:
+
+- **Join Wi-Fi on the Show itself** during LineageOS's setup.
+- **Switch on adb**: tap Build number in Settings → About seven times, then
+  switch on **USB debugging** and **Rooted debugging** in Developer options,
+  and allow your computer's key when the Show asks. The wizard restarts adb
+  as root itself, each time it connects.
+- **Install your kiosk** and make it the home app. While EchoMuse records,
+  the kiosk gets no microphone.
+
+The wizard then installs the boot hook (plus a small addon.d script that
+keeps it across LineageOS updates) and the firmware, reboots, and waits for
+the Show to reach the controller. There is no kiosk check, no Alexa step and
+no Wi-Fi step.
+
 ## Step 2 — Make a Home Assistant token
 
 Skip this step if you are installing the Home Assistant add-on (see below).
@@ -193,7 +217,8 @@ Once approved, the Dot connects fully: you'll see it as **online**, with its
 volume, settings, and a live status.
 
 A Dot that never appears as pending was refused: the controller admits only
-Dots (and Echo Show 8s) running Fire OS 6 with protocol v1 firmware. Run the
+Dots running Fire OS 6, and Echo Show 8s running Fire OS 6 or LineageOS 18.1,
+with protocol v1 firmware. Run the
 wizard on it (after
 moving it to Fire OS 6, if needed); a device the controller already knows is
 re-adopted with **Continue**, keeping its name and settings.

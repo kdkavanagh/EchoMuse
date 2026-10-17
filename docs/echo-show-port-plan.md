@@ -248,6 +248,8 @@ LineageOS is a third platform beside the Dot and Fire OS crown, not a replacemen
 
 Still open on LineageOS: double talk, capture policy with an assistant role holder set, the long-run counter wrap and resampler hazards (findings §8.3), whether a later build brings the metadata back, and a multi-day soak.
 
+The implementation plan for the variant is [echo-show-lineage-plan.md](echo-show-lineage-plan.md).
+
 ### Phase 7 (deferred): Mute
 
 - Phase 0 item 4: what the `amazon-gating` button does to capture at the source.

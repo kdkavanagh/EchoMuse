@@ -148,7 +148,7 @@ is never filled.
  "assets":["<sha256>",…],
  "volume":{"level":120,"seeded":false}}
 ```
-An Echo Show (`"platform":"fireos6_crown"`) announces the eight required
+An Echo Show (`"platform":"fireos6_crown"` or `"lineage18_crown"`) announces the eight required
 capabilities (`alert_cache_v1` under the same wakelock condition) plus
 `alert_prefetch`, `local_wake_chime`, `open_rules_v1`, `afe_metadata_v1`,
 `ambient_light` when its sensor is readable, and `screen_wake`: no `leds`,
@@ -188,7 +188,7 @@ a hardware privacy mute and reports it in `privacy.muted` and
 as off. On the Echo Show the device's own Android stack owns Wi-Fi and
 Bluetooth, and its mute is not integrated yet (`privacy.muted` is always
 false there).
-`screen_wake`: announced by firmware on the Echo Show (`fireos6_crown`) only.
+`screen_wake`: announced by firmware on the Echo Show (`fireos6_crown`, `lineage18_crown`) only.
 With `config` `screenWake` true the device lights the kiosk screen when a wake
 candidate opens, with
 `GET {screenWakeUrl}/?cmd=screenOn&type=json&password={screenWakePassword, URL-encoded}`
@@ -196,10 +196,12 @@ to the kiosk's local REST API (Fully Kiosk Browser's Remote Administration):
 asynchronous, 2 s timeout, failures logged rate-limited, never delaying or
 blocking the wake.
 `platform`: the system image the firmware runs on: `fireos6` (Echo Dot 2nd
-gen, Fire OS 6, Android 7.1.2 `biscuit_puffin`) or `fireos6_crown` (Echo Show 8
-1st gen `crown`, Fire OS 6 with the full Android framework). One firmware
-binary runs on both and picks its audio backend and hardware bindings at
-runtime. It is not a capability and selects no protocol behaviour; it is an
+gen, Fire OS 6, Android 7.1.2 `biscuit_puffin`), `fireos6_crown` (Echo Show 8
+1st gen `crown`, Fire OS 6 with the full Android framework) or
+`lineage18_crown` (the same Echo Show 8 on LineageOS 18.1, Android 11, with no
+Amazon apps). One firmware binary runs on all three and picks its audio
+backend and hardware bindings at runtime. It is not a capability and selects
+no protocol behaviour; it is an
 admission check, and it decides which reason the dashboard gives for an absent
 optional capability ("managed by the device" or "no LED ring on this device"
 on an Echo Show, "firmware update available" on an older Dot). The controller
@@ -556,11 +558,14 @@ fields unchanged:
 
 Volume levels (`volume_set`, `volume_state`, a non-null hello `volume.level`,
 `startupVolume`) are 0–127 on every platform. The Echo Show's volume is
-Android's `STREAM_MUSIC` index 0–30, shared with its volume keys and the kiosk;
-its firmware maps proportionally, index = round(level × 30 / 127) and
-level = round(index × 127 / 30). Android's index is the live state there: once
-the firmware's startup check of its pinned `service call audio` codes passes
-(maximum index 30, and a get / set-same / get round trip), hello
+Android's `STREAM_MUSIC` index, shared with its volume keys and the kiosk:
+0–30 on Fire OS (`fireos6_crown`), 0–15 on LineageOS (`lineage18_crown`). Its
+firmware maps proportionally to the image's maximum, index =
+round(level × max / 127) and level = round(index × 127 / max), and pins the
+`service call audio` codes per image (Fire OS: get 8, set 3, max 10;
+LineageOS: get 16, set 10, max 18). Android's index is the live state there: once
+the firmware's startup check of those codes passes
+(the image's maximum index, and a get / set-same / get round trip), hello
 `volume.seeded` is already true, so `startupVolume` is never applied over it,
 and the device sends `volume_state` with Android's level right after
 `session.ready`. Key presses and kiosk changes are reported as `volume_state`

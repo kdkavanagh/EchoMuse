@@ -160,8 +160,9 @@ class DevicePlatform(enum.StrEnum):
     """`session.hello.platform` (WIRE §4.1): the system image the firmware runs on.
     One firmware binary runs on every member; it picks its backends at runtime."""
 
-    FIREOS6 = "fireos6"               # Echo Dot 2nd gen, Android 7.1.2 `biscuit_puffin`: headless, toybox only
-    FIREOS6_CROWN = "fireos6_crown"   # Echo Show 8 1st gen `crown`, Fire OS 6 with the full Android framework
+    FIREOS6 = "fireos6"                   # Echo Dot 2nd gen, Android 7.1.2 `biscuit_puffin`: headless, toybox only
+    FIREOS6_CROWN = "fireos6_crown"       # Echo Show 8 1st gen `crown`, Fire OS 6 with the full Android framework
+    LINEAGE18_CROWN = "lineage18_crown"   # the same Echo Show 8 on LineageOS 18.1 (Android 11), no Amazon apps
 
 
 class RejectReason(enum.StrEnum):

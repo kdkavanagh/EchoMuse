@@ -314,6 +314,7 @@ type opts struct {
 	ambient    bool
 	afe        bool // the mic decodes AFE metadata (Config.AFEMetadata)
 	crown      bool // the Echo Show (fireos6_crown) instead of the Dot
+	lineage    bool // with crown: the LineageOS Show (lineage18_crown)
 	// volumeUnavailable: the Show's Android volume check failed
 	// (server.Config.VolumeUnavailable).
 	volumeUnavailable string
@@ -356,6 +357,9 @@ func newHarness(t *testing.T, o opts) *harness {
 	platform := proto.PlatformFireOS6
 	if o.crown {
 		platform = proto.PlatformFireOS6Crown
+		if o.lineage {
+			platform = proto.PlatformLineage18Crown
+		}
 	}
 	h.phys = server.New(server.Config{Hardware: h.hw, StatePath: filepath.Join(dir, "state.json"),
 		NoPrivacyMute: o.crown, VolumeAuthoritative: o.crown && o.volumeUnavailable == "", VolumeUnavailable: o.volumeUnavailable})
@@ -885,6 +889,7 @@ func TestHelloCapabilities(t *testing.T) {
 		{"dot", opts{}, proto.PlatformFireOS6,
 			[]proto.Capability{"leds", "led_anim", "buttons", "button_hold", "wifi_control", "ble_proxy", "privacy_mute"}},
 		{"show", opts{crown: true}, proto.PlatformFireOS6Crown, []proto.Capability{"screen_wake"}},
+		{"lineage show", opts{crown: true, lineage: true}, proto.PlatformLineage18Crown, []proto.Capability{"screen_wake"}},
 	} {
 		h := newHarness(t, tc.o)
 		hello := h.s.Hello()

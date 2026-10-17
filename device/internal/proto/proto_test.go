@@ -60,9 +60,12 @@ func TestHelloAmbientLightStatus(t *testing.T) {
 }
 
 // session.hello names the image as the controller parses it: "fireos6" on
-// the Dot, "fireos6_crown" on the Show, always present on the wire.
+// the Dot, "fireos6_crown" on the Fire OS Show, "lineage18_crown" on the
+// LineageOS Show, always present on the wire.
 func TestHelloPlatform(t *testing.T) {
-	for p, want := range map[Platform]string{PlatformFireOS6: `"fireos6"`, PlatformFireOS6Crown: `"fireos6_crown"`} {
+	for p, want := range map[Platform]string{
+		PlatformFireOS6: `"fireos6"`, PlatformFireOS6Crown: `"fireos6_crown"`, PlatformLineage18Crown: `"lineage18_crown"`,
+	} {
 		var m map[string]json.RawMessage
 		b, err := json.Marshal(SessionHello{Platform: p})
 		if err != nil {

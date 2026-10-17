@@ -43,6 +43,9 @@ const (
 const (
 	sampleNs = 1_000_000_000 / 16000 // one 16 kHz sample
 
+	periodFrames = 1280 // §4.1: 80 ms periods
+	periodNs     = periodFrames * sampleNs
+
 	// afeTimestampMod is AFE_TIMESTAMP's modulus, in ms.
 	afeTimestampMod = 1 << 16
 

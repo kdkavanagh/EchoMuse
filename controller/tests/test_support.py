@@ -642,7 +642,7 @@ def test_the_wizard_probe_list_matches_the_allowlist():
     blocks = re.findall(r"const _PROVISION_PROBES(?:_[A-Z]+)? = \{(.*?)\n  \};", jsx, re.S)
     assert blocks, "dashboard.jsx no longer defines _PROVISION_PROBES"
     in_jsx = {name for block in blocks
-              for name in re.findall(r"^\s*([a-z_]+):", block, re.M)}
+              for name in re.findall(r"^\s*([a-z][a-z0-9_]*):", block, re.M)}
     in_py = {str(p) for p in S.ProvisionProbe}
 
     assert not (in_jsx - in_py), (

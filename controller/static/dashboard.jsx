@@ -120,8 +120,9 @@ const CAPABILITY = Object.freeze({
 
 // em_device_link.DevicePlatform — the image a device's session runs on.
 const PLATFORM_LABEL = Object.freeze({
-  fireos6:       'Echo Dot 2nd gen · Fire OS 6',
-  fireos6_crown: 'Echo Show 8 1st gen · Fire OS 6',
+  fireos6:         'Echo Dot 2nd gen · Fire OS 6',
+  fireos6_crown:   'Echo Show 8 1st gen · Fire OS 6',
+  lineage18_crown: 'Echo Show 8 1st gen · LineageOS 18.1',
 });
 
 // deviceState()'s key: what the dashboard shows a device doing. Derived here
@@ -3832,12 +3833,18 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                     Re-apply the debloat: re-sync the start script, which carries the service
                     denylist, and stop Amazon's services now — no reboot needed. The same list is
                     stopped on every boot and with every firmware update; this is for a device
-                    already on the current firmware. Idempotent. On an Echo Show it also re-syncs
-                    the Alexa hide lists and re-hides any listed app that has become visible.
+                    already on the current firmware. Idempotent. On an Echo Show with Fire OS it
+                    also re-syncs the Alexa hide lists and re-hides any listed app that has become
+                    visible. A LineageOS Show has nothing to debloat.
                   </div>
-                  <Pill small disabled={!device.connected || debloating} onClick={doDebloat}>
-                    {debloating ? 'Applying…' : 'Re-apply debloat'}
-                  </Pill>
+                  <div style={{ display:'flex', alignItems:'center', gap:10, flexWrap:'wrap' }}>
+                    <Pill small disabled={!device.connected || debloating || !!device.debloat_gap} onClick={doDebloat}>
+                      {debloating ? 'Applying…' : 'Re-apply debloat'}
+                    </Pill>
+                    {device.debloat_gap && (
+                      <span style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)' }}>{device.debloat_gap}</span>
+                    )}
+                  </div>
                 </Panel>
               )}
 
@@ -3957,6 +3964,8 @@ function Card({ device, onClick, firmware }) {
 //   client.shell(cmd)   -> string
 //   client.push(path, Uint8Array, onProgress?)
 //   client.pull(path)   -> Uint8Array
+//   client.root()       -> adbd's answer to `adb root`
+//   client.reopen()     -> client, the same device after adbd restarted
 //   client.close()
 const _ADB = (() => {
   // Module cache — loaded once on first requestDevice() call.
@@ -4059,6 +4068,56 @@ const _ADB = (() => {
       try { await this._transport.close(); } catch {}
     }
 
+    // adb's `root:` service, as `adb root` sends it: Adb.createSocketAndWait
+    // (@yume-chan/adb 2.1.0 src/adb.ts), the call the library's own
+    // AdbTcpIpService makes for `tcpip:`; 2.1.0 has no root helper. adbd
+    // answers one line and closes the socket (LineageOS 18.1's
+    // restart_root_service): "restarting adbd as root" (it then restarts as
+    // uid 0, which drops this connection and re-enumerates the USB device),
+    // "adbd is already running as root", or a refusal, "ADB Root access is
+    // disabled by system setting - …" while Rooted debugging is off. Returns
+    // that line, trimmed; null when the connection went down before the
+    // answer arrived, which only the restart does.
+    async root() {
+      try {
+        return (await this._adb.createSocketAndWait('root:')).trim();
+      } catch {
+        return null;
+      }
+    }
+
+    // The same device again after adbd restarted (root()), without the
+    // picker: waits for this connection to drop (Adb.disconnected; 10 s at
+    // most, then it is closed anyway), finds the device by its serial among
+    // those the browser has already been granted
+    // (AdbDaemonWebUsbDeviceManager.getDevices, @yume-chan/adb-daemon-webusb
+    // 2.1.0 src/manager.ts) and authenticates again. A restarted adbd
+    // enumerates as the same USB device with the same serial, so the grant
+    // holds. Returns the new Client.
+    async reopen(logFn = () => {}, timeoutMs = 60000) {
+      if (!this.serial) {
+        throw new Error('The device reported no USB serial, so it cannot be found again without '
+                      + 'the picker. Click Reconnect.');
+      }
+      const { manager } = await _load(logFn);
+      await Promise.race([this._adb.disconnected, new Promise(r => setTimeout(r, 10000))]);
+      await this.close();
+      logFn(`Waiting for ${this.serial} to come back over USB…`);
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 1000));
+        const usbDevice = (await manager.BROWSER.getDevices()).find(d => d.serial === this.serial);
+        if (!usbDevice) continue;
+        try {
+          return await _open(usbDevice, logFn);
+        } catch (e) {
+          logFn(`Not answering yet (${e.message}) — retrying…`);
+        }
+      }
+      throw new Error(`${this.serial} did not come back over USB within ${timeoutMs / 1000}s of `
+                    + 'adbd restarting. Unplug it and plug it back in, click Reconnect, then Retry.');
+    }
+
     // ── Static factory ──────────────────────────────────────────────────────
 
     // Open the browser USB picker, load the library, authenticate, return a
@@ -4072,7 +4131,7 @@ const _ADB = (() => {
         );
       }
 
-      const { manager, Transport, Adb, defaultAuths } = await _load(logFn);
+      const { manager } = await _load(logFn);
 
       // Release any previous connection — calling connect() on an already-claimed
       // interface hangs indefinitely. This happens on retry after a reboot.
@@ -4085,25 +4144,31 @@ const _ADB = (() => {
       const usbDevice = await manager.BROWSER.requestDevice();
       if (!usbDevice) throw new Error('No device selected.');
       logFn(`Device selected: ${usbDevice.name ?? usbDevice.serial ?? 'unknown'}`);
-      _lastUsbDevice = usbDevice;
-
-      logFn('Opening USB connection…');
-      const connection = await usbDevice.connect();
-
-      logFn('Authenticating ADB…');
-      const transport = await Transport.authenticate({
-        serial:         usbDevice.serial ?? 'echomuse',
-        connection,
-        authenticators: defaultAuths,
-      });
-      logFn('ADB authenticated.');
-
-      const adb = new Adb(transport);
-      const banner = adb.banner?.product ?? '(unknown)';
-      logFn(`Connected. Banner: ${banner}`);
-
-      return new Client(adb, transport, banner, usbDevice.serial ?? null);
+      return _open(usbDevice, logFn);
     }
+  }
+
+  // Connect to a picked (or already granted) device and authenticate.
+  async function _open(usbDevice, logFn) {
+    const { Transport, Adb, defaultAuths } = await _load(logFn);
+    _lastUsbDevice = usbDevice;
+
+    logFn('Opening USB connection…');
+    const connection = await usbDevice.connect();
+
+    logFn('Authenticating ADB…');
+    const transport = await Transport.authenticate({
+      serial:         usbDevice.serial ?? 'echomuse',
+      connection,
+      authenticators: defaultAuths,
+    });
+    logFn('ADB authenticated.');
+
+    const adb = new Adb(transport);
+    const banner = adb.banner?.product ?? '(unknown)';
+    logFn(`Connected. Banner: ${banner}`);
+
+    return new Client(adb, transport, banner, usbDevice.serial ?? null);
   }
 
   return { Client };
@@ -4155,39 +4220,96 @@ const LOG_TONE_COLOR = Object.freeze({
 
 // The devices the wizard provisions, by their em_device_link.DevicePlatform
 // value: the string the firmware announces in session.hello once installed.
-const WIZARD_PLATFORM = Object.freeze({ DOT: 'fireos6', CROWN: 'fireos6_crown' });
+const WIZARD_PLATFORM = Object.freeze({
+  DOT: 'fireos6', CROWN: 'fireos6_crown', CROWN_LINEAGE: 'lineage18_crown',
+});
 
 // What a step is called on each, for "not applicable" notes.
 const WIZARD_PLATFORM_NAME = Object.freeze({
   [WIZARD_PLATFORM.DOT]: 'Echo Dot', [WIZARD_PLATFORM.CROWN]: 'Echo Show 8',
+  [WIZARD_PLATFORM.CROWN_LINEAGE]: 'Echo Show 8 (LineageOS)',
 });
+
+// Both Echo Show images: Android owns their Wi-Fi, their audio service is
+// audioserver, and the server logs under /data/local/tmp/echomuse.
+function _isShow(platform) {
+  return platform === WIZARD_PLATFORM.CROWN || platform === WIZARD_PLATFORM.CROWN_LINEAGE;
+}
+
+// /system/lib/libasp.so of our LineageOS 18.1 build for crown: the NS6571
+// AFE, which writes the v3.3 metadata the firmware decodes
+// (docs/echo-show-lineage-plan.md §1 "ROM", docs/echo-show-crown.md §8.4).
+// Upstream builds carry another libasp.so (v0.6: no metadata at all), so
+// this hash is what connect_android pins a LineageOS Show to, in place of a
+// Fire OS build id.
+const _LINEAGE_LIBASP_SHA1 = 'e3816eb3efd4654c708d3891a5f907b79f3ebce3';
+
+// Whether `sha1sum /system/lib/libasp.so` (its trimmed output) names ours.
+function _isOurLibasp(sha1sumOut) {
+  return (sha1sumOut || '').trim().split(/\s+/)[0].toLowerCase() === _LINEAGE_LIBASP_SHA1;
+}
 
 // What connect_android requires of the device's own properties before it
 // trusts the shell, and which device that makes it:
 //  - Echo Dot 2nd gen: Fire OS 6 (Android 7.1.x, biscuit_puffin) with the adb
 //    shell already root via boot-root.zip;
 //  - Echo Show 8 1st gen: Fire OS 6 (Android 7.1.x, product crown) with the
-//    adb shell already root via the crown thread's boot-root.img.
+//    adb shell already root via the crown thread's boot-root.img;
+//  - Echo Show 8 1st gen on LineageOS 18.1 (Android 11, product crown,
+//    ro.lineage.version set): our build, by its libasp.so, with the adb
+//    shell root once Developer options' "Rooted debugging" let adbd restart
+//    as root (connect_android asks for that before calling this).
 // Returns the WIZARD_PLATFORM; throws the refusal. Pure and side-effect-free
 // so every outcome is testable without a device.
 //
 // `uid` is the trimmed stdout of `id -u`; `productName` and `productDevice`
-// are ro.product.name and ro.product.device.
+// are ro.product.name and ro.product.device; `lineageVersion` is
+// ro.lineage.version (empty on Fire OS); `libaspSha1` is sha1sum's output
+// for /system/lib/libasp.so and `rootReply` adbd's answer to `adb root`,
+// both asked of a LineageOS Show only.
 function classifyDevice(opts) {
-  const { release, productName, productDevice, uid } = opts;
+  const { release, productName, productDevice, uid, lineageVersion, libaspSha1, rootReply } = opts;
   const rel = release || '';
+  const lineage = (lineageVersion || '').trim();
+  const crown = productName === 'crown' || productDevice === 'crown';
   if (rel.startsWith('5.')) {
     throw new Error(
       `This Dot runs Fire OS 5 (Android ${rel}), which EchoMuse no longer supports. Move it to `
       + `Fire OS 6 first (amonet-biscuit v2, then boot-root.zip) — see docs/rooting.md in the `
       + `EchoMuse repository.`);
   }
+  if (crown && lineage) {
+    if (!rel.startsWith('11')) {
+      throw new Error(
+        `This Echo Show 8 runs LineageOS ${lineage} (Android ${rel}); EchoMuse supports `
+        + `LineageOS 18.1 (Android 11) only — see docs/rooting.md.`);
+    }
+    if (!_isOurLibasp(libaspSha1)) {
+      const sha = (libaspSha1 || '').trim().split(/\s+/)[0];
+      throw new Error(
+        `This Echo Show 8 runs LineageOS ${lineage}, but not the build EchoMuse needs: its `
+        + `/system/lib/libasp.so is ${sha || '(unreadable)'}, not the NS6571 AFE `
+        + `(${_LINEAGE_LIBASP_SHA1.slice(0, 8)}…) whose metadata EchoMuse reads. Flash a build of `
+        + `our fork (branch crown-ns6571-asp of kdkavanagh/android_device_amazon_crown and `
+        + `kdkavanagh/android_vendor_amazon_crown) — see docs/rooting.md — then Retry.`);
+    }
+    if (uid !== '0') {
+      throw new Error(
+        `This Echo Show 8 runs LineageOS ${lineage} but the adb shell is not root `
+        + `(id -u = "${uid || '(unknown)'}"${rootReply ? `; adbd said "${rootReply}"` : ''}). `
+        + `On the Show, open Developer options (Settings → System) and switch on "USB debugging" `
+        + `and "Rooted debugging" (if Developer options is missing, tap Build number in the `
+        + `Settings → About page seven times first), then Retry — see docs/rooting.md.`);
+    }
+    return WIZARD_PLATFORM.CROWN_LINEAGE;
+  }
   if (!rel.startsWith('7.1')) {
     throw new Error(
       `Expected Fire OS 6 (Android 7.1.x: an Echo Dot 2nd gen, biscuit_puffin, or an Echo `
-      + `Show 8 1st gen, crown), got Android ${rel}. Wrong device?`);
+      + `Show 8 1st gen, crown) or LineageOS 18.1 on an Echo Show 8, got Android ${rel}. `
+      + `Wrong device?`);
   }
-  if (productName === 'crown' || productDevice === 'crown') {
+  if (crown) {
     if (uid !== '0') {
       throw new Error(
         `This is an Echo Show 8 (crown, Android ${rel}) but the adb shell is not root `
@@ -4252,9 +4374,87 @@ on property:sys.boot_completed=1
     start echomuse
 `;
 
+// The Echo Show 8's echomuse.rc on LineageOS 18.1 (docs/echo-show-lineage-
+// plan.md decision 9). There init may start the service in `su` itself, a
+// defined, permissive domain in this userdebug policy, so there is no
+// `adbd` way in and no move: measured with a test service of the same
+// shape, which recorded at boot (docs/echo-show-crown.md §8.5). `root` and
+// `audio` for the capture, `inet` for the controller link; nothing else is
+// the firmware's there. Same trailing-newline rule.
+const _ECHOMUSE_RC_LINEAGE = `service echomuse /system/bin/sh /data/local/bin/start_server.sh
+    class late_start
+    user root
+    group root audio inet
+    seclabel u:r:su:s0
+    disabled
+
+on property:sys.boot_completed=1
+    start echomuse
+`;
+
+// Where install_boot_hook puts _ECHOMUSE_ADDOND_LINEAGE.
+const _ADDOND_PATH = '/system/addon.d/50-echomuse.sh';
+
+// The addon.d v2 script that keeps the LineageOS boot hook across a
+// LineageOS update (decision 9): the updater's backuptool runs every
+// /system/addon.d script around the system write, and this one backs up
+// and restores /system/etc/init/echomuse.rc, nothing else. Written 0755,
+// byte-for-byte; the shape is LineageOS 18.1's own 50-lineage.sh, and a
+// dirty flash with a script of this shape kept the .rc (docs/echo-show-
+// crown.md §8.5). The binary and its state are on /data, which an update
+// does not touch; a clean flash loses both files, and re-running the wizard
+// writes them again.
+const _ECHOMUSE_ADDOND_LINEAGE = `#!/sbin/sh
+#
+# ADDOND_VERSION=2
+#
+# /system/addon.d/50-echomuse.sh
+# During a LineageOS upgrade, this script backs up EchoMuse's init service,
+# /system/etc/init/echomuse.rc; /system is formatted and reinstalled, then
+# the file is restored. Written by the EchoMuse provisioning wizard.
+#
+
+. /tmp/backuptool.functions
+
+list_files() {
+cat <<EOF
+etc/init/echomuse.rc
+EOF
+}
+
+case "$1" in
+  backup)
+    list_files | while read FILE DUMMY; do
+      backup_file $S/"$FILE"
+    done
+  ;;
+  restore)
+    list_files | while read FILE REPLACEMENT; do
+      R=""
+      [ -n "$REPLACEMENT" ] && R="$S/$REPLACEMENT"
+      [ -f "$C/$S/$FILE" ] && restore_file $S/"$FILE" "$R"
+    done
+  ;;
+  pre-backup)
+    # Stub
+  ;;
+  post-backup)
+    # Stub
+  ;;
+  pre-restore)
+    # Stub
+  ;;
+  post-restore)
+    # Stub
+  ;;
+esac
+`;
+
 // The boot hook a platform gets.
 function _rcFor(platform) {
-  return platform === WIZARD_PLATFORM.CROWN ? _ECHOMUSE_RC_CROWN : _ECHOMUSE_RC;
+  if (platform === WIZARD_PLATFORM.CROWN) return _ECHOMUSE_RC_CROWN;
+  if (platform === WIZARD_PLATFORM.CROWN_LINEAGE) return _ECHOMUSE_RC_LINEAGE;
+  return _ECHOMUSE_RC;
 }
 
 // Whether the file already on device matches what install_boot_hook would
@@ -4289,7 +4489,10 @@ const _TESTED_CROWN_NAME  = 'Fire OS 6574.1';
 // The untested-build warning for a device, or null when it runs the tested
 // build (or says nothing about its build). `buildIds` are
 // ro.build.version.name and ro.build.display.id: either may carry the code.
+// A LineageOS Show has no Fire OS build id to compare; its pin is the
+// libasp.so hash classifyDevice already required.
 function untestedBuild(platform, buildIds) {
+  if (platform === WIZARD_PLATFORM.CROWN_LINEAGE) return null;
   const [code, name] = platform === WIZARD_PLATFORM.CROWN
     ? [_TESTED_CROWN_BUILD, _TESTED_CROWN_NAME]
     : [_TESTED_FIREOS6_BUILD, _TESTED_FIREOS6_NAME];
@@ -4451,9 +4654,10 @@ function _listedPackages(out) {
 }
 
 // Where the server's own output goes: the Dot's tmpfs /tmp, and on the Show
-// (no /tmp at all) /data/local/tmp/echomuse. Mirrors LOG in start_server.sh.
+// (no /tmp at all, on either image) /data/local/tmp/echomuse. Mirrors LOG in
+// start_server.sh.
 function _serverLog(platform) {
-  return platform === WIZARD_PLATFORM.CROWN ? '/data/local/tmp/echomuse/server.log' : '/tmp/server.log';
+  return _isShow(platform) ? '/data/local/tmp/echomuse/server.log' : '/tmp/server.log';
 }
 
 // WiFi security labels, used in the network picker and in error messages.
@@ -4462,10 +4666,11 @@ const _SECURITY_LABEL = {
   wpa2: 'WPA2', wpa3: 'WPA3', open: 'Open', wep: 'WEP', enterprise: 'Enterprise',
 };
 
-// Steps, in order. One list for both devices: each names the platforms it
+// Steps, in order. One list for every device: each names the platforms it
 // runs on (`on`); until connect_android has said which device this is,
-// every step shows, and afterwards the other device's steps show as not
-// applicable. `crownDesc` replaces `desc` on the Echo Show.
+// every step shows, and afterwards the other devices' steps show as not
+// applicable. `crownDesc` replaces `desc` on either Echo Show image, and
+// `lineageDesc` replaces both on LineageOS.
 //
 // Echo Dot (docs/fireos6-port.md Phase 3/4). boot-root.zip already has the
 // shell at uid 0, and the only boot-time change EchoMuse makes is the one
@@ -4497,31 +4702,43 @@ const _SECURITY_LABEL = {
 //  neutralize_alexa   — setup flags, kiosk as HOME, pm hide the lists  [button]
 //  reboot, reconnect, verify_service (echomuse + audioserver), confirm_link
 //
+// Echo Show 8 on LineageOS 18.1 (docs/echo-show-lineage-plan.md Phase L4).
+// No Amazon apps, so no kiosk check and no neutralisation; the kiosk is the
+// owner's. adbd starts as uid 2000 after every boot, so connect_android and
+// reconnect restart it as root (`adb root`, allowed by "Rooted debugging"):
+//
+//  connect_android    — LineageOS 18.1 crown + our libasp + root + Wi-Fi
+//  install_boot_hook  — echomuse.rc + addon.d script, / remounted rw then ro
+//  install_em         — push bundled firmware + startup script        [auto]
+//  reboot, reconnect, verify_service (echomuse + audioserver), confirm_link
+//
 // `id` is also what a diagnostics upload names the failed step by.
-const _BOTH_PLATFORMS = [WIZARD_PLATFORM.DOT, WIZARD_PLATFORM.CROWN];
+const _ALL_PLATFORMS = Object.values(WIZARD_PLATFORM);
 const _WIZARD_STEPS = [
-  { id: 'connect_android',   label: 'Connect Device',    on: _BOTH_PLATFORMS,
-    desc: 'Connect the Echo device via USB, booted and rooted. Echo Dot: Fire OS 6 rooted via boot-root.zip, "AEOBC" in the USB picker. Echo Show 8: rooted via boot-root.img, already on Wi-Fi (joined on the device), your kiosk app installed.' },
+  { id: 'connect_android',   label: 'Connect Device',    on: _ALL_PLATFORMS,
+    desc: 'Connect the Echo device via USB, booted and rooted. Echo Dot: Fire OS 6 rooted via boot-root.zip, "AEOBC" in the USB picker. Echo Show 8: rooted via boot-root.img, already on Wi-Fi (joined on the device), your kiosk app installed. Echo Show 8 on LineageOS 18.1: our build, "USB debugging" and "Rooted debugging" switched on in Developer options, already on Wi-Fi.' },
   { id: 'check_home',        label: 'Check Kiosk',       on: [WIZARD_PLATFORM.CROWN],
     desc: "Confirm a home-screen app other than Amazon's is installed (your kiosk). Fully Kiosk Browser ships its home screen switched off; the wizard switches it on (pm enable), as Fully's own launcher setting would. Amazon's launchers are hidden later; with no other home screen the display would stay blank." },
-  { id: 'install_boot_hook', label: 'Install Boot Hook', on: _BOTH_PLATFORMS,
+  { id: 'install_boot_hook', label: 'Install Boot Hook', on: _ALL_PLATFORMS,
     desc: 'Write the echomuse init service to /system/etc/init/ on the system slot the Dot is running. The other slot is left stock until this one is proven.',
-    crownDesc: 'Write the echomuse init service to /system/etc/init/, remounting /system read-write for the write and read-only again after it.' },
-  { id: 'install_em',        label: 'Install EchoMuse',  on: _BOTH_PLATFORMS,
+    crownDesc: 'Write the echomuse init service to /system/etc/init/, remounting /system read-write for the write and read-only again after it.',
+    lineageDesc: 'Write the echomuse init service to /system/etc/init/ and its addon.d script to /system/addon.d/ (a LineageOS update keeps the service), remounting / read-write for the writes and read-only again after them.' },
+  { id: 'install_em',        label: 'Install EchoMuse',  on: _ALL_PLATFORMS,
     desc: 'Push the EchoMuse firmware bundled with this controller, and its startup script, to the device.' },
   { id: 'wifi',              label: 'Configure WiFi',    on: [WIZARD_PLATFORM.DOT],
     desc: "Write the WiFi network into wpa_supplicant.conf — the firmware brings WiFi up itself at boot." },
   { id: 'neutralize_alexa',  label: 'Neutralise Alexa',  on: [WIZARD_PLATFORM.CROWN],
     desc: "Mark setup complete, repair Settings, make your kiosk the home screen, hide Amazon's Alexa apps (Tier 1) with pm hide and deny the microphone to the Amazon apps that must stay (Alexa's wake engine, Amazon's keyboard) — all reversible. Tier 2 is optional." },
-  { id: 'reboot',            label: 'Reboot',            on: _BOTH_PLATFORMS,
+  { id: 'reboot',            label: 'Reboot',            on: _ALL_PLATFORMS,
     desc: 'Reboot device to start the echomuse service.' },
-  { id: 'reconnect',         label: 'Reconnect',         on: _BOTH_PLATFORMS,
+  { id: 'reconnect',         label: 'Reconnect',         on: _ALL_PLATFORMS,
     desc: 'Re-connect ADB as soon as the device appears as "AEOBC" in the USB picker.',
-    crownDesc: 'Re-connect ADB as soon as the Echo Show appears in the USB picker.' },
-  { id: 'verify_service',    label: 'Verify Service',    on: _BOTH_PLATFORMS,
+    crownDesc: 'Re-connect ADB as soon as the Echo Show appears in the USB picker.',
+    lineageDesc: 'Re-connect ADB as soon as the Echo Show appears in the USB picker. adbd starts unprivileged after a reboot, so the wizard restarts it as root again.' },
+  { id: 'verify_service',    label: 'Verify Service',    on: _ALL_PLATFORMS,
     desc: "Confirm the echomuse service and Amazon's mixer are both running.",
     crownDesc: "Confirm the echomuse service and Android's audioserver are both running." },
-  { id: 'confirm_link',      label: 'Confirm Link',      on: _BOTH_PLATFORMS,
+  { id: 'confirm_link',      label: 'Confirm Link',      on: _ALL_PLATFORMS,
     desc: 'Wait for the device to join WiFi and reach this controller (a new device shows up pending approval).',
     crownDesc: 'Wait for the Echo Show to reach this controller over its Wi-Fi (a new device shows up pending approval).' },
   { id: 'mirror_boot_hook',  label: 'Mirror Boot Hook',  on: [WIZARD_PLATFORM.DOT],
@@ -4553,7 +4770,8 @@ function _lastStep(platform) {
 
 // A step's description for the device at hand.
 function _stepDesc(step, platform) {
-  return platform === WIZARD_PLATFORM.CROWN && step.crownDesc ? step.crownDesc : step.desc;
+  if (platform === WIZARD_PLATFORM.CROWN_LINEAGE && step.lineageDesc) return step.lineageDesc;
+  return _isShow(platform) && step.crownDesc ? step.crownDesc : step.desc;
 }
 
 // Steps that establish an ADB connection rather than needing one, steps
@@ -4924,12 +5142,27 @@ function ProvisionWizard({ onClose, knownDevices }) {
     mic_deny:        'while read -r p _; do case "$p" in ""|"#"*) ;; *) echo "$p: $(appops get $p RECORD_AUDIO </dev/null 2>&1)" ;; esac; done < /data/local/etc/echomuse/crown_mic_deny_packages.txt 2>&1',
     settings_bundle: `grep -o bundle_location ${_SETTINGS_BUNDLE_PREFS} 2>&1`,
   };
+  // docs/echo-show-lineage-plan.md Phase L4: the audio service, whether
+  // Android is on Wi-Fi, the privacy mute, which libasp.so this build ships
+  // (ours: the NS6571 AFE), and whether the addon.d script that keeps the
+  // boot hook across an update is there. ro.lineage.version comes with the
+  // props probe, init.svc.echomuse with echomuse_service.
+  const _PROVISION_PROBES_LINEAGE = {
+    audioserver_service: 'getprop init.svc.audioserver',
+    wlan:            'ip -4 addr show wlan0 2>&1',
+    amazon_gating:   'cat /sys/devices/platform/amazon-gating/state 2>&1',
+    libasp_sha1:     'sha1sum /system/lib/libasp.so 2>&1',
+    addond_script:   `ls -l ${_ADDOND_PATH} 2>&1`,
+  };
+  const _PLATFORM_PROBES = {
+    [WIZARD_PLATFORM.CROWN]: _PROVISION_PROBES_CROWN,
+    [WIZARD_PLATFORM.CROWN_LINEAGE]: _PROVISION_PROBES_LINEAGE,
+  };
 
   async function collectProvisionDiagnostics(c, stepIdx, err) {
     const probes = {};
     const asked = { ..._PROVISION_PROBES,
-                    ...(platformRef.current === WIZARD_PLATFORM.CROWN
-                          ? _PROVISION_PROBES_CROWN : _PROVISION_PROBES_DOT) };
+                    ...(_PLATFORM_PROBES[platformRef.current] || _PROVISION_PROBES_DOT) };
     for (const [name, cmd] of Object.entries(asked)) {
       try {
         // Bounded per probe. The device has just failed something and may be
@@ -4977,9 +5210,34 @@ function ProvisionWizard({ onClose, knownDevices }) {
 
   // ── Step runners ──
 
+  // decision 11 of docs/echo-show-lineage-plan.md: LineageOS's adbd runs as
+  // uid 2000 after every boot, even with "Rooted debugging" on, and adb's
+  // `root:` service restarts it as uid 0 (Client.root). The restart drops
+  // the USB connection and re-enumerates the device, so the wizard expects
+  // that disconnect and finds the same device again by its serial
+  // (Client.reopen). Returns the client to use from here on and adbd's
+  // answer, which a refusal quotes.
+  async function restartAdbdAsRoot(c) {
+    addLog('The adb shell is not root: asking adbd to restart as root (adb root)…');
+    expectDisconnect.current = true;
+    const reply = await c.root();
+    addLog(`  adbd: ${reply === null ? '(no answer: the connection dropped)' : reply || '(no answer)'}`);
+    if (reply !== null && !/restarting adbd as root/i.test(reply)) {
+      // No restart, so no disconnect is coming: the next one is real.
+      expectDisconnect.current = false;
+      return { client: c, reply };
+    }
+    setAdb(null);
+    const next = await c.reopen(addLog);
+    next._log = msg => addLog(`  adb: ${msg}`);
+    setAdb(next);
+    addLog('Reconnected to the restarted adbd.', LOG_TONE.OK);
+    return { client: next, reply: reply || '' };
+  }
+
   async function runConnectAndroid() {
     // requestDevice() handles USB open + ADB auth in one call.
-    const c = await _ADB.Client.requestDevice(addLog);
+    let c = await _ADB.Client.requestDevice(addLog);
     c._log = msg => addLog(`  adb: ${msg}`);
     setAdb(c);
     const model   = await c.shell('getprop ro.product.model');
@@ -4993,9 +5251,22 @@ function ProvisionWizard({ onClose, knownDevices }) {
     addLog(`Model: ${model || '(unknown)'}  Build: Android ${release}  Codename: ${name || '(unknown)'}  Serial: ${serial || '(unknown)'}`);
     addLog(`OS: ${fwName || '(unknown)'}  ${fwBuild || ''}`);
     // The adb shell's uid tells a rooted device apart from one that
-    // boot-root has not been flashed onto yet.
-    const uid = await c.shell('id -u');
-    const kind = classifyDevice({ release, productName: name, productDevice: device, uid });
+    // boot-root has not been flashed onto yet. On LineageOS, a Show running
+    // our build (its libasp.so) gets adbd restarted as root first; a refusal
+    // there means "Rooted debugging" is off.
+    let uid = await c.shell('id -u');
+    const lineageVersion = await c.shell('getprop ro.lineage.version');
+    let libaspSha1 = '', rootReply = '';
+    if (lineageVersion && (name === 'crown' || device === 'crown')) {
+      libaspSha1 = await c.shell('sha1sum /system/lib/libasp.so 2>&1');
+      addLog(`LineageOS ${lineageVersion}  libasp.so: ${libaspSha1.split(/\s+/)[0] || '(unreadable)'}`);
+      if (uid !== '0' && _isOurLibasp(libaspSha1)) {
+        ({ client: c, reply: rootReply } = await restartAdbdAsRoot(c));
+        uid = await c.shell('id -u');
+      }
+    }
+    const kind = classifyDevice({ release, productName: name, productDevice: device, uid,
+                                  lineageVersion, libaspSha1, rootReply });
     setPlatform(kind);
     const untested = untestedBuild(kind, [fwName, display]);
     if (untested) addLog(untested, LOG_TONE.WARN);
@@ -5003,7 +5274,7 @@ function ProvisionWizard({ onClose, knownDevices }) {
         && !name.toLowerCase().includes('biscuit')) {
       addLog('Warning: device may not be an Echo Dot 2nd gen — proceeding anyway.', LOG_TONE.WARN);
     }
-    if (kind === WIZARD_PLATFORM.CROWN) {
+    if (_isShow(kind)) {
       // The Show's Wi-Fi is Android's, joined on the device; EchoMuse never
       // configures it, so there is no Wi-Fi step to fall back on.
       const addr = _wlanAddress(await c.shell('ip -4 addr show wlan0 2>&1'));
@@ -5058,7 +5329,9 @@ function ProvisionWizard({ onClose, knownDevices }) {
     // boot-root already has the shell at uid 0, and the one boot-time
     // change (install_boot_hook) is written live from this same session.
     // Stay connected.
-    addLog(kind === WIZARD_PLATFORM.CROWN
+    addLog(kind === WIZARD_PLATFORM.CROWN_LINEAGE
+      ? `Echo Show 8 confirmed (crown, LineageOS ${lineageVersion}, our libasp.so, adb root, on Wi-Fi). Continuing…`
+      : kind === WIZARD_PLATFORM.CROWN
       ? 'Echo Show 8 confirmed (crown, Fire OS 6, adb root, on Wi-Fi). Continuing…'
       : 'FireOS 6 confirmed (biscuit_puffin, rooted via boot-root.zip). Continuing…', LOG_TONE.OK);
     return c;
@@ -5083,10 +5356,22 @@ function ProvisionWizard({ onClose, knownDevices }) {
   }
 
   async function runReconnect() {
-    const c = await _ADB.Client.requestDevice(addLog);
+    let c = await _ADB.Client.requestDevice(addLog);
     c._log = msg => addLog(`  adb: ${msg}`);
     setAdb(c);
     addLog('ADB connected.', LOG_TONE.OK);
+    // `adb root` does not survive a reboot on LineageOS: adbd comes back
+    // unprivileged, so restart it as root again, as connect_android did. The
+    // service checks read properties and need no root; the server log and
+    // the diagnostics do, so a refusal here is a warning.
+    if (platformRef.current === WIZARD_PLATFORM.CROWN_LINEAGE && (await c.shell('id -u')) !== '0') {
+      const { client, reply } = await restartAdbdAsRoot(c);
+      c = client;
+      if ((await c.shell('id -u')) !== '0') {
+        addLog(`adbd stayed unprivileged (${reply || 'no answer'}), so the server log cannot be read `
+             + 'from here. Check "Rooted debugging" in Developer options.', LOG_TONE.WARN);
+      }
+    }
     return c;
   }
 
@@ -5342,7 +5627,10 @@ function ProvisionWizard({ onClose, knownDevices }) {
     // place. Each step is checked individually rather than && chained —
     // that's what let the original bug stay silent in the first place.
     addLog('Clearing any pre-existing EchoMuse install…');
-    await c.shell('mkdir -p /data/local/bin');
+    // adb's shell runs with umask 000, so a bare mkdir leaves the directory
+    // init runs as root world-writable; with SELinux permissive (LineageOS)
+    // file modes are all that keeps an app from replacing the binary.
+    await c.shell('mkdir -p /data/local/bin && chmod 0755 /data/local/bin');
     const rmOut = (await c.shell('rm -f /data/local/bin/server /data/local/bin/server_a /data/local/bin/server_b 2>&1')).trim();
     if (rmOut) addLog(`  → ${rmOut}`);
     // Confirm the symlink itself is gone — readlink is already proven on
@@ -5449,11 +5737,13 @@ function ProvisionWizard({ onClose, knownDevices }) {
         addLog('TLS credentials installed — device will connect over wss.', LOG_TONE.OK);
       }
     }
-    // WiFi (the Show: neutralisation) and the reboot are separate steps —
-    // this one only has to leave the binary and startup script installed
-    // and verified.
+    // WiFi (the Fire OS Show: neutralisation) and the reboot are separate
+    // steps — this one only has to leave the binary and startup script
+    // installed and verified.
     addLog(platformRef.current === WIZARD_PLATFORM.CROWN
       ? 'EchoMuse installed — neutralising Alexa and the reboot are separate steps.'
+      : platformRef.current === WIZARD_PLATFORM.CROWN_LINEAGE
+      ? 'EchoMuse installed — the reboot is a separate step.'
       : 'EchoMuse installed — WiFi and reboot are separate steps.', LOG_TONE.OK);
   }
 
@@ -5479,18 +5769,28 @@ function ProvisionWizard({ onClose, knownDevices }) {
     return slot;
   }
 
-  async function withStagedRc(c, rc, fn) {
-    await c.push('/data/local/tmp/echomuse.rc.new', new TextEncoder().encode(rc));
+  async function withStaged(c, path, content, fn) {
+    await c.push(path, new TextEncoder().encode(content));
     try {
       await fn();
     } finally {
-      await c.shell('rm -f /data/local/tmp/echomuse.rc.new');
+      await c.shell(`rm -f ${path}`);
     }
+  }
+
+  function withStagedRc(c, rc, fn) {
+    return withStaged(c, '/data/local/tmp/echomuse.rc.new', rc, fn);
   }
 
   async function runInstallBootHook(c) {
     if (platformRef.current === WIZARD_PLATFORM.CROWN) {
       await withStagedRc(c, _ECHOMUSE_RC_CROWN, () => installBootHookCrown(c));
+      return;
+    }
+    if (platformRef.current === WIZARD_PLATFORM.CROWN_LINEAGE) {
+      await withStagedRc(c, _ECHOMUSE_RC_LINEAGE, () => withStaged(
+        c, '/data/local/tmp/50-echomuse.sh.new', _ECHOMUSE_ADDOND_LINEAGE,
+        () => installBootHookLineage(c)));
       return;
     }
     const active = await activeSlot(c);
@@ -5531,6 +5831,49 @@ function ProvisionWizard({ onClose, knownDevices }) {
     }
     addLog('/system/etc/init/echomuse.rc written and verified; /system is read-only again.',
            LOG_TONE.OK);
+  }
+
+  // LineageOS 18.1 mounts the system partition as / (system-as-root), with
+  // no verity and no overlayfs, so `mount -o remount,rw /` makes
+  // /system/etc/init and /system/addon.d writable (measured,
+  // docs/echo-show-crown.md §8.5). Both files are compared byte for byte
+  // and the addon.d script's mode with them, so a re-run writes only what
+  // is missing or stale. Undo: remount / read-write, delete both files,
+  // remount read-only (docs/rooting.md).
+  async function bootHookPresentLineage(c) {
+    const rc = await c.shell('cat /system/etc/init/echomuse.rc 2>/dev/null');
+    const addond = await c.shell(`cat ${_ADDOND_PATH} 2>/dev/null`);
+    const mode = (await c.shell(`stat -c %a ${_ADDOND_PATH} 2>/dev/null`)).trim();
+    return _rcInstalled(rc, _ECHOMUSE_RC_LINEAGE)
+        && _rcInstalled(addond, _ECHOMUSE_ADDOND_LINEAGE) && mode === '755';
+  }
+
+  async function installBootHookLineage(c) {
+    if (await bootHookPresentLineage(c)) {
+      addLog('Boot hook and its addon.d script already in place.', LOG_TONE.OK);
+      return;
+    }
+    addLog('Remounting / read-write…');
+    const rw = await c.shell('mount -o remount,rw / 2>&1');
+    if (rw.trim()) addLog(`  → ${rw.trim()}`);
+    try {
+      const out = (await c.shell('(cp /data/local/tmp/echomuse.rc.new /system/etc/init/echomuse.rc '
+                               + '&& chmod 0644 /system/etc/init/echomuse.rc '
+                               + '&& mkdir -p /system/addon.d '
+                               + `&& cp /data/local/tmp/50-echomuse.sh.new ${_ADDOND_PATH} `
+                               + `&& chmod 0755 ${_ADDOND_PATH} && sync) 2>&1`)).trim();
+      if (out) addLog(`  → ${out}`);
+    } finally {
+      // Always attempt the remount back, even if the write above threw.
+      const ro = await c.shell('mount -o remount,ro / 2>&1');
+      if (ro.trim()) addLog(`  → ${ro.trim()}`);
+    }
+    if (!await bootHookPresentLineage(c)) {
+      throw new Error(`/system/etc/init/echomuse.rc or ${_ADDOND_PATH} did not read back as written.`);
+    }
+    addLog(`/system/etc/init/echomuse.rc and ${_ADDOND_PATH} written and verified; / is `
+         + 'read-only again. A LineageOS update keeps the boot hook; a clean flash needs this '
+         + 'wizard again.', LOG_TONE.OK);
   }
 
   // The HOME activities the Show offers, logged; throws unless one of them
@@ -5799,7 +6142,7 @@ function ProvisionWizard({ onClose, knownDevices }) {
       }
       await new Promise(r => setTimeout(r, 3000));
     }
-    const crown = platformRef.current === WIZARD_PLATFORM.CROWN;
+    const crown = _isShow(platformRef.current);
     const serverLog = _serverLog(platformRef.current);
     const tail = await c.shell(
       `grep -E '\\[wifi\\]|\\[clock\\]|mDNS|link|session' ${serverLog} 2>&1 | tail -n 25`);
@@ -5927,7 +6270,7 @@ function ProvisionWizard({ onClose, knownDevices }) {
   // device_payloads/start_server.sh) rather than just naming the stuck
   // property.
   async function runVerifyService(c) {
-    const crown = platformRef.current === WIZARD_PLATFORM.CROWN;
+    const crown = _isShow(platformRef.current);
     const audio = crown ? 'audioserver' : 'mixer';
     addLog(`Waiting for echomuse and ${audio} to start…`);
     const TIMEOUT_MS = crown ? 180000 : 90000;
@@ -6074,9 +6417,11 @@ function ProvisionWizard({ onClose, knownDevices }) {
             <div style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)', letterSpacing: '0.12em', textTransform: 'uppercase', marginTop: 4 }}>
               {platform === WIZARD_PLATFORM.CROWN
                 ? 'Chrome/Edge only · USB cable · Fire OS 6 rooted via boot-root.img · on Wi-Fi · kiosk installed'
+                : platform === WIZARD_PLATFORM.CROWN_LINEAGE
+                  ? 'Chrome/Edge only · USB cable · LineageOS 18.1, our build · USB and Rooted debugging on · on Wi-Fi'
                 : platform === WIZARD_PLATFORM.DOT
                   ? 'Chrome/Edge only · USB-A cable · Fire OS 6 rooted via boot-root.zip'
-                  : 'Chrome/Edge only · USB cable · Echo Dot 2nd gen or Echo Show 8 1st gen, Fire OS 6, rooted'}
+                  : 'Chrome/Edge only · USB cable · Echo Dot 2nd gen (Fire OS 6) or Echo Show 8 1st gen (Fire OS 6 or LineageOS 18.1), rooted'}
             </div>
           </div>
           <CircleButton onClick={onClose} title="Close">×</CircleButton>

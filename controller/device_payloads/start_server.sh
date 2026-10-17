@@ -15,16 +15,21 @@ MIN_RUNTIME=15   # seconds below which an exit is treated as a failed start
 
 # ── Platform ─────────────────────────────────────────────────────────────────
 # One script for every device, as the firmware is one binary
-# (docs/echo-show-port-plan.md decision 1). The Echo Show 8 names itself in
+# (docs/echo-show-port-plan.md decision 1). An Echo Show 8 on LineageOS 18.1
+# names itself in ro.lineage.version, tested first because ro.product.device
+# reads crown on both Show images; the Fire OS Echo Show 8 names itself in
 # ro.product.device; everything else takes the Echo Dot path, exactly as it
 # ran before the Show existed. Only the boot preparation and the debloat
 # differ: the supervisor at the bottom is shared.
 #
 # The server's output goes to $LOG: the Dot's /tmp is a tmpfs mounted below;
-# the Show has no /tmp at all (its root is a read-only ramdisk rebuilt at
-# every boot), so its logs and the server's scratch space live under
-# /data/local/tmp/echomuse.
-if [ "$(getprop ro.product.device)" = crown ]; then
+# the Show has no /tmp at all on either image (Fire OS's root is a read-only
+# ramdisk rebuilt at every boot), so its logs and the server's scratch space
+# live under /data/local/tmp/echomuse.
+if [ -n "$(getprop ro.lineage.version)" ]; then
+    PLATFORM="lineage"
+    LOG_DIR=/data/local/tmp/echomuse
+elif [ "$(getprop ro.product.device)" = crown ]; then
     PLATFORM="crown"
     LOG_DIR=/data/local/tmp/echomuse
 else
@@ -76,13 +81,14 @@ fos6_debloat_check() {
     UP=${UP#,}
 }
 
-# ── Echo Show 8 (`crown`): Alexa neutralisation ──────────────────────────────
+# ── Echo Show 8 (`crown`) on Fire OS: Alexa neutralisation ───────────────────
 # docs/echo-show-port-plan.md Phases 3–4, docs/echo-show-crown.md §9. The
 # Show runs the full Android framework, and its audio, Wi-Fi, Bluetooth and
 # clock are Android's. Nothing in the crown path touches tinymix,
 # wpa_supplicant, wifisvc, the mixer or the Dot's denylist above, and it
 # NEVER stops audioserver or media: they own both PCMs and Amazon's AEC, and
-# stopping them takes the ASR pipeline with them.
+# stopping them takes the ASR pipeline with them. None of this runs on
+# LineageOS ($PLATFORM lineage), which has no Amazon apps or services.
 #
 # Alexa is APKs here, kept away from the hardware by `pm hide`. The wizard's
 # Neutralise Alexa step pushes the hide lists into $EM_ETC, hides them, and
@@ -233,6 +239,13 @@ package:$pkg
 # before:
 #   HIDE_REASSERTED:<re-hidden a,b,…> STILL_VISIBLE:<a,b,…>
 #   MIC_REASSERTED:<re-denied a,b,…> STILL_ALLOWED:<a,b,…>
+# LineageOS has no Amazon apps or services (docs/echo-show-lineage-plan.md
+# decision 10): nothing is listed, so nothing is stopped, and the result
+# says so. The controller never asks there (em_device.debloat_gap).
+if [ "$1" = "debloat" ] && [ "$PLATFORM" = lineage ]; then
+    echo "DEBLOAT_STOPPED:0 STILL_RUNNING:"
+    exit 0
+fi
 if [ "$1" = "debloat" ] && [ "$PLATFORM" = crown ]; then
     crown_rehide
     crown_mic_deny
@@ -276,7 +289,11 @@ fi
 # audioserver's binder replies are refused (`transaction failed 29201`), so
 # the OpenSL recorder cannot realize and `pm` lists nothing; after the move
 # capture, `pm` and `service call audio` all work.
-echo -n u:r:su:s0 > /proc/self/attr/current
+# LineageOS needs no move: its echomuse.rc has init start this script in
+# `su` directly (seclabel u:r:su:s0, measured, docs/echo-show-crown.md §8.5).
+if [ "$PLATFORM" != lineage ]; then
+    echo -n u:r:su:s0 > /proc/self/attr/current
+fi
 
 # ── Echo Dot boot preparation ─────────────────────────────────────────────────
 dot_boot() {
@@ -341,16 +358,21 @@ dot_boot() {
 }
 
 # ── Echo Show 8 boot preparation ──────────────────────────────────────────────
-# The hiding is re-asserted further down, once sup_log exists, and in the
-# background: it waits on the package manager, and the server need not.
-crown_boot() {
+# Both Show images: scratch space, the audio service, the wake lock. Fire OS
+# also stops its native stop list here, and re-asserts the hiding further
+# down, once sup_log exists, and in the background: it waits on the package
+# manager, and the server need not. LineageOS has no Amazon apps or services
+# (docs/echo-show-lineage-plan.md decision 10): no stop list, no hide lists,
+# no microphone denials.
+show_boot() {
     mkdir -p "$LOG_DIR"
     # The firmware's scratch space; Go's os.TempDir() reads it.
     export TMPDIR=$LOG_DIR
 
     # ── Wait for the audio service (up to 4 minutes) ─────────────────────────
-    # audioserver owns AudioFlinger, Amazon's HAL and libasp.so (findings
-    # §4.1); the firmware records and plays through it with OpenSL.
+    # audioserver owns AudioFlinger, the vendor HAL and libasp.so (findings
+    # §4.1); the firmware records and plays through it (OpenSL on Fire OS,
+    # AAudio on LineageOS).
     i=0
     while [ $i -lt 120 ]; do
         if [ "$(getprop init.svc.audioserver)" = "running" ]; then
@@ -360,19 +382,22 @@ crown_boot() {
         i=$((i + 2))
     done
 
-    crown_stop_services
-
     # Belt and braces: the open recorder already holds Android's `AudioIn`
     # wake lock, which kept a screen-off Show from suspending (measured,
     # findings §10). This one also covers the gaps while capture re-opens.
     echo "EchoMuse" > /sys/power/wake_lock
 }
 
-if [ "$PLATFORM" = crown ]; then
-    crown_boot
-else
-    dot_boot
-fi
+crown_boot() {
+    show_boot
+    crown_stop_services
+}
+
+case "$PLATFORM" in
+    lineage) show_boot ;;
+    crown)   crown_boot ;;
+    *)       dot_boot ;;
+esac
 
 # ── Log size cap ──────────────────────────────────────────────────────────────
 # $LOG only ever grows: everything below only ever appends — without a cap
@@ -445,12 +470,13 @@ sup_log() {
 
 sup_log "boot slot=$(readlink /data/local/bin/server 2>/dev/null)"
 
-# ── Show: re-assert the hide lists and mic denials ───────────────────────────
+# ── Fire OS Show: re-assert the hide lists and mic denials ───────────────────
 # crown_rehide and crown_mic_deny. The service starts on sys.boot_completed,
 # and the package manager answers shortly after; `pm path android` printing
 # a path is the readiness test, and `appops` (app_process, like `pm`) is
 # ready with it. Logged only when it had to act, which means something
-# unhid a package or allowed a microphone again.
+# unhid a package or allowed a microphone again. Not on LineageOS: nothing
+# there is Amazon's.
 if [ "$PLATFORM" = crown ]; then
     (
         i=0
@@ -480,10 +506,11 @@ fi
 # because the mixer daemon owns the PCM and the HAL reacts to the same
 # controls (see slspeaker.MixerSink.Close). Idempotent; the server re-enables
 # the amp in its own startup sequence.
-# Echo Dot only: on the Show audioserver owns the codec and its controls
-# have other meanings (findings §3), so there is nothing here to switch off.
+# Echo Dot only: on the Show (either image) audioserver owns the codec and
+# its controls have other meanings (findings §3), so there is nothing here
+# to switch off.
 amp_off() {
-    if [ "$PLATFORM" = crown ]; then
+    if [ "$PLATFORM" != dot ]; then
         return 0
     fi
     tinymix -D 0 61 0 0 2>/dev/null

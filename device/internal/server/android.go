@@ -2,11 +2,12 @@ package server
 
 import "github.com/wilbowes/EchoMuse/internal/androidvol"
 
-// StreamVolume is Android's STREAM_MUSIC index, 0..androidvol.MaxIndex
-// (internal/androidvol.Control).
+// StreamVolume is Android's STREAM_MUSIC index, 0..MaxIndex
+// (internal/androidvol.Control): 0..30 on Fire OS, 0..15 on LineageOS.
 type StreamVolume interface {
 	Index() (int, error)
 	SetIndex(index int) error
+	MaxIndex() int
 }
 
 // androidHardware is the Echo Show's Hardware. Volume is Android's
@@ -26,11 +27,11 @@ func (h androidHardware) ReadDAC() (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	return androidvol.LevelForIndex(index), nil
+	return androidvol.LevelForIndex(index, h.vol.MaxIndex()), nil
 }
 
 func (h androidHardware) SetDAC(level int) error {
-	return h.vol.SetIndex(androidvol.IndexForLevel(clamp(level)))
+	return h.vol.SetIndex(androidvol.IndexForLevel(clamp(level), h.vol.MaxIndex()))
 }
 
 func (androidHardware) SetADCMute(bool) error    { return nil }

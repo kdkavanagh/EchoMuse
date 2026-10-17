@@ -11,12 +11,23 @@ import (
 	"time"
 )
 
-// Replies as `service call audio` printed them on NS65741/8146.
+// Replies as `service call audio` printed them on NS65741/8146 (Fire OS)
+// and on lineage-18.1 for crown (Android 11, 2026-10-17).
 const (
 	replyGet12  = "Result: Parcel(00000000 0000000c   '........')\n"
 	replyMax30  = "Result: Parcel(00000000 0000001e   '........')\n"
 	replyVoid   = "Result: Parcel(00000000    '....')\n"
 	replyBadArg = "Result: Parcel(\n  0x00000000: fffffffd 00000012 00610042 00200064 '....B.a.d. .'\n  0x00000010: 00740073 00650072 'Bad stream type 99')\n"
+
+	replyA11Get5  = "Result: Parcel(00000000 00000005   '........')\n"
+	replyA11Max15 = "Result: Parcel(00000000 0000000f   '........')\n"
+	replyA11Void  = "Result: Parcel(00000000    '....')\n"
+	// getStreamVolume(99) on Android 11: IllegalArgumentException with
+	// its stack trace, one hex dump line per 16 bytes (truncated here).
+	replyA11BadArg = "Result: Parcel(\n" +
+		"  0x00000000: fffffffd 00000012 00610042 00200064 '........B.a.d. .'\n" +
+		"  0x00000010: 00740073 00650072 006d0061 00740020 's.t.r.e.a.m. .t.'\n" +
+		"  0x00000300: 0000000a                            '....            ')\n"
 )
 
 func TestParseReplies(t *testing.T) {
@@ -28,6 +39,18 @@ func TestParseReplies(t *testing.T) {
 	}
 	if err := parseVoid(replyVoid); err != nil {
 		t.Errorf("set: %v", err)
+	}
+	if n, err := parseInt(replyA11Get5); err != nil || n != 5 {
+		t.Errorf("Android 11 get: %d, %v", n, err)
+	}
+	if n, err := parseInt(replyA11Max15); err != nil || n != 15 {
+		t.Errorf("Android 11 max: %d, %v", n, err)
+	}
+	if err := parseVoid(replyA11Void); err != nil {
+		t.Errorf("Android 11 set: %v", err)
+	}
+	if _, err := parseInt(replyA11BadArg); err == nil {
+		t.Error("Android 11 exception parsed as an int")
 	}
 	for name, bad := range map[string]string{
 		"exception":        replyBadArg,
@@ -57,23 +80,32 @@ func TestParseReplies(t *testing.T) {
 	}
 }
 
-// The wire scale and the index map proportionally (contract formula), and
-// an index survives the round trip through a level, so a reported key
-// change re-applied later as a level lands on the same index.
+// The wire scale and the index map proportionally (contract formula) on
+// both builds' ranges, and an index survives the round trip through a
+// level, so a reported key change re-applied later as a level lands on the
+// same index.
 func TestLevelIndexMapping(t *testing.T) {
-	for _, tc := range []struct{ level, index int }{{0, 0}, {127, 30}, {85, 20}, {64, 15}, {2, 0}, {3, 1}, {-5, 0}, {200, 30}} {
-		if got := IndexForLevel(tc.level); got != tc.index {
-			t.Errorf("IndexForLevel(%d) = %d, want %d", tc.level, got, tc.index)
+	for _, tc := range []struct{ level, max, index int }{
+		{0, 30, 0}, {127, 30, 30}, {85, 30, 20}, {64, 30, 15}, {2, 30, 0}, {3, 30, 1}, {-5, 30, 0}, {200, 30, 30},
+		{0, 15, 0}, {127, 15, 15}, {85, 15, 10}, {64, 15, 8}, {4, 15, 0}, {5, 15, 1}, {200, 15, 15},
+	} {
+		if got := IndexForLevel(tc.level, tc.max); got != tc.index {
+			t.Errorf("IndexForLevel(%d, %d) = %d, want %d", tc.level, tc.max, got, tc.index)
 		}
 	}
-	for _, tc := range []struct{ index, level int }{{0, 0}, {30, 127}, {12, 51}, {20, 85}, {1, 4}, {31, 127}} {
-		if got := LevelForIndex(tc.index); got != tc.level {
-			t.Errorf("LevelForIndex(%d) = %d, want %d", tc.index, got, tc.level)
+	for _, tc := range []struct{ index, max, level int }{
+		{0, 30, 0}, {30, 30, 127}, {12, 30, 51}, {20, 30, 85}, {1, 30, 4}, {31, 30, 127},
+		{0, 15, 0}, {15, 15, 127}, {5, 15, 42}, {1, 15, 8}, {16, 15, 127},
+	} {
+		if got := LevelForIndex(tc.index, tc.max); got != tc.level {
+			t.Errorf("LevelForIndex(%d, %d) = %d, want %d", tc.index, tc.max, got, tc.level)
 		}
 	}
-	for i := 0; i <= MaxIndex; i++ {
-		if got := IndexForLevel(LevelForIndex(i)); got != i {
-			t.Errorf("index %d round trips to %d", i, got)
+	for _, codes := range []Codes{FireOS, Lineage18} {
+		for i := 0; i <= codes.MaxIndex; i++ {
+			if got := IndexForLevel(LevelForIndex(i, codes.MaxIndex), codes.MaxIndex); got != i {
+				t.Errorf("%s: index %d round trips to %d", codes.Name, i, got)
+			}
 		}
 	}
 }
@@ -81,6 +113,7 @@ func TestLevelIndexMapping(t *testing.T) {
 // fakeAudio is AudioService's STREAM_MUSIC as `service` sees it.
 type fakeAudio struct {
 	mu         sync.Mutex
+	codes      Codes // the build; FireOS when zero
 	index      int
 	max        int
 	calls      []string
@@ -93,22 +126,27 @@ type fakeAudio struct {
 }
 
 func (f *fakeAudio) control() *Control {
+	if f.codes.Name == "" {
+		f.codes = FireOS
+	}
+	codes := f.codes
 	return &Control{
+		codes: codes,
 		call: func(args ...string) (string, error) {
 			f.mu.Lock()
 			f.calls = append(f.calls, strings.Join(args, " "))
 			switch args[0] {
-			case codeGet:
+			case codes.Get:
 				index, hook := f.index, f.onGet
 				f.mu.Unlock()
 				if hook != nil {
 					hook()
 				}
 				return fmt.Sprintf("Result: Parcel(00000000 %08x   '........')\n", index), nil
-			case codeGetMax:
+			case codes.GetMax:
 				defer f.mu.Unlock()
 				return fmt.Sprintf("Result: Parcel(00000000 %08x   '........')\n", f.max), nil
-			case codeSet:
+			case codes.Set:
 				defer f.mu.Unlock()
 				if f.setErr {
 					return replyBadArg, nil
@@ -160,40 +198,60 @@ func (f *fakeAudio) key(index int) {
 }
 
 func TestSetIndexCallShape(t *testing.T) {
-	f := &fakeAudio{index: 12, max: 30}
-	c := f.control()
-	if err := c.SetIndex(20); err != nil || f.index != 20 {
-		t.Fatalf("set: %v, index %d", err, f.index)
-	}
-	if got := f.calls[0]; got != "3 i32 3 i32 20 i32 0 s16 com.android.shell" {
-		t.Errorf("set call %q", got)
-	}
-	if err := c.SetIndex(99); err != nil || f.index != 30 {
-		t.Fatalf("set clamps: %v, index %d", err, f.index)
-	}
-	f.setErr = true
-	if err := c.SetIndex(5); err == nil {
-		t.Fatal("a binder exception must fail the set")
+	for _, tc := range []struct {
+		codes      Codes
+		max        int
+		set, clamp string
+	}{
+		{FireOS, 30, "3 i32 3 i32 20 i32 0 s16 com.android.shell", "3 i32 3 i32 30 i32 0 s16 com.android.shell"},
+		{Lineage18, 15, "10 i32 3 i32 12 i32 0 s16 com.android.shell", "10 i32 3 i32 15 i32 0 s16 com.android.shell"},
+	} {
+		f := &fakeAudio{codes: tc.codes, index: 5, max: tc.max}
+		c := f.control()
+		want := 20
+		if tc.max == 15 {
+			want = 12
+		}
+		if err := c.SetIndex(want); err != nil || f.index != want {
+			t.Fatalf("%s set: %v, index %d", tc.codes.Name, err, f.index)
+		}
+		if err := c.SetIndex(99); err != nil || f.index != tc.max {
+			t.Fatalf("%s set clamps: %v, index %d", tc.codes.Name, err, f.index)
+		}
+		if f.calls[0] != tc.set || f.calls[1] != tc.clamp {
+			t.Errorf("%s set calls %q", tc.codes.Name, f.calls)
+		}
+		f.setErr = true
+		if err := c.SetIndex(5); err == nil {
+			t.Fatalf("%s: a binder exception must fail the set", tc.codes.Name)
+		}
 	}
 }
 
-// Verify passes on the pinned build without moving the index, and fails
-// when the maximum, the set or the read-back disagrees.
+// Verify passes on each build's own table without moving the index, and
+// fails when the maximum, the set or the read-back disagrees.
 func TestVerify(t *testing.T) {
-	f := &fakeAudio{index: 12, max: 30}
-	if err := f.control().Verify(); err != nil {
-		t.Fatalf("pinned build: %v", err)
-	}
-	if f.index != 12 {
-		t.Fatalf("verify changed the index to %d", f.index)
-	}
-	if got := f.calls[0]; got != "10 i32 3" {
-		t.Errorf("max call %q", got)
+	for _, tc := range []struct {
+		codes   Codes
+		max     int
+		maxCall string
+	}{{FireOS, 30, "10 i32 3"}, {Lineage18, 15, "18 i32 3"}} {
+		f := &fakeAudio{codes: tc.codes, index: 12, max: tc.max}
+		if err := f.control().Verify(); err != nil {
+			t.Fatalf("%s: %v", tc.codes.Name, err)
+		}
+		if f.index != 12 {
+			t.Fatalf("%s: verify changed the index to %d", tc.codes.Name, f.index)
+		}
+		if got := f.calls[0]; got != tc.maxCall {
+			t.Errorf("%s: max call %q", tc.codes.Name, got)
+		}
 	}
 	for name, bad := range map[string]*fakeAudio{
-		"wrong maximum":   {index: 12, max: 15},
-		"failing set":     {index: 12, max: 30, setErr: true},
-		"read-back moved": {index: 12, max: 30, setOffset: 1},
+		"Fire OS table on a 15-step build":   {index: 12, max: 15},
+		"LineageOS table on a 30-step build": {codes: Lineage18, index: 12, max: 30},
+		"failing set":                        {index: 12, max: 30, setErr: true},
+		"read-back moved":                    {index: 12, max: 30, setOffset: 1},
 	} {
 		if err := bad.control().Verify(); err == nil {
 			t.Errorf("%s accepted", name)

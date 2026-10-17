@@ -1,6 +1,7 @@
 """Capability negotiation (SPEC §11.1): admission requires the exact v1 set
-and one of the Fire OS 6 images, and every UI capability derives from the
-announced set and the platform, never a version."""
+and one of the supported images (the Dot's Fire OS 6, the Echo Show's Fire OS
+6 or LineageOS 18.1), and every UI capability derives from the announced set
+and the platform, never a version."""
 
 import re
 from pathlib import Path
@@ -135,6 +136,7 @@ def _hello_without_platform() -> SessionHello:
 @pytest.mark.parametrize("extra, expected", [
     ({"platform": "fireos6"}, DevicePlatform.FIREOS6),
     ({"platform": "fireos6_crown"}, DevicePlatform.FIREOS6_CROWN),
+    ({"platform": "lineage18_crown"}, DevicePlatform.LINEAGE18_CROWN),
     ({"platform": "fireos5"}, None),
     ({"platform": "fireos7"}, None),
     ({"platform": None}, None),
@@ -148,18 +150,19 @@ def test_a_hello_naming_no_platform_parses_as_none():
     assert _hello_without_platform().platform is None
 
 
-@pytest.mark.parametrize("platform", ["fireos6", "fireos6_crown"])
-def test_admission_accepts_both_fire_os_6_images(platform):
+@pytest.mark.parametrize("platform", ["fireos6", "fireos6_crown", "lineage18_crown"])
+def test_admission_accepts_every_supported_image(platform):
     assert isinstance(_admit(hello(platform=platform)), em_device.em_device_link.Admitted)
 
 
 @pytest.mark.parametrize("platform, logged", [
     ("fireos5", "'fireos5'"), ("fireos7", "'fireos7'"), ("crown", "'crown'"),
+    ("lineage18", "'lineage18'"), ("lineage19_crown", "'lineage19_crown'"),
     (None, "None"), (6, "6")])
 def test_admission_refuses_any_other_platform(platform, logged, caplog):
-    # Firmware from this tree runs audio only on the Dot's and the Echo Show's
-    # Fire OS 6: admitting another image would only offer it an update that
-    # breaks it.
+    # Firmware from this tree runs audio only on the Dot's Fire OS 6 and the
+    # Echo Show's Fire OS 6 or LineageOS 18.1: admitting another image would
+    # only offer it an update that breaks it.
     assert _admit(hello(platform=platform)) == em_device.em_device_link.Rejected("protocol")
     assert f"unsupported platform: {logged}" in caplog.text
 
@@ -170,14 +173,16 @@ def test_admission_refuses_a_hello_naming_no_platform(caplog):
 
 
 # What each image's current firmware announces (decisions 6 and 7 of the
-# Echo Show port plan), and a Dot on firmware predating the Dot-only three.
+# Echo Show port plan, §3 of the LineageOS plan), and a Dot on firmware
+# predating the Dot-only three. The Show announces the same set on both images.
 DOT = ALL_V1 + ["leds", "led_anim", "buttons", "button_hold", "alert_prefetch",
                 "local_wake_chime", "open_rules_v1", "ambient_light", "afe_metadata_v1",
                 "wifi_control", "ble_proxy", "privacy_mute"]
 DOT_OLDER = [c for c in DOT if c not in ("wifi_control", "ble_proxy", "privacy_mute")]
 SHOW = ALL_V1 + ["alert_prefetch", "local_wake_chime", "open_rules_v1", "afe_metadata_v1",
                  "ambient_light", "screen_wake"]
-DEVICES = [("fireos6", DOT), ("fireos6", DOT_OLDER), ("fireos6_crown", SHOW)]
+SHOWS = ["fireos6_crown", "lineage18_crown"]
+DEVICES = [("fireos6", DOT), ("fireos6", DOT_OLDER), *((show, SHOW) for show in SHOWS)]
 
 
 async def _session(caps, platform, store=None, host=None, **extra):
@@ -195,17 +200,18 @@ RING, BUTTON = "no LED ring on this device", "no action button on this device"
 UPDATE, MANAGED = "firmware update available", "managed by the device"
 
 
+SHOW_GAPS = {"leds": RING, "led_anim": RING, "buttons": BUTTON, "button_hold": BUTTON,
+             "wifi_control": MANAGED, "ble_proxy": MANAGED,
+             "privacy_mute": "mute not supported on this device yet"}
+
+
 @pytest.mark.parametrize("platform, caps, gaps", [
     ("fireos6", DOT, {"screen_wake": "no screen on this device"}),
     ("fireos6", DOT_OLDER, {"screen_wake": "no screen on this device", "wifi_control": UPDATE,
                             "ble_proxy": UPDATE, "privacy_mute": UPDATE}),
-    ("fireos6_crown", SHOW, {"leds": RING, "led_anim": RING, "buttons": BUTTON, "button_hold": BUTTON,
-                             "wifi_control": MANAGED, "ble_proxy": MANAGED,
-                             "privacy_mute": "mute not supported on this device yet"}),
-    ("fireos6_crown", [c for c in SHOW if c != "screen_wake"],
-     {"leds": RING, "led_anim": RING, "buttons": BUTTON, "button_hold": BUTTON,
-      "wifi_control": MANAGED, "ble_proxy": MANAGED,
-      "privacy_mute": "mute not supported on this device yet", "screen_wake": UPDATE}),
+    *((show, SHOW, SHOW_GAPS) for show in SHOWS),
+    *((show, [c for c in SHOW if c != "screen_wake"], {**SHOW_GAPS, "screen_wake": UPDATE})
+      for show in SHOWS),
     # Absent elsewhere, the dashboard's own per-capability reason applies.
     ("fireos6", [c for c in DOT if c != "led_anim"], {"screen_wake": "no screen on this device"}),
 ])
@@ -222,7 +228,7 @@ def test_no_session_no_gap():
 
 
 @pytest.mark.parametrize("platform, caps, reason", [
-    ("fireos6_crown", SHOW, MANAGED), ("fireos6", DOT_OLDER, UPDATE)])
+    *((show, SHOW, MANAGED) for show in SHOWS), ("fireos6", DOT_OLDER, UPDATE)])
 def test_wifi_change_and_scan_are_refused_with_the_reason(platform, caps, reason, monkeypatch):
     pytest.importorskip("aiohttp")
     from aiohttp import web
@@ -299,7 +305,7 @@ SCREEN = {"screenWake": True, "screenWakeUrl": "http://192.168.3.159:2323", "scr
 
 
 @pytest.mark.parametrize("platform, caps, pushed", [
-    ("fireos6_crown", SHOW, SCREEN), ("fireos6", DOT, {}), ("fireos6", DOT_OLDER, {})])
+    *((show, SHOW, SCREEN) for show in SHOWS), ("fireos6", DOT, {}), ("fireos6", DOT_OLDER, {})])
 def test_screen_wake_config_goes_only_to_a_screen_wake_device(platform, caps, pushed):
     async def scenario():
         store = FakeStore()
@@ -312,7 +318,7 @@ def test_screen_wake_config_goes_only_to_a_screen_wake_device(platform, caps, pu
 
 
 @pytest.mark.parametrize("platform, caps, painted", [
-    ("fireos6", DOT, True), ("fireos6", DOT_OLDER, True), ("fireos6_crown", SHOW, False)])
+    ("fireos6", DOT, True), ("fireos6", DOT_OLDER, True), *((show, SHOW, False) for show in SHOWS)])
 def test_the_ring_is_painted_only_on_a_device_with_leds(platform, caps, painted):
     async def scenario():
         device, link, *_ = await _session(caps, platform)
@@ -322,7 +328,12 @@ def test_the_ring_is_painted_only_on_a_device_with_leds(platform, caps, painted)
     run(scenario())
 
 
-def test_the_dashboard_device_json_carries_the_platform_reasons(tmp_path, monkeypatch):
+@pytest.mark.parametrize("platform, debloat_gap", [
+    ("fireos6_crown", None),
+    ("lineage18_crown", "nothing to debloat: LineageOS has no Amazon apps or services"),
+])
+def test_the_dashboard_device_json_carries_the_platform_reasons(platform, debloat_gap, tmp_path,
+                                                               monkeypatch):
     pytest.importorskip("aiohttp")
     import em_api
     import em_db
@@ -332,23 +343,61 @@ def test_the_dashboard_device_json_carries_the_platform_reasons(tmp_path, monkey
     em_db.approve_device("DEV1", "Kitchen")
 
     async def scenario():
-        device, *_ = await _session(SHOW, "fireos6_crown")
+        device, *_ = await _session(SHOW, platform)
         monkeypatch.setattr(em_api, "_devices", {"DEV1": device})
         out = em_api._merge_device(em_db.get_device("DEV1"))
-        assert out["platform"] == "fireos6_crown"
+        assert out["platform"] == platform
         assert out["muted"] is None                   # unavailable, not "off"
         assert out["capability_gaps"]["wifi_control"] == "managed by the device"
         assert out["capability_gaps"]["privacy_mute"] == "mute not supported on this device yet"
+        assert out["debloat_gap"] == debloat_gap
         await device.close()
         # Offline: nothing live to gate on.
         monkeypatch.setattr(em_api, "_devices", {})
         out = em_api._merge_device(em_db.get_device("DEV1"))
-        assert (out["platform"], out["capability_gaps"], out["muted"]) == (None, {}, None)
+        assert (out["platform"], out["capability_gaps"], out["muted"], out["debloat_gap"]) \
+            == (None, {}, None, None)
     try:
         run(scenario())
     finally:
         em_db._conn.close()
         em_db._conn = None
+
+
+@pytest.mark.parametrize("platform, caps, gap", [
+    ("fireos6", DOT, None), ("fireos6_crown", SHOW, None),
+    ("lineage18_crown", SHOW, "nothing to debloat: LineageOS has no Amazon apps or services")])
+def test_only_a_lineageos_show_has_nothing_to_debloat(platform, caps, gap):
+    async def scenario():
+        device, *_ = await _session(caps, platform)
+        assert device.debloat_gap == gap
+        await device.close()
+    run(scenario())
+
+
+def test_re_apply_debloat_is_refused_with_the_reason_on_lineageos(monkeypatch):
+    pytest.importorskip("aiohttp")
+    from aiohttp import web
+    from aiohttp.test_utils import make_mocked_request
+
+    import em_api
+
+    spawned = []
+    monkeypatch.setattr(em_api, "_spawn", lambda coro, name: spawned.append(name) or coro.close())
+
+    async def scenario():
+        device, link, *_ = await _session(SHOW, "lineage18_crown")
+        monkeypatch.setattr(em_api, "_devices", {"DEV1": device})
+        request = make_mocked_request("POST", "/api/devices/DEV1/debloat",
+                                      match_info={"id": "DEV1"}, app=web.Application())
+        with pytest.raises(em_api.ApiError) as refused:
+            await em_api._post_debloat.__wrapped__(request)
+        assert (refused.value.code, refused.value.status) == (em_api.ErrorCode.NOT_SUPPORTED, 409)
+        assert refused.value.message == ("Debloat unavailable: nothing to debloat: LineageOS has "
+                                         "no Amazon apps or services")
+        assert spawned == []
+        await device.close()
+    run(scenario())
 
 
 async def _ha_server(monkeypatch, *, platform=DevicePlatform.FIREOS6, volume_control=True):
@@ -373,6 +422,7 @@ async def _ha_server(monkeypatch, *, platform=DevicePlatform.FIREOS6, volume_con
 @pytest.mark.parametrize("platform, model", [
     (DevicePlatform.FIREOS6, "Echo Dot Gen 2 (biscuit)"),
     (DevicePlatform.FIREOS6_CROWN, "Echo Show 8 Gen 1 (crown)"),
+    (DevicePlatform.LINEAGE18_CROWN, "Echo Show 8 Gen 1 (crown, LineageOS)"),
 ])
 def test_home_assistant_is_told_which_echo_the_platform_is(platform, model, monkeypatch):
     pytest.importorskip("zeroconf")

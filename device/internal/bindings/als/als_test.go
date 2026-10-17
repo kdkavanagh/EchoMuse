@@ -93,20 +93,23 @@ func fakeBus(t *testing.T, devices map[string]bool) {
 	mu.Lock()
 	path, lastScan, reported = "", time.Time{}, false
 	status = Status{Code: StatusUnknown}
+	pollAlsPs, pollFailed = false, false
 	mu.Unlock()
 
-	oldI2C, oldIIO, oldAlsPs := i2cGlob, iioGlob, alsPsPath
+	oldI2C, oldIIO, oldAlsPs, oldPoll := i2cGlob, iioGlob, alsPsPath, alsPsPollPath
 	i2cGlob = filepath.Join(root, "*", "name")
 	// No IIO or als_ps fixture in this helper — point both at empty roots
 	// so a stray real sensor on the host (or a leftover test fixture) can
 	// never make the i2c-only fixtures match through a fallback.
 	iioGlob = filepath.Join(t.TempDir(), "*", "name")
 	alsPsPath = filepath.Join(t.TempDir(), "als_ps", "lux")
+	alsPsPollPath = filepath.Join(filepath.Dir(alsPsPath), "enable_als_polling")
 	t.Cleanup(func() {
-		i2cGlob, iioGlob, alsPsPath = oldI2C, oldIIO, oldAlsPs
+		i2cGlob, iioGlob, alsPsPath, alsPsPollPath = oldI2C, oldIIO, oldAlsPs, oldPoll
 		mu.Lock()
 		path, lastScan, reported = "", time.Time{}, false
 		status = Status{Code: StatusUnknown}
+		pollAlsPs, pollFailed = false, false
 		mu.Unlock()
 	})
 }
@@ -341,6 +344,30 @@ func TestStatusOKFromAlsPs(t *testing.T) {
 	writeAlsPs(t, "309 lux\n")
 	if lux := Lux(); lux == nil || *lux != 309 {
 		t.Fatalf("Lux() = %v after a change, want 309", lux)
+	}
+}
+
+// On LineageOS the driver's polling is off until someone switches it on, so
+// with EnablePolling the reader writes 1 to enable_als_polling before it
+// first reads; on Fire OS (no EnablePolling) it never writes there.
+func TestAlsPsPolling(t *testing.T) {
+	fakeBus(t, nil)
+	writeAlsPs(t, "0 lux\n")
+	if !Present() {
+		t.Fatal("Present() must be true with a readable als_ps")
+	}
+	if _, err := os.Stat(alsPsPollPath); !os.IsNotExist(err) {
+		t.Fatalf("polling switched without EnablePolling: %v", err)
+	}
+
+	fakeBus(t, nil)
+	writeAlsPs(t, "0 lux\n")
+	EnablePolling()
+	if !Present() {
+		t.Fatal("Present() must be true with a readable als_ps")
+	}
+	if b, err := os.ReadFile(alsPsPollPath); err != nil || string(b) != "1" {
+		t.Fatalf("enable_als_polling = %q, %v; want \"1\"", b, err)
 	}
 }
 

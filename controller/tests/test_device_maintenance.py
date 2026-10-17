@@ -213,6 +213,13 @@ def test_debloat_never_runs_a_script_it_could_not_sync(dev_shell):
     assert "debloat not applied" in dev_shell.logs[-1][1]
 
 
+def test_debloat_never_runs_on_a_lineageos_show(dev_shell):
+    """No Amazon apps or services there (docs/echo-show-lineage-plan.md
+    decision 10): nothing is synced, run or logged."""
+    _debloat(DevicePlatform.LINEAGE18_CROWN)
+    assert (dev_shell.commands, dev_shell.transfers, dev_shell.logs) == ([], [], [])
+
+
 # ── start_server.sh debloat ──────────────────────────────────────────────────
 
 DENYLIST = re.search(r'^FOS6_DENYLIST="([^"]+)"', START_SERVER.read_text(), re.M).group(1).split()
@@ -570,3 +577,97 @@ def test_crown_debloat_names_a_microphone_it_could_not_deny(crown):
     lines = _crown_debloat(crown, "1")
     assert _lines(crown.state / "denied") == ["amazon.speech.sim"]
     assert lines[-2] == "MIC_REASSERTED: STILL_ALLOWED:amazon.speech.sim"
+
+
+# ── LineageOS Show: start_server.sh ──────────────────────────────────────────
+
+LINEAGE_VERSION = "18.1-20261017-UNOFFICIAL-crown"   # docs/echo-show-crown.md §3's unit
+
+
+@pytest.fixture
+def show(tmp_path: Path, bindir: Path) -> SimpleNamespace:
+    """An Echo Show running start_server.sh from boot, on either image: the
+    device paths moved under tmp_path, tools that record what Android was
+    asked (`stop`, `pm`, `appops` and the Dot's), audioserver running, and a
+    server that ends the whole run the moment the supervisor starts it."""
+    state = tmp_path / "state"
+    state.mkdir()
+    for name in ("logs", "etc"):
+        (tmp_path / name).mkdir()
+    for name in [*em_api.CROWN_HIDE_LISTS.values(), em_api.CROWN_MIC_DENY_LIST]:
+        shutil.copy(PAYLOADS / name, tmp_path / "etc" / name)
+    (tmp_path / "etc" / "crown_tiers").write_text("1\n")
+    _tool(bindir, "stop", 'echo "$1" >> "$STATE/stopped"')
+    for tool in ("pm", "appops", "mount", "tinymix", "wpa_cli", "ifconfig"):
+        _tool(bindir, tool, 'echo "$0 $*" >> "$STATE/android"')
+    _tool(bindir, "sleep", "exit 0")
+    server = tmp_path / "server"
+    server.write_text('#!/bin/sh\ntouch "$STATE/server_started"\nkill -9 0\n')
+    server.chmod(0o755)
+    paths = {"/data/local/tmp/echomuse": tmp_path / "logs", "/data/local/etc/echomuse": tmp_path / "etc",
+             "/data/local/bin/server": server, "/sys/power/wake_lock": tmp_path / "wake_lock",
+             "/proc/self/attr/current": tmp_path / "attr_current"}
+    text = SCRIPT
+    for device_path, here in paths.items():
+        assert device_path in text, device_path
+        text = text.replace(device_path, str(here))
+    script = tmp_path / "start_server.sh"
+    script.write_text(text)
+    return SimpleNamespace(root=tmp_path, state=state, script=script, bindir=bindir)
+
+
+def _show_getprop(show: SimpleNamespace, lineage: str) -> None:
+    _tool(show.bindir, "getprop", f"""case "$1" in
+  ro.lineage.version) echo "{lineage}" ;;
+  ro.product.device) echo crown ;;
+  init.svc.audioserver) echo running ;;
+esac""")
+
+
+def _boot(show: SimpleNamespace, *args: str) -> tuple[int, str]:
+    env = {"PATH": f"{show.bindir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+           "STATE": str(show.state)}
+    proc = subprocess.Popen([SH, str(show.script), *args], env=env, text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            start_new_session=True)
+    try:
+        out, _ = proc.communicate(timeout=30)
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+    return proc.returncode, out
+
+
+def test_lineageos_boot_skips_the_domain_move_and_everything_amazon(show):
+    """Decision 10: init starts the script in `su` already, and nothing on
+    LineageOS is Amazon's to stop, hide or deny the microphone."""
+    _show_getprop(show, LINEAGE_VERSION)
+    _boot(show)
+    assert (show.state / "server_started").exists(), "the supervisor never started the server"
+    assert not (show.root / "attr_current").exists()
+    assert _lines(show.state / "stopped") == []
+    assert _lines(show.state / "android") == []
+    assert (show.root / "wake_lock").read_text() == "EchoMuse\n"
+    assert (show.root / "logs").is_dir()
+
+
+def test_fire_os_show_boot_still_moves_and_stops_its_list(show):
+    """The same fixture on Fire OS: the paths it watches are the ones the
+    crown branch writes, so the LineageOS test above is not vacuous."""
+    _show_getprop(show, "")
+    _boot(show)
+    assert (show.state / "server_started").exists()
+    assert (show.root / "attr_current").exists()
+    assert _lines(show.state / "stopped") == CROWN_STOPLIST
+    assert (show.root / "wake_lock").read_text() == "EchoMuse\n"
+
+
+def test_lineageos_debloat_reports_nothing_to_do(show):
+    _show_getprop(show, LINEAGE_VERSION)
+    rc, out = _boot(show, "debloat")
+    assert rc == 0
+    assert out.splitlines() == ["DEBLOAT_STOPPED:0 STILL_RUNNING:"]
+    assert em_api._parse_denylist_result(out) == em_api.DenylistResult(0, ())
+    assert (em_api._parse_hide_result(out), em_api._parse_mic_result(out)) == (None, None)
+    assert not (show.state / "server_started").exists()
+    assert _lines(show.state / "stopped") == [] and _lines(show.state / "android") == []

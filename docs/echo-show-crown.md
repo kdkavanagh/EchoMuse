@@ -417,6 +417,36 @@ In brackets: the third burst, detected late at 21–24 dB SNR once the AEC had c
 
 **Screen off.** §8.4: 190 s of `VOICE_RECOGNITION` capture, 160 s of it with the screen off, had no gap over 44.4 ms; the device did not suspend (on mains and USB).
 
+### 8.6 The firmware's AAudio backend on our ROM (measured 2026-10-17)
+
+Same unit, now on our fork (`18.1-20261017-UNOFFICIAL-crown`, `/system/lib/libasp.so` SHA-1 `e3816eb3…`, the NS6571 blob with TFLite and Edgeflow), uid 0 over adb, no EchoMuse service installed. The firmware detects `lineage18_crown` and opens `slmic.OpenAAudio` and `slspeaker.NewAAudio` (docs/echo-show-lineage-plan.md decisions 3–5).
+
+**Negotiated streams.** Input: `VOICE_RECOGNITION`, 16 kHz mono I16, `PERFORMANCE_MODE_NONE`, burst 320 frames, buffer 960. Output: `USAGE_MEDIA`, 48 kHz mono I16, asked for 4,096 frames; granted 4,096 of 4,616 (burst 2,308) in the `sl_latency` runs and 4,616 of 9,232 (burst 4,616) in the firmware run. Behind the buffer, the server's consumed count ran 9,968–10,352 frames (about 210 ms) ahead of the presented position, so a write's last frame is presented about 285 ms after the write returns.
+
+**Render-to-capture lag, `device/tools/sl_latency -backend aaudio`** (index 9/15, 2.5 s between bursts, then one burst after a 2.5 s writer stall), with `aaudioRenderLatencyNs` = 60 ms and the capture stamps 5 ms under AAudio's fitted capture time:
+
+| Run | `pcm` lag, ms (min / median / max over the steady bursts) | After the stall, ms |
+|---|---|---|
+| 1 kHz tone, −6 dBFS, 8 bursts | +23.3 (first burst) / +65.6 / +69.5 | +217.4 |
+| white noise, −12 dBFS, open 1 | +39.7 / +46.6 / +50.1 | not found |
+| open 2 | +42.6 / +46.3 / +47.4 | +242.6 |
+| open 3 | +40.9 / +48.0 / +49.0 | +247.6 |
+| open 4 | +40.7 / +47.4 / +49.6 | +242.7 |
+| open 5 | +44.0 / +47.7 / +53.6 | +241.9 |
+
+- **No late stamp in any open;** the per-open medians spread 1.7 ms. The tone's first burst, before the AEC converged on the tone, puts the echo 83 ms after presentation on these stamps, §8.4's 88 ms less the 5 ms capture bias; later tone bursts and every noise burst are found 20–30 ms later in the residual.
+- **After a writer stall** the presented position stops and the estimate falls back to the handoff bound, about 240 ms early: inside the controller's 0–500 ms lag search.
+- **Capture stamps:** every period was stamped from the fit (352 of 352 per open). Read completion came 0.5–1.1 ms (median) and at most 12.7–16.5 ms after the stamp; 141–152 of 352 periods (40–43 %) were held at their completion, where the fitted time less 5 ms still lay after it.
+- **Metadata:** decoded on every open: 4,136 frames over 33 s, 0 invalid, 1 sync, 0 gaps, 0 lost; AFE_TIMESTAMP sat 2.6–8.7 ms (median 3.4) before read completion. No mic drops; sink completions trailed writes by two (the last writes complete only once later ones are written).
+
+**Firmware run, 50 s,** against the LAN controller, which predates `lineage18_crown` and refused the session with `protocol`, as it should:
+- `Platform: lineage18_crown (crown_lineage, "LineageOS 18.1-20261017-UNOFFICIAL-crown")`; the volume check passed with codes 18/16/10 and maximum 15; `[als] ambient light sensor at …/als_ps/lux` after switching polling on (13 lux in the room); `[cpu] core floor 1 -> 2`.
+- `[afe] 30s: 3716/3720 frames valid, 0 invalid, 1 syncs, 0 gaps, 0 lost … volume 30`.
+- RSS 16.4 MB, 15 goroutines.
+- `KEYCODE_VOLUME_UP` then `DOWN` while the firmware ran moved `STREAM_MUSIC` 5 → 6 → 5: the firmware's continuous media stream keeps the keys live (§8.4 found them ignored with nothing playing).
+
+**Boot hook and a LineageOS update.** The wizard's `install_boot_hook` and `install_em` commands, run by hand over adb with its payloads (`/system/etc/init/echomuse.rc`, `user root`, `group root audio inet`, `seclabel u:r:su:s0`; `/system/addon.d/50-echomuse.sh`, LineageOS's own `50-lineage.sh` with the `.rc` as its only file): after `adb reboot` init started `start_server.sh` 26 s after boot, the server ran in `u:r:su:s0` and opened both AAudio streams. Then a dirty flash of the same zip in TWRP (`twrp install`, 105 s): the `.rc` and the addon.d script came back with the flash's timestamps, and the service was running 26 s into the next boot with the same platform, volume and AFE lines, without the wizard. The flash also dropped the TWRP-seeded `persist.sys.usb.config=adb`, `service.adb.root=1` and `/adb_keys` (§8.5), so adb stayed off until USB debugging and Rooted debugging were enabled on screen; `adb root` then answered `restarting adbd as root` and the reconnected shell was uid 0.
+
 ## 9. Alexa takeover surface: what to hide
 
 The list comes from `dumpsys package` (granted permissions, persistent and privileged flags), `cmd package query-receivers -a BOOT_COMPLETED`/`LOCKED_BOOT_COMPLETED`, `cmd package query-activities -c HOME`, and init service state. Roles marked [INFERENCE] come from package names, not behaviour. Tier 1 was applied on 2026-10-17 and corrected by what it broke; §9.5 has the measurements. Tier 2 has not been applied.
