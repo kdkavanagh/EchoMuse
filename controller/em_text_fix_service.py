@@ -37,6 +37,7 @@ from em_text_fix import (
     propose,
     user_vocabulary,
 )
+from em_text_fix_search import PhraseSearch, SearchResult
 
 log = logging.getLogger("em_text_fix")
 
@@ -62,6 +63,13 @@ class TextFixService:
         self._history_build: asyncio.Task[None] | None = None
         self._cpu = ThreadPoolExecutor(max_workers=1, thread_name_prefix="text-fix")
         self._builder = ThreadPoolExecutor(max_workers=1, thread_name_prefix="text-fix-build")
+        self._search = PhraseSearch()
+
+    async def search(self, query: str, config: FixConfig, limit: int) -> SearchResult:
+        """The dashboard's phrase search over `config`'s saved lists and the published tables.
+        Runs off the event loop, never on the executor corrections use."""
+        return await asyncio.to_thread(self._search.search, self.current(), query, config.terms,
+                                       config.phrases, limit)
 
     # ── lifecycle ──
 

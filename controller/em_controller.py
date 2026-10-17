@@ -207,6 +207,12 @@ def firmware() -> em_firmware.BundledFirmware:
     return _firmware
 
 
+def text_fix() -> em_text_fix_service.TextFixService:
+    if _text_fix is None:
+        raise NotStarted("controller not started")
+    return _text_fix
+
+
 def _ha_client() -> em_ha_client.HaClient:
     if _ha is None:
         raise NotStarted("controller not started")
@@ -1216,6 +1222,9 @@ class Services:
 
     def firmware(self) -> em_firmware.BundledFirmware:
         return firmware()
+
+    def text_fix(self) -> em_text_fix_service.TextFixService:
+        return text_fix()
 
     def ha_status(self) -> dict[em_ha_client.HaFeature, api.FeatureStatusWire]:
         return ha_status()

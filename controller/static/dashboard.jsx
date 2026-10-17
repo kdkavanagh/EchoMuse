@@ -6003,7 +6003,7 @@ function ScopeToggle({ local, onChange, disabled }) {
   );
 }
 
-function Stage({ n, title, chips, desc, children, scope, dim }) {
+function Stage({ n, title, chips, desc, children, scope, dim, after }) {
   return (
     <Panel>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 6, flexWrap: 'wrap' }}>
@@ -6015,8 +6015,10 @@ function Stage({ n, title, chips, desc, children, scope, dim }) {
       </div>
       <div style={{ fontFamily: MONO, fontSize: 10, color: 'var(--muted)', lineHeight: 1.6, marginBottom: 14 }}>{desc}</div>
       {/* dim: a section following the fleet is shown read-only rather than
-          hidden, so you can still see what it is inheriting. */}
+          hidden, so you can still see what it is inheriting. `after` is
+          read-only content that stays usable whatever the scope. */}
       <div style={dim}>{children}</div>
+      {after}
     </Panel>
   );
 }
@@ -6483,6 +6485,120 @@ function TextFixListEditor({ label, sub, noun, placeholder, items, onChange, dis
   );
 }
 
+// Fuzzy search over what transcript correction knows (GET /api/text_fix/phrases, §16.8):
+// the saved preferred phrases and terms of this device (the fleet's in the fleet view), HA's
+// trigger sentences, the requests HA answered before, and HA's entity, area and floor names.
+// Results follow the typing, debounced; a response to an older query is dropped.
+const TEXT_FIX_KINDS = Object.freeze({
+  user_phrase: 'your phrase', user_term: 'your term', trigger: 'HA trigger', wildcard: 'HA trigger, any words',
+  history: 'earlier request', entity: 'entity', area: 'area', floor: 'floor',
+});
+const TEXT_FIX_SEARCH_DEBOUNCE_MS = 120;
+const TEXT_FIX_SEARCH_LIMIT = 50;
+
+function Highlighted({ text, spans }) {
+  const out = [];
+  let at = 0;
+  for (const [start, end] of spans || []) {
+    if (start > at) out.push(text.slice(at, start));
+    out.push(<b key={start} style={{ color:'var(--accent)', fontWeight:700 }}>{text.slice(start, end)}</b>);
+    at = end;
+  }
+  if (at < text.length) out.push(text.slice(at));
+  return <>{out}</>;
+}
+
+function TextFixPhraseSearch({ deviceId }) {
+  const [query, setQuery] = useState('');
+  const [result, setResult] = useState(null);     // the last response, for `shown`
+  const [shown, setShown] = useState('');         // the query `result` answers
+  const [error, setError] = useState(null);
+  const seq = useRef(0);
+
+  useEffect(() => {
+    const mine = ++seq.current;
+    const timer = setTimeout(async () => {
+      const params = new URLSearchParams({ q: query, limit: String(TEXT_FIX_SEARCH_LIMIT) });
+      if (deviceId) params.set('device_id', deviceId);
+      try {
+        const r = await API.get(`/api/text_fix/phrases?${params}`);
+        if (mine !== seq.current) return;
+        setResult(r); setShown(query); setError(null);
+      } catch (e) {
+        if (mine !== seq.current) return;
+        setError(e?.error || e?.message || 'search failed');
+      }
+    }, query ? TEXT_FIX_SEARCH_DEBOUNCE_MS : 0);
+    return () => clearTimeout(timer);
+  }, [query, deviceId]);
+
+  const counts = result?.counts || {};
+  const n = k => (counts[k] || 0).toLocaleString();
+  const names = (counts.entity || 0) + (counts.area || 0) + (counts.floor || 0);
+  const rows = result?.results || [];
+  const small = { fontFamily:MONO, fontSize:9, color:'var(--muted)' };
+  const detail = r => {
+    if (r.kind === 'wildcard') return "left to HA's matcher: the {…} parts take any words";
+    if (r.kind === 'trigger') return `${r.template}${r.variants > 1 ? ` · ${r.variants.toLocaleString()} matching wordings` : ''}`;
+    if (r.kind === 'history') return `turn #${r.turn_id}${r.ts ? ` · ${new Date(r.ts * 1000).toLocaleDateString()}` : ''}`;
+    if (r.kind === 'user_phrase' || r.kind === 'user_term') return `#${r.position + 1} in your list`;
+    return (r.ids || []).join(', ');
+  };
+  return (
+    <div style={{ marginTop:4 }}>
+      <span style={{ fontFamily:MONO, fontSize:11, color:'var(--text2)' }}>Search known phrases</span>
+      <span style={{ fontFamily:MONO, fontSize:10, color:'var(--muted)', marginLeft:8 }}>
+        what correction can match against: your saved lists and what Home Assistant knows
+      </span>
+      <input type="search" value={query} placeholder="watch plex, what time, kitchen…"
+        aria-label="Search known phrases" onChange={e => setQuery(e.target.value)}
+        onKeyDown={e => { if (e.key === 'Escape') { e.preventDefault(); setQuery(''); } }}
+        style={{ display:'block', width:'100%', boxSizing:'border-box', marginTop:8 }}/>
+      <div style={{ ...small, marginTop:4 }}>
+        {result ? <>
+          {n('user_phrase')} of your phrases · {n('user_term')} terms · {n('trigger')} HA trigger wordings
+          {counts.wildcard ? ` (+${n('wildcard')} any-words templates)` : ''} · {n('history')} earlier requests · {names.toLocaleString()} names
+        </> : 'loading…'}
+      </div>
+      {result && !result.ready && (
+        <div style={{ ...small, color:'var(--warn)', marginTop:4 }}>
+          Correction tables are not built (Home Assistant not connected, or still loading): searching your saved lists only.
+        </div>
+      )}
+      {error && <div style={{ ...small, color:'var(--error)', marginTop:4 }}>{error}</div>}
+      {shown && result && (
+        <div role="list" aria-label="Matching phrases"
+          style={{ marginTop:8, maxHeight:320, overflowY:'auto', border:'1px solid var(--border)', borderRadius:6 }}>
+          {rows.length === 0 && <div style={{ ...small, padding:'8px 10px' }}>no match for “{shown}”</div>}
+          {rows.map((r, i) => {
+            const mine = r.kind === 'user_phrase' || r.kind === 'user_term';
+            return (
+              <div key={`${r.kind}:${r.text}:${i}`} role="listitem"
+                style={{ display:'grid', gridTemplateColumns:'1fr auto', gap:'2px 10px', padding:'5px 10px',
+                  borderTop:i ? '1px solid var(--border)' : 'none' }}>
+                <span style={{ fontFamily:SANS, fontSize:12, color:'var(--text)', overflowWrap:'anywhere' }}>
+                  <Highlighted text={r.text} spans={r.spans}/>
+                </span>
+                <span style={{ fontFamily:MONO, fontSize:9, color:mine ? 'var(--accent)' : 'var(--text2)', whiteSpace:'nowrap' }}>
+                  {TEXT_FIX_KINDS[r.kind] || r.kind}
+                </span>
+                <span title={detail(r)} style={{ ...small, gridColumn:'1 / -1', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
+                  {detail(r)}
+                </span>
+              </div>
+            );
+          })}
+          {result.total > rows.length && (
+            <div style={{ ...small, padding:'6px 10px', borderTop:'1px solid var(--border)' }}>
+              best {rows.length} of {result.total.toLocaleString()} matches; type more to narrow
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // The sound catalog (GET /api/sounds).
 function useSounds() {
   return useCatalog('/api/sounds', SOUND_CATALOG_EMPTY);
@@ -6874,8 +6990,9 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
       {/* 08 TRANSCRIPT CORRECTION (section id "transcript") */}
       <Stage n="08" title="Transcript correction"
         chips={<><ScopeChip tone="controller">Controller</ScopeChip><ScopeChip tone="controller">HA matcher</ScopeChip></>}
-        desc="After Home Assistant's speech-to-text and EchoMuse's own commands, a misheard request can be repaired before Home Assistant runs it. Candidates come from HA's trigger sentences, its entity, area and floor names, requests it answered before, and the terms and phrases below; HA's own sentence matcher must fully accept one without running it. Text HA already understands is never changed, and follow-ups and lock, alarm, door or gate commands are never corrected. Each turn's correction is shown in Activity."
-        scope={scopeEl('transcript')} dim={secStyle('transcript')}>
+        desc="After Home Assistant's speech-to-text and EchoMuse's own commands, a misheard request can be repaired before Home Assistant runs it. Candidates come from HA's trigger sentences, its entity, area and floor names, requests it answered before, and the terms and phrases below; HA's own sentence matcher must fully accept one without running it. Text HA already understands is never changed, and follow-ups are never corrected. Each turn's correction is shown in Activity."
+        scope={scopeEl('transcript')} dim={secStyle('transcript')}
+        after={<TextFixPhraseSearch deviceId={deviceId}/>}>
         <div style={inputStyle}>
           <div role="group" aria-label="Transcript correction mode" style={{ display:'flex', alignItems:'center', gap:6, flexWrap:'wrap' }}>
             <span style={{ fontFamily:MONO, fontSize:11, color:'var(--text2)', marginRight:4 }}>Mode</span>

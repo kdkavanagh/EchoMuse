@@ -642,6 +642,15 @@ Based on a review of Office turns 433–476 (`docs/turn-latency-review.md`,
   repaired (every one with a known intent correctly) and 3 left alone as
   ambiguous. New dependency: `hassil==3.11.0`, the version Home Assistant
   2026.8.1 ships, to expand trigger sentences.
+- **Search known phrases.** Config → **Transcript correction** has a
+  fuzzy finder over everything correction can match against: your saved
+  preferred phrases and terms, your automations' trigger sentences (a
+  trigger with alternatives shows once, with how many of its wordings
+  match), requests Home Assistant answered before, and Home Assistant's
+  entity, area and floor names. Results update as you type, with the
+  matched letters highlighted; words match in any order, and letters in
+  order ("wtch plx" finds "watch plex"). It is usable whatever the section's
+  scope and by non-administrators (`GET /api/text_fix/phrases`).
 
 ### Earlier in this release
 

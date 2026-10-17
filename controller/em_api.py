@@ -48,6 +48,8 @@ import em_wakeclips
 import em_ambient
 import em_pause_asr
 import em_text_fix
+import em_text_fix_search
+import em_text_fix_service
 import em_volume
 import em_sounds
 import em_device_assets
@@ -357,6 +359,7 @@ class ControllerServices(Protocol):
     def registry(self) -> em_wake_registry.WakeRegistry: ...
     def device_assets(self) -> em_device_assets.DeviceAssets: ...
     def firmware(self) -> em_firmware.BundledFirmware: ...
+    def text_fix(self) -> em_text_fix_service.TextFixService: ...
     def ha_status(self) -> dict[em_ha_client.HaFeature, FeatureStatusWire]: ...
     def speech_worker_status(self) -> SpeechWorkerStatus: ...
     def loop_lag_peak_ms(self) -> float: ...
@@ -511,6 +514,7 @@ async def create_app(services: ControllerServices) -> web.Application:
     app.router.add_patch("/api/system/config",  _patch_system_config)
     app.router.add_get("/api/ha/status",        _get_ha_status)
     app.router.add_get("/api/speech/wyoming",   _get_wyoming_info)
+    app.router.add_get("/api/text_fix/phrases", _get_text_fix_phrases)
 
     # Provisioning
     app.router.add_get("/api/provision/start_script", _get_provision_start_script)
@@ -3960,6 +3964,58 @@ async def _get_wyoming_info(request: web.Request) -> web.Response:
         return _error(ErrorCode.SERVER_UNREACHABLE,
                       f"{server.host}:{server.port}: {str(err) or type(err).__name__}", 502)
     return _ok({"programs": [asdict(program) for program in programs]})
+
+
+@auth.require_auth
+async def _get_text_fix_phrases(request: web.Request) -> web.Response:
+    """GET /api/text_fix/phrases?q=&device_id=&limit= — fuzzy search over what transcript
+    correction knows (§16.8): the saved preferred phrases and terms of the device (its
+    effective config) or, without `device_id`, of the fleet, and the published tables.
+    `ready` false: the tables are not built, and only the lists are searched."""
+    query = request.query.get("q", "")
+    try:
+        limit = int(request.query.get("limit", "50"))
+    except ValueError:
+        return _error(ErrorCode.INVALID_PARAM, "limit must be an integer", 400)
+    if not 1 <= limit <= em_text_fix_search.MAX_RESULTS:
+        return _error(ErrorCode.INVALID_PARAM, f"limit must be 1–{em_text_fix_search.MAX_RESULTS}", 400)
+    device_id = request.query.get("device_id")
+    loop = asyncio.get_running_loop()
+    if device_id:
+        await _device_row(device_id)
+        config = await loop.run_in_executor(None, db.get_effective_device_config, device_id)
+    else:
+        config = await loop.run_in_executor(None, db.get_global_device_config)
+    try:
+        fix = em_text_fix.fix_config(config)
+    except ValueError:
+        fix = em_text_fix.FixConfig()     # a hand-edited database; correction is off for it too
+    service = request.app[SERVICES].text_fix()
+    result = await service.search(query, fix, limit)
+    tables = service.current()
+    return _ok({
+        "ready": tables is not None, "revision": tables.revision if tables is not None else None,
+        "total": result.total, "counts": result.counts,
+        "results": [_phrase_match(m) for m in result.matches],
+    })
+
+
+def _phrase_match(m: em_text_fix_search.Match) -> dict[str, object]:
+    e = m.entry
+    out: dict[str, object] = {"text": e.text, "source": e.source, "kind": e.kind, "score": m.score,
+                              "spans": [list(s) for s in m.spans]}
+    if e.template is not None:
+        out["template"] = e.template
+    if e.group is not None:
+        out["variants"] = m.variants
+    if e.position is not None:
+        out["position"] = e.position
+    if e.turn_id is not None:
+        out.update(turn_id=e.turn_id, ts=e.ts)
+    if e.ids:
+        out["ids"] = list(e.ids)
+    return out
+
 
 
 @auth.require_admin

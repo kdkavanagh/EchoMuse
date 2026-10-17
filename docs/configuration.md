@@ -716,6 +716,23 @@ one letter or digit. Entries that differ only in case, spaces or punctuation
 change only this correction: they do not teach or bias any speech-to-text
 model.
 
+### Search known phrases
+
+Below the lists, **Search known phrases** looks through everything the
+correction can match against, as you type: your saved preferred phrases and
+terms (this speaker's, or the fleet's on the fleet page; unsaved edits are not
+included), your automations' trigger sentences, requests Home Assistant
+answered before, and Home Assistant's entity, area and floor names. It is a
+fuzzy finder: each word you type must appear, in any order, as the start of a
+word, anywhere in a word, or as letters in order ("wtch plx" finds "watch
+plex"). The matched letters are highlighted. A trigger written with
+alternatives (`(watch|put on) [the] plex`) shows as its best-matching wording
+with a count of the other wordings that match, and a trigger with a
+`{wildcard}` (`play {query}`) shows as written, since Home Assistant fills in
+its words. The search works whichever way the section is scoped, and for
+non-administrators too. Until Home Assistant is connected and the tables are
+built, it searches your lists only.
+
 ### What you see in Activity
 
 A turn's detail shows a **Correction** stage after Home Assistant's
