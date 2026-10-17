@@ -6494,6 +6494,8 @@ function TextFixListEditor({ label, sub, noun, placeholder, items, onChange, dis
   );
 }
 
+const TEXT_FIX_NOT_READY_RETRY_MS = 3000;
+
 // `transcriptFixPronunciations`: {word: ARPAbet}, the pronunciation the correction compares a
 // word by, in place of CMUdict's (em_phonetics). The checks mirror em_phonetics.parse_guides.
 // Below the guides, the words of Home Assistant's trigger sentences, earlier requests and names
@@ -6537,13 +6539,20 @@ function TextFixPronunciationEditor({ guides, onChange, disabled, deviceId }) {
   const saved = JSON.stringify(map);
   const full = words.length >= TEXT_FIX_MAX_GUIDES;
 
+  // Not ready (tables rebuilding after a Home Assistant change, or HA reconnecting): ask again
+  // every TEXT_FIX_NOT_READY_RETRY_MS while this is shown.
   useEffect(() => {
-    let live = true;
+    let live = true, timer = null;
     const params = deviceId ? `?device_id=${encodeURIComponent(deviceId)}` : '';
-    API.get(`/api/text_fix/unknown_words${params}`)
+    const load = () => API.get(`/api/text_fix/unknown_words${params}`)
       .then(r => { if (live) setUnknown(r.words || []); })
-      .catch(e => { if (live) setUnknown({ error: e?.error || e?.message || 'unavailable' }); });
-    return () => { live = false; };
+      .catch(e => {
+        if (!live) return;
+        setUnknown({ error: e?.error || e?.message || 'unavailable' });
+        if (e?.code === 'not_ready') timer = setTimeout(load, TEXT_FIX_NOT_READY_RETRY_MS);
+      });
+    load();
+    return () => { live = false; clearTimeout(timer); };
   }, [deviceId, saved]);
   useEffect(() => { setEditing(null); }, [saved]);
 
