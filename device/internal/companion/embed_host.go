@@ -2,9 +2,11 @@
 
 package companion
 
-// The host build (go test, go vet) embeds no app: the installer reports
-// that as its health error and never runs pm.
+// The host build (go test, go vet) embeds no app and no plugin: the
+// installers report that as their health errors and never run pm or call
+// Kiosk Satellite.
 var (
-	apk     []byte
-	version string
+	apk      []byte
+	version  string
+	ksplugin []byte
 )

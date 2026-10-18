@@ -6,24 +6,26 @@ import java.nio.charset.StandardCharsets;
 import java.util.Map;
 
 /**
- * The local link, version 1 (docs/echo-show-companion-plan.md §3): one JSON
- * object per line between this app and the firmware on 127.0.0.1:8771, the
- * type in field {@code t}. Pure Java, so the image build tests it on the JDK.
+ * The local link, version 2 (docs/echo-show-companion-plan.md §3 and §11.3):
+ * one JSON object per line between the firmware on 127.0.0.1:8771 and its two
+ * clients, this app and the Kiosk Satellite plugin, the type in field
+ * {@code t}. Pure Java, so the image build tests it on the JDK; the plugin
+ * (org.echomuse.ksplugin) compiles this same codec in, hence the public parts.
  *
  * <p>Unknown types are ignored, for a newer firmware; a malformed line or a
  * known type with a missing or mistyped field is a protocol error, and the
  * connection closes.
  */
-final class Link {
-    static final int VERSION = 1;
-    /** Longest line in bytes, newline included. */
-    static final int MAX_LINE = 4096;
+public final class Link {
+    public static final int VERSION = 2;
+    /** Longest line in bytes, newline included (decision 6 of §11.2). */
+    public static final int MAX_LINE = 131072;
     /** Colours in a frame, as LEDs on the Dot's ring. */
-    static final int SEGMENTS = 12;
+    public static final int SEGMENTS = 12;
 
     private Link() {}
 
-    static final class ProtocolException extends Exception {
+    public static final class ProtocolException extends Exception {
         ProtocolException(String message) {
             super(message);
         }
@@ -55,33 +57,40 @@ final class Link {
         }
     }
 
-    /** A firmware → app message. */
-    abstract static class Message {
+    /** A firmware → app or firmware → plugin message. */
+    public abstract static class Message {
         private Message() {}
     }
 
-    static final class Hello extends Message {
-        final long link;
-        /** The firmware's fw- version and its embedded cmp- version; null when link is not VERSION. */
-        final String firmware;
-        final String companion;
+    /**
+     * The firmware's reply to a hello. It carries the embedded version of the
+     * client's role: {@code companion} for the app, {@code plugin} for the
+     * plugin, the other one null. Every field but link is null when link is
+     * not VERSION.
+     */
+    public static final class Hello extends Message {
+        public final long link;
+        public final String firmware;
+        public final String companion;
+        public final String plugin;
 
-        Hello(long link, String firmware, String companion) {
+        Hello(long link, String firmware, String companion, String plugin) {
             this.link = link;
             this.firmware = firmware;
             this.companion = companion;
+            this.plugin = plugin;
         }
     }
 
-    static final class Frame extends Message {
+    public static final class Frame extends Message {
         /** 0xRRGGBB per segment, index 0 at the left. */
-        final int[] rgb;
+        public final int[] rgb;
 
         Frame(int[] rgb) {
             this.rgb = rgb;
         }
 
-        boolean dark() {
+        public boolean dark() {
             for (int c : rgb) {
                 if (c != 0) {
                     return false;
@@ -96,7 +105,7 @@ final class Link {
          * strength: an off segment is transparent rather than a black block
          * over the kiosk, and a dim one is a faint tint.
          */
-        int[] argb() {
+        public int[] argb() {
             int[] out = new int[rgb.length];
             for (int k = 0; k < rgb.length; k++) {
                 int r = rgb[k] >> 16 & 0xff, g = rgb[k] >> 8 & 0xff, b = rgb[k] & 0xff;
@@ -144,8 +153,55 @@ final class Link {
         }
     }
 
+    /** A turn's phase in the controller's turn.view (decision 8 of §11.2). */
+    public enum Phase {
+        LISTENING("listening"),
+        THINKING("thinking"),
+        ANSWERING("answering"),
+        DONE("done");
+
+        final String wire;
+
+        Phase(String wire) {
+            this.wire = wire;
+        }
+    }
+
+    /** The controller's turn.view, relayed whole by the firmware; never a delta. */
+    public static final class View extends Message {
+        public final String turnId;
+        public final Phase phase;
+        /** The request as sent to HA; null until STT ends. */
+        public final String heard;
+        /** The answer so far; null until the first text. */
+        public final String answer;
+        /** The streamed text has been replaced by intent-end's final speech. */
+        public final boolean isFinal;
+        /** HA continues the conversation: the next turn follows this one. */
+        public final boolean followUp;
+
+        public View(String turnId, Phase phase, String heard, String answer, boolean isFinal, boolean followUp) {
+            this.turnId = turnId;
+            this.phase = phase;
+            this.heard = heard;
+            this.answer = answer;
+            this.isFinal = isFinal;
+            this.followUp = followUp;
+        }
+    }
+
+    /** The plugin's settings from the device config. */
+    public static final class Config extends Message {
+        /** How long a finished turn stays on screen, in seconds; 0 hides it at once. */
+        public final double turnViewLinger;
+
+        Config(double turnViewLinger) {
+            this.turnViewLinger = turnViewLinger;
+        }
+    }
+
     /** Decodes one line; null for a type this version does not know. */
-    static Message decode(String line) throws ProtocolException {
+    public static Message decode(String line) throws ProtocolException {
         Map<String, Object> m;
         try {
             m = Json.parseObject(line);
@@ -157,9 +213,14 @@ final class Link {
             case "hello": {
                 long link = integer(m, "link");
                 if (link != VERSION) {
-                    return new Hello(link, null, null);
+                    return new Hello(link, null, null, null);
                 }
-                return new Hello(link, string(m, "firmware"), string(m, "companion"));
+                String companion = optString(m, "companion");
+                String plugin = optString(m, "plugin");
+                if (companion == null && plugin == null) {
+                    throw new ProtocolException("hello: neither companion nor plugin");
+                }
+                return new Hello(link, string(m, "firmware"), companion, plugin);
             }
             case "frame":
                 return new Frame(rgb(string(m, "rgb")));
@@ -176,6 +237,16 @@ final class Link {
                 }
                 return new Screen(Boolean.TRUE.equals(wake), hold);
             }
+            case "view":
+                return new View(string(m, "turn_id"), phase(string(m, "phase")), optString(m, "heard"),
+                        optString(m, "answer"), bool(m, "final"), bool(m, "follow_up"));
+            case "config": {
+                double linger = number(m, "turn_view_linger");
+                if (linger < 0) {
+                    throw new ProtocolException("config: turn_view_linger is negative");
+                }
+                return new Config(linger);
+            }
             default:
                 return null;
         }
@@ -183,8 +254,14 @@ final class Link {
 
     /** The app's hello, the first line on every connection. */
     static String hello(String companion, boolean overlay, boolean screenOn) {
-        return new Json.Writer().put("t", "hello").put("link", VERSION).put("companion", companion)
-                .put("overlay", overlay).put("screen_on", screenOn).end();
+        return new Json.Writer().put("t", "hello").put("link", VERSION).put("role", "app")
+                .put("companion", companion).put("overlay", overlay).put("screen_on", screenOn).end();
+    }
+
+    /** The plugin's hello, the first and only line it sends. */
+    public static String pluginHello(String plugin) {
+        return new Json.Writer().put("t", "hello").put("link", VERSION).put("role", "plugin")
+                .put("plugin", plugin).end();
     }
 
     static String pressDown() {
@@ -201,16 +278,16 @@ final class Link {
     }
 
     /** Splits a stream into lines of at most MAX_LINE bytes, newline included. */
-    static final class LineReader {
+    public static final class LineReader {
         private final InputStream in;
         private final byte[] line = new byte[MAX_LINE - 1];
 
-        LineReader(InputStream in) {
+        public LineReader(InputStream in) {
             this.in = in;
         }
 
         /** The next line without its newline, or null at the end of the stream; an unterminated last line is dropped. */
-        String readLine() throws IOException, ProtocolException {
+        public String readLine() throws IOException, ProtocolException {
             int n = 0;
             for (;;) {
                 int b = in.read();
@@ -261,6 +338,15 @@ final class Link {
         throw new ProtocolException("touch: unknown zone " + wire);
     }
 
+    private static Phase phase(String wire) throws ProtocolException {
+        for (Phase p : Phase.values()) {
+            if (p.wire.equals(wire)) {
+                return p;
+            }
+        }
+        throw new ProtocolException("view: unknown phase " + wire);
+    }
+
     private static String string(Map<String, Object> m, String key) throws ProtocolException {
         Object v = m.get(key);
         if (!(v instanceof String)) {
@@ -290,6 +376,22 @@ final class Link {
             throw new ProtocolException("field " + key + " is not a boolean");
         }
         return (Boolean) v;
+    }
+
+    private static boolean bool(Map<String, Object> m, String key) throws ProtocolException {
+        Object v = m.get(key);
+        if (!(v instanceof Boolean)) {
+            throw new ProtocolException("field " + key + " is not a boolean");
+        }
+        return (Boolean) v;
+    }
+
+    private static double number(Map<String, Object> m, String key) throws ProtocolException {
+        Object v = m.get(key);
+        if (!(v instanceof Long) && !(v instanceof Double)) {
+            throw new ProtocolException("field " + key + " is not a number");
+        }
+        return ((Number) v).doubleValue();
     }
 
     private static long integer(Map<String, Object> m, String key) throws ProtocolException {

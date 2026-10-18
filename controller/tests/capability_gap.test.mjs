@@ -52,12 +52,18 @@ const code = [
   liftFunctionDecl("capabilityGap"),
   liftFunctionDecl("liveCapabilities"),
   liftFunctionDecl("kioskApiGap"),
+  liftFunctionDecl("_known"),
   liftFunctionDecl("companionRows"),
+  liftConst("KIOSK_ERROR"),
+  liftConst("KIOSK_ERROR_TEXT"),
+  liftFunctionDecl("kioskRows"),
+  liftFunctionDecl("kioskHealth"),
+  liftFunctionDecl("kioskLoginReason"),
   "export { CAPABILITY, CAPABILITY_REASONS, PLATFORM_LABEL, capabilityGap, liveCapabilities,",
-  "         kioskApiGap, companionRows };",
+  "         kioskApiGap, companionRows, kioskRows, kioskLoginReason };",
 ].join("\n");
 const { CAPABILITY, CAPABILITY_REASONS, PLATFORM_LABEL, capabilityGap, liveCapabilities,
-        kioskApiGap, companionRows } = await import(
+        kioskApiGap, companionRows, kioskRows, kioskLoginReason } = await import(
   "data:text/javascript;base64," + Buffer.from(code).toString("base64"));
 
 let failures = 0;
@@ -94,11 +100,12 @@ const SHOWS = {
       ...SHOW_GAPS,
       leds: "no LED ring on this device", led_anim: "no LED ring on this device",
       buttons: "no action button on this device", button_hold: "no action button on this device",
+      turn_view_v1: "needs LineageOS on this Echo Show", kiosk_plugin: "needs LineageOS on this Echo Show",
     },
   },
   lineage18_crown: {
     connected: true, platform: "lineage18_crown",
-    capabilities: [...SHOW, "leds", "led_anim", "buttons", "button_hold", "screen_overlay"],
+    capabilities: [...SHOW, "leds", "led_anim", "buttons", "button_hold", "screen_overlay", "turn_view_v1", "kiosk_plugin"],
     capability_gaps: SHOW_GAPS,
   },
 };
@@ -117,6 +124,8 @@ for (const [platform, show] of Object.entries(SHOWS)) {
   check("fireos6_crown: the ring controls are gated on leds", capabilityGap(s, CAPABILITY.LEDS), "no LED ring on this device");
   check("fireos6_crown: no action button", capabilityGap(s, CAPABILITY.BUTTON_HOLD), "no action button on this device");
   check("fireos6_crown: the kiosk API lights the screen", kioskApiGap(s), null);
+  check("fireos6_crown: no turn view", capabilityGap(s, CAPABILITY.TURN_VIEW), "needs LineageOS on this Echo Show");
+  check("fireos6_crown: no Kiosk Satellite plugin", capabilityGap(s, CAPABILITY.KIOSK_PLUGIN), "needs LineageOS on this Echo Show");
 }
 {
   const s = liveCapabilities(SHOWS.lineage18_crown);
@@ -125,6 +134,8 @@ for (const [platform, show] of Object.entries(SHOWS)) {
   check("lineage18_crown: the action button is available", capabilityGap(s, CAPABILITY.BUTTON_HOLD), null);
   check("lineage18_crown: the app lights the screen, not the kiosk API", kioskApiGap(s),
         "the EchoMuse app lights the screen");
+  check("lineage18_crown: the turn view is available", capabilityGap(s, CAPABILITY.TURN_VIEW), null);
+  check("lineage18_crown: the plugin is available", capabilityGap(s, CAPABILITY.KIOSK_PLUGIN), null);
 }
 {
   // LineageOS firmware from before the companion app.
@@ -132,11 +143,13 @@ for (const [platform, show] of Object.entries(SHOWS)) {
   const s = liveCapabilities({
     connected: true, platform: "lineage18_crown", capabilities: SHOW,
     capability_gaps: { ...SHOW_GAPS, leds: UPDATE, led_anim: UPDATE, buttons: UPDATE,
-                       button_hold: UPDATE, screen_overlay: UPDATE },
+                       button_hold: UPDATE, screen_overlay: UPDATE, turn_view_v1: UPDATE, kiosk_plugin: UPDATE },
   });
   check("older lineage18_crown: the ring waits for the update", capabilityGap(s, CAPABILITY.LEDS), UPDATE);
   check("older lineage18_crown: the button waits for the update", capabilityGap(s, CAPABILITY.BUTTON_HOLD), UPDATE);
   check("older lineage18_crown: the kiosk API still lights the screen", kioskApiGap(s), null);
+  check("older lineage18_crown: the plugin waits for the update", capabilityGap(s, CAPABILITY.KIOSK_PLUGIN), UPDATE);
+  check("older lineage18_crown: the turn view waits for the update", capabilityGap(s, CAPABILITY.TURN_VIEW), UPDATE);
 }
 // A Dot on firmware predating the Dot-only capabilities and led_anim.
 const olderDot = {
@@ -145,7 +158,8 @@ const olderDot = {
   capability_gaps: {
     wifi_control: "firmware update available", ble_proxy: "firmware update available",
     privacy_mute: "firmware update available", screen_wake: "no screen on this device",
-    screen_overlay: "no screen on this device",
+    screen_overlay: "no screen on this device", turn_view_v1: "no screen on this device",
+    kiosk_plugin: "no screen on this device",
   },
 };
 const d = liveCapabilities(olderDot);
@@ -157,6 +171,7 @@ check("older Dot: led_anim keeps the dashboard's reason",
       capabilityGap(d, CAPABILITY.LED_ANIM), CAPABILITY_REASONS[CAPABILITY.LED_ANIM]);
 check("older Dot: the ring itself is available", capabilityGap(d, CAPABILITY.LEDS), null);
 check("older Dot: no screen, so no screen overlay", capabilityGap(d, CAPABILITY.SCREEN_OVERLAY), "no screen on this device");
+check("older Dot: no screen, so no turn view", capabilityGap(d, CAPABILITY.TURN_VIEW), "no screen on this device");
 check("older Dot: no screen, so no kiosk API", kioskApiGap(d), "no screen on this device");
 
 // Nothing is gated without a live session to ask: the fleet view, or an
@@ -188,6 +203,41 @@ check("overlay revoked, installer error",
 check("unknown link state is unavailable",
       text(companionRows({ companion: { version: null, linked: null, overlay: null, error: null } })),
       "Linked=unavailable, App version=unavailable, Overlay=unavailable, Last error=none");
+
+// The Kiosk Satellite rows (stats.companion.kiosk): one row without it
+// installed, "unavailable" for every unknown, and the two error codes in words.
+check("no kiosk report: no kiosk rows", kioskRows({ companion: { linked: true } }), null);
+check("Kiosk Satellite not installed: one row",
+  text(kioskRows({ companion: { kiosk: { installed: false, version: null, remote_admin: null,
+                                         plugin: { version: null, linked: false, error: null, switched_on: null } } } })),
+  "Kiosk Satellite=Not installed");
+check("installed, plugin linked",
+  text(kioskRows({ companion: { kiosk: { installed: true, version: "2026.10.28", remote_admin: true,
+    plugin: { version: "1.0.0-0123456789ab", linked: true, error: null, switched_on: false } } } })),
+  "Kiosk Satellite=2026.10.28, Remote admin=Answering, Plugin=Linked, Plugin version=1.0.0-0123456789ab, "
+  + "Plugins switched on=no, Plugin error=none");
+check("unknown fields are unavailable, never no",
+  text(kioskRows({ companion: { kiosk: { installed: null, version: null, remote_admin: null,
+    plugin: { version: null, linked: null, error: "token_rejected", switched_on: null } } } })),
+  "Kiosk Satellite=unavailable, Remote admin=unavailable, Plugin=unavailable, Plugin version=unavailable, "
+  + "Plugins switched on=unavailable, Plugin error=Kiosk Satellite rejected the token — log in again (Config → Screen)");
+
+// When the dashboard asks for the password before an update (decision 4):
+// Kiosk Satellite installed, and no token held or the held one rejected.
+// Offline, the last report (`kiosk`) stands in for the live stats.
+const kiosk = (installed, error = null) => ({ installed, version: null, remote_admin: true,
+  plugin: { version: null, linked: false, error, switched_on: null } });
+const show = (k, tokenSet, connected = true) => ({ connected, kioskTokenSet: tokenSet,
+  stats: connected ? { companion: { kiosk: k } } : null, kiosk: k });
+check("installed, no token: asks", typeof kioskLoginReason(show(kiosk(true), false)), "string");
+check("installed, token held: does not ask", kioskLoginReason(show(kiosk(true), true)), null);
+check("installed, token rejected: asks again",
+  typeof kioskLoginReason(show(kiosk(true, "token_rejected"), true)), "string");
+check("not installed: does not ask", kioskLoginReason(show(kiosk(false), false)), null);
+check("installed unknown: does not ask", kioskLoginReason(show(kiosk(null), false)), null);
+check("no report at all: does not ask", kioskLoginReason({ connected: true, kioskTokenSet: false, stats: {} }), null);
+check("offline with the last report: asks before a queued update",
+  typeof kioskLoginReason(show(kiosk(true), false, false)), "string");
 
 if (failures) {
   console.error(`${failures} check(s) failed`);

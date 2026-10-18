@@ -1,0 +1,6 @@
+Kiosk Satellite plugin SDK 1 interfaces, copied unchanged from
+https://github.com/jxlarrea/kiosk-satellite-plugin-hello-world at commit
+233e7391ac6e2efd4d271b28dc588c88a956b7c5 (2026-10-17), sdk/src/me/jxl/kiosk/plugins/.
+Apache-2.0, per their SPDX headers. Compile-time only: Kiosk Satellite supplies
+these classes at runtime, and the plugin ZIP must not carry them
+(SDK docs/creating-plugins.md, "Package").

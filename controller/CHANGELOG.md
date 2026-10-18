@@ -922,6 +922,49 @@ of the action button (docs/echo-show-companion-plan.md).
   `[companion]` log lines and `dumpsys package org.echomuse.companion`. Undo
   adds `pm uninstall org.echomuse.companion` (docs/rooting.md).
 
+### Echo Show 8 on LineageOS: the turn view in Kiosk Satellite
+
+With Kiosk Satellite as the kiosk, every turn shows full screen: the request
+in grey, the answer in large text as it streams
+(docs/echo-show-companion-plan.md §11).
+
+- **`turn.view` (device protocol §4.9).** The session sends a device
+  announcing the new `turn_view_v1` the whole view of each turn: `listening`
+  when its input starts, `thinking` with the text sent to Home Assistant (or,
+  for EchoMuse's own commands, the text as heard), `answering` as Home
+  Assistant streams the answer (`intent-progress` `chat_log_delta`, now the
+  run event `AnswerDelta`; at most 10 sends a second, the latest text
+  winning) and with the final speech at `intent-end`, and `done` once the
+  reply has played. `follow_up` keeps the view up into a reply window;
+  `no_input`, cancelled and failed turns end with no answer. Answers are cut
+  at 16 KiB, at a word. A wake that lost arbitration shows nothing.
+- **Kiosk Satellite login.** `POST /api/devices/{id}/kiosk_login {password}`
+  logs in at the Echo Show's Kiosk Satellite (`http://<device ip>:<kioskPort>`,
+  a ten-year token) and keeps only the token, in the device row (schema v35),
+  never the password; the device JSON says only `kioskTokenSet`. A wrong
+  password, a throttled login and an unreachable Kiosk Satellite each get
+  their own error. The token goes in `config` (`kioskToken`, `kioskPort`) to
+  a device announcing the new `kiosk_plugin`, whose firmware installs the
+  plugin with it.
+- **Screen settings.** `kioskPort` (default 2324) and `turnViewLinger`
+  (seconds the view stays after a turn, default 6, 0–60), each disabled with
+  the reason where the device lacks its capability; and the Kiosk Satellite
+  token, shown as set or not set, with a login.
+- **The password prompt.** The wizard's new last LineageOS step,
+  `kiosk_plugin`, asks for the password when Kiosk Satellite is installed
+  (read from stats, or with `pm path` while the Show is pending approval).
+  The dashboard asks again before a firmware update or a queued one when it
+  holds no token or Kiosk Satellite rejected it. Every prompt can be skipped,
+  and each states that Remote Administration with a password must be on and
+  that changing the password does not revoke the token.
+- **Status.** The Companion app panel shows `stats.companion.kiosk`:
+  Kiosk Satellite's version, remote admin, the plugin's version, link and
+  error, and whether the firmware switched Kiosk Satellite's plugins on.
+  Unknown values read "unavailable".
+- **Capabilities.** A LineageOS Show on firmware from before the plugin reads
+  "firmware update available" for both; a Fire OS Show "needs LineageOS on
+  this Echo Show"; a Dot "no screen on this device".
+
 ### Earlier in this release
 
 - ASR gain: the STT copy sent to Home Assistant is amplified by

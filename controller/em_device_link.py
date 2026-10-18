@@ -124,6 +124,8 @@ class MessageType(enum.StrEnum):
     BLE_ADVERTS = "ble_adverts"
     STATS = "stats"
     PONG = "pong"
+    # §4.9 turn view (C→D)
+    TURN_VIEW = "turn.view"
 
 
 class Capability(enum.StrEnum):
@@ -160,6 +162,15 @@ class Capability(enum.StrEnum):
     # ring compositor's frame as an on-screen light bar and turns touches in
     # its zones into button.action; screenWakeUrl/Password go unused there.
     SCREEN_OVERLAY = "screen_overlay"
+    # Announced by a LineageOS Show's firmware: it relays turn.view to its
+    # Kiosk Satellite plugin, which draws the turn full screen and hides it
+    # config turnViewLinger seconds after `done`
+    # (docs/echo-show-companion-plan.md §11).
+    TURN_VIEW = "turn_view_v1"
+    # Announced by a LineageOS Show's firmware: it installs and enables that
+    # plugin through Kiosk Satellite's remote API with config kioskToken and
+    # kioskPort, and reports it in stats.companion.kiosk.
+    KIOSK_PLUGIN = "kiosk_plugin"
 
 
 class DevicePlatform(enum.StrEnum):

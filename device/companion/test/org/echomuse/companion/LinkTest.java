@@ -15,6 +15,8 @@ import java.util.Map;
 public final class LinkTest {
     private static final String CMP = "cmp-0123456789ab";
     private static final String FW = "fw-ba9876543210";
+    private static final String KSP = "1.0.0-0123456789ab";
+    private static final String TURN = "6f1c2a9e-0d4b-4c51-9a8e-3b7d2f10c4e5";
     private static final String BLACK = repeat("000000", 12);
 
     private static final List<String> failures = new ArrayList<>();
@@ -26,10 +28,12 @@ public final class LinkTest {
 
     public static void main(String[] args) {
         run("encode app hello", LinkTest::encodeHello);
+        run("encode plugin hello", LinkTest::encodePluginHello);
         run("encode press", LinkTest::encodePress);
         run("encode state", LinkTest::encodeState);
         run("encode escapes strings", LinkTest::encodeEscapes);
         run("decode firmware hello", LinkTest::decodeHello);
+        run("decode firmware hello to the plugin", LinkTest::decodePluginHello);
         run("decode hello of another link version", LinkTest::decodeHelloMismatch);
         run("decode frame", LinkTest::decodeFrame);
         run("decode frame rejects bad rgb", LinkTest::decodeFrameBad);
@@ -38,6 +42,9 @@ public final class LinkTest {
         run("decode status rejects bad fields", LinkTest::decodeStatusBad);
         run("decode touch", LinkTest::decodeTouch);
         run("decode screen", LinkTest::decodeScreen);
+        run("decode view", LinkTest::decodeView);
+        run("decode view rejects bad fields", LinkTest::decodeViewBad);
+        run("decode config", LinkTest::decodeConfig);
         run("unknown type is ignored", LinkTest::unknownType);
         run("malformed lines are protocol errors", LinkTest::malformed);
         run("json values", LinkTest::jsonValues);
@@ -70,8 +77,15 @@ public final class LinkTest {
     // ── app → firmware ──────────────────────────────────────────────────────
 
     private static void encodeHello() {
-        eq("{\"t\":\"hello\",\"link\":1,\"companion\":\"" + CMP + "\",\"overlay\":true,\"screen_on\":false}",
+        eq("{\"t\":\"hello\",\"link\":2,\"role\":\"app\",\"companion\":\"" + CMP + "\",\"overlay\":true,\"screen_on\":false}",
                 Link.hello(CMP, true, false));
+    }
+
+    private static void encodePluginHello() throws Exception {
+        String line = Link.pluginHello(KSP);
+        eq("{\"t\":\"hello\",\"link\":2,\"role\":\"plugin\",\"plugin\":\"" + KSP + "\"}", line);
+        // The plugin's version is the firmware's comparison key: it survives a parse.
+        eq(KSP, Json.parseObject(line).get("plugin"));
     }
 
     private static void encodePress() {
@@ -87,31 +101,46 @@ public final class LinkTest {
     private static void encodeEscapes() throws Exception {
         String odd = "a\"b\\c\nd\u0001é";
         String line = Link.hello(odd, false, false);
-        eq("{\"t\":\"hello\",\"link\":1,\"companion\":\"a\\\"b\\\\c\\nd\\u0001é\",\"overlay\":false,\"screen_on\":false}", line);
+        eq("{\"t\":\"hello\",\"link\":2,\"role\":\"app\",\"companion\":\"a\\\"b\\\\c\\nd\\u0001é\",\"overlay\":false,\"screen_on\":false}", line);
         eq(odd, Json.parseObject(line).get("companion"));
     }
 
     // ── firmware → app ──────────────────────────────────────────────────────
 
     private static void decodeHello() throws Exception {
-        Link.Hello h = (Link.Hello) Link.decode("{\"t\":\"hello\",\"link\":1,\"firmware\":\"" + FW + "\",\"companion\":\"" + CMP + "\"}");
-        eq(1L, h.link);
+        Link.Hello h = (Link.Hello) Link.decode("{\"t\":\"hello\",\"link\":2,\"firmware\":\"" + FW + "\",\"companion\":\"" + CMP + "\"}");
+        eq(2L, h.link);
         eq(FW, h.firmware);
         eq(CMP, h.companion);
+        eq(null, h.plugin);
         // Field order and whitespace do not matter; extra fields are ignored.
-        h = (Link.Hello) Link.decode(" { \"companion\" : \"" + CMP + "\", \"future\": [1, {\"x\": null}], \"firmware\":\"" + FW + "\",\"link\":1,\"t\":\"hello\" } ");
+        h = (Link.Hello) Link.decode(" { \"companion\" : \"" + CMP + "\", \"future\": [1, {\"x\": null}], \"firmware\":\"" + FW + "\",\"link\":2,\"t\":\"hello\" } ");
         eq(FW, h.firmware);
-        protocolError("{\"t\":\"hello\",\"link\":1,\"companion\":\"" + CMP + "\"}");
-        protocolError("{\"t\":\"hello\",\"link\":\"1\",\"firmware\":\"" + FW + "\",\"companion\":\"" + CMP + "\"}");
-        protocolError("{\"t\":\"hello\",\"link\":1.5,\"firmware\":\"" + FW + "\",\"companion\":\"" + CMP + "\"}");
+        protocolError("{\"t\":\"hello\",\"link\":2,\"companion\":\"" + CMP + "\"}");
+        protocolError("{\"t\":\"hello\",\"link\":\"2\",\"firmware\":\"" + FW + "\",\"companion\":\"" + CMP + "\"}");
+        protocolError("{\"t\":\"hello\",\"link\":2.5,\"firmware\":\"" + FW + "\",\"companion\":\"" + CMP + "\"}");
+        // A hello naming neither role's version.
+        protocolError("{\"t\":\"hello\",\"link\":2,\"firmware\":\"" + FW + "\"}");
+        protocolError("{\"t\":\"hello\",\"link\":2,\"firmware\":\"" + FW + "\",\"companion\":5}");
+    }
+
+    private static void decodePluginHello() throws Exception {
+        Link.Hello h = (Link.Hello) Link.decode("{\"t\":\"hello\",\"link\":2,\"firmware\":\"" + FW + "\",\"plugin\":\"" + KSP + "\"}");
+        eq(FW, h.firmware);
+        eq(KSP, h.plugin);
+        eq(null, h.companion);
+        protocolError("{\"t\":\"hello\",\"link\":2,\"firmware\":\"" + FW + "\",\"plugin\":true}");
     }
 
     private static void decodeHelloMismatch() throws Exception {
         // Another version's hello may carry other fields: it decodes, and the
-        // service closes on the version alone.
-        Link.Hello h = (Link.Hello) Link.decode("{\"t\":\"hello\",\"link\":2}");
-        eq(2L, h.link);
+        // client closes on the version alone. Link 1 is the C1 firmware's.
+        Link.Hello h = (Link.Hello) Link.decode("{\"t\":\"hello\",\"link\":1,\"firmware\":\"" + FW + "\",\"companion\":\"" + CMP + "\"}");
+        eq(1L, h.link);
         eq(null, h.firmware);
+        h = (Link.Hello) Link.decode("{\"t\":\"hello\",\"link\":3}");
+        eq(3L, h.link);
+        eq(null, h.plugin);
     }
 
     private static void decodeFrame() throws Exception {
@@ -190,6 +219,52 @@ public final class LinkTest {
         protocolError("{\"t\":\"screen\",\"hold\":\"yes\"}");
     }
 
+    private static void decodeView() throws Exception {
+        Link.View v = (Link.View) Link.decode("{\"t\":\"view\",\"turn_id\":\"" + TURN + "\",\"phase\":\"listening\","
+                + "\"heard\":null,\"answer\":null,\"final\":false,\"follow_up\":false}");
+        eq(TURN, v.turnId);
+        eq(Link.Phase.LISTENING, v.phase);
+        eq(null, v.heard);
+        eq(null, v.answer);
+        check(!v.isFinal && !v.followUp, "listening: neither final nor follow-up");
+        v = (Link.View) Link.decode("{\"t\":\"view\",\"turn_id\":\"" + TURN + "\",\"phase\":\"thinking\","
+                + "\"heard\":\"What's the weather\",\"answer\":null,\"final\":false,\"follow_up\":false}");
+        eq(Link.Phase.THINKING, v.phase);
+        eq("What's the weather", v.heard);
+        v = (Link.View) Link.decode("{\"t\":\"view\",\"turn_id\":\"" + TURN + "\",\"phase\":\"answering\","
+                + "\"heard\":\"What's the weather\",\"answer\":\"Sunny, 21 \\u00b0C\\nand dry \\u2026\",\"final\":true,\"follow_up\":false}");
+        eq(Link.Phase.ANSWERING, v.phase);
+        eq("Sunny, 21 °C\nand dry …", v.answer);
+        check(v.isFinal, "final");
+        // Absent heard and answer read as null, like a JSON null.
+        v = (Link.View) Link.decode("{\"t\":\"view\",\"turn_id\":\"" + TURN + "\",\"phase\":\"done\",\"final\":false,\"follow_up\":true}");
+        eq(Link.Phase.DONE, v.phase);
+        eq(null, v.heard);
+        eq(null, v.answer);
+        check(v.followUp, "follow-up");
+    }
+
+    private static void decodeViewBad() {
+        String tail = ",\"heard\":null,\"answer\":null,\"final\":false,\"follow_up\":false}";
+        protocolError("{\"t\":\"view\",\"turn_id\":\"" + TURN + "\",\"phase\":\"speaking\"" + tail);
+        protocolError("{\"t\":\"view\",\"turn_id\":\"" + TURN + "\"" + tail);
+        protocolError("{\"t\":\"view\",\"phase\":\"done\"" + tail);
+        protocolError("{\"t\":\"view\",\"turn_id\":null,\"phase\":\"done\"" + tail);
+        protocolError("{\"t\":\"view\",\"turn_id\":\"" + TURN + "\",\"phase\":\"done\",\"heard\":5,\"answer\":null,\"final\":false,\"follow_up\":false}");
+        protocolError("{\"t\":\"view\",\"turn_id\":\"" + TURN + "\",\"phase\":\"done\",\"heard\":null,\"answer\":[],\"final\":false,\"follow_up\":false}");
+        protocolError("{\"t\":\"view\",\"turn_id\":\"" + TURN + "\",\"phase\":\"done\",\"heard\":null,\"answer\":null,\"follow_up\":false}");
+        protocolError("{\"t\":\"view\",\"turn_id\":\"" + TURN + "\",\"phase\":\"done\",\"heard\":null,\"answer\":null,\"final\":false,\"follow_up\":null}");
+    }
+
+    private static void decodeConfig() throws Exception {
+        eq(6.0, ((Link.Config) Link.decode("{\"t\":\"config\",\"turn_view_linger\":6}")).turnViewLinger);
+        eq(2.5, ((Link.Config) Link.decode("{\"t\":\"config\",\"turn_view_linger\":2.5}")).turnViewLinger);
+        eq(0.0, ((Link.Config) Link.decode("{\"t\":\"config\",\"turn_view_linger\":0}")).turnViewLinger);
+        protocolError("{\"t\":\"config\",\"turn_view_linger\":-1}");
+        protocolError("{\"t\":\"config\",\"turn_view_linger\":\"6\"}");
+        protocolError("{\"t\":\"config\"}");
+    }
+
     private static void unknownType() throws Exception {
         eq(null, Link.decode("{\"t\":\"captions\",\"text\":\"hi\"}"));
         eq(null, Link.decode("{\"t\":\"press\",\"down\":true}")); // app → fw only
@@ -227,7 +302,7 @@ public final class LinkTest {
         eq(Link.MAX_LINE - 1, max.length());
         Link.LineReader r = reader("{\"t\":\"touch\",\"zone\":\"stop\"}\n" + max + "\n\nlast");
         eq("{\"t\":\"touch\",\"zone\":\"stop\"}", r.readLine());
-        eq(max, r.readLine()); // 4096 bytes with its newline: accepted
+        eq(max, r.readLine()); // 131072 bytes with its newline: accepted
         eq("", r.readLine());
         eq(null, r.readLine()); // unterminated last line dropped
         eq(null, r.readLine());
@@ -235,7 +310,7 @@ public final class LinkTest {
         r = reader(max + "a\n");
         try {
             r.readLine();
-            check(false, "a 4097-byte line is refused");
+            check(false, "a 131073-byte line is refused");
         } catch (Link.ProtocolException expected) {
             // ok
         }
@@ -246,10 +321,22 @@ public final class LinkTest {
         r = reader(repeat("é", Link.MAX_LINE / 2) + "\n");
         try {
             r.readLine();
-            check(false, "a 4097-byte line of 2048 two-byte characters is refused");
+            check(false, "a 131073-byte line of 65536 two-byte characters is refused");
         } catch (Link.ProtocolException expected) {
             // ok
         }
+
+        // The longest view the controller sends: a 16 KiB answer whose every
+        // byte the encoder escapes to six (Go's json escapes '<' as \u003c)
+        // and a long request still fit in one line.
+        String answer = repeat("\\u003c", 16384);
+        String view = "{\"t\":\"view\",\"turn_id\":\"" + TURN + "\",\"phase\":\"answering\",\"heard\":\"" + repeat("\\u003c", 2048)
+                + "\",\"answer\":\"" + answer + "\",\"final\":true,\"follow_up\":false}";
+        check(view.length() < Link.MAX_LINE, "an escaped 16 KiB answer fits in one line");
+        r = reader(view + "\n");
+        Link.View v = (Link.View) Link.decode(r.readLine());
+        eq(16384, v.answer.length());
+        eq('<', v.answer.charAt(0));
     }
 
     // ── status text ─────────────────────────────────────────────────────────

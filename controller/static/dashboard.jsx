@@ -117,6 +117,8 @@ const CAPABILITY = Object.freeze({
   PRIVACY_MUTE:    'privacy_mute',
   SCREEN_WAKE:     'screen_wake',
   SCREEN_OVERLAY:  'screen_overlay',
+  TURN_VIEW:       'turn_view_v1',
+  KIOSK_PLUGIN:    'kiosk_plugin',
 });
 
 // em_device_link.DevicePlatform — the image a device's session runs on.
@@ -378,6 +380,11 @@ function kioskApiGap(capabilities) {
     || (capabilities?.names.includes(CAPABILITY.SCREEN_OVERLAY) ? SCREEN_OVERLAY_REASON : null);
 }
 
+// A Status value that may be unknown: null reads "unavailable", never "no".
+function _known(v, yes, no) {
+  return v == null ? ['unavailable', 'var(--muted)'] : v ? [yes, 'var(--ok)'] : [no, 'var(--warn)'];
+}
+
 // The Status rows for a LineageOS Show's companion app, from
 // `stats.companion` (protocol-v1 §stats): null when the device reports none,
 // so a device without the app shows no row at all. A null value is unknown
@@ -385,14 +392,59 @@ function kioskApiGap(capabilities) {
 function companionRows(stats) {
   const c = stats?.companion;
   if (c == null) return null;
-  const known = (v, yes, no) => v == null ? ['unavailable', 'var(--muted)']
-    : v ? [yes, 'var(--ok)'] : [no, 'var(--warn)'];
   return [
-    ['Linked', ...known(c.linked, 'Linked', 'Not linked')],
+    ['Linked', ..._known(c.linked, 'Linked', 'Not linked')],
     ['App version', c.version ?? 'unavailable', c.version == null ? 'var(--muted)' : undefined],
-    ['Overlay', ...known(c.overlay, 'Allowed', 'Not allowed')],
+    ['Overlay', ..._known(c.overlay, 'Allowed', 'Not allowed')],
     ['Last error', c.error ?? 'none', c.error == null ? undefined : 'var(--error)'],
   ];
+}
+
+// stats.companion.kiosk.plugin.error codes the dashboard acts on
+// (protocol-v1 §4.8); any other error is Kiosk Satellite's own text.
+const KIOSK_ERROR = Object.freeze({ TOKEN_REJECTED: 'token_rejected', NO_TOKEN: 'no_token' });
+const KIOSK_ERROR_TEXT = Object.freeze({
+  [KIOSK_ERROR.TOKEN_REJECTED]: 'Kiosk Satellite rejected the token — log in again (Config → Screen)',
+  [KIOSK_ERROR.NO_TOKEN]: 'no token — log in to Kiosk Satellite (Config → Screen)',
+});
+
+// The Status rows for the Kiosk Satellite plugin that shows each turn
+// (docs/echo-show-companion-plan.md §11), from `stats.companion.kiosk`: null
+// when the device reports none; one row when Kiosk Satellite is not
+// installed. Null values read "unavailable", as above.
+function kioskRows(stats) {
+  const k = stats?.companion?.kiosk;
+  if (k == null) return null;
+  if (k.installed === false) return [['Kiosk Satellite', 'Not installed', 'var(--muted)']];
+  const p = k.plugin ?? {};
+  return [
+    ['Kiosk Satellite', k.installed == null ? 'unavailable' : k.version ?? 'installed, version unavailable',
+     k.installed == null || k.version == null ? 'var(--muted)' : undefined],
+    ['Remote admin', ..._known(k.remote_admin, 'Answering', 'Not answering')],
+    ['Plugin', ..._known(p.linked, 'Linked', 'Not linked')],
+    ['Plugin version', p.version ?? 'unavailable', p.version == null ? 'var(--muted)' : undefined],
+    ['Plugins switched on', ...(p.switched_on == null ? ['unavailable', 'var(--muted)']
+      : p.switched_on ? ['by EchoMuse', 'var(--warn)'] : ['no', undefined])],
+    ['Plugin error', KIOSK_ERROR_TEXT[p.error] ?? p.error ?? 'none', p.error == null ? undefined : 'var(--error)'],
+  ];
+}
+
+// The Kiosk Satellite health a prompt reads: the live report while the device
+// is connected, else its last one (`kiosk`, kept past the session), since a
+// queued update is for an offline device.
+function kioskHealth(d) {
+  return (d.connected ? d.stats?.companion?.kiosk : d.kiosk) ?? null;
+}
+
+// Why the dashboard asks for the Kiosk Satellite password before an update
+// (docs/echo-show-companion-plan.md decision 4), or null when it need not:
+// Kiosk Satellite is installed and EchoMuse holds no token for it, or its
+// token was rejected.
+function kioskLoginReason(d) {
+  const k = kioskHealth(d);
+  if (k?.installed !== true) return null;
+  if (k.plugin?.error === KIOSK_ERROR.TOKEN_REJECTED) return 'Kiosk Satellite rejected the token EchoMuse holds.';
+  return d.kioskTokenSet ? null : 'EchoMuse holds no Kiosk Satellite token for this Echo Show.';
 }
 
 // Simulated LED colour for a device the controller cannot use: offline.
@@ -3332,6 +3384,98 @@ function firmwareBehind(d, firmware) {
   return !!(firmware && d.firmware_ver && d.firmware_ver !== firmware.version);
 }
 
+// The Kiosk Satellite password prompt (docs/echo-show-companion-plan.md
+// decision 4). POST /api/devices/{id}/kiosk_login logs in at the Echo Show's
+// own Kiosk Satellite and keeps only the token it issues, which the firmware
+// installs the turn-view plugin with. Always skippable: the light bar works
+// without the plugin. `reason` says why it is asked, when it was not asked for.
+function KioskLogin({ deviceId, reason, onDone, onSkip, skipLabel = 'Skip' }) {
+  const [password, setPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  async function login() {
+    if (!password || busy) return;
+    setBusy(true); setError('');
+    try {
+      await API.post(`/api/devices/${deviceId}/kiosk_login`, { password });
+    } catch (e) {
+      setError(e.error || 'Login failed');
+      setBusy(false);
+      return;
+    }
+    setPassword(''); setBusy(false);
+    onDone();
+  }
+
+  return (
+    <div style={{ display:'flex', flexDirection:'column', gap:8, padding:12, marginTop:8,
+                  border:'1px solid var(--border)', borderRadius:8, background:'var(--card)' }}>
+      {reason && <div style={{ fontFamily:MONO, fontSize:10, color:'var(--warn)' }}>{reason}</div>}
+      <div style={{ fontFamily:MONO, fontSize:10, color:'var(--text2)', lineHeight:1.6 }}>
+        Kiosk Satellite's Remote Administration password lets the firmware install the EchoMuse
+        plugin, which shows each request and answer full screen. Remote Administration must be on,
+        with a password set (Kiosk Satellite → Settings → Device → Remote Administration). EchoMuse
+        logs in once and keeps only the token Kiosk Satellite issues, never the password; changing
+        the password later does not revoke that token.
+      </div>
+      <div style={{ display:'flex', gap:8, alignItems:'center', flexWrap:'wrap' }}>
+        <input type="password" value={password} autoComplete="off" placeholder="Remote Administration password"
+          aria-label="Kiosk Satellite Remote Administration password" disabled={busy}
+          onChange={e => setPassword(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') login(); }}
+          style={{ flex:'1 1 220px', minWidth:0 }}/>
+        <Pill accent disabled={busy || !password} onClick={login}>{busy ? 'Logging in…' : 'Log in'}</Pill>
+        <Pill disabled={busy} onClick={onSkip}>{skipLabel}</Pill>
+      </div>
+      {error && <div style={{ fontFamily:MONO, fontSize:10, color:'var(--error)' }}>{error}</div>}
+    </div>
+  );
+}
+
+// Runs an update action at once, or after the Kiosk Satellite prompt when
+// kioskLoginReason says one is due (decision 4: before a firmware update or a
+// queued one). Returns [gate(action), the prompt or null]; logging in and
+// skipping both go on to the action.
+function useKioskGate(device) {
+  const [held, setHeld] = useState(null);   // {action, reason} waiting on the prompt
+  const gate = action => {
+    const reason = kioskLoginReason(device);
+    if (reason) setHeld({ action, reason });
+    else action();
+  };
+  const release = () => { const h = held; setHeld(null); if (h) h.action(); };
+  const prompt = held && (
+    <KioskLogin deviceId={device.device_id} onDone={release} onSkip={release} skipLabel="Skip, update anyway"
+      reason={`${held.reason} Log in before the update so the new firmware can install its Kiosk Satellite plugin.`}/>
+  );
+  return [gate, prompt];
+}
+
+// The Screen section's Kiosk Satellite token: set or not (never its value)
+// and a login at any time (decision 4). Outside the section's scope dimming:
+// the token belongs to the device, not to a config scope.
+function KioskTokenRow({ deviceId, tokenSet, reason, gap, disabled }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div style={{ marginTop:12, paddingTop:10, borderTop:'1px solid var(--hairline)' }}>
+      <div style={{ display:'flex', alignItems:'center', gap:10, flexWrap:'wrap' }}>
+        <span style={{ fontFamily:MONO, fontSize:11, color:'var(--text2)' }}>Kiosk Satellite token</span>
+        <span style={{ fontFamily:MONO, fontSize:11, color: tokenSet ? 'var(--ok)' : 'var(--muted)' }}>
+          {tokenSet ? 'set' : 'not set'}
+        </span>
+        {!open && (
+          <Pill small disabled={disabled || !!gap} onClick={() => setOpen(true)}>
+            {tokenSet ? 'Log in again' : 'Log in to Kiosk Satellite'}
+          </Pill>
+        )}
+      </div>
+      {gap && <div style={{ marginTop:6, fontFamily:MONO, fontSize:9, color:'var(--muted)' }}>Kiosk Satellite plugin unavailable: {gap}</div>}
+      {!gap && reason && !open && <div style={{ marginTop:6, fontFamily:MONO, fontSize:9, color:'var(--warn)' }}>{reason}</div>}
+      {open && <KioskLogin deviceId={deviceId} onDone={() => setOpen(false)} onSkip={() => setOpen(false)} skipLabel="Cancel"/>}
+    </div>
+  );
+}
+
 // Install-on-reconnect for an approved device that is offline and behind:
 // POST/DELETE /api/devices/{id}/update/queue. The controller keeps the request
 // across restarts and runs it when the device next connects. It names no
@@ -3340,6 +3484,7 @@ function firmwareBehind(d, firmware) {
 function QueuedInstall({ device, firmware, small }) {
   const [busy, setBusy]   = useState(false);
   const [error, setError] = useState('');
+  const [kioskGate, kioskPrompt] = useKioskGate(device);
   const queued = device.update_queued_at != null;
 
   async function toggle() {
@@ -3358,10 +3503,12 @@ function QueuedInstall({ device, firmware, small }) {
           Queued {relTime(device.update_queued_at)} — installs {firmware ? firmware.version : 'the bundled firmware'} on reconnect
         </span>
       )}
-      <Pill small={small} accent={!queued && !busy} disabled={busy} onClick={toggle}>
+      <Pill small={small} accent={!queued && !busy} disabled={busy || !!kioskPrompt}
+            onClick={() => queued ? toggle() : kioskGate(toggle)}>
         {busy ? '…' : queued ? 'Cancel queued install' : 'Install when it reconnects'}
       </Pill>
       {error && <span style={{ fontFamily:MONO, fontSize:10, color:'var(--error)' }}>{error}</span>}
+      {kioskPrompt && <div style={{ flexBasis:'100%' }}>{kioskPrompt}</div>}
     </div>
   );
 }
@@ -3404,6 +3551,7 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
   const state = deviceState(device);
   const needsUpdate = firmwareBehind(device, firmware);
   const updateRunning = pushing || !!device.update_in_progress;
+  const [kioskGate, kioskPrompt] = useKioskGate(device);
 
   // "samples" is admin-only for the reason the endpoint behind it is: the
   // mode suspends the assistant on this device, which is not something a
@@ -3908,19 +4056,30 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                   );
                 })()}
                 {/* A LineageOS Show's companion app (stats.companion): the
-                    light bar and touch zones. Health, not a capability — the
-                    app can be down while the session is up. */}
+                    light bar and touch zones, and below them the Kiosk
+                    Satellite plugin that shows each turn (`kiosk`). Health,
+                    not a capability — either can be down while the session
+                    is up. */}
                 {(() => {
                   const rows = companionRows(s);
+                  const kiosk = kioskRows(s);
                   const cells = part => part.map(([label, text, color]) => (
                     <React.Fragment key={label}>{row(label, text, color)}</React.Fragment>
                   ));
+                  const half = list => Math.ceil(list.length / 2);
                   return rows && (
                     <Panel label="Companion app">
                       <div className="em-grid2" style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:'0 24px' }}>
                         <div>{cells(rows.slice(0, 2))}</div>
                         <div>{cells(rows.slice(2))}</div>
                       </div>
+                      {kiosk && (
+                        <div className="em-grid2" style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:'0 24px',
+                                                          marginTop:10, paddingTop:10, borderTop:'1px solid var(--hairline)' }}>
+                          <div>{cells(kiosk.slice(0, half(kiosk)))}</div>
+                          <div>{cells(kiosk.slice(half(kiosk)))}</div>
+                        </div>
+                      )}
                     </Panel>
                   );
                 })()}
@@ -4006,6 +4165,8 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                 capabilities={liveCapabilities(device)}
                 deviceId={device.device_id}
                 deviceConnected={!!device.connected}
+                kioskTokenSet={!!device.kioskTokenSet}
+                kioskReason={kioskLoginReason(device)}
                 onScopeChange={(id, local) => {
                   setSections(prev => local
                     ? [...prev, id]
@@ -4067,8 +4228,8 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                 <div style={{ display:'flex', alignItems:'center', gap:10, flexWrap:'wrap', marginTop:16 }}>
                   {(device.connected || !needsUpdate || updateRunning) && (
                     <Pill accent={needsUpdate && device.connected && !updateRunning}
-                          disabled={!needsUpdate || !device.connected || updateRunning}
-                          onClick={doUpdate}>
+                          disabled={!needsUpdate || !device.connected || updateRunning || !!kioskPrompt}
+                          onClick={() => kioskGate(doUpdate)}>
                       {updateRunning ? 'Updating…'
                         : firmware ? `Install bundled ${firmware.version}` : 'Install bundled EchoMuse firmware'}
                     </Pill>
@@ -4086,6 +4247,7 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                     rolls itself back if an update fails to start.
                   </span>
                 </div>
+                {kioskPrompt}
                 <div style={{ fontFamily:MONO, fontSize:10, color:'var(--text2)', lineHeight:1.5, marginTop:10 }}>
                   {!firmware ? 'The bundled firmware version is not known yet.'
                     : updateRunning ? 'An update is in progress — wait for it to finish.'
@@ -4950,6 +5112,17 @@ function _serverLog(platform) {
 const _COMPANION_PKG = 'org.echomuse.companion';
 const _COMPANION_PORT = 8771;
 
+// Kiosk Satellite (docs/echo-show-companion-plan.md §11): the kiosk whose
+// plugin shows each turn full screen, installed by the firmware once
+// EchoMuse holds a token for its remote API.
+const _KIOSK_PKG = 'me.jxl.kiosk_satellite';
+
+// Whether `pm path` output says Kiosk Satellite is installed, for a device
+// pending approval, which reports no stats.
+function _kioskOnDevice(pmPath) {
+  return /^package:/m.test(pmPath || '');
+}
+
 // Whether `stats.companion` says the app is linked with its overlay allowed.
 function _companionReady(companion) {
   return companion?.linked === true && companion?.overlay === true;
@@ -5021,6 +5194,7 @@ const _SECURITY_LABEL = {
 //  install_em         — push bundled firmware + startup script        [auto]
 //  reboot, reconnect, verify_service (echomuse + audioserver), confirm_link
 //  verify_companion   — the firmware's app linked, overlay allowed     [auto]
+//  kiosk_plugin       — Kiosk Satellite installed: its password → token [auto, then input]
 //
 // `id` is also what a diagnostics upload names the failed step by.
 const _ALL_PLATFORMS = Object.values(WIZARD_PLATFORM);
@@ -5055,6 +5229,8 @@ const _WIZARD_STEPS = [
     desc: 'Now that the hooked slot is proven, write the same hook to the other system slot, so a bootloader fallback still runs EchoMuse.' },
   { id: 'verify_companion',  label: 'Verify App',        on: [WIZARD_PLATFORM.CROWN_LINEAGE],
     desc: "Wait for the EchoMuse app, which the firmware installs and starts, to link to the firmware with its overlay allowed: the light bar and touch zones along the bottom of the screen." },
+  { id: 'kiosk_plugin',      label: 'Kiosk Satellite',   on: [WIZARD_PLATFORM.CROWN_LINEAGE],
+    desc: "If Kiosk Satellite is installed, log in to its remote API once so the firmware can install the EchoMuse plugin that shows each request and answer full screen. Optional: skip it and the light bar still works." },
 ];
 
 // Whether a step runs for `platform` (null before connect_android: all do).
@@ -5090,7 +5266,7 @@ function _stepDesc(step, platform) {
 // that need no input, and steps with their own input panel.
 const CONNECT_STEPS = new Set(['connect_android', 'reconnect']);
 const AUTO_STEPS = new Set(['check_home', 'install_boot_hook', 'install_em', 'verify_service',
-                            'confirm_link', 'mirror_boot_hook', 'verify_companion']);
+                            'confirm_link', 'mirror_boot_hook', 'verify_companion', 'kiosk_plugin']);
 const INPUT_STEPS = new Set(['wifi']);
 
 // ── WifiPanel ──
@@ -5269,6 +5445,9 @@ function ProvisionWizard({ onClose, knownDevices }) {
   // registered ({serial, device}); readoptAnswer resolves it.
   const [readoptAsk, setReadoptAsk] = useState(null);
   const readoptAnswer = useRef(null);
+  // kiosk_plugin's open password prompt ({serial, reason}); kioskAnswer ends it.
+  const [kioskAsk, setKioskAsk] = useState(null);
+  const kioskAnswer = useRef(null);
   // The registered device this run keeps, once the operator chose to.
   const [readopting, setReadopting] = useState(null);
   const [progress, setProgress] = useState(null);
@@ -5346,6 +5525,7 @@ function ProvisionWizard({ onClose, knownDevices }) {
     stepEpoch.current++;
     // A step waiting on the re-adoption question unwinds as an abort.
     answerReadopt(false);
+    answerKiosk(false);
     setRunning(false);
     markStep(idx, STEP_STATE.ERROR);
     addLog(reason, LOG_TONE.ERROR);
@@ -6683,6 +6863,47 @@ function ProvisionWizard({ onClose, knownDevices }) {
                   + 'controller; the firmware retries the app every 30 s, so fix the cause above, then Retry.');
   }
 
+  // Decision 4 of the companion plan: when Kiosk Satellite is installed, ask
+  // for its Remote Administration password, which the controller turns into
+  // the token the firmware installs the plugin with. Installed is read from
+  // stats.companion.kiosk, or with `pm path` for a device pending approval.
+  // Skipping finishes the step: the light bar works without the plugin.
+  async function runKioskPlugin(c) {
+    const serial = (await c.shell('getprop ro.serialno')).trim();
+    if (!serial) throw new Error('Could not read the device serial (ro.serialno).');
+    const d = (await API.get('/api/devices')).find(x => x.device_id === serial) || null;
+    if (!d) throw new Error(`${serial} is not known to this controller.`);
+    const installed = d.connected && d.stats?.companion?.kiosk
+      ? d.stats.companion.kiosk.installed === true
+      : _kioskOnDevice(await c.shell(`pm path ${_KIOSK_PKG} 2>/dev/null`));
+    if (!installed) {
+      addLog('Kiosk Satellite is not installed: nothing to log in to.', LOG_TONE.OK);
+      return;
+    }
+    const reason = d.connected ? kioskLoginReason(d) : (d.kioskTokenSet ? null : 'EchoMuse holds no Kiosk Satellite token for this Echo Show.');
+    if (!reason) {
+      addLog('Kiosk Satellite is installed and EchoMuse already holds its token.', LOG_TONE.OK);
+      return;
+    }
+    addLog(`Kiosk Satellite is installed. ${reason}`);
+    const loggedIn = await askKiosk({ serial, reason });
+    addLog(loggedIn ? 'Kiosk Satellite token stored; the firmware installs the plugin with it.'
+                    : 'Kiosk Satellite login skipped: the plugin is not installed until you log in from Config → Screen.',
+           loggedIn ? LOG_TONE.OK : LOG_TONE.WARN);
+  }
+  function askKiosk(ask) {
+    return new Promise(resolve => {
+      kioskAnswer.current = resolve;
+      setKioskAsk(ask);
+    });
+  }
+  function answerKiosk(loggedIn) {
+    const resolve = kioskAnswer.current;
+    kioskAnswer.current = null;
+    setKioskAsk(null);
+    if (resolve) resolve(loggedIn);
+  }
+
   // ── Step executor ──
 
   async function runStep(stepIdx) {
@@ -6726,6 +6947,7 @@ function ProvisionWizard({ onClose, knownDevices }) {
         case 'confirm_link':      await runConfirmLink(c); break;
         case 'mirror_boot_hook':  await runMirrorBootHook(c); break;
         case 'verify_companion':  await runVerifyCompanion(c); break;
+        case 'kiosk_plugin':      await runKioskPlugin(c); break;
       }
       if (abandoned()) return;
       markStep(stepIdx, STEP_STATE.DONE);
@@ -6855,6 +7077,12 @@ function ProvisionWizard({ onClose, knownDevices }) {
             )}
 
             {/* ── Step-specific controls ── */}
+
+            {/* kiosk_plugin is waiting on the password (askKiosk). */}
+            {kioskAsk && (
+              <KioskLogin deviceId={kioskAsk.serial} reason={kioskAsk.reason}
+                onDone={() => answerKiosk(true)} onSkip={() => answerKiosk(false)}/>
+            )}
 
             {/* Connect / reconnect buttons */}
             {CONNECT_STEPS.has(stepId) && stepState[step] === STEP_STATE.PENDING && !running && (
@@ -7110,7 +7338,7 @@ const CONFIG_SECTIONS = {
   "bluetooth": ["bleProxyEnabled"],
   "timers": ["timerSound", "timerRingSeconds", "timerRingGapSeconds", "alarmSound"],
   "transcript": ["transcriptFix", "transcriptFixTerms", "transcriptFixPhrases", "transcriptFixPronunciations"],
-  "screen": ["screenWake", "screenWakeUrl", "screenWakePassword"]
+  "screen": ["screenWake", "screenWakeUrl", "screenWakePassword", "kioskPort", "turnViewLinger"]
 };
 
 // Display labels for the section ids, and the reverse key -> section index
@@ -8082,7 +8310,8 @@ function SoundPicker({ label, configKey, value, onChange, disabled, catalog, rel
 
 
 function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
-                            capabilities = null, deviceId = null, deviceConnected = false }) {
+                            capabilities = null, deviceId = null, deviceConnected = false,
+                            kioskTokenSet = null, kioskReason = null }) {
   // sections == null is the fleet view: nothing to inherit from, so every
   // control is live and no capability is guessed for a particular device.
   const scoped = Array.isArray(sections);
@@ -8114,6 +8343,10 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
   const bleGap = capabilityGap(capabilities, CAPABILITY.BLE_PROXY);
   const screenGap = capabilityGap(capabilities, CAPABILITY.SCREEN_WAKE);
   const kioskGap = kioskApiGap(capabilities);
+  // A LineageOS Show's Kiosk Satellite plugin (docs/echo-show-companion-plan.md
+  // §11): the remote API port it is installed through, and the turn view.
+  const pluginGap = capabilityGap(capabilities, CAPABILITY.KIOSK_PLUGIN);
+  const turnViewGap = capabilityGap(capabilities, CAPABILITY.TURN_VIEW);
   const [catalog, reloadSounds] = useSounds();
 
   const bands = config.eqBands ?? [0,0,0,0,0,0,0,0];
@@ -8410,8 +8643,12 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
       {/* 09 SCREEN */}
       <Stage n="09" title="Screen"
         chips={<ScopeChip tone="device">Kiosk</ScopeChip>}
-        desc="An Echo Show's screen belongs to its kiosk app (Fully Kiosk Browser), which keeps its own motion wake and screen timeout. With this on, the wake word also lights the screen, through the kiosk's local REST API: enable Remote Administration in Fully's settings and enter its password here. The URL is the kiosk API's root; the default reaches Fully on the Echo Show itself. On LineageOS, firmware with the EchoMuse app lights the screen through the app and needs neither."
-        scope={scopeEl('screen')} dim={secStyle('screen')}>
+        desc="An Echo Show's screen belongs to its kiosk app, which keeps its own motion wake and screen timeout. With this on, the wake word also lights the screen, through Fully Kiosk Browser's local REST API: enable Remote Administration in Fully's settings and enter its password here. The URL is the kiosk API's root; the default reaches Fully on the Echo Show itself. On LineageOS, firmware with the EchoMuse app lights the screen through the app and needs neither. With Kiosk Satellite as the kiosk, the firmware installs an EchoMuse plugin that shows each request and answer full screen, through Kiosk Satellite's remote API: turn on Remote Administration with a password there, and log in below."
+        scope={scopeEl('screen')} dim={secStyle('screen')}
+        after={deviceId && kioskTokenSet != null && (
+          <KioskTokenRow deviceId={deviceId} tokenSet={kioskTokenSet} reason={kioskReason}
+            gap={pluginGap} disabled={disabled}/>
+        )}>
         {screenGap && <div style={{ marginBottom:8, fontFamily:MONO, fontSize:9, color:'var(--warn)' }}>Screen controls unavailable: {screenGap}</div>}
         <div className="em-grid2" style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:'0 24px', ...inputStyle }}>
           <Toggle label="Light the screen on wake"
@@ -8432,6 +8669,18 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
           </label>
         </div>
         {kioskGap && !screenGap && <div style={{ marginTop:6, fontFamily:MONO, fontSize:9, color:'var(--muted)' }}>Kiosk API unused: {kioskGap}</div>}
+        <div className="em-grid2" style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:'0 24px', marginTop:12, ...inputStyle }}>
+          <Slider label="Turn view stays up"
+            sub={turnViewGap || 'after a turn ends, before the full-screen view hides (0: at once)'}
+            value={config.turnViewLinger ?? 6} min={0} max={60} step={1} unit="s"
+            onChange={v => { if (!turnViewGap) set('turnViewLinger', v); }}/>
+          <label style={{ fontFamily:MONO, fontSize:8, color:'var(--muted)' }}>Kiosk Satellite API port
+            <input type="number" min={1} max={65535} value={config.kioskPort ?? 2324} disabled={!!pluginGap}
+              onChange={e => { const v = parseInt(e.target.value, 10); if (v >= 1 && v <= 65535) set('kioskPort', v); }}
+              style={{ display:'block', width:'100%', marginTop:4, boxSizing:'border-box' }}/>
+          </label>
+        </div>
+        {pluginGap && <div style={{ marginTop:6, fontFamily:MONO, fontSize:9, color:'var(--muted)' }}>Kiosk Satellite plugin unavailable: {pluginGap}</div>}
       </Stage>
     </div>
   );

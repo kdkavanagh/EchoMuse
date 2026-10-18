@@ -19,6 +19,7 @@
 //	privacy mute             yes                     deferred                       deferred
 //	screen wake              no                      Fully Kiosk REST (kiosk)       companion app (internal/companion)
 //	companion app            embedded, never run     embedded, never run            installed, kept running, linked on 127.0.0.1:8771
+//	Kiosk Satellite plugin   embedded, never run     embedded, never run            installed by hash over its remote API, linked on 127.0.0.1:8771
 //	ambient light            yes                     yes                            yes, als_ps polling switched on
 //	stats                    yes                     yes (no wpa_cli link stats)    yes (no wpa_cli link stats)
 //	scratch (heap profiles)  /tmp                    /data/local/tmp/echomuse       /data/local/tmp/echomuse
@@ -28,6 +29,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -170,17 +172,24 @@ func run() error {
 	}
 	// On LineageOS the companion app is the ring and the action button
 	// (docs/echo-show-companion-plan.md): its bar shows every ring paint
-	// and a touch in its zone presses the Dot's action button.
+	// and a touch in its zone presses the Dot's action button. Where the
+	// kiosk is Kiosk Satellite, its EchoMuse plugin shows each turn (§11).
 	var app *companion.Server
 	var appInstaller *companion.Installer
+	var pluginInstaller *companion.KioskInstaller
 	var appHealth *companion.Health
 	if kind == platform.KindCrownLineage {
 		appHealth = &companion.Health{}
 		appInstaller = companion.NewInstaller(companion.InstallerConfig{Runner: companion.ExecRunner{}, Dir: kind.ScratchDir(), Health: appHealth})
+		v := cfg.Get()
+		pluginInstaller = companion.NewKioskInstaller(companion.KioskInstallerConfig{
+			Runner: companion.ExecRunner{}, HTTP: &http.Client{}, Health: appHealth, Token: v.KioskToken, Port: v.KioskPort,
+		})
 		app = companion.NewServer(companion.ServerConfig{
-			DeviceID: deviceID, Firmware: client.Version, Health: appHealth,
+			DeviceID: deviceID, Firmware: client.Version, Health: appHealth, TurnViewLinger: v.TurnViewLinger,
 			Press:  func(ev pkgbuttons.ButtonClickEvent) { sup.DotButton(ev) },
 			Linked: appInstaller.SetLinked, Mismatch: appInstaller.Reinstall, Overlay: appInstaller.Grant,
+			PluginLinked: pluginInstaller.SetLinked, PluginMismatch: pluginInstaller.Check,
 		})
 		phys.AttachLEDs(app.Sink())
 	}
@@ -229,6 +238,10 @@ func run() error {
 		// The app lights the screen; Fully's REST API is not used.
 		supCfg.ScreenOn = func(string, string) { app.ScreenWake() }
 		supCfg.Companion = app
+		supCfg.Retained.ConfigApplied = func(v config.Values) {
+			pluginInstaller.Configure(v.KioskToken, v.KioskPort)
+			app.SetTurnViewLinger(v.TurnViewLinger)
+		}
 	} else {
 		supCfg.ScreenOn = kiosk.New().ScreenOn
 	}
@@ -261,9 +274,10 @@ func run() error {
 		go vol.Watch(ctx, func(index int) { phys.ExternalVolumeChange(androidvol.LevelForIndex(index, vol.MaxIndex())) })
 	}
 	if app != nil {
-		// Neither returns before ctx ends, and no failure of theirs stops
-		// the firmware (plan decision 5).
+		// None returns before ctx ends, and no failure of theirs stops the
+		// firmware (plan decision 5, §11.2 decision 2).
 		go appInstaller.Run(ctx)
+		go pluginInstaller.Run(ctx)
 		go app.Run(ctx)
 	}
 

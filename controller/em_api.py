@@ -12,6 +12,7 @@ import enum
 import hashlib
 import html as _html
 import io
+import ipaddress
 import json
 import logging
 import os
@@ -433,6 +434,7 @@ async def create_app(services: ControllerServices) -> web.Application:
     app.router.add_post("/api/devices/{id}/approve",      _post_approve)
     app.router.add_get("/api/devices/{id}/config",        _get_device_config)
     app.router.add_post("/api/devices/{id}/config",       _post_device_config)
+    app.router.add_post("/api/devices/{id}/kiosk_login",  _post_kiosk_login)
     app.router.add_get("/api/devices/{id}/logs",          _get_device_logs)
     app.router.add_get("/api/devices/{id}/turns",         _get_device_turns)
     app.router.add_get("/api/devices/{id}/activity",      _get_device_activity)
@@ -568,10 +570,15 @@ class ErrorCode(enum.StrEnum):
     INVALID_MODEL = "invalid_model"
     INVALID_PARAM = "invalid_param"
     INVALID_UPLOAD = "invalid_upload"
+    KIOSK_ERROR = "kiosk_error"
+    KIOSK_PASSWORD_REJECTED = "kiosk_password_rejected"
+    KIOSK_THROTTLED = "kiosk_throttled"
+    KIOSK_UNREACHABLE = "kiosk_unreachable"
     MISSING_FIELD = "missing_field"
     MODEL_IN_USE = "model_in_use"
     NO_AFE_SERIES = "no_afe_series"
     NO_DECISION_TRACE = "no_decision_trace"
+    NO_DEVICE_ADDRESS = "no_device_address"
     NO_RECORDING = "no_recording"
     NO_ROLLBACK_AVAILABLE = "no_rollback_available"
     NO_SAMPLE = "no_sample"
@@ -1804,7 +1811,7 @@ def _validate_config(values: Mapping[str, object],
         if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 3600:
             return _error(ErrorCode.INVALID_CONFIG,
                           "timerRingSeconds must be an integer from 1 through 3600", 400)
-    message = sections_mod.screen_wake_error(values)
+    message = sections_mod.screen_wake_error(values) or sections_mod.kiosk_error(values)
     if message is not None:
         return _error(ErrorCode.INVALID_CONFIG, message, 400)
     return None
@@ -1885,6 +1892,88 @@ async def _post_device_config(request: web.Request) -> web.Response:
     return _ok({"device_id": device_id, "config": config,
                 "config_sections": new_sections,
                 "use_global_config": not new_sections, "pushed": pushed})
+
+
+# Kiosk Satellite's remote API login (docs/echo-show-companion-plan.md §11
+# decision 3): a token for ten years, the longest it issues.
+KIOSK_TOKEN_TTL_DAYS = 3650
+KIOSK_LOGIN_TIMEOUT_S = 10.0
+KIOSK_PREREQUISITE = "Kiosk Satellite's Remote Administration must be on, with a password set"
+
+
+def _kiosk_host(ip: str | None) -> str | None:
+    """The device's address as a URL host, or None when there is none to
+    dial (never reported, or not an IP address)."""
+    try:
+        addr = ipaddress.ip_address(ip or "")
+    except ValueError:
+        return None
+    return f"[{addr}]" if addr.version == 6 else str(addr)
+
+
+@auth.require_admin
+async def _post_kiosk_login(request: web.Request) -> web.Response:
+    """
+    POST /api/devices/{id}/kiosk_login — {"password": "..."}
+
+    Turns the Kiosk Satellite admin password into the API token a LineageOS
+    Show's firmware installs its plugin with (§11 decision 3): logs in at
+    http://<device ip>:<kioskPort>/api/login with ttl_days 3650, keeps only
+    the token (the device row's kiosk_token) and pushes it in `config`. The
+    password serves this one request and is never stored or logged. A device
+    pending approval may log in too (the wizard's kiosk_plugin step): its
+    last address is on its row, and the token reaches it once admitted.
+    """
+    device_id = request.match_info["id"]
+    body = await _json_body(request)
+    password = _require_str(body, "password")
+    row = await _device_row(device_id)
+    live = _online(device_id)
+    if live is not None and not live.kiosk_plugin_capable:
+        gap = live.capability_gap(Capability.KIOSK_PLUGIN)
+        if gap is not em_device.CapabilityGap.FIRMWARE_UPDATE:
+            # An older LineageOS firmware keeps the token for the update; any
+            # other device never uses one.
+            return _error(ErrorCode.NOT_SUPPORTED,
+                          f"Kiosk Satellite login unavailable: {gap or 'no kiosk_plugin capability'}", 409)
+    host = _kiosk_host(live.ip if live is not None else row.ip)
+    if host is None:
+        return _error(ErrorCode.NO_DEVICE_ADDRESS,
+                      "The device's network address is not known, so Kiosk Satellite cannot be reached", 409)
+    loop = asyncio.get_running_loop()
+    effective = await loop.run_in_executor(None, db.get_effective_device_config, device_id)
+    where = f"{host}:{sections_mod.kiosk_port(effective)}"
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=KIOSK_LOGIN_TIMEOUT_S)) as session:
+            async with session.post(f"http://{where}/api/login",
+                                    json={"password": password, "ttl_days": KIOSK_TOKEN_TTL_DAYS}) as resp:
+                status, text = resp.status, await resp.text()
+    except (aiohttp.ClientError, TimeoutError) as err:
+        log.info("[api] %s: Kiosk Satellite login at %s failed: %s", device_id, where, type(err).__name__)
+        return _error(ErrorCode.KIOSK_UNREACHABLE,
+                      f"Kiosk Satellite did not answer at {where}. {KIOSK_PREREQUISITE}.", 502)
+    if status == 401:
+        return _error(ErrorCode.KIOSK_PASSWORD_REJECTED,
+                      "Kiosk Satellite rejected the password: enter its Remote Administration password", 400)
+    if status == 429:
+        return _error(ErrorCode.KIOSK_THROTTLED,
+                      "Kiosk Satellite is refusing logins after failed attempts; wait a minute and try again", 429)
+    try:
+        token = json.loads(text).get("token") if status == 200 else None
+    except (ValueError, AttributeError):
+        token = None
+    if not isinstance(token, str) or not token:
+        return _error(ErrorCode.KIOSK_ERROR,
+                      f"Kiosk Satellite at {where} answered HTTP {status} without a token", 502)
+    await loop.run_in_executor(None, db.set_kiosk_token, device_id, token)
+    log.info("[api] %s: Kiosk Satellite token stored", device_id)
+    device = _devices.get(device_id)
+    pushed = False
+    if device is not None:
+        device.kiosk_token = token
+        pushed = await _apply_live_config(device_id, device, effective)
+    await push_device_update(device_id, {"kioskTokenSet": True})
+    return _ok({"device_id": device_id, "pushed": pushed})
 
 
 @auth.require_admin
@@ -5246,10 +5335,22 @@ class DeviceJson(TypedDict):
     bleProxy: em_ble_proxy.BleProxyStatus | None
     linkTokenIssued: bool
     linkTls: bool
+    kioskTokenSet: bool
+    kiosk: dict[str, object] | None
     wifi: dict[str, object]
     update_in_progress: bool
     update_queued_at: int | None
     update_error: str | None
+
+
+def _kiosk_health(device: em_device.Device | None) -> dict[str, object] | None:
+    """`stats.companion.kiosk` of the device's last stats report (protocol-v1
+    §4.8), kept past its session as Device.stats is, so the dashboard's Kiosk
+    Satellite prompt before a queued update reads it for an offline device
+    too. None: no such report this controller run."""
+    companion = device.stats.get("companion") if device is not None and device.stats is not None else None
+    kiosk = companion.get("kiosk") if isinstance(companion, dict) else None
+    return kiosk if isinstance(kiosk, dict) else None
 
 
 def _merge_device(row: db.DeviceRow) -> DeviceJson:
@@ -5343,6 +5444,10 @@ def _merge_device(row: db.DeviceRow) -> DeviceJson:
         "bleProxy":           em_ble_proxy.get_status(device_id),
         "linkTokenIssued":    bool(row.token),
         "linkTls":            bool(live is not None and live.secure),
+        # Kiosk Satellite (docs/echo-show-companion-plan.md §11): whether an API
+        # token is stored (never the token itself), and its last health report.
+        "kioskTokenSet":      bool(row.kiosk_token),
+        "kiosk":              _kiosk_health(device),
         "wifi":               _wifi_change(device_id).wire(),
         "update_in_progress": device_id in _updates_in_progress,
         # Unix time an install of the bundled firmware was queued for the

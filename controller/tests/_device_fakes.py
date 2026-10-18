@@ -57,7 +57,7 @@ class FakeActor:
     async def close(self) -> None: ...
 
     def attach(self, link, render, *, afe_metadata=False, no_input_chime=False,
-               announcement_chime=False) -> None:
+               announcement_chime=False, turn_view=False) -> None:
         self.attached = (link, render)
         self.afe_metadata = afe_metadata
 
@@ -206,30 +206,34 @@ class FakeHost:
         return {"ok": ok}
 
 
-def device_row(device_id: str, *, approved: bool, label: str | None) -> em_db.DeviceRow:
+def device_row(device_id: str, *, approved: bool, label: str | None,
+               kiosk_token: str | None = None) -> em_db.DeviceRow:
     """A `devices` row as a freshly registered device has it."""
     return em_db.DeviceRow(
         device_id=device_id, label=label, approved=int(approved), ip=None,
         firmware_ver=None, firmware_previous=None, first_seen=None, last_seen=None,
         config="{}", esphome_api_port=None, esphome_noise_psk=None, use_global_config=1,
         ble_proxy_port=None, token=None, config_sections="[]", collect_mode=0, ambient_mode=0,
-        os_version=None, update_queued_at=None)
+        os_version=None, update_queued_at=None, kiosk_token=kiosk_token)
 
 
 class FakeStore:
     """In-memory device table with the em_db registration semantics."""
 
-    def __init__(self, *, approval: str = "strict", token: str | None = None) -> None:
+    def __init__(self, *, approval: str = "strict", token: str | None = None,
+                 kiosk_token: str | None = None) -> None:
         self.rows: dict[str, em_db.DeviceRow] = {}
         self.approval = approval
         self.stored_token = token
+        self.kiosk_token = kiosk_token          # every row's Kiosk Satellite API token
         self.configs: dict[str, dict] = {}
         self.wake: list[dict] = []
         self.shadow: list[tuple] = []           # (reports, {mono_ns: wall s} of their events)
         self.registered: list[str] = []
 
     def add(self, device_id: str, *, approved: bool, label: str = "Office") -> None:
-        self.rows[device_id] = device_row(device_id, approved=approved, label=label)
+        self.rows[device_id] = device_row(device_id, approved=approved, label=label,
+                                          kiosk_token=self.kiosk_token)
 
     def device(self, device_id):
         return self.rows.get(device_id)

@@ -316,12 +316,14 @@ def test_config_form_does_not_reference_a_device_it_never_receives():
 
 # ─── Screen wake (Echo Show) ─────────────────────────────────────────────────
 
-def test_screen_wake_defaults_are_off_and_point_at_the_kiosk_on_the_device():
+def test_screen_defaults_are_off_and_point_at_the_kiosks_on_the_device():
     defaults = {k: em_db.DEFAULT_DEVICE_CONFIG[k] for k in cs.SECTIONS[cs.SectionId.SCREEN].keys}
     assert defaults == {"screenWake": False, "screenWakeUrl": "http://127.0.0.1:2323",
-                        "screenWakePassword": ""}
-    assert cs.screen_wake(em_db.DEFAULT_DEVICE_CONFIG) == defaults
-    assert cs.screen_wake_error(defaults) is None
+                        "screenWakePassword": "", "kioskPort": 2324, "turnViewLinger": 6}
+    assert cs.screen_wake(em_db.DEFAULT_DEVICE_CONFIG) == {
+        k: v for k, v in defaults.items() if k.startswith("screen")}
+    assert cs.screen_wake_error(defaults) is None and cs.kiosk_error(defaults) is None
+    assert (cs.kiosk_port(em_db.DEFAULT_DEVICE_CONFIG), cs.turn_view_linger(em_db.DEFAULT_DEVICE_CONFIG)) == (2324, 6)
 
 
 def test_screen_wake_push_is_strictly_typed():
@@ -354,3 +356,22 @@ def test_screen_wake_push_is_strictly_typed():
 ])
 def test_screen_wake_validation(values, ok):
     assert (cs.screen_wake_error(values) is None) is ok
+
+
+@pytest.mark.parametrize("values, ok", [
+    ({"kioskPort": 2324}, True), ({"kioskPort": 65535}, True),
+    ({"kioskPort": 0}, False), ({"kioskPort": 65536}, False), ({"kioskPort": "2324"}, False),
+    ({"kioskPort": True}, False), ({"kioskPort": 2324.0}, False),
+    ({"turnViewLinger": 0}, True), ({"turnViewLinger": 2.5}, True), ({"turnViewLinger": 60}, True),
+    ({"turnViewLinger": -1}, False), ({"turnViewLinger": 61}, False), ({"turnViewLinger": "6"}, False),
+    ({"turnViewLinger": False}, False),
+])
+def test_kiosk_validation(values, ok):
+    assert (cs.kiosk_error(values) is None) is ok
+
+
+def test_kiosk_push_falls_back_to_the_defaults_for_a_mistyped_value():
+    # A hand-edited database is the only way past the API's validation.
+    assert cs.kiosk_port({"kioskPort": "2400"}) == 2324
+    assert cs.turn_view_linger({"turnViewLinger": 99}) == 6
+    assert (cs.kiosk_port({"kioskPort": 2400}), cs.turn_view_linger({"turnViewLinger": 0})) == (2400, 0)

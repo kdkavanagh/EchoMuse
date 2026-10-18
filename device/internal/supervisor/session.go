@@ -25,11 +25,12 @@ var v1Capabilities = []proto.Capability{
 // platformCapabilities are the hardware and platform capabilities each
 // image implements (§18.2; docs/echo-show-port-plan.md decisions 6, 7;
 // docs/echo-show-lineage-plan.md §3; docs/echo-show-companion-plan.md
-// decision 8). The Dot keeps its ring, buttons, Wi-Fi management, BLE
-// proxy and privacy mute; on the Show, on either OS, Android owns Wi-Fi,
-// Bluetooth and the keys, mute is deferred and the kiosk screen can be
-// woken. On LineageOS the companion app's bar is the ring and its touch
-// zone the action button.
+// decision 8, §11.2 decision 7). The Dot keeps its ring, buttons, Wi-Fi
+// management, BLE proxy and privacy mute; on the Show, on either OS,
+// Android owns Wi-Fi, Bluetooth and the keys, mute is deferred and the
+// kiosk screen can be woken. On LineageOS the companion app's bar is the
+// ring and its touch zone the action button, and the firmware keeps the
+// Kiosk Satellite plugin that shows each turn.
 var platformCapabilities = map[proto.Platform][]proto.Capability{
 	proto.PlatformFireOS6: {
 		proto.CapLEDs, proto.CapLEDAnim, proto.CapButtons, proto.CapButtonHold,
@@ -38,7 +39,7 @@ var platformCapabilities = map[proto.Platform][]proto.Capability{
 	proto.PlatformFireOS6Crown: {proto.CapScreenWake},
 	proto.PlatformLineage18Crown: {
 		proto.CapLEDs, proto.CapLEDAnim, proto.CapButtons, proto.CapButtonHold,
-		proto.CapScreenWake, proto.CapScreenOverlay,
+		proto.CapScreenWake, proto.CapScreenOverlay, proto.CapTurnView, proto.CapKioskPlugin,
 	},
 }
 
@@ -159,13 +160,15 @@ func (s *Supervisor) Rejected(reason proto.RejectReason, controller string) {
 // Lost implements client.Handler: every dialog/uplink lease and network
 // playback ends; local alerts, privacy and physical stop continue (§16.1).
 // A wake or dialog the controller was still handling gets the offline
-// notice, so the user is not left with silence; the detector keeps (or
-// restores) the last model and answers later wakes itself.
+// notice, so the user is not left with silence, and a turn view it was
+// still showing ends; the detector keeps (or restores) the last model and
+// answers later wakes itself.
 func (s *Supervisor) Lost(reason client.LostReason) {
 	log.Printf("[session] lost: %s", reason)
 	inFlight := s.endSession()
 	s.cfg.Physical.SetLinkState(server.LinkDown)
 	s.companionLink(companion.LinkDown, string(reason), "")
+	s.endTurnView()
 	s.mu.Lock()
 	s.offCancel()
 	s.offCtx, s.offCancel = context.WithCancel(context.Background())
@@ -244,6 +247,8 @@ func (s *Supervisor) Control(env proto.Envelope) {
 		s.alertOpResult(env)
 	case proto.TypeClockReply:
 		s.clockReply(env)
+	case proto.TypeTurnView:
+		s.turnView(env)
 	default:
 		s.retained(env)
 	}

@@ -93,6 +93,7 @@ from em_audio_timeline import (
 from em_device_link import AckStatus, CloseReason, CommandAck, Envelope, MessageType
 from em_endpoint_policy import Route, recognized_completeness, recognizer_sentences, redecode_differs
 from em_ha_client import (
+    AnswerDelta,
     HaError,
     HaTimer,
     HaUnavailable,
@@ -126,6 +127,7 @@ from em_stt_copy import STT_TAIL_SILENCE, asr_gain_for, stt_copy
 from em_text_fix import FixConfig, FixOutcome, FixRecord, TextFixMode, fix_config, fix_key
 from em_text_fix import Reason as FixReason
 from em_text_fix_service import NotReady, TextFixService
+from em_turn_view import ANSWER_INTERVAL_S, TurnView, ViewPhase
 from em_utterance import (
     PREROLL,
     REPLY_KINDS,
@@ -995,6 +997,7 @@ class _Turn:
     fix_job: tuple[tuple[str, str], asyncio.Task[FixOutcome | None]] | None = None
     fix_task: asyncio.Task[None] | None = None
     stt_fix: FixRecord | None = None
+    view: TurnView | None = None              # what a turn_view_v1 device shows of it; None: nothing
 
 
 @dataclass
@@ -1050,6 +1053,7 @@ class SessionActor:
         self.render: RenderClient | None = None
         self._no_input_chime_capable = False   # the session's device plays NO_INPUT_CHIME
         self._announcement_chime_capable = False   # the session's device plays ANNOUNCEMENT_CHIME
+        self._turn_view_capable = False   # the session's device takes turn.view
         self.uplink: UplinkSession | None = None
         self._queue: asyncio.PriorityQueue[tuple[int, int, _Event]] = asyncio.PriorityQueue()
         self._sequence = 0
@@ -1103,14 +1107,17 @@ class SessionActor:
             await self._task
 
     def attach(self, link: _Link, render: RenderClient, *, afe_metadata: bool = False,
-               no_input_chime: bool = False, announcement_chime: bool = False) -> None:
+               no_input_chime: bool = False, announcement_chime: bool = False,
+               turn_view: bool = False) -> None:
         """Session ready: the new session's link, renderer, and an empty uplink record.
         `afe_metadata`: session.ready granted it, so the session carries the `afe` stream.
         `no_input_chime`, `announcement_chime`: the device announced it, so it plays
-        NO_INPUT_CHIME, ANNOUNCEMENT_CHIME."""
+        NO_INPUT_CHIME, ANNOUNCEMENT_CHIME. `turn_view`: it announced turn_view_v1, so it
+        is sent turn.view."""
         self.link, self.render = link, render
         self._no_input_chime_capable = no_input_chime
         self._announcement_chime_capable = announcement_chime
+        self._turn_view_capable = turn_view
         self.uplink = UplinkSession(afe_metadata=afe_metadata)
         self._post(P_LOSS, _Attach())
 
@@ -1567,6 +1574,7 @@ class SessionActor:
                      inherited.conversation_id if inherited else None, inherited, local_only=local_only)
         self._turn = turn
         await self._acquire_focus(turn_id, Focus.DIALOG_INPUT, turn.generation)
+        await self._view_listening(turn)
         # An alert-context wake chimes like any other: a ring falling silent cannot tell the user they
         # were heard, since its own gaps are silent too. No chime when the wake cancels a reply: the
         # stopping is the acknowledgement (§16.2). Content only ducks, so a media-context wake chimes,
@@ -1633,6 +1641,7 @@ class SessionActor:
                      conversation_id=inherited.conversation_id if inherited else None, expectation=inherited)
         self._turn = turn
         await self._acquire_focus(turn_id, Focus.DIALOG_INPUT, turn.generation)
+        await self._view_listening(turn)
         self._set_state(ActorState.ARMED)
         await self._open_utterance(turn)
 
@@ -1749,6 +1758,7 @@ class SessionActor:
         turn = _Turn(exp.owner, self._generation, kind, asyncio.get_running_loop().time(), Utterance(spec), runtime,
                      conversation_id=exp.conversation_id, expectation=exp)
         self._turn = turn
+        await self._view_listening(turn)    # its input focus was taken above, or at the drain
         self._set_state(ActorState.ARMED)
         log.info("[%s] reply turn %s open for %s at %d%s (vad %s)", self.device_id, turn.turn_id,
                  exp.origin.turn_id if exp.origin is not None else exp.source, trigger,
@@ -2430,10 +2440,12 @@ class SessionActor:
             await self._finish_turn(turn, TerminalReason.EMPTY_TRANSCRIPT)
             return
         exp = turn.expectation
+        command = local_route(text)
+        if (exp is not None and exp.choices) or command is not None:
+            await self._view_heard(turn, text)   # a local route acts on the text as heard
         if exp is not None and exp.choices:
             await self._answer_choice(turn, exp, exp.choices, text)
             return
-        command = local_route(text)
         if isinstance(command, RepeatRequest):
             await self._repeat(turn)
             return
@@ -2449,6 +2461,7 @@ class SessionActor:
         sent = await self._corrected(turn, text, pipeline, language)
         if sent is None:
             return
+        await self._view_heard(turn, sent)
         turn.outcome = TurnOutcome.HA
         self.awaiting_intent = True
         started = time.monotonic()
@@ -2495,8 +2508,13 @@ class SessionActor:
                         turn.timings["stt_ms"] = round((time.monotonic() - sent) * 1000)
                         _mark(turn, TurnStage.STT, sent)
                         sent = time.monotonic()
+                        await self._view_heard(turn, event.text)
+                    elif isinstance(event, AnswerDelta):
+                        await self._view_answer(turn, event.text, final=False)
                     elif isinstance(event, IntentEnded):
                         intent = event
+                        if event.speech:
+                            await self._view_answer(turn, event.speech, final=True)
                     elif isinstance(event, TtsReady):
                         tts = event
                         _tts_ready(turn, sent)
@@ -2739,6 +2757,7 @@ class SessionActor:
         """§6.3 step 3: execute on the captured occurrence without HA."""
         turn.outcome = TurnOutcome.LOCAL_COMMAND
         turn.stt_text = commit.text
+        await self._view_heard(turn, commit.text)
         if action == LocalAction.STOP:        # dialog context: the wake already cancelled the output
             await self._finish_turn(turn, TerminalReason.COMPLETED, feedback=False)
             return
@@ -2861,6 +2880,8 @@ class SessionActor:
             return
         said = last.said()
         turn.response_text = said.text
+        if said.text:
+            await self._view_answer(turn, said.text, final=True)
         if said.asks:
             if self._chain_allowed(turn):
                 turn.conversation_id = said.conversation_id
@@ -2995,6 +3016,7 @@ class SessionActor:
         """EchoMuse's own answer (a confirmation or status) as the turn's spoken response,
         so the turn's row records what was said and how it played (§11.3)."""
         turn.response_text = line
+        await self._view_answer(turn, line, final=True)
         started = time.monotonic()
         url = await self._tts(line)
         if not self._current(turn):
@@ -3397,6 +3419,7 @@ class SessionActor:
         if turn.terminal is not None:
             return
         turn.terminal = reason
+        await self._view_done(turn, reason)
         if turn.trigger in REPLY_KINDS and turn.expectation is not None and turn.commit is None:
             # A reply that never committed did not answer its question: a silent window is the
             # question's `reply_timeout`, any other end its own reason (§9.1).
@@ -3629,6 +3652,75 @@ class SessionActor:
                                                              row_id, capture.pcm)
         except Exception:
             log.exception("[%s] turn %s audio not saved", self.device_id, row_id)
+
+    # --- turn view (docs/echo-show-companion-plan.md §11 decision 8) ------------------------------
+
+    async def _view_listening(self, turn: _Turn) -> None:
+        """`listening` at the turn's dialog_input start, to a turn_view_v1 device only. A wake
+        that lost arbitration and acts on a local command alone shows nothing: the winning
+        device shows the turn."""
+        if self._turn_view_capable and not turn.local_only:
+            turn.view = TurnView(turn.turn_id)
+            await self._send_view(turn.view)
+
+    async def _view_heard(self, turn: _Turn, heard: str) -> None:
+        """`thinking` at dispatch: the text sent to HA (`sent`), or the text a local route acts on."""
+        view = turn.view
+        if view is None or view.phase == ViewPhase.DONE:
+            return
+        view.phase, view.heard = ViewPhase.THINKING, heard
+        await self._send_view(view)
+
+    async def _view_answer(self, turn: _Turn, text: str, *, final: bool) -> None:
+        """`answering`: a streamed piece appended, sent at most every ANSWER_INTERVAL_S with the
+        latest winning (a held-back piece goes out with the next send, or after the interval),
+        or the final speech, which replaces the streamed text and goes at once."""
+        view = turn.view
+        if view is None or view.phase == ViewPhase.DONE or (view.final and not final):
+            return
+        view.phase = ViewPhase.ANSWERING
+        if final:
+            view.answer, view.final = text, True
+            await self._send_view(view)
+            return
+        view.answer = (view.answer or "") + text
+        if view.trailing is not None:
+            return
+        now = asyncio.get_running_loop().time()
+        wait = 0.0 if view.sent_at is None else view.sent_at + ANSWER_INTERVAL_S - now
+        if wait <= 0:
+            await self._send_view(view)
+        else:
+            view.trailing = self._spawn(self._send_view_later(view, wait))
+
+    async def _send_view_later(self, view: TurnView, wait: float) -> None:
+        await asyncio.sleep(wait)
+        view.trailing = None
+        await self._send_view(view)
+
+    async def _view_done(self, turn: _Turn, reason: TerminalReason) -> None:
+        """`done` as the turn ends. A completed turn keeps what it said, and `follow_up` says a
+        reply window follows (HA's continue_conversation, or EchoMuse's own question); any other
+        end (no_input, cancelled, an error) shows no answer."""
+        view = turn.view
+        if view is None or view.phase == ViewPhase.DONE:
+            return
+        view.phase = ViewPhase.DONE
+        if reason == TerminalReason.COMPLETED:
+            if turn.response_text:
+                view.answer, view.final = turn.response_text, True
+            view.follow_up = turn.continuation == FollowUp.PENDING
+        else:
+            view.answer, view.final = None, False
+        await self._send_view(view)
+
+    async def _send_view(self, view: TurnView) -> None:
+        """The whole view, now; a held-back streamed send is folded into it."""
+        if view.trailing is not None:
+            view.trailing.cancel()
+            view.trailing = None
+        view.sent_at = asyncio.get_running_loop().time()
+        await self._send(MessageType.TURN_VIEW, view.body(), 0)
 
     # --- wire helpers -----------------------------------------------------------------------------
 

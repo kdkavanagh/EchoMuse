@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, TypeGuard
 from urllib.parse import urlsplit
 
 # A config scope as stored (JSON object): values are whatever each key holds.
@@ -68,8 +68,11 @@ SECTIONS: dict[SectionId, Section] = {
     SectionId.TRANSCRIPT: Section("Transcript correction", ("transcriptFix", "transcriptFixTerms",
                                                             "transcriptFixPhrases", "transcriptFixPronunciations")),
     # The kiosk screen of a `screen_wake` device (the Echo Show): lit through
-    # the kiosk's local REST API when a wake candidate opens.
-    SectionId.SCREEN: Section("Screen", ("screenWake", "screenWakeUrl", "screenWakePassword")),
+    # the kiosk's local REST API when a wake candidate opens. On a LineageOS
+    # Show, Kiosk Satellite's remote API port (`kiosk_plugin`) and how long its
+    # turn view lingers (`turn_view_v1`, docs/echo-show-companion-plan.md §11).
+    SectionId.SCREEN: Section("Screen", ("screenWake", "screenWakeUrl", "screenWakePassword",
+                                         "kioskPort", "turnViewLinger")),
 }
 
 # Keys that live in the config dict but are device STATE, not settings: they
@@ -185,3 +188,42 @@ def _kiosk_root(url: object) -> bool:
         return False
     return (parts.scheme in ("http", "https") and bool(parts.hostname) and port != 0
             and not (parts.path or parts.query or parts.fragment))
+
+
+# Kiosk Satellite's remote API port unless changed in its settings, and the
+# turn view's linger after `done` (§11.7: 6 s; 0 hides it at once, at most a
+# minute).
+KIOSK_PORT_DEFAULT = 2324
+TURN_VIEW_LINGER_DEFAULT = 6
+TURN_VIEW_LINGER_MAX = 60
+
+
+def kiosk_port(cfg: Mapping[str, object]) -> int:
+    """`kioskPort` as pushed to a `kiosk_plugin` device and dialled by
+    kiosk_login: the default standing in for a missing or mistyped value."""
+    port = cfg.get("kioskPort")
+    return port if _is_port(port) else KIOSK_PORT_DEFAULT
+
+
+def turn_view_linger(cfg: Mapping[str, object]) -> float:
+    """`turnViewLinger` as pushed to a `turn_view_v1` device, in seconds."""
+    linger = cfg.get("turnViewLinger")
+    return linger if _is_linger(linger) else TURN_VIEW_LINGER_DEFAULT
+
+
+def kiosk_error(values: Mapping[str, object]) -> str | None:
+    """Why the Kiosk Satellite keys in a config write are invalid, or None."""
+    if "kioskPort" in values and not _is_port(values["kioskPort"]):
+        return "kioskPort must be an integer from 1 through 65535"
+    if "turnViewLinger" in values and not _is_linger(values["turnViewLinger"]):
+        return f"turnViewLinger must be a number of seconds from 0 through {TURN_VIEW_LINGER_MAX}"
+    return None
+
+
+def _is_port(value: object) -> TypeGuard[int]:
+    return isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 65535
+
+
+def _is_linger(value: object) -> TypeGuard[int | float]:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and 0 <= value <= TURN_VIEW_LINGER_MAX)

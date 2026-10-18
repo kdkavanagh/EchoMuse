@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "apiVersion": 1,
+  "id": "echomuse",
+  "name": "EchoMuse",
+  "version": "1.0.0-dev",
+  "minAndroidSdk": 30,
+  "entryClass": "org.echomuse.ksplugin.EchoMusePlugin",
+  "description": "Shows each EchoMuse voice turn full screen: the request, the answer as it streams, and the light bar's colours. Installed and updated by the EchoMuse firmware on this device.",
+  "author": "EchoMuse",
+  "license": "Internal use",
+  "capabilities": ["overlay", "host.read", "host.control"]
+}

@@ -291,6 +291,13 @@ class IntentEnded:
 
 
 @dataclass(frozen=True)
+class AnswerDelta:
+    """`intent-progress` `chat_log_delta.content`: the next piece of the answer
+    text while the conversation agent streams it, before `intent-end`."""
+    text: str
+
+
+@dataclass(frozen=True)
 class TtsReady:
     """Response audio URL (absolute), sent once HA has decided what the reply
     is. `streamed`: the run-start URL, released by `intent-progress`
@@ -318,7 +325,7 @@ class RunLost:
     """The connection dropped before the run ended; its outcome is unknown. Terminal."""
 
 
-RunEvent = RunRejected | SttEnded | IntentEnded | TtsReady | RunFailed | RunEnded | RunLost
+RunEvent = RunRejected | SttEnded | AnswerDelta | IntentEnded | TtsReady | RunFailed | RunEnded | RunLost
 _TERMINAL = (RunRejected, RunFailed, RunEnded, RunLost)
 
 
@@ -704,6 +711,9 @@ class PipelineRun:
             if data.get("tts_start_streaming") and self._stream_url and not self._tts_sent:
                 self._tts_sent = True
                 return TtsReady(url=self._stream_url, streamed=True)
+            content = (data.get("chat_log_delta") or {}).get("content")
+            if isinstance(content, str) and content:
+                return AnswerDelta(content)
         elif etype == PipelineEventType.INTENT_END:
             return _intent_ended(data)
         elif etype == PipelineEventType.TTS_END:

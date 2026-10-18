@@ -108,6 +108,14 @@ const (
 	// lights the screen through the app, not Fully's REST API (the
 	// LineageOS Show). Whether the app is up right now is stats.companion.
 	CapScreenOverlay Capability = "screen_overlay"
+	// CapTurnView: the device accepts turn.view and shows it full screen
+	// through its Kiosk Satellite plugin, honouring config turnViewLinger
+	// (the LineageOS Show; docs/echo-show-companion-plan.md §11).
+	CapTurnView Capability = "turn_view_v1"
+	// CapKioskPlugin: the device installs and enables that plugin through
+	// Kiosk Satellite's remote API with config kioskToken and kioskPort,
+	// and reports it in stats.companion.kiosk (the LineageOS Show).
+	CapKioskPlugin Capability = "kiosk_plugin"
 )
 
 // Platform is session.hello's platform: the system image this firmware runs
@@ -178,6 +186,11 @@ const (
 	TypeAlertPrefetch  MessageType = "alert.prefetch"
 	TypeAlertRingEnded MessageType = "alert.ring_ended"
 	TypeAlertState     MessageType = "alert.state"
+
+	// TypeTurnView is C→D, generation 0, never acked: the whole view of the
+	// current turn (turn_view_v1), which the firmware relays unchanged to
+	// its Kiosk Satellite plugin.
+	TypeTurnView MessageType = "turn.view"
 
 	// Retained messages (WIRE §4.8): legacy bodies inside the envelope.
 	TypeLEDs         MessageType = "leds"
@@ -672,7 +685,45 @@ type CompanionStats struct {
 	Overlay *bool `json:"overlay"`
 	// Error is the last installer or link error, null when none.
 	Error *string `json:"error"`
+	// Kiosk is Kiosk Satellite and its EchoMuse plugin (kiosk_plugin).
+	Kiosk *KioskStats `json:"kiosk"`
 }
+
+// KioskStats is stats.companion.kiosk: each field null when unknown.
+type KioskStats struct {
+	// Installed: the Kiosk Satellite package is present.
+	Installed *bool `json:"installed"`
+	// Version is its versionName.
+	Version *string `json:"version"`
+	// RemoteAdmin: its GET /api/health answered on kioskPort.
+	RemoteAdmin *bool            `json:"remote_admin"`
+	Plugin      KioskPluginStats `json:"plugin"`
+}
+
+// KioskPluginStats is stats.companion.kiosk.plugin.
+type KioskPluginStats struct {
+	// Version is the plugin version last seen: Kiosk Satellite's
+	// listPlugins record, the one this firmware installed, or the
+	// plugin's link hello.
+	Version *string `json:"version"`
+	// Linked: a plugin connection is up past hello.
+	Linked *bool `json:"linked"`
+	// Error is null, KioskTokenRejected, KioskNoToken or free text (an
+	// installPlugin refusal, a link mismatch).
+	Error *string `json:"error"`
+	// SwitchedOn: this firmware run turned Kiosk Satellite's plugin master
+	// switch on; false once checked otherwise.
+	SwitchedOn *bool `json:"switched_on"`
+}
+
+// The stats.companion.kiosk.plugin.error codes the controller acts on.
+const (
+	// KioskTokenRejected: Kiosk Satellite answered 401 to kioskToken.
+	KioskTokenRejected = "token_rejected"
+	// KioskNoToken: Kiosk Satellite is installed with remote administration
+	// up, and no kioskToken is configured.
+	KioskNoToken = "no_token"
+)
 
 // WifiResult is the retained wifi_result body; error is always present, ""
 // on success.

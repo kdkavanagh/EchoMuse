@@ -123,12 +123,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # The Echo Show companion app (device/companion), built by the image's
-      # `companion` stage exactly as the firmware embeds it: the link codec
-      # tests on the JDK (a failure fails the stage), then compile, package,
-      # sign and verify. Only that stage; the firmware and the controller
-      # image are not built here. ubuntu-latest is x86-64, which aapt2 and
-      # zipalign need.
+      # The Echo Show companion app and Kiosk Satellite plugin
+      # (device/companion), built by the image's `companion` stage exactly as
+      # the firmware embeds them: the link codec and turn view tests on the
+      # JDK (a failure fails the stage), then compile, package, sign and
+      # verify the APK, and build the plugin ZIP and check its size. Only that
+      # stage; the firmware and the controller image are not built here.
+      # ubuntu-latest is x86-64, which aapt2 and zipalign need.
       - name: Build the companion stage
         run: docker build -f controller/Dockerfile --target companion .
 

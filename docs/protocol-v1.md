@@ -214,6 +214,18 @@ the screen at candidate open itself, so `screenWakeUrl` and
 `screenWakePassword` are unused there; the controller still sends them to
 every `screen_wake` device, which older LineageOS firmware needs. Whether the
 app is up right now is health in `stats.companion` (§4.8), not a capability.
+`turn_view_v1` and `kiosk_plugin`: announced statically by firmware on a
+LineageOS Show (`lineage18_crown`) only (`docs/echo-show-companion-plan.md`
+§11). `turn_view_v1`: the device accepts `turn.view` (§4.9) and relays it to
+its Kiosk Satellite plugin, which shows the turn full screen and hides it
+`config` `turnViewLinger` seconds after `done`; the controller sends
+`turn.view` and `turnViewLinger` to no other device. `kiosk_plugin`: the
+device installs and enables that plugin through Kiosk Satellite's remote API
+on `127.0.0.1:{kioskPort}` with the bearer token `kioskToken`, and reports it
+in `stats.companion.kiosk` (§4.8); the controller sends `kioskToken` and
+`kioskPort` to no other device. Absent on a LineageOS Show, each reads
+"firmware update available"; a Fire OS Show lacks both ("needs LineageOS on
+this Echo Show"), a Dot too ("no screen on this device").
 `platform`: the system image the firmware runs on: `fireos6` (Echo Dot 2nd
 gen, Fire OS 6, Android 7.1.2 `biscuit_puffin`), `fireos6_crown` (Echo Show 8
 1st gen `crown`, Fire OS 6 with the full Android framework) or
@@ -571,11 +583,20 @@ fields unchanged:
   `wifi_scan_result`, `ble_adverts`, `stats`, `pong`.
 
 `config` keys after cutover: `startupVolume`, `duckDb`, `bleProxyEnabled`,
-`wakeSound` (JSON boolean) only to a device announcing `local_wake_chime`, and
+`wakeSound` (JSON boolean) only to a device announcing `local_wake_chime`,
 `screenWake` (JSON boolean, default false), `screenWakeUrl` (string, default
 `http://127.0.0.1:2323`, the kiosk API's root with no path) and
 `screenWakePassword` (string, default empty) only to a device announcing
-`screen_wake` (§4.1).
+`screen_wake` (§4.1), `kioskToken` (string, empty when the controller holds
+none) and `kioskPort` (integer 1–65535, default 2324) only to a device
+announcing `kiosk_plugin`, and `turnViewLinger` (number of seconds 0–60,
+default 6; 0 hides the view at once) only to a device announcing
+`turn_view_v1`. `kioskToken` is the token Kiosk Satellite issued when the
+dashboard logged in with its admin password (`POST
+/api/devices/{id}/kiosk_login`, `ttl_days` 3650); the controller keeps the
+token, never the password, and its API reports only whether one is set. The
+firmware clamps `turnViewLinger` to 0–60 and ignores a `kioskPort` outside
+1–65535.
 
 Volume levels (`volume_set`, `volume_state`, a non-null hello `volume.level`,
 `startupVolume`) are 0–127 on every platform. The Echo Show's volume is
@@ -610,6 +631,52 @@ last reported (null until it reports); `error` is the last installer or link
 error, null when there is none. Null is unknown: the controller passes the
 object through as reported and the dashboard shows a null value as
 unavailable, never as no.
+
+On a LineageOS Show `stats.companion` always carries `kiosk`, Kiosk
+Satellite and its EchoMuse plugin (`docs/echo-show-companion-plan.md` §11):
+```json
+"kiosk": {"installed": true|false|null, "version": "2026.10.28"|null, "remote_admin": true|false|null,
+          "plugin": {"version": "1.0.0-…"|null, "linked": true|false, "error": "…"|null, "switched_on": true|false|null}}
+```
+`installed`: the package `me.jxl.kiosk_satellite` is present; `version` its
+`versionName`; `remote_admin`: `GET http://127.0.0.1:{kioskPort}/api/health`
+answered. `plugin.version` is the plugin version last seen (Kiosk Satellite's
+plugin list or the plugin's link hello); `plugin.linked` is true while the
+plugin's link connection is up past its hello; `plugin.switched_on` is true
+when this firmware run turned Kiosk Satellite's plugin master switch on
+(which also resumes its other enabled plugins), false once checked
+otherwise. `plugin.error` is null or a string; two exact codes are acted on:
+`token_rejected` (Kiosk Satellite answered 401) and `no_token` (installed,
+remote admin up, no `kioskToken`). Anything else is free text. The
+dashboard asks for the Kiosk Satellite password before an update of such a
+device when it holds no token or the error is `token_rejected`. Null is
+unknown, as above.
+
+### 4.9 Turn view
+
+**`turn.view`** C→D, `generation` 0, only to a device announcing
+`turn_view_v1`; the device does not ack it:
+```json
+{"turn_id":"<uuid>","phase":"listening|thinking|answering|done","heard":"…"|null,
+ "answer":"…"|null,"final":false,"follow_up":false}
+```
+The whole view every time, never a delta, so a lost message costs nothing.
+`heard` is the text sent to Home Assistant (after transcript correction), or
+for an EchoMuse local route the text as heard; null until it is dispatched.
+`answer` is the answer so far, null until its first text, at most 16384 bytes
+of UTF-8 (a longer one is cut at a word and ends in "…"). `final` is true once
+`intent-end`'s speech (or EchoMuse's own answer) has replaced streamed text.
+`follow_up` is true on `done` when a reply window follows (Home Assistant's
+`continue_conversation`, or EchoMuse's own question).
+Sent at the turn's `dialog_input` start (`listening`; not for a wake that lost
+arbitration), at dispatch (`thinking` with `heard`), on each Home Assistant
+`chat_log_delta` at most 10 times a second with the latest text winning
+(`answering`), at `intent-end` (`answering`, `final`), and at the end of the
+reply's playback or of a turn with no reply (`done`). A turn ending any other
+way than completed (`no_input`, cancelled, an error) sends `done` with
+`answer` null. The firmware relays the body unchanged to the plugin and,
+when the session is lost before `done`, sends it a `done` of the last view
+itself.
 
 ## 5. Transport rules
 

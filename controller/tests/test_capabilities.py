@@ -184,7 +184,8 @@ DOT = ALL_V1 + ["leds", "led_anim", "buttons", "button_hold", "alert_prefetch",
 DOT_OLDER = [c for c in DOT if c not in ("wifi_control", "ble_proxy", "privacy_mute")]
 FIREOS_SHOW = ALL_V1 + ["alert_prefetch", "local_wake_chime", "open_rules_v1", "afe_metadata_v1",
                         "ambient_light", "screen_wake"]
-COMPANION = ["leds", "led_anim", "buttons", "button_hold", "screen_overlay"]
+KIOSK = ["turn_view_v1", "kiosk_plugin"]
+COMPANION = ["leds", "led_anim", "buttons", "button_hold", "screen_overlay", *KIOSK]
 LINEAGE_SHOW = FIREOS_SHOW + COMPANION
 LINEAGE_SHOW_OLDER = FIREOS_SHOW
 SHOWS = [("fireos6_crown", FIREOS_SHOW), ("lineage18_crown", LINEAGE_SHOW)]
@@ -206,13 +207,16 @@ async def _session(caps, platform, store=None, host=None, **extra):
 RING, BUTTON = "no LED ring on this device", "no action button on this device"
 UPDATE, MANAGED = "firmware update available", "managed by the device"
 NO_SCREEN = "no screen on this device"
+LINEAGE_ONLY = "needs LineageOS on this Echo Show"
 
 
 SHOW_GAPS = {"wifi_control": MANAGED, "ble_proxy": MANAGED,
              "privacy_mute": "mute not supported on this device yet"}
+# The Kiosk Satellite plugin needs Android 11, which a Fire OS Show lacks.
 FIREOS_SHOW_GAPS = {**SHOW_GAPS, "leds": RING, "led_anim": RING, "buttons": BUTTON,
-                    "button_hold": BUTTON}
-DOT_GAPS = {"screen_wake": NO_SCREEN, "screen_overlay": NO_SCREEN}
+                    "button_hold": BUTTON, "turn_view_v1": LINEAGE_ONLY, "kiosk_plugin": LINEAGE_ONLY}
+DOT_GAPS = {"screen_wake": NO_SCREEN, "screen_overlay": NO_SCREEN, "turn_view_v1": NO_SCREEN,
+            "kiosk_plugin": NO_SCREEN}
 
 
 @pytest.mark.parametrize("platform, caps, gaps", [
@@ -228,6 +232,9 @@ DOT_GAPS = {"screen_wake": NO_SCREEN, "screen_overlay": NO_SCREEN}
     ("lineage18_crown", [c for c in LINEAGE_SHOW if c != "screen_wake"],
      {**SHOW_GAPS, "screen_wake": UPDATE}),
     ("lineage18_crown", LINEAGE_SHOW_OLDER, {**SHOW_GAPS, **{c: UPDATE for c in COMPANION}}),
+    # Firmware with the app but from before the Kiosk Satellite plugin.
+    ("lineage18_crown", [c for c in LINEAGE_SHOW if c not in KIOSK],
+     {**SHOW_GAPS, **{c: UPDATE for c in KIOSK}}),
     # Absent elsewhere, the dashboard's own per-capability reason applies.
     ("fireos6", [c for c in DOT if c != "led_anim"], DOT_GAPS),
 ])
@@ -334,6 +341,31 @@ def test_screen_wake_config_goes_only_to_a_screen_wake_device(platform, caps, pu
         assert {k: v for k, v in config.items() if k.startswith("screen")} == pushed
         await device.close()
     run(scenario())
+
+
+KIOSK_CONFIG = {"kioskPort": 2400, "turnViewLinger": 0}
+
+
+# The token is the device row's, never a config value; each key goes only to
+# firmware announcing what uses it.
+@pytest.mark.parametrize("platform, caps, token, pushed", [
+    ("lineage18_crown", LINEAGE_SHOW, "tok", {"kioskToken": "tok", **KIOSK_CONFIG}),
+    ("lineage18_crown", LINEAGE_SHOW, None, {"kioskToken": "", **KIOSK_CONFIG}),
+    ("lineage18_crown", [c for c in LINEAGE_SHOW if c != "turn_view_v1"], "tok",
+     {"kioskToken": "tok", "kioskPort": 2400}),
+    ("lineage18_crown", [c for c in LINEAGE_SHOW if c != "kiosk_plugin"], "tok", {"turnViewLinger": 0}),
+    ("lineage18_crown", LINEAGE_SHOW_OLDER, "tok", {}),
+    ("fireos6_crown", FIREOS_SHOW, "tok", {}), ("fireos6", DOT, "tok", {})])
+def test_kiosk_config_goes_only_to_a_device_announcing_its_use(platform, caps, token, pushed):
+    async def scenario():
+        store = FakeStore(kiosk_token=token)
+        store.configs["DEV1"] = {"duckDb": -18.0, **KIOSK_CONFIG}
+        device, link, *_ = await _session(caps, platform, store)
+        config = next(body for kind, body in link.sent if kind == "config")
+        assert {k: v for k, v in config.items() if k in ("kioskToken", "kioskPort", "turnViewLinger")} == pushed
+        await device.close()
+    run(scenario())
+
 
 
 @pytest.mark.parametrize("platform, caps, painted", [

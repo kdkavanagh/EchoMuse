@@ -18,47 +18,79 @@ import (
 	"github.com/wilbowes/EchoMuse/pkg/led"
 )
 
-const appHello = `{"t":"hello","link":1,"companion":"cmp-aaaaaaaaaaaa","overlay":true,"screen_on":true}`
+const (
+	appHello    = `{"t":"hello","link":2,"role":"app","companion":"cmp-aaaaaaaaaaaa","overlay":true,"screen_on":true}`
+	pluginHello = `{"t":"hello","link":2,"role":"plugin","plugin":"1.0.0-aaaaaaaaaaaa"}`
+)
+
+var blackFrame = `{"t":"frame","rgb":"` + strings.Repeat("0", 72) + `"}`
 
 // linkEnv is a Server on an ephemeral loopback port whose app uid is the
-// test's own (the owner of a temp DataDir) and whose /proc/net/tcp is a
-// file the test writes before each dial.
+// test's own (the owner of a temp DataDir), whose Kiosk Satellite uid is
+// another (foreignDir), and whose /proc/net/tcp is a file the test writes
+// before each dial.
 type linkEnv struct {
-	t      *testing.T
-	s      *Server
-	health *Health
-	addr   netip.AddrPort
-	proc   string
+	t         *testing.T
+	s         *Server
+	health    *Health
+	addr      netip.AddrPort
+	proc      string
+	pluginUID int
 
-	mu        sync.Mutex
-	presses   []pkgbuttons.ButtonClickEvent
-	linked    []bool
-	mismatch  int
-	overlays  int
-	pressedCh chan struct{}
+	mu             sync.Mutex
+	presses        []pkgbuttons.ButtonClickEvent
+	linked         []bool
+	mismatch       int
+	overlays       int
+	pluginLinked   []bool
+	pluginMismatch int
+	pressedCh      chan struct{}
+}
+
+// foreignDir is a directory owned by a uid other than the test's, which
+// stands for Kiosk Satellite's data directory.
+func foreignDir(t *testing.T) (string, int) {
+	t.Helper()
+	if os.Getuid() == 0 {
+		dir := t.TempDir()
+		if err := os.Chown(dir, 4242, 4242); err != nil {
+			t.Fatal(err)
+		}
+		return dir, 4242
+	}
+	uid, err := ownerUID("/")
+	if err != nil || uid == os.Getuid() {
+		t.Skip("no directory owned by another uid")
+	}
+	return "/", uid
 }
 
 func newLinkEnv(t *testing.T) *linkEnv {
 	t.Helper()
+	kioskDir, pluginUID := foreignDir(t)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	e := &linkEnv{t: t, health: &Health{}, addr: netip.MustParseAddrPort(ln.Addr().String()),
-		proc: filepath.Join(t.TempDir(), "tcp"), pressedCh: make(chan struct{}, 16)}
+		proc: filepath.Join(t.TempDir(), "tcp"), pluginUID: pluginUID, pressedCh: make(chan struct{}, 16)}
 	e.s = NewServer(ServerConfig{
-		DeviceID: "G6G16D12143203LD", Firmware: "fw-111111111111", Companion: "cmp-aaaaaaaaaaaa", Health: e.health,
+		DeviceID: "G6G16D12143203LD", Firmware: "fw-111111111111", Companion: "cmp-aaaaaaaaaaaa",
+		Plugin: "1.0.0-aaaaaaaaaaaa", Health: e.health, TurnViewLinger: 6,
 		Press: func(ev pkgbuttons.ButtonClickEvent) {
 			e.mu.Lock()
 			e.presses = append(e.presses, ev)
 			e.mu.Unlock()
 			e.pressedCh <- struct{}{}
 		},
-		Linked:   func(up bool) { e.mu.Lock(); e.linked = append(e.linked, up); e.mu.Unlock() },
-		Mismatch: func() { e.mu.Lock(); e.mismatch++; e.mu.Unlock() },
-		Overlay:  func() { e.mu.Lock(); e.overlays++; e.mu.Unlock() },
-		DataDir:  t.TempDir(),
-		ProcNet:  []string{e.proc},
+		Linked:         func(up bool) { e.mu.Lock(); e.linked = append(e.linked, up); e.mu.Unlock() },
+		Mismatch:       func() { e.mu.Lock(); e.mismatch++; e.mu.Unlock() },
+		Overlay:        func() { e.mu.Lock(); e.overlays++; e.mu.Unlock() },
+		PluginLinked:   func(up bool) { e.mu.Lock(); e.pluginLinked = append(e.pluginLinked, up); e.mu.Unlock() },
+		PluginMismatch: func() { e.mu.Lock(); e.pluginMismatch++; e.mu.Unlock() },
+		DataDir:        t.TempDir(),
+		KioskDataDir:   kioskDir,
+		ProcNet:        []string{e.proc},
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -155,6 +187,28 @@ func (e *linkEnv) waitLinked(want bool) {
 	e.t.Fatalf("linked never became %v", want)
 }
 
+// linkPlugin links a plugin and reads its replay: hello, config, frame.
+func (e *linkEnv) linkPlugin() *appConn {
+	e.t.Helper()
+	p := e.dial(e.pluginUID)
+	p.send(pluginHello)
+	for range 3 {
+		p.next()
+	}
+	e.waitPluginLinked(true)
+	return p
+}
+
+func (e *linkEnv) waitPluginLinked(want bool) {
+	e.t.Helper()
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		if *e.health.Stats().Kiosk.Plugin.Linked == want {
+			return
+		}
+	}
+	e.t.Fatalf("plugin linked never became %v", want)
+}
+
 // Plan §3: the firmware answers hello and replays status, touch, the last
 // frame and, while held, the screen hold, in that order.
 func TestReplayAfterHello(t *testing.T) {
@@ -166,7 +220,7 @@ func TestReplayAfterHello(t *testing.T) {
 	a := e.dial(os.Getuid())
 	a.send(appHello)
 	want := []string{
-		`{"t":"hello","link":1,"firmware":"fw-111111111111","companion":"cmp-aaaaaaaaaaaa"}`,
+		`{"t":"hello","link":2,"firmware":"fw-111111111111","companion":"cmp-aaaaaaaaaaaa"}`,
 		`{"t":"status","link":"pending","reason":"pending_approval","device_id":"G6G16D12143203LD","controller":"10.0.0.2:8770"}`,
 		`{"t":"touch","zone":"stop"}`,
 		`{"t":"frame","rgb":"ff0000` + strings.Repeat("000000", 10) + `00800a"}`,
@@ -297,12 +351,12 @@ func TestPressInActiveZoneOnly(t *testing.T) {
 	}
 }
 
-// Unknown types are ignored; malformed JSON and over-long lines end the
+// Unknown types are ignored; malformed JSON and lines over 128 KiB end the
 // connection, which reports the app unlinked.
 func TestCodecErrors(t *testing.T) {
 	for name, bad := range map[string]string{
 		"malformed": `{"t":"press",`,
-		"too long":  `{"t":"x","pad":"` + strings.Repeat("a", maxLine) + `"}`,
+		"too long":  `{"t":"x","pad":"` + strings.Repeat("a", 131072) + `"}`,
 	} {
 		e := newLinkEnv(t)
 		a := e.link()
@@ -324,26 +378,27 @@ func TestCodecErrors(t *testing.T) {
 	}
 }
 
-// A line of exactly maxLine bytes, newline included, is accepted.
+// A line of exactly 128 KiB, newline included, is accepted (plan §11.2
+// decision 6).
 func TestLineCap(t *testing.T) {
 	e := newLinkEnv(t)
 	a := e.link()
 	head := `{"t":"x","pad":"`
-	a.send(head + strings.Repeat("a", maxLine-len(head)-3) + `"}`)
+	a.send(head + strings.Repeat("a", 131072-len(head)-3) + `"}`)
 	e.s.ScreenWake()
 	if got := a.next(); got != `{"t":"screen","wake":true}` {
 		t.Fatalf("got %s", got)
 	}
 }
 
-// Another link version: the firmware answers with its own hello, closes
+// A link-1 app (no role): the firmware answers with its own hello, closes
 // and asks for a reinstall.
 func TestLinkVersionMismatch(t *testing.T) {
 	e := newLinkEnv(t)
 	a := e.dial(os.Getuid())
-	a.send(`{"t":"hello","link":2,"companion":"cmp-bbbbbbbbbbbb","overlay":true,"screen_on":true}`)
+	a.send(`{"t":"hello","link":1,"companion":"cmp-bbbbbbbbbbbb","overlay":true,"screen_on":true}`)
 	var hello helloMsg
-	if err := json.Unmarshal([]byte(a.next()), &hello); err != nil || hello.Link != 1 {
+	if err := json.Unmarshal([]byte(a.next()), &hello); err != nil || hello.Link != 2 || hello.Companion != "cmp-aaaaaaaaaaaa" {
 		t.Fatalf("hello %+v, %v", hello, err)
 	}
 	if !a.closed() {
@@ -351,8 +406,8 @@ func TestLinkVersionMismatch(t *testing.T) {
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.mismatch != 1 || len(e.linked) != 0 {
-		t.Fatalf("mismatch %d linked %v", e.mismatch, e.linked)
+	if e.mismatch != 1 || len(e.linked) != 0 || e.pluginMismatch != 0 {
+		t.Fatalf("mismatch %d linked %v plugin mismatch %d", e.mismatch, e.linked, e.pluginMismatch)
 	}
 }
 
@@ -374,21 +429,222 @@ func TestOverlayDenied(t *testing.T) {
 	}
 }
 
-// A new connection replaces the old one, which is closed.
-func TestNewConnectionReplacesOld(t *testing.T) {
+// A new connection replaces the old one of its role only (plan §11.2
+// decision 6): a new plugin leaves the app linked, a new app the plugin.
+func TestNewConnectionReplacesOldOfItsRole(t *testing.T) {
 	e := newLinkEnv(t)
-	old := e.link()
-	b := e.dial(os.Getuid())
-	if !old.closed() {
-		t.Fatal("old connection kept")
+	app := e.link()
+	plugin := e.linkPlugin()
+
+	plugin2 := e.dial(e.pluginUID)
+	if !plugin.closed() {
+		t.Fatal("old plugin connection kept")
 	}
-	b.send(appHello)
-	for range 4 {
-		b.next()
+	e.waitPluginLinked(false)
+	plugin2.send(pluginHello)
+	for range 3 {
+		plugin2.next()
 	}
 	e.s.ScreenWake()
-	if got := b.next(); got != `{"t":"screen","wake":true}` {
-		t.Fatalf("new connection got %s", got)
+	if got := app.next(); got != `{"t":"screen","wake":true}` {
+		t.Fatalf("app after a new plugin got %s", got)
+	}
+
+	app2 := e.dial(os.Getuid())
+	if !app.closed() {
+		t.Fatal("old app connection kept")
+	}
+	e.waitLinked(false)
+	app2.send(appHello)
+	for range 4 {
+		app2.next()
+	}
+	e.s.ScreenWake()
+	if got := app2.next(); got != `{"t":"screen","wake":true}` {
+		t.Fatalf("new app got %s", got)
+	}
+	e.s.View(json.RawMessage(`{"turn_id":"t1","phase":"listening"}`))
+	if got := plugin2.next(); got != `{"phase":"listening","t":"view","turn_id":"t1"}` {
+		t.Fatalf("plugin after a new app got %s", got)
 	}
 	e.waitLinked(true)
+	e.waitPluginLinked(true)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !slices.Equal(e.linked, []bool{true, false, true}) || !slices.Equal(e.pluginLinked, []bool{true, false, true}) {
+		t.Fatalf("linked hooks app %v plugin %v", e.linked, e.pluginLinked)
+	}
+}
+
+// Role app only from the app's uid, role plugin only from Kiosk
+// Satellite's; a hello without a role is the app's. Every other pairing is
+// closed and reported, as is any other uid (TestForeignUIDRefused).
+func TestRoleUIDMatrix(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		plugin bool // dial from Kiosk Satellite's uid, else the app's
+		hello  string
+		linked bool
+	}{
+		{"app from the app's uid", false, appHello, true},
+		{"no role from the app's uid", false, `{"t":"hello","link":2,"companion":"cmp-aaaaaaaaaaaa","overlay":true}`, true},
+		{"plugin from the app's uid", false, pluginHello, false},
+		{"plugin from Kiosk Satellite's uid", true, pluginHello, true},
+		{"app from Kiosk Satellite's uid", true, appHello, false},
+		{"no role from Kiosk Satellite's uid", true, `{"t":"hello","link":2,"plugin":"1.0.0-aaaaaaaaaaaa"}`, false},
+		{"another role from Kiosk Satellite's uid", true, `{"t":"hello","link":2,"role":"admin","plugin":"1.0.0-aaaaaaaaaaaa"}`, false},
+	} {
+		e := newLinkEnv(t)
+		uid := os.Getuid()
+		if tc.plugin {
+			uid = e.pluginUID
+		}
+		c := e.dial(uid)
+		c.send(tc.hello)
+		if !tc.linked {
+			if !c.closed() {
+				t.Errorf("%s: connection kept", tc.name)
+			}
+			st := e.health.Stats()
+			if *st.Linked || *st.Kiosk.Plugin.Linked || st.Error == nil || !strings.Contains(*st.Error, "refused connection") {
+				t.Errorf("%s: health %+v", tc.name, st)
+			}
+			continue
+		}
+		var hello map[string]any
+		if err := json.Unmarshal([]byte(c.next()), &hello); err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if _, ok := hello["plugin"]; ok != tc.plugin {
+			t.Errorf("%s: hello %v", tc.name, hello)
+		}
+		if tc.plugin {
+			e.waitPluginLinked(true)
+		} else {
+			e.waitLinked(true)
+		}
+	}
+}
+
+// Plan §11.3: after the plugin's hello the firmware sends hello, config,
+// the last frame and the last view, then views, linger changes and frames
+// as they happen; nothing meant for the app reaches it, and nothing the
+// plugin sends past hello acts.
+func TestPluginReplayAndRelay(t *testing.T) {
+	e := newLinkEnv(t)
+	e.s.SetTurnViewLinger(4)
+	_ = e.s.Sink().SetLEDs(led.Led{ID: 0, B: 0xff})
+	e.s.View(json.RawMessage(`{"turn_id":"t1","phase":"thinking","heard":"is the <door> locked?","answer":null,"final":false,"follow_up":false}`))
+	e.s.SetZone(ZoneStop)
+
+	p := e.dial(e.pluginUID)
+	p.send(pluginHello)
+	want := []string{
+		`{"t":"hello","link":2,"firmware":"fw-111111111111","plugin":"1.0.0-aaaaaaaaaaaa"}`,
+		`{"t":"config","turn_view_linger":4}`,
+		`{"t":"frame","rgb":"0000ff` + strings.Repeat("000000", 11) + `"}`,
+		`{"answer":null,"final":false,"follow_up":false,"heard":"is the <door> locked?","phase":"thinking","t":"view","turn_id":"t1"}`,
+	}
+	for i, w := range want {
+		if got := p.next(); got != w {
+			t.Fatalf("line %d\n got %s\nwant %s", i, got, w)
+		}
+	}
+	e.waitPluginLinked(true)
+	if st := e.health.Stats().Kiosk.Plugin; *st.Version != "1.0.0-aaaaaaaaaaaa" || st.Error != nil {
+		t.Fatalf("plugin health %+v", st)
+	}
+
+	p.send(`{"t":"press","down":true}`)
+	e.s.SetZone(ZoneCancel)
+	e.s.ScreenWake()
+	e.s.SetLink(Status{Link: LinkUp})
+	e.s.SetTurnViewLinger(4)
+	e.s.SetTurnViewLinger(0)
+	e.s.View(json.RawMessage(`{"turn_id":"t1","phase":"answering","heard":"is the <door> locked?","answer":"Yes & bolted.","final":true,"follow_up":false,"tools":[]}`))
+	_ = e.s.Sink().SetLEDs(led.Led{ID: 0, R: 0xff})
+	for _, w := range []string{
+		`{"t":"config","turn_view_linger":0}`,
+		`{"answer":"Yes & bolted.","final":true,"follow_up":false,"heard":"is the <door> locked?","phase":"answering","t":"view","tools":[],"turn_id":"t1"}`,
+		`{"t":"frame","rgb":"ff0000` + strings.Repeat("000000", 11) + `"}`,
+	} {
+		if got := p.next(); got != w {
+			t.Fatalf("got %s\nwant %s", got, w)
+		}
+	}
+	select {
+	case <-e.pressedCh:
+		t.Fatal("a plugin press reached the action button")
+	default:
+	}
+
+	// Bodies the plugin could not parse are not relayed.
+	e.s.View(json.RawMessage(`{"turn_id":"t2"}`))
+	e.s.View(json.RawMessage(`[1]`))
+	e.s.View(json.RawMessage(`{"turn_id":"t2","phase":"listening","answer":"` + strings.Repeat("x", 131072) + `"}`))
+	e.s.View(json.RawMessage(`{"turn_id":"t3","phase":"listening"}`))
+	if got := p.next(); got != `{"phase":"listening","t":"view","turn_id":"t3"}` {
+		t.Fatalf("after bad bodies got %s", got)
+	}
+}
+
+// A lost controller session ends a view not yet done: the plugin gets it
+// again as done, and so does a plugin linking later; a done view is not
+// sent again.
+func TestEndView(t *testing.T) {
+	e := newLinkEnv(t)
+	e.s.EndView() // no view yet
+	p := e.linkPlugin()
+	e.s.View(json.RawMessage(`{"turn_id":"t1","phase":"answering","heard":"hi","answer":"Hello","final":false,"follow_up":true}`))
+	p.next()
+	e.s.EndView()
+	done := `{"answer":"Hello","final":false,"follow_up":true,"heard":"hi","phase":"done","t":"view","turn_id":"t1"}`
+	if got := p.next(); got != done {
+		t.Fatalf("got %s\nwant %s", got, done)
+	}
+	e.s.EndView()
+	e.s.SetTurnViewLinger(2)
+	if got := p.next(); got != `{"t":"config","turn_view_linger":2}` {
+		t.Fatalf("a done view was ended again: %s", got)
+	}
+
+	p2 := e.dial(e.pluginUID)
+	p2.send(pluginHello)
+	for range 3 {
+		p2.next()
+	}
+	if got := p2.next(); got != done {
+		t.Fatalf("replay %s\nwant %s", got, done)
+	}
+}
+
+// A plugin speaking another link or plugin version gets the firmware's
+// hello, is closed, and the KioskInstaller is asked to run; health shows
+// the version it saw and why.
+func TestPluginVersionMismatch(t *testing.T) {
+	for _, hello := range []string{
+		`{"t":"hello","link":2,"role":"plugin","plugin":"1.0.0-bbbbbbbbbbbb"}`,
+		`{"t":"hello","link":3,"role":"plugin","plugin":"1.0.0-aaaaaaaaaaaa"}`,
+	} {
+		e := newLinkEnv(t)
+		p := e.dial(e.pluginUID)
+		p.send(hello)
+		if got := p.next(); got != `{"t":"hello","link":2,"firmware":"fw-111111111111","plugin":"1.0.0-aaaaaaaaaaaa"}` {
+			t.Fatalf("%s: hello %s", hello, got)
+		}
+		if !p.closed() {
+			t.Fatalf("%s: mismatched plugin kept its connection", hello)
+		}
+		var in inMsg
+		_ = json.Unmarshal([]byte(hello), &in)
+		st := e.health.Stats().Kiosk.Plugin
+		if *st.Linked || st.Version == nil || *st.Version != in.Plugin || st.Error == nil || !strings.Contains(*st.Error, "reinstalling") {
+			t.Fatalf("%s: plugin health %+v", hello, st)
+		}
+		e.mu.Lock()
+		if e.pluginMismatch != 1 || len(e.pluginLinked) != 0 || e.mismatch != 0 {
+			t.Fatalf("%s: plugin mismatch %d linked %v app mismatch %d", hello, e.pluginMismatch, e.pluginLinked, e.mismatch)
+		}
+		e.mu.Unlock()
+	}
 }

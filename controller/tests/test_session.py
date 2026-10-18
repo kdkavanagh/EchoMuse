@@ -27,7 +27,7 @@ from em_audio_timeline import (
     build_packet,
 )
 from em_device_link import AckStatus, CommandAck, Envelope, MessageType
-from em_ha_client import HaUnavailable, IntentEnded, RunEnded, SentenceRecognition, TtsReady, Vocabulary
+from em_ha_client import AnswerDelta, HaUnavailable, IntentEnded, RunEnded, SentenceRecognition, TtsReady, Vocabulary
 from em_pause_asr import PauseDecode, WyomingServer
 from em_session import ActorDeps, SessionActor
 from em_text_fix import build_tables
@@ -472,7 +472,8 @@ class Device:
 
 
 class Harness:
-    def __init__(self, config=None, afe=False, no_input_chime=True, announcement_chime=True, text_fix=False):
+    def __init__(self, config=None, afe=False, no_input_chime=True, announcement_chime=True, text_fix=False,
+                 turn_view=False):
         self.link = FakeLink()
         self.render = FakeRender()
         self.worker = FakeWorker()
@@ -487,6 +488,7 @@ class Harness:
         self.link.render = self.render
         self.no_input_chime = no_input_chime   # the device announces no_input_chime
         self.announcement_chime = announcement_chime   # ... and announcement_chime
+        self.turn_view = turn_view              # ... and turn_view_v1
         self.media_playing = False              # the Dot's own content player
         self.media_pauses = 0
 
@@ -530,7 +532,7 @@ class Harness:
     async def start(self):
         await self.actor.start()
         self.actor.attach(self.link, self.render, afe_metadata=self.device.afe, no_input_chime=self.no_input_chime,
-                          announcement_chime=self.announcement_chime)
+                          announcement_chime=self.announcement_chime, turn_view=self.turn_view)
         self.device.open_streams()
         await self.settle()
 
@@ -2491,5 +2493,120 @@ def test_an_answer_in_a_conversation_is_sent_as_heard():
         h.render.streams[1].finish("drained")
         await h.wait_for(lambda: len(h.rows) == 2)
         assert json.loads(h.rows[1]["stt_fix"])["reason"] == "contextual"
+        await h.actor.close()
+    run(main())
+
+
+# --- turn view (docs/echo-show-companion-plan.md §11 decision 8) -----------------------------
+
+
+def views(h: Harness) -> list[dict]:
+    return [b for b, _ in h.link.of("turn.view")]
+
+
+def shown(view: dict) -> tuple:
+    return view["phase"], view["heard"], view["answer"], view["final"], view["follow_up"]
+
+
+def test_a_turn_view_device_sees_the_turn_listen_think_answer_and_end_after_the_reply_plays():
+    async def main():
+        h = Harness(turn_view=True)
+        h.ha.next_run = FakeRun([IntentEnded("It is 3 PM.", "c", False, "action_done", True),
+                                 TtsReady("http://ha/tts/1", False), RunEnded()])
+        await button_turn(h, PRESS + 50_000)
+        await h.wait_for(lambda: h.render.streams)
+        assert views(h)[-1]["phase"] == "answering"          # done waits for the reply to play
+        h.render.streams[0].finish("drained")
+        await h.wait_for(lambda: h.rows)
+        heard = "What time is it?"
+        assert [shown(v) for v in views(h)] == [
+            ("listening", None, None, False, False),
+            ("thinking", heard, None, False, False),
+            ("answering", heard, "It is 3 PM.", True, False),
+            ("done", heard, "It is 3 PM.", True, False)]
+        assert {v["turn_id"] for v in views(h)} == {h.rows[0]["turn_uuid"]}
+        assert {g for _, g in h.link.of("turn.view")} == {0}
+        await h.actor.close()
+    run(main())
+
+
+def test_a_streamed_answer_goes_out_at_most_every_interval_and_its_latest_text_is_never_dropped(monkeypatch):
+    monkeypatch.setattr(em_session, "ANSWER_INTERVAL_S", 0.3)
+
+    async def main():
+        h = Harness(turn_view=True)
+        run_ = h.ha.next_run = FakeRun()
+        await button_turn(h, PRESS + 50_000)
+        await h.wait_for(lambda: views(h)[-1]["phase"] == "thinking")
+
+        def streamed():
+            return [(v["answer"], v["final"]) for v in views(h) if v["phase"] == "answering"]
+
+        for piece in ("It ", "is ", "3 ", "PM."):
+            run_.queue.put_nowait(AnswerDelta(piece))
+        await h.settle()
+        assert streamed() == []                               # within the interval of `thinking`
+        await h.wait_for(lambda: streamed())
+        assert streamed() == [("It is 3 PM.", False)]         # four pieces, one send
+        run_.queue.put_nowait(AnswerDelta(" Anything else?"))
+        await h.settle()
+        assert len(streamed()) == 1                           # held back...
+        run_.queue.put_nowait(IntentEnded("It is 3 PM.", "c", False, "action_done", False))
+        await h.settle()
+        # ...and replaced at once by intent-end's speech, never sent after it.
+        await asyncio.sleep(0.4)
+        assert streamed() == [("It is 3 PM.", False), ("It is 3 PM.", True)]
+        for event in (TtsReady("http://ha/tts/1", False), RunEnded()):
+            run_.queue.put_nowait(event)
+        await h.wait_for(lambda: h.render.streams)
+        h.render.streams[0].finish("drained")
+        await h.wait_for(lambda: views(h)[-1]["phase"] == "done")
+        assert shown(views(h)[-1]) == ("done", "What time is it?", "It is 3 PM.", True, False)
+        await h.actor.close()
+    run(main())
+
+
+def test_a_question_keeps_the_view_up_into_its_reply_and_a_silent_reply_ends_with_no_answer():
+    async def main():
+        h = Harness(turn_view=True)
+        await question_drained(h)                             # HA asked "Which TV?" in conv-1
+        asking, reply = views(h)[0]["turn_id"], h.actor._turn.turn_id
+        assert [(v["turn_id"], *shown(v)) for v in views(h)[-2:]] == [
+            (asking, "done", "What time is it?", "Which TV?", True, True),
+            (reply, "listening", None, None, False, False)]
+        base = h.device.pos[Kind.MIC]
+        await h.feed(base, base + 7 * 16_000 + 4_000)
+        await h.wait_for(lambda: h.actor.state == "IDLE")
+        assert h.terminals()[-1] == "no_input"
+        assert (views(h)[-1]["turn_id"], *shown(views(h)[-1])) == (reply, "done", None, None, False, False)
+        await h.actor.close()
+    run(main())
+
+
+def test_a_local_route_shows_the_text_as_heard_and_its_own_answer():
+    async def main():
+        h = Harness(config={"transcriptFix": "on"}, text_fix=True, turn_view=True)
+        h.ha.stt_text = "When's my next alarm?"
+        h.alerts.alarms = [{"name": "Alarm", "kind": "alarm", "due": "2030-01-02T07:00:00+00:00",
+                            "repeats": [], "schedule_id": "s1"}]
+        await button_turn(h, PRESS + 50_000)
+        await h.wait_for(lambda: h.render.streams)
+        h.render.streams[0].finish("drained")
+        await h.wait_for(lambda: h.rows)
+        heard, said = "When's my next alarm?", "Your next alarm is 7 AM on January 2."
+        assert [shown(v) for v in views(h)] == [
+            ("listening", None, None, False, False),
+            ("thinking", heard, None, False, False),
+            ("answering", heard, said, True, False),
+            ("done", heard, said, True, False)]
+        await h.actor.close()
+    run(main())
+
+
+def test_a_device_without_turn_view_is_sent_none():
+    async def main():
+        h = Harness()
+        await answered(h, "It is 3 PM.", "http://ha/tts/1")
+        assert h.rows[0]["response_text"] == "It is 3 PM." and views(h) == []
         await h.actor.close()
     run(main())

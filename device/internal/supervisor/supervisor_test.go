@@ -142,11 +142,13 @@ func (missingAssets) Fetch(context.Context, string, int64, io.Writer) (int64, er
 	return 0, assets.ErrNotFound
 }
 
-// fakeCompanion records the zones and link statuses the supervisor sets.
+// fakeCompanion records the zones, link statuses and turn views the
+// supervisor sets.
 type fakeCompanion struct {
 	mu       sync.Mutex
 	zones    []companion.Zone
 	statuses []companion.Status
+	views    []string // View bodies, "end" for each EndView
 }
 
 func (f *fakeCompanion) SetZone(z companion.Zone) {
@@ -158,6 +160,18 @@ func (f *fakeCompanion) SetZone(z companion.Zone) {
 func (f *fakeCompanion) SetLink(st companion.Status) {
 	f.mu.Lock()
 	f.statuses = append(f.statuses, st)
+	f.mu.Unlock()
+}
+
+func (f *fakeCompanion) View(body json.RawMessage) {
+	f.mu.Lock()
+	f.views = append(f.views, string(body))
+	f.mu.Unlock()
+}
+
+func (f *fakeCompanion) EndView() {
+	f.mu.Lock()
+	f.views = append(f.views, "end")
 	f.mu.Unlock()
 }
 
@@ -984,7 +998,8 @@ func TestAlertFocusRoutesDACAndVolumeButtons(t *testing.T) {
 // WIRE §4.1 session.hello: the v1 capability set plus the platform's
 // capabilities (the Dot: ring, buttons, Wi-Fi, BLE proxy, privacy mute; the
 // Fire OS Show: screen wake; the LineageOS Show: the companion's ring,
-// button and overlay, and screen wake); alert_cache_v1 only with a working
+// button and overlay, screen wake, the turn view and the Kiosk Satellite
+// plugin); alert_cache_v1 only with a working
 // wakelock; ambient_light only when readable.
 func TestHelloCapabilities(t *testing.T) {
 	common := []proto.Capability{"audio_timeline_v1", "uplink_leases_v1", "device_wake_v1", "render_reference_v1",
@@ -1000,7 +1015,7 @@ func TestHelloCapabilities(t *testing.T) {
 			[]proto.Capability{"leds", "led_anim", "buttons", "button_hold", "wifi_control", "ble_proxy", "privacy_mute"}},
 		{"show", opts{crown: true}, proto.PlatformFireOS6Crown, []proto.Capability{"screen_wake"}},
 		{"lineage show", opts{crown: true, lineage: true}, proto.PlatformLineage18Crown,
-			[]proto.Capability{"leds", "led_anim", "buttons", "button_hold", "screen_wake", "screen_overlay"}},
+			[]proto.Capability{"leds", "led_anim", "buttons", "button_hold", "screen_wake", "screen_overlay", "turn_view_v1", "kiosk_plugin"}},
 	} {
 		h := newHarness(t, tc.o)
 		hello := h.s.Hello()
@@ -1093,6 +1108,29 @@ func TestCompanionLinkStatus(t *testing.T) {
 	h.s.Rejected(proto.RejectUnauthorized, "10.0.0.2:8767")
 	if got, want := h.comp.lastStatus(), (companion.Status{Link: companion.LinkDown, Reason: "unauthorized", Controller: "10.0.0.2:8767"}); got != want {
 		t.Fatalf("unauthorized: %+v, want %+v", got, want)
+	}
+}
+
+// turn_view_v1 (plan §11.2 decision 8): on the LineageOS Show each
+// turn.view reaches the companion unchanged, and a session loss ends the
+// view; the Dot and the Fire OS Show, which have no companion, ignore it.
+func TestTurnViewOnTurnViewPlatformsOnly(t *testing.T) {
+	view := map[string]any{"turn_id": "t1", "phase": "answering", "heard": "what time is it", "answer": "It's <9>", "final": false, "follow_up": false}
+	body, _ := json.Marshal(view)
+	for _, o := range []opts{{}, {crown: true}, {crown: true, lineage: true}} {
+		h := newHarness(t, o)
+		h.ready()
+		h.control(proto.TypeTurnView, 0, view)
+		h.s.Lost(client.LostTimeout)
+		if h.comp == nil {
+			continue // no companion: getting here without a nil call is the check
+		}
+		h.comp.mu.Lock()
+		got := slices.Clone(h.comp.views)
+		h.comp.mu.Unlock()
+		if want := []string{string(body), "end"}; !slices.Equal(got, want) {
+			t.Fatalf("views %q, want %q", got, want)
+		}
 	}
 }
 

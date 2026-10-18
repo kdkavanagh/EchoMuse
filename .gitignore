@@ -1,10 +1,12 @@
 .idea
 __pycache__
 /device/build/
-# The companion APK and its version, copied in by the image's firmware stage
-# for //go:embed; built from device/companion, never committed.
+# The companion APK, its version and the Kiosk Satellite plugin ZIP, copied in
+# by the image's firmware stage for //go:embed; built from device/companion,
+# never committed.
 device/internal/companion/app.apk
 device/internal/companion/app.version
+device/internal/companion/ksplugin.zip
 controller/.env
 controller/data/
 controller/static/vendor/

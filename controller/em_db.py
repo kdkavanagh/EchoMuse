@@ -103,6 +103,7 @@ class DeviceRow:
     ambient_mode: int
     os_version: Optional[str]
     update_queued_at: Optional[int]
+    kiosk_token: Optional[str]
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Self:
@@ -262,6 +263,14 @@ DEFAULT_DEVICE_CONFIG: DeviceConfig = {
     "screenWake":       False,
     "screenWakeUrl":    em_config_sections.SCREEN_WAKE_URL_DEFAULT,
     "screenWakePassword": "",
+    # A LineageOS Show's Kiosk Satellite plugin (docs/echo-show-companion-plan.md
+    # §11): the port of Kiosk Satellite's remote API on the device, which the
+    # firmware installs the plugin through (`kiosk_plugin`), and how long the
+    # turn view stays up after a turn ends, in seconds (`turn_view_v1`; 0 hides
+    # it at once). The API token is no config key: it is the device row's
+    # `kiosk_token`, written only by POST /api/devices/{id}/kiosk_login.
+    "kioskPort":        em_config_sections.KIOSK_PORT_DEFAULT,
+    "turnViewLinger":   em_config_sections.TURN_VIEW_LINGER_DEFAULT,
     # EQ applies to controller-rendered content and dialog, not to device-
     # executed alerts (§18.4).
     "eqBands":          [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
@@ -1107,6 +1116,19 @@ MIGRATIONS: list[str] = [
     ALTER TABLE turns ADD COLUMN stt_fix TEXT;
     UPDATE system_config SET value = '34' WHERE key = 'schema_version';
     """,
+
+    # ── v35 — Kiosk Satellite API token ──────────────────────────────────────
+    #
+    # `kiosk_token` is the bearer token Kiosk Satellite's remote API issued for
+    # a LineageOS Show (docs/echo-show-companion-plan.md §11 decision 3): the
+    # controller logs in with the admin password the dashboard asks for, keeps
+    # only this, and pushes it to a `kiosk_plugin` device in `config`. A
+    # credential, so it lives outside the config JSON: the API reports only
+    # whether it is set. NULL: never logged in.
+    """
+    ALTER TABLE devices ADD COLUMN kiosk_token TEXT;
+    UPDATE system_config SET value = '35' WHERE key = 'schema_version';
+    """,
 ]
 
 # Post-migration fixups that need Python rather than SQL. Keyed by the schema
@@ -1672,6 +1694,15 @@ def clear_device_token(device_id: str) -> None:
     with _tx() as conn:
         conn.execute(
             "UPDATE devices SET token = NULL WHERE device_id = ?", (device_id,)
+        )
+
+
+def set_kiosk_token(device_id: str, token: str) -> None:
+    """Store the Kiosk Satellite API token issued for this device (see the
+    v35 migration), replacing any earlier one."""
+    with _tx() as conn:
+        conn.execute(
+            "UPDATE devices SET kiosk_token = ? WHERE device_id = ?", (token, device_id)
         )
 
 

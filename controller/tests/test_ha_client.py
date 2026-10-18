@@ -22,6 +22,7 @@ import em_ha_client as ha_mod
 from echomuse_grammar import GrammarClass
 from em_endpoint_policy import recognized_completeness, recognizer_sentences
 from em_ha_client import (
+    AnswerDelta,
     FeatureStatus,
     HaClient,
     HaEndpoint,
@@ -440,13 +441,15 @@ def test_intent_tts_typed_events_streaming_error_and_abandonment():
                 TtsReady(_fake.base_url + "/api/tts_proxy/Vn6uQ8.flac", False),
                 RunEnded(),
             ]
-            # A streamable reply is fetched only once intent-progress says HA will
-            # stream it; that arrives before intent-end.
+            # The agent's text streams as chat_log_delta content (the role-only delta
+            # carries none); a streamable reply is fetched only once intent-progress
+            # says HA will stream it. Both arrive before intent-end.
             streaming = await collect(await client.run_intent_tts(
                 PIPELINE_ID, DEVICE_ID, "tell me a story", "old-conversation"))
-            assert streaming[0] == TtsReady(_fake.base_url + "/api/tts_proxy/Vn6uQ8.flac", True)
-            assert isinstance(streaming[1], IntentEnded)
-            assert streaming[1].continue_conversation
+            assert streaming[:2] == [AnswerDelta("Once upon a time, in a kingdom far away, "),
+                                     TtsReady(_fake.base_url + "/api/tts_proxy/Vn6uQ8.flac", True)]
+            assert isinstance(streaming[2], IntentEnded)
+            assert streaming[2].continue_conversation
             assert streaming[-1] == RunEnded()
             # Run-start announces a streamable URL but HA never starts streaming (a
             # local intent whose result HA may override with the acknowledge sound):

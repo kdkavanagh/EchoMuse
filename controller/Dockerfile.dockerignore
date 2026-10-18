@@ -20,6 +20,7 @@ device/**/testdata
 # must not reach the image.
 device/internal/companion/app.apk
 device/internal/companion/app.version
+device/internal/companion/ksplugin.zip
 controller/tests
 controller/data
 controller/echomuse.db*

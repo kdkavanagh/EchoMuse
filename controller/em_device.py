@@ -98,6 +98,8 @@ class CapabilityGap(enum.StrEnum):
     NO_RING = "no LED ring on this device"
     NO_BUTTON = "no action button on this device"
     NO_SCREEN = "no screen on this device"
+    # The Kiosk Satellite plugin needs Android 11: a Fire OS Show has neither.
+    NEEDS_LINEAGEOS = "needs LineageOS on this Echo Show"
 
 
 # Why a device reports no volume (`volume.level` null in its hello): an Echo
@@ -112,7 +114,8 @@ VOLUME_UNAVAILABLE = "volume control unavailable: Android volume check failed (s
 # mute ones, on Fire OS and on LineageOS alike. Only Fire OS's Show lacks the
 # ring and the button: a LineageOS Show's companion app paints the ring as an
 # on-screen light bar and turns touches into button presses
-# (docs/echo-show-companion-plan.md).
+# (docs/echo-show-companion-plan.md). The turn view and its Kiosk Satellite
+# plugin are LineageOS's alone (§11 there).
 _NOT_ON_ECHO_SHOW: dict[Capability, CapabilityGap] = {
     Capability.WIFI_CONTROL: CapabilityGap.MANAGED_BY_DEVICE,
     Capability.BLE_PROXY: CapabilityGap.MANAGED_BY_DEVICE,
@@ -120,13 +123,17 @@ _NOT_ON_ECHO_SHOW: dict[Capability, CapabilityGap] = {
 }
 _NOT_ON_PLATFORM: dict[DevicePlatform, dict[Capability, CapabilityGap]] = {
     DevicePlatform.FIREOS6: {Capability.SCREEN_WAKE: CapabilityGap.NO_SCREEN,
-                             Capability.SCREEN_OVERLAY: CapabilityGap.NO_SCREEN},
+                             Capability.SCREEN_OVERLAY: CapabilityGap.NO_SCREEN,
+                             Capability.TURN_VIEW: CapabilityGap.NO_SCREEN,
+                             Capability.KIOSK_PLUGIN: CapabilityGap.NO_SCREEN},
     DevicePlatform.FIREOS6_CROWN: {
         **_NOT_ON_ECHO_SHOW,
         Capability.LEDS: CapabilityGap.NO_RING,
         Capability.LED_ANIM: CapabilityGap.NO_RING,
         Capability.BUTTONS: CapabilityGap.NO_BUTTON,
         Capability.BUTTON_HOLD: CapabilityGap.NO_BUTTON,
+        Capability.TURN_VIEW: CapabilityGap.NEEDS_LINEAGEOS,
+        Capability.KIOSK_PLUGIN: CapabilityGap.NEEDS_LINEAGEOS,
     },
     DevicePlatform.LINEAGE18_CROWN: _NOT_ON_ECHO_SHOW,
 }
@@ -140,6 +147,7 @@ _PLATFORM_OPTIONAL: dict[DevicePlatform, frozenset[Capability]] = {
     DevicePlatform.LINEAGE18_CROWN: frozenset({
         Capability.SCREEN_WAKE, Capability.LEDS, Capability.LED_ANIM,
         Capability.BUTTONS, Capability.BUTTON_HOLD, Capability.SCREEN_OVERLAY,
+        Capability.TURN_VIEW, Capability.KIOSK_PLUGIN,
     }),
 }
 
@@ -186,7 +194,8 @@ class Actor(Protocol):
     async def start(self) -> None: ...
     async def close(self) -> None: ...
     def attach(self, link: em_device_link.DeviceLink, render: em_render.RenderClient, *,
-               afe_metadata: bool, no_input_chime: bool, announcement_chime: bool) -> None: ...
+               afe_metadata: bool, no_input_chime: bool, announcement_chime: bool,
+               turn_view: bool) -> None: ...
     def detach(self, reason: CloseReason) -> None: ...
     def on_message(self, envelope: em_device_link.Envelope) -> None: ...
     def on_audio(self, frame: bytes) -> None: ...
@@ -396,6 +405,9 @@ class Device:
         self.ip: str | None = None
         self.secure = False
         self.stats: dict[str, object] | None = None
+        # The Kiosk Satellite API token (em_db `kiosk_token`), pushed in
+        # `config` to a `kiosk_plugin` device; None: never logged in.
+        self.kiosk_token: str | None = None
         self.wake_stats: dict[str, object] | None = None
         # wake.stats `afe` of the last report: None when it carried none (no
         # data, never zeros) or the device lacks afe_metadata_v1.
@@ -543,6 +555,14 @@ class Device:
     def screen_wake_capable(self) -> bool:
         return Capability.SCREEN_WAKE in self.capabilities
 
+    @property
+    def turn_view_capable(self) -> bool:
+        return Capability.TURN_VIEW in self.capabilities
+
+    @property
+    def kiosk_plugin_capable(self) -> bool:
+        return Capability.KIOSK_PLUGIN in self.capabilities
+
     def capability_gap(self, capability: Capability) -> CapabilityGap | None:
         """Why this device lacks `capability` (module `capability_gap`)."""
         return capability_gap(self.platform, self.capabilities, capability)
@@ -638,6 +658,12 @@ class Device:
             if self.screen_wake_capable:
                 # Only to firmware that lights a kiosk screen at candidate open.
                 body.update(em_config_sections.screen_wake(cfg))
+            if self.kiosk_plugin_capable:
+                # Only to firmware that installs the Kiosk Satellite plugin (§11 decision 3).
+                body["kioskToken"] = self.kiosk_token or ""
+                body["kioskPort"] = em_config_sections.kiosk_port(cfg)
+            if self.turn_view_capable:
+                body["turnViewLinger"] = em_config_sections.turn_view_linger(cfg)
             await self.send(MessageType.CONFIG, body)
             # The wake graph and the open/shadow rules are named only in
             # session.ready (§16.1): a changed selection renegotiates the
@@ -669,7 +695,8 @@ class Device:
         # session.ready granted afe_metadata exactly when the hello announced it (LinkHub.admit).
         self.actor.attach(link, render, afe_metadata=self.afe_metadata_capable,
                           no_input_chime=self.no_input_chime_capable,
-                          announcement_chime=self.announcement_chime_capable)
+                          announcement_chime=self.announcement_chime_capable,
+                          turn_view=self.turn_view_capable)
         await self.host.alerts.on_session_hello(self.device_id, hello.alerts,
                                                 capabilities=self.capabilities)
         await self.apply_config(self.config)
@@ -1070,6 +1097,8 @@ class LinkHub:
             return em_device_link.Rejected(registration.rejected)
         device = await self.ensure(device_id, registration.label or device_id)
         device.config = await asyncio.to_thread(self.store.config, device_id)
+        row = await asyncio.to_thread(self.store.device, device_id)
+        device.kiosk_token = row.kiosk_token if row is not None else None
         model = self.registry.for_config(device.config)
         device.wake_model_sha256 = model.graph_sha256
         duck_db = _number(device.config.get("duckDb"))

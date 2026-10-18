@@ -137,6 +137,20 @@ dashboard disables them). It does not dismiss the kiosk's screensaver: the
 bar shows over it. The app's health (linked, version, overlay allowed, last
 error) is on the device's Status tab.
 
+**With Kiosk Satellite as your kiosk**, the firmware also installs an
+EchoMuse plugin into it that shows each turn full screen: what you asked, in
+grey, and the answer in large text as it arrives, staying up 6 s after the
+reply (Config → Screen, **Turn view stays up**; 0 hides it at once). The
+prerequisite is in Kiosk Satellite: turn on **Remote Administration** with a
+password, leaving **Use HTTPS** off (Settings → Device → Remote
+Administration). The wizard's last step then asks for that password, and so
+does the dashboard before a firmware update while it holds no token, or after
+Kiosk Satellite rejected it; Config → Screen has a login at any time. EchoMuse
+logs in once and keeps only the token Kiosk Satellite issues, never the
+password; changing the password later does not revoke that token. Every
+prompt can be skipped: the light bar works without the plugin. The plugin's
+state is in the Status tab's Companion app panel.
+
 ## Step 2 — Make a Home Assistant token
 
 Skip this step if you are installing the Home Assistant add-on (see below).

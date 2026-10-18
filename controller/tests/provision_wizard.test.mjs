@@ -505,16 +505,18 @@ for (const id of ['check_home', 'neutralize_alexa']) {
 }
 // docs/echo-show-lineage-plan.md Phase L4: no Amazon apps, so no kiosk
 // check and no neutralisation; Wi-Fi is Android's, one system partition.
-// docs/echo-show-companion-plan.md Phase C5: the firmware's app is verified last.
+// docs/echo-show-companion-plan.md Phase C5: the firmware's app is verified,
+// then (Phase K5) Kiosk Satellite's password asked for when it is installed.
 const LINEAGE_STEPS = ['connect_android', 'install_boot_hook', 'install_em', 'reboot',
-                       'reconnect', 'verify_service', 'confirm_link', 'verify_companion'];
-check("the LineageOS Show's step list is Phase L4's plus verify_companion",
+                       'reconnect', 'verify_service', 'confirm_link', 'verify_companion', 'kiosk_plugin'];
+check("the LineageOS Show's step list is Phase L4's plus verify_companion and kiosk_plugin",
   _stepsFor('lineage18_crown').join() === LINEAGE_STEPS.join(), _stepsFor('lineage18_crown').join());
 for (const id of ['check_home', 'neutralize_alexa', 'wifi', 'mirror_boot_hook']) {
   check(`${id} is not applicable on the LineageOS Show`, !_stepsFor('lineage18_crown').includes(id));
 }
 for (const platform of ['fireos6', 'fireos6_crown']) {
   check(`verify_companion is not applicable on ${platform}`, !_stepsFor(platform).includes('verify_companion'));
+  check(`kiosk_plugin is not applicable on ${platform}`, !_stepsFor(platform).includes('kiosk_plugin'));
 }
 check("before connect_android every step shows", _stepsFor(null).length === _WIZARD_STEPS.length);
 
@@ -538,9 +540,11 @@ check("the LineageOS Show goes from connect_android to install_boot_hook",
   _nextStep(idx('connect_android') + 1, 'lineage18_crown') === idx('install_boot_hook'));
 check("the LineageOS Show goes from install_em to reboot",
   _nextStep(idx('install_em') + 1, 'lineage18_crown') === idx('reboot'));
-check("the LineageOS Show ends at verify_companion", _lastStep('lineage18_crown') === idx('verify_companion'));
+check("the LineageOS Show ends at kiosk_plugin", _lastStep('lineage18_crown') === idx('kiosk_plugin'));
 check("the LineageOS Show goes from confirm_link to verify_companion",
   _nextStep(idx('confirm_link') + 1, 'lineage18_crown') === idx('verify_companion'));
+check("the LineageOS Show goes from verify_companion to kiosk_plugin",
+  _nextStep(idx('verify_companion') + 1, 'lineage18_crown') === idx('kiosk_plugin'));
 check("the Dot ends at mirror_boot_hook, past verify_companion",
   _nextStep(idx('mirror_boot_hook') + 1, 'fireos6') === _WIZARD_STEPS.length);
 
@@ -602,6 +606,14 @@ for (const companion of [null, undefined, { linked: true, overlay: null }, { lin
     on(APP, '10123', 'SYSTEM_ALERT_WINDOW: ignore') === '{"linked":true,"overlay":false}'
     && on(APP, '10123', 'No operations.') === '{"linked":true,"overlay":false}');
 }
+
+// ─── kiosk_plugin's evidence on a pending device ────────────────────────────
+
+const { _kioskOnDevice } = await lift([liftFunctionDecl("_kioskOnDevice"), "export { _kioskOnDevice };"]);
+check("pm path naming the APK reads as installed",
+  _kioskOnDevice('package:/data/app/~~x==/me.jxl.kiosk_satellite-y==/base.apk\n'));
+check("pm path with no output reads as not installed", !_kioskOnDevice(''));
+check("an error message reads as not installed", !_kioskOnDevice('Error: package not found'));
 
 // ─── Boot hook content + idempotency ───────────────────────────────────────
 

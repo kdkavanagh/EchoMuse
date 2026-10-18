@@ -1,6 +1,6 @@
 # Echo Show 8 on LineageOS: companion app plan
 
-**Status:** proposed 2026-10-17; Phases C1–C5 implemented 2026-10-17, ahead of C0. C0 and C6 need the unit and are open (§10). The Kiosk Satellite plugin and turn view (§11) were proposed 2026-10-18; its probe, Phase K0, was measured the same day (findings §8.7), and K1–K5 are being implemented.
+**Status:** proposed 2026-10-17; Phases C1–C5 implemented 2026-10-17, ahead of C0. C0 and C6 need the unit and are open (§10). The Kiosk Satellite plugin and turn view (§11) were proposed 2026-10-18; its probe, Phase K0, was measured the same day (findings §8.7), and K1–K5 were implemented the same day, with the plugin checked by hand on the unit against a stub link (§11.9). K6 needs a controller deploy and is open.
 **Evidence:** [echo-show-crown.md](echo-show-crown.md) (written "findings §N") and the code cited inline. The platform this extends is [echo-show-lineage-plan.md](echo-show-lineage-plan.md), written "LineageOS plan".
 **Goal:** a LineageOS Show shows what the Dot's ring shows (wake, listening, thinking, speaking, timers, link state, alerts) as a light bar on screen. Touch takes the place of the action button. The app is installed by adoption and kept current by every firmware update, rollback and auto-rollback, with no separate delivery path.
 
@@ -330,8 +330,11 @@ These are added to §3. The app's `hello` gains `role: "app"` and `link: 2`. The
 |---|---|---|---|
 | plugin → fw | `hello` | `link: 2`, `role: "plugin"`, `plugin: "1.0.0-…"` | on connect |
 | fw → plugin | `hello` | `link: 2`, `firmware: "fw-…"`, `plugin: "1.0.0-…"` (the embedded one) | reply; on a mismatch both sides close and the firmware reinstalls the plugin (decision 2) |
+| fw → plugin | `config` | `turn_view_linger`: seconds | after `hello`, and when `turnViewLinger` changes |
 | fw → plugin | `frame` | as for the app | as for the app |
-| fw → plugin | `view` | the `turn.view` body | on every `turn.view`, and the last one after `hello` |
+| fw → plugin | `view` | the `turn.view` body | on every `turn.view`, and the last one after `hello`. When the controller session is lost while the last view is not `done`, the firmware sends it again as `done` |
+
+After the plugin's `hello` the firmware sends `hello`, `config`, `frame`, then the last `view`. A `hello` without `role` is an app's (only link-1 apps omit it).
 
 ### 11.4 Build
 
@@ -449,3 +452,32 @@ Not measured: Lockdown Mode and the `screen_off_black` cover over the view. Neit
 | Tool lines and result panels | the controller subscribes to `conversation/chat_log/subscribe` for the turn's conversation (its HA token is an administrator's) and adds `tools` and `results` to `turn.view` |
 | Live partial transcripts | partial text from the speech worker into the session |
 | Announcement text | `turn.view` for announcements |
+
+### 11.9 Status (2026-10-18)
+
+| Phase | State | Evidence |
+|---|---|---|
+| K0 Probe | done | findings §8.7 |
+| K1 Plugin | done; checked by hand on the unit | `device/companion/ksplugin/`: `EchoMusePlugin`, `ViewOverlay`, the pure-Java reducer `TurnView` (`core/`), manifest, `LICENSE`. `TurnViewTest` (11 cases, 54 checks) and the v2 codec in `LinkTest` (26 cases, 164 checks) run in the `companion` stage. On the unit (firmware `fw-b063e8ba4d8d` stopped for 28 s, a `toybox nc -L` stub on 127.0.0.1:8771 answering role `plugin` only): `installPlugin`, `setPluginsEnabled`, `enablePlugin`; the plugin linked from uid 10148 over `tcp6`; `listening`, `thinking`, a growing `answering`, `done` and a long answer each drew as decision 9 says, and the view hid 6 s after `done`. With the `black` screensaver started over the API (backlight 1), `listening` lifted it: backlight 30 after 0.3 s, 102 after 1 s, `isScreensaverActive` false. Afterwards the plugin was removed, the master switch put back off and the service relinked the app |
+| K2 Build | done | Vendored SDK in `device/companion/kssdk/` (`SOURCE`: commit `233e739`). The `companion` stage generates `BuildInfo.java` with the plugin version, compiles against `android.jar` and the SDK, runs the tests, d8s into `plugin.jar` and zips with `jar --date` (fixed timestamps), failing over 4 MB: 18 138 bytes, the same SHA-256 on a rebuild. The firmware stage embeds it as `internal/companion/ksplugin.zip`, excluded from the `fw-` hash; `.gitignore`, `Dockerfile.dockerignore`. The ZIP carved out of the `firmware-out` binary is byte-identical to the one installed on the unit. Version acceptance: an edit under `device/companion/ksplugin` moved `cmp-` and `fw-`; an edit to a Go `_test.go` moved neither. It was installed with `installPlugin`, the firmware's path, not Kiosk Satellite's Install from ZIP |
+| K3 Firmware | done, not run on the unit | Link v2 in `internal/companion` (`server.go`: roles by uid, one connection per role, 128 KiB lines, `config`/`frame`/`view` to the plugin), `KioskInstaller` (`kiosk.go`) over an injected `HTTPClient`, the shared pacing in `pacer.go`, `stats.companion.kiosk`; `proto.CapTurnView`, `proto.CapKioskPlugin`, `proto.TypeTurnView`; config `kioskToken`, `kioskPort`, `turnViewLinger`; the LineageOS row in `cmd/server.go`. Host tests for every K3 item; `go vet` and `go test` green |
+| K4 Controller | done | `AnswerDelta`; `em_turn_view.py` and the session's `turn.view`; `Capability.TURN_VIEW`, `Capability.KIOSK_PLUGIN`, both platform-optional on `lineage18_crown`; Screen keys; `POST /api/devices/{id}/kiosk_login`; dashboard prompt, Status rows, gaps; `docs/protocol-v1.md` §4.1, §4.8, §4.9, `CLAUDE.md`, `docs/quickstart.md`. pytest, mypy, pyflakes and the three dashboard tests green |
+| K5 Adoption | done, wizard not run over WebUSB | wizard step `kiosk_plugin` pinned in `provision_wizard.test.mjs`; the update prompt; changelog |
+| K6 Acceptance | open | Needs a controller deploy with this firmware, then the wizard or the update prompt on the unit; every item of §11.5 K6 is to do |
+
+Where the build differs from the text above:
+- **The token is a device column, not a config key.** `devices.kiosk_token` (migration v35). Screen-section keys follow the fleet unless a device overrides the whole section, and config is echoed by the config API, websocket pushes and the device JSON; a column makes "never returned" structural. On the wire it is still `config` `kioskToken`, and the device JSON carries only `kioskTokenSet`.
+- **`config` on the local link.** `turnViewLinger` reaches the plugin as a `config` line (§11.3), which the plan did not list.
+- **`done` on session loss.** The firmware ends a view the controller can no longer end, so the plugin does not stay up after a lost session (§11.3).
+- **`turn.view` is never acknowledged**; a lost one is covered by the next whole view. Bodies that are not an object with a string `phase`, or that would exceed a 128 KiB line, are dropped and logged.
+- **`follow_up`** is true only when a reply window actually follows (HA's `continue_conversation`, or EchoMuse's own question), not when the chain limit or a cancelled prompt means nothing will listen.
+- **A wake that lost arbitration shows no view**: the winning device shows the turn. `done` on a completed turn carries the turn's response text, which covers EchoMuse's own clarification prompts.
+- **Reducer rules the plan left open:** a follow-up `done` keeps the view up for the longer of the linger and 15 s; a view not `done` hides 5 min after its last update; a repeated `done` (a replay after reconnecting) does not restart the linger; link loss hides after the linger or the time left on a running countdown, whichever is shorter; a `done` with neither request nor answer hides at once, `follow_up` or not.
+- **No writer queue in the plugin.** Its `hello` is its only outgoing line, written by the link thread right after connecting; the main thread never touches the socket, which is what the StrictMode rule needs.
+- **Layout:** hidden is `View.INVISIBLE` on the long-lived view; text stays out of the bottom 100 dp (the app's 72 dp touch band plus a gap); the glow fades up over the bottom 160 dp.
+- **The manifest carries `license`**, which `PluginManifest.kt:43` requires.
+- **The plugin knows its version** from a `BuildInfo` class the image build generates.
+- **Installer pacing.** Kiosk Satellite not installed, remote admin down and `no_token` back off like failures, so a Show without Kiosk Satellite is not probed every 30 s. A change of `kioskToken` or `kioskPort` resets the backoff, so a token just stored is used within 10 s. Config is not persisted across firmware starts, so the start attempt usually reads `no_token` until `session.ready`'s config arrives.
+- **`remote_admin`** is a 200 from `GET /api/health` over plain HTTP. With Kiosk Satellite's **Use HTTPS** on it reads false and the plugin is not installed; `docs/quickstart.md` says to leave it off.
+- **Replacement per role happens at accept,** by the role the peer's uid allows. A role refusal is reported in the companion `error`; a plugin link or version mismatch in `kiosk.plugin.error`.
+- **The update prompt** asks when `kioskTokenSet` is false or `plugin.error` is `token_rejected`; it gates the per-device install and the queued install, not the fleet-wide "install now". `kiosk_login` is accepted while the only gap is "firmware update available", so the token can be stored before the update that brings the plugin.
