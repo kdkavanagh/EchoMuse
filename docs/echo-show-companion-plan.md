@@ -248,7 +248,7 @@ Where the build differs from the text above:
 - Tool-call lines ("Get weather forecast") and result panels (the weather card). Both come from HA's chat log; see §11.8.
 - Live partial transcripts while listening. The session has no partial text, so the request appears when STT ends.
 - Announcement, timer and alarm text in the view.
-- Kiosk Satellite's skins. They are application code, which `PLUGIN-EXCEPTION.md` does not let a plugin copy; the view is our own drawing.
+- Kiosk Satellite's skins. They are Flutter code inside the app, not reusable from a plugin's Android view; the view is our own drawing.
 - Kiosks other than Kiosk Satellite, and Fire OS crown.
 
 ### 11.1 Starting point
@@ -317,7 +317,6 @@ Where the build differs from the text above:
      - a soft glow along the bottom in the colours of the firmware's latest `frame`.
    - **When it shows:** from `listening` until `done`, plus `turnViewLinger` seconds (config, default 6; 0 hides at once). A new turn replaces it; `follow_up` keeps it up into the next `listening`.
 10. **One bar on screen.** The app keeps the bar and its touch zones. Its `TYPE_APPLICATION_OVERLAY` window sits above Kiosk Satellite's window, so the bar draws over the bottom edge of the view, and the view leaves that edge to it. The view takes no touches.
-11. **The plugin's `LICENSE`.** Kiosk Satellite requires one in the ZIP (SDK `docs/installing-plugins.md:41`), and the repository has no licence file. See §11.7.
 
 ### 11.3 Local link, version 2
 
@@ -335,8 +334,8 @@ These are added to §3. The app's `hello` gains `role: "app"` and `link: 2`. The
 - `device/companion/ksplugin/`:
   - `kiosk-satellite-plugin.json`: `schemaVersion: 1`, `apiVersion: 1`, `id: "echomuse"`, `minAndroidSdk: 30`, `entryClass: org.echomuse.ksplugin.EchoMusePlugin`, `capabilities: ["overlay"]`;
   - the Java sources, reusing the link codec in `device/companion/core`;
-  - `LICENSE`.
-- The SDK interfaces: the six Apache-2.0 files under `me/jxl/kiosk/plugins/`, vendored in `device/companion/kssdk/` with their `LICENSE` and the source commit. They are compile-time only and never packaged (SDK `docs/creating-plugins.md:76`).
+  - a `LICENSE` file: Kiosk Satellite's installer rejects a ZIP without one (SDK `docs/installing-plugins.md:41`). Internal use only, so it is a one-line placeholder.
+- The SDK interfaces: the six files under `me/jxl/kiosk/plugins/`, vendored in `device/companion/kssdk/` with the source commit. They are compile-time only and never packaged (SDK `docs/creating-plugins.md:76`).
 - In the `companion` stage:
   1. `javac` against `android.jar` and the SDK;
   2. the plugin's tests on the JDK;
@@ -437,8 +436,7 @@ These are added to §3. The app's `hello` gains `role: "app"` and `link: 2`. The
 
 ### 11.7 Open questions
 
-1. The licence in the plugin ZIP. The repository has none. Apache-2.0 would match the SDK; this is the project's call, and Phase K2 cannot ship without it.
-2. The `turnViewLinger` default: 6 s proposed.
+1. The `turnViewLinger` default: 6 s proposed.
 
 ### 11.8 Later candidates
 
