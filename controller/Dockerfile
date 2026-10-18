@@ -87,9 +87,10 @@ RUN set -e; \
 # Satellite plugin and its SDK (ksplugin/, kssdk/), built below.
 #
 # core/ is the link codec and the status text, ksplugin/core/ the turn view's
-# show and hide rules, all pure Java: they are compiled and tested alone on
-# the JDK first, so a failing test, or an android.* import creeping into
-# either core/, fails the image. app/ is the Android side.
+# show and hide rules and the timer view's faces, all pure Java: they are
+# compiled and tested alone on the JDK first, so a failing test, or an
+# android.* import creeping into either core/, fails the image. app/ is the
+# Android side.
 #
 # The signing key is generated per build and discarded (decision 3): no
 # secret lives in the repository, and since the firmware reinstalls on any
@@ -105,6 +106,7 @@ RUN set -e; \
       $(find companion/core companion/ksplugin/core companion/test -name '*.java'); \
     java -cp test-classes org.echomuse.companion.LinkTest; \
     java -cp test-classes org.echomuse.ksplugin.TurnViewTest; \
+    java -cp test-classes org.echomuse.ksplugin.TimerViewTest; \
     $BT/aapt2 compile --dir companion/res -o res.zip; \
     $BT/aapt2 link -o unsigned.apk -I $SDK --manifest companion/AndroidManifest.xml \
       --java gen --version-name "$VERSION" --version-code 1 res.zip; \

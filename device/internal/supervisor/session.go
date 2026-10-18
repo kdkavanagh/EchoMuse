@@ -30,7 +30,7 @@ var v1Capabilities = []proto.Capability{
 // Android owns Wi-Fi, Bluetooth and the keys, mute is deferred and the
 // kiosk screen can be woken. On LineageOS the companion app's bar is the
 // ring and its touch zone the action button, and the firmware keeps the
-// Kiosk Satellite plugin that shows each turn.
+// Kiosk Satellite plugin that shows each turn and running timer.
 var platformCapabilities = map[proto.Platform][]proto.Capability{
 	proto.PlatformFireOS6: {
 		proto.CapLEDs, proto.CapLEDAnim, proto.CapButtons, proto.CapButtonHold,
@@ -39,7 +39,7 @@ var platformCapabilities = map[proto.Platform][]proto.Capability{
 	proto.PlatformFireOS6Crown: {proto.CapScreenWake},
 	proto.PlatformLineage18Crown: {
 		proto.CapLEDs, proto.CapLEDAnim, proto.CapButtons, proto.CapButtonHold,
-		proto.CapScreenWake, proto.CapScreenOverlay, proto.CapTurnView, proto.CapKioskPlugin,
+		proto.CapScreenWake, proto.CapScreenOverlay, proto.CapTurnView, proto.CapTimerView, proto.CapKioskPlugin,
 	},
 }
 
@@ -161,14 +161,15 @@ func (s *Supervisor) Rejected(reason proto.RejectReason, controller string) {
 // playback ends; local alerts, privacy and physical stop continue (§16.1).
 // A wake or dialog the controller was still handling gets the offline
 // notice, so the user is not left with silence, and a turn view it was
-// still showing ends; the detector keeps (or restores) the last model and
-// answers later wakes itself.
+// still showing ends and its timers clear; the detector keeps (or
+// restores) the last model and answers later wakes itself.
 func (s *Supervisor) Lost(reason client.LostReason) {
 	log.Printf("[session] lost: %s", reason)
 	inFlight := s.endSession()
 	s.cfg.Physical.SetLinkState(server.LinkDown)
 	s.companionLink(companion.LinkDown, string(reason), "")
 	s.endTurnView()
+	s.endTimerView()
 	s.mu.Lock()
 	s.offCancel()
 	s.offCtx, s.offCancel = context.WithCancel(context.Background())
@@ -249,6 +250,8 @@ func (s *Supervisor) Control(env proto.Envelope) {
 		s.clockReply(env)
 	case proto.TypeTurnView:
 		s.turnView(env)
+	case proto.TypeTimerView:
+		s.timerView(env)
 	default:
 		s.retained(env)
 	}

@@ -333,8 +333,9 @@ These are added to §3. The app's `hello` gains `role: "app"` and `link: 2`. The
 | fw → plugin | `config` | `turn_view_linger`: seconds | after `hello`, and when `turnViewLinger` changes |
 | fw → plugin | `frame` | as for the app | as for the app |
 | fw → plugin | `view` | the `turn.view` body | on every `turn.view`, and the last one after `hello`. When the controller session is lost while the last view is not `done`, the firmware sends it again as `done` |
+| fw → plugin | `timers` | the `timer.view` body (§11.10) | on every `timer.view`, and the last one after `hello`. When the controller session is lost, the firmware sends, and keeps, an empty list |
 
-After the plugin's `hello` the firmware sends `hello`, `config`, `frame`, then the last `view`. A `hello` without `role` is an app's (only link-1 apps omit it).
+After the plugin's `hello` the firmware sends `hello`, `config`, `frame`, then the last `view` and the last `timers`. A `hello` without `role` is an app's (only link-1 apps omit it).
 
 ### 11.4 Build
 
@@ -481,3 +482,15 @@ Where the build differs from the text above:
 - **`remote_admin`** is a 200 from `GET /api/health` over plain HTTP. With Kiosk Satellite's **Use HTTPS** on it reads false and the plugin is not installed; `docs/quickstart.md` says to leave it off.
 - **Replacement per role happens at accept,** by the role the peer's uid allows. A role refusal is reported in the companion `error`; a plugin link or version mismatch in `kiosk.plugin.error`.
 - **The update prompt** asks when `kioskTokenSet` is false or `plugin.error` is `token_rejected`; it gates the per-device install and the queued install, not the fleet-wide "install now". `kiosk_login` is accepted while the only gap is "firmware update available", so the token can be stored before the update that brings the plugin.
+
+### 11.10 Timer view (2026-10-18)
+
+**Goal:** each of the speaker's running timers is drawn over the kiosk's page as a circle whose perimeter is a progress ring, with the time left in the middle.
+
+1. **Capability `timer_view_v1`**, announced statically by the LineageOS firmware like `turn_view_v1`. The controller sends `timer.view` (protocol-v1 §4.10) to no other device.
+2. **The alert engine sends it**, since it holds the display copies of the timers (architecture §10.8): the whole list, sorted (active soonest first, then paused), at `session.hello`, after each HA timer event, and with every 1 s tick while a timer exists. `name` is null for an unnamed timer, so the ring shows only the time.
+3. **Counted down in the plugin.** Each `timers` line re-anchors every timer at its arrival; between lines the plugin counts down from `uptimeMillis`. The text is the remaining time rounded up to whole seconds (`M:SS`, `H:MM:SS` from an hour), so it reads 0:00 at zero. The view redraws when a text changes or an arc has moved a pixel, and not at all while only paused timers are shown.
+4. **Stale and lost.** No line for 5 s (the controller resends every second) or a lost link clears the timers; on a lost controller session the firmware sends an empty list.
+5. **Placement.** A second overlay, `timers`, anchored top-right with a 24 dp inset, 560 × 128 dp, not touchable, `onTop` like the turn view: up to four 128 dp rings right to left, the soonest nearest the corner; with more than four timers the last ring reads `+N`. A ring is a `surface` disc, an `outlineVariant` track and a `primary` arc from 12 o'clock, clockwise, shrinking as time runs out; a paused ring is drawn in `onSurfaceVariant`. The timers are hidden while the turn view is up and come back when it hides.
+
+**Status (2026-10-18):** built and checked on the unit. `companion` stage: `TimerViewTest` (65 checks) and the `timers` decode in `LinkTest` (186 checks in all); host tests for the firmware relay, replay and session-loss clear, and for the alert engine's sends, order and unnamed timers. The controller was deployed with `fw-af443a9705ec` and the unit took it by OTA; the firmware reinstalled the plugin (`1.0.0-dd324f6a9bb6`, linked). With timers started through HA's intent API on the unit's HA device, over the black screensaver: an unnamed 5 min and a 1 h 2 min "pasta" timer drew top right, 4:57 at the corner and 1:01:57 "pasta" beside it, and counted down (4:51 and 1:01:51 six seconds later) with the 5 min arc opening at 12 o'clock; pausing "pasta" drew it grey and froze it at 1:01:27 while the other ran on; cancelling both cleared the overlay within 2 s. Not yet seen on the unit: the rings hiding under a spoken turn's view, and the 5 s stale clear.

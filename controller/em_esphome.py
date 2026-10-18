@@ -104,6 +104,8 @@ class Hooks:
     announce: Callable[[str, bool, str | None, bool], HookCoro] | None = None
     set_volume: Callable[[int], HookCoro] | None = None
     stop_alert: Callable[[], HookCoro] | None = None
+    # timer_event(event, timer_id, name, total_seconds, seconds_left, is_active): `name`
+    # as HA gave it, "" for an unnamed timer.
     timer_event: Callable[[TimerEvent, str, str, int, int, bool], HookCoro] | None = None
     attached: Callable[[], HookCoro] | None = None
 
@@ -292,7 +294,7 @@ class EchoMuseSatellite(SatelliteServerProtocol):
         if event is None or self.server.hooks.timer_event is None:
             return
         self._spawn(self.server.hooks.timer_event(
-            event, msg.timer_id, msg.name or "timer", int(msg.total_seconds),
+            event, msg.timer_id, msg.name, int(msg.total_seconds),
             int(msg.seconds_left), bool(msg.is_active)), "timer-event")
 
     def _handle_voice_event(self, msg: api_pb2.VoiceAssistantEventResponse) -> None:

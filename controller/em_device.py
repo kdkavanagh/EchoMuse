@@ -114,8 +114,8 @@ VOLUME_UNAVAILABLE = "volume control unavailable: Android volume check failed (s
 # mute ones, on Fire OS and on LineageOS alike. Only Fire OS's Show lacks the
 # ring and the button: a LineageOS Show's companion app paints the ring as an
 # on-screen light bar and turns touches into button presses
-# (docs/echo-show-companion-plan.md). The turn view and its Kiosk Satellite
-# plugin are LineageOS's alone (§11 there).
+# (docs/echo-show-companion-plan.md). The turn view, the timer view and their
+# Kiosk Satellite plugin are LineageOS's alone (§11 there).
 _NOT_ON_ECHO_SHOW: dict[Capability, CapabilityGap] = {
     Capability.WIFI_CONTROL: CapabilityGap.MANAGED_BY_DEVICE,
     Capability.BLE_PROXY: CapabilityGap.MANAGED_BY_DEVICE,
@@ -125,6 +125,7 @@ _NOT_ON_PLATFORM: dict[DevicePlatform, dict[Capability, CapabilityGap]] = {
     DevicePlatform.FIREOS6: {Capability.SCREEN_WAKE: CapabilityGap.NO_SCREEN,
                              Capability.SCREEN_OVERLAY: CapabilityGap.NO_SCREEN,
                              Capability.TURN_VIEW: CapabilityGap.NO_SCREEN,
+                             Capability.TIMER_VIEW: CapabilityGap.NO_SCREEN,
                              Capability.KIOSK_PLUGIN: CapabilityGap.NO_SCREEN},
     DevicePlatform.FIREOS6_CROWN: {
         **_NOT_ON_ECHO_SHOW,
@@ -133,6 +134,7 @@ _NOT_ON_PLATFORM: dict[DevicePlatform, dict[Capability, CapabilityGap]] = {
         Capability.BUTTONS: CapabilityGap.NO_BUTTON,
         Capability.BUTTON_HOLD: CapabilityGap.NO_BUTTON,
         Capability.TURN_VIEW: CapabilityGap.NEEDS_LINEAGEOS,
+        Capability.TIMER_VIEW: CapabilityGap.NEEDS_LINEAGEOS,
         Capability.KIOSK_PLUGIN: CapabilityGap.NEEDS_LINEAGEOS,
     },
     DevicePlatform.LINEAGE18_CROWN: _NOT_ON_ECHO_SHOW,
@@ -147,7 +149,7 @@ _PLATFORM_OPTIONAL: dict[DevicePlatform, frozenset[Capability]] = {
     DevicePlatform.LINEAGE18_CROWN: frozenset({
         Capability.SCREEN_WAKE, Capability.LEDS, Capability.LED_ANIM,
         Capability.BUTTONS, Capability.BUTTON_HOLD, Capability.SCREEN_OVERLAY,
-        Capability.TURN_VIEW, Capability.KIOSK_PLUGIN,
+        Capability.TURN_VIEW, Capability.TIMER_VIEW, Capability.KIOSK_PLUGIN,
     }),
 }
 

@@ -126,6 +126,8 @@ class MessageType(enum.StrEnum):
     PONG = "pong"
     # §4.9 turn view (C→D)
     TURN_VIEW = "turn.view"
+    # §4.10 timer view (C→D)
+    TIMER_VIEW = "timer.view"
 
 
 class Capability(enum.StrEnum):
@@ -167,6 +169,10 @@ class Capability(enum.StrEnum):
     # config turnViewLinger seconds after `done`
     # (docs/echo-show-companion-plan.md §11).
     TURN_VIEW = "turn_view_v1"
+    # Announced by a LineageOS Show's firmware: it relays timer.view to its
+    # Kiosk Satellite plugin, which draws each running timer as a ring over
+    # the page (docs/protocol-v1.md §4.10).
+    TIMER_VIEW = "timer_view_v1"
     # Announced by a LineageOS Show's firmware: it installs and enables that
     # plugin through Kiosk Satellite's remote API with config kioskToken and
     # kioskPort, and reports it in stats.companion.kiosk.

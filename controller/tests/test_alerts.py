@@ -18,7 +18,7 @@ from em_alert_wire import (
     canonical_json, iso_seconds, occurrence_id_for, parse_description,
     snooze_due_utc_ms, snooze_schedule_id, ui_schedule_id,
 )
-from em_alerts import AlertEngine, Speaker
+from em_alerts import TIMER_FINISH_GRACE_MS, AlertEngine, Speaker
 from em_device_link import CommandAck
 from em_ha_client import HaUnavailable
 
@@ -805,19 +805,19 @@ def test_timer_display_copy_ring_missed_and_undeliverable():
         e = rig.engine
         await e.on_timer_event("dev1", "started", "t1", "Tea", 4, 4, True)
         rig.now[0] += 1000
-        e.tick_timers()
+        await e.tick_timers()
         assert rig.notes("timers")[-1]["timers"] == [
             {"id": "t1", "name": "Tea", "total_seconds": 4, "remaining_seconds": 3, "active": True}]
         await e.on_timer_event("dev1", "updated", "t1", "Tea", 4, 3, False)     # paused
         rig.now[0] += 60_000
-        e.tick_timers()
+        await e.tick_timers()
         assert e.timers("dev1")[0]["remaining_seconds"] == 3 and not rig.notes("timer_finish_missed")
         await e.on_timer_event("dev1", "updated", "t1", "Tea", 4, 3, True)
         rig.now[0] += 3000 + 4999
-        e.tick_timers()
+        await e.tick_timers()
         assert not rig.notes("timer_finish_missed")
         rig.now[0] += 1
-        e.tick_timers()
+        await e.tick_timers()
         assert rig.notes("timer_finish_missed") == [{"timer_id": "t1", "name": "Tea"}]
         assert e.timers("dev1") == [] and rig.of("alert.ring") == []   # never rings on its own
         await e.on_timer_event("dev1", "started", "t2", "Pasta", 60, 60, True)
@@ -846,6 +846,96 @@ def test_the_timer_sound_is_prefetched_on_connect_and_timer_start_only_by_capabl
         await e.on_timer_event("dev1", "started", "t2", "Pasta", 60, 60, True)
         await e.on_timer_event("dev1", "updated", "t2", "Pasta", 60, 50, False)
         assert rig.of("alert.prefetch") == [{"sounds": [TIMER_SOUND]}] * 2
+    run(go())
+
+
+HELLO = {"delivery_epoch": None, "acked_sequence": 0}
+TIMER_VIEW = frozenset({"timer_view_v1"})
+
+
+def shown(view):
+    """(id, name, remaining_ms, active) of each timer, in the order sent."""
+    return [(t["id"], t["name"], t["remaining_ms"], t["active"]) for t in view["timers"]]
+
+
+def test_a_timer_view_device_sees_the_whole_list_on_hello_every_change_and_every_tick():
+    async def go():
+        rig = Rig()
+        await rig.up()
+        e = rig.engine
+        await e.on_session_hello("dev1", HELLO, capabilities=TIMER_VIEW)
+        assert rig.of("timer.view") == [{"timers": []}]     # replaces what an earlier session showed
+        await e.on_timer_event("dev1", "started", "t1", "Tea", 60, 60, True)
+        await e.on_timer_event("dev1", "started", "t2", "", 30, 30, True)      # HA named it nothing
+        assert rig.of("timer.view")[-1] == {"timers": [
+            {"id": "t2", "name": None, "total_ms": 30_000, "remaining_ms": 30_000, "active": True},
+            {"id": "t1", "name": "Tea", "total_ms": 60_000, "remaining_ms": 60_000, "active": True}]}
+        assert [t["name"] for t in e.timers("dev1")] == ["Tea", "timer"]   # the dashboard's label stands
+        rig.now[0] += 1500
+        await e.tick_timers()
+        assert shown(rig.of("timer.view")[-1]) == [("t2", None, 28_500, True), ("t1", "Tea", 58_500, True)]
+        await e.on_timer_event("dev1", "updated", "t1", "Tea", 60, 20, False)  # paused: after every running one
+        assert shown(rig.of("timer.view")[-1]) == [("t2", None, 28_500, True), ("t1", "Tea", 20_000, False)]
+        rig.now[0] += 5000
+        await e.tick_timers()
+        assert shown(rig.of("timer.view")[-1]) == [("t2", None, 23_500, True), ("t1", "Tea", 20_000, False)]
+        await e.on_timer_event("dev1", "cancelled", "t1", "Tea", 60, 20, False)
+        assert shown(rig.of("timer.view")[-1]) == [("t2", None, 23_500, True)]
+        await e.on_timer_event("dev1", "finished", "t2", "", 30, 0, False)
+        assert [kind for _dev, kind, _body in rig.sent[-2:]] == ["timer.view", "alert.ring"]
+        assert rig.of("timer.view")[-1] == {"timers": []} and rig.of("alert.ring")[-1]["name"] == "timer"
+        sent = len(rig.of("timer.view"))
+        await e.tick_timers()                               # no timers: nothing to repeat
+        assert len(rig.of("timer.view")) == sent
+    run(go())
+
+
+def test_the_timer_view_runs_soonest_first_then_paused_and_ties_keep_start_order():
+    async def go():
+        rig = Rig()
+        await rig.up()
+        e = rig.engine
+        await e.on_session_hello("dev1", HELLO, capabilities=TIMER_VIEW)
+        await e.on_timer_event("dev1", "started", "a", "A", 600, 300, False)
+        await e.on_timer_event("dev1", "started", "b", "B", 60, 60, True)
+        await e.on_timer_event("dev1", "started", "c", "C", 60, 60, True)
+        await e.on_timer_event("dev1", "started", "d", "D", 600, 100, False)
+        await e.on_timer_event("dev1", "started", "e", "E", 600, 10, True)
+        await e.on_timer_event("dev1", "updated", "b", "B", 60, 60, True)     # keeps its place among ties
+        assert [t[0] for t in shown(rig.of("timer.view")[-1])] == ["e", "b", "c", "d", "a"]
+    run(go())
+
+
+def test_the_tick_that_drops_a_timer_without_finished_sends_the_emptied_view():
+    async def go():
+        rig = Rig()
+        await rig.up()
+        e = rig.engine
+        await e.on_session_hello("dev1", HELLO, capabilities=TIMER_VIEW)
+        await e.on_timer_event("dev1", "started", "t1", "Tea", 4, 4, True)
+        rig.now[0] += 4000 + TIMER_FINISH_GRACE_MS
+        await e.tick_timers()
+        assert rig.notes("timer_finish_missed") == [{"timer_id": "t1", "name": "Tea"}]
+        assert rig.of("timer.view")[-1] == {"timers": []}
+    run(go())
+
+
+def test_timer_view_goes_only_to_an_online_device_that_announced_it():
+    async def go():
+        rig = Rig()
+        await rig.up(online=True)                           # hello without timer_view_v1
+        e = rig.engine
+        await e.on_timer_event("dev1", "started", "t1", "Tea", 60, 60, True)
+        rig.now[0] += 1000
+        await e.tick_timers()
+        assert rig.of("timer.view") == []
+        e.on_session_lost("dev1")
+        await e.on_session_hello("dev1", HELLO, capabilities=TIMER_VIEW)
+        assert shown(rig.of("timer.view")[-1]) == [("t1", "Tea", 59_000, True)]
+        e.on_session_lost("dev1")
+        await e.on_timer_event("dev1", "started", "t2", "Pasta", 60, 60, True)
+        await e.tick_timers()
+        assert len(rig.of("timer.view")) == 1
     run(go())
 
 

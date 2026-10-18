@@ -104,7 +104,7 @@ type Config struct {
 	// at once.
 	ScreenOn func(url, password string)
 	// Companion is the screen app's link (companion.Server); required on a
-	// screen_overlay or turn_view_v1 platform, nil elsewhere.
+	// screen_overlay, turn_view_v1 or timer_view_v1 platform, nil elsewhere.
 	Companion Companion
 
 	Mic pkgmic.Microphone
@@ -234,8 +234,9 @@ func Assemble(cfg Config, d Deps) (*Supervisor, error) {
 	if slices.Contains(platformCaps, proto.CapScreenWake) && cfg.ScreenOn == nil {
 		return nil, errors.New("supervisor: screen_wake platform without ScreenOn")
 	}
-	if (slices.Contains(platformCaps, proto.CapScreenOverlay) || slices.Contains(platformCaps, proto.CapTurnView)) && cfg.Companion == nil {
-		return nil, errors.New("supervisor: screen_overlay or turn_view_v1 platform without Companion")
+	if (slices.Contains(platformCaps, proto.CapScreenOverlay) || slices.Contains(platformCaps, proto.CapTurnView) ||
+		slices.Contains(platformCaps, proto.CapTimerView)) && cfg.Companion == nil {
+		return nil, errors.New("supervisor: screen_overlay, turn_view_v1 or timer_view_v1 platform without Companion")
 	}
 	if cfg.NowMonoNS == nil {
 		cfg.NowMonoNS = monoclock.Now

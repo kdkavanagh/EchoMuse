@@ -81,13 +81,14 @@ func TestHelloPlatform(t *testing.T) {
 }
 
 // The optional platform capabilities carry the names the controller gates
-// its Wi-Fi, BLE proxy, mute, screen wake, companion, turn view and kiosk
-// plugin controls on.
+// its Wi-Fi, BLE proxy, mute, screen wake, companion, turn view, timer view
+// and kiosk plugin controls on.
 func TestPlatformCapabilityNames(t *testing.T) {
 	for c, want := range map[Capability]string{
 		CapWifiControl: "wifi_control", CapBLEProxy: "ble_proxy",
 		CapPrivacyMute: "privacy_mute", CapScreenWake: "screen_wake",
-		CapScreenOverlay: "screen_overlay", CapTurnView: "turn_view_v1", CapKioskPlugin: "kiosk_plugin",
+		CapScreenOverlay: "screen_overlay", CapTurnView: "turn_view_v1", CapTimerView: "timer_view_v1",
+		CapKioskPlugin: "kiosk_plugin",
 	} {
 		if string(c) != want {
 			t.Errorf("capability %q, want %q", c, want)

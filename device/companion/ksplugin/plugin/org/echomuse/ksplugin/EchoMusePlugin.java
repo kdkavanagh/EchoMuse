@@ -25,10 +25,12 @@ import me.jxl.kiosk.plugins.PluginHost;
 import org.echomuse.companion.Link;
 
 /**
- * The EchoMuse turn view inside Kiosk Satellite (docs/echo-show-companion-plan.md
- * §11). The firmware installs it and keeps it current (decision 2); it holds
- * the local link, role {@code plugin} (§11.3), and draws each turn the
- * controller's turn.view describes in one long-lived overlay (decision 9).
+ * The EchoMuse turn and timer views inside Kiosk Satellite
+ * (docs/echo-show-companion-plan.md §11). The firmware installs it and keeps
+ * it current (decision 2); it holds the local link, role {@code plugin}
+ * (§11.3), draws each turn the controller's turn.view describes in one
+ * long-lived overlay (decision 9), and the speaker's HA timers from its
+ * timer.view in another, in the top-right corner, hidden while a turn is up.
  *
  * <p>Threads: Kiosk Satellite runs StrictMode, so the link thread alone
  * connects, writes the hello (the plugin's only line) and reads; every view
@@ -46,6 +48,7 @@ public final class EchoMusePlugin implements KioskPlugin {
     /** stop() must return within Kiosk Satellite's 3 s callback deadline. */
     private static final long JOIN_MS = 2500;
     private static final String OVERLAY = "turn_view";
+    private static final String TIMER_OVERLAY = "timers";
     private static final String SCREENSAVER = "screensaver.state";
 
     private final Handler main = new Handler(Looper.getMainLooper());
@@ -64,9 +67,15 @@ public final class EchoMusePlugin implements KioskPlugin {
     private ViewOverlay overlay;
     /** The latest frame's colours, or null while the bar is dark or the link is down. */
     private int[] glow;
+    private final TimerView timerView = new TimerView();
+    private TimerOverlay timerOverlay;
 
     private final Runnable tick = guarded(() -> {
         turn.tick(SystemClock.uptimeMillis());
+        render();
+    });
+    private final Runnable timerTick = guarded(() -> {
+        timerView.tick(SystemClock.uptimeMillis());
         render();
     });
 
@@ -76,6 +85,9 @@ public final class EchoMusePlugin implements KioskPlugin {
         running = true;
         host.showOverlay(OVERLAY, OverlaySpec.fullScreen().onTop(true).touchable(false).closeOnBack(false),
                 new Factory());
+        host.showOverlay(TIMER_OVERLAY, OverlaySpec.at(OverlaySpec.TOP_RIGHT)
+                .size(TimerOverlay.WIDTH_DP, TimerOverlay.HEIGHT_DP).inset(24)
+                .onTop(true).touchable(false).closeOnBack(false), new TimerFactory());
         // Subscribe first, then read: an event after the read wins (SDK docs/ks-api.md).
         host.subscribe(SCREENSAVER);
         int seen = screensaverEvents.get();
@@ -237,6 +249,9 @@ public final class EchoMusePlugin implements KioskPlugin {
                 stopScreensaver();
             }
             render();
+        } else if (m instanceof Link.Timers) {
+            timerView.timers((Link.Timers) m, SystemClock.uptimeMillis());
+            render();
         }
     }
 
@@ -246,6 +261,7 @@ public final class EchoMusePlugin implements KioskPlugin {
             return;
         }
         turn.linkLost(SystemClock.uptimeMillis());
+        timerView.linkLost();
         glow = null;
         if (overlay != null) {
             overlay.setGlow(null);
@@ -253,15 +269,23 @@ public final class EchoMusePlugin implements KioskPlugin {
         render();
     }
 
-    /** Shows the reducer's state and arms the timer for its next deadline. */
+    /** Shows the reducers' state and arms each one's tick for its next deadline. */
     private void render() {
         if (overlay != null) {
             overlay.show(turn.shown());
+        }
+        if (timerOverlay != null) {
+            timerOverlay.show(timerView, turn.shown() != null);
         }
         main.removeCallbacks(tick);
         long at = turn.hideAt();
         if (at != TurnView.NEVER) {
             main.postAtTime(tick, at);
+        }
+        main.removeCallbacks(timerTick);
+        at = timerView.staleAt();
+        if (at != TimerView.NEVER) {
+            main.postAtTime(timerTick, at);
         }
     }
 
@@ -293,12 +317,12 @@ public final class EchoMusePlugin implements KioskPlugin {
             try {
                 r.run();
             } catch (Throwable t) {
-                log("turn view: " + t);
+                log("main thread: " + t);
             }
         };
     }
 
-    /** Builds the overlay's view; Kiosk Satellite calls these on the main thread. */
+    /** Builds the turn view's overlay; Kiosk Satellite calls these on the main thread. */
     private final class Factory implements OverlayFactory {
         @Override
         public View create(Context context, KsTheme theme) {
@@ -322,6 +346,33 @@ public final class EchoMusePlugin implements KioskPlugin {
         public void onDestroy(View view) {
             if (overlay == view) {
                 overlay = null;
+            }
+        }
+    }
+
+    /** Builds the timer view's overlay, as {@link Factory} does the turn view's. */
+    private final class TimerFactory implements OverlayFactory {
+        @Override
+        public View create(Context context, KsTheme theme) {
+            TimerOverlay v = new TimerOverlay(context, theme);
+            v.show(timerView, turn.shown() != null);
+            timerOverlay = v;
+            return v;
+        }
+
+        @Override
+        public void onThemeChanged(View view, KsTheme theme) {
+            try {
+                ((TimerOverlay) view).setTheme(theme);
+            } catch (RuntimeException e) {
+                log("theme: " + e);
+            }
+        }
+
+        @Override
+        public void onDestroy(View view) {
+            if (timerOverlay == view) {
+                timerOverlay = null;
             }
         }
     }

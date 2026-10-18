@@ -24,7 +24,7 @@ from _device_fakes import ALL_V1, FakeLink, FakeStore, hello, make_hub  # noqa: 
 DEVICE = "SHOW1"
 PASSWORD = "correct horse battery"
 TOKEN = "ks-token-0123456789"
-LINEAGE = ALL_V1 + ["screen_wake", "screen_overlay", "turn_view_v1", "kiosk_plugin"]
+LINEAGE = ALL_V1 + ["screen_wake", "screen_overlay", "turn_view_v1", "timer_view_v1", "kiosk_plugin"]
 
 
 class FakeKioskSatellite:

@@ -6,8 +6,9 @@ Authority (SPEC §3.1, §10.1): HA's Local Calendar owns which alarm schedules
 and unhandled occurrences exist; HA's timer manager owns every timer. This
 engine owns the occurrence lifecycle, the calendar write order (§10.3), the
 write-ahead journal and restore guard (§16.3), delivery of the device alert
-cache (§16.4), and turning HA timer `finished` events into `alert.ring`
-(§10.8). It never writes ringing state or timers to HA.
+cache (§16.4), turning HA timer `finished` events into `alert.ring`
+(§10.8), and keeping a `timer_view_v1` device's `timer.view` current
+(WIRE §4.10). It never writes ringing state or timers to HA.
 
 Callers inject everything that touches the outside world: the stock HA client
 (`em_ha_client.HaApi`), the device control sender, the sound/config/speaker
@@ -71,6 +72,7 @@ STATUS_WINDOW_MS = 86_400_000               # dashboard: finished rows younger t
 TIMER_FINISH_GRACE_MS = 5_000               # §10.8 timer_finish_missed
 TIMER_RING_SECONDS = 900                    # §10.8 default timerRingSeconds
 TIMER_RING_GAP_SECONDS = 2.0                # default timerRingGapSeconds
+UNNAMED_TIMER = "timer"                     # an unnamed timer's label: ring, dashboard, notices
 
 
 # ── vocabulary ───────────────────────────────────────────────────────────────
@@ -221,6 +223,20 @@ class TimerDisplay(TypedDict):
     active: bool
 
 
+class TimerViewEntry(TypedDict):
+    """One timer of `timer.view` (WIRE §4.10)."""
+    id: str
+    name: str | None                # None: HA gave it no name
+    total_ms: int
+    remaining_ms: int
+    active: bool
+
+
+class TimerViewBody(TypedDict):
+    """`timer.view`: the speaker's whole timer list, never a delta."""
+    timers: list[TimerViewEntry]
+
+
 class OccurrenceStatus(OccurrenceBody):
     armed_on_endpoint: bool
 
@@ -282,7 +298,8 @@ class Speaker:
 class TimerCopy:
     """Display copy of one HA timer (§10.8); never decides that it finished."""
     timer_id: str
-    name: str
+    name: str               # HA's name, or UNNAMED_TIMER
+    named: bool             # HA gave it a name
     total_seconds: int
     seconds_left: int
     active: bool
@@ -299,6 +316,11 @@ class TimerCopy:
     def as_dict(self, now_ms: int) -> TimerDisplay:
         return {"id": self.timer_id, "name": self.name, "total_seconds": self.total_seconds,
                 "remaining_seconds": round(self.remaining(now_ms)), "active": self.active}
+
+    def view(self, now_ms: int) -> TimerViewEntry:
+        return {"id": self.timer_id, "name": self.name if self.named else None,
+                "total_ms": self.total_seconds * 1000,
+                "remaining_ms": max(0, round(self.remaining(now_ms) * 1000)), "active": self.active}
 
 
 @dataclass(frozen=True, slots=True)
@@ -382,6 +404,7 @@ class _Endpoint:
     # Delivery.
     online: bool = False
     prefetch: bool = False          # the device installs sounds alert.prefetch names
+    timer_view: bool = False        # the device takes timer.view
     delivered: dict[str, tuple[OccurrenceBody, int]] = field(default_factory=dict)
     delivered_valid: bool = False   # `delivered` is known to equal the device cache
     schedule_rev: dict[str, int] = field(default_factory=dict)
@@ -578,7 +601,7 @@ class AlertEngine:
         last_roll = time.monotonic()
         while not self._closed:
             await asyncio.sleep(TICK_SECONDS)
-            self.tick_timers()
+            await self.tick_timers()
             if time.monotonic() - last_roll >= ROLL_SECONDS:
                 last_roll = time.monotonic()
                 await self.roll_windows()
@@ -1031,12 +1054,14 @@ class AlertEngine:
     async def on_session_hello(self, endpoint_id: str, alerts: Mapping[str, object], *,
                                capabilities: Iterable[str] = ()) -> None:
         """`session.hello.alerts`: snapshot on an epoch/sequence mismatch; then the
-        timer sound, so a first ring does not fall back for want of it."""
+        timer sound, so a first ring does not fall back for want of it; then the
+        timer view, replacing whatever an earlier session left on screen."""
         ep = self._eps.get(endpoint_id)
         if ep is None:
             return
         ep.online = True
         ep.prefetch = Capability.ALERT_PREFETCH in capabilities
+        ep.timer_view = Capability.TIMER_VIEW in capabilities
         dev_epoch, dev_acked = alerts.get("delivery_epoch"), alerts.get("acked_sequence")
         if dev_epoch == ep.epoch and isinstance(dev_acked, int) and 0 <= dev_acked <= ep.sequence:
             ep.acked = dev_acked
@@ -1046,6 +1071,7 @@ class AlertEngine:
         if ep.materialized:
             await self._deliver(ep)
         await self._prefetch_timer_sound(ep)
+        await self._send_timer_view(ep)
 
     def on_session_lost(self, endpoint_id: str) -> None:
         ep = self._eps.get(endpoint_id)
@@ -1603,30 +1629,34 @@ class AlertEngine:
 
     async def on_timer_event(self, endpoint_id: str, event: TimerEvent, timer_id: str, name: str,
                              total_seconds: int, seconds_left: int, is_active: bool) -> None:
-        """HA's native timer event for this speaker's satellite."""
+        """HA's native timer event for this speaker's satellite. `name`: HA's, "" for an
+        unnamed timer, which every copy but the timer view calls UNNAMED_TIMER."""
         ep = self._eps.get(endpoint_id)
         if ep is None:
             return
+        label = name or UNNAMED_TIMER
         if event in (TimerEvent.STARTED, TimerEvent.UPDATED):
-            ep.timers[timer_id] = TimerCopy(timer_id, name, int(total_seconds), int(seconds_left),
-                                            bool(is_active), self.now_ms())
+            ep.timers[timer_id] = TimerCopy(timer_id, label, bool(name), int(total_seconds),
+                                            int(seconds_left), bool(is_active), self.now_ms())
         else:
             ep.timers.pop(timer_id, None)
         self.notify(endpoint_id, AlertNotice.TIMERS, {"timers": self.timers(endpoint_id)})
+        await self._send_timer_view(ep)
         if event == TimerEvent.STARTED:
             await self._prefetch_timer_sound(ep)      # timerSound may have changed since hello
         elif event == TimerEvent.FINISHED:
-            await self._ring_timer(ep, timer_id, name)
+            await self._ring_timer(ep, timer_id, label)
 
     def timers(self, endpoint_id: str) -> list[TimerDisplay]:
         ep = self._eps.get(endpoint_id)
         now = self.now_ms()
         return [t.as_dict(now) for t in ep.timers.values()] if ep else []
 
-    def tick_timers(self) -> None:
-        """Once a second: publish display copies; flag a zero with no `finished`."""
+    async def tick_timers(self) -> None:
+        """Once a second: publish display copies and the timer view; flag a zero with
+        no `finished`."""
         now = self.now_ms()
-        for ep in self._eps.values():
+        for ep in list(self._eps.values()):
             if not ep.timers:
                 continue
             for timer in list(ep.timers.values()):
@@ -1636,6 +1666,7 @@ class AlertEngine:
                     self.notify(ep.endpoint_id, AlertNotice.TIMER_FINISH_MISSED,
                                 {"timer_id": timer.timer_id, "name": timer.name})
             self.notify(ep.endpoint_id, AlertNotice.TIMERS, {"timers": self.timers(ep.endpoint_id)})
+            await self._send_timer_view(ep)
 
     async def _ring_timer(self, ep: _Endpoint, timer_id: str, name: str) -> None:
         config = self.config_resolver(ep.endpoint_id) or {}
@@ -1670,6 +1701,20 @@ class AlertEngine:
             await self.send(ep.endpoint_id, MessageType.ALERT_PREFETCH, {"sounds": [sound]}, generation=0)
         except Exception as err:  # the session layer owns transport errors
             log.info("alerts: timer sound prefetch on %s not sent: %s", ep.endpoint_id, err)
+
+    async def _send_timer_view(self, ep: _Endpoint) -> None:
+        """The speaker's whole timer list to a `timer_view_v1` device (WIRE §4.10): running
+        timers soonest first, then paused ones; ties keep HA's start order."""
+        if not (ep.online and ep.timer_view):
+            return
+        now = self.now_ms()
+        timers = sorted((t.view(now) for t in ep.timers.values()),
+                        key=lambda t: (not t["active"], t["remaining_ms"]))
+        body: TimerViewBody = {"timers": timers}
+        try:
+            await self.send(ep.endpoint_id, MessageType.TIMER_VIEW, body, generation=0)
+        except Exception as err:  # the session layer owns transport errors
+            log.info("alerts: timer view on %s not sent: %s", ep.endpoint_id, err)
 
     # ── sounds, flags, status ─────────────────────────────────────────────
 

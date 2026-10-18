@@ -10,8 +10,8 @@ import (
 // Companion is the screen app's link on a screen_overlay platform
 // (internal/companion, docs/echo-show-companion-plan.md): the supervisor
 // keeps its touch zone and controller link status current and, on a
-// turn_view_v1 platform, hands it each turn.view for the Kiosk Satellite
-// plugin (§11). All must return at once.
+// turn_view_v1 or timer_view_v1 platform, hands it each turn.view and
+// timer.view for the Kiosk Satellite plugin (§11). All must return at once.
 type Companion interface {
 	SetZone(companion.Zone)
 	SetLink(companion.Status)
@@ -19,6 +19,10 @@ type Companion interface {
 	// view again as done when the controller can no longer finish it.
 	View(body json.RawMessage)
 	EndView()
+	// Timers relays a timer.view body to the plugin; EndTimers clears the
+	// plugin's timers when the controller session is lost.
+	Timers(body json.RawMessage)
+	EndTimers()
 }
 
 // updateZone sets the companion's touch zone (plan decision 9): stop while
@@ -73,5 +77,22 @@ func (s *Supervisor) turnView(env proto.Envelope) {
 func (s *Supervisor) endTurnView() {
 	if s.has(proto.CapTurnView) {
 		s.cfg.Companion.EndView()
+	}
+}
+
+// timerView relays timer.view to the plugin, unchanged. The controller
+// sends it only to timer_view_v1 devices; elsewhere it is ignored, as any
+// unknown type.
+func (s *Supervisor) timerView(env proto.Envelope) {
+	if s.has(proto.CapTimerView) {
+		s.cfg.Companion.Timers(env.Body)
+	}
+}
+
+// endTimerView clears the timers a lost session can no longer count down,
+// so the plugin does not show them forever.
+func (s *Supervisor) endTimerView() {
+	if s.has(proto.CapTimerView) {
+		s.cfg.Companion.EndTimers()
 	}
 }

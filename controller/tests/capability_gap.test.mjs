@@ -100,12 +100,14 @@ const SHOWS = {
       ...SHOW_GAPS,
       leds: "no LED ring on this device", led_anim: "no LED ring on this device",
       buttons: "no action button on this device", button_hold: "no action button on this device",
-      turn_view_v1: "needs LineageOS on this Echo Show", kiosk_plugin: "needs LineageOS on this Echo Show",
+      turn_view_v1: "needs LineageOS on this Echo Show", timer_view_v1: "needs LineageOS on this Echo Show",
+      kiosk_plugin: "needs LineageOS on this Echo Show",
     },
   },
   lineage18_crown: {
     connected: true, platform: "lineage18_crown",
-    capabilities: [...SHOW, "leds", "led_anim", "buttons", "button_hold", "screen_overlay", "turn_view_v1", "kiosk_plugin"],
+    capabilities: [...SHOW, "leds", "led_anim", "buttons", "button_hold", "screen_overlay", "turn_view_v1",
+                   "timer_view_v1", "kiosk_plugin"],
     capability_gaps: SHOW_GAPS,
   },
 };
@@ -143,7 +145,8 @@ for (const [platform, show] of Object.entries(SHOWS)) {
   const s = liveCapabilities({
     connected: true, platform: "lineage18_crown", capabilities: SHOW,
     capability_gaps: { ...SHOW_GAPS, leds: UPDATE, led_anim: UPDATE, buttons: UPDATE,
-                       button_hold: UPDATE, screen_overlay: UPDATE, turn_view_v1: UPDATE, kiosk_plugin: UPDATE },
+                       button_hold: UPDATE, screen_overlay: UPDATE, turn_view_v1: UPDATE, timer_view_v1: UPDATE,
+                       kiosk_plugin: UPDATE },
   });
   check("older lineage18_crown: the ring waits for the update", capabilityGap(s, CAPABILITY.LEDS), UPDATE);
   check("older lineage18_crown: the button waits for the update", capabilityGap(s, CAPABILITY.BUTTON_HOLD), UPDATE);
@@ -159,7 +162,7 @@ const olderDot = {
     wifi_control: "firmware update available", ble_proxy: "firmware update available",
     privacy_mute: "firmware update available", screen_wake: "no screen on this device",
     screen_overlay: "no screen on this device", turn_view_v1: "no screen on this device",
-    kiosk_plugin: "no screen on this device",
+    timer_view_v1: "no screen on this device", kiosk_plugin: "no screen on this device",
   },
 };
 const d = liveCapabilities(olderDot);

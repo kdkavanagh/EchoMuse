@@ -78,7 +78,8 @@ type ServerConfig struct {
 // the app's and the plugin's loopback connections, answers their hellos and
 // replays the current state. The app then gets frames, link status, touch
 // zones and screen requests, and its presses in an active zone become
-// action-button edges; the plugin gets its config, frames and turn views.
+// action-button edges; the plugin gets its config, frames, turn views and
+// timers.
 // One connection per role; a newly accepted one replaces the old one of its
 // role only.
 type Server struct {
@@ -90,6 +91,7 @@ type Server struct {
 	status Status
 	linger float64
 	view   *view
+	timers []byte         // the last timers line, nil before the first
 	newest map[Role]*conn // the latest accepted connection per role
 	linked map[Role]*conn // the connection past hello per role, which state goes to
 }
@@ -229,6 +231,44 @@ func (s *Server) EndView() {
 	s.sendLocked(RolePlugin, v.line)
 }
 
+// Timers relays a timer.view body to the plugin as a timers line, unchanged
+// but for t, and keeps it for the plugin's next hello. A body that is not an
+// object whose timers is an array, or too long for one line, is dropped. It
+// arrives every second while the speaker has a timer, so a relay is not
+// logged.
+func (s *Server) Timers(body json.RawMessage) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		log.Printf("[companion] timer.view dropped: %v", err)
+		return
+	}
+	l, err := timersLine(fields)
+	if err != nil {
+		log.Printf("[companion] timer.view dropped: %v", err)
+		return
+	}
+	s.mu.Lock()
+	s.timers = l
+	s.sendLocked(RolePlugin, l)
+	s.mu.Unlock()
+}
+
+// EndTimers clears the timers the controller can no longer count down (its
+// session was lost): unless the last timers line is already the empty list,
+// the empty list is sent and kept, so the plugin does not show them forever.
+func (s *Server) EndTimers() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.timers == nil || bytes.Equal(s.timers, noTimers) {
+		return
+	}
+	s.timers = noTimers
+	s.sendLocked(RolePlugin, noTimers)
+}
+
+// noTimers is the timers line of an empty list, as timersLine writes it.
+var noTimers = []byte(`{"t":"timers","timers":[]}` + "\n")
+
 // newView builds the view line from a turn.view body's fields, which it
 // takes over.
 func newView(fields map[string]json.RawMessage) (*view, error) {
@@ -237,6 +277,30 @@ func newView(fields map[string]json.RawMessage) (*view, error) {
 		return nil, fmt.Errorf("phase: %w", err)
 	}
 	fields["t"] = json.RawMessage(`"view"`)
+	b, err := fieldsLine(fields)
+	if err != nil {
+		return nil, err
+	}
+	return &view{fields: fields, phase: phase, line: b}, nil
+}
+
+// timersLine builds the timers line from a timer.view body's fields, which
+// it takes over.
+func timersLine(fields map[string]json.RawMessage) ([]byte, error) {
+	var timers []json.RawMessage
+	if err := json.Unmarshal(fields["timers"], &timers); err != nil {
+		return nil, fmt.Errorf("timers: %w", err)
+	}
+	if timers == nil {
+		return nil, errors.New("timers: not an array")
+	}
+	fields["t"] = json.RawMessage(`"timers"`)
+	return fieldsLine(fields)
+}
+
+// fieldsLine is fields as one link line, HTML unescaped; a line over
+// maxLine is an error.
+func fieldsLine(fields map[string]json.RawMessage) ([]byte, error) {
 	var b bytes.Buffer
 	enc := json.NewEncoder(&b)
 	enc.SetEscapeHTML(false)
@@ -246,7 +310,7 @@ func newView(fields map[string]json.RawMessage) (*view, error) {
 	if b.Len() > maxLine {
 		return nil, fmt.Errorf("%d bytes, the link takes %d", b.Len(), maxLine)
 	}
-	return &view{fields: fields, phase: phase, line: b.Bytes()}, nil
+	return b.Bytes(), nil
 }
 
 // Run listens and serves until ctx ends. A port that cannot be bound is
@@ -419,7 +483,7 @@ func (s *Server) helloPlugin(c *conn, m inMsg) bool {
 // link makes c its role's linked connection and queues the hello reply and
 // the replay, unless a newer connection has replaced c meanwhile. The app
 // gets status, touch, frame, then a held screen; the plugin config, frame,
-// then the last view.
+// then the last view and the last timers.
 func (s *Server) link(c *conn, hello []byte) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -439,6 +503,9 @@ func (s *Server) link(c *conn, hello []byte) bool {
 		c.queue = append(c.queue, line(configMsg{T: "config", TurnViewLinger: s.linger}), frame)
 		if s.view != nil {
 			c.queue = append(c.queue, s.view.line)
+		}
+		if s.timers != nil {
+			c.queue = append(c.queue, s.timers)
 		}
 	}
 	return true

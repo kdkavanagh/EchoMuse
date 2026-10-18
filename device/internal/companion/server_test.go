@@ -2,6 +2,7 @@ package companion
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"net"
@@ -615,6 +616,87 @@ func TestEndView(t *testing.T) {
 	}
 	if got := p2.next(); got != done {
 		t.Fatalf("replay %s\nwant %s", got, done)
+	}
+}
+
+// timer_view_v1: each timer.view reaches the plugin as a timers line,
+// unchanged but for t, and the last one follows the last view after a new
+// plugin's hello; bodies the plugin could not parse are not relayed.
+func TestTimersRelayAndReplay(t *testing.T) {
+	e := newLinkEnv(t)
+	p := e.linkPlugin()
+	e.s.Timers(json.RawMessage(`{"timers":[{"id":"a","name":"<pasta>","total_ms":300000,"remaining_ms":123456,"active":true},` +
+		`{"id":"b","name":null,"total_ms":60000,"remaining_ms":60000,"active":false}]}`))
+	timers := `{"t":"timers","timers":[{"id":"a","name":"<pasta>","total_ms":300000,"remaining_ms":123456,"active":true},` +
+		`{"id":"b","name":null,"total_ms":60000,"remaining_ms":60000,"active":false}]}`
+	if got := p.next(); got != timers {
+		t.Fatalf("got %s\nwant %s", got, timers)
+	}
+
+	// Bodies the plugin could not parse are not relayed.
+	e.s.Timers(json.RawMessage(`[1]`))
+	e.s.Timers(json.RawMessage(`{}`))
+	e.s.Timers(json.RawMessage(`{"timers":null}`))
+	e.s.Timers(json.RawMessage(`{"timers":{"id":"a"}}`))
+	e.s.Timers(json.RawMessage(`{"timers":["` + strings.Repeat("x", 131072) + `"]}`))
+	e.s.Timers(json.RawMessage(`{"timers":[]}`))
+	if got := p.next(); got != `{"t":"timers","timers":[]}` {
+		t.Fatalf("after bad bodies got %s", got)
+	}
+
+	e.s.View(json.RawMessage(`{"turn_id":"t1","phase":"listening"}`))
+	p.next()
+	e.s.Timers(json.RawMessage(`{"timers":[{"id":"a","name":null,"total_ms":1000,"remaining_ms":500,"active":true}]}`))
+	p.next()
+	p2 := e.dial(e.pluginUID)
+	p2.send(pluginHello)
+	for range 3 {
+		p2.next()
+	}
+	for _, w := range []string{
+		`{"phase":"listening","t":"view","turn_id":"t1"}`,
+		`{"t":"timers","timers":[{"id":"a","name":null,"total_ms":1000,"remaining_ms":500,"active":true}]}`,
+	} {
+		if got := p2.next(); got != w {
+			t.Fatalf("replay %s\nwant %s", got, w)
+		}
+	}
+}
+
+// A lost controller session clears the plugin's timers: it gets the empty
+// list once, and so does a plugin linking later; nothing is sent before
+// the first timers line or when the list is already empty.
+func TestEndTimers(t *testing.T) {
+	if l, err := timersLine(map[string]json.RawMessage{"timers": json.RawMessage(`[]`)}); err != nil || !bytes.Equal(l, noTimers) {
+		t.Fatalf("empty list encodes as %q (%v), want %q", l, err, noTimers)
+	}
+	e := newLinkEnv(t)
+	e.s.EndTimers() // no timers yet
+	p := e.linkPlugin()
+	e.s.SetTurnViewLinger(2)
+	if got := p.next(); got != `{"t":"config","turn_view_linger":2}` {
+		t.Fatalf("timers ended before any: %s", got)
+	}
+	e.s.Timers(json.RawMessage(`{"timers":[{"id":"a","name":"tea","total_ms":180000,"remaining_ms":90000,"active":true}]}`))
+	p.next()
+	e.s.EndTimers()
+	empty := `{"t":"timers","timers":[]}`
+	if got := p.next(); got != empty {
+		t.Fatalf("got %s\nwant %s", got, empty)
+	}
+	e.s.EndTimers()
+	e.s.SetTurnViewLinger(3)
+	if got := p.next(); got != `{"t":"config","turn_view_linger":3}` {
+		t.Fatalf("empty timers were ended again: %s", got)
+	}
+
+	p2 := e.dial(e.pluginUID)
+	p2.send(pluginHello)
+	for range 3 {
+		p2.next()
+	}
+	if got := p2.next(); got != empty {
+		t.Fatalf("replay %s\nwant %s", got, empty)
 	}
 }
 

@@ -184,7 +184,7 @@ DOT = ALL_V1 + ["leds", "led_anim", "buttons", "button_hold", "alert_prefetch",
 DOT_OLDER = [c for c in DOT if c not in ("wifi_control", "ble_proxy", "privacy_mute")]
 FIREOS_SHOW = ALL_V1 + ["alert_prefetch", "local_wake_chime", "open_rules_v1", "afe_metadata_v1",
                         "ambient_light", "screen_wake"]
-KIOSK = ["turn_view_v1", "kiosk_plugin"]
+KIOSK = ["turn_view_v1", "timer_view_v1", "kiosk_plugin"]
 COMPANION = ["leds", "led_anim", "buttons", "button_hold", "screen_overlay", *KIOSK]
 LINEAGE_SHOW = FIREOS_SHOW + COMPANION
 LINEAGE_SHOW_OLDER = FIREOS_SHOW
@@ -214,9 +214,10 @@ SHOW_GAPS = {"wifi_control": MANAGED, "ble_proxy": MANAGED,
              "privacy_mute": "mute not supported on this device yet"}
 # The Kiosk Satellite plugin needs Android 11, which a Fire OS Show lacks.
 FIREOS_SHOW_GAPS = {**SHOW_GAPS, "leds": RING, "led_anim": RING, "buttons": BUTTON,
-                    "button_hold": BUTTON, "turn_view_v1": LINEAGE_ONLY, "kiosk_plugin": LINEAGE_ONLY}
+                    "button_hold": BUTTON, "turn_view_v1": LINEAGE_ONLY, "timer_view_v1": LINEAGE_ONLY,
+                    "kiosk_plugin": LINEAGE_ONLY}
 DOT_GAPS = {"screen_wake": NO_SCREEN, "screen_overlay": NO_SCREEN, "turn_view_v1": NO_SCREEN,
-            "kiosk_plugin": NO_SCREEN}
+            "timer_view_v1": NO_SCREEN, "kiosk_plugin": NO_SCREEN}
 
 
 @pytest.mark.parametrize("platform, caps, gaps", [

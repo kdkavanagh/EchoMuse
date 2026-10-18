@@ -214,18 +214,22 @@ the screen at candidate open itself, so `screenWakeUrl` and
 `screenWakePassword` are unused there; the controller still sends them to
 every `screen_wake` device, which older LineageOS firmware needs. Whether the
 app is up right now is health in `stats.companion` (§4.8), not a capability.
-`turn_view_v1` and `kiosk_plugin`: announced statically by firmware on a
-LineageOS Show (`lineage18_crown`) only (`docs/echo-show-companion-plan.md`
-§11). `turn_view_v1`: the device accepts `turn.view` (§4.9) and relays it to
-its Kiosk Satellite plugin, which shows the turn full screen and hides it
-`config` `turnViewLinger` seconds after `done`; the controller sends
-`turn.view` and `turnViewLinger` to no other device. `kiosk_plugin`: the
+`turn_view_v1`, `timer_view_v1` and `kiosk_plugin`: announced statically by
+firmware on a LineageOS Show (`lineage18_crown`) only
+(`docs/echo-show-companion-plan.md` §11). `turn_view_v1`: the device accepts
+`turn.view` (§4.9) and relays it to its Kiosk Satellite plugin, which shows
+the turn full screen and hides it `config` `turnViewLinger` seconds after
+`done`; the controller sends `turn.view` and `turnViewLinger` to no other
+device. `timer_view_v1`: the device accepts `timer.view` (§4.10) and relays
+it to the same plugin, which draws each of the speaker's running timers as a
+progress ring over the kiosk's page; the controller sends `timer.view` to no
+other device. `kiosk_plugin`: the
 device installs and enables that plugin through Kiosk Satellite's remote API
 on `127.0.0.1:{kioskPort}` with the bearer token `kioskToken`, and reports it
 in `stats.companion.kiosk` (§4.8); the controller sends `kioskToken` and
 `kioskPort` to no other device. Absent on a LineageOS Show, each reads
-"firmware update available"; a Fire OS Show lacks both ("needs LineageOS on
-this Echo Show"), a Dot too ("no screen on this device").
+"firmware update available"; a Fire OS Show lacks all three ("needs LineageOS
+on this Echo Show"), a Dot too ("no screen on this device").
 `platform`: the system image the firmware runs on: `fireos6` (Echo Dot 2nd
 gen, Fire OS 6, Android 7.1.2 `biscuit_puffin`), `fireos6_crown` (Echo Show 8
 1st gen `crown`, Fire OS 6 with the full Android framework) or
@@ -677,6 +681,30 @@ way than completed (`no_input`, cancelled, an error) sends `done` with
 `answer` null. The firmware relays the body unchanged to the plugin and,
 when the session is lost before `done`, sends it a `done` of the last view
 itself.
+
+### 4.10 Timer view
+
+**`timer.view`** C→D, `generation` 0, only to a device announcing
+`timer_view_v1`; the device does not ack it:
+```json
+{"timers":[{"id":"<HA timer id>","name":"pasta"|null,"total_ms":300000,
+            "remaining_ms":123456,"active":true}]}
+```
+The speaker's Home Assistant timers (§10.8 of the architecture), the whole
+list every time. `name` is the name Home Assistant gave the timer, null for an
+unnamed one; `remaining_ms` is the time left when the message was sent;
+`active` is false while the timer is paused, its `remaining_ms` then frozen.
+Active timers come first, soonest first, then paused ones by time left; the
+plugin draws them in this order. A finished timer leaves the list: its ring is
+`alert.ring` (§4.7).
+Sent in the session's `session.hello` handling (always, an empty list
+included, so a previous session's timers are replaced), after each Home
+Assistant timer event for the speaker, and once a second while the speaker
+has any timer (including the tick that drops one never reported finished).
+The firmware relays the body to the plugin as a `timers` line, keeps the last
+one for the plugin's next hello, and on session loss sends and keeps an empty
+list. The plugin counts each timer down from the line's arrival, and drops
+them all when no line has arrived for 5 s or its link is lost.
 
 ## 5. Transport rules
 

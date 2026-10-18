@@ -142,13 +142,14 @@ func (missingAssets) Fetch(context.Context, string, int64, io.Writer) (int64, er
 	return 0, assets.ErrNotFound
 }
 
-// fakeCompanion records the zones, link statuses and turn views the
-// supervisor sets.
+// fakeCompanion records the zones, link statuses, turn views and timer
+// views the supervisor sets.
 type fakeCompanion struct {
 	mu       sync.Mutex
 	zones    []companion.Zone
 	statuses []companion.Status
 	views    []string // View bodies, "end" for each EndView
+	timers   []string // Timers bodies, "end" for each EndTimers
 }
 
 func (f *fakeCompanion) SetZone(z companion.Zone) {
@@ -172,6 +173,18 @@ func (f *fakeCompanion) View(body json.RawMessage) {
 func (f *fakeCompanion) EndView() {
 	f.mu.Lock()
 	f.views = append(f.views, "end")
+	f.mu.Unlock()
+}
+
+func (f *fakeCompanion) Timers(body json.RawMessage) {
+	f.mu.Lock()
+	f.timers = append(f.timers, string(body))
+	f.mu.Unlock()
+}
+
+func (f *fakeCompanion) EndTimers() {
+	f.mu.Lock()
+	f.timers = append(f.timers, "end")
 	f.mu.Unlock()
 }
 
@@ -1015,7 +1028,7 @@ func TestHelloCapabilities(t *testing.T) {
 			[]proto.Capability{"leds", "led_anim", "buttons", "button_hold", "wifi_control", "ble_proxy", "privacy_mute"}},
 		{"show", opts{crown: true}, proto.PlatformFireOS6Crown, []proto.Capability{"screen_wake"}},
 		{"lineage show", opts{crown: true, lineage: true}, proto.PlatformLineage18Crown,
-			[]proto.Capability{"leds", "led_anim", "buttons", "button_hold", "screen_wake", "screen_overlay", "turn_view_v1", "kiosk_plugin"}},
+			[]proto.Capability{"leds", "led_anim", "buttons", "button_hold", "screen_wake", "screen_overlay", "turn_view_v1", "timer_view_v1", "kiosk_plugin"}},
 	} {
 		h := newHarness(t, tc.o)
 		hello := h.s.Hello()
@@ -1130,6 +1143,29 @@ func TestTurnViewOnTurnViewPlatformsOnly(t *testing.T) {
 		h.comp.mu.Unlock()
 		if want := []string{string(body), "end"}; !slices.Equal(got, want) {
 			t.Fatalf("views %q, want %q", got, want)
+		}
+	}
+}
+
+// timer_view_v1: on the LineageOS Show each timer.view reaches the
+// companion unchanged, and a session loss clears its timers; the Dot and
+// the Fire OS Show, which have no companion, ignore it.
+func TestTimerViewOnTimerViewPlatformsOnly(t *testing.T) {
+	view := map[string]any{"timers": []map[string]any{{"id": "a", "name": nil, "total_ms": 300000, "remaining_ms": 123456, "active": true}}}
+	body, _ := json.Marshal(view)
+	for _, o := range []opts{{}, {crown: true}, {crown: true, lineage: true}} {
+		h := newHarness(t, o)
+		h.ready()
+		h.control(proto.TypeTimerView, 0, view)
+		h.s.Lost(client.LostTimeout)
+		if h.comp == nil {
+			continue // no companion: getting here without a nil call is the check
+		}
+		h.comp.mu.Lock()
+		got := slices.Clone(h.comp.timers)
+		h.comp.mu.Unlock()
+		if want := []string{string(body), "end"}; !slices.Equal(got, want) {
+			t.Fatalf("timers %q, want %q", got, want)
 		}
 	}
 }

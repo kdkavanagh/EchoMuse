@@ -3,6 +3,9 @@ package org.echomuse.companion;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -190,6 +193,40 @@ public final class Link {
         }
     }
 
+    /** One of the speaker's HA timers in the controller's timer.view. */
+    public static final class Timer {
+        /** HA's timer id. */
+        public final String id;
+        /** The name HA gave the timer, or null for none. */
+        public final String name;
+        public final long totalMs;
+        /** Remaining when the controller sent the list. */
+        public final long remainingMs;
+        /** False while paused: remainingMs is then frozen. */
+        public final boolean active;
+
+        public Timer(String id, String name, long totalMs, long remainingMs, boolean active) {
+            this.id = id;
+            this.name = name;
+            this.totalMs = totalMs;
+            this.remainingMs = remainingMs;
+            this.active = active;
+        }
+    }
+
+    /**
+     * The controller's timer.view, relayed whole by the firmware; never a
+     * delta. Active timers first, then paused ones, each soonest first.
+     */
+    public static final class Timers extends Message {
+        /** Unmodifiable; empty when the speaker has no timer. */
+        public final List<Timer> timers;
+
+        public Timers(List<Timer> timers) {
+            this.timers = Collections.unmodifiableList(new ArrayList<>(timers));
+        }
+    }
+
     /** The plugin's settings from the device config. */
     public static final class Config extends Message {
         /** How long a finished turn stays on screen, in seconds; 0 hides it at once. */
@@ -240,6 +277,8 @@ public final class Link {
             case "view":
                 return new View(string(m, "turn_id"), phase(string(m, "phase")), optString(m, "heard"),
                         optString(m, "answer"), bool(m, "final"), bool(m, "follow_up"));
+            case "timers":
+                return new Timers(timers(m.get("timers")));
             case "config": {
                 double linger = number(m, "turn_view_linger");
                 if (linger < 0) {
@@ -345,6 +384,27 @@ public final class Link {
             }
         }
         throw new ProtocolException("view: unknown phase " + wire);
+    }
+
+    private static List<Timer> timers(Object v) throws ProtocolException {
+        if (!(v instanceof List)) {
+            throw new ProtocolException("timers: timers is not an array");
+        }
+        List<Timer> out = new ArrayList<>();
+        for (Object o : (List<?>) v) {
+            if (!(o instanceof Map)) {
+                throw new ProtocolException("timers: a timer is not an object");
+            }
+            @SuppressWarnings("unchecked")
+            Map<String, Object> t = (Map<String, Object>) o;
+            long total = integer(t, "total_ms");
+            long remaining = integer(t, "remaining_ms");
+            if (total < 0 || remaining < 0) {
+                throw new ProtocolException("timers: total_ms or remaining_ms is negative");
+            }
+            out.add(new Timer(string(t, "id"), optString(t, "name"), total, remaining, bool(t, "active")));
+        }
+        return out;
     }
 
     private static String string(Map<String, Object> m, String key) throws ProtocolException {

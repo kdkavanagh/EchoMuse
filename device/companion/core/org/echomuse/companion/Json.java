@@ -14,7 +14,7 @@ final class Json {
     /** A present JSON null, distinct from an absent key. */
     static final Object NULL = new Object();
 
-    /** The link's objects are flat; this leaves room for future fields. */
+    /** The deepest link line, timers, nests objects in an array; this leaves room. */
     private static final int MAX_DEPTH = 16;
 
     static final class SyntaxException extends Exception {

@@ -44,6 +44,8 @@ public final class LinkTest {
         run("decode screen", LinkTest::decodeScreen);
         run("decode view", LinkTest::decodeView);
         run("decode view rejects bad fields", LinkTest::decodeViewBad);
+        run("decode timers", LinkTest::decodeTimers);
+        run("decode timers rejects bad fields", LinkTest::decodeTimersBad);
         run("decode config", LinkTest::decodeConfig);
         run("unknown type is ignored", LinkTest::unknownType);
         run("malformed lines are protocol errors", LinkTest::malformed);
@@ -254,6 +256,50 @@ public final class LinkTest {
         protocolError("{\"t\":\"view\",\"turn_id\":\"" + TURN + "\",\"phase\":\"done\",\"heard\":null,\"answer\":[],\"final\":false,\"follow_up\":false}");
         protocolError("{\"t\":\"view\",\"turn_id\":\"" + TURN + "\",\"phase\":\"done\",\"heard\":null,\"answer\":null,\"follow_up\":false}");
         protocolError("{\"t\":\"view\",\"turn_id\":\"" + TURN + "\",\"phase\":\"done\",\"heard\":null,\"answer\":null,\"final\":false,\"follow_up\":null}");
+    }
+
+    private static void decodeTimers() throws Exception {
+        Link.Timers t = (Link.Timers) Link.decode("{\"t\":\"timers\",\"timers\":["
+                + "{\"id\":\"01J8A\",\"name\":\"pasta\",\"total_ms\":300000,\"remaining_ms\":123456,\"active\":true},"
+                + "{\"id\":\"01J8B\",\"name\":null,\"total_ms\":60000,\"remaining_ms\":0,\"active\":false}]}");
+        eq(2, t.timers.size());
+        Link.Timer a = t.timers.get(0);
+        eq("01J8A", a.id);
+        eq("pasta", a.name);
+        eq(300000L, a.totalMs);
+        eq(123456L, a.remainingMs);
+        check(a.active, "active");
+        // An unnamed timer has no name, not "timer".
+        Link.Timer b = t.timers.get(1);
+        eq(null, b.name);
+        eq(0L, b.remainingMs);
+        check(!b.active, "paused");
+        try {
+            t.timers.clear();
+            check(false, "timers is unmodifiable");
+        } catch (UnsupportedOperationException expected) {
+            // ok
+        }
+        // An absent name reads as null; no timers is an empty list.
+        t = (Link.Timers) Link.decode("{\"t\":\"timers\",\"timers\":[{\"id\":\"x\",\"total_ms\":1,\"remaining_ms\":1,\"active\":true}]}");
+        eq(null, t.timers.get(0).name);
+        t = (Link.Timers) Link.decode("{\"t\":\"timers\",\"timers\":[]}");
+        check(t.timers.isEmpty(), "empty list");
+    }
+
+    private static void decodeTimersBad() {
+        protocolError("{\"t\":\"timers\"}");
+        protocolError("{\"t\":\"timers\",\"timers\":null}");
+        protocolError("{\"t\":\"timers\",\"timers\":{}}");
+        protocolError("{\"t\":\"timers\",\"timers\":[5]}");
+        String id = "{\"id\":\"x\",\"name\":null,";
+        protocolError("{\"t\":\"timers\",\"timers\":[" + id + "\"total_ms\":60000,\"remaining_ms\":-1,\"active\":true}]}");
+        protocolError("{\"t\":\"timers\",\"timers\":[" + id + "\"total_ms\":-1,\"remaining_ms\":0,\"active\":true}]}");
+        protocolError("{\"t\":\"timers\",\"timers\":[" + id + "\"total_ms\":60000,\"remaining_ms\":1.5,\"active\":true}]}");
+        protocolError("{\"t\":\"timers\",\"timers\":[" + id + "\"total_ms\":60000,\"remaining_ms\":0}]}");
+        protocolError("{\"t\":\"timers\",\"timers\":[" + id + "\"total_ms\":60000,\"remaining_ms\":0,\"active\":null}]}");
+        protocolError("{\"t\":\"timers\",\"timers\":[{\"name\":null,\"total_ms\":60000,\"remaining_ms\":0,\"active\":true}]}");
+        protocolError("{\"t\":\"timers\",\"timers\":[{\"id\":\"x\",\"name\":5,\"total_ms\":60000,\"remaining_ms\":0,\"active\":true}]}");
     }
 
     private static void decodeConfig() throws Exception {

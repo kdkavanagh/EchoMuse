@@ -112,6 +112,10 @@ const (
 	// through its Kiosk Satellite plugin, honouring config turnViewLinger
 	// (the LineageOS Show; docs/echo-show-companion-plan.md §11).
 	CapTurnView Capability = "turn_view_v1"
+	// CapTimerView: the device accepts timer.view and relays it to its
+	// Kiosk Satellite plugin, which draws each running timer as a progress
+	// ring over the page (the LineageOS Show).
+	CapTimerView Capability = "timer_view_v1"
 	// CapKioskPlugin: the device installs and enables that plugin through
 	// Kiosk Satellite's remote API with config kioskToken and kioskPort,
 	// and reports it in stats.companion.kiosk (the LineageOS Show).
@@ -191,6 +195,11 @@ const (
 	// current turn (turn_view_v1), which the firmware relays unchanged to
 	// its Kiosk Satellite plugin.
 	TypeTurnView MessageType = "turn.view"
+
+	// TypeTimerView is C→D, generation 0, never acked: the whole list of
+	// the speaker's timers (timer_view_v1), which the firmware relays
+	// unchanged to its Kiosk Satellite plugin.
+	TypeTimerView MessageType = "timer.view"
 
 	// Retained messages (WIRE §4.8): legacy bodies inside the envelope.
 	TypeLEDs         MessageType = "leds"

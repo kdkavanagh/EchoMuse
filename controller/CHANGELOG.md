@@ -965,6 +965,27 @@ in grey, the answer in large text as it streams
   "firmware update available" for both; a Fire OS Show "needs LineageOS on
   this Echo Show"; a Dot "no screen on this device".
 
+### Echo Show 8 on LineageOS: timers on screen
+
+With Kiosk Satellite as the kiosk, each running timer of the speaker is drawn
+over the page as a ring that empties as time runs out, with the time left in
+the middle (docs/echo-show-companion-plan.md §11.10).
+
+- **`timer.view` (device protocol §4.10).** The alert engine sends a device
+  announcing the new `timer_view_v1` the whole list of its Home Assistant
+  timers (name, total, time left, paused or not) at connect, on every timer
+  event and once a second while one runs. An unnamed timer is sent without a
+  name, so its ring shows only the time; the dashboard still calls it
+  "timer".
+- **The rings.** Top right, up to four, the soonest nearest the corner; with
+  more than four the last ring counts the rest as `+N`. A paused timer is
+  drawn grey. They count down on the Show between messages, hide while the
+  turn view is up, and clear when the controller goes quiet for 5 s or its
+  session is lost.
+- **Capabilities.** A LineageOS Show on older firmware reads "firmware update
+  available"; a Fire OS Show "needs LineageOS on this Echo Show"; a Dot "no
+  screen on this device".
+
 ### Earlier in this release
 
 - ASR gain: the STT copy sent to Home Assistant is amplified by
