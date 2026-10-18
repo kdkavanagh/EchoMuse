@@ -1,6 +1,6 @@
 # Echo Show 8 on LineageOS: companion app plan
 
-**Status:** proposed 2026-10-17; Phases C1–C5 implemented 2026-10-17, ahead of C0. C0 and C6 need the unit and are open (§10). The Kiosk Satellite plugin and turn view (§11) are proposed 2026-10-18; nothing of them is built.
+**Status:** proposed 2026-10-17; Phases C1–C5 implemented 2026-10-17, ahead of C0. C0 and C6 need the unit and are open (§10). The Kiosk Satellite plugin and turn view (§11) were proposed 2026-10-18; its probe, Phase K0, was measured the same day (findings §8.7), and K1–K5 are being implemented.
 **Evidence:** [echo-show-crown.md](echo-show-crown.md) (written "findings §N") and the code cited inline. The platform this extends is [echo-show-lineage-plan.md](echo-show-lineage-plan.md), written "LineageOS plan".
 **Goal:** a LineageOS Show shows what the Dot's ring shows (wake, listening, thinking, speaking, timers, link state, alerts) as a light bar on screen. Touch takes the place of the action button. The app is installed by adoption and kept current by every firmware update, rollback and auto-rollback, with no separate delivery path.
 
@@ -241,7 +241,7 @@ Where the build differs from the text above:
 
 ## 11. Kiosk Satellite plugin and turn view (proposed 2026-10-18)
 
-**Goal:** on a Show whose kiosk is Kiosk Satellite (`me.jxl.kiosk_satellite`), every EchoMuse turn shows a full-screen view modelled on Kiosk Satellite's own voice overlay ([reference](https://kiosksatellite.com/img/voice.jpg)): the request as transcribed, in grey, and the answer in large text below it. The view draws over the dashboard and the screensaver. The firmware installs the plugin and keeps it current through Kiosk Satellite's remote API. The dashboard turns the Kiosk Satellite admin password into a token for that.
+**Goal:** on a Show whose kiosk is Kiosk Satellite (`me.jxl.kiosk_satellite`), every EchoMuse turn shows a full-screen view modelled on Kiosk Satellite's own voice overlay ([reference](https://kiosksatellite.com/img/voice.jpg)): the request as transcribed, in grey, and the answer in large text below it. The view draws over the dashboard and the screensaver, lifting a screensaver that has darkened the panel (decision 9). The firmware installs the plugin and keeps it current through Kiosk Satellite's remote API. The dashboard turns the Kiosk Satellite admin password into a token for that.
 **Evidence:** Kiosk Satellite at `28113b6` and its plugin SDK repository `kiosk-satellite-plugin-hello-world` at `233e739` (written "SDK `docs/…`").
 
 **Not in scope:**
@@ -259,7 +259,9 @@ Where the build differs from the text above:
 | Request text | `sent`: the text dispatched to HA, after transcript correction | `controller/em_session.py:2449` |
 | Answer text | `IntentEnded.speech` at `intent-end`; from `intent-progress` only `tts_start_streaming` is read, not `chat_log_delta` | `controller/em_ha_client.py:703-733` |
 | Local link | one connection, accepted only from the companion's uid; lines at most 4 KiB | `device/internal/companion/server.go:18-56` |
-| Plugin overlays | native Android views composited into Kiosk Satellite's screen; `onTop(true)` takes the voice overlay's slot, over the screensaver; covered by its notifications, intercom cards, announcements, the screensaver's black cover and Lockdown Mode | SDK `docs/overlays.md:3,164` |
+| Plugin overlays | native Android views composited into Kiosk Satellite's screen; `onTop(true)` takes the voice overlay's slot, over the screensaver. The SDK says its notifications, intercom cards, announcements, the screensaver's black cover and Lockdown Mode cover it; on the unit a notification drew under it | SDK `docs/overlays.md:3,164`; findings §8.7 |
+| Plugin threads | Kiosk Satellite runs StrictMode: socket I/O on the main thread throws, and an exception in a plugin callback disables the plugin | findings §8.7 |
+| Screensaver on the unit | mode `black`: its window sets `screenBrightness` 0.0 and the backlight sits at 1 of 255, so a view drawn over it is not visible. `stopScreensaver` restores the brightness within 0.3–0.8 s | findings §8.7 |
 | Plugin code | runs in Kiosk Satellite's process with its identity, unsandboxed; may open sockets | SDK `docs/installing-plugins.md:53`, `docs/creating-plugins.md:187` |
 | Plugin install | `POST /api/commands/installPlugin {data, trusted: true}` (ZIP up to 4 MB, base64). `listPlugins` returns each plugin's `sha256` (of the ZIP), `enabled` and `running`. A new plugin starts disabled; a replacement keeps the enabled state | SDK `docs/installing-plugins.md:41,61-86`; `PluginBridge.kt:593-599,698-747` |
 | Remote API auth | `POST /api/login {password, ttl_days}` returns a bearer token valid up to 3650 days. Tokens are stateless, so a password change does not revoke them. The server runs only with Remote Administration on and a password set, on port 2324 unless changed; `GET /api/health` needs no token | `docs/remote-api.md:3,16-17,83-98` |
@@ -313,9 +315,11 @@ Where the build differs from the text above:
      - a near-opaque backdrop in `KsTheme`'s `surface` colour; there is no blur, because `RenderEffect` needs API 31;
      - `heard` in `onSurfaceVariant`, 28 sp;
      - three pulsing dots while `thinking`;
-     - `answer` in `onSurface`, 34 sp, Rubik (`KsTheme.typeface`), scrolling up as it grows past its area;
+     - `answer` in `onSurface`, 34 sp, Rubik (`KsTheme.typeface`), scrolling up as it grows past its area. On the unit a scroll ran at about 35 fps on its 54 Hz panel (findings §8.7);
      - a soft glow along the bottom in the colours of the firmware's latest `frame`.
    - **When it shows:** from `listening` until `done`, plus `turnViewLinger` seconds (config, default 6; 0 hides at once). A new turn replaces it; `follow_up` keeps it up into the next `listening`.
+   - **A darkened screensaver is lifted.** The unit's `black` screensaver holds the panel at backlight 1 of 255, so drawing over it shows nothing (findings §8.7). At `listening`, if Kiosk Satellite's screensaver is active, the plugin calls `stopScreensaver` (`host.control`). It tracks the screensaver with the `screensaver.state` event and `isScreensaverActive` (`host.read`). A screensaver that leaves the panel lit is dismissed the same way: the plugin cannot read whether it is lit, only the brightness Kiosk Satellite reports, and one rule is simpler than two.
+   - **Threads.** All link I/O runs on the plugin's own threads; the main thread only posts to a writer queue (StrictMode, findings §8.7).
 10. **One bar on screen.** The app keeps the bar and its touch zones. Its `TYPE_APPLICATION_OVERLAY` window sits above Kiosk Satellite's window, so the bar draws over the bottom edge of the view, and the view leaves that edge to it. The view takes no touches.
 
 ### 11.3 Local link, version 2
@@ -332,10 +336,10 @@ These are added to §3. The app's `hello` gains `role: "app"` and `link: 2`. The
 ### 11.4 Build
 
 - `device/companion/ksplugin/`:
-  - `kiosk-satellite-plugin.json`: `schemaVersion: 1`, `apiVersion: 1`, `id: "echomuse"`, `minAndroidSdk: 30`, `entryClass: org.echomuse.ksplugin.EchoMusePlugin`, `capabilities: ["overlay"]`;
+  - `kiosk-satellite-plugin.json`: `schemaVersion: 1`, `apiVersion: 1`, `id: "echomuse"`, `name`, `version`, `minAndroidSdk: 30`, `entryClass: org.echomuse.ksplugin.EchoMusePlugin`, `description`, `author`, `capabilities: ["overlay", "host.read", "host.control"]`;
   - the Java sources, reusing the link codec in `device/companion/core`;
   - a `LICENSE` file: Kiosk Satellite's installer rejects a ZIP without one (SDK `docs/installing-plugins.md:41`). Internal use only, so it is a one-line placeholder.
-- The SDK interfaces: the six files under `me/jxl/kiosk/plugins/`, vendored in `device/companion/kssdk/` with the source commit. They are compile-time only and never packaged (SDK `docs/creating-plugins.md:76`).
+- The SDK interfaces: the five files under `me/jxl/kiosk/plugins/` (`KioskPlugin`, `KsTheme`, `OverlayFactory`, `OverlaySpec`, `PluginHost`), vendored in `device/companion/kssdk/` with the source commit. They are compile-time only and never packaged (SDK `docs/creating-plugins.md:76`).
 - In the `companion` stage:
   1. `javac` against `android.jar` and the SDK;
   2. the plugin's tests on the JDK;
@@ -346,15 +350,15 @@ These are added to §3. The app's `hello` gains `role: "app"` and `link: 2`. The
 
 ### 11.5 Phases
 
-#### Phase K0: Probe on the unit (throwaway code; findings only)
+#### Phase K0: Probe on the unit (done 2026-10-18; findings §8.7)
 
-1. With Remote Administration on, from the init-started `su` context: `login`, `listPlugins`, `installPlugin` of a small ZIP, `enablePlugin`.
-2. A throwaway plugin connects to a `su` loopback listener, and its `/proc/net/tcp{,6}` row carries Kiosk Satellite's uid.
-3. An `onTop(true)`, `touchable(false)` overlay over the dashboard and over the screensaver: touches pass through, and what covers it is as SDK `docs/overlays.md:164` says.
-4. On the long-lived view: the time from a content change to pixels, and the frame rate while a long answer scrolls.
-5. The app's bar drawing over the plugin view (decision 10).
+1. **Install over the remote API from `u:r:su:s0`:** `login`, `listPlugins`, `installPlugin` (1.07 s), `setPluginsEnabled`, `enablePlugin` all worked. `listPlugins` `sha256` is the ZIP's own hash, which decision 2 compares.
+2. **Loopback link:** the plugin's socket is an IPv4-mapped `tcp6` row with uid 10148, the owner of `/data/data/me.jxl.kiosk_satellite`.
+3. **Placement:** the overlay drew over the dashboard and the screensaver, a Kiosk Satellite notification drew under it, and a tap went through it to Kiosk Satellite. The screensaver's zero brightness changed decision 9.
+4. **Speed:** from receipt on the link to the presented frame, median 44 ms, p90 55 ms, maximum 62 ms (n = 20). A long answer scrolled at about 35 fps.
+5. **Bar:** the app's bar layer composites above Kiosk Satellite's (decision 10 holds).
 
-**Acceptance:** findings §8.x with numbers. A failure of 1, 2 or 3 sends decisions 1–9 back for review.
+Not measured: Lockdown Mode and the `screen_off_black` cover over the view. Neither is on for this unit.
 
 #### Phase K1: Plugin
 
@@ -415,7 +419,7 @@ These are added to §3. The app's `hello` gains `role: "app"` and `link: 2`. The
 
 - Adoption with Kiosk Satellite installed: the prompt, then the plugin installed, enabled and linked.
 - A spoken turn shows the listening view, the request, the thinking dots and the answer as it streams. The view then stays for 6 s and hides.
-- The same over the screensaver.
+- A wake during the `black` screensaver lifts it: the view is visible within a second of the wake.
 - A long answer scrolls.
 - A follow-up keeps the view up.
 - `no_input` hides it after listening.
@@ -434,9 +438,9 @@ These are added to §3. The app's `hello` gains `role: "app"` and `link: 2`. The
 | Turning the master switch on also resumes other enabled plugins | done only when it is off, and reported in health |
 | Kiosk Satellite changes its plugin SDK | `apiVersion 1` is its published contract; an `installPlugin` refusal reaches health with Kiosk Satellite's message |
 
-### 11.7 Open questions
+### 11.7 Open questions (resolved 2026-10-18)
 
-1. The `turnViewLinger` default: 6 s proposed.
+1. The `turnViewLinger` default: **6 s**, configurable per device.
 
 ### 11.8 Later candidates
 

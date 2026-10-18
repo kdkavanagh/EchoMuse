@@ -447,6 +447,41 @@ Same unit, now on our fork (`18.1-20261017-UNOFFICIAL-crown`, `/system/lib/libas
 
 **Boot hook and a LineageOS update.** The wizard's `install_boot_hook` and `install_em` commands, run by hand over adb with its payloads (`/system/etc/init/echomuse.rc`, `user root`, `group root audio inet`, `seclabel u:r:su:s0`; `/system/addon.d/50-echomuse.sh`, LineageOS's own `50-lineage.sh` with the `.rc` as its only file): after `adb reboot` init started `start_server.sh` 26 s after boot, the server ran in `u:r:su:s0` and opened both AAudio streams. Then a dirty flash of the same zip in TWRP (`twrp install`, 105 s): the `.rc` and the addon.d script came back with the flash's timestamps, and the service was running 26 s into the next boot with the same platform, volume and AFE lines, without the wizard. The flash also dropped the TWRP-seeded `persist.sys.usb.config=adb`, `service.adb.root=1` and `/adb_keys` (§8.5), so adb stayed off until USB debugging and Rooted debugging were enabled on screen; `adb root` then answered `restarting adbd as root` and the reconnected shell was uid 0.
 
+### 8.7 Kiosk Satellite plugin probe (measured 2026-10-18)
+
+Same unit on `18.1-20261017-UNOFFICIAL-crown`, firmware `fw-b063e8ba4d8d` running with the companion app `cmp-21feee8e74c9` linked, and Kiosk Satellite `2026.10.28` (uid 10148) in front. Kiosk Satellite's Remote Administration was on, port 2324. Everything ran over `adb root` (uid 0, `u:r:su:s0`, the firmware's domain) with the device's `/system/bin/curl`. This is Phase K0 of [echo-show-companion-plan.md](echo-show-companion-plan.md) §11.
+
+**Probe.** A throwaway SDK 1 plugin (`echomuse-probe`, 7 KB ZIP: manifest, `plugin.jar` with `classes.dex`, `LICENSE`), built in the `companion` image's toolchain (`javac --release 8` against `android.jar` and the SDK interfaces, `d8 --min-api 30`). It shows one `OverlaySpec.fullScreen().onTop(true).touchable(false)` overlay and connects to a `toybox nc` listener on `127.0.0.1:8772` in `u:r:su:s0`. Each command it reads over that link changes the view, and it reports `System.nanoTime()` at receipt and at the end of the next `onDraw`. It was removed afterwards, and Kiosk Satellite's master plugin switch was put back off, as found.
+
+**Install over the remote API** (`POST /api/login {password}`, then `/api/commands/<name>` with the bearer token):
+- Before: `getPluginState` read `{"enabled": false, "plugins": []}`.
+- `installPlugin {data: <base64 ZIP>, trusted: true}` took 1.07 s and returned the record disabled. `setPluginsEnabled {enabled: true}` took 56 ms; `enablePlugin` took 90 ms and returned `running: true`.
+- A replacement `installPlugin` of the same id kept its enabled state.
+- `listPlugins` `sha256` equals `sha256sum` of the ZIP (`daeaf968…`).
+- **Kiosk Satellite runs StrictMode.** The first build wrote to its socket from the overlay factory's `create`, on the main thread. Kiosk Satellite disabled the plugin with `error: "NetworkOnMainThreadException"`. All link I/O has to stay off the main thread.
+
+**Loopback link.** The plugin's socket is an IPv4-mapped `tcp6` row (`::ffff:127.0.0.1`) owned by uid 10148, the owner of `/data/data/me.jxl.kiosk_satellite`. The listener's own row is uid 0. The plugin reported `uid=10148`.
+
+**Placement:**
+- The overlay drew over the dashboard and over Kiosk Satellite's screensaver.
+- A Kiosk Satellite notification (`showNotification`) drew under it, not over it as SDK `docs/overlays.md:164` says.
+- `KsTheme.typeface(400)` (Rubik) rendered.
+- `input tap` on the centre went through the `touchable(false)` overlay to Kiosk Satellite: the tap dismissed the screensaver, and the view saw no touch.
+
+**The screensaver darkens the panel.**
+- Kiosk Satellite's settings: `screensaver.mode` `black`, `timeout_seconds` 60, `brightness_enabled` true, `brightness_level` 0.2, `screen_off_black` false.
+- While the screensaver is up, its window carries `screenBrightness` 0.0 (`dumpsys window`: `sbrt=0.0`), `getBrightness {panel: true}` reads 0.0, and `/sys/class/leds/lcd-backlight/brightness` reads 1 of 255. So a view drawn over the screensaver is composited but not visible.
+- `stopScreensaver` over the remote API brought the backlight to 102 (window `sbrt` 0.398) between about 0.3 and 0.8 s after the call, curl's start included.
+- A tap ramped it 55 → 102 within about 150 ms.
+
+**Latency and frame rate,** on the `me.jxl.kiosk_satellite/…MainActivity#0` buffer layer's `dumpsys SurfaceFlinger --latency`:
+- Refresh period 18.48 ms (54.1 Hz).
+- Kiosk Satellite renders on demand: each change produced two frames.
+- Over 20 full-screen colour changes, from receipt on the link to the first frame presented after `onDraw`: median 44.1 ms, p90 55.0 ms, maximum 62.4 ms. Receipt to the end of `onDraw` took a median of 9.1 ms (maximum 19.9 ms).
+- A 5 s scroll of a long answer at 120 px/s: 173 draws (34.4/s). SurfaceFlinger presented 35.4 fps, with a median interval of 18.9 ms and 2 of 83 intervals over 40 ms (maximum 73.9 ms).
+
+**The companion bar is above the view.** `dumpsys SurfaceFlinger`'s HWC list, bottom to top: the SurfaceView background, Kiosk Satellite's buffer layer (Flutter and the plugin view), then `EchoMuse bar#0` (window type 2038, `TYPE_APPLICATION_OVERLAY`, 11 px at the bottom edge). In `dumpsys window` the bar is window #3 and Kiosk Satellite's activity #6.
+
 ## 9. Alexa takeover surface: what to hide
 
 The list comes from `dumpsys package` (granted permissions, persistent and privileged flags), `cmd package query-receivers -a BOOT_COMPLETED`/`LOCKED_BOOT_COMPLETED`, `cmd package query-activities -c HOME`, and init service state. Roles marked [INFERENCE] come from package names, not behaviour. Tier 1 was applied on 2026-10-17 and corrected by what it broke; §9.5 has the measurements. Tier 2 has not been applied.
