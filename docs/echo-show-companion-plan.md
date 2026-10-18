@@ -1,12 +1,12 @@
 # Echo Show 8 on LineageOS: companion app plan
 
-**Status:** proposed 2026-10-17; Phases C1–C5 implemented 2026-10-17, ahead of C0. C0 and C6 need the unit and are open (§10).
+**Status:** proposed 2026-10-17; Phases C1–C5 implemented 2026-10-17, ahead of C0. C0 and C6 need the unit and are open (§10). The Kiosk Satellite plugin and turn view (§11) are proposed 2026-10-18; nothing of them is built.
 **Evidence:** [echo-show-crown.md](echo-show-crown.md) (written "findings §N") and the code cited inline. The platform this extends is [echo-show-lineage-plan.md](echo-show-lineage-plan.md), written "LineageOS plan".
 **Goal:** a LineageOS Show shows what the Dot's ring shows (wake, listening, thinking, speaking, timers, link state, alerts) as a light bar on screen. Touch takes the place of the action button. The app is installed by adoption and kept current by every firmware update, rollback and auto-rollback, with no separate delivery path.
 
 **Not in scope:**
 - Fire OS crown. It keeps Fully's REST screen wake (`internal/kiosk`) and gets no app.
-- Volume through `AudioManager`, a Bluetooth proxy through `BluetoothLeScanner`, captions and named timer countdowns. These are later candidates that build on this link (§8).
+- Volume through `AudioManager`, a Bluetooth proxy through `BluetoothLeScanner` and named timer countdowns. These are later candidates that build on this link (§8). The request and answer text are §11.
 - Mute. It stays LineageOS plan scope: `privacy_mute` is not announced.
 - Tap-to-talk while idle (open question 3).
 - The camera.
@@ -205,7 +205,7 @@ The unit (`G6G16D12143203LD`, pending approval on the LAN controller since 2026-
 |---|---|---|
 | Volume through `AudioManager` | `androidvol`'s pinned `service call audio` codes and the `settings_system.xml` mtime watch | a cutover decision: volume would depend on the app being up |
 | BLE proxy through `BluetoothLeScanner` | the Show's `ble_proxy` gap ("managed by the device") | a probe: raw advert bytes and address type from the public API on API 30, scan throttling, location permission |
-| Captions and named timer countdowns | the bar's fill fraction | a new controller → device message and capability |
+| Named timer countdowns | the bar's fill fraction | the timer names and remaining time in a controller → device message |
 
 ## 9. Rejected alternatives
 
@@ -214,7 +214,7 @@ The unit (`G6G16D12143203LD`, pending approval on the LAN controller since 2026-
 - **Unix socket.** It works on LineageOS's permissive policy, but would need policy for any enforcing build. TCP needs nothing.
 - **`am broadcast` per update.** It starts a Java process per call: fine for starting the app, far too slow for frames.
 - **Hidden `SurfaceControl` from an `app_process` helper** (no install). It relies on private APIs.
-- **An HA dashboard card.** The HA satellite entities never leave `idle`, because the controller runs `assist_pipeline/run` directly (`em_ha_client.py:1146,1191`). It would also show nothing offline or over other pages.
+- **An HA dashboard card.** HA's `assist_satellite` entities stay `idle`, because the controller runs `assist_pipeline/run` directly (`em_ha_client.py:1146,1191`). `sensor.<name>_voice_state` does follow the turn, but no entity carries the request or answer text, and a card shows nothing offline or over other pages.
 
 ## 10. Status (2026-10-17)
 
@@ -238,3 +238,212 @@ Where the build differs from the text above:
 - **Installer pacing.** Attempts at least 10 s apart, the gap doubling per consecutive failure up to 5 min, plus the 30 s link-down recheck of decision 5.
 - **`status` reasons.** `up`: none; `pending`: `pending_approval`; `down`: `starting` (controller null), `closed`, `session_lost`, `protocol`, `unauthorized`. The controller is the host:port actually dialled, and the last one reached is kept while down. `client.Handler.Rejected` gained the controller address for this.
 - **SDK levels** come from the manifest's `<uses-sdk>` alone, not also from `aapt2 link` flags.
+
+## 11. Kiosk Satellite plugin and turn view (proposed 2026-10-18)
+
+**Goal:** on a Show whose kiosk is Kiosk Satellite (`me.jxl.kiosk_satellite`), every EchoMuse turn shows a full-screen view modelled on Kiosk Satellite's own voice overlay ([reference](https://kiosksatellite.com/img/voice.jpg)): the request as transcribed, in grey, and the answer in large text below it. The view draws over the dashboard and the screensaver. The firmware installs the plugin and keeps it current through Kiosk Satellite's remote API. The dashboard turns the Kiosk Satellite admin password into a token for that.
+**Evidence:** Kiosk Satellite at `28113b6` and its plugin SDK repository `kiosk-satellite-plugin-hello-world` at `233e739` (written "SDK `docs/…`").
+
+**Not in scope:**
+- Tool-call lines ("Get weather forecast") and result panels (the weather card). Both come from HA's chat log; see §11.8.
+- Live partial transcripts while listening. The session has no partial text, so the request appears when STT ends.
+- Announcement, timer and alarm text in the view.
+- Kiosk Satellite's skins. They are application code, which `PLUGIN-EXCEPTION.md` does not let a plugin copy; the view is our own drawing.
+- Kiosks other than Kiosk Satellite, and Fire OS crown.
+
+### 11.1 Starting point
+
+| Area | Today | Source |
+|---|---|---|
+| Turn text on the device | none: the device link carries no transcript or answer | `docs/protocol-v1.md` |
+| Request text | `sent`: the text dispatched to HA, after transcript correction | `controller/em_session.py:2449` |
+| Answer text | `IntentEnded.speech` at `intent-end`; from `intent-progress` only `tts_start_streaming` is read, not `chat_log_delta` | `controller/em_ha_client.py:703-733` |
+| Local link | one connection, accepted only from the companion's uid; lines at most 4 KiB | `device/internal/companion/server.go:18-56` |
+| Plugin overlays | native Android views composited into Kiosk Satellite's screen; `onTop(true)` takes the voice overlay's slot, over the screensaver; covered by its notifications, intercom cards, announcements, the screensaver's black cover and Lockdown Mode | SDK `docs/overlays.md:3,164` |
+| Plugin code | runs in Kiosk Satellite's process with its identity, unsandboxed; may open sockets | SDK `docs/installing-plugins.md:53`, `docs/creating-plugins.md:187` |
+| Plugin install | `POST /api/commands/installPlugin {data, trusted: true}` (ZIP up to 4 MB, base64). `listPlugins` returns each plugin's `sha256` (of the ZIP), `enabled` and `running`. A new plugin starts disabled; a replacement keeps the enabled state | SDK `docs/installing-plugins.md:41,61-86`; `PluginBridge.kt:593-599,698-747` |
+| Remote API auth | `POST /api/login {password, ttl_days}` returns a bearer token valid up to 3650 days. Tokens are stateless, so a password change does not revoke them. The server runs only with Remote Administration on and a password set, on port 2324 unless changed; `GET /api/health` needs no token | `docs/remote-api.md:3,16-17,83-98` |
+
+### 11.2 Decisions
+
+1. **The plugin ships inside the firmware**, as the APK does (decision 1). `internal/companion` embeds `ksplugin.zip`, built from `device/companion/ksplugin/` in the `companion` stage, and the firmware installs it. Every update, rollback and auto-rollback carries the matching plugin. Its manifest version is `1.0.0-<hash>`, with the `cmp-` hash: Kiosk Satellite requires `major.minor.patch[-suffix]` (`PluginManifest.kt:13-14`).
+2. **Install by hash.** On `127.0.0.1:<kioskPort>`, the firmware runs `listPlugins` and compares the `echomuse` record's `sha256` with the embedded ZIP's.
+   - A missing record or a different hash: `installPlugin`.
+   - Then `getPluginState`. If the master switch is off: `setPluginsEnabled {enabled: true}`, recorded in health, since it also resumes other plugins already enabled. If the record is disabled: `enablePlugin {id: "echomuse"}`.
+   - It runs at firmware start, when the token changes and when the plugin has been unlinked for 30 s, paced as decision 5. Failures go to health only; nothing here ends the server.
+3. **The token, never the password.**
+   - The dashboard asks for the Kiosk Satellite admin password. The controller logs in at `http://<device ip>:<kioskPort>/api/login` with `ttl_days: 3650`, so a wrong password is reported at once.
+   - Only the token is kept, in the device config (`kioskToken`; `kioskPort`, default 2324), and pushed to devices announcing `kiosk_plugin` (decision 7).
+   - The API reports the token to the dashboard only as set or unset.
+   - A 401 from any call is reported in health as `token_rejected`, and the dashboard asks again.
+4. **When the dashboard asks.** Every prompt can be skipped: the bar works without the plugin.
+   - In the LineageOS wizard's new step `kiosk_plugin`, after `verify_companion`, when the device reports Kiosk Satellite installed.
+   - Before a firmware update or queued update to such a device that has no token, or whose health reads `token_rejected`.
+   - From the Screen section at any time.
+5. **Detection.** `stats.companion.kiosk`, each field null when unknown:
+   - `installed`: the package is present;
+   - `version`: its `versionName`;
+   - `remote_admin`: `GET /api/health` answers;
+   - `plugin`: `version`, `linked`, `error`.
+6. **One link, two roles.** Link version 2.
+   - `hello` carries `role: "app" | "plugin"`. Role `app` is accepted only from the companion's uid, role `plugin` only from Kiosk Satellite's (the owner of `/data/data/me.jxl.kiosk_satellite`).
+   - One connection per role; a new one replaces the old.
+   - Lines may be up to 128 KiB.
+7. **Capabilities.** `turn_view_v1`: the device accepts `turn.view`. `kiosk_plugin`: the device installs the plugin and takes `kioskToken` and `kioskPort`. The controller sends each only to devices announcing it, and the LineageOS firmware announces both.
+8. **`turn.view`**, a new controller → device message that the firmware relays unchanged to the plugin as `view`. The controller sends the whole view every time, never a delta, so a lost message costs nothing.
+
+   | Field | Value |
+   |---|---|
+   | `turn_id` | the turn |
+   | `phase` | `listening` \| `thinking` \| `answering` \| `done` |
+   | `heard` | `sent`, or the text as heard for a local route; null until STT ends |
+   | `answer` | the answer so far; null until the first text. At most 16 KiB UTF-8, cut at a word with "…" |
+   | `final` | true once `intent-end` has replaced the streamed text with the final speech |
+   | `follow_up` | `continue_conversation` |
+
+   When it is sent:
+   - at the turn's `dialog_input` start (`listening`);
+   - at dispatch (`thinking`, with `heard`);
+   - on each `chat_log_delta`, at most 10 per second with the latest winning (`answering`);
+   - at `intent-end` (`final`);
+   - at the end of the reply's playback, or of a turn with no reply (`done`). A turn ending `no_input`, cancelled or in error sends `done` with no answer.
+9. **The view.**
+   - **One long-lived overlay**, `OverlaySpec.fullScreen().onTop(true).touchable(false)`, created when the plugin starts. A turn changes its contents' visibility; a turn never calls `showOverlay`, since creating an overlay can take a second or more on a slow panel (SDK `docs/overlays.md:40`).
+   - **Layout, after the reference:**
+     - a near-opaque backdrop in `KsTheme`'s `surface` colour; there is no blur, because `RenderEffect` needs API 31;
+     - `heard` in `onSurfaceVariant`, 28 sp;
+     - three pulsing dots while `thinking`;
+     - `answer` in `onSurface`, 34 sp, Rubik (`KsTheme.typeface`), scrolling up as it grows past its area;
+     - a soft glow along the bottom in the colours of the firmware's latest `frame`.
+   - **When it shows:** from `listening` until `done`, plus `turnViewLinger` seconds (config, default 6; 0 hides at once). A new turn replaces it; `follow_up` keeps it up into the next `listening`.
+10. **One bar on screen.** The app keeps the bar and its touch zones. Its `TYPE_APPLICATION_OVERLAY` window sits above Kiosk Satellite's window, so the bar draws over the bottom edge of the view, and the view leaves that edge to it. The view takes no touches.
+11. **The plugin's `LICENSE`.** Kiosk Satellite requires one in the ZIP (SDK `docs/installing-plugins.md:41`), and the repository has no licence file. See §11.7.
+
+### 11.3 Local link, version 2
+
+These are added to §3. The app's `hello` gains `role: "app"` and `link: 2`. The app comes from the same build as the firmware, so the version bump costs nothing.
+
+| Direction | `t` | Body | When |
+|---|---|---|---|
+| plugin → fw | `hello` | `link: 2`, `role: "plugin"`, `plugin: "1.0.0-…"` | on connect |
+| fw → plugin | `hello` | `link: 2`, `firmware: "fw-…"`, `plugin: "1.0.0-…"` (the embedded one) | reply; on a mismatch both sides close and the firmware reinstalls the plugin (decision 2) |
+| fw → plugin | `frame` | as for the app | as for the app |
+| fw → plugin | `view` | the `turn.view` body | on every `turn.view`, and the last one after `hello` |
+
+### 11.4 Build
+
+- `device/companion/ksplugin/`:
+  - `kiosk-satellite-plugin.json`: `schemaVersion: 1`, `apiVersion: 1`, `id: "echomuse"`, `minAndroidSdk: 30`, `entryClass: org.echomuse.ksplugin.EchoMusePlugin`, `capabilities: ["overlay"]`;
+  - the Java sources, reusing the link codec in `device/companion/core`;
+  - `LICENSE`.
+- The SDK interfaces: the six Apache-2.0 files under `me/jxl/kiosk/plugins/`, vendored in `device/companion/kssdk/` with their `LICENSE` and the source commit. They are compile-time only and never packaged (SDK `docs/creating-plugins.md:76`).
+- In the `companion` stage:
+  1. `javac` against `android.jar` and the SDK;
+  2. the plugin's tests on the JDK;
+  3. `d8` into `plugin.jar` (`classes.dex` only);
+  4. a ZIP with fixed timestamps, checked to be at most 4 MB.
+
+  Output: `/out/ksplugin.zip`, which the firmware stage embeds as `internal/companion/ksplugin.zip`, excluded from the `fw-` hash like `app.*`.
+
+### 11.5 Phases
+
+#### Phase K0: Probe on the unit (throwaway code; findings only)
+
+1. With Remote Administration on, from the init-started `su` context: `login`, `listPlugins`, `installPlugin` of a small ZIP, `enablePlugin`.
+2. A throwaway plugin connects to a `su` loopback listener, and its `/proc/net/tcp{,6}` row carries Kiosk Satellite's uid.
+3. An `onTop(true)`, `touchable(false)` overlay over the dashboard and over the screensaver: touches pass through, and what covers it is as SDK `docs/overlays.md:164` says.
+4. On the long-lived view: the time from a content change to pixels, and the frame rate while a long answer scrolls.
+5. The app's bar drawing over the plugin view (decision 10).
+
+**Acceptance:** findings §8.x with numbers. A failure of 1, 2 or 3 sends decisions 1–9 back for review.
+
+#### Phase K1: Plugin
+
+- `EchoMusePlugin`: `start` opens its own link thread with a 0.5–5 s backoff; `stop` closes the socket and joins the thread within the 3 s callback deadline (SDK `docs/creating-plugins.md:145`).
+- `ViewOverlay` (decision 9). Every listener and `onDraw` catches its own exceptions, since one escaping there ends the Kiosk Satellite app (SDK `docs/overlays.md:178`).
+- A pure-Java view-state reducer (phases, linger, replacement, follow-up), with tests.
+
+**Acceptance:** reducer tests green in the `companion` stage. By hand on the unit, with a stub listener, every `view` phase draws as decision 9 says.
+
+#### Phase K2: Build
+
+§11.4.
+
+**Acceptance:**
+- The stage builds and runs the plugin tests.
+- The ZIP installs through Kiosk Satellite's Install from ZIP.
+- An edit under `device/companion/ksplugin` moves both the `cmp-` and `fw-` versions.
+
+#### Phase K3: Firmware
+
+- Link version 2: roles, per-role uid, 128 KiB lines, the `view` relay.
+- `KioskInstaller` over an injected HTTP client: decisions 2, 3 (`token_rejected`) and 5.
+- The `turn_view_v1` and `kiosk_plugin` capabilities; `turn.view` handling; the config keys `kioskToken` and `kioskPort`.
+- Host tests:
+  - the role and uid matrix, and replacement per role;
+  - the relay, and replay after `hello`;
+  - installer decisions: no package, remote admin down, no token, 401, same hash, different hash, master switch off, record disabled, pacing;
+  - an installer failure never ends `Run`.
+
+**Acceptance:** host `go test` and `go vet` green.
+
+#### Phase K4: Controller and dashboard
+
+- `em_ha_client`: `intent-progress` `chat_log_delta.content` becomes a new run event, `AnswerDelta(text)`; tested with the fake HA.
+- `em_session`: `turn.view` as in decision 8, to `turn_view_v1` devices only. Tested for a normal turn, a streamed answer, a follow-up, `no_input`, a local route, and a device without the capability.
+- `Capability.TURN_VIEW` and `Capability.KIOSK_PLUGIN`. `kioskToken`, `kioskPort` and `turnViewLinger` in the Screen section, with the token write-only in the API.
+- `POST /api/devices/{id}/kiosk_login {password}` (decision 3), tested against a fake Kiosk Satellite: success stores the token and pushes the config; a 401; an unreachable device.
+- Dashboard:
+  - the password prompt (decision 4);
+  - `kiosk` in the Status panel's companion block;
+  - capability gaps for the two new capabilities.
+- Docs:
+  - `docs/protocol-v1.md`: `turn.view`, the capabilities and `stats.companion.kiosk`;
+  - the `CLAUDE.md` capability list;
+  - `docs/quickstart.md`: Remote Administration with a password is the prerequisite.
+
+**Acceptance:** pytest, mypy, pyflakes and the dashboard tests green.
+
+#### Phase K5: Adoption and upgrade
+
+- The wizard step `kiosk_plugin` (decision 4), pinned in `provision_wizard.test.mjs`.
+- The update prompt (decision 4).
+- Behaviour to verify, not to build:
+  - rollback to a firmware with an older plugin reinstalls that plugin;
+  - rollback to a firmware from before the plugin leaves it installed but unlinked, since that firmware refuses Kiosk Satellite's uid, so it draws nothing.
+
+#### Phase K6: Acceptance on the unit
+
+- Adoption with Kiosk Satellite installed: the prompt, then the plugin installed, enabled and linked.
+- A spoken turn shows the listening view, the request, the thinking dots and the answer as it streams. The view then stays for 6 s and hides.
+- The same over the screensaver.
+- A long answer scrolls.
+- A follow-up keeps the view up.
+- `no_input` hides it after listening.
+- Only one bar is visible.
+- An OTA with a changed plugin reinstalls it without a prompt.
+- A token rejected after a Kiosk Satellite reset brings back the prompt.
+
+### 11.6 Risks
+
+| Risk | Mitigation |
+|---|---|
+| A plugin bug crashes Kiosk Satellite | drawing and listener code catch everything; Kiosk Satellite switches the plugin off before the crash, and health shows `linked: false` |
+| A long-lived credential on the device and in the controller's database | only the token is kept, never the password, and the dashboard never reads it back. A password change does not revoke it (`docs/remote-api.md:91-93`), which the dashboard states next to the prompt |
+| The request and answer text reach Kiosk Satellite's process | inherent: the plugin runs there, and Kiosk Satellite is the kiosk the user chose to trust |
+| `installPlugin` is labelled "developer testing only" | it is part of the authenticated command API; a repository install would mean a public plugin repository and GitHub Actions releases for every firmware version |
+| Turning the master switch on also resumes other enabled plugins | done only when it is off, and reported in health |
+| Kiosk Satellite changes its plugin SDK | `apiVersion 1` is its published contract; an `installPlugin` refusal reaches health with Kiosk Satellite's message |
+
+### 11.7 Open questions
+
+1. The licence in the plugin ZIP. The repository has none. Apache-2.0 would match the SDK; this is the project's call, and Phase K2 cannot ship without it.
+2. The `turnViewLinger` default: 6 s proposed.
+
+### 11.8 Later candidates
+
+| Candidate | Needs |
+|---|---|
+| Tool lines and result panels | the controller subscribes to `conversation/chat_log/subscribe` for the turn's conversation (its HA token is an administrator's) and adds `tools` and `results` to `turn.view` |
+| Live partial transcripts | partial text from the speech worker into the session |
+| Announcement text | `turn.view` for announcements |
