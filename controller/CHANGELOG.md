@@ -664,6 +664,38 @@ Based on a review of Office turns 433–476 (`docs/turn-latency-review.md`,
   (`GET /api/text_fix/unknown_words`). **Try a transcript** shows each
   word's pronunciation and where it came from. New dependency:
   `cmudict==1.1.3`.
+- **One stall no longer takes speech offline for every speaker.** When the
+  controller paused for a moment (a transcript-correction rebuild held it for
+  about half a second), every speech job queued behind the late one missed
+  its deadline too, each counted as a separate error, and three errors within
+  60 s made speech unavailable on every speaker for at least 20 s. A missed
+  deadline is now counted only when its job was submitted after the last
+  counted one, in any lane and for any speaker; the queued jobs still end
+  their turn as before. Exceptions always count, and a worker that stays too
+  slow still goes unavailable.
+- **Speech worker errors are logged.** Each counted error is logged as a
+  warning with its component, speaker, lane and reason, even when its turn
+  has already ended; speech becoming unavailable is a warning naming the
+  errors that caused it, and recovery is logged too.
+- **Transcript correction no longer pauses speech.** Building its tables
+  and compiling pronunciations held the controller for up to 0.7 s at a
+  time, long enough for a speech job to miss its deadline and end the turn
+  (`interrupted`). All of transcript correction's work now runs in one child
+  process of its own: the tables, pronunciations, candidates and the
+  acceptance check live there, and the controller only sends it requests
+  and asks Home Assistant's matcher. Measured while the child builds and
+  compiles, a speech-sized job in the controller is delayed by at most 2 ms,
+  against over 100 ms before. If the child exits it is logged and restarted;
+  until its tables are rebuilt, corrections report `not_ready` and the
+  transcript is sent as heard.
+- **Transcript correction rebuilds only when something it uses changed.**
+  Home Assistant republishes some entities' registry entries every few
+  minutes (a media player's `capabilities`), and each one withdrew the
+  correction tables and rebuilt them: over a thousand rebuilds in under two
+  days, with the same 224 names every time. A registry event now refreshes
+  the vocabulary only when it can change it (a name, alias, area, device,
+  Assist exposure, rename, enabling, or any area or floor change), and a
+  refresh that changed nothing keeps the tables in use without a rebuild.
 
 ### Echo Show 8 (`crown`)
 

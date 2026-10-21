@@ -11,6 +11,9 @@ from __future__ import annotations
 import asyncio
 import functools
 import json
+import os
+import signal
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -19,8 +22,10 @@ pytest.importorskip("hassil")
 
 import em_phonetics
 import em_text_fix_service
+import em_text_fix_worker
 from em_phonetics import Lexicon, PronunciationSource, best_similarity, parse_guides
 from em_ha_client import (
+    HaUnavailable,
     SentenceRecognition,
     SlotValue,
     VocabArea,
@@ -55,6 +60,9 @@ from em_text_fix import (
     user_vocabulary,
 )
 from em_text_fix_service import NotReady, TextFixService
+from em_text_fix_worker import Build, ChildWorker, Decide, Pronounce, Propose, Stale, Unknown, history_rows
+
+from _text_fix_fakes import inline_workers
 
 FIXTURE = json.loads((Path(__file__).parent / "fixtures" / "text_fix.json").read_text())
 DEVICE = FIXTURE["device_id"]
@@ -437,6 +445,7 @@ class FakeHa:
         self.listing.set()
         self.calls: list[tuple[tuple[str, ...], str | None, str | None]] = []
         self.disconnect = []
+        self.failure: Exception | None = None
 
     def add_disconnect_listener(self, listener):
         self.disconnect.append(listener)
@@ -446,6 +455,8 @@ class FakeHa:
 
     async def trigger_sentences(self):
         await self.listing.wait()
+        if self.failure is not None:
+            raise self.failure
         return self.templates
 
     async def recognize(self, sentences, device_id, *, language=None, timeout=None):
@@ -453,54 +464,70 @@ class FakeHa:
         return [recognized(s) for s in sentences]
 
 
-async def ready_service(monkeypatch, ha=None, history=()):
+async def ready_service(monkeypatch, ha=None, history=(), worker=None):
+    """A service whose tables are published; its jobs run inline unless `worker` (a factory) says
+    otherwise. Returns the service, HA and the worker it made."""
     monkeypatch.setattr(em_text_fix_service, "REBUILD_DEBOUNCE_S", 0.0)
     ha = ha or FakeHa()
+    factory, made = inline_workers()
+    workers = []
+
+    def make(on_lost):
+        workers.append((worker or factory)(on_lost))
+        return workers[-1]
 
     async def load():
         return list(history)
 
-    service = TextFixService(ha, load)
+    service = TextFixService(ha, load, worker=make)
     service.start()
     service.on_vocabulary(vocabulary())
     await service._rebuild
-    return service, ha
+    assert service.current() is not None
+    return service, ha, workers[0]
+
+
+def renamed(vocab: Vocabulary) -> Vocabulary:
+    """`vocab` with one more area: "Potting Shed"."""
+    return replace(vocab, areas=(*vocab.areas, VocabArea("potting_shed", ("Potting Shed",), None)))
 
 
 def test_the_service_corrects_with_the_pipeline_language_and_the_satellite(monkeypatch):
     async def main():
-        service, ha = await ready_service(monkeypatch)
+        service, ha, _ = await ready_service(monkeypatch)
         config = FixConfig(TextFixMode.ON)
         context = service.context(config, DEVICE, "p1", "en", None)
         outcome = await service.correct("watch flex", context, config)
         assert outcome.decision.selected.candidate.text == "watch plex"
         assert all(device == DEVICE and language == "en" for _, device, language in ha.calls)
-        service.close()
+        await service.close()
     asyncio.run(main())
 
 
-@pytest.mark.parametrize("change", ["disconnect", "registry", "triggers", "history"])
+@pytest.mark.parametrize("change", ["disconnect", "vocabulary", "triggers", "history", "worker"])
 def test_a_result_is_stale_after_any_change_until_new_tables_publish(monkeypatch, change):
     async def main():
-        service, ha = await ready_service(monkeypatch)
+        service, ha, worker = await ready_service(monkeypatch)
         context = service.context(FixConfig(TextFixMode.ON), DEVICE, "p1", "en", None)
         assert service.valid(context)
         if change == "disconnect":
             ha.connected = False
             for listener in ha.disconnect:
                 listener()
-        elif change == "registry":
-            service.on_registry_stale()
+        elif change == "vocabulary":
+            service.on_vocabulary(renamed(vocabulary()))
         elif change == "triggers":
             ha.triggers_changed()
-        else:
+        elif change == "history":
             service.add_history(HistoryEntry("watch netflix", 700, 2.0))
             await service._history_build
+        else:
+            worker.lose()
         assert not service.valid(context)
-        if change in ("disconnect", "registry"):
-            # Reconnecting or rebuilding waits for the refreshed vocabulary: not ready till then.
+        if change == "disconnect":
+            # Reconnecting waits for the refreshed vocabulary, unchanged or not: not ready till then.
             ha.connected = True
-            ha.generation += change == "disconnect"
+            ha.generation += 1
             await asyncio.sleep(0.01)
             assert service.current() is None
             with pytest.raises(NotReady):
@@ -510,41 +537,147 @@ def test_a_result_is_stale_after_any_change_until_new_tables_publish(monkeypatch
             await service._rebuild
         fresh = service.context(FixConfig(TextFixMode.ON), DEVICE, "p1", "en", None)
         assert service.valid(fresh) and fresh.tables > context.tables
-        service.close()
+        names = {n.text for n in worker.engine.tables(fresh.tables).names}
+        assert ("Potting Shed" in names) == (change == "vocabulary")
+        await service.close()
+    asyncio.run(main())
+
+
+def test_a_refresh_that_changed_nothing_keeps_the_tables_and_builds_nothing(monkeypatch):
+    async def main():
+        service, _, worker = await ready_service(monkeypatch)
+        published, asked = service.current(), len(worker.asked)
+        context = service.context(FixConfig(TextFixMode.ON), DEVICE, "p1", "en", None)
+        service.on_vocabulary(vocabulary())              # equal, though built anew from HA's replies
+        await asyncio.sleep(0.01)
+        assert service.current() is published and service.revision == published.revision
+        assert service.valid(context) and not any(isinstance(job, Build) for job in worker.asked[asked:])
+        outcome = await service.correct("watch flex", context, FixConfig(TextFixMode.ON))
+        assert outcome.decision.selected.candidate.text == "watch plex"
+        await service.close()
+    asyncio.run(main())
+
+
+def test_after_a_build_that_failed_an_unchanged_refresh_builds_again(monkeypatch):
+    async def main():
+        service, ha, _ = await ready_service(monkeypatch)
+        ha.failure = HaUnavailable("connection lost")
+        ha.triggers_changed()
+        await service._rebuild
+        assert service.current() is None
+        ha.failure = None
+        service.on_vocabulary(vocabulary())
+        await service._rebuild
+        assert service.current() is not None
+        await service.close()
     asyncio.run(main())
 
 
 def test_a_build_invalidated_while_it_runs_never_publishes(monkeypatch):
     async def main():
-        service, ha = await ready_service(monkeypatch)
+        service, ha, worker = await ready_service(monkeypatch)
         ha.listing.clear()
         ha.triggers_changed()                     # build 1 waits on the trigger listing
         first = service._rebuild
         await asyncio.sleep(0.01)
         ha.templates = [t for t in ha.templates if "plex" not in t]
-        service.on_registry_stale()               # invalidates build 1 before it can publish
+        service.on_vocabulary(renamed(vocabulary()))    # invalidates build 1 before it can publish
         ha.listing.set()
         await asyncio.gather(first, return_exceptions=True)
-        assert service.current() is None
-        service.on_vocabulary(vocabulary())
         await service._rebuild
         tables = service.current()
         assert tables is not None and tables.revision == service.revision
-        assert "watch plex" not in {p.text for p in tables.triggers.phrases}
-        service.close()
+        built = worker.engine.tables(tables.revision)
+        assert "watch plex" not in {p.text for p in built.triggers.phrases}
+        assert "Potting Shed" in {n.text for n in built.names}
+        await service.close()
     asyncio.run(main())
 
 
 def test_added_history_is_retrieved_without_a_full_rebuild(monkeypatch):
     async def main():
-        service, ha = await ready_service(monkeypatch)
+        service, ha, worker = await ready_service(monkeypatch)
         before = service.current()
         service.add_history(HistoryEntry("play cherub rock", 532, 3.0))
         await service._history_build
         after = service.current()
-        assert after.triggers is before.triggers and after.revision > before.revision
-        assert [p.text for p in after.history.phrases] == ["play cherub rock"]
-        service.close()
+        assert after.revision > before.revision
+        old, new = worker.engine.tables(before.revision), worker.engine.tables(after.revision)
+        assert new.triggers is old.triggers and new.names is old.names
+        assert [p.text for p in new.history.phrases] == ["play cherub rock"]
+        assert not any(isinstance(job, Build) for job in worker.asked[1:])
+        await service.close()
+    asyncio.run(main())
+
+
+# --- the child process ----------------------------------------------------------------------
+
+
+def test_the_child_decides_exactly_as_the_functions_do_in_process():
+    """Build, propose and decide round trip through the child: the same Decision, the same
+    pronunciations and unknown words as computed here."""
+    texts = ["Watch Flex.", "RMV alarm.", "What time is", "Plate cherub rock.", "watch you"]
+
+    async def main():
+        lost = []
+        worker = ChildWorker(lambda: lost.append(True))
+        worker.start()
+        lexicon = Lexicon()
+        built = await worker.ask(Build(7, vocabulary(), tuple(FIXTURE["templates"]), history_rows(HISTORY)))
+        assert built.revision == 7 and built.summary == {**tables().summary, "revision": 7}
+        decisions = []
+        for text in texts:
+            key = fix_key(text)
+            proposal = await worker.ask(Propose(7, Request(key), recognized(key), (), (), lexicon))
+            verdicts = tuple(recognized(c.text) for c in proposal.validate)
+            decisions.append((proposal, await worker.ask(Decide(7, proposal, verdicts, recognized(key)))))
+        unknown = await worker.ask(Unknown(7, lexicon))
+        said = await worker.ask(Pronounce(lexicon, ("rmv alarm", "youtubetv")))
+        with pytest.raises(Stale):
+            await worker.ask(Propose(6, Request("watch flex"), None, (), (), lexicon))
+        await worker.close()
+        return decisions, unknown, said, lost
+
+    decisions, unknown, said, lost = asyncio.run(main())
+    for text, (proposal, decision) in zip(texts, decisions):
+        here, proposal_here = correct(text)
+        assert proposal == proposal_here and decision == here
+    assert [d.reason for _, d in decisions][:2] == [Reason.APPLIED, Reason.APPLIED]
+    assert unknown == phonetic().unknown
+    assert said == (Lexicon().pronounce("rmv alarm"), Lexicon().pronounce("youtubetv"))
+    assert lost == []                             # a close is no loss
+
+
+def test_a_child_that_dies_is_replaced_and_its_loss_withdraws_the_tables(monkeypatch):
+    monkeypatch.setattr(em_text_fix_worker, "RESTART_MIN_S", 0.05)
+
+    async def main():
+        service, ha, worker = await ready_service(monkeypatch, worker=ChildWorker)
+        config = FixConfig(TextFixMode.ON)
+        context = service.context(config, DEVICE, "p1", "en", None)
+        pid = worker.pid
+        # A job in flight when the child dies fails, rather than waiting forever.
+        pending = asyncio.ensure_future(service.pronounce(Lexicon(), ["play cherub rock"] * 300_000))
+        await asyncio.sleep(0.05)
+        os.kill(pid, signal.SIGKILL)
+        with pytest.raises(NotReady):
+            await pending
+        for _ in range(500):
+            if service.current() is None:
+                break
+            await asyncio.sleep(0.01)
+        assert service.current() is None          # its tables went with it: not ready
+        with pytest.raises(NotReady):
+            await service.correct("watch flex", context, config)
+        rebuilt = service._rebuild
+        await asyncio.wait_for(rebuilt, 30)
+        fresh = service.context(config, DEVICE, "p1", "en", None)
+        assert fresh.tables > context.tables and worker.pid not in (None, pid)
+        outcome = await service.correct("watch flex", fresh, config)
+        assert outcome.decision.selected.candidate.text == "watch plex"
+        await service.close()
+        assert worker.pid is None
+
     asyncio.run(main())
 
 
@@ -582,7 +715,8 @@ def controller(tmp_path, monkeypatch):
         "for_config": lambda self, config: type("M", (), {"wake_phrase": "ophelia"})()})())
 
     async def start():
-        service, _ = await ready_service(monkeypatch, ha=ha)
+        # The real child: the tester's pronunciations come from it too.
+        service, _, _ = await ready_service(monkeypatch, ha=ha, worker=ChildWorker)
         monkeypatch.setattr(em_controller, "_text_fix", service)
         return service
 
@@ -602,7 +736,7 @@ def test_a_tried_transcript_shows_what_on_would_send_in_the_speakers_context(con
         alarm = await em_controller.trial_transcript("DOT", "RMV alarm.", False)
         ha.calls.clear()
         fleet = await em_controller.trial_transcript(None, "Watch Flex.", True)
-        service.close()
+        await service.close()
         return plex, dot_calls, alarm, fleet, list(ha.calls)
 
     plex, dot_calls, alarm, fleet, fleet_calls = asyncio.run(main())
@@ -632,7 +766,7 @@ def test_a_transcript_an_echomuse_route_takes_is_never_corrected(controller, tex
         service = await start()
         ha.calls.clear()
         trial = await em_controller.trial_transcript("DOT", text, True)
-        service.close()
+        await service.close()
         return trial
 
     trial = asyncio.run(main())

@@ -8,6 +8,7 @@ named by `EM_TEST_SHERPA_WHEEL`, `EM_TEST_KROKO_ARCHIVE`, `EM_TEST_SILERO_V5`
 
 import asyncio
 import importlib.util
+import logging
 import os
 import sys
 import time
@@ -18,6 +19,7 @@ import pytest
 
 import em_speech_worker as sw
 from _wyoming_fake import FakeWyoming
+from em_attribution import EchoResult
 from em_audio_timeline import ReferenceTimeline, SampleTimeline, StreamId
 from em_pause_asr import WyomingServer
 
@@ -144,6 +146,178 @@ def test_a_primed_lease_restores_the_voice_from_the_first_cell_at_its_sample():
     asyncio.run(main())
     probs = [p for o in got if isinstance(o.payload, sw.VadPayload) for p in o.payload.probabilities]
     assert probs == [0.0, 1.0, 2.0, 100.5, 101.0, 102.0, 0.0]
+
+
+class _Clock:
+    """The worker's injected `now`: moves only when a test (or a fake job) moves it."""
+
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+
+class _ProbeModels:
+    revision = "fake"
+
+    def probe(self):
+        pass
+
+
+ECHO = ((EchoResult.ECHO_ONLY,), None)
+
+
+def _fake_worker(clock, got, **kw):
+    w = sw.SpeechWorker(None, on_observation=got.append, now=clock, **kw)
+    w._executor = sw.ThreadPoolExecutor(max_workers=1)
+    w.models = _ProbeModels()
+    w._wake["g"] = object()
+    return w
+
+
+async def _until(condition, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, "timed out"
+        await asyncio.sleep(0.005)
+
+
+def _errors(got):
+    return [o for o in got if o.kind == "error"]
+
+
+def _worker_logs(caplog, text):
+    return [r for r in caplog.records if r.name == "echomuse.speech" and text in r.getMessage()]
+
+
+def test_one_stall_is_one_error_however_much_backlog_it_leaves_in_every_lane(caplog):
+    """§8.1: one stall that makes every queued job miss its deadline, in every lane, reports
+    each job's error but counts once: alone it cannot make the worker unavailable, and two
+    later independent errors are needed to do so."""
+    caplog.set_level(logging.DEBUG, logger="echomuse.speech")
+    clock, got, changes = _Clock(), [], []
+
+    def stall():
+        if clock.t == 0.0:
+            clock.t = 1.0                    # the first job to run is held past the deadline
+        return ECHO
+
+    def boom():
+        raise RuntimeError("comparator failed")
+
+    async def main():
+        w = _fake_worker(clock, got, on_availability=changes.append, probe_interval_s=3600)
+        try:
+            for device, lease in (("office", "L1"), ("kitchen", "L2")):
+                w.open_lease(device, 7, lease, "g")
+                for i in range(4):
+                    w.submit_echo(lease, i * 512, (i + 1) * 512, stall)
+            await _until(lambda: len(_errors(got)) == 8)
+            stalled = w.available
+            w.submit_echo("L1", 2_048, 2_560, boom)
+            await _until(lambda: len(_errors(got)) == 9)
+            one_more = w.available
+            w.submit_echo("L2", 2_048, 2_560, boom)
+            await _until(lambda: changes == [False])
+            return stalled, one_more
+        finally:
+            await w.close()
+
+    stalled, one_more = asyncio.run(main())
+    assert stalled and one_more
+    deadline = [o for o in _errors(got) if "deadline" in o.payload.reason]
+    assert len(deadline) == 8 and {o.device_id for o in deadline} == {"office", "kitchen"}
+    counted = _worker_logs(caplog, "speech worker error")
+    assert len(counted) == 3 and all(r.levelno == logging.WARNING for r in counted)
+    assert "deadline" in counted[0].getMessage()
+    assert len(_worker_logs(caplog, "not counted")) == 7
+
+
+def test_sustained_overload_still_makes_the_worker_unavailable():
+    """Each job that arrives after a counted stall and misses its deadline too is a new error
+    (its own queued backlog is not), so a worker that stays too slow goes unavailable."""
+    clock, got, changes = _Clock(), [], []
+
+    def slow():
+        clock.t += 1.0
+        return ECHO
+
+    async def main():
+        w = _fake_worker(clock, got, on_availability=changes.append, probe_interval_s=3600)
+        try:
+            w.open_lease("office", 7, "L", "g")
+            available = []
+            for n in range(3):
+                clock.t += 0.08                  # the next block arrives after the last failure
+                w.submit_echo("L", 1_024 * n, 1_024 * n + 512, slow)
+                w.submit_echo("L", 1_024 * n + 512, 1_024 * (n + 1), lambda: ECHO)   # its backlog
+                await _until(lambda: len(_errors(got)) == 2 * (n + 1))
+                available.append(w.available)
+            return available
+        finally:
+            await w.close()
+
+    assert asyncio.run(main()) == [True, True, False]
+    assert changes == [False]
+
+
+def test_independent_errors_make_the_worker_unavailable_and_the_transitions_are_logged(caplog):
+    """Exceptions always count, and the worker itself logs each error (with its device) and both
+    availability transitions, so they are visible after the turn that owned the lease is gone."""
+    caplog.set_level(logging.INFO, logger="echomuse.speech")
+    clock, got, changes = _Clock(), [], []
+
+    def boom():
+        raise RuntimeError("comparator failed")
+
+    async def main():
+        w = _fake_worker(clock, got, on_availability=changes.append, probe_interval_s=0.01)
+        try:
+            w.open_lease("office", 7, "L1", "g")
+            w.open_lease("kitchen", 7, "L2", "g")
+            for i, lease in enumerate(("L1", "L2", "L1")):
+                clock.t += 20.0                  # three errors, all within 60 s
+                w.submit_echo(lease, i * 512, (i + 1) * 512, boom)
+                await _until(lambda: len(_errors(got)) == i + 1)
+            await _until(lambda: changes == [False, True])
+            return w.available
+        finally:
+            await w.close()
+
+    assert asyncio.run(main())
+    errors = _worker_logs(caplog, "speech worker error")
+    assert [r.levelno for r in errors] == [logging.WARNING] * 3
+    assert ["office" in r.getMessage() for r in errors] == [True, False, True]
+    assert all("comparator failed" in r.getMessage() for r in errors)
+    (down,) = _worker_logs(caplog, "unavailable")
+    assert down.levelno == logging.WARNING
+    assert all(s in down.getMessage() for s in ("3 errors", "office", "kitchen", "comparator failed"))
+    (up,) = _worker_logs(caplog, "available again")
+    assert up.levelno == logging.INFO
+    assert caplog.records.index(down) < caplog.records.index(up)
+
+
+def test_errors_further_apart_than_the_window_never_add_up():
+    clock, got, changes = _Clock(), [], []
+
+    def boom():
+        raise RuntimeError("comparator failed")
+
+    async def main():
+        w = _fake_worker(clock, got, on_availability=changes.append, probe_interval_s=3600)
+        try:
+            w.open_lease("office", 7, "L", "g")
+            for i in range(4):
+                clock.t += 31.0                  # only two ever fall within 60 s
+                w.submit_echo("L", i * 512, (i + 1) * 512, boom)
+                await _until(lambda: len(_errors(got)) == i + 1)
+            return w.available
+        finally:
+            await w.close()
+
+    assert asyncio.run(main()) and changes == []
+
 
 
 @pytest.fixture(scope="module")
@@ -515,7 +689,7 @@ def test_job_older_than_its_deadline_is_an_error(bundle_dir, registry):
 
             def slow():
                 time.sleep(0.2)
-                return ("echo_only",), 12
+                return (EchoResult.ECHO_ONLY,), 12
             w.submit_echo("L", 0, 512, slow)
             return await drain(w, lambda got: bool(got))
         finally:

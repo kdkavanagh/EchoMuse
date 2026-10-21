@@ -614,10 +614,10 @@ async def trial_transcript(device_id: str | None, text: str, wake: bool) -> em_t
         outcome = await service.correct(em_text_fix.fix_key(text), context, config)
         record = em_text_fix.trial_record(text, outcome)
     proposed = record.outcome.decision.proposed if record is not None and record.outcome is not None else None
-    heard = await asyncio.to_thread(config.lexicon.pronounce, text)      # CMUdict may not be read yet
-    said = await asyncio.to_thread(config.lexicon.pronounce, proposed.candidate.text) if proposed else None
+    texts = [text, proposed.candidate.text] if proposed is not None else [text]
+    heard, *said = await service.pronounce(config.lexicon, texts)
     return em_text_fix_service.Trial(text, config.mode, route, satellite, pipeline, language, wake_phrase,
-                                     heard, said, record)
+                                     heard, said[0] if said else None, record)
 
 
 async def unknown_words(device_id: str | None) -> Counter[str]:
@@ -1410,7 +1410,7 @@ async def main() -> None:
         log.info("HA vocabulary: %d targets", len(vocab.targets()))
         text_fix.on_vocabulary(vocab)
 
-    ha.track_vocabulary(vocabulary_changed, on_stale=text_fix.on_registry_stale)
+    ha.track_vocabulary(vocabulary_changed)
     text_fix.start()
     await ha.start()
     await engine.start()
@@ -1465,7 +1465,7 @@ async def main() -> None:
             await device.close()
         await engine.close()
         await worker.close()
-        text_fix.close()
+        await text_fix.close()
         await ha.close()
         await azc.async_unregister_service(info)
         await azc.async_close()

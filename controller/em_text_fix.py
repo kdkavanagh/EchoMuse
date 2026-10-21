@@ -2,7 +2,8 @@
 
 Pure: candidate tables, the candidate rules, semantic preservation, ambiguity, and user
 preference. No I/O; the HA calls and the table lifecycle are `em_text_fix_service`'s, the
-turn plumbing `em_session`'s.
+child process every computation here runs in `em_text_fix_worker`'s, the turn plumbing
+`em_session`'s.
 
 A correction is proposed only for text HA's sentence matcher does not already understand,
 from six rules (`Rule`), and is applied only when HA's matcher fully accepts it under the
@@ -529,7 +530,7 @@ class Tables:
 
 def build_tables(vocabulary: Vocabulary, templates: Sequence[str], history: Iterable[HistoryEntry],
                  revision: int) -> Tables:
-    """The snapshot for one revision: CPU work, run off the event loop."""
+    """The snapshot for one revision: CPU work, run in em_text_fix_worker's child process."""
     triggers, skipped = expand_triggers(templates)
     entity_ids: dict[str, set[str]] = {}
     area_ids: dict[str, str] = {}
@@ -640,7 +641,7 @@ def _sources(tables: Tables) -> tuple[PhraseLayer, PhraseLayer, tuple[Name, ...]
 
 
 def compile_phonetic(tables: Tables, lexicon: Lexicon, previous: Phonetic | None = None) -> Phonetic:
-    """`tables` pronounced under `lexicon`: CPU work, run off the event loop. A part whose
+    """`tables` pronounced under `lexicon`: CPU work, run in the child process. A part whose
     source and lexicon are unchanged from `previous` is reused (a history update recompiles
     only the history)."""
     sources = _sources(tables)

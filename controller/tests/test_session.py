@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 
 import em_session
+import em_text_fix_service
 from em_arbiter import WakeArbiter
 from em_audio_timeline import (
     FLAG_DIGITAL_SILENCE,
@@ -30,7 +31,6 @@ from em_device_link import AckStatus, CommandAck, Envelope, MessageType
 from em_ha_client import AnswerDelta, HaUnavailable, IntentEnded, RunEnded, SentenceRecognition, TtsReady, Vocabulary
 from em_pause_asr import PauseDecode, WyomingServer
 from em_session import ActorDeps, SessionActor
-from em_text_fix import build_tables
 from em_text_fix_service import TextFixService
 from em_speech_worker import (
     AsrPayload,
@@ -43,6 +43,8 @@ from em_speech_worker import (
 )
 from em_utterance import CellAssembler, Utterance, UtteranceKind, UtteranceSpec
 from em_wake_scorer import ReferenceCandidate
+
+from _text_fix_fakes import inline_workers
 
 MIC_EPOCH, REF_EPOCH = 11, 22
 BLOCK = 1_280
@@ -57,6 +59,7 @@ def fast_deadlines(monkeypatch):
     monkeypatch.setattr(em_session, "_stream_url", lambda url: url)
     monkeypatch.setattr(em_session, "RESPONSE_STALL_S", 60.0)
     monkeypatch.setattr(em_session, "WAKE_VERIFY_S", 0.3)
+    monkeypatch.setattr(em_text_fix_service, "REBUILD_DEBOUNCE_S", 0.0)
 
 
 def run(coro):
@@ -214,6 +217,16 @@ class FakeHa:
         self.fix_delay = 0.0
         self.fix_error: Exception | None = None
         self.on_fix = lambda sentences: None
+        self.disconnect = []
+
+    def add_disconnect_listener(self, listener):
+        self.disconnect.append(listener)
+
+    def track_triggers(self, on_change):
+        pass
+
+    async def trigger_sentences(self):
+        return ["(watch|put on) [the] plex"]
 
     async def recognize(self, sentences, device_id, *, language=None, timeout):
         self.calls.append((tuple(sentences), device_id, language))
@@ -515,8 +528,7 @@ class Harness:
             async def no_history():
                 return []
 
-            self.text_fix = TextFixService(self.ha, no_history)
-            self.text_fix.tables = build_tables(Vocabulary((), (), ()), ["(watch|put on) [the] plex"], [], 1)
+            self.text_fix = TextFixService(self.ha, no_history, worker=inline_workers()[0])
 
         self.actor = SessionActor("dev1", ActorDeps(
             ha=self.ha, worker=self.worker, registry=FakeRegistry(), alerts=self.alerts, arbiter=self.arbiter,
@@ -530,6 +542,12 @@ class Harness:
         self.device = Device(self.actor, afe)
 
     async def start(self):
+        if self.text_fix is not None:
+            # Tables holding the trigger "(watch|put on) [the] plex" (FakeHa.trigger_sentences).
+            self.text_fix.start()
+            self.text_fix.on_vocabulary(Vocabulary((), (), ()))
+            await self.text_fix._rebuild
+            assert self.text_fix.current() is not None
         await self.actor.start()
         self.actor.attach(self.link, self.render, afe_metadata=self.device.afe, no_input_chime=self.no_input_chime,
                           announcement_chime=self.announcement_chime, turn_view=self.turn_view)

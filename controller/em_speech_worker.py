@@ -21,6 +21,7 @@ import collections
 import enum
 import inspect
 import json
+import logging
 import math
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -44,6 +45,8 @@ from em_wake_scorer import (
     BcresnetScorer, BcresnetSpec, ReferenceCandidate, ReferenceDetector, WINDOW_SAMPLES,
     load_spec, onnx_infer, wake_probability,
 )
+
+log = logging.getLogger("echomuse.speech")
 
 SAMPLE_RATE = 16_000
 BLOCK_SAMPLES = 1_280                 # one 80 ms capture block (§4.1)
@@ -503,6 +506,20 @@ class _Job:
 _Lane = asyncio.Queue[_Job | None]      # None stops the lane
 
 
+@dataclass(frozen=True, slots=True)
+class _WorkerError:
+    """One error counted toward `speech_unavailable` (§8.1)."""
+
+    at: float
+    component: ObservationKind
+    reason: str
+    device_id: str | None             # None: no lease (a committed-span re-decode)
+    lane: str
+
+    def __str__(self) -> str:
+        return f"{self.component} on {self.device_id or '-'} ({self.lane}): {self.reason}"
+
+
 # ---------------------------------------------------------------------------
 # Worker
 # ---------------------------------------------------------------------------
@@ -545,7 +562,10 @@ class SpeechWorker:
         self._leases: dict[str, _Lease] = {}
         self._lanes: dict[str, _Lane] = {}
         self._lane_tasks: dict[str, asyncio.Task[None]] = {}
-        self._errors: collections.deque[float] = collections.deque()
+        self._errors: collections.deque[_WorkerError] = collections.deque()
+        # `_now()` at the last counted deadline failure: a deadline failure of a job submitted
+        # by then is that stall's backlog, reported but not counted again (§8.1).
+        self._stall_mark: float | None = None
         self._probe_task: asyncio.Task[None] | None = None
         self._callbacks: set[asyncio.Future[object]] = set()   # awaitables on_availability returned
         self._closed = False
@@ -975,7 +995,7 @@ class SpeechWorker:
         try:
             return await asyncio.get_running_loop().run_in_executor(self._executor, run)
         except Exception as exc:
-            self._record_error()
+            self._record_error(ObservationKind.ASR, f"span re-decode: {type(exc).__name__}: {exc}", None, "span")
             raise SpeechWorkerError(f"span re-decode failed: {type(exc).__name__}: {exc}") from exc
 
     async def transcribe_span(self, canonical_pcm: np.ndarray, server: WyomingServer) -> str:
@@ -1029,8 +1049,17 @@ class SpeechWorker:
             del self._lane_tasks[name]
 
     async def _fail(self, job: _Job, reason: str, *, deadline: bool = False) -> None:
-        """Report a failed job; a verification past its deadline is also a `timeout` verdict (§16.6)."""
+        """Report a failed job; a verification past its deadline is also a `timeout` verdict (§16.6).
+
+        One stall is one error: a missed deadline is counted unless the job was submitted
+        by the last counted deadline failure (in any lane, since the GIL and the executor
+        are shared), which makes it that stall's backlog. Its error is still reported."""
+        now = self._now()
+        backlog = deadline and self._stall_mark is not None and job.created <= self._stall_mark
+        if deadline and not backlog:
+            self._stall_mark = now
         lease = job.lease
+        device_id = None if lease is None else lease.device_id
         if lease is not None:
             if job.stream == StreamId.MIC and not job.candidate_id:
                 lease.dirty = True   # the lane's recurrent state skipped audio
@@ -1040,14 +1069,22 @@ class SpeechWorker:
                     VerificationPayload(job.candidate_id, None, None, VerificationResult.TIMEOUT)))
             await self._emit(self._observe(lease, job.stream, ObservationKind.ERROR, job.through,
                                            ErrorPayload(job.component, reason), job.utterance_id))
-        self._record_error()
+        if backlog:
+            log.debug("speech worker: %s on %s (%s): %s; backlog of the stall at %.3f, not counted",
+                      job.component, device_id or "-", job.lane, reason, self._stall_mark)
+            return
+        self._record_error(job.component, reason, device_id, job.lane, now)
 
-    def _record_error(self) -> None:
-        now = self._now()
-        self._errors.append(now)
-        while self._errors and now - self._errors[0] > ERROR_WINDOW_S:
+    def _record_error(self, component: ObservationKind, reason: str, device_id: str | None, lane: str,
+                      now: float | None = None) -> None:
+        error = _WorkerError(self._now() if now is None else now, component, reason, device_id, lane)
+        self._errors.append(error)
+        while self._errors and error.at - self._errors[0].at > ERROR_WINDOW_S:
             self._errors.popleft()
+        log.warning("speech worker error: %s (%d within %.0f s)", error, len(self._errors), ERROR_WINDOW_S)
         if self.available and len(self._errors) >= ERRORS_UNAVAILABLE:
+            log.warning("speech worker unavailable (speech_unavailable) after %d errors within %.0f s: %s",
+                        len(self._errors), ERROR_WINDOW_S, "; ".join(str(e) for e in self._errors))
             self._set_available(False)
             self._probe_task = asyncio.create_task(self._probe_loop())
 
@@ -1071,6 +1108,7 @@ class SpeechWorker:
             good = good + 1 if ok else 0
             if good >= PROBES_TO_RECOVER:
                 self._errors.clear()
+                log.info("speech worker available again: %d consecutive probes passed", good)
                 self._set_available(True)
                 self._probe_task = None
                 return

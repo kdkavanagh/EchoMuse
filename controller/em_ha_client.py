@@ -14,6 +14,7 @@ environments without it (the alert engine's tests).
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -87,13 +88,56 @@ class HaFeature(StrEnum):
 
 
 class VocabEvent(StrEnum):
-    """Registry events that rebuild the vocabulary snapshot (§16.7). A device rename changes
-    the full name of every entity on it that has no name of its own, and a device's area is
-    the area of each entity without one."""
+    """Registry events that may change the vocabulary snapshot (§16.7); `vocab_relevant`
+    tells which do. A device rename changes the full name of every entity on it that has no
+    name of its own, and a device's area is the area of each entity without one."""
     ENTITY_REGISTRY_UPDATED = "entity_registry_updated"
     AREA_REGISTRY_UPDATED = "area_registry_updated"
     FLOOR_REGISTRY_UPDATED = "floor_registry_updated"
     DEVICE_REGISTRY_UPDATED = "device_registry_updated"
+
+
+class RegistryAction(StrEnum):
+    """A registry event's `action`."""
+    CREATE = "create"
+    REMOVE = "remove"
+    UPDATE = "update"
+
+
+# The `changes` keys (field → old value) of an entity registry `update` that build_vocabulary
+# can see. Any other (HA republishes a media player's `capabilities` every few minutes) changes
+# nothing it reads, so it refreshes nothing.
+ENTITY_VOCAB_FIELDS: frozenset[str] = frozenset({
+    "name",            # the user's name, which wins over the device's joined with the original
+    "original_name",   # the integration's name, joined to its device's
+    "aliases",         # the other names Assist answers to
+    "area_id",         # the entity's own area
+    "device_id",       # whose name and area it inherits
+    "options",         # Assist exposure is stored here (`conversation.should_expose`)
+    "entity_id",       # a rename (with `old_entity_id`): the snapshot is keyed by entity id
+    "disabled_by",     # a disabled entity is not in Assist's exposed list
+})
+# The same for a device registry `update`.
+DEVICE_VOCAB_FIELDS: frozenset[str] = frozenset({
+    "name",            # an entity without a name of its own is called by its device's
+    "name_by_user",    # which the user's device name overrides
+    "area_id",         # an entity without an area is in its device's
+})
+
+
+def vocab_relevant(event: VocabEvent, data: Mapping[str, object]) -> bool:
+    """Whether a registry event can change the vocabulary snapshot: any area or floor event,
+    an entity or device created or removed, or an update touching a field the snapshot reads.
+    An event of a shape not known here counts: a needless refresh beats a missed change."""
+    if event in (VocabEvent.AREA_REGISTRY_UPDATED, VocabEvent.FLOOR_REGISTRY_UPDATED):
+        return True
+    if data.get("action") != RegistryAction.UPDATE or "old_entity_id" in data:
+        return True
+    changes = data.get("changes")
+    if not isinstance(changes, Mapping):
+        return True
+    fields = ENTITY_VOCAB_FIELDS if event == VocabEvent.ENTITY_REGISTRY_UPDATED else DEVICE_VOCAB_FIELDS
+    return not fields.isdisjoint(changes)
 
 
 class TriggerEvent(StrEnum):
@@ -776,7 +820,6 @@ class HaClient:
         self._disconnect_listeners: list[Callable[[], None]] = []
         self._background: set[asyncio.Task[None]] = set()
         self._vocab_listener: Callable[[Vocabulary], None] | None = None
-        self._vocab_stale: Callable[[], None] | None = None
         self._vocab_task: asyncio.Task[None] | None = None
         self._vocab_dirty = False
 
@@ -1451,25 +1494,22 @@ class HaClient:
             self._vocab_listener(vocab)
         return vocab
 
-    def track_vocabulary(self, on_change: Callable[[Vocabulary], None],
-                         on_stale: Callable[[], None] | None = None) -> None:
-        """Keep `self.vocabulary` current: rebuilt at every connect and, debounced,
-        after each registry-updated event. `on_stale` hears each such event at once,
-        before the rebuild it schedules."""
+    def track_vocabulary(self, on_change: Callable[[Vocabulary], None]) -> None:
+        """Keep `self.vocabulary` current: rebuilt at every connect and, debounced, after
+        each registry event that can change it (`vocab_relevant`); any other is ignored."""
         self._vocab_listener = on_change
-        self._vocab_stale = on_stale
         self.add_connect_listener(self._vocab_on_connect)
         if self.connected:
             self._spawn(self._vocab_on_connect(), "HA vocabulary")
 
     async def _vocab_on_connect(self) -> None:
         for event_type in VocabEvent:
-            await self.subscribe_events(event_type, self._vocab_changed)
+            await self.subscribe_events(event_type, functools.partial(self._vocab_changed, event_type))
         await self.refresh_vocabulary()
 
-    def _vocab_changed(self, _data: HaMessage) -> None:
-        if self._vocab_stale is not None:
-            self._vocab_stale()
+    def _vocab_changed(self, event: VocabEvent, data: HaMessage) -> None:
+        if not vocab_relevant(event, data):
+            return
         self._vocab_dirty = True
         if self._vocab_task is None or self._vocab_task.done():
             self._vocab_task = asyncio.create_task(self._vocab_debounced())

@@ -624,16 +624,55 @@ def test_vocabulary_build_and_registry_event_refresh():
                     await asyncio.sleep(0.01)
                 assert refreshed
                 before = len(refreshed)
+                # HA republishes a media player's capabilities every few minutes: nothing to refresh.
+                await fake.emit("entity_registry_updated", {
+                    "action": "update", "entity_id": "switch.porch",
+                    "changes": {"capabilities": {"source_list": ["TV"]}}})
+                await fake.emit("device_registry_updated", {
+                    "action": "update", "device_id": DEVICE_ID, "changes": {"sw_version": "1.0"}})
+                await asyncio.sleep(0.1)
+                assert len(refreshed) == before
                 await fake.emit("entity_registry_updated", {"action": "update",
-                                                            "entity_id": "switch.porch", "changes": {}})
+                                                            "entity_id": "switch.porch", "changes": {"aliases": []}})
                 for _ in range(50):
                     if len(refreshed) > before:
                         break
                     await asyncio.sleep(0.01)
-                assert len(refreshed) > before
+                assert len(refreshed) == before + 1
         finally:
             ha_mod.VOCAB_DEBOUNCE_S = old_debounce
     run(scenario())
+
+
+@pytest.mark.parametrize("event, data, relevant", [
+    (ha_mod.VocabEvent.ENTITY_REGISTRY_UPDATED, {"action": "update", "entity_id": "media_player.spotify",
+                                                 "changes": {"capabilities": {}}}, False),
+    (ha_mod.VocabEvent.ENTITY_REGISTRY_UPDATED, {"action": "update", "entity_id": "light.a",
+                                                 "changes": {"capabilities": {}, "icon": None}}, False),
+    (ha_mod.VocabEvent.ENTITY_REGISTRY_UPDATED, {"action": "update", "entity_id": "light.a",
+                                                 "changes": {"capabilities": {}, "name": None}}, True),
+    # Exposing an entity to Assist writes its options.
+    (ha_mod.VocabEvent.ENTITY_REGISTRY_UPDATED, {"action": "update", "entity_id": "light.a",
+                                                 "changes": {"options": {}}}, True),
+    (ha_mod.VocabEvent.ENTITY_REGISTRY_UPDATED, {"action": "update", "entity_id": "light.b",
+                                                 "old_entity_id": "light.a", "changes": {"entity_id": "light.a"}},
+     True),
+    (ha_mod.VocabEvent.ENTITY_REGISTRY_UPDATED, {"action": "create", "entity_id": "light.a"}, True),
+    (ha_mod.VocabEvent.ENTITY_REGISTRY_UPDATED, {"action": "remove", "entity_id": "light.a"}, True),
+    (ha_mod.VocabEvent.DEVICE_REGISTRY_UPDATED, {"action": "update", "device_id": "d",
+                                                 "changes": {"sw_version": "2", "via_device_id": None}}, False),
+    (ha_mod.VocabEvent.DEVICE_REGISTRY_UPDATED, {"action": "update", "device_id": "d",
+                                                 "changes": {"name_by_user": None}}, True),
+    (ha_mod.VocabEvent.DEVICE_REGISTRY_UPDATED, {"action": "update", "device_id": "d",
+                                                 "changes": {"area_id": "office"}}, True),
+    (ha_mod.VocabEvent.DEVICE_REGISTRY_UPDATED, {"action": "remove", "device_id": "d"}, True),
+    (ha_mod.VocabEvent.AREA_REGISTRY_UPDATED, {"action": "update", "area_id": "office"}, True),
+    (ha_mod.VocabEvent.FLOOR_REGISTRY_UPDATED, {"action": "reorder"}, True),
+    # A shape this code does not know refreshes rather than risk a missed change.
+    (ha_mod.VocabEvent.ENTITY_REGISTRY_UPDATED, {"action": "update", "entity_id": "light.a"}, True),
+])
+def test_only_registry_events_that_can_change_the_vocabulary_refresh_it(event, data, relevant):
+    assert ha_mod.vocab_relevant(event, data) is relevant
 
 
 def test_reconnect_hook_reestablishes_subscription():
