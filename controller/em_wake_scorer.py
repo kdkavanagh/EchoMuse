@@ -351,9 +351,12 @@ def probe_model(infer: Infer, spec: BcresnetSpec) -> dict[str, float]:
     return scores
 
 
-def validate_probe(scores: dict[str, float], near_miss: float) -> None:
+def validate_probe(scores: dict[str, float], ceiling: float) -> None:
+    """Reject a model whose silence/noise/tone probe scores are not all finite,
+    non-negative and below `ceiling`, the model's lowest threshold (its
+    `reference`): such a model would score non-speech as a wake."""
     if set(scores) != {"silence", "noise", "tone"}:
         raise ValueError("probe did not produce silence, noise, and tone scores")
     for name, value in scores.items():
-        if not math.isfinite(value) or not 0.0 <= value < near_miss:
-            raise ValueError(f"{name} probe score {value!r} is not finite and below {near_miss}")
+        if not math.isfinite(value) or not 0.0 <= value < ceiling:
+            raise ValueError(f"{name} probe score {value!r} is not finite and below {ceiling}")

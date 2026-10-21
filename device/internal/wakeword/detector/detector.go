@@ -100,6 +100,8 @@ func New(cb Callbacks) (*Detector, error) {
 		return nil, errors.New("detector: ProducingSound callback is required")
 	case cb.OnCandidate == nil, cb.OnCandidateEnd == nil:
 		return nil, errors.New("detector: candidate callbacks are required")
+	case cb.OnNearMiss == nil:
+		return nil, errors.New("detector: OnNearMiss callback is required")
 	case cb.OnStats == nil:
 		return nil, errors.New("detector: OnStats callback is required")
 	}

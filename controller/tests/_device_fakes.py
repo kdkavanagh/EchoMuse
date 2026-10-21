@@ -51,6 +51,7 @@ class FakeActor:
         self.attached = None
         self.afe_metadata: bool | None = None
         self.detached: list[str] = []
+        self.near_misses: list[tuple[Envelope, float]] = []   # (envelope, its wall time)
         self.listeners = []
 
     async def start(self) -> None: ...
@@ -69,6 +70,9 @@ class FakeActor:
 
     def on_audio(self, frame: bytes) -> None:
         self.audio.append(frame)
+
+    def on_near_miss(self, envelope: Envelope, wall) -> None:
+        self.near_misses.append((envelope, wall(int(envelope.body["mono_ns"]))))
 
     def button_turn(self, action: dict) -> None:
         self.turns.append(action)
@@ -272,8 +276,7 @@ class FakeStore:
 class FakeRegistry:
     def for_config(self, config):
         return SimpleNamespace(graph_sha256="g", sidecar_sha256="s",
-                               thresholds=SimpleNamespace(idle=0.9, playback=0.65,
-                                                          reference=0.3, near_miss=0.17))
+                               thresholds=SimpleNamespace(idle=0.9, playback=0.65, reference=0.3))
 
 
 class FakeAssets:

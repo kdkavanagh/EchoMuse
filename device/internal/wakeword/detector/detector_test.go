@@ -90,6 +90,7 @@ type harness struct {
 	cands     []detector.Candidate
 	ends      []detector.CandidateEnd
 	stats     []detector.Stats
+	nears     []detector.NearMissEvent
 	soundFrom uint64
 	soundTo   uint64
 }
@@ -119,6 +120,7 @@ func newRulesHarness(t *testing.T, results []result, th detector.Thresholds, rul
 		},
 		OnCandidate:    func(c detector.Candidate) { h.mu.Lock(); h.cands = append(h.cands, c); h.mu.Unlock() },
 		OnCandidateEnd: func(e detector.CandidateEnd) { h.mu.Lock(); h.ends = append(h.ends, e); h.mu.Unlock() },
+		OnNearMiss:     func(e detector.NearMissEvent) { h.mu.Lock(); h.nears = append(h.nears, e); h.mu.Unlock() },
 		OnStats:        func(s detector.Stats) { h.mu.Lock(); h.stats = append(h.stats, s); h.mu.Unlock() },
 		NowMonoNS:      func() int64 { return mono.Add(int64(time.Millisecond)) },
 		NewID:          func() string { return string(rune('A' + ids.Add(1))) },
@@ -164,6 +166,13 @@ func (h *harness) snapshot() ([]detector.Candidate, []detector.CandidateEnd, det
 	return append([]detector.Candidate(nil), h.cands...),
 		append([]detector.CandidateEnd(nil), h.ends...),
 		h.stats[len(h.stats)-1]
+}
+
+func (h *harness) nearMisses() []detector.NearMissEvent {
+	h.d.FlushStats()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]detector.NearMissEvent(nil), h.nears...)
 }
 
 func TestHopGridFirstWindowAndAcrossGap(t *testing.T) {
@@ -366,6 +375,83 @@ func TestNearMissEpisodes(t *testing.T) {
 	}
 	if st.InferMeanMS == nil || st.InferMaxMS == nil || st.WakeUnavailable != nil {
 		t.Fatalf("stats %+v", st)
+	}
+	// Only ep1 is reported, as wake.stats counts it.
+	nears := h.nearMisses()
+	if len(nears) != 1 {
+		t.Fatalf("near-miss events %+v", nears)
+	}
+	want := detector.NearMissEvent{
+		NearMissID: nears[0].NearMissID, CaptureEpoch: 7, GraphSHA256: graphSHA, Profile: detector.ProfileIdle,
+		Floor: 0.17, Peak: 0.3, SupportStart: 23040 - detector.WindowSamples, SupportEnd: 23040,
+		MonoNS: st.NearMisses[0].MonoNS, Reason: detector.ReasonBelow,
+	}
+	if nears[0] != want || want.NearMissID == "" || want.NearMissID == cands[0].CandidateID {
+		t.Fatalf("near-miss event %+v, want %+v", nears[0], want)
+	}
+}
+
+// nearMissSeq opens an episode at the hop ending 30,720, whose mean spans
+// the scores ending 25,600..30,720; the means stay at or above 0.17 through
+// 35,840 and fall below at 38,400 and 40,960. The values are exact in
+// binary, so the means compare exactly.
+func nearMissSeq() []result {
+	return scored(0.0625, 0.0625, 0.25, 0.5, 0.0625, 0.0625, 0.0625)
+}
+
+func TestNearMissEventSpan(t *testing.T) {
+	h := newHarness(t, nearMissSeq(), defaults())
+	h.profile.Store(detector.ProfilePlayback)
+	h.feed(18 + 14)
+	nears := h.nearMisses()
+	if len(nears) != 1 {
+		t.Fatalf("near-miss events %+v", nears)
+	}
+	e := nears[0]
+	if e.SupportStart != 25600-detector.WindowSamples || e.SupportEnd != 35840 || e.Peak != 0.8125/3 ||
+		e.Floor != 0.17 || e.Profile != detector.ProfilePlayback || e.CaptureEpoch != 7 || e.Reason != detector.ReasonBelow {
+		t.Fatalf("event %+v", e)
+	}
+}
+
+func TestNearMissFloorLatchedAcrossPolicy(t *testing.T) {
+	h := newHarness(t, nearMissSeq(), defaults())
+	h.feed(18 + 6) // through the opening hop at 30,720
+	// The 0.2083 mean at 35,840 is below the new floor but not the latched one.
+	if err := h.d.SetPolicy(detector.Thresholds{Idle: 0.90, Playback: 0.65, NearMiss: 0.30}, detector.Rules{}); err != nil {
+		t.Fatal(err)
+	}
+	h.feed(8)
+	nears := h.nearMisses()
+	if len(nears) != 1 || nears[0].Floor != 0.17 || nears[0].SupportEnd != 35840 {
+		t.Fatalf("near-miss events %+v", nears)
+	}
+}
+
+func TestNearMissEndedByInvalidation(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		act    func(h *harness)
+		reason detector.CloseReason
+	}{
+		{"gap", func(h *harness) { h.gap(1) }, detector.ReasonGap},
+		{"reset", func(h *harness) { h.d.Reset() }, detector.ReasonReset},
+		{"mute", func(h *harness) { h.d.SetMuted(true) }, detector.ReasonMute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Means of 0.5 hold the episode open without opening a candidate.
+			h := newHarness(t, scored(0.5), defaults())
+			h.feed(18 + 2)
+			tc.act(h)
+			nears := h.nearMisses()
+			if len(nears) != 1 || nears[0].Reason != tc.reason || nears[0].SupportEnd != 25600 || nears[0].Peak != 0.5 {
+				t.Fatalf("near-miss events %+v, want one ended %s", nears, tc.reason)
+			}
+			_, _, st := h.snapshot()
+			if len(st.NearMisses) != 1 {
+				t.Fatalf("near misses %+v", st.NearMisses)
+			}
+		})
 	}
 }
 

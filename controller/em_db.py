@@ -4,7 +4,7 @@ db.py — EchoMuse Controller persistence layer
 
 SQLite-backed storage for device registry, per-device config, logs,
 users, sessions, system configuration, and activity stats (voice turns,
-hourly wake/near-miss counters, hourly hardware metrics).
+near-miss episodes, hourly wake/near-miss counters, hourly hardware metrics).
 
 All public functions are synchronous — they are intended to be called
 from asyncio handlers via loop.run_in_executor() when called on the
@@ -173,6 +173,64 @@ class SessionRow:
         return cls(**{f.name: row[f.name] for f in fields(cls)})
 
 
+class NearMissEnd(StrEnum):
+    """`near_misses.end_reason`: the wake.near_miss `reason` (WIRE §4.4)."""
+    BELOW = "below"        # two consecutive scored hops below the floor
+    GAP = "gap"            # the wake.candidate_end invalidations
+    RESET = "reset"
+    MUTE = "mute"
+    OVERRUN = "overrun"
+
+
+class NearMissRecording(StrEnum):
+    """`near_misses.recording`: the episode's WAV, or why there is none."""
+    SAVED = "saved"
+    OFF = "off"                       # saveWakeClips off
+    NOT_PERMITTED = "not_permitted"   # capture not permitted, a diagnostic lease live, or muted
+    FAILED = "failed"                 # lease refused or ended short, epoch changed, or the write failed
+    PRUNED = "pruned"                 # saved, then removed by retention: derived on read, never stored
+
+
+@dataclass(frozen=True, slots=True)
+class NearMissRecord:
+    """One `near_misses` row as written (insert_near_miss). `recording` is
+    what the row keeps unless its audio is saved."""
+    ts: float
+    near_miss_uuid: str
+    profile: em_wake_rules.RuleProfile
+    floor: float
+    peak: float
+    wake_threshold: Optional[float]
+    wake_model_sha256: Optional[str]
+    duration_ms: int
+    end_reason: NearMissEnd
+    recording: NearMissRecording
+
+
+@dataclass(frozen=True, slots=True)
+class NearMissRow:
+    """`near_misses`."""
+    id: int
+    device_id: str
+    ts: float
+    near_miss_uuid: str
+    profile: str
+    floor: float
+    peak: float
+    wake_threshold: Optional[float]
+    wake_model_sha256: Optional[str]
+    duration_ms: int
+    end_reason: str
+    recording: NearMissRecording
+    audio_ms: Optional[int]
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> Self:
+        values = {f.name: row[f.name] for f in fields(cls)}
+        values["recording"] = NearMissRecording(row["recording"])
+        return cls(**values)
+
+
 # ─── Default device config ────────────────────────────────────────────────────
 
 # The deployed BCResNet graph (SPEC §5.1 [D1]); migration 22 makes it the
@@ -199,9 +257,14 @@ DEFAULT_DEVICE_CONFIG: DeviceConfig = {
     # Dialog ducks content by this much (§6.2); also the provisional-duck depth
     # of a wake candidate over content (§16.1).
     "duckDb": -18.0,
-    # Active wake graph: a WakeRegistry SHA-256 (§5.1). Thresholds belong to
-    # the registry entry.
+    # Active wake graph: a WakeRegistry SHA-256 (§5.1). Its open thresholds
+    # belong to the registry entry.
     "wakeModel":        DEPLOYED_WAKE_MODEL,
+    # Near-miss floor (BCResNet 3-window smoothed score), sent as
+    # `session.ready` `detector.thresholds.near_miss`: an episode at or above
+    # it that opens no candidate is a near miss, counted and (`near_miss_v1`)
+    # listed with its recording. 0.05–0.60, two decimals at most.
+    "nearMissThreshold": em_config_sections.NEAR_MISS_THRESHOLD_DEFAULT,
     # Multi-device wake suppression window (ms): the first claimant answers,
     # others within the window stand down (em_arbiter, §5.3). 0 disables.
     "wakeArbitrationMs": 700,
@@ -289,7 +352,9 @@ DEFAULT_DEVICE_CONFIG: DeviceConfig = {
 }
 
 # Keys deleted from every config scope; the API rejects them by name.
-# v22: the pre-cutover wake/endpoint keys (SPEC §18.4).
+# v22: the pre-cutover wake/endpoint keys (SPEC §18.4). Its `nearMissThreshold`
+# was an openWakeWord-scale floor; the key returned as the BCResNet near-miss
+# floor, so v22 still deletes the old values but the API accepts the key.
 _V22_REMOVED_KEYS: frozenset[str] = frozenset({
     "owwModel", "owwThreshold", "bargeInThreshold", "nearMissThreshold",
     "owwOnDevice", "owwSpeexNs", "bargeInEnabled",
@@ -306,7 +371,8 @@ _V23_REMOVED_KEYS: frozenset[str] = frozenset({
 # v31: the reply onset gate. A reply turn opens at the question's drain and the
 # ordinary endpoint reducer finds the answer (§16.6), so nothing reads it.
 _V31_REMOVED_KEYS: frozenset[str] = frozenset({"replyOnset"})
-REMOVED_CONFIG_KEYS: frozenset[str] = _V22_REMOVED_KEYS | _V23_REMOVED_KEYS | _V31_REMOVED_KEYS
+REMOVED_CONFIG_KEYS: frozenset[str] = (
+    (_V22_REMOVED_KEYS - {"nearMissThreshold"}) | _V23_REMOVED_KEYS | _V31_REMOVED_KEYS)
 
 # Maximum log rows retained per device. Older rows are pruned on insert.
 LOG_RETENTION = 10_000
@@ -325,6 +391,10 @@ WAKE_COUNTER_RETENTION_DAYS = 180
 
 # Newest wake_shadow_events rows kept per device (pruned on insert).
 WAKE_SHADOW_EVENT_RETENTION = 2_000
+
+# Newest near_misses rows kept per device (pruned on insert). Their WAVs keep
+# a shorter window (em_recordings.KEEP_NEAR_MISS_PER_DEVICE).
+NEAR_MISS_RETENTION = 2_000
 
 # ─── Migrations ───────────────────────────────────────────────────────────────
 #
@@ -1128,6 +1198,38 @@ MIGRATIONS: list[str] = [
     """
     ALTER TABLE devices ADD COLUMN kiosk_token TEXT;
     UPDATE system_config SET value = '35' WHERE key = 'schema_version';
+    """,
+
+    # ── v36 — near-miss episodes ─────────────────────────────────────────────
+    #
+    # One row per wake.near_miss (near_miss_v1): a smoothed wake score reached
+    # the device's near-miss floor and no candidate opened. `ts` is the
+    # episode's open on the controller's wall clock; `floor`/`peak` the
+    # device's numbers; `wake_threshold` the open threshold of the episode's
+    # profile and `wake_model_sha256` the graph, as that session's ready named
+    # them; `duration_ms` the support span; `end_reason` how it ended (below,
+    # or the invalidation). `recording` is NearMissRecording: `saved` only once
+    # the em_recordings NEAR_MISS file was written (`audio_ms` its length),
+    # else why there is none. wake_counters keeps the hourly counts as before.
+    # NEAR_MISS_RETENTION rows per device.
+    """
+    CREATE TABLE IF NOT EXISTS near_misses (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        device_id         TEXT    NOT NULL,
+        ts                REAL    NOT NULL,
+        near_miss_uuid    TEXT    NOT NULL,
+        profile           TEXT    NOT NULL,
+        floor             REAL    NOT NULL,
+        peak              REAL    NOT NULL,
+        wake_threshold    REAL,
+        wake_model_sha256 TEXT,
+        duration_ms       INTEGER NOT NULL,
+        end_reason        TEXT    NOT NULL,
+        recording         TEXT    NOT NULL,
+        audio_ms          INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_near_misses_device_ts ON near_misses (device_id, ts);
+    UPDATE system_config SET value = '36' WHERE key = 'schema_version';
     """,
 ]
 
@@ -2419,6 +2521,44 @@ def get_turns(
             rec[col] = row[col]
         out.append(rec)
     return out
+
+
+def insert_near_miss(device_id: str, rec: NearMissRecord) -> int:
+    """Persist one near-miss episode; returns its rowid (the recording is named
+    by it). Prunes to the newest NEAR_MISS_RETENTION rows per device."""
+    with _tx() as conn:
+        cur = conn.execute(
+            "INSERT INTO near_misses (device_id, ts, near_miss_uuid, profile, floor, peak, wake_threshold, "
+            "wake_model_sha256, duration_ms, end_reason, recording) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (device_id, rec.ts, rec.near_miss_uuid, rec.profile, rec.floor, rec.peak, rec.wake_threshold,
+             rec.wake_model_sha256, rec.duration_ms, rec.end_reason, rec.recording),
+        )
+        conn.execute(
+            "DELETE FROM near_misses WHERE device_id = ? AND id NOT IN ("
+            "SELECT id FROM near_misses WHERE device_id = ? ORDER BY id DESC LIMIT ?)",
+            (device_id, device_id, NEAR_MISS_RETENTION),
+        )
+        return _rowid(cur)
+
+
+def set_near_miss_saved(near_miss_id: int, audio_ms: int) -> None:
+    """Mark a near miss's recording written: `saved`, `audio_ms` long."""
+    with _tx() as conn:
+        conn.execute(
+            "UPDATE near_misses SET recording = ?, audio_ms = ? WHERE id = ?",
+            (NearMissRecording.SAVED, audio_ms, near_miss_id),
+        )
+
+
+def get_near_misses(device_id: str, limit: int = 50, since: Optional[float] = None) -> list[NearMissRow]:
+    """A device's newest `limit` near misses (from `since`, epoch s), oldest first."""
+    if since is not None:
+        rows = _q("SELECT * FROM near_misses WHERE device_id = ? AND ts >= ? ORDER BY ts DESC LIMIT ?",
+                  (device_id, since, limit))
+    else:
+        rows = _q("SELECT * FROM near_misses WHERE device_id = ? ORDER BY ts DESC LIMIT ?",
+                  (device_id, limit))
+    return [NearMissRow.from_row(r) for r in reversed(rows)]
 
 
 def get_text_fix_history(limit: int, before_id: Optional[int] = None) -> list[tuple[int, float, str, Optional[str]]]:

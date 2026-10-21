@@ -333,11 +333,12 @@ func (e *Executor) AcceptCandidate(leaseID string, accepted bool) {
 	e.Notify()
 }
 
-// Open applies uplink.open for a turn, reply or diagnostic lease. The afe
-// stream is a valid key only in a session that opted into it.
+// Open applies uplink.open for a turn, reply, diagnostic or near-miss
+// lease. The afe stream is a valid key only in a session that opted into
+// it.
 func (e *Executor) Open(env proto.Envelope, b proto.UplinkOpen) error {
 	switch b.Reason {
-	case proto.LeaseTurn, proto.LeaseReply, proto.LeaseDiagnostic:
+	case proto.LeaseTurn, proto.LeaseReply, proto.LeaseDiagnostic, proto.LeaseNearMiss:
 	default:
 		return ErrInvalid
 	}

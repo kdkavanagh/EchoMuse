@@ -82,6 +82,10 @@ const (
 	// frames. On session.ready's afe_metadata the device announces the afe
 	// stream, serves it under leases and reports wake.stats.afe.
 	CapAFEMetadata Capability = "afe_metadata_v1"
+	// CapNearMiss: the device reports every near-miss episode (the smoothed
+	// score reached session.ready's near_miss floor and no candidate opened)
+	// in wake.near_miss and serves uplink leases with reason near_miss.
+	CapNearMiss Capability = "near_miss_v1"
 
 	// Optional platform capabilities. A device announces each only where
 	// the firmware implements it on the image it runs.
@@ -171,6 +175,9 @@ const (
 	TypeWakeCandidate    MessageType = "wake.candidate"
 	TypeWakeCandidateEnd MessageType = "wake.candidate_end"
 	TypeWakeStats        MessageType = "wake.stats"
+	// TypeWakeNearMiss is D→C, generation 0, sent only in a session: one
+	// closed near-miss episode (near_miss_v1).
+	TypeWakeNearMiss MessageType = "wake.near_miss"
 
 	TypeUplinkOpen  MessageType = "uplink.open"
 	TypeUplinkRenew MessageType = "uplink.renew"
@@ -551,6 +558,10 @@ const (
 	LeaseTurn       LeaseReason = "turn"
 	LeaseReply      LeaseReason = "reply"
 	LeaseDiagnostic LeaseReason = "diagnostic"
+	// LeaseNearMiss uploads a near-miss episode's microphone audio
+	// (near_miss_v1). It has no other effect: no duck, no focus, and it is
+	// not a diagnostic lease.
+	LeaseNearMiss LeaseReason = "near_miss"
 )
 
 // CloseReason is an uplink.close reason.

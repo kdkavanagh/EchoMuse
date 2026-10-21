@@ -55,7 +55,9 @@ device's firmware does not announce is shown disabled with the reason.
   appears when the proxy is on.
 - **Activity** — the voice-turn history: what was heard, the transcript, how
   the turn ended, and the audio of each turn when **Save utterances** or
-  **Save wake clips** is on. The header names the wake model with its idle and
+  **Save wake clips** is on. Near misses are listed among the turns (see
+  [Near-miss floor](#near-miss-floor)); the **Near misses** pill shows or
+  hides them. The header names the wake model with its idle and
   playback thresholds, and a counter shows **Refused wakes**. Each turn that
   played a reply shows its response latency (`↦1.9s`, the same measure as on
   Status). A turn whose answer asked a follow-up question is marked `?`
@@ -151,7 +153,7 @@ The default wake word is **Ophelia**.
 ### Wake model
 
 The section shows one tile per model in the controller's wake-model registry:
-its wake phrase, the short hashes of its graph and sidecar files, its four
+its wake phrase, the short hashes of its graph and sidecar files, its three
 thresholds, and its validation probe result. The model in use is highlighted
 and marked `active`. Click another tile to select it, then save.
 
@@ -175,26 +177,27 @@ setting names a model the registry does not have.
 | **JSON sidecar** | Its `.json` sidecar (up to 64 KiB) describing input, labels and normalisation. |
 | **Wake phrase** | The word as it appears in transcripts, lowercase letters only (`ophelia`). The controller removes it from the transcript text before Home Assistant's conversation agent sees the request; the audio is never cut. |
 | **Verification core** | The part of the word the controller must find in the recognised speech to confirm a wake heard while the Dot was making sound, lowercase letters only (`ophel`). |
-| **idle, playback, reference, near miss** | The model's thresholds, each between 0 and 1. The form starts with the values of the built-in model. |
+| **idle, playback, reference** | The model's thresholds, each between 0 and 1. The form starts with the values of the built-in model. |
 
 **Validate & add** checks that the graph and sidecar agree, runs the model on
 silence, noise and a tone, and requires every probe score to stay below the
-near-miss threshold. A model that passes is added but **not** selected; select
+reference threshold. A model that passes is added but **not** selected; select
 it yourself when you are ready.
 
 Thresholds belong to the model because scores mean different things for
-different models. They must satisfy near miss < reference ≤ playback ≤ idle:
+different models. They must satisfy reference ≤ playback ≤ idle:
 
 | Threshold | Used for | Built-in model |
 |---|---|---:|
 | **idle** | Wake threshold while nothing is playing, including while the Dot speaks a response | 0.90 |
 | **playback** | Wake threshold while music plays or an alarm or timer rings | 0.65 |
 | **reference** | Controller-side threshold for spotting the wake word in what the Dot itself played | 0.30 |
-| **near miss** | Scores at or above this that do not become a wake are counted as near misses | 0.17 |
 
 Thresholds are fixed when a model is added. Uploading the same graph again
 returns the existing entry unchanged. To change a model's thresholds, select a
 different model, delete this one, and upload it again with the new values.
+The near-miss floor is not a model threshold; it is its own setting,
+[Near-miss floor](#near-miss-floor).
 
 ### Wake health (Status tab)
 
@@ -258,23 +261,52 @@ answering.
 ### Save wake clips
 
 Keeps the audio of each accepted wake: from 300 ms before the stretch the
-model scored to the end of the last window that crossed the threshold. Off by
-default.
+model scored to the end of the last window that crossed the threshold. It
+also records each [near miss](#near-miss-floor). Off by default.
 
 This answers *what woke it?* When a Dot answers a room nobody was talking to,
 the Activity row says a wake happened; the clip lets you hear the sound that
-caused it — a line of TV dialogue, a name that rhymes, a jingle. Those clips
-are the material for training a better model.
+caused it — a line of TV dialogue, a name that rhymes, a jingle. A near-miss
+clip answers the opposite question, *why didn't it wake?* Those clips are the
+material for training a better model.
 
 Each turn with a clip gets an amber ▷ (play) and ⤓ (download the WAV) in
-**Activity**. **Download wake clips (.zip)** above the list gives the device's
-whole set as one archive.
+**Activity**, and so does each recorded near miss. **Download wake clips
+(.zip)** above the list gives the device's whole set of wake clips as one
+archive.
 
-Nothing extra is recorded to make a clip: it is cut from audio the controller
-already received for that wake. The newest **500 clips per device** are kept.
-Turning the setting off stops new clips but keeps the saved ones until newer
-clips push them out or you delete the device. To clear them sooner, delete the
-files in the `wakes/` folder beside the controller's database.
+Nothing extra is recorded to make a wake clip: it is cut from audio the
+controller already received for that wake. A near miss is different: the Dot
+uploads nothing for it unless this setting is on, and then only its few
+seconds, from 300 ms before the stretch the model scored to 300 ms after the
+last score at or above the floor, at most the Dot's last 6 seconds. The newest
+**500 wake clips** and **200 near-miss clips per device** are kept. Turning
+the setting off stops new clips but keeps the saved ones until newer clips
+push them out or you delete the device. To clear them sooner, delete the
+files in the `wakes/` and `nearmiss_recordings/` folders beside the
+controller's database.
+
+### Near-miss floor
+
+A **near miss** is a moment the model scored the wake word at or above this
+floor without reaching the wake threshold, so the Dot did not wake. Default
+**0.17**, from 0.05 to 0.60.
+
+Each near miss appears in **Activity** among the turns, marked `near miss`:
+when it happened, its peak score against the floor and the wake threshold it
+missed, whether the Dot was idle or playing, how long it lasted and, with
+**Save wake clips** on, its recording. Without the recording the row says why:
+the setting was off, capture was not permitted (privacy mute, a recording
+mode), the recording failed, or the clip has since been pushed out by newer
+ones. **Near misses** and **Near-miss peak** on the Status tab's
+[Wake health](#wake-health-status-tab) count them per 30-second report. The
+controller keeps each Echo's newest 2,000 near misses.
+
+Raise the floor in a noisy room, where ordinary sound reaches it often; lower
+it to hear quieter attempts. It changes only what is listed and recorded,
+never what wakes the Dot. Saving a new value reconnects the affected Echos,
+which takes a few seconds. Echos on firmware older than the controller's show
+*firmware update available* in place of the near-miss rows.
 
 ### Arbitration window
 
@@ -973,6 +1005,7 @@ Once the whole fleet shows `wss (TLS)`, set `REQUIRE_DEVICE_TLS=1`.
 | Wake word | model tiles | `wakeModel` | the built-in Ophelia model (`4eb74512…`) |
 | Wake word | Wake chime | `wakeSound` | off |
 | Wake word | Save wake clips | `saveWakeClips` | off |
+| Wake word | Near-miss floor | `nearMissThreshold` | 0.17 |
 | Wake word | Arbitration window | `wakeArbitrationMs` | 700 ms |
 | Wake word | Open rules | `wakeOpenRules` | none (only the model's own rules) |
 | Wake word | Shadow rules | `wakeShadowRules` | five idle rules (see [Shadow rules](#shadow-rules)) |

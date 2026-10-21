@@ -1197,6 +1197,7 @@ class LeaseReason(enum.StrEnum):
     TURN = "turn"
     REPLY = "reply"
     DIAGNOSTIC = "diagnostic"
+    NEAR_MISS = "near_miss"     # records a wake.near_miss's span; nothing else on the device
 
 
 class AckState(enum.StrEnum):
@@ -1359,7 +1360,7 @@ class LeaseTable:
 
     def open(self, lease_id: str, reason: LeaseReason, owner: str, capture_epoch: int,
              streams: Mapping[StreamId, int | None], ttl_ms: int = LEASE_TTL_MS) -> tuple[Lease, LeaseMessage]:
-        """A controller-opened lease (`turn`, `reply`, `diagnostic`)."""
+        """A controller-opened lease (`turn`, `reply`, `diagnostic`, `near_miss`)."""
         reason = LeaseReason(reason)
         if reason is LeaseReason.CANDIDATE:
             raise LeaseError("candidate leases are opened by the device")

@@ -54,7 +54,7 @@ func (s *Supervisor) Hello() proto.SessionHello {
 	}
 	caps = append(caps, s.platformCaps...)
 	caps = append(caps, proto.CapAlertPrefetch, proto.CapLocalWakeChime, proto.CapNoInputChime,
-		proto.CapAnnouncementChime, proto.CapOpenRules)
+		proto.CapAnnouncementChime, proto.CapOpenRules, proto.CapNearMiss)
 	if s.cfg.AmbientReadable() {
 		caps = append(caps, proto.CapAmbientLight)
 	}

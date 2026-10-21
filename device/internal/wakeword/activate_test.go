@@ -66,6 +66,7 @@ func newFixture(t *testing.T) *fixture {
 		ProducingSound: func(uint64, uint64) bool { return false },
 		OnCandidate:    func(detector.Candidate) {},
 		OnCandidateEnd: func(detector.CandidateEnd) {},
+		OnNearMiss:     func(detector.NearMissEvent) {},
 		OnStats:        func(s detector.Stats) { f.mu.Lock(); f.stats = append(f.stats, s); f.mu.Unlock() },
 	})
 	if err != nil {

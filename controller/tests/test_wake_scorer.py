@@ -177,7 +177,7 @@ def test_deployed_fixture_scores_probe_signals_in_the_measured_range():
     assert set(scores) == {"silence", "noise", "tone"}
     for value in scores.values():
         assert 0.0033 - 5e-5 <= value <= 0.0106 + 5e-5
-    ws.validate_probe(scores, 0.17)
+    ws.validate_probe(scores, 0.30)
 
 
 def test_onnx_infer_refuses_sidecar_with_wrong_label_count(tmp_path):

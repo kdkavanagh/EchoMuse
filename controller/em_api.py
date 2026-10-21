@@ -444,6 +444,8 @@ async def create_app(services: ControllerServices) -> web.Application:
     app.router.add_get("/api/devices/{id}/turns/{turn}/recording", _get_turn_recording)
     app.router.add_get("/api/devices/{id}/turns/{turn}/afe",   _get_turn_afe_series)
     app.router.add_get("/api/devices/{id}/turns/{turn}/trace", _get_turn_decision_trace)
+    app.router.add_get("/api/devices/{id}/near_misses",   _get_device_near_misses)
+    app.router.add_get("/api/devices/{id}/near_misses/{nm}/recording", _get_near_miss_recording)
     # Wake clips — the pre-detection audio that crossed the threshold. The
     # per-turn WAV sits beside the turn's utterance because that is the pair
     # you look at together; the archive and the purge are device-wide.
@@ -954,6 +956,77 @@ def _slug(text: str) -> str:
     """Lowercase ASCII slug, safe for a Content-Disposition filename."""
     out = re.sub(r"[^A-Za-z0-9]+", "-", text).strip("-").lower()
     return out or "device"
+
+
+@auth.require_auth
+async def _get_device_near_misses(request: web.Request) -> web.Response:
+    """GET /api/devices/{id}/near_misses — recent near misses (a wake score
+    reached the near-miss floor and no candidate opened), newest last, for
+    the Activity tab beside the turns.
+
+    Query params: limit (default 50, max 1000), since (epoch seconds).
+    `recording` is `pruned` for a saved recording retention has since
+    removed (em_recordings.KEEP_NEAR_MISS_PER_DEVICE)."""
+    device_id = request.match_info["id"]
+    try:
+        limit = min(int(request.query.get("limit", 50)), 1000)
+        raw_since = request.query.get("since")
+        since = float(raw_since) if raw_since is not None else None
+    except ValueError:
+        return _error(ErrorCode.BAD_REQUEST, "limit/since must be numeric", 400)
+    loop = asyncio.get_running_loop()
+    rows = await loop.run_in_executor(None, lambda: [_near_miss_json(r) for r in db.get_near_misses(
+        device_id, limit, since)])
+    return _ok(rows)
+
+
+def _near_miss_json(row: db.NearMissRow) -> dict[str, object]:
+    """A near_misses row for the dashboard; blocking (a saved recording is
+    checked on disk)."""
+    recording, audio_ms = row.recording, row.audio_ms
+    if recording == db.NearMissRecording.SAVED and _near_miss_path(row.device_id, row.id) is None:
+        recording, audio_ms = db.NearMissRecording.PRUNED, None
+    return {
+        "id": row.id, "ts": row.ts, "near_miss_uuid": row.near_miss_uuid, "profile": row.profile,
+        "floor": row.floor, "peak": row.peak, "wake_threshold": row.wake_threshold,
+        "wake_model_sha256": row.wake_model_sha256, "duration_ms": row.duration_ms,
+        "end_reason": row.end_reason, "recording": recording, "audio_ms": audio_ms,
+    }
+
+
+def _near_miss_path(device_id: str, near_miss_id: int) -> Path | None:
+    """The near miss's saved WAV, named by (device, row id) and resolved with the
+    device-ownership check, as turn recordings are."""
+    name = em_recordings.filename(device_id, near_miss_id)
+    return (em_recordings.resolve(device_id, name, kind=em_recordings.RecordingKind.NEAR_MISS)
+            if name else None)
+
+
+@auth.require_auth
+async def _get_near_miss_recording(request: web.Request) -> web.StreamResponse:
+    """GET /api/devices/{id}/near_misses/{nm}/recording — a near miss's
+    support span ±300 ms as a WAV. Only near misses heard while saveWakeClips
+    was on have one, and only the newest
+    em_recordings.KEEP_NEAR_MISS_PER_DEVICE per device survive, so a 404
+    here is an ordinary outcome, not an error state."""
+    device_id = request.match_info["id"]
+    try:
+        near_miss_id = int(request.match_info["nm"])
+    except ValueError:
+        return _error(ErrorCode.BAD_REQUEST, "near miss must be an integer", 400)
+    row = await _device_row(device_id)
+    path = await asyncio.get_running_loop().run_in_executor(None, _near_miss_path, device_id, near_miss_id)
+    if path is None:
+        return _error(ErrorCode.NO_RECORDING, "No saved audio for this near miss", 404)
+    label = _slug(row.label or device_id)
+    return web.FileResponse(
+        path,
+        headers={
+            "Content-Type":        "audio/wav",
+            "Content-Disposition": f'attachment; filename="{label}-nearmiss{near_miss_id}.wav"',
+            "Cache-Control":       "private, max-age=60",
+        },
+    )
 
 
 # ─── Wake-word sample collection ──────────────────────────────────────────────
@@ -1811,7 +1884,8 @@ def _validate_config(values: Mapping[str, object],
         if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 3600:
             return _error(ErrorCode.INVALID_CONFIG,
                           "timerRingSeconds must be an integer from 1 through 3600", 400)
-    message = sections_mod.screen_wake_error(values) or sections_mod.kiosk_error(values)
+    message = (sections_mod.near_miss_error(values) or sections_mod.screen_wake_error(values)
+               or sections_mod.kiosk_error(values))
     if message is not None:
         return _error(ErrorCode.INVALID_CONFIG, message, 400)
     return None
@@ -2525,7 +2599,7 @@ async def _read_part(field: aiohttp.BodyPartReader, limit: int) -> bytes | None:
 
 
 # The multipart text fields of a wake model upload, all required.
-_WAKE_MODEL_TEXT_FIELDS = frozenset({"idle", "playback", "reference", "near_miss",
+_WAKE_MODEL_TEXT_FIELDS = frozenset({"idle", "playback", "reference",
                                      "wake_phrase", "verify_core"})
 
 
@@ -2572,7 +2646,7 @@ async def _post_wake_model_upload(request: web.Request) -> web.Response:
     try:
         thresholds = em_wake_registry.Thresholds(
             idle=float(text["idle"]), playback=float(text["playback"]),
-            reference=float(text["reference"]), near_miss=float(text["near_miss"]),
+            reference=float(text["reference"]),
         )
     except (TypeError, ValueError, em_wake_registry.RegistryError) as exc:
         return _error(ErrorCode.INVALID_MODEL, str(exc), 400)

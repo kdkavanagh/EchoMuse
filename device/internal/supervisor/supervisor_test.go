@@ -1017,7 +1017,7 @@ func TestAlertFocusRoutesDACAndVolumeButtons(t *testing.T) {
 func TestHelloCapabilities(t *testing.T) {
 	common := []proto.Capability{"audio_timeline_v1", "uplink_leases_v1", "device_wake_v1", "render_reference_v1",
 		"render_progress_v1", "focus_leases_v1", "alert_cache_v1", "turn_protocol_v1",
-		"alert_prefetch", "local_wake_chime", "no_input_chime", "announcement_chime", "open_rules_v1"}
+		"alert_prefetch", "local_wake_chime", "no_input_chime", "announcement_chime", "open_rules_v1", "near_miss_v1"}
 	for _, tc := range []struct {
 		name     string
 		o        opts

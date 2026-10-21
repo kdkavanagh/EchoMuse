@@ -171,6 +171,12 @@ func (s *Supervisor) onCandidateEnd(e detector.CandidateEnd) {
 	s.logSend(proto.TypeWakeCandidateEnd, 1, e)
 }
 
+// onNearMiss reports a closed near-miss episode in wake.near_miss
+// (near_miss_v1). With no session it is dropped; wake.stats still counts it.
+func (s *Supervisor) onNearMiss(e detector.NearMissEvent) {
+	s.logSend(proto.TypeWakeNearMiss, 0, e)
+}
+
 // onStats reports wake.stats, with the AFE decoder's health in an
 // afe_metadata_v1 session; the AFE window follows the detector's.
 func (s *Supervisor) onStats(st detector.Stats) {

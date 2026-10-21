@@ -334,3 +334,26 @@ def test_wake_stats_windows_accumulate_into_the_hour(fresh_db):
     assert r.near_miss_max == 0.31
     assert r.dev_max_score == 0.93
     assert r.dev_max_infer_ms == 131
+
+
+def test_the_near_miss_list_shows_a_saved_recording_retention_removed_as_pruned(fresh_db, tmp_path, monkeypatch):
+    em_api = pytest.importorskip("em_api")
+    import em_recordings
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))       # recordings sit beside it
+
+    def record(ts, recording):
+        return db.NearMissRecord(
+            ts=ts, near_miss_uuid=f"n{ts:g}", profile=db.em_wake_rules.RuleProfile.PLAYBACK, floor=0.2,
+            peak=0.4, wake_threshold=0.65, wake_model_sha256=None, duration_ms=800,
+            end_reason=db.NearMissEnd.GAP, recording=recording)
+
+    kept, pruned = (db.insert_near_miss("dev1", record(ts, db.NearMissRecording.FAILED)) for ts in (1.0, 2.0))
+    off = db.insert_near_miss("dev1", record(3.0, db.NearMissRecording.OFF))
+    em_recordings.save("dev1", kept, b"\x00\x00" * 9_600, kind=em_recordings.RecordingKind.NEAR_MISS)
+    for row_id in (kept, pruned):              # `pruned`'s file has since gone
+        db.set_near_miss_saved(row_id, 600)
+    out = [em_api._near_miss_json(r) for r in db.get_near_misses("dev1")]
+    assert [(o["id"], o["recording"], o["audio_ms"]) for o in out] == [
+        (kept, "saved", 600), (pruned, "pruned", None), (off, "off", None)]
+    assert (out[0]["profile"], out[0]["end_reason"], out[0]["wake_model_sha256"]) == ("playback", "gap", None)
+    assert em_api._near_miss_path("dev2", kept) is None               # another device's row id

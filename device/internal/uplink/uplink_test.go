@@ -213,6 +213,36 @@ func TestOpenRoundsStartsToGridsAndClipsToRing(t *testing.T) {
 	}
 }
 
+// A near_miss lease is served from the ring like a turn lease, and is not
+// a diagnostic lease. uplink.open refuses any other reason.
+func TestNearMissLeaseBackfillsMic(t *testing.T) {
+	h := newHarness(t)
+	h.appendMic(40) // 51,200 samples
+	must(t, h.e.Open(proto.Envelope{Generation: 1}, proto.UplinkOpen{
+		LeaseID: "N", Owner: "nm-1", Reason: proto.LeaseNearMiss, Streams: map[proto.StreamID]string{"mic": "20480"}, TTLMs: 3000}))
+	if h.e.DiagnosticLive() {
+		t.Fatal("near_miss lease counted as diagnostic")
+	}
+	h.e.step()
+	if first, end := span(t, byKind(h.frames(), ema.KindMic), ema.MaxUplinkPCMFrames); first != 20480 || end != 51200 {
+		t.Fatalf("mic backfill [%d, %d)", first, end)
+	}
+	if _, err := h.e.Close(proto.Envelope{Generation: 1}, proto.UplinkClose{LeaseID: "N", Reason: proto.CloseClosed}); err != nil {
+		t.Fatal(err)
+	}
+	if msgs := h.ended(); len(msgs) != 1 || msgs[0].body.Reason != proto.EndedClosed || msgs[0].body.LastSample["mic"] != u64(51199) {
+		t.Fatalf("ended %+v", msgs)
+	}
+
+	for _, reason := range []proto.LeaseReason{proto.LeaseCandidate, "unknown"} {
+		err := h.e.Open(proto.Envelope{Generation: 1}, proto.UplinkOpen{
+			LeaseID: "X", Owner: "x", Reason: reason, Streams: map[proto.StreamID]string{"mic": "live"}, TTLMs: 3000})
+		if !errors.Is(err, ErrInvalid) {
+			t.Fatalf("reason %q: %v", reason, err)
+		}
+	}
+}
+
 func TestReferenceStartOutsideClockFitIsClipped(t *testing.T) {
 	h := newHarness(t)
 	h.appendMic(1)

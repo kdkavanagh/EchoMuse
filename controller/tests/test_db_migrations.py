@@ -32,7 +32,7 @@ def _v21_db(tmp_path):
     for sql in em_db.MIGRATIONS[:21]:
         c.executescript(sql)
     fleet = {
-        "owwModel": "ophelia-bcresnet", "owwThreshold": 0.77,
+        "owwModel": "ophelia-bcresnet", "owwThreshold": 0.77, "nearMissThreshold": 0.4,
         "bargeInEnabled": False, "maxSpeechMs": 0,
         "timerSound": "chime", "timerRingSeconds": 60,
         "timerRingGapSeconds": 3.0,
@@ -44,7 +44,7 @@ def _v21_db(tmp_path):
         "VALUES (?,?,?,?,?,0)",
         ("short", "Short", 1, json.dumps({
             "maxSpeechMs": 15_000, "timerSound": "beep",
-            "timerRingSeconds": 60, "owwModel": "old",
+            "timerRingSeconds": 60, "owwModel": "old", "nearMissThreshold": 0.3,
         }), json.dumps(["wakeword", "microphones", "timers"])),
     )
     c.execute(
@@ -189,6 +189,8 @@ def test_v22_upgrades_configs_and_exports_effective_sounds(tmp_path, monkeypatch
     assert configs["long"]["extendedUtterances"] is True
     assert configs["long"]["timerRingSeconds"] == 120
     assert not any(em_db.REMOVED_CONFIG_KEYS & cfg.keys() for cfg in configs.values())
+    # The openWakeWord-scale near-miss floors go; the BCResNet key is a default again.
+    assert "nearMissThreshold" not in fleet and "nearMissThreshold" not in configs["short"]
     expected_dir = em_db.em_sounds.sounds_dir(p)
     assert set(exported) == {
         ("default", expected_dir), ("beep", expected_dir), ("chime", expected_dir),
@@ -380,6 +382,36 @@ def test_v34_adds_the_correction_record_and_history_reads_only_what_ha_answered(
             "Plate cherub rock.", "play cherub rock", "watch plex"]
         assert em_db.get_turns("D", limit=1)[0]["stt_fix"] is None
         assert json.loads(em_db.get_turns("D", limit=6)[0]["stt_fix"])["sent"] == "play cherub rock"
+    finally:
+        em_db._conn.close()
+        em_db._conn = None
+
+
+def test_v36_adds_near_misses_kept_newest_per_device_and_saved_only_once_marked(tmp_path, monkeypatch):
+    p = str(tmp_path / "v35.db")
+    c = sqlite3.connect(p)
+    for sql in em_db.MIGRATIONS[:35]:
+        c.executescript(sql)
+    c.close()
+    monkeypatch.setattr(em_db, "NEAR_MISS_RETENTION", 2)
+
+    def record(ts):
+        return em_db.NearMissRecord(
+            ts=ts, near_miss_uuid=f"n{ts:g}", profile=em_db.em_wake_rules.RuleProfile.IDLE, floor=0.17,
+            peak=0.31, wake_threshold=0.9, wake_model_sha256="g" * 64, duration_ms=1_400,
+            end_reason=em_db.NearMissEnd.BELOW, recording=em_db.NearMissRecording.FAILED)
+
+    em_db.init(p)
+    try:
+        ids = [em_db.insert_near_miss("D", record(ts)) for ts in (1.0, 2.0, 3.0)]
+        em_db.insert_near_miss("E", record(4.0))           # another device's rows are its own
+        em_db.set_near_miss_saved(ids[2], 1_900)
+        rows = em_db.get_near_misses("D")
+        assert [(r.id, r.ts) for r in rows] == [(ids[1], 2.0), (ids[2], 3.0)]   # oldest first, newest 2 kept
+        assert [(r.recording, r.audio_ms) for r in rows] == [
+            (em_db.NearMissRecording.FAILED, None), (em_db.NearMissRecording.SAVED, 1_900)]
+        assert [r.ts for r in em_db.get_near_misses("D", since=2.5)] == [3.0]
+        assert [r.near_miss_uuid for r in em_db.get_near_misses("E")] == ["n4"]
     finally:
         em_db._conn.close()
         em_db._conn = None

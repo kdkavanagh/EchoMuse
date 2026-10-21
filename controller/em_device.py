@@ -141,15 +141,16 @@ _NOT_ON_PLATFORM: dict[DevicePlatform, dict[Capability, CapabilityGap]] = {
 }
 # Optional capabilities newer than some firmware in the field on each
 # platform that has them: absent there, the bundled firmware brings them.
+# near_miss_v1 is the firmware's on every image.
 _PLATFORM_OPTIONAL: dict[DevicePlatform, frozenset[Capability]] = {
     DevicePlatform.FIREOS6: frozenset({
-        Capability.WIFI_CONTROL, Capability.BLE_PROXY, Capability.PRIVACY_MUTE,
+        Capability.WIFI_CONTROL, Capability.BLE_PROXY, Capability.PRIVACY_MUTE, Capability.NEAR_MISS,
     }),
-    DevicePlatform.FIREOS6_CROWN: frozenset({Capability.SCREEN_WAKE}),
+    DevicePlatform.FIREOS6_CROWN: frozenset({Capability.SCREEN_WAKE, Capability.NEAR_MISS}),
     DevicePlatform.LINEAGE18_CROWN: frozenset({
         Capability.SCREEN_WAKE, Capability.LEDS, Capability.LED_ANIM,
         Capability.BUTTONS, Capability.BUTTON_HOLD, Capability.SCREEN_OVERLAY,
-        Capability.TURN_VIEW, Capability.TIMER_VIEW, Capability.KIOSK_PLUGIN,
+        Capability.TURN_VIEW, Capability.TIMER_VIEW, Capability.KIOSK_PLUGIN, Capability.NEAR_MISS,
     }),
 }
 
@@ -201,6 +202,7 @@ class Actor(Protocol):
     def detach(self, reason: CloseReason) -> None: ...
     def on_message(self, envelope: em_device_link.Envelope) -> None: ...
     def on_audio(self, frame: bytes) -> None: ...
+    def on_near_miss(self, envelope: em_device_link.Envelope, wall: Callable[[int], float]) -> None: ...
     def on_observation(self, obs: em_speech_worker.Observation) -> None: ...
     def button_turn(self, action: Mapping[str, object]) -> None: ...
     def cancel_turn(self) -> None: ...
@@ -448,6 +450,8 @@ class Device:
         # Extra/shadow rules granted in this session's ready; None when the
         # device lacks open_rules_v1 (it was sent none).
         self.wake_rules: em_wake_rules.RuleSet | None = None
+        # nearMissThreshold sent in this session's ready; None before one.
+        self.near_miss_floor: float | None = None
         self._cue: em_session.Cue | None = None
         self._timer_fraction: float | None = None
         self.preview_playback: em_render.Playback | None = None
@@ -540,6 +544,10 @@ class Device:
     @property
     def afe_metadata_capable(self) -> bool:
         return Capability.AFE_METADATA in self.capabilities
+
+    @property
+    def near_miss_capable(self) -> bool:
+        return Capability.NEAR_MISS in self.capabilities
 
     @property
     def wifi_control_capable(self) -> bool:
@@ -667,15 +675,19 @@ class Device:
             if self.turn_view_capable:
                 body["turnViewLinger"] = em_config_sections.turn_view_linger(cfg)
             await self.send(MessageType.CONFIG, body)
-            # The wake graph and the open/shadow rules are named only in
-            # session.ready (§16.1): a changed selection renegotiates the
-            # session so device and controller agree.
-            model_changed = cfg.get("wakeModel") not in (None, self.wake_model_sha256)
-            rules_changed = (self.wake_rules is not None
-                             and em_wake_rules.RuleSet.from_config(cfg) != self.wake_rules)
-            if model_changed or rules_changed:
+            # The wake graph, the open/shadow rules and the near-miss floor are
+            # named only in session.ready (§16.1): a changed value renegotiates
+            # the session so device and controller agree.
+            changed = [what for what, differs in (
+                ("model", cfg.get("wakeModel") not in (None, self.wake_model_sha256)),
+                ("rules", self.wake_rules is not None
+                 and em_wake_rules.RuleSet.from_config(cfg) != self.wake_rules),
+                ("near-miss floor", self.near_miss_floor is not None
+                 and em_config_sections.near_miss_threshold(cfg) != self.near_miss_floor),
+            ) if differs]
+            if changed:
                 log.info("[%s] wake %s changed; renegotiating the session", self.device_id,
-                         "model" if model_changed else "rules")
+                         ", ".join(changed))
                 await link.close(CloseReason.CLOSED)
         self._led_event.set()
 
@@ -735,6 +747,10 @@ class Device:
                     "wake_stats": self.wake_stats,
                     "afe_stats": self.afe_stats.wire() if self.afe_stats is not None else None,
                 }), "wake stats push")
+            case MessageType.WAKE_NEAR_MISS:
+                # Only near_miss_v1 firmware sends it; the actor records the episode.
+                if self.near_miss_capable:
+                    self.actor.on_near_miss(envelope, self._device_wall(time.time()))
             case MessageType.ALERT_ACK:
                 self._spawn(self.host.alerts.on_alert_ack(self.device_id, body), "alert ack")
             case MessageType.ALERT_STATE:
@@ -1107,6 +1123,7 @@ class LinkHub:
         rules = (em_wake_rules.RuleSet.from_config(device.config)
                  if Capability.OPEN_RULES in hello.capabilities else None)
         device.wake_rules = rules
+        near_miss = device.near_miss_floor = em_config_sections.near_miss_threshold(device.config)
         afe_metadata = Capability.AFE_METADATA in hello.capabilities
         ready = em_device_link.ReadyGrant(
             capture_permitted=device.capture_permitted,
@@ -1115,7 +1132,7 @@ class LinkHub:
                 thresholds=em_device_link.DetectorThresholds(
                     idle=model.thresholds.idle,
                     playback=model.thresholds.playback,
-                    near_miss=model.thresholds.near_miss,
+                    near_miss=near_miss,
                 ),
                 provisional_duck=em_device_link.ProvisionalDuck(
                     duck_db=DEFAULT_DUCK_DB if duck_db is None else duck_db),

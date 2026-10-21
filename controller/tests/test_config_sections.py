@@ -375,3 +375,21 @@ def test_kiosk_push_falls_back_to_the_defaults_for_a_mistyped_value():
     assert cs.kiosk_port({"kioskPort": "2400"}) == 2324
     assert cs.turn_view_linger({"turnViewLinger": 99}) == 6
     assert (cs.kiosk_port({"kioskPort": 2400}), cs.turn_view_linger({"turnViewLinger": 0})) == (2400, 0)
+
+
+# ─── Near-miss floor ─────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("value, ok", [
+    (0.05, True), (0.60, True), (0.17, True), (0.6, True),
+    (0.04, False), (0.61, False), (0.123, False), (True, False), ("0.17", False),
+    (float("nan"), False), (None, False),
+])
+def test_near_miss_threshold_validation(value, ok):
+    assert (cs.near_miss_error({"nearMissThreshold": value}) is None) is ok
+
+
+def test_near_miss_threshold_falls_back_to_the_default_for_an_invalid_value():
+    assert cs.near_miss_threshold(em_db.DEFAULT_DEVICE_CONFIG) == 0.17
+    assert cs.near_miss_threshold({"nearMissThreshold": 0.25}) == 0.25
+    assert cs.near_miss_threshold({"nearMissThreshold": 0.9}) == 0.17
+    assert cs.near_miss_threshold({}) == 0.17

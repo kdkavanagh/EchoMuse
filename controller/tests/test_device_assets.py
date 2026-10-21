@@ -14,7 +14,7 @@ SIDECAR = {
     "labels": ["noise", "ohphelia", "unknown"], "wakeIndex": 1,
     "nMels": 40, "clipSeconds": 1.4, "normPeak": 0.8,
 }
-T = wr.Thresholds(0.9, 0.65, 0.3, 0.17)
+T = wr.Thresholds(0.9, 0.65, 0.3)
 
 
 def stub_loader(graph, spec):

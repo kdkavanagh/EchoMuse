@@ -62,6 +62,7 @@ import em_phonetics
 import em_pki
 import em_player
 import em_render
+import em_recordings
 import em_samples
 import em_session
 import em_shell
@@ -447,6 +448,7 @@ class _Host:
             vocabulary=lambda: ha.vocabulary,
             esphome_reply=lambda pcm: esphome.esphome_reply(device_id, pcm),
             persist_turn=lambda rec: _persist_turn(device_id, rec),
+            persist_near_miss=lambda rec, pcm: _persist_near_miss(device_id, rec, pcm),
             record_continuation=lambda row_id, outcome: asyncio.to_thread(
                 db.set_turn_continuation, row_id, outcome),
             media_playing=lambda: em_player.is_playing(device_id),
@@ -567,6 +569,22 @@ async def _persist_turn(device_id: str, record: Mapping[str, object]) -> int:
             em_text_fix.sent_text(text, fix if isinstance(fix, str) else None), turn_id,
             float(ts) if isinstance(ts, (int, float)) else time.time()))
     return turn_id
+
+
+async def _persist_near_miss(device_id: str, record: db.NearMissRecord, pcm: bytes | None) -> int:
+    """A near miss's row, then its WAV, then `saved`: the row claims a recording only once
+    the file exists (a failed write leaves `record.recording`)."""
+    row_id = await asyncio.to_thread(db.insert_near_miss, device_id, record)
+    if not pcm:
+        return row_id
+    try:
+        name = await asyncio.to_thread(em_recordings.save, device_id, row_id, pcm,
+                                       kind=em_recordings.RecordingKind.NEAR_MISS)
+        if name is not None:
+            await asyncio.to_thread(db.set_near_miss_saved, row_id, em_recordings.duration_ms(len(pcm)))
+    except Exception:
+        log.exception("[%s] near miss %d audio not saved", device_id, row_id)
+    return row_id
 
 
 async def _text_fix_history() -> list[em_text_fix.HistoryEntry]:

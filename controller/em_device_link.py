@@ -85,6 +85,7 @@ class MessageType(enum.StrEnum):
     WAKE_CANDIDATE = "wake.candidate"
     WAKE_CANDIDATE_END = "wake.candidate_end"
     WAKE_STATS = "wake.stats"
+    WAKE_NEAR_MISS = "wake.near_miss"
     # §4.5 uplink leases
     UPLINK_OPEN = "uplink.open"                      # C→D
     UPLINK_RENEW = "uplink.renew"                    # C→D
@@ -152,6 +153,9 @@ class Capability(enum.StrEnum):
     ANNOUNCEMENT_CHIME = "announcement_chime"
     OPEN_RULES = "open_rules_v1"
     AFE_METADATA = "afe_metadata_v1"
+    # Sends wake.near_miss for each near-miss episode and takes `near_miss`
+    # uplink leases, which record it (docs/protocol-v1.md §4.4).
+    NEAR_MISS = "near_miss_v1"
     # Announced by the Dot's firmware only: the Echo Show's own Android stack
     # owns Wi-Fi and Bluetooth, and its mute is not integrated yet.
     WIFI_CONTROL = "wifi_control"    # handles wifi_change/wifi_scan/wifi_commit
@@ -494,6 +498,7 @@ _U64_PATHS: dict[MessageType, tuple[tuple[str, ...], ...]] = {
     MessageType.WAKE_STATS: (("near_misses", "*", "mono_ns"),
                              ("shadow", "*", "events", "*", "open_sample"),
                              ("shadow", "*", "events", "*", "mono_ns")),
+    MessageType.WAKE_NEAR_MISS: (("capture_epoch",), ("support_start",), ("support_end",), ("mono_ns",)),
     MessageType.UPLINK_ENDED: (("last_sample", "*"), ("clipped_start", "*")),
     MessageType.PRIVACY_CHANGED: (("capture_epoch",),),
     MessageType.BUTTON_ACTION: (("mono_ns",), ("capture_epoch",), ("capture_sample",)),

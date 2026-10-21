@@ -16,7 +16,7 @@ SIDECAR = {
     "labels": ["noise", "ohphelia", "unknown"], "wakeIndex": 1,
     "nMels": 40, "clipSeconds": 1.4, "normPeak": 0.8,
 }
-T = wr.Thresholds(idle=0.9, playback=0.65, reference=0.3, near_miss=0.17)
+T = wr.Thresholds(idle=0.9, playback=0.65, reference=0.3)
 
 
 def quiet_loader(p=0.005):
@@ -103,14 +103,51 @@ def test_upload_rejects_a_model_that_fires_on_the_probe(tmp_path):
         reg.register(*pair(tmp_path), T, "ophelia", "ophel")
 
 
+# 0.31, not 0.30: the stub's float32 logits round 0.30 to just below it.
+@pytest.mark.parametrize("p, accepted", [(0.29, True), (0.31, False)])
+def test_upload_probe_ceiling_is_the_reference_threshold(tmp_path, p, accepted):
+    reg = wr.WakeRegistry(tmp_path / "r", infer_loader=quiet_loader(p=p))
+    if accepted:
+        assert reg.register(*pair(tmp_path), T, "ophelia", "ophel").thresholds == T
+    else:
+        with pytest.raises(wr.RegistryError, match="probe score"):
+            reg.register(*pair(tmp_path), T, "ophelia", "ophel")
+
+
 @pytest.mark.parametrize("kwargs", [
-    dict(idle=0.9, playback=0.95, reference=0.3, near_miss=0.17),   # playback above idle
-    dict(idle=0.9, playback=0.65, reference=0.1, near_miss=0.17),   # near-miss above reference
-    dict(idle=1.0, playback=0.65, reference=0.3, near_miss=0.17),
+    dict(idle=0.9, playback=0.95, reference=0.3),   # playback above idle
+    dict(idle=0.9, playback=0.65, reference=0.7),   # reference above playback
+    dict(idle=1.0, playback=0.65, reference=0.3),
 ])
 def test_threshold_sets_must_be_ordered_probabilities(kwargs):
     with pytest.raises(wr.RegistryError):
         wr.Thresholds(**kwargs)
+
+
+def _rewrite_index(reg, version, near_miss):
+    index = json.loads(reg.index_path.read_text())
+    index["version"] = version
+    for entry in index["models"]:
+        entry["thresholds"]["near_miss"] = near_miss
+    reg.index_path.write_text(json.dumps(index))
+
+
+def test_version_1_index_migrates_to_version_2_without_near_miss(tmp_path, reg):
+    model = reg.register(*pair(tmp_path), T, "ophelia", "ophel")
+    _rewrite_index(reg, 1, 0.17)
+    again = wr.WakeRegistry(reg.directory, infer_loader=quiet_loader())
+    assert again.list() == (model,)
+    index = json.loads(reg.index_path.read_text())
+    assert index["version"] == 2
+    assert [e["thresholds"] for e in index["models"]] == [
+        {"idle": 0.9, "playback": 0.65, "reference": 0.3}]
+
+
+def test_version_2_entry_carrying_near_miss_is_malformed(tmp_path, reg):
+    reg.register(*pair(tmp_path), T, "ophelia", "ophel")
+    _rewrite_index(reg, 2, 0.17)
+    with pytest.raises(wr.RegistryError, match="malformed"):
+        wr.WakeRegistry(reg.directory, infer_loader=quiet_loader())
 
 
 @pytest.mark.parametrize("phrase, core", [("Ophelia", "ophel"), ("ophelia", ""), ("oph elia", "ophel")])
@@ -145,7 +182,7 @@ def test_deployed_entry_is_pinned_with_its_thresholds_and_spoken_forms(tmp_path)
     model = reg.install_deployed(ROOT / "bcresnet_audio.onnx", ROOT / "bcresnet_audio.json")
     assert model.graph_sha256 == wr.DEPLOYED_GRAPH_SHA256
     assert model.sidecar_sha256 == wr.DEPLOYED_SIDECAR_SHA256
-    assert model.thresholds == wr.Thresholds(0.90, 0.65, 0.30, 0.17)
+    assert model.thresholds == wr.Thresholds(0.90, 0.65, 0.30)
     assert (model.wake_phrase, model.verify_core) == ("ophelia", "ophel")
     assert all(0.0033 - 5e-5 <= v <= 0.0106 + 5e-5 for v in model.probe.values())
     assert reg.active() == model

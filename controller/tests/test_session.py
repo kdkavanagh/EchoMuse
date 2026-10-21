@@ -11,7 +11,8 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -276,6 +277,7 @@ class Model:
     graph_sha256: str = "g" * 64
     wake_phrase: str = "ophelia"
     verify_core: str = "ophel"
+    thresholds: SimpleNamespace = field(default_factory=lambda: SimpleNamespace(idle=0.9, playback=0.65))
 
 
 class FakeRegistry:
@@ -494,6 +496,7 @@ class Harness:
         self.alerts = FakeAlerts()
         self.arbiter = WakeArbiter()
         self.rows: list[dict] = []
+        self.near_misses: list = []             # (em_db.NearMissRecord, pcm | None) as persisted
         self.replies: list[bytes] = []
         self.reply_events: list = []
         self.events = []
@@ -511,6 +514,9 @@ class Harness:
 
         async def record_continuation(row_id, outcome):
             self.rows[row_id - 1]["continuation"] = outcome
+
+        async def persist_near_miss(record, pcm):
+            self.near_misses.append((record, pcm))
 
         async def pipeline():
             return "p1"
@@ -535,7 +541,8 @@ class Harness:
             config=lambda: self.config, ha_device_id=lambda: "hadev", recognizer=lambda: self.ha.recognizer,
             pipeline_id=pipeline,
             vocabulary=lambda: None, esphome_reply=esphome_reply, persist_turn=persist,
-            record_continuation=record_continuation, media_playing=lambda: self.media_playing,
+            record_continuation=record_continuation, persist_near_miss=persist_near_miss,
+            media_playing=lambda: self.media_playing,
             pause_media=pause_media, text_fix=self.text_fix))
         self.worker.actor = self.actor
         self.actor.add_listener(self.events.append)
@@ -1311,6 +1318,151 @@ def test_the_diagnostic_lease_feeds_its_tap_the_mic_and_in_an_afe_session_the_re
     assert mic and {m[0] for m in mic} == {lease}
     assert records == ([(lease, k * PERIOD) for k in range(4)] if afe else [])
 
+
+# --- near misses (near_miss_v1) -------------------------------------------------------------------
+
+NM_START, NM_END = 48_000, 73_600          # support: the floor reached, no candidate opened
+NM_MIC = (NM_START - 4_800) // CELL * CELL  # the lease's mic start
+
+
+def near_miss(nm_id="N1", *, start=NM_START, end=NM_END, epoch=MIC_EPOCH):
+    return envelope("wake.near_miss", {
+        "near_miss_id": nm_id, "capture_epoch": str(epoch), "graph_sha256": "g" * 64, "profile": "idle",
+        "floor": 0.17, "peak": 0.31, "support_start": str(start), "support_end": str(end),
+        "mono_ns": str(MONO_BASE), "reason": "below"})
+
+
+def capture_ramp(a, b):                      # each sample names its capture index
+    return (np.arange(a, b) % 32_749).astype(np.int16)
+
+
+def at_wall(mono_ns):
+    return 1_000.0 + (mono_ns - MONO_BASE) / 1e9
+
+
+def test_near_misses_with_wake_clips_on_record_their_span_through_their_own_leases_beside_the_worker():
+    async def main():
+        h = Harness(config={"saveWakeClips": True})
+        h.device.mic_pcm = capture_ramp
+        await h.start()
+        audio: set[str] = set()
+        real_audio = h.actor._audio
+
+        async def spy(deliveries):
+            audio.update(d.lease_id for d in deliveries)
+            await real_audio(deliveries)
+        h.actor._audio = spy
+        # Two in flight at once: the second opens while the first still waits for its tail.
+        h.actor.on_near_miss(near_miss("N1"), at_wall)
+        h.actor.on_near_miss(near_miss("N2", start=NM_START + 12_800, end=NM_END + 12_800), at_wall)
+        await h.settle()
+        opens = [(b, g) for b, g in h.link.of("uplink.open")]
+        await h.feed(NM_MIC, NM_END + 12_800 + 4_800 + BLOCK)
+        await h.wait_for(lambda: len(h.near_misses) == 2)
+        await h.actor.close()
+        return h, opens, audio
+
+    h, opens, audio = run(main())
+    second_mic = (NM_START + 12_800 - 4_800) // CELL * CELL
+    assert [(b["owner"], b["reason"], b["streams"], b["ttl_ms"], g) for b, g in opens] == [
+        ("N1", "near_miss", {"mic": str(NM_MIC)}, 3_000, 1), ("N2", "near_miss", {"mic": str(second_mic)}, 3_000, 1)]
+    leases = [b["lease_id"] for b, _ in opens]
+    assert sorted(b["lease_id"] for b, _ in h.link.of("uplink.close")) == sorted(leases)
+    assert {b["reason"] for b, _ in h.link.of("uplink.close")} == {"closed"}
+    # Their mic never reached the speech pipeline.
+    assert not audio & set(leases) and h.worker.leases == {}
+    rows = {rec.near_miss_uuid: (rec, pcm) for rec, pcm in h.near_misses}
+    rec, pcm = rows["N1"]
+    assert (rec.ts, rec.profile, rec.floor, rec.peak, rec.wake_threshold, rec.wake_model_sha256,
+            rec.duration_ms, rec.end_reason) == (1_000.0, "idle", 0.17, 0.31, 0.9, "g" * 64, 1_600, "below")
+    assert pcm == capture_ramp(NM_MIC, NM_END + 4_800).tobytes()
+    assert rows["N2"][1] == capture_ramp(second_mic, NM_END + 12_800 + 4_800).tobytes()
+
+
+@pytest.mark.parametrize("case, status", [
+    ("off", "off"), ("muted", "not_permitted"), ("diagnostic", "not_permitted"), ("old_epoch", "failed")])
+def test_a_near_miss_that_cannot_be_recorded_is_persisted_with_why_and_opens_no_lease(case, status):
+    async def main():
+        h = Harness(config={"saveWakeClips": case != "off"})
+        await h.start()
+        if case == "muted":
+            h.actor.on_message(envelope("privacy.changed", {"muted": True, "capture_epoch": None,
+                                                            "physical_seq": 2}))
+        elif case == "diagnostic":
+            await h.actor.open_diagnostic(em_session.DiagnosticTap(lambda *a: None, lambda *a: None))
+        await h.settle()
+        h.actor.on_near_miss(near_miss(epoch=MIC_EPOCH + 1 if case == "old_epoch" else MIC_EPOCH), at_wall)
+        await h.wait_for(lambda: h.near_misses)
+        await h.actor.close()
+        return h
+
+    h = run(main())
+    [(rec, pcm)] = h.near_misses
+    assert (rec.near_miss_uuid, rec.recording, pcm) == ("N1", status, None)
+    assert [b for b, _ in h.link.of("uplink.open") if b["reason"] == "near_miss"] == []
+
+
+@pytest.mark.parametrize("held, keeps", [(NM_START + 6_400, False), (NM_END, True)])
+def test_a_near_miss_lease_the_device_ends_early_keeps_its_audio_only_if_it_covers_the_support(held, keeps):
+    async def main():
+        h = Harness(config={"saveWakeClips": True})
+        h.device.mic_pcm = capture_ramp
+        await h.start()
+        h.actor.on_near_miss(near_miss(), at_wall)
+        await h.settle()
+        [(body, _)] = h.link.of("uplink.open")
+        await h.feed(NM_MIC, held)
+        through = h.device.pos[Kind.MIC]
+        h.actor.on_message(envelope("uplink.ended", {"lease_id": body["lease_id"], "reason": "overrun",
+                                                     "last_sample": {"mic": str(through)}, "clipped_start": {}}))
+        await h.wait_for(lambda: h.near_misses)
+        await h.actor.close()
+        return h, through
+
+    h, through = run(main())
+    [(rec, pcm)] = h.near_misses
+    assert rec.recording == "failed"            # what the row keeps unless `pcm` is saved
+    assert pcm == (capture_ramp(NM_MIC, through).tobytes() if keeps else None)
+    assert h.link.of("uplink.close") == []
+
+
+@pytest.mark.parametrize("case", ["refused", "session_lost"])
+def test_a_refused_or_lost_near_miss_lease_still_writes_its_row_as_failed(case):
+    async def main():
+        h = Harness(config={"saveWakeClips": True})
+        await h.start()
+        h.actor.on_near_miss(near_miss(), at_wall)
+        await h.settle()
+        if case == "refused":                   # the device opened no lease: no audio comes
+            [capture] = h.actor._near_misses.values()
+            h.actor.on_message(envelope("command.ack", {"message_id": capture.open_message,
+                                                        "status": "rejected", "error": "muted"}))
+        else:                                   # what it carried went with the session
+            await h.feed(NM_MIC, NM_END)
+            h.actor.detach("closed")
+        await h.wait_for(lambda: h.near_misses)
+        await h.actor.close()
+        return h
+
+    h = run(main())
+    [(rec, pcm)] = h.near_misses
+    assert (rec.recording, pcm) == ("failed", None)
+    assert h.link.of("uplink.close") == []
+
+
+def test_a_malformed_near_miss_is_dropped_without_a_row():
+    async def main():
+        h = Harness(config={"saveWakeClips": True})
+        await h.start()
+        bad = near_miss()
+        h.actor.on_near_miss(envelope("wake.near_miss", {**bad.body, "profile": "loud"}), at_wall)
+        h.actor.on_near_miss(envelope("wake.near_miss", {**bad.body, "support_end": str(NM_START - 1)}), at_wall)
+        await h.settle()
+        await h.actor.close()
+        return h
+
+    h = run(main())
+    assert h.near_misses == [] and h.link.of("uplink.open") == []
 
 
 # --- button turns and Home Assistant --------------------------------------------------------------

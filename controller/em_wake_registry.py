@@ -22,7 +22,7 @@ from em_wake_scorer import BcresnetSpec, Infer, load_spec, onnx_infer, probe_mod
 
 DEPLOYED_GRAPH_SHA256 = "4eb745120ea56f5681eddbf788a0c69e1fd406d4694a04a4dba0c1e41d862d3f"
 DEPLOYED_SIDECAR_SHA256 = "25da0c652c562bf0a45a8f34bb46e38788bfc689e31401f33950831a0f2af51f"
-INDEX_VERSION = 1
+INDEX_VERSION = 2
 INDEX_NAME = "registry.json"
 MAX_GRAPH_BYTES = 20 * 1024 * 1024
 MAX_SIDECAR_BYTES = 64 * 1024
@@ -39,18 +39,17 @@ class Thresholds:
     idle: float
     playback: float
     reference: float
-    near_miss: float
 
     def __post_init__(self) -> None:
-        values = (self.idle, self.playback, self.reference, self.near_miss)
+        values = (self.idle, self.playback, self.reference)
         if not all(isinstance(x, (int, float)) and not isinstance(x, bool) and 0.0 < float(x) < 1.0
                    for x in values):
             raise RegistryError("all thresholds must be numbers in (0, 1)")
-        if not self.near_miss < self.reference <= self.playback <= self.idle:
-            raise RegistryError("threshold order must be near_miss < reference <= playback <= idle")
+        if not self.reference <= self.playback <= self.idle:
+            raise RegistryError("threshold order must be reference <= playback <= idle")
 
 
-DEPLOYED_THRESHOLDS = Thresholds(idle=0.90, playback=0.65, reference=0.30, near_miss=0.17)
+DEPLOYED_THRESHOLDS = Thresholds(idle=0.90, playback=0.65, reference=0.30)
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,7 +90,7 @@ class WakeModel:
         _validate_words(model.wake_phrase, model.verify_core)
         if not _SHA_RE.fullmatch(model.graph_sha256) or not _SHA_RE.fullmatch(model.sidecar_sha256):
             raise RegistryError("registry entry has malformed SHA-256")
-        validate_probe(model.probe, model.thresholds.near_miss)
+        validate_probe(model.probe, model.thresholds.reference)
         return model
 
     def to_dict(self) -> dict[str, object]:
@@ -118,6 +117,17 @@ def _validate_words(wake_phrase: str, verify_core: str) -> None:
         raise RegistryError("wake_phrase must contain lowercase ASCII letters only")
     if not isinstance(verify_core, str) or not _WORD_RE.fullmatch(verify_core):
         raise RegistryError("verify_core must contain lowercase ASCII letters only")
+
+
+def _migrate_v1_entry(raw: object) -> object:
+    """A version-1 index entry as version 2: its thresholds lose `near_miss`,
+    which became the per-device `nearMissThreshold` config key."""
+    if not isinstance(raw, Mapping):
+        raise RegistryError("malformed registry entry: not an object")
+    thresholds = raw.get("thresholds")
+    if not isinstance(thresholds, Mapping) or "near_miss" not in thresholds:
+        raise RegistryError("malformed version 1 registry entry: thresholds lack near_miss")
+    return {**raw, "thresholds": {k: v for k, v in thresholds.items() if k != "near_miss"}}
 
 
 def default_registry_dir(db_path: str | os.PathLike[str] | None = None) -> Path:
@@ -157,8 +167,11 @@ class WakeRegistry:
         except (OSError, json.JSONDecodeError) as exc:
             raise RegistryError(f"cannot read {self.index_path}: {exc}") from None
         models = raw.get("models") if isinstance(raw, dict) else None
-        if not isinstance(models, list) or raw.get("version") != INDEX_VERSION:
+        version = raw.get("version") if isinstance(raw, dict) else None
+        if not isinstance(models, list) or version not in (1, INDEX_VERSION):
             raise RegistryError("unsupported or malformed registry index")
+        if version == 1:
+            models = [_migrate_v1_entry(item) for item in models]
         loaded: dict[str, WakeModel] = {}
         for item in models:
             model = WakeModel.from_dict(item)
@@ -167,6 +180,8 @@ class WakeRegistry:
             self._verify_files(model)
             loaded[model.graph_sha256] = model
         self._models = loaded
+        if version != INDEX_VERSION:
+            self._save()
 
     def _verify_files(self, model: WakeModel) -> None:
         graph = self.directory / model.graph_file
@@ -265,7 +280,7 @@ class WakeRegistry:
             spec = load_spec(graph, sidecar)
             infer, _ = self.infer_loader(graph, spec=spec)
             scores = probe_model(infer, spec)
-            validate_probe(scores, thresholds.near_miss)
+            validate_probe(scores, thresholds.reference)
         except (OSError, ValueError) as exc:
             raise RegistryError(f"invalid BCResNet pair: {exc}") from None
         return ValidatedUpload(sha256_file(graph), sha256_file(sidecar), scores)

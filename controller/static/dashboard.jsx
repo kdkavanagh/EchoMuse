@@ -119,6 +119,7 @@ const CAPABILITY = Object.freeze({
   SCREEN_OVERLAY:  'screen_overlay',
   TURN_VIEW:       'turn_view_v1',
   KIOSK_PLUGIN:    'kiosk_plugin',
+  NEAR_MISS:       'near_miss_v1',
 });
 
 // em_device_link.DevicePlatform — the image a device's session runs on.
@@ -144,6 +145,24 @@ const TURN_TRIGGER = Object.freeze({
 // (/api/devices/{id}/turns/{turn}/<kind>): the wake clip, the utterance (the
 // STT copy), and the turn recording its AFE chart plays.
 const TURN_CLIP = Object.freeze({ WAKE: 'wake', MIC: 'audio', RECORDING: 'recording' });
+
+// GET /api/devices/{id}/near_misses — each near miss's `recording`: whether
+// the episode's audio was kept, and why not. PRUNED is derived at read time
+// (the WAV was saved, retention has since removed it).
+const NEAR_MISS_RECORDING = Object.freeze({
+  SAVED: 'saved', OFF: 'off', NOT_PERMITTED: 'not_permitted', FAILED: 'failed', PRUNED: 'pruned',
+});
+const NEAR_MISS_UNRECORDED = Object.freeze({
+  [NEAR_MISS_RECORDING.OFF]:           'not recorded — Save wake clips is off',
+  [NEAR_MISS_RECORDING.NOT_PERMITTED]: 'not recorded — capture not permitted',
+  [NEAR_MISS_RECORDING.FAILED]:        'recording failed',
+  [NEAR_MISS_RECORDING.PRUNED]:        'recording no longer kept',
+});
+// wake.near_miss.reason — near_misses[].end_reason: BELOW is the score falling
+// back under the floor; the rest are the detector invalidations that cut it.
+const NEAR_MISS_END = Object.freeze({
+  BELOW: 'below', GAP: 'gap', RESET: 'reset', MUTE: 'mute', OVERRUN: 'overrun',
+});
 
 // em_session.TerminalReason — turns.terminal_reason.
 const TERMINAL_REASON = Object.freeze({
@@ -281,6 +300,10 @@ const RULE_COMBINE = Object.freeze({ MEAN: 'mean', ALL: 'all' });
 const RULE_COMBINE_LABEL = Object.freeze({
   [RULE_COMBINE.MEAN]: 'average', [RULE_COMBINE.ALL]: 'every window',
 });
+// A near miss's profile (near_misses[].profile), as the Activity list says it.
+const NEAR_MISS_PROFILE_LABEL = Object.freeze({
+  [RULE_PROFILE.IDLE]: 'idle', [RULE_PROFILE.PLAYBACK]: 'while playing',
+});
 // Who transcribes an utterance at a pause (§16.6), config `pauseAsr`; mirrors
 // em_pause_asr.PauseAsrEngine.
 const PAUSE_ASR_ENGINE = Object.freeze({ KROKO: 'kroko', WYOMING: 'wyoming' });
@@ -352,6 +375,7 @@ const CAPABILITY_REASONS = Object.freeze({
   [CAPABILITY.BUTTON_HOLD]:     'this firmware has no action-button event for a tap to fire — update it',
   [CAPABILITY.OPEN_RULES]:      'this firmware opens a wake only on the model threshold and runs no shadow rules — update it',
   [CAPABILITY.AFE_METADATA]:    'this firmware does not decode the native AFE metadata — update it',
+  [CAPABILITY.NEAR_MISS]:       'this firmware does not report near-miss wakes — update it',
 });
 
 // The reason `cap` is missing, or null when the control is available.
@@ -2096,9 +2120,12 @@ function TurnDetail({ turn: t, turns, deviceId, onSelect, playback }) {
   );
 }
 
-function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, stateLabel, stateColor }) {
-  const [hover, setHover] = useState(null);       // index into `recent`
+// `nearMisses` is GET …/near_misses (oldest first, like `turns`);
+// `nearMissGap` the reason the device reports none (no near_miss_v1), else null.
+function TurnObservability({ turns, nearMisses, nearMissGap, deviceId, deviceLabel, recordingsOn, stateLabel, stateColor }) {
+  const [hover, setHover] = useState(null);       // key of the hovered row in `rows`
   const [selected, setSelected] = useState(null); // turn_id; null follows the newest
+  const [showNear, setShowNear] = useState(true); // near-miss rows in the list
 
   // Saved audio — play in place or download the WAV, through one cached
   // object URL per clip (useClipPlayer).
@@ -2143,6 +2170,20 @@ function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, stateLa
     // same downloads folder seconds apart, and only one of them is the
     // training negative anyone went looking for.
     downloadUrl(url, `${slug}-${when}${kind === WAKE ? '-wake' : ''}.wav`);
+  };
+
+  // A near miss's recording (GET …/near_misses/{id}/recording). Its key is
+  // also its row's, and never collides with a turn clip's `<turn_id>:<kind>`,
+  // so the one player stops whichever else is sounding.
+  const nearKey  = n => `near:${n.id}`;
+  const nearPath = n => `/api/devices/${deviceId}/near_misses/${n.id}/recording`;
+  const toggleNear = async n => {
+    if (!(await player.toggle(nearKey(n), nearPath(n)))) markGone(nearKey(n));
+  };
+  const downloadNear = async n => {
+    let url;
+    try { url = await player.url(nearKey(n), nearPath(n)); } catch { markGone(nearKey(n)); return; }
+    downloadUrl(url, `${slug}-nearmiss${n.id}.wav`);
   };
 
   // The shown turn's recordings for its AFE chart: which one is sounding,
@@ -2203,11 +2244,79 @@ function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, stateLa
   const scale = Math.max(3000, ...recent.map(t => turnSegments(t).shown));
   // The detailed turn: the one clicked while it is still in the list, else the newest.
   const shown = recent.find(t => t.turn_id === selected) || recent[0] || null;
+  // Near misses interleave with the turns by time, newest first. Without
+  // near_miss_v1 the device reports none, and the panel says why instead.
+  const nearShown = !nearMissGap && showNear;
+  const rows = [
+    ...recent.map(t => ({ key: `turn:${t.turn_id}`, ts: t.ts, turn: t })),
+    ...(nearShown ? nearMisses.slice().reverse().map(n => ({ key: nearKey(n), ts: n.ts, near: n })) : []),
+  ].sort((a, b) => b.ts - a.ts);
+  const nearGapNote = nearMissGap && (
+    <div style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)', margin: '0 0 8px' }}>
+      Near misses unavailable — {nearMissGap}
+    </div>
+  );
 
   // The row controls are bare glyphs rather than Pills: four of them share
   // the last column of a 14px-tall row, and anything with a border in there
   // reads as a second timeline.
   const glyphBtn = { background: 'none', border: 'none', padding: 0, cursor: 'pointer', fontSize: 10, lineHeight: 1 };
+
+  // One near miss, in the turn rows' columns so the two read as one
+  // timeline: an amber marker where a turn has its trace number and ending,
+  // the scores where a turn has its stage bar. Not pressable: it has no
+  // stages to detail.
+  const nearRow = n => {
+    const key = nearKey(n);
+    const recording = n.recording === NEAR_MISS_RECORDING.SAVED && gone.has(key)
+      ? NEAR_MISS_RECORDING.PRUNED : n.recording;
+    const saved = recording === NEAR_MISS_RECORDING.SAVED;
+    const sounding = playing === key;
+    const facts = [
+      `peak ${n.peak.toFixed(2)}`,
+      `floor ${n.floor.toFixed(2)}`,
+      n.wake_threshold != null && `wake ${n.wake_threshold.toFixed(2)}`,
+      NEAR_MISS_PROFILE_LABEL[n.profile] || n.profile,
+      n.end_reason !== NEAR_MISS_END.BELOW && `cut short: ${n.end_reason}`,
+    ].filter(Boolean).join(' · ');
+    return (
+      <div key={key} onMouseEnter={() => setHover(key)} onMouseLeave={() => setHover(null)}
+        style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '3px 0', borderRadius: 4,
+          background: hover === key ? 'var(--hairline)' : 'transparent' }}>
+        <span style={{ fontFamily: MONO, fontSize: 10, color: 'var(--lcd-amber)', width: 44, flexShrink: 0, textAlign: 'right' }}
+          title={`Near miss ${n.near_miss_uuid}${n.wake_model_sha256 ? ` · model ${shortSha(n.wake_model_sha256)}` : ''}`}>
+          ◇
+        </span>
+        <span style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)', width: 86, flexShrink: 0, textAlign: 'right', whiteSpace: 'nowrap' }}>{fmtTurnWhen(n.ts)}</span>
+        <span style={{ flex: 1, minWidth: 0, fontFamily: MONO, fontSize: 9, color: 'var(--text2)', whiteSpace: 'nowrap',
+          overflow: 'hidden', textOverflow: 'ellipsis', borderLeft: '2px dashed var(--lcd-amber)', paddingLeft: 6 }}
+          title="The wake score reached the near-miss floor without opening a wake: peak smoothed score, the floor, and the threshold that would have woken it">
+          {facts}
+          {!saved && <span style={{ color: 'var(--muted)' }}> · {NEAR_MISS_UNRECORDED[recording] || recording}</span>}
+        </span>
+        <span style={{ fontFamily: MONO, fontSize: 9, color: 'var(--text2)', width: 34, flexShrink: 0 }}>{fmtS(n.duration_ms)}</span>
+        <span style={{ width: 40, flexShrink: 0 }}/>
+        <span style={{ width: 10, flexShrink: 0 }}/>
+        <span style={{ fontFamily: MONO, fontSize: 8, textTransform: 'uppercase', letterSpacing: '0.08em', width: 62, flexShrink: 0, color: 'var(--lcd-amber)' }}>
+          near miss
+        </span>
+        <span style={{ width: 60, flexShrink: 0, display: 'flex', gap: 4, justifyContent: 'flex-end' }}>
+          {saved && (<>
+            <button type="button" onClick={() => toggleNear(n)}
+              aria-label={sounding ? 'Stop the near miss' : 'Play the near miss'}
+              title={sounding ? 'Stop' : `Play the ${n.audio_ms != null ? fmtS(n.audio_ms) + ' ' : ''}recording of what nearly woke it`}
+              style={{ ...glyphBtn, color: sounding ? 'var(--warn)' : 'var(--lcd-amber)' }}>
+              {sounding ? '▮' : '▷'}
+            </button>
+            <button type="button" onClick={() => downloadNear(n)}
+              aria-label="Download the near miss"
+              title="Download the near miss — a sound that nearly woke it belongs in wake-word training"
+              style={{ ...glyphBtn, color: 'var(--muted)' }}>⤓</button>
+          </>)}
+        </span>
+      </div>
+    );
+  };
 
   return (
     <div>
@@ -2224,9 +2333,12 @@ function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, stateLa
              color={brokenFollowups.length > 0 ? 'var(--lcd-amber)' : 'var(--lcd-dim)'} size={16}/>
       </div>
 
-      {recent.length === 0 ? (
-        <div style={{ fontFamily: MONO, fontSize: 11, color: 'var(--muted)' }}>
-          No voice turns recorded yet — history starts when the device is next used.
+      {turns.length === 0 && (nearMissGap || nearMisses.length === 0) ? (
+        <div>
+          <div style={{ fontFamily: MONO, fontSize: 11, color: 'var(--muted)', marginBottom: 8 }}>
+            No voice turns{nearMissGap ? '' : ' or near misses'} recorded yet — history starts when the device is next used.
+          </div>
+          {nearGapNote}
         </div>
       ) : (
         <div style={{ position: 'relative' }}>
@@ -2241,7 +2353,20 @@ function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, stateLa
             <span title={RESPONSE_LATENCY_TITLE} style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontFamily: MONO, fontSize: 9, color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
               ↦ response latency
             </span>
+            {!nearMissGap && (
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontFamily: MONO, fontSize: 9, color: 'var(--lcd-amber)', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+                ◇ near miss
+              </span>
+            )}
             <span style={{ marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 12 }}>
+              {/* Pill takes no title; the wrapper says what the toggle hides. */}
+              {!nearMissGap && (
+                <span title="Show or hide the near misses: wake scores at or above the near-miss floor that did not wake it">
+                  <Pill small accent={showNear} onClick={() => setShowNear(s => !s)}>
+                    Near misses ({nearMisses.length})
+                  </Pill>
+                </span>
+              )}
               {(recordingsOn || anyAudio) && (
                 <span style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
                   ▶ hear the mic{anyAudio ? '' : ' — next turn'}
@@ -2267,19 +2392,22 @@ function TurnObservability({ turns, deviceId, deviceLabel, recordingsOn, stateLa
               )}
             </span>
           </div>
+          {nearGapNote}
 
-          {/* One stacked bar per turn, newest first — own scroll container */}
+          {/* One stacked bar per turn and one line per near miss, newest
+              first — own scroll container */}
           <div style={{ maxHeight: 230, overflowY: 'auto', paddingRight: 4 }}>
-          {recent.map((t, i) => {
+          {rows.map(({ key, turn: t, near }) => {
+            if (near) return nearRow(near);
             const seg = turnSegments(t);
             const end = turnEnd(t);
             const isSel = shown && t.turn_id === shown.turn_id;
             return (
-              <div key={t.turn_id}
+              <div key={key}
                 {...pressable(() => setSelected(t.turn_id), { selected: !!isSel })}
-                onMouseEnter={() => setHover(i)} onMouseLeave={() => setHover(null)}
+                onMouseEnter={() => setHover(key)} onMouseLeave={() => setHover(null)}
                 style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '3px 0', cursor: 'pointer', borderRadius: 4,
-                  background: isSel ? 'var(--accent-tint)' : hover === i ? 'var(--hairline)' : 'transparent' }}>
+                  background: isSel ? 'var(--accent-tint)' : hover === key ? 'var(--hairline)' : 'transparent' }}>
                 {/* The trace number: the key of GET …/turns/{n}/trace. The title
                     carries the controller-log id (turn_uuid) of the same turn. */}
                 <span style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)', width: 44, flexShrink: 0, textAlign: 'right', whiteSpace: 'nowrap' }}
@@ -3547,6 +3675,7 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
   const [securing, setSecuring] = useState(false);
   const [debloating, setDebloating] = useState(false);
   const [turns, setTurns] = useState([]);
+  const [nearMisses, setNearMisses] = useState([]);
   const [registry] = useWakeRegistry();
   const state = deviceState(device);
   const needsUpdate = firmwareBehind(device, firmware);
@@ -3576,13 +3705,20 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
   }, [tab, device.device_id]);
 
   // Turn observability — fetch on Activity tab entry, refresh every 10s while
-  // the tab is open (turn history is in-memory on the controller).
+  // the tab is open (turn history is in-memory on the controller). The near
+  // misses listed beside the turns ride the same poll.
   useEffect(() => {
     if (tab !== DETAIL_TAB.ACTIVITY) return;
     let live = true;
-    const load = () => API.get(`/api/devices/${device.device_id}/turns`)
-      .then(t => { if (live) setTurns(Array.isArray(t) ? t : []); })
-      .catch(() => {});
+    const id = device.device_id;
+    const load = () => {
+      API.get(`/api/devices/${id}/turns`)
+        .then(t => { if (live) setTurns(Array.isArray(t) ? t : []); })
+        .catch(() => {});
+      API.get(`/api/devices/${id}/near_misses?limit=50`)
+        .then(n => { if (live) setNearMisses(Array.isArray(n) ? n : []); })
+        .catch(() => {});
+    };
     load();
     const iv = setInterval(load, 10000);
     return () => { live = false; clearInterval(iv); };
@@ -4100,6 +4236,8 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                 <Panel label={`Voice activity — ${wakeModelLabel(registry.models, cfgEff.wakeModel)}${thr}`} style={{ flex:1 }}>
                   <TurnObservability
                     turns={turns}
+                    nearMisses={nearMisses}
+                    nearMissGap={capabilityGap(liveCapabilities(device), CAPABILITY.NEAR_MISS)}
                     deviceId={device.device_id}
                     deviceLabel={device.label}
                     recordingsOn={cfgEff.saveUtterances}
@@ -7331,7 +7469,7 @@ function EqSliders({ bands, onChange, disabled }) {
 // be silently wrong.
 const CONFIG_SECTIONS = {
   "playback": ["eqBands", "eqLoudness", "duckDb"],
-  "wakeword": ["wakeModel", "saveWakeClips", "wakeArbitrationMs", "wakeSound", "wakeOpenRules", "wakeShadowRules"],
+  "wakeword": ["wakeModel", "nearMissThreshold", "saveWakeClips", "wakeArbitrationMs", "wakeSound", "wakeOpenRules", "wakeShadowRules"],
   "microphones": ["nsAsr", "saveUtterances", "extendedUtterances", "pauseAsr"],
   "ring": ["ledScene", "ledListenColor", "ledThinkColor", "meterAttack", "meterDecay", "meterFloor", "meterGamma", "meterRef", "meterCurve"],
   "advanced": ["buttonSingleTapEvent", "buttonMultiTapMs"],
@@ -7458,7 +7596,7 @@ function WakeModelPicker({ value, onChange, disabled }) {
   const [wakePhrase, setWakePhrase] = useState('ophelia');
   const [verifyCore, setVerifyCore] = useState('ophel');
   const [thresholds, setThresholds] = useState({
-    idle:0.90, playback:0.65, reference:0.30, near_miss:0.17,
+    idle:0.90, playback:0.65, reference:0.30,
   });
   const [uploading, setUploading] = useState(false);
   const [validation, setValidation] = useState(null);
@@ -7515,7 +7653,7 @@ function WakeModelPicker({ value, onChange, disabled }) {
               <div style={{ fontFamily:MONO, fontSize:9, color:'var(--muted)', marginTop:3 }}>graph {shortSha(m.graph_sha256)} · sidecar {shortSha(m.sidecar_sha256)}</div>
               <div style={{ fontFamily:MONO, fontSize:8, color:'var(--muted)', marginTop:6, lineHeight:1.5 }}>
                 idle {m.thresholds.idle.toFixed(2)} · playback {m.thresholds.playback.toFixed(2)}<br/>
-                reference {m.thresholds.reference.toFixed(2)} · near miss {m.thresholds.near_miss.toFixed(2)}<br/>
+                reference {m.thresholds.reference.toFixed(2)}<br/>
                 validation probe max {probe.toFixed(4)}
               </div>
               {!disabled && !selected && !(m.in_use_by || []).length && (
@@ -7556,9 +7694,9 @@ function WakeModelPicker({ value, onChange, disabled }) {
               <input value={verifyCore} onChange={e => setVerifyCore(e.target.value)} style={{ display:'block', width:'100%', marginTop:5, boxSizing:'border-box' }}/>
             </label>
           </div>
-          <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:8, marginTop:12 }}>
+          <div style={{ display:'grid', gridTemplateColumns:'repeat(3,1fr)', gap:8, marginTop:12 }}>
             {Object.entries(thresholds).map(([key, v]) => (
-              <label key={key} style={{ fontFamily:MONO, fontSize:8, color:'var(--muted)' }}>{key.replace('_',' ')}
+              <label key={key} style={{ fontFamily:MONO, fontSize:8, color:'var(--muted)' }}>{key}
                 <input type="number" min="0.01" max="0.99" step="0.01" value={v}
                   onChange={e => setThresholds(t => ({ ...t, [key]:Number(e.target.value) }))}
                   style={{ display:'block', width:'100%', marginTop:4, boxSizing:'border-box' }}/>
@@ -8431,13 +8569,20 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
             disabled={!!renderGap}
             onChange={v => set('wakeSound', v)}/>
           <Toggle label="Save wake clips"
-            sub="keeps bounded candidate audio for tuning; play or download it from Activity"
+            sub="keeps bounded candidate audio for tuning, and records each near miss; play or download them from Activity"
             value={config.saveWakeClips ?? false}
             onChange={v => set('saveWakeClips', v)}/>
           <Slider label="Arbitration window"
             sub="the first Echo to claim a wake suppresses the others; 0 disables"
             value={config.wakeArbitrationMs ?? 700} min={0} max={2000} step={50} unit="ms"
             onChange={v => set('wakeArbitrationMs', v)}/>
+          {/* Rounded: the controller takes at most two decimals, and a range
+              input's stepped value is a float. */}
+          <Slider label="Near-miss floor"
+            sub="wake scores at or above this that do not wake the Echo are listed in Activity; raise it in a noisy room. Changing it briefly reconnects the device"
+            value={config.nearMissThreshold ?? 0.17} min={0.05} max={0.60} step={0.01}
+            formatValue={v => v.toFixed(2)}
+            onChange={v => set('nearMissThreshold', Math.round(v * 100) / 100)}/>
         </div>
         <div style={inputStyle}>
           <WakeRulesEditor config={config} set={set} disabled={disabled} gap={rulesGap}/>

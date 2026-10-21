@@ -138,7 +138,7 @@ is never filled.
 {"capabilities":["audio_timeline_v1","uplink_leases_v1","device_wake_v1",
   "render_reference_v1","render_progress_v1","focus_leases_v1","alert_cache_v1",
   "turn_protocol_v1","leds","led_anim","buttons","button_hold","alert_prefetch","local_wake_chime",
-  "no_input_chime","announcement_chime","open_rules_v1","ambient_light","afe_metadata_v1",
+  "no_input_chime","announcement_chime","open_rules_v1","near_miss_v1","ambient_light","afe_metadata_v1",
   "wifi_control","ble_proxy","privacy_mute"],
  "platform":"fireos6",
  "firmware_version":"v3.0.0","os_version":"Fire OS 6.5.6.9 (NS6569/6009)",
@@ -152,7 +152,7 @@ is never filled.
 ```
 An Echo Show (`"platform":"fireos6_crown"` or `"lineage18_crown"`) announces the eight required
 capabilities (`alert_cache_v1` under the same wakelock condition) plus
-`alert_prefetch`, `local_wake_chime`, `open_rules_v1`, `afe_metadata_v1`,
+`alert_prefetch`, `local_wake_chime`, `open_rules_v1`, `near_miss_v1`, `afe_metadata_v1`,
 `ambient_light` when its sensor is readable, and `screen_wake`, and none of
 the three Dot-only capabilities below. On Fire OS that is all: no `leds`,
 `led_anim`, `buttons` or `button_hold` (it has no ring and no action button).
@@ -178,6 +178,10 @@ other device.
 `detector.open_rules`, evaluates `detector.shadow_rules` without acting on
 them, names the opening rule in `wake.candidate.rule` and reports shadow
 counters in `wake.stats.shadow` (§4.4; architecture §5.2).
+`near_miss_v1`: announced by every firmware from this tree, on all three
+images. The device reports each near-miss episode that opened no candidate in
+`wake.near_miss` as it closes (§4.4) and accepts `uplink.open` reason
+`near_miss` (§4.5); the controller opens that lease to no other device.
 `afe_metadata_v1`: the capture carries the native AFE's per-frame metadata
 (the ASR capture's bit 0, format v3.3; see §3) and the device's decoder is validating
 it. The firmware announces it only when a frame validated in the 2 s before
@@ -280,9 +284,13 @@ invalid policy leaves the detector unavailable (`wake.stats`
 unimplemented `hop_blocks`/`smoothing`. `thresholds.near_miss`, `smoothing`,
 `hop_blocks` and `clear_after_unscored` keep their meaning: the 3-window
 smoothed value still drives candidate extension and close, near misses, peaks
-and `hops` records. A changed policy on an unchanged graph is applied between
-candidates (deferred while one is open, latest wins); the same policy again is
-a no-op.
+and `hops` records. `idle` and `playback` are the registry model's;
+`near_miss` is the device's effective `nearMissThreshold` setting, which
+selects nothing but near misses. A changed policy on an unchanged graph is
+applied between candidates (deferred while one is open, latest wins); the
+same policy again is a no-op. The controller delivers a changed model, rule
+list or `nearMissThreshold` by closing the session, so the reconnect's
+`session.ready` carries it.
 
 `capture_permitted: false` = the device keeps capturing and scoring locally but
 the controller refuses every candidate (diagnostics/approval states).
@@ -463,6 +471,27 @@ discontinuities and `lost_frames` the AFE frames they skipped (§3). It carries
 no acoustic values: those leave the device only in kind-5 records under a
 lease. Absent means no data, never zero counts.
 
+**`wake.near_miss`** D→C, `generation` 0, `near_miss_v1` only, while a session
+exists:
+```json
+{"near_miss_id":"uuid","capture_epoch":"…","graph_sha256":"…","profile":"idle|playback",
+ "floor":0.17,"peak":0.31,"support_start":"…","support_end":"…","mono_ns":"…",
+ "reason":"below|gap|reset|mute|overrun"}
+```
+Sent once for each near-miss episode (architecture §5.2) as it closes, if no
+candidate opened during it: exactly the episodes `wake.stats.near_misses`
+lists, which is unchanged. `floor` is `thresholds.near_miss` when the episode
+opened (latched); `profile` is the opening hop's; `peak` the highest 3-window
+smoothed value over the episode; `support_start` the end of the oldest score in
+the smoothed mean at the opening hop minus 22,400, as for a baseline
+candidate; `support_end` the end of the last scored hop whose smoothed value
+was ≥ `floor`; `mono_ns` the opening hop's, the same value as the episode's
+`wake.stats` entry. `reason` is `below` after two consecutive scored hops
+below the floor, otherwise the invalidation that ended it (the
+`wake.candidate_end` vocabulary). Sample indices and `mono_ns` are uint64
+decimal strings. The device leases nothing for a near miss; an episode that
+closes with no session is only counted in `wake.stats`.
+
 ### 4.5 Uplink leases
 
 Stream keys: `mic`, `reference`, `cells`, and `afe` in an `afe_metadata`
@@ -473,7 +502,7 @@ down (mic/cells to 512, afe to 1280, reference to 2560) and clips to the ring
 (afe: 8 s, like the reference).
 
 **`uplink.open`** C→D, gen = lease generation (starts at 1):
-`{"lease_id":"uuid","owner":"…","reason":"turn|reply|diagnostic","streams":{"mic":"…|live","reference":"…|live","cells":"…|live","afe":"…|live"},"ttl_ms":3000}`.
+`{"lease_id":"uuid","owner":"…","reason":"turn|reply|diagnostic|near_miss","streams":{"mic":"…|live","reference":"…|live","cells":"…|live","afe":"…|live"},"ttl_ms":3000}`.
 An omitted stream key is not wanted. In an `afe_metadata` session the
 controller opens one more `turn` lease when a turn commits, before closing the
 committed lease: same owner, `streams` `{"afe":"…"}` from where the committed
@@ -481,6 +510,14 @@ lease's records reached, plus `"mic":"…"` from the committed lease's last
 contiguous sample while the speaker's `saveUtterances` is on. It carries the
 AEC state, and then the turn recording, through the response and closes 1 s
 after the turn ends, or 30 s after the commit (architecture §4.4).
+
+A `near_miss` lease (`near_miss_v1` devices only, generation 1) records one
+near miss while the speaker's `saveWakeClips` is on and capture is permitted:
+`owner` is its `near_miss_id` and `streams` is
+`{"mic":"<support_start − 4800, rounded down to 512>"}`, served from the 6 s
+mic ring. The controller closes it (`closed`) once it holds mic through
+`support_end + 4800`. The device gives it no other effect: no duck, no focus,
+and it is not a diagnostic lease, so wakes and the local chime are unaffected.
 
 **`uplink.renew`** C→D, gen = the lease's generation, or +1 to convert:
 `{"lease_id":"…","ttl_ms":3000,"reason":"turn","owner":"turn-uuid"}` (`reason`/`owner`

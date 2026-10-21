@@ -1,13 +1,14 @@
 """
-em_recordings.py — utterance and turn audio for the Activity panel
-==================================================================
+em_recordings.py — utterance, turn and near-miss audio for the Activity panel
+=============================================================================
 
 Saves the mic audio of recent voice turns as WAV files so you can *listen*
 to what the array actually captured, rather than inferring mic quality from
 an STT transcript and a wake score. Asked for by users who wanted to judge
 capture quality before spending an evening on the room and the placement.
 
-Two kinds (`RecordingKind`), both kept only while `saveUtterances` is on:
+Three kinds (`RecordingKind`). The first two are kept only while
+`saveUtterances` is on:
 
   * **The utterance** (`recordings/`) is exactly the STT copy the controller
     uploaded to Home Assistant for the committed span — after ASR gain and,
@@ -21,12 +22,17 @@ Two kinds (`RecordingKind`), both kept only while `saveUtterances` is on:
     wake included, is recorded through its lease's close. Only turns with an
     AFE chart (Fire OS 6, `afe_metadata_v1`) have one; the dashboard plays it
     against the chart.
+  * **The near-miss recording** (`nearmiss_recordings/`) is a near miss's
+    support span — a wake score that reached the near-miss floor without
+    opening a candidate — from 300 ms before it through 300 ms after it, as
+    canonical mic PCM. Kept only while `saveWakeClips` is on; named by the
+    near_misses row id, not a turn's.
 
 Storage: files live beside the SQLite DB, so they sit inside the persisted
 Docker volume and survive image upgrades. Retention is a hard per-device
 file count per kind — these are the artefacts here that contain raw speech,
 so a bounded window, then gone, is the point, not an optimisation. Pruning
-is by turn id parsed out of the filename rather than mtime: ids are
+is by row id parsed out of the filename rather than mtime: ids are
 monotonic rowids, so the order is exact even if the volume is restored from
 a backup that flattened timestamps. 16kHz mono S16_LE.
 
@@ -51,14 +57,17 @@ log = logging.getLogger("echomuse.recordings")
 
 class RecordingKind(enum.StrEnum):
     """What a recording holds. Each kind has its own directory and retention;
-    the filename is `<device>_<turn>.wav` in both."""
+    the filename is `<device>_<row id>.wav` in all of them (a turn's row, or a
+    near miss's)."""
 
     UTTERANCE = "utterance"   # the STT copy of the committed span
     TURN = "turn"             # the whole turn on its chart's timeline, canonical PCM
+    NEAR_MISS = "near_miss"   # a near miss's support span ±300 ms, canonical PCM
 
 
 RECORDINGS_SUBDIR = "recordings"
 TURN_RECORDINGS_SUBDIR = "turn_recordings"
+NEAR_MISS_RECORDINGS_SUBDIR = "nearmiss_recordings"
 
 # How many utterances to keep per device: enough for an endpoint and ASR
 # evaluation corpus. The STT copy runs ~100–200 kB per turn, so 300 is
@@ -70,10 +79,16 @@ KEEP_PER_DEVICE = 300
 # and the spoken answer — so 100 is ~30–80 MB per device.
 KEEP_TURN_PER_DEVICE = 100
 
-_SUBDIRS = {RecordingKind.UTTERANCE: RECORDINGS_SUBDIR, RecordingKind.TURN: TURN_RECORDINGS_SUBDIR}
-_KEEP = {RecordingKind.UTTERANCE: KEEP_PER_DEVICE, RecordingKind.TURN: KEEP_TURN_PER_DEVICE}
+# How many near-miss recordings to keep per device: each is ~2 s (~60 kB),
+# so 200 is ~12 MB per device — a few days of a chatty room's false starts.
+KEEP_NEAR_MISS_PER_DEVICE = 200
 
-# Format of both kinds (em_stt_copy, em_audio_timeline): 16 kHz mono PCM16.
+_SUBDIRS = {RecordingKind.UTTERANCE: RECORDINGS_SUBDIR, RecordingKind.TURN: TURN_RECORDINGS_SUBDIR,
+            RecordingKind.NEAR_MISS: NEAR_MISS_RECORDINGS_SUBDIR}
+_KEEP = {RecordingKind.UTTERANCE: KEEP_PER_DEVICE, RecordingKind.TURN: KEEP_TURN_PER_DEVICE,
+         RecordingKind.NEAR_MISS: KEEP_NEAR_MISS_PER_DEVICE}
+
+# Format of every kind (em_stt_copy, em_audio_timeline): 16 kHz mono PCM16.
 SAMPLE_RATE  = 16000
 SAMPLE_WIDTH = 2
 CHANNELS     = 1
@@ -84,7 +99,7 @@ CHANNELS     = 1
 MAX_UTTERANCE_SECONDS = 30
 MAX_UTTERANCE_BYTES   = MAX_UTTERANCE_SECONDS * SAMPLE_RATE * SAMPLE_WIDTH
 
-# device_id is ro.serialno (hex) and turn_id is a rowid, but this is the
+# device_id is ro.serialno (hex) and the id is a rowid, but this is the
 # name that comes back off disk and out of the DB, so it gets validated
 # like any other path component rather than trusted.
 _NAME_RE = re.compile(r"^(?P<device>[A-Za-z0-9_.-]{1,64})_(?P<turn>\d{1,19})\.wav$")
@@ -93,7 +108,7 @@ _NAME_RE = re.compile(r"^(?P<device>[A-Za-z0-9_.-]{1,64})_(?P<turn>\d{1,19})\.wa
 def recordings_dir(db_path: str | None = None, *, kind: RecordingKind = RecordingKind.UTTERANCE) -> Path:
     """
     Resolve a kind's directory beside the SQLite DB (DB_PATH env, same
-    default as em_controller): `recordings/` or `turn_recordings/`.
+    default as em_controller): `recordings/`, `turn_recordings/` or `nearmiss_recordings/`.
     Absolute, so it stays valid regardless of the process cwd.
     """
     if db_path is None:
@@ -102,7 +117,7 @@ def recordings_dir(db_path: str | None = None, *, kind: RecordingKind = Recordin
 
 
 def filename(device_id: str, turn_id: int) -> str | None:
-    """Canonical filename for a turn's recording (either kind), or None if unnameable."""
+    """Canonical filename for a turn's (or near miss's) recording, any kind, or None if unnameable."""
     safe = safe_device_id(device_id)
     if safe is None or turn_id is None or int(turn_id) < 0:
         return None

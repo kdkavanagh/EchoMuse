@@ -13,6 +13,7 @@ config key belongs to no section.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Iterable, Mapping, TypeGuard
@@ -44,10 +45,12 @@ class Section:
 
 SECTIONS: dict[SectionId, Section] = {
     SectionId.PLAYBACK: Section("Playback", ("eqBands", "eqLoudness", "duckDb")),
-    # wakeModel is the active registry graph's SHA-256 (§5.1); its
+    # wakeModel is the active registry graph's SHA-256 (§5.1); its open
     # thresholds belong to the registry entry, not to config. The open and
     # shadow rules (em_wake_rules) add to that entry's baseline rule.
-    SectionId.WAKEWORD: Section("Wake word", ("wakeModel", "saveWakeClips", "wakeArbitrationMs", "wakeSound",
+    # nearMissThreshold is the device's near-miss floor.
+    SectionId.WAKEWORD: Section("Wake word", ("wakeModel", "nearMissThreshold", "saveWakeClips",
+                                              "wakeArbitrationMs", "wakeSound",
                                               "wakeOpenRules", "wakeShadowRules")),
     # Everything the controller decides about the STT copy and who transcribes
     # the utterance at a pause (§16.6). Gain, beamforming, AEC and AGC belong
@@ -144,6 +147,37 @@ def wake_sound(cfg: Mapping[str, object]) -> bool:
     on acceptance and the `wakeSound` pushed to a `local_wake_chime` device.
     Only JSON true counts: the device decodes the key as a strict boolean."""
     return cfg.get("wakeSound") is True
+
+
+# The near-miss floor (`nearMissThreshold`), a BCResNet 3-window smoothed
+# score: an episode at or above it that opens no candidate is a near miss.
+# Below 0.05 every breath is one; above 0.60 it nears the playback threshold.
+NEAR_MISS_THRESHOLD_DEFAULT = 0.17
+NEAR_MISS_THRESHOLD_MIN = 0.05
+NEAR_MISS_THRESHOLD_MAX = 0.60
+
+
+def near_miss_threshold(cfg: Mapping[str, object]) -> float:
+    """`nearMissThreshold` as sent in `session.ready`
+    `detector.thresholds.near_miss`: the default standing in for a missing or
+    invalid value."""
+    value = cfg.get("nearMissThreshold")
+    return round(float(value), 2) if _is_near_miss(value) else NEAR_MISS_THRESHOLD_DEFAULT
+
+
+def near_miss_error(values: Mapping[str, object]) -> str | None:
+    """Why `nearMissThreshold` in a config write is invalid, or None."""
+    if "nearMissThreshold" in values and not _is_near_miss(values["nearMissThreshold"]):
+        return (f"nearMissThreshold must be a number from {NEAR_MISS_THRESHOLD_MIN:.2f} "
+                f"through {NEAR_MISS_THRESHOLD_MAX:.2f} with at most two decimals")
+    return None
+
+
+def _is_near_miss(value: object) -> TypeGuard[int | float]:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value)
+            and NEAR_MISS_THRESHOLD_MIN <= value <= NEAR_MISS_THRESHOLD_MAX
+            and abs(round(value, 2) - value) <= 1e-9)
 
 
 # Fully Kiosk's local REST API on the device itself: the kiosk runs on the

@@ -134,6 +134,32 @@ def test_changing_the_selected_wake_model_renegotiates_the_session():
     run(scenario())
 
 
+def test_ready_sends_the_devices_effective_near_miss_floor():
+    async def scenario():
+        store = FakeStore()
+        store.add("DEV1", approved=True)
+        store.configs["DEV1"] = {"duckDb": -9.0, "nearMissThreshold": 0.25}
+        hub, _, _ = make_hub(store)
+        result = await hub.admit(hello(), device_id="DEV1", peer_ip="x", secure=True, token=None)
+        assert result.ready.wire()["detector"]["thresholds"]["near_miss"] == 0.25
+        assert hub.devices["DEV1"].near_miss_floor == 0.25
+        await hub.devices["DEV1"].close()
+    run(scenario())
+
+
+def test_changing_the_near_miss_floor_renegotiates_the_session():
+    # The floor is named only in session.ready, like the graph.
+    async def scenario():
+        device, link, *_ = await _online()
+        assert device.near_miss_floor == 0.17
+        await device.apply_config({"duckDb": -12.0, "nearMissThreshold": 0.17})
+        assert not link.closed
+        await device.apply_config({"duckDb": -12.0, "nearMissThreshold": 0.3})
+        assert link.closed
+        await device.close()
+    run(scenario())
+
+
 _EXTRA = {"profile": "idle", "windows": 2, "combine": "mean", "threshold": 0.95}
 _SHADOW = {"profile": "idle", "windows": 1, "combine": "all", "threshold": 0.97}
 _BASELINE = [{"profile": "idle", "windows": 3, "combine": "mean", "threshold": 0.9},
@@ -270,6 +296,20 @@ def test_wake_stats_shadow_is_persisted_with_event_times_and_absence_writes_noth
         [r] = reports                                   # the malformed entry is dropped
         assert r.rule.key == "idle:1:all:0.97" and (r.hops, r.unmatched) == (180, 1)
         assert r.events[0].raws == (0.4, 0.98) and times == {10_000_000_000: 998.0}
+        await device.close()
+    run(scenario())
+
+
+@pytest.mark.parametrize("capable", [True, False])
+def test_a_near_miss_reaches_the_actor_with_its_wall_time_only_from_a_near_miss_device(capable):
+    async def scenario():
+        caps = ALL_V1 + (["near_miss_v1"] if capable else [])
+        device, link, _, _, sink = await _online(capabilities=caps)
+        link.clock = (12_000_000_000, 1_000.0)          # a heartbeat 2 s after the episode opened
+        sink.on_message(envelope("wake.near_miss", {"near_miss_id": "n1", "mono_ns": str(10_000_000_000)}))
+        await settle()
+        assert [(e.body["near_miss_id"], ts) for e, ts in device.actor.near_misses] == (
+            [("n1", 998.0)] if capable else [])
         await device.close()
     run(scenario())
 

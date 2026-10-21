@@ -293,7 +293,7 @@ func Assemble(cfg Config, d Deps) (*Supervisor, error) {
 	})
 	det, err := detector.New(detector.Callbacks{
 		Profile: s.profile, ProducingSound: s.producingSound,
-		OnCandidate: s.onCandidate, OnCandidateEnd: s.onCandidateEnd, OnStats: s.onStats,
+		OnCandidate: s.onCandidate, OnCandidateEnd: s.onCandidateEnd, OnNearMiss: s.onNearMiss, OnStats: s.onStats,
 		NowMonoNS: cfg.NowMonoNS,
 	})
 	if err != nil {

@@ -104,8 +104,13 @@ because it owns the speaker:
 | silent, or speaking a reply | idle | 0.90 |
 | playing music, or ringing an alarm or timer (including the gaps) | playback | 0.65 |
 
-Scores that come close without crossing are counted as **near misses** and
-shown on the Status tab. No audio goes with them.
+Scores that reach the **near-miss floor** (`nearMissThreshold`, 0.17 by
+default, a setting of its own rather than the model's) without crossing the
+threshold are **near misses**. The Activity tab lists each one beside the
+turns, and the Status tab counts them. The Dot uploads nothing for a near miss
+unless **Save wake clips** is on; then the controller asks it for those few
+seconds from its microphone history and keeps them as the near miss's
+recording.
 
 That 3-score average is the model's own **open rule** and is always on. On
 firmware with the `open_rules_v1` capability you can add up to four extra
@@ -568,6 +573,8 @@ On the controller, in its data directory:
 | Rejected wake candidates: score and reason, **no audio** | always | in the same history |
 | **Save utterances**: the STT copy sent to Home Assistant, as WAV | off by default | newest 10 per device |
 | **Save wake clips**: each accepted wake word, from 300 ms before it | off by default | newest 500 per device |
+| Near misses: time, peak score, floor, wake threshold, profile | always | newest 2,000 per device |
+| **Save wake clips**: each near miss, from 300 ms before it to 300 ms after | off by default | newest 200 per device |
 
 Clicking a turn on the Activity tab shows it stage by stage: the wake score,
 what the controller's streaming recognizer heard and why it stopped

@@ -356,10 +356,12 @@ The LED ring tells you what's happening (full list in
    reason.
 3. Does the wake word register? The device's Status tab shows wake health
    (the active model, whether the Dot loaded it, near misses), and the
-   Activity tab lists each turn with its date; click one to see its wake
-   score, what the controller heard, what Home Assistant transcribed and
-   answered, and how it ended. Frequent
-   near misses or false wakes are a question of the model's thresholds; see
+   Activity tab lists each turn with its date, and each near miss (the model
+   heard something close to the wake word but not close enough); click a turn
+   to see its wake score, what the controller heard, what Home Assistant
+   transcribed and answered, and how it ended. With **Save wake clips** on,
+   each near miss has a recording, so you can hear whether it was you. Missed
+   or false wakes are a question of the model's thresholds; see
    [configuration.md](configuration.md#wake-model).
 4. Bad transcriptions? See stages 1 and 8 of
    [voice-pipeline.md](voice-pipeline.md) — room noise and speaker distance

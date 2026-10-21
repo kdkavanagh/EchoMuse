@@ -75,6 +75,7 @@ def test_a_malformed_or_unsupported_hello_is_refused(bad):
     ("announcement_chime_capable", "announcement_chime"),
     ("open_rules_capable", "open_rules_v1"),
     ("afe_metadata_capable", "afe_metadata_v1"),
+    ("near_miss_capable", "near_miss_v1"),
     ("leds_capable", "leds"),
     ("wifi_control_capable", "wifi_control"),
     ("ble_proxy_capable", "ble_proxy"),
@@ -180,10 +181,10 @@ def test_admission_refuses_a_hello_naming_no_platform(caplog):
 # on firmware predating the companion app, which announced the Fire OS set.
 DOT = ALL_V1 + ["leds", "led_anim", "buttons", "button_hold", "alert_prefetch",
                 "local_wake_chime", "open_rules_v1", "ambient_light", "afe_metadata_v1",
-                "wifi_control", "ble_proxy", "privacy_mute"]
-DOT_OLDER = [c for c in DOT if c not in ("wifi_control", "ble_proxy", "privacy_mute")]
+                "near_miss_v1", "wifi_control", "ble_proxy", "privacy_mute"]
+DOT_OLDER = [c for c in DOT if c not in ("wifi_control", "ble_proxy", "privacy_mute", "near_miss_v1")]
 FIREOS_SHOW = ALL_V1 + ["alert_prefetch", "local_wake_chime", "open_rules_v1", "afe_metadata_v1",
-                        "ambient_light", "screen_wake"]
+                        "near_miss_v1", "ambient_light", "screen_wake"]
 KIOSK = ["turn_view_v1", "timer_view_v1", "kiosk_plugin"]
 COMPANION = ["leds", "led_anim", "buttons", "button_hold", "screen_overlay", *KIOSK]
 LINEAGE_SHOW = FIREOS_SHOW + COMPANION
@@ -223,7 +224,7 @@ DOT_GAPS = {"screen_wake": NO_SCREEN, "screen_overlay": NO_SCREEN, "turn_view_v1
 @pytest.mark.parametrize("platform, caps, gaps", [
     ("fireos6", DOT, DOT_GAPS),
     ("fireos6", DOT_OLDER, {**DOT_GAPS, "wifi_control": UPDATE, "ble_proxy": UPDATE,
-                            "privacy_mute": UPDATE}),
+                            "privacy_mute": UPDATE, "near_miss_v1": UPDATE}),
     # A Fire OS Show has no ring or button, and never an app to paint them.
     ("fireos6_crown", FIREOS_SHOW, FIREOS_SHOW_GAPS),
     ("fireos6_crown", [c for c in FIREOS_SHOW if c != "screen_wake"],
@@ -236,6 +237,10 @@ DOT_GAPS = {"screen_wake": NO_SCREEN, "screen_overlay": NO_SCREEN, "turn_view_v1
     # Firmware with the app but from before the Kiosk Satellite plugin.
     ("lineage18_crown", [c for c in LINEAGE_SHOW if c not in KIOSK],
      {**SHOW_GAPS, **{c: UPDATE for c in KIOSK}}),
+    # Firmware from before near-miss recording, on every image.
+    *((platform, [c for c in caps if c != "near_miss_v1"], {**gaps, "near_miss_v1": UPDATE})
+      for platform, caps, gaps in (("fireos6", DOT, DOT_GAPS), ("fireos6_crown", FIREOS_SHOW, FIREOS_SHOW_GAPS),
+                                   ("lineage18_crown", LINEAGE_SHOW, SHOW_GAPS))),
     # Absent elsewhere, the dashboard's own per-capability reason applies.
     ("fireos6", [c for c in DOT if c != "led_anim"], DOT_GAPS),
 ])

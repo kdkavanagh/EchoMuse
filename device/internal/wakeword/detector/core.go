@@ -49,8 +49,16 @@ type candidateState struct {
 	overlap    uint32 // bit i: shadow rule i had an episode open with it
 }
 
+// nearState is the open near-miss episode. Everything but peak, supportEnd
+// and below is latched at its opening hop.
 type nearState struct {
 	open          bool
+	floor         float64
+	profile       Profile
+	epoch         uint64
+	graphSHA256   string
+	supportStart  uint64
+	supportEnd    uint64 // end of the last scored hop at or above floor
 	monoNS        int64
 	peak          float64
 	below         int
@@ -286,7 +294,7 @@ func (c *core) score(it queueItem) {
 	if live != nil && live.below == closeAfterBelow {
 		c.closeCandidate(ReasonBelow)
 	}
-	c.nearHop(smoothed, now)
+	c.nearHop(it, smoothed, now)
 }
 
 // appendRecord keeps the hop slots from the oldest score in the mean onward.
@@ -523,32 +531,51 @@ func (c *core) abandonShadow() {
 }
 
 // nearHop tracks near-miss episodes (SPEC §5.2). candidateHop runs first, so
-// an episode opened on the candidate's own hop is already marked.
-func (c *core) nearHop(smoothed float64, now int64) {
-	floor := c.model.Thresholds.NearMiss
+// an episode opened on the candidate's own hop is already marked. The floor
+// is latched at the opening hop, as a candidate's threshold is.
+func (c *core) nearHop(it queueItem, smoothed float64, now int64) {
 	if !c.near.open {
-		if smoothed >= floor {
-			c.near = nearState{open: true, monoNS: now, peak: smoothed, candidateSeen: c.candidate != nil}
+		if floor := c.model.Thresholds.NearMiss; smoothed >= floor {
+			c.near = nearState{
+				open: true, floor: floor, profile: it.profile, epoch: it.epoch,
+				graphSHA256: c.model.GraphSHA256, supportStart: c.scores[0].end - WindowSamples,
+				supportEnd: it.end, monoNS: now, peak: smoothed, candidateSeen: c.candidate != nil,
+			}
 		}
 		return
 	}
 	c.near.peak = max(c.near.peak, smoothed)
-	if smoothed >= floor {
+	if smoothed >= c.near.floor {
 		c.near.below = 0
+		c.near.supportEnd = it.end
 		return
 	}
 	if c.near.below++; c.near.below == closeAfterBelow {
-		c.endNearMiss()
+		c.endNearMiss(ReasonBelow)
 	}
 }
 
-// endNearMiss closes the open episode, counting it if no candidate opened
-// during it.
-func (c *core) endNearMiss() {
-	if c.near.open && !c.near.candidateSeen {
-		c.stats.nearMisses = append(c.stats.nearMisses, NearMiss{MonoNS: c.near.monoNS, Peak: c.near.peak})
-	}
+// endNearMiss closes the open episode for reason, counting and reporting it
+// if no candidate opened during it.
+func (c *core) endNearMiss(reason CloseReason) {
+	n := c.near
 	c.near = nearState{}
+	if !n.open || n.candidateSeen {
+		return
+	}
+	c.stats.nearMisses = append(c.stats.nearMisses, NearMiss{MonoNS: n.monoNS, Peak: n.peak})
+	c.d.cb.OnNearMiss(NearMissEvent{
+		NearMissID:   c.d.cb.NewID(),
+		CaptureEpoch: n.epoch,
+		GraphSHA256:  n.graphSHA256,
+		Profile:      n.profile,
+		Floor:        n.floor,
+		Peak:         n.peak,
+		SupportStart: n.supportStart,
+		SupportEnd:   n.supportEnd,
+		MonoNS:       n.monoNS,
+		Reason:       reason,
+	})
 }
 
 // invalid handles an invalid window, reset, or mute: it closes any candidate
@@ -557,7 +584,7 @@ func (c *core) endNearMiss() {
 func (c *core) invalid(reason CloseReason) {
 	c.closeCandidate(reason)
 	c.abandonShadow()
-	c.endNearMiss()
+	c.endNearMiss(reason)
 	c.scores = c.scores[:0]
 	c.records = c.records[:0]
 	c.unscored = 0

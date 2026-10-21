@@ -144,9 +144,9 @@ the device wire protocol is [docs/protocol-v1.md](../docs/protocol-v1.md).
 
 **Removed settings**
 
-- Config keys: `owwModel`, `owwThreshold`, `bargeInThreshold`,
-  `nearMissThreshold` (thresholds belong to the registry model; `owwModel`
-  is replaced by `wakeModel`), `owwOnDevice`, `owwSpeexNs`, `bargeInEnabled`,
+- Config keys: `owwModel`, `owwThreshold`, `bargeInThreshold` (thresholds
+  belong to the registry model; `owwModel` is replaced by `wakeModel`),
+  `owwOnDevice`, `owwSpeexNs`, `bargeInEnabled`,
   `endpointRelative`, `endpointLowPerMil`, `endpointSilenceMs`,
   `endpointBackporchMs`, `maxSpeechMs` (replaced by `extendedUtterances`:
   on when the old cap was off or above 15 s), `vadThreshold`, `vadSpeechMs`,
@@ -155,13 +155,15 @@ the device wire protocol is [docs/protocol-v1.md](../docs/protocol-v1.md).
   `micGainDb`, `adcDigitalGain`, `adcMicpga`, `agcEnabled`, `aecEnabled`,
   `aecDelayMs`, `aecTailMs`, `beamformingEnabled`, `beamAngle` — which were
   still stored and made every dashboard config save fail. The API rejects
-  all of them by name.
+  all of them by name. `nearMissThreshold` is deleted too, because its value
+  was on openWakeWord's scale; the key itself is kept and starts again at
+  0.17 on the BCResNet scale (see "Near misses in Activity" below).
 - Dashboard config sections renamed: **Microphones** → **Speech** (it holds
   only the speech-to-text copy settings) and **Advanced** → **Button**.
 - Environment: `OWW_MODEL`, `OWW_THRESHOLD`. Add-on options: `oww_model`,
   `oww_threshold`.
 - Dashboard: stock wake word tiles, custom openWakeWord upload, Threshold,
-  Speex NS, Barge-in, Barge threshold, Near-miss floor, On-device; Stop on
+  Speex NS, Barge-in, Barge threshold, On-device; Stop on
   quiet, Stop sensitivity, Pause before stopping, Trailing audio, Max turn
   length; VAD Threshold, Speech gate, Silence gate; Burst length; "ring this
   device now".
@@ -1017,6 +1019,41 @@ the middle (docs/echo-show-companion-plan.md §11.10).
 - **Capabilities.** A LineageOS Show on older firmware reads "firmware update
   available"; a Fire OS Show "needs LineageOS on this Echo Show"; a Dot "no
   screen on this device".
+
+### Near misses in Activity
+
+A near miss is a wake score that reached the near-miss floor without waking
+the Echo. Near misses had been only a count on the Status tab. The Activity
+tab now lists each one among the turns, and records it while **Save wake
+clips** is on.
+
+- **Activity.** Each near miss shows its time, its peak score against the
+  floor and the wake threshold it missed, whether the Echo was idle or
+  playing, how long it lasted, and ▷/⤓ for its recording. Without a recording
+  the row says why: Save wake clips off, capture not permitted, recording
+  failed, or no longer kept. The **Near misses** pill hides or shows them.
+  An Echo on older firmware shows *firmware update available* instead. API:
+  `GET /api/devices/{id}/near_misses` and `GET
+  /api/devices/{id}/near_misses/{nm}/recording`.
+- **Near-miss floor is a setting again** (`nearMissThreshold`, Config →
+  Wake word, fleet or per device): 0.05–0.60, default 0.17, which was the
+  built-in model's value. It decides only what is listed and recorded, never
+  a wake. Saving a new value reconnects the affected Echos so the new floor
+  reaches them.
+- **Wake models have three thresholds.** A registry entry keeps `idle`,
+  `playback` and `reference`. The upload form and `POST` drop `near_miss`, and
+  the validation probe must now stay below `reference`. The controller
+  rewrites `registry.json` as version 2 at its first start.
+- **Recordings.** A near-miss clip runs from 300 ms before the scored stretch
+  to 300 ms after the last score at or above the floor, taken from the Echo's
+  6 s microphone history. It is uploaded only while Save wake clips is on and
+  never reaches speech recognition. The controller keeps the newest 200 clips
+  per device in `nearmiss_recordings/` and the newest 2,000 near misses per
+  device in the database (schema v36).
+- **Device protocol.** The new capability `near_miss_v1` brings the
+  `wake.near_miss` message, sent as each near miss ends, and an `uplink.open`
+  reason `near_miss` (docs/protocol-v1.md §4.4, §4.5). Firmware from this
+  tree announces it on all three images.
 
 ### Earlier in this release
 

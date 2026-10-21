@@ -280,6 +280,24 @@ type NearMiss struct {
 	Peak   float64 `json:"peak"`
 }
 
+// NearMissEvent is the WIRE wake.near_miss body: one closed near-miss
+// episode no candidate opened during. Floor, Profile, CaptureEpoch,
+// SupportStart and MonoNS are latched at its opening hop; Peak is the
+// highest smoothed value over it and SupportEnd the end of its last scored
+// hop at or above Floor. Reason is below, or the invalidation that ended it.
+type NearMissEvent struct {
+	NearMissID   string      `json:"near_miss_id"`
+	CaptureEpoch uint64      `json:"capture_epoch,string"`
+	GraphSHA256  string      `json:"graph_sha256"`
+	Profile      Profile     `json:"profile"`
+	Floor        float64     `json:"floor"`
+	Peak         float64     `json:"peak"`
+	SupportStart uint64      `json:"support_start,string"`
+	SupportEnd   uint64      `json:"support_end,string"`
+	MonoNS       int64       `json:"mono_ns,string"`
+	Reason       CloseReason `json:"reason"`
+}
+
 // UnavailableReason is WIRE wake_unavailable.
 type UnavailableReason string
 
@@ -361,6 +379,9 @@ type Callbacks struct {
 	ProducingSound func(from, to uint64) bool
 	OnCandidate    func(Candidate)
 	OnCandidateEnd func(CandidateEnd)
+	// OnNearMiss receives each near-miss episode wake.stats counts, as it
+	// closes.
+	OnNearMiss func(NearMissEvent)
 	// OnStats receives wake.stats every StatsPeriod and whenever
 	// wake_unavailable changes.
 	OnStats func(Stats)
