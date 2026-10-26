@@ -357,3 +357,33 @@ def test_the_near_miss_list_shows_a_saved_recording_retention_removed_as_pruned(
         (kept, "saved", 600), (pruned, "pruned", None), (off, "off", None)]
     assert (out[0]["profile"], out[0]["end_reason"], out[0]["wake_model_sha256"]) == ("playback", "gap", None)
     assert em_api._near_miss_path("dev2", kept) is None               # another device's row id
+
+
+def test_the_activity_view_lists_the_newest_rows_of_every_registered_device_by_time(fresh_db, tmp_path, monkeypatch):
+    """GET /api/turns and /api/near_misses: the newest rows across devices by
+    time, oldest first, each naming its device (as a device's own list does,
+    since the dashboard builds every recording's URL from it); a deleted
+    device's rows, which delete_device keeps, are not listed."""
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))       # delete_device's recordings sit beside it
+
+    def near_miss(ts):
+        return db.NearMissRecord(
+            ts=ts, near_miss_uuid=f"n{ts:g}", profile=db.em_wake_rules.RuleProfile.IDLE, floor=0.17,
+            peak=0.3, wake_threshold=0.9, wake_model_sha256=None, duration_ms=800,
+            end_reason=db.NearMissEnd.BELOW, recording=db.NearMissRecording.OFF)
+
+    for dev in ("dev1", "dev2", "gone"):
+        db.register_new_device(dev, "1.2.3.4", None, None)
+    for ts, dev in ((1.0, "dev1"), (2.0, "gone"), (3.0, "dev2"), (4.0, "dev1"), (5.0, "dev2"), (6.0, "gone")):
+        db.insert_turn(dev, {"ts": ts, "decision_trace": "{}", "afe_series": "{}"})
+        db.insert_near_miss(dev, near_miss(ts))
+    db.delete_device("gone")
+
+    turns = db.get_fleet_turns(limit=3)
+    assert [(t["device_id"], t["ts"]) for t in turns] == [("dev2", 3.0), ("dev1", 4.0), ("dev2", 5.0)]
+    assert not {"decision_trace", "afe_series"} & set(turns[0])
+    assert [t["ts"] for t in db.get_fleet_turns(since=3.5)] == [4.0, 5.0]
+    assert [(n.device_id, n.ts) for n in db.get_fleet_near_misses(limit=3)] == [
+        ("dev2", 3.0), ("dev1", 4.0), ("dev2", 5.0)]
+    assert [n.ts for n in db.get_fleet_near_misses(since=3.5)] == [4.0, 5.0]
+    assert [(t["device_id"], t["ts"]) for t in db.get_turns("dev1")] == [("dev1", 1.0), ("dev1", 4.0)]

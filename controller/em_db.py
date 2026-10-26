@@ -1231,6 +1231,18 @@ MIGRATIONS: list[str] = [
     CREATE INDEX IF NOT EXISTS idx_near_misses_device_ts ON near_misses (device_id, ts);
     UPDATE system_config SET value = '36' WHERE key = 'schema_version';
     """,
+
+    # ── v37 — Activity across every device ───────────────────────────────────
+    #
+    # GET /api/turns and /api/near_misses list the newest rows of every
+    # device by time (get_fleet_turns, get_fleet_near_misses). The
+    # (device_id, ts) indexes cannot order that, so without these each
+    # request sorted the whole table: TURN_RETENTION rows per device.
+    """
+    CREATE INDEX IF NOT EXISTS idx_turns_ts ON turns (ts);
+    CREATE INDEX IF NOT EXISTS idx_near_misses_ts ON near_misses (ts);
+    UPDATE system_config SET value = '37' WHERE key = 'schema_version';
+    """,
 ]
 
 # Post-migration fixups that need Python rather than SQL. Keyed by the schema
@@ -2323,7 +2335,7 @@ def get_device_logs(
 #
 # Persistent per-turn records + hourly rollups (near-misses, hardware
 # metrics). Written from the voice pipeline via run_in_executor; read by the
-# /api/devices/{id}/turns and /api/devices/{id}/activity endpoints.
+# /api/devices/{id}/turns, /api/turns and /api/devices/{id}/activity endpoints.
 
 # Turn dict keys ↔ column names written by insert_turn. "trigger" is stored
 # as trigger_type because TRIGGER is an SQLite keyword. The §11.3 decision
@@ -2489,38 +2501,55 @@ def set_turn_continuation(turn_id: int, continuation: str) -> None:
         )
 
 
+# The columns the turn lists read, as (record key, column): every
+# _TURN_COLUMNS one but TURN_WRITE_ONLY_COLUMNS, then _TURN_READ_ONLY_COLUMNS.
+# Named rather than `*`, so a list never reads the trace and AFE series its
+# newest TRACE_RETENTION rows carry (up to ~46 KB a row).
+_TURN_LIST_COLUMNS: tuple[tuple[str, str], ...] = (
+    tuple((k, c) for k, c in _TURN_COLUMNS.items() if k not in TURN_WRITE_ONLY_COLUMNS)
+    + tuple((c, c) for c in _TURN_READ_ONLY_COLUMNS))
+_TURN_LIST_SELECT = ("SELECT id, device_id, ts, " + ", ".join(c for _, c in _TURN_LIST_COLUMNS)
+                     + " FROM turns")
+
+# A row whose device is still registered: delete_device keeps a removed
+# device's turns and near misses, and the lists across devices leave them out.
+_REGISTERED = "EXISTS (SELECT 1 FROM devices d WHERE d.device_id = {table}.device_id)"
+
+
+def _newest(select: str, where: str, params: Sequence[object], limit: int,
+            since: Optional[float]) -> list[sqlite3.Row]:
+    """The newest `limit` rows of `select` matching `where` (and `ts >= since`), newest first."""
+    if since is not None:
+        where, params = f"{where} AND ts >= ?", (*params, since)
+    return _q(f"{select} WHERE {where} ORDER BY ts DESC LIMIT ?", (*params, limit))
+
+
+def _turn_records(rows: Sequence[sqlite3.Row]) -> list[dict[str, object]]:
+    """_TURN_LIST_SELECT rows, newest first, as turn records oldest first:
+    {turn_id, device_id, ts} plus every _TURN_LIST_COLUMNS key (NULL = not recorded)."""
+    out = []
+    for row in reversed(rows):
+        rec: dict[str, object] = {"turn_id": row["id"], "device_id": row["device_id"], "ts": row["ts"]}
+        for key, col in _TURN_LIST_COLUMNS:
+            rec[key] = row[col]
+        out.append(rec)
+    return out
+
+
 def get_turns(
     device_id: str,
     limit: int = 50,
     since: Optional[float] = None,
 ) -> list[dict[str, object]]:
-    """
-    Recent turns for a device, oldest first: {turn_id, ts} plus every
-    _TURN_COLUMNS key except TURN_WRITE_ONLY_COLUMNS, and every
-    _TURN_READ_ONLY_COLUMNS column (NULL = not recorded). since: optional
-    epoch-seconds lower bound.
-    """
-    if since is not None:
-        rows = _q(
-            "SELECT * FROM turns WHERE device_id = ? AND ts >= ? "
-            "ORDER BY ts DESC LIMIT ?",
-            (device_id, since, limit),
-        )
-    else:
-        rows = _q(
-            "SELECT * FROM turns WHERE device_id = ? ORDER BY ts DESC LIMIT ?",
-            (device_id, limit),
-        )
-    out = []
-    for row in reversed(rows):
-        rec: dict[str, object] = {"turn_id": row["id"], "ts": row["ts"]}
-        for key, col in _TURN_COLUMNS.items():
-            if key not in TURN_WRITE_ONLY_COLUMNS:
-                rec[key] = row[col]
-        for col in _TURN_READ_ONLY_COLUMNS:
-            rec[col] = row[col]
-        out.append(rec)
-    return out
+    """A device's newest `limit` turns (from `since`, epoch s), oldest first (_turn_records)."""
+    return _turn_records(_newest(_TURN_LIST_SELECT, "device_id = ?", (device_id,), limit, since))
+
+
+def get_fleet_turns(limit: int = 50, since: Optional[float] = None) -> list[dict[str, object]]:
+    """The newest `limit` turns of every registered device (from `since`, epoch s),
+    oldest first (_turn_records)."""
+    return _turn_records(_newest(f"{_TURN_LIST_SELECT} t", _REGISTERED.format(table="t"), (),
+                                 limit, since))
 
 
 def insert_near_miss(device_id: str, rec: NearMissRecord) -> int:
@@ -2552,12 +2581,14 @@ def set_near_miss_saved(near_miss_id: int, audio_ms: int) -> None:
 
 def get_near_misses(device_id: str, limit: int = 50, since: Optional[float] = None) -> list[NearMissRow]:
     """A device's newest `limit` near misses (from `since`, epoch s), oldest first."""
-    if since is not None:
-        rows = _q("SELECT * FROM near_misses WHERE device_id = ? AND ts >= ? ORDER BY ts DESC LIMIT ?",
-                  (device_id, since, limit))
-    else:
-        rows = _q("SELECT * FROM near_misses WHERE device_id = ? ORDER BY ts DESC LIMIT ?",
-                  (device_id, limit))
+    rows = _newest("SELECT * FROM near_misses", "device_id = ?", (device_id,), limit, since)
+    return [NearMissRow.from_row(r) for r in reversed(rows)]
+
+
+def get_fleet_near_misses(limit: int = 50, since: Optional[float] = None) -> list[NearMissRow]:
+    """The newest `limit` near misses of every registered device (from `since`, epoch s),
+    oldest first."""
+    rows = _newest("SELECT * FROM near_misses n", _REGISTERED.format(table="n"), (), limit, since)
     return [NearMissRow.from_row(r) for r in reversed(rows)]
 
 

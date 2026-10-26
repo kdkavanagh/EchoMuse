@@ -80,6 +80,20 @@ device's firmware does not announce is shown disabled with the reason.
   firmware bundled with this controller and rolling it back, and the device
   log.
 
+### Activity across every device
+
+The page's **Activity** tab, beside **Devices**, lists every Echo's voice
+turns and near misses in one list by time: the newest 200 of each, every row
+naming the Echo it happened on, and the name opens that Echo. The pills above
+the list narrow it to one Echo, which then also offers that Echo's wake clips
+as one archive. The tiles, recordings and turn detail are those of a device's
+Activity tab. The list follows each turn as it finishes and reloads every
+10 s, which is what brings new near misses. An Echo whose firmware reports no
+near misses is named above the list with the reason. The view is kept in the
+address (`#activity`), so a reload stays on it. API: `GET /api/turns` and
+`GET /api/near_misses` (`limit`, default 50, at most 1,000; `since`, epoch
+seconds), each row naming its `device_id`.
+
 ---
 
 ## 01 — Playback

@@ -1055,6 +1055,26 @@ clips** is on.
   reason `near_miss` (docs/protocol-v1.md §4.4, §4.5). Firmware from this
   tree announces it on all three images.
 
+### Activity across every device
+
+The dashboard's page has an **Activity** view beside **Devices**: every
+Echo's voice turns and near misses in one list by time.
+
+- **The list.** The newest 200 turns and 200 near misses across the Echos,
+  each row naming its Echo; the name opens it. Pills above the list narrow it
+  to one Echo, which also offers that Echo's wake clips as one archive. The
+  tiles, recordings and turn detail are those of the device Activity tab. It
+  reloads as each turn finishes and every 10 s, and the view is kept in the
+  address (`#activity`).
+- **API.** `GET /api/turns` and `GET /api/near_misses`: the newest rows of
+  every registered device by time (`limit`, default 50, at most 1,000;
+  `since`). A deleted device's rows, which the database keeps, are left out.
+  The rows of `GET /api/devices/{id}/turns` and `…/near_misses` now name their
+  `device_id` too.
+- **Schema v37** indexes `turns` and `near_misses` by time, so a list across
+  devices reads only the rows it returns. The turn lists no longer read each
+  row's decision trace and AFE series (up to ~46 KB a row) only to drop them.
+
 ### Earlier in this release
 
 - ASR gain: the STT copy sent to Home Assistant is amplified by

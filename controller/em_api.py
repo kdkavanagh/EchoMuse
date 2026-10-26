@@ -437,6 +437,8 @@ async def create_app(services: ControllerServices) -> web.Application:
     app.router.add_post("/api/devices/{id}/kiosk_login",  _post_kiosk_login)
     app.router.add_get("/api/devices/{id}/logs",          _get_device_logs)
     app.router.add_get("/api/devices/{id}/turns",         _get_device_turns)
+    app.router.add_get("/api/turns",                      _get_fleet_turns)
+    app.router.add_get("/api/near_misses",                _get_fleet_near_misses)
     app.router.add_get("/api/devices/{id}/activity",      _get_device_activity)
     app.router.add_get("/api/devices/{id}/wake_shadow",   _get_device_wake_shadow)
     app.router.add_get("/api/devices/{id}/response_latency", _get_device_response_latency)
@@ -810,6 +812,14 @@ async def _get_device(request: web.Request) -> web.Response:
     return _ok(_merge_device(row))
 
 
+def _limit_since(request: web.Request) -> tuple[int, float | None]:
+    """A list's `limit` (default 50, max 1000) and `since` (epoch seconds) query
+    params; ValueError when either is not numeric."""
+    limit = min(int(request.query.get("limit", 50)), 1000)
+    raw_since = request.query.get("since")
+    return limit, float(raw_since) if raw_since is not None else None
+
+
 @auth.require_auth
 async def _get_device_turns(request: web.Request) -> web.Response:
     """GET /api/devices/{id}/turns — recent voice-turn traces, newest last.
@@ -819,15 +829,28 @@ async def _get_device_turns(request: web.Request) -> web.Response:
     Query params: limit (default 50, max 1000), since (epoch seconds)."""
     device_id = request.match_info["id"]
     try:
-        limit = min(int(request.query.get("limit", 50)), 1000)
-        raw_since = request.query.get("since")
-        since = float(raw_since) if raw_since is not None else None
+        limit, since = _limit_since(request)
     except ValueError:
         return _error(ErrorCode.BAD_REQUEST, "limit/since must be numeric", 400)
     loop  = asyncio.get_running_loop()
     turns = await loop.run_in_executor(
         None, lambda: db.get_turns(device_id, limit, since)
     )
+    return _ok([_turn_json(t) for t in turns])
+
+
+@auth.require_auth
+async def _get_fleet_turns(request: web.Request) -> web.Response:
+    """GET /api/turns — the newest voice turns of every registered device,
+    newest last, each naming its `device_id`: the dashboard's Activity view.
+
+    Query params: limit (default 50, max 1000), since (epoch seconds)."""
+    try:
+        limit, since = _limit_since(request)
+    except ValueError:
+        return _error(ErrorCode.BAD_REQUEST, "limit/since must be numeric", 400)
+    turns = await asyncio.get_running_loop().run_in_executor(
+        None, lambda: db.get_fleet_turns(limit, since))
     return _ok([_turn_json(t) for t in turns])
 
 
@@ -969,14 +992,26 @@ async def _get_device_near_misses(request: web.Request) -> web.Response:
     removed (em_recordings.KEEP_NEAR_MISS_PER_DEVICE)."""
     device_id = request.match_info["id"]
     try:
-        limit = min(int(request.query.get("limit", 50)), 1000)
-        raw_since = request.query.get("since")
-        since = float(raw_since) if raw_since is not None else None
+        limit, since = _limit_since(request)
     except ValueError:
         return _error(ErrorCode.BAD_REQUEST, "limit/since must be numeric", 400)
     loop = asyncio.get_running_loop()
     rows = await loop.run_in_executor(None, lambda: [_near_miss_json(r) for r in db.get_near_misses(
         device_id, limit, since)])
+    return _ok(rows)
+
+
+@auth.require_auth
+async def _get_fleet_near_misses(request: web.Request) -> web.Response:
+    """GET /api/near_misses — the newest near misses of every registered
+    device, newest last, each naming its `device_id`: the dashboard's Activity
+    view. Query params and `recording` as GET /api/devices/{id}/near_misses."""
+    try:
+        limit, since = _limit_since(request)
+    except ValueError:
+        return _error(ErrorCode.BAD_REQUEST, "limit/since must be numeric", 400)
+    rows = await asyncio.get_running_loop().run_in_executor(
+        None, lambda: [_near_miss_json(r) for r in db.get_fleet_near_misses(limit, since)])
     return _ok(rows)
 
 
@@ -987,7 +1022,8 @@ def _near_miss_json(row: db.NearMissRow) -> dict[str, object]:
     if recording == db.NearMissRecording.SAVED and _near_miss_path(row.device_id, row.id) is None:
         recording, audio_ms = db.NearMissRecording.PRUNED, None
     return {
-        "id": row.id, "ts": row.ts, "near_miss_uuid": row.near_miss_uuid, "profile": row.profile,
+        "id": row.id, "device_id": row.device_id, "ts": row.ts, "near_miss_uuid": row.near_miss_uuid,
+        "profile": row.profile,
         "floor": row.floor, "peak": row.peak, "wake_threshold": row.wake_threshold,
         "wake_model_sha256": row.wake_model_sha256, "duration_ms": row.duration_ms,
         "end_reason": row.end_reason, "recording": recording, "audio_ms": audio_ms,

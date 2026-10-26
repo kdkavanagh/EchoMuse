@@ -1983,8 +1983,10 @@ function PauseTranscripts({ deviceId, turnId }) {
 // heard and whose words it ended on, what Home Assistant
 // transcribed and what was sent on, who handled it, what was said back, and
 // what became of any follow-up question. A stage that never ran (a refused
-// wake, no speech, a failed STT) is omitted rather than shown empty.
-function TurnDetail({ turn: t, turns, deviceId, onSelect, playback }) {
+// wake, no speech, a failed STT) is omitted rather than shown empty. Its
+// recordings and per-turn fetches are the turn's own device's (`device_id`);
+// `deviceLabel`, given across devices, names that device in the header.
+function TurnDetail({ turn: t, turns, deviceLabel, onSelect, playback }) {
   // Pre-cutover rows stored negative sentinels for unmeasured stages.
   const measured = v => typeof v === 'number' && v >= 0;
   const fmtS = ms => (measured(ms) ? (ms / 1000).toFixed(2) + ' s' : '—');
@@ -2014,6 +2016,7 @@ function TurnDetail({ turn: t, turns, deviceId, onSelect, playback }) {
   return (
     <div style={{ marginTop: 10, background: 'var(--hairline)', border: '1px solid var(--track)', borderRadius: 6, padding: '8px 12px', fontFamily: MONO, fontSize: 10, color: 'var(--text2)', lineHeight: 1.7 }}>
       <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', paddingBottom: 4 }}>
+        {deviceLabel && <span style={{ color: 'var(--text)' }}>{deviceLabel}</span>}
         <span style={{ color: 'var(--text)' }}>{fmtTurnWhenFull(t.ts)}</span>
         <span>{TRIGGERS[t.trigger] || t.trigger}</span>
         <span style={{ color: end.color }}>{end.label.replace(/_/g, ' ')}</span>
@@ -2040,9 +2043,9 @@ function TurnDetail({ turn: t, turns, deviceId, onSelect, playback }) {
         </div>
       </>)}
 
-      {!refused && !legacy && stage('Pause ASR', <PauseTranscripts deviceId={deviceId} turnId={t.turn_id}/>)}
+      {!refused && !legacy && stage('Pause ASR', <PauseTranscripts deviceId={t.device_id} turnId={t.turn_id}/>)}
 
-      {!legacy && stage('Native AFE', <NativeAfeEvidence evidence={t.afe_evidence} deviceId={deviceId}
+      {!legacy && stage('Native AFE', <NativeAfeEvidence evidence={t.afe_evidence} deviceId={t.device_id}
         turnId={t.turn_id} playback={playback}/>)}
 
       {(t.stt_raw != null || (legacy && (t.stt_text || measured(t.stt_ms)))) && stage('Transcribed (HA)', <>
@@ -2120,9 +2123,20 @@ function TurnDetail({ turn: t, turns, deviceId, onSelect, playback }) {
   );
 }
 
-// `nearMisses` is GET …/near_misses (oldest first, like `turns`);
-// `nearMissGap` the reason the device reports none (no near_miss_v1), else null.
-function TurnObservability({ turns, nearMisses, nearMissGap, deviceId, deviceLabel, recordingsOn, stateLabel, stateColor }) {
+// The rows each Activity list asks for: a device's tab, and the view across devices.
+const ACTIVITY_LIMIT = Object.freeze({ DEVICE: 50, FLEET: 200 });
+
+// One list of voice turns and near misses, each oldest first and every row
+// naming its `device_id`: one device's on its Activity tab, or, with `fleet`,
+// the Activity view's across devices, where each row names its device and
+// `onOpenDevice(id)` opens it. `labels` maps each device id the rows may name
+// to its label; `device` is the one device the rows are of (its wake-clip
+// archive, and the clip player's scope), else null. `nearMissGap` is the
+// reason the rows can hold no near miss (no device in view reports them),
+// else null; `state` the device's {label, color} tile, or null; `limit` the
+// rows asked for; `listHeight` the scrolling list's maximum height.
+function TurnObservability({ turns, nearMisses, nearMissGap, labels, device = null, fleet = false, onOpenDevice,
+                             recordingsOn, state = null, limit, listHeight = 230 }) {
   const [hover, setHover] = useState(null);       // key of the hovered row in `rows`
   const [selected, setSelected] = useState(null); // turn_id; null follows the newest
   const [showNear, setShowNear] = useState(true); // near-miss rows in the list
@@ -2138,15 +2152,16 @@ function TurnObservability({ turns, nearMisses, nearMissGap, deviceId, deviceLab
   // stops the other instead of leaving them talking over each other.
   const { WAKE, MIC, RECORDING } = TURN_CLIP;
   const clipKey = (t, kind) => `${t.turn_id}:${kind}`;
-  const clipPath = (t, kind) => `/api/devices/${deviceId}/turns/${t.turn_id}/${kind}`;
+  const clipPath = (t, kind) => `/api/devices/${t.device_id}/turns/${t.turn_id}/${kind}`;
 
-  const player = useClipPlayer(deviceId);
+  const player = useClipPlayer(device);
   const playing = player.playing;             // clip key currently sounding
   const [gone, setGone]         = useState(() => new Set()); // 404 = pruned
   const [zipping, setZipping]   = useState(false);
   const [zipError, setZipError] = useState('');
 
-  const slug = fileSlug(deviceLabel, deviceId);
+  const slugOf = id => fileSlug(labels[id], id);
+  const nameOf = id => labels[id] || id;
 
   // Retention is a small per-device file count, far shorter than the turn
   // history, so a row naming a recording that no longer exists is ordinary.
@@ -2169,21 +2184,21 @@ function TurnObservability({ turns, nearMisses, nearMissGap, deviceId, deviceLab
     // The kind is in the filename because both clips of one turn land in the
     // same downloads folder seconds apart, and only one of them is the
     // training negative anyone went looking for.
-    downloadUrl(url, `${slug}-${when}${kind === WAKE ? '-wake' : ''}.wav`);
+    downloadUrl(url, `${slugOf(t.device_id)}-${when}${kind === WAKE ? '-wake' : ''}.wav`);
   };
 
   // A near miss's recording (GET …/near_misses/{id}/recording). Its key is
   // also its row's, and never collides with a turn clip's `<turn_id>:<kind>`,
   // so the one player stops whichever else is sounding.
   const nearKey  = n => `near:${n.id}`;
-  const nearPath = n => `/api/devices/${deviceId}/near_misses/${n.id}/recording`;
+  const nearPath = n => `/api/devices/${n.device_id}/near_misses/${n.id}/recording`;
   const toggleNear = async n => {
     if (!(await player.toggle(nearKey(n), nearPath(n)))) markGone(nearKey(n));
   };
   const downloadNear = async n => {
     let url;
     try { url = await player.url(nearKey(n), nearPath(n)); } catch { markGone(nearKey(n)); return; }
-    downloadUrl(url, `${slug}-nearmiss${n.id}.wav`);
+    downloadUrl(url, `${slugOf(n.device_id)}-nearmiss${n.id}.wav`);
   };
 
   // The shown turn's recordings for its AFE chart: which one is sounding,
@@ -2207,7 +2222,7 @@ function TurnObservability({ turns, nearMisses, nearMissGap, deviceId, deviceLab
   async function doWakeZip() {
     setZipping(true); setZipError('');
     try {
-      downloadBlob(await API.blob(`/api/devices/${deviceId}/wakeclips.zip`), `${slug}-wakeclips.zip`);
+      downloadBlob(await API.blob(`/api/devices/${device}/wakeclips.zip`), `${slugOf(device)}-wakeclips.zip`);
     } catch (e) {
       setZipError(e.error || e.message || 'Could not build the archive');
     }
@@ -2262,6 +2277,15 @@ function TurnObservability({ turns, nearMisses, nearMissGap, deviceId, deviceLab
   // reads as a second timeline.
   const glyphBtn = { background: 'none', border: 'none', padding: 0, cursor: 'pointer', fontSize: 10, lineHeight: 1 };
 
+  // Across devices, each row names its device, as a button that opens it.
+  const deviceCell = id => fleet && (
+    <button type="button" onClick={e => { e.stopPropagation(); onOpenDevice(id); }} title={`Open ${nameOf(id)}`}
+      style={{ ...glyphBtn, fontFamily: MONO, fontSize: 9, color: 'var(--text2)', width: 96, flexShrink: 0,
+        textAlign: 'left', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+      {nameOf(id)}
+    </button>
+  );
+
   // One near miss, in the turn rows' columns so the two read as one
   // timeline: an amber marker where a turn has its trace number and ending,
   // the scores where a turn has its stage bar. Not pressable: it has no
@@ -2288,6 +2312,7 @@ function TurnObservability({ turns, nearMisses, nearMissGap, deviceId, deviceLab
           ◇
         </span>
         <span style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)', width: 86, flexShrink: 0, textAlign: 'right', whiteSpace: 'nowrap' }}>{fmtTurnWhen(n.ts)}</span>
+        {deviceCell(n.device_id)}
         <span style={{ flex: 1, minWidth: 0, fontFamily: MONO, fontSize: 9, color: 'var(--text2)', whiteSpace: 'nowrap',
           overflow: 'hidden', textOverflow: 'ellipsis', borderLeft: '2px dashed var(--lcd-amber)', paddingLeft: 6 }}
           title="The wake score reached the near-miss floor without opening a wake: peak smoothed score, the floor, and the threshold that would have woken it">
@@ -2322,8 +2347,8 @@ function TurnObservability({ turns, nearMisses, nearMissGap, deviceId, deviceLab
     <div>
       {/* Stat tiles */}
       <div style={{ display: 'flex', gap: 12, alignItems: 'flex-end', flexWrap: 'wrap', marginBottom: 16 }}>
-        <Lcd label="State" value={stateLabel} color={stateColor} size={16}/>
-        <Lcd label="Turns (last 50)" value={turns.length} color="var(--lcd-green)" size={16}/>
+        {state && <Lcd label="State" value={state.label} color={state.color} size={16}/>}
+        <Lcd label={`Turns (last ${limit})`} value={turns.length} color="var(--lcd-green)" size={16}/>
         <Lcd label="Success" value={successPct != null ? successPct + '%' : '—'}
              color={successPct == null ? 'var(--lcd-dim)' : successPct >= 80 ? 'var(--lcd-green)' : 'var(--lcd-amber)'} size={16}/>
         <Lcd label="Median reply" value={medianReply != null ? fmtS(medianReply) : '—'} color="var(--lcd-dim)" size={16}/>
@@ -2336,7 +2361,7 @@ function TurnObservability({ turns, nearMisses, nearMissGap, deviceId, deviceLab
       {turns.length === 0 && (nearMissGap || nearMisses.length === 0) ? (
         <div>
           <div style={{ fontFamily: MONO, fontSize: 11, color: 'var(--muted)', marginBottom: 8 }}>
-            No voice turns{nearMissGap ? '' : ' or near misses'} recorded yet — history starts when the device is next used.
+            No voice turns{nearMissGap ? '' : ' or near misses'} recorded yet — history starts when {fleet ? 'an Echo' : 'the device'} is next used.
           </div>
           {nearGapNote}
         </div>
@@ -2383,7 +2408,7 @@ function TurnObservability({ turns, nearMisses, nearMissGap, deviceId, deviceLab
               {/* Pill takes no title, so the explanation hangs off a wrapper
                   — this is the button someone presses before a retraining
                   run, and the label alone does not say that. */}
-              {anyWake && (
+              {anyWake && device && (
                 <span title="Download every wake clip this device still has, as one .zip — the false positives to feed back into wake-word training">
                   <Pill small disabled={zipping} onClick={doWakeZip}>
                     {zipping ? 'Building…' : 'Download wake clips (.zip)'}
@@ -2396,7 +2421,7 @@ function TurnObservability({ turns, nearMisses, nearMissGap, deviceId, deviceLab
 
           {/* One stacked bar per turn and one line per near miss, newest
               first — own scroll container */}
-          <div style={{ maxHeight: 230, overflowY: 'auto', paddingRight: 4 }}>
+          <div style={{ maxHeight: listHeight, overflowY: 'auto', paddingRight: 4 }}>
           {rows.map(({ key, turn: t, near }) => {
             if (near) return nearRow(near);
             const seg = turnSegments(t);
@@ -2411,10 +2436,11 @@ function TurnObservability({ turns, nearMisses, nearMissGap, deviceId, deviceLab
                 {/* The trace number: the key of GET …/turns/{n}/trace. The title
                     carries the controller-log id (turn_uuid) of the same turn. */}
                 <span style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)', width: 44, flexShrink: 0, textAlign: 'right', whiteSpace: 'nowrap' }}
-                  title={`Trace ${t.turn_id} — GET /api/devices/${deviceId}/turns/${t.turn_id}/trace${t.turn_uuid ? ` · controller log id ${t.turn_uuid}` : ''}`}>
+                  title={`Trace ${t.turn_id} — GET /api/devices/${t.device_id}/turns/${t.turn_id}/trace${t.turn_uuid ? ` · controller log id ${t.turn_uuid}` : ''}`}>
                   #{t.turn_id}
                 </span>
                 <span style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)', width: 86, flexShrink: 0, textAlign: 'right', whiteSpace: 'nowrap' }}>{fmtTurnWhen(t.ts)}</span>
+                {deviceCell(t.device_id)}
                 <div style={{ flex: 1, display: 'flex', height: 14, alignItems: 'stretch' }}>
                   {TURN_STAGES.map(s => seg[s.key] > 0 && (
                     <div key={s.key} style={{
@@ -2477,11 +2503,86 @@ function TurnObservability({ turns, nearMisses, nearMissGap, deviceId, deviceLab
           </div>
 
           {/* Stage-by-stage detail of the selected turn (the newest until one is clicked) */}
-          {shown && <TurnDetail turn={shown} turns={turns} deviceId={deviceId} onSelect={setSelected}
-            playback={playbackFor(shown)}/>}
+          {shown && <TurnDetail turn={shown} turns={turns} deviceLabel={fleet ? nameOf(shown.device_id) : null}
+            onSelect={setSelected} playback={playbackFor(shown)}/>}
         </div>
       )}
     </div>
+  );
+}
+
+// ─── Activity across devices ─────────────────────────────────────────────────
+// The page's Activity view: every device's voice turns and near misses as one
+// list by time (GET /api/turns, /api/near_misses), or one device's through its
+// own endpoints, with the device tab's turn detail. Reloaded every 10 s and as
+// each turn in view lands (turn_complete); near misses raise no event, so the
+// poll is what brings them.
+function FleetActivity({ devices, globalConfig, onOpenDevice }) {
+  const [choice, setChoice] = useState(null); // device_id shown alone, or null for every device
+  const [load, setLoad] = useState(null);     // {scope, turns, nearMisses} of the newest load; turns null: it failed
+  const approved = devices.filter(d => d.approved);
+  // A device deleted while chosen falls back to every device.
+  const scope = approved.some(d => d.device_id === choice) ? choice : null;
+
+  useEffect(() => {
+    let live = true;
+    let seq = 0;
+    const base = scope ? `/api/devices/${scope}` : '/api';
+    const fetchAll = () => {
+      const n = ++seq;
+      Promise.all([
+        API.get(`${base}/turns?limit=${ACTIVITY_LIMIT.FLEET}`).catch(() => null),
+        API.get(`${base}/near_misses?limit=${ACTIVITY_LIMIT.FLEET}`).catch(() => null),
+      ]).then(([turns, nearMisses]) => {
+        if (!live || n !== seq) return;   // overtaken by a newer load
+        // A failed request keeps what this scope last showed.
+        setLoad(prev => {
+          const kept = prev?.scope === scope ? prev : null;
+          return { scope, turns: turns ?? kept?.turns ?? null, nearMisses: nearMisses ?? kept?.nearMisses ?? [] };
+        });
+      });
+    };
+    fetchAll();
+    const iv = setInterval(fetchAll, 10000);
+    const unsubscribe = subscribeEvents(msg => {
+      if (msg.type === EVENT_TYPE.TURN_COMPLETE && (!scope || msg.device_id === scope)) fetchAll();
+    });
+    return () => { live = false; clearInterval(iv); unsubscribe(); };
+  }, [scope]);
+
+  const nameOf = d => d.label || d.device_id;
+  const labels = Object.fromEntries(devices.map(d => [d.device_id, d.label]));
+  const inView = scope ? approved.filter(d => d.device_id === scope) : approved;
+  const recordingsOn = inView.some(d => effectiveConfig(globalConfig, d).saveUtterances);
+  // Devices in view without near_miss_v1. When none has it the list says why
+  // it holds no near miss; when only some lack it, the note above names them.
+  const gaps = inView.map(d => [d, capabilityGap(liveCapabilities(d), CAPABILITY.NEAR_MISS)]).filter(([, g]) => g);
+  const gapText = gaps.map(([d, g]) => (scope ? g : `${nameOf(d)}: ${g}`)).join(' · ');
+  const noneReport = inView.length > 0 && gaps.length === inView.length;
+  const current = load?.scope === scope ? load : null;
+  const muted = { fontFamily: MONO, fontSize: 11, color: 'var(--muted)' };
+
+  return (
+    <Panel label={`Voice activity — ${scope ? nameOf(inView[0]) : 'every device'}`}>
+      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 14 }}>
+        <Pill small accent={!scope} onClick={() => setChoice(null)}>All devices</Pill>
+        {approved.map(d => (
+          <Pill key={d.device_id} small accent={scope === d.device_id} onClick={() => setChoice(d.device_id)}>
+            {nameOf(d)}
+          </Pill>
+        ))}
+      </div>
+      {!noneReport && gaps.length > 0 && (
+        <div style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)', marginBottom: 8 }}>
+          Near misses unavailable on {gapText}
+        </div>
+      )}
+      {!current ? <div style={muted}>loading…</div>
+        : current.turns == null ? <div style={{ ...muted, color: 'var(--warn)' }}>Could not load the activity — retrying every 10 s</div>
+        : <TurnObservability turns={current.turns} nearMisses={current.nearMisses}
+            nearMissGap={noneReport ? gapText : null} labels={labels} device={scope} fleet
+            onOpenDevice={onOpenDevice} recordingsOn={recordingsOn} limit={ACTIVITY_LIMIT.FLEET} listHeight="45vh"/>}
+    </Panel>
   );
 }
 
@@ -3712,10 +3813,10 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
     let live = true;
     const id = device.device_id;
     const load = () => {
-      API.get(`/api/devices/${id}/turns`)
+      API.get(`/api/devices/${id}/turns?limit=${ACTIVITY_LIMIT.DEVICE}`)
         .then(t => { if (live) setTurns(Array.isArray(t) ? t : []); })
         .catch(() => {});
-      API.get(`/api/devices/${id}/near_misses?limit=50`)
+      API.get(`/api/devices/${id}/near_misses?limit=${ACTIVITY_LIMIT.DEVICE}`)
         .then(n => { if (live) setNearMisses(Array.isArray(n) ? n : []); })
         .catch(() => {});
     };
@@ -4238,11 +4339,11 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                     turns={turns}
                     nearMisses={nearMisses}
                     nearMissGap={capabilityGap(liveCapabilities(device), CAPABILITY.NEAR_MISS)}
-                    deviceId={device.device_id}
-                    deviceLabel={device.label}
+                    labels={{ [device.device_id]: device.label }}
+                    device={device.device_id}
                     recordingsOn={cfgEff.saveUtterances}
-                    stateLabel={state.label.toUpperCase()}
-                    stateColor={state.dot}
+                    state={{ label: state.label.toUpperCase(), color: state.dot }}
+                    limit={ACTIVITY_LIMIT.DEVICE}
                   />
                 </Panel>
               </div>
@@ -9199,6 +9300,10 @@ function SettingsPanel({ globalConfig, onGlobalConfigChange, onClose, username, 
 
 // ─── App ──────────────────────────────────────────────────────────────────────
 
+// The page's views below the summary; each value is also its (upper-cased)
+// tab label and, but for the default, its URL hash.
+const PAGE_VIEW = Object.freeze({ DEVICES: 'devices', ACTIVITY: 'activity' });
+
 function App() {
   // The session is read once: signing in and out both happen on the landing
   // page, which this one navigates to. API.token is set here, synchronously,
@@ -9232,6 +9337,15 @@ function App() {
   const [globalConfig, setGlobalConfig] = useState(null);
   // Bumped to open a fresh events socket after the last one closed.
   const [socketEpoch, setSocketEpoch] = useState(0);
+  // The view on screen, kept in the URL hash so a reload stays on it. The
+  // URL is spelled out: a bare "#activity" resolves against the page's
+  // <base href> (the ingress root), not the dashboard.
+  const [view, setView] = useState(() =>
+    (location.hash === `#${PAGE_VIEW.ACTIVITY}` ? PAGE_VIEW.ACTIVITY : PAGE_VIEW.DEVICES));
+  function selectView(v) {
+    setView(v);
+    history.replaceState(null, '', location.pathname + location.search + (v === PAGE_VIEW.DEVICES ? '' : `#${v}`));
+  }
 
   const isAdmin = role === ROLE.ADMIN;
 
@@ -9296,7 +9410,7 @@ function App() {
           // Detail panels consume these through subscribeEvents.
           break;
         case EVENT_TYPE.TURN_COMPLETE:
-          // The Activity tab polls its own turn list.
+          // The Activity views fetch their own lists (subscribeEvents).
           break;
         case EVENT_TYPE.DEVICE_CONNECTED:
           setDevices(prev => prev.map(d =>
@@ -9523,8 +9637,16 @@ function App() {
         )}
       </div>
 
+      <div style={{ borderBottom: '1px solid var(--border-hard)', marginBottom: 28 }}>
+        <TabBar tabs={[PAGE_VIEW.DEVICES, PAGE_VIEW.ACTIVITY]} active={view} onSelect={selectView}/>
+      </div>
+
+      {view === PAGE_VIEW.ACTIVITY && (
+        <FleetActivity devices={devices} globalConfig={globalConfig} onOpenDevice={setSelected}/>
+      )}
+
       {/* Pending devices */}
-      {pending.length > 0 && (
+      {view === PAGE_VIEW.DEVICES && pending.length > 0 && (
         <>
           <div style={{ fontFamily: MONO, fontSize: 9, color: 'var(--accent-hi)', textTransform: 'uppercase', letterSpacing: '0.15em', marginBottom: 14 }}>
             Pending Approval · {pending.length}
@@ -9536,7 +9658,7 @@ function App() {
       )}
 
       {/* Device grid */}
-      {(approved.length > 0 || isAdmin) && (
+      {view === PAGE_VIEW.DEVICES && (approved.length > 0 || isAdmin) && (
         <>
           {approved.length > 0 && (
             <div style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.15em', marginBottom: 14 }}>
@@ -9555,7 +9677,7 @@ function App() {
         </>
       )}
 
-      {devices.length === 0 && !loadError && !isAdmin && (
+      {view === PAGE_VIEW.DEVICES && devices.length === 0 && !loadError && !isAdmin && (
         <div style={{ textAlign: 'center', padding: '60px 0', fontFamily: MONO, fontSize: 12, color: 'var(--muted)' }}>
           No devices yet — power on an EchoMuse device to see it appear here
         </div>
