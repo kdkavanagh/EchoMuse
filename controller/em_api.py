@@ -1612,10 +1612,10 @@ async def _get_fleet_near_misses_zip(request: web.Request) -> web.StreamResponse
     `verdict` (db.NearMissVerdict) only those marked with it, each named as the Activity list
     downloads it (`<device>-nearmiss<id>.wav`). A 404 when none matches."""
     device_id, lo, hi = _clip_filter(request)
-    try:
-        verdict = _near_miss_verdict(request.query.get("verdict") or None)
-    except ValueError as err:
-        raise ApiError(ErrorCode.BAD_REQUEST, str(err), 400) from None
+    raw = request.query.get("verdict")
+    if raw and raw not in db.NearMissVerdict:
+        raise ApiError(ErrorCode.BAD_REQUEST, f"verdict must be one of {', '.join(db.NearMissVerdict)}", 400)
+    verdict = db.NearMissVerdict(raw) if raw else None
     slugs = await _archive_slugs(device_id)
     loop = asyncio.get_running_loop()
     rows = await loop.run_in_executor(None, db.get_near_miss_recordings, device_id, lo, hi, verdict)
