@@ -514,3 +514,102 @@ def test_the_archives_stream_a_zip_of_the_matching_clips_named_as_their_own_down
     with zipfile.ZipFile(io.BytesIO(wakes)) as z:
         assert z.namelist() == ["kitchen-2026-10-26232503-wake.wav", "kitchen-2026-10-26232503-wake (1).wav"]
         assert z.read("kitchen-2026-10-26232503-wake (1).wav").endswith(wake_pcm["dev2"])
+
+
+def test_a_marked_near_miss_outlives_retention_until_its_mark_is_cleared(fresh_db, monkeypatch):
+    """set_near_miss_verdict marks one device's near miss (None clears it; another device's row
+    id is not found) and the lists return the mark. Retention prunes only unmarked rows and
+    counts only them, so marking a near miss keeps it however many come after."""
+    monkeypatch.setattr(db, "NEAR_MISS_RETENTION", 2)
+
+    def insert(ts):
+        return db.insert_near_miss("dev1", _near_miss_record(ts, 0.3, db.NearMissRecording.OFF))
+
+    first = insert(1.0)
+    insert(2.0)
+    assert db.set_near_miss_verdict("dev2", first, db.NearMissVerdict.MISSED_WAKE) is None
+    marked = db.set_near_miss_verdict("dev1", first, db.NearMissVerdict.MISSED_WAKE)
+    assert (marked.id, marked.verdict) == (first, db.NearMissVerdict.MISSED_WAKE)
+    for ts in (3.0, 4.0, 5.0):
+        insert(ts)
+    assert [(n.ts, n.verdict) for n in db.get_near_misses("dev1")] == [
+        (1.0, "missed_wake"), (4.0, None), (5.0, None)]
+    assert db.get_marked_near_miss_ids("dev1") == {first}
+
+    assert db.set_near_miss_verdict("dev1", first, None).verdict is None
+    assert db.get_marked_near_miss_ids("dev1") == frozenset()
+    insert(6.0)
+    assert [n.ts for n in db.get_near_misses("dev1")] == [5.0, 6.0]
+
+
+def test_a_near_miss_is_marked_over_the_api_and_the_verdict_archives_hold_only_their_marks(
+        fresh_db, tmp_path, monkeypatch):
+    """PATCH /api/devices/{id}/near_misses/{nm} sets or clears a verdict (400 for any other
+    value or none given, 404 for another device's near miss), and GET /api/near_misses.zip
+    with `verdict` holds only the saved recordings marked with it, named for the verdict
+    (400 for an unknown one)."""
+    em_api = pytest.importorskip("em_api")
+    import asyncio
+    import io
+    import zipfile
+
+    from aiohttp import ClientSession, web
+    from aiohttp.test_utils import TestServer
+
+    import em_recordings
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
+    db.register_new_device("dev1", "1.2.3.4", None, None)
+    db.approve_device("dev1", "Kitchen")
+    missed, ignored, unmarked = (db.insert_near_miss("dev1", _near_miss_record(ts, 0.4, db.NearMissRecording.SAVED))
+                                 for ts in (1.0, 2.0, 3.0))
+    for row in (missed, ignored, unmarked):
+        em_recordings.save("dev1", row, b"\x00\x00" * 9_600, kind=em_recordings.RecordingKind.NEAR_MISS)
+    db.set_near_miss_verdict("dev1", ignored, db.NearMissVerdict.CORRECTLY_IGNORED)
+
+    async def main():
+        app = web.Application(middlewares=[em_api._error_middleware])
+        app.router.add_patch("/api/devices/{id}/near_misses/{nm}", em_api._patch_near_miss.__wrapped__)
+        app.router.add_get("/api/near_misses.zip", em_api._get_fleet_near_misses_zip.__wrapped__)
+        server = TestServer(app, host="127.0.0.1")
+        await server.start_server()
+        try:
+            async with ClientSession() as http:
+                async def patch(path, body):
+                    async with http.patch(server.make_url(path), json=body) as r:
+                        return r.status, await r.json()
+
+                async def get(path):
+                    async with http.get(server.make_url(path)) as r:
+                        return r.status, r.headers.get("Content-Disposition"), await r.read()
+                patched = [await patch(f"/api/devices/{dev}/near_misses/{nm}", body) for dev, nm, body in (
+                    ("dev1", missed, {"verdict": "missed_wake"}),
+                    ("dev1", unmarked, {"verdict": "wake"}),
+                    ("dev1", unmarked, {}),
+                    ("dev2", missed, {"verdict": None}),
+                )]
+                archives = [await get(p) for p in (
+                    "/api/near_misses.zip?verdict=missed_wake", "/api/near_misses.zip?verdict=correctly_ignored",
+                    "/api/near_misses.zip", "/api/near_misses.zip?verdict=unmarked")]
+                cleared = await patch(f"/api/devices/dev1/near_misses/{ignored}", {"verdict": None})
+                return patched, archives, cleared
+        finally:
+            await server.close()
+
+    patched, archives, cleared = asyncio.run(main())
+    (ok, row), (bad, _), (missing, _), (other, _) = patched
+    assert (ok, bad, missing, other) == (200, 400, 400, 404)
+    assert (row["id"], row["verdict"], row["recording"]) == (missed, "missed_wake", "saved")
+    assert (cleared[0], cleared[1]["verdict"]) == (200, None)
+    assert db.get_marked_near_miss_ids("dev1") == {missed}
+
+    (m_status, m_name, m_body), (i_status, i_name, i_body), (all_status, _, all_body), (unknown, *_) = archives
+    assert (m_status, i_status, all_status, unknown) == (200, 200, 200, 400)
+    assert m_name == 'attachment; filename="echomuse-missedwakes-0.00-1.00.zip"'
+    assert i_name == 'attachment; filename="echomuse-correctlyignored-0.00-1.00.zip"'
+
+    def names(body):
+        with zipfile.ZipFile(io.BytesIO(body)) as z:
+            return z.namelist()
+    assert names(m_body) == [f"kitchen-nearmiss{missed}.wav"]
+    assert names(i_body) == [f"kitchen-nearmiss{ignored}.wav"]
+    assert names(all_body) == [f"kitchen-nearmiss{n}.wav" for n in (unmarked, ignored, missed)]

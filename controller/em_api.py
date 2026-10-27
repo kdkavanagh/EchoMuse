@@ -448,6 +448,7 @@ async def create_app(services: ControllerServices) -> web.Application:
     app.router.add_get("/api/devices/{id}/turns/{turn}/afe",   _get_turn_afe_series)
     app.router.add_get("/api/devices/{id}/turns/{turn}/trace", _get_turn_decision_trace)
     app.router.add_get("/api/devices/{id}/near_misses",   _get_device_near_misses)
+    app.router.add_patch("/api/devices/{id}/near_misses/{nm}", _patch_near_miss)
     app.router.add_get("/api/devices/{id}/near_misses/{nm}/recording", _get_near_miss_recording)
     app.router.add_get("/api/devices/{id}/near_misses/{nm}/afe", _get_near_miss_afe_series)
     # Wake clips — the pre-detection audio that crossed the threshold. The
@@ -994,7 +995,8 @@ async def _get_device_near_misses(request: web.Request) -> web.Response:
 
     Query params: limit (default 50, max 1000), since (epoch seconds).
     `recording` is `pruned` for a saved recording retention has since
-    removed (em_recordings.KEEP_NEAR_MISS_PER_DEVICE)."""
+    removed (em_recordings.KEEP_NEAR_MISS_PER_DEVICE). `verdict` is
+    db.NearMissVerdict, or null while nobody has marked it."""
     device_id = request.match_info["id"]
     try:
         limit, since = _limit_since(request)
@@ -1032,6 +1034,7 @@ def _near_miss_json(row: db.NearMissRow) -> dict[str, object]:
         "floor": row.floor, "peak": row.peak, "wake_threshold": row.wake_threshold,
         "wake_model_sha256": row.wake_model_sha256, "duration_ms": row.duration_ms,
         "end_reason": row.end_reason, "recording": recording, "audio_ms": audio_ms,
+        "verdict": row.verdict,
     }
 
 
@@ -1041,6 +1044,42 @@ def _near_miss_path(device_id: str, near_miss_id: int) -> Path | None:
     name = em_recordings.filename(device_id, near_miss_id)
     return (em_recordings.resolve(device_id, name, kind=em_recordings.RecordingKind.NEAR_MISS)
             if name else None)
+
+
+@auth.require_admin
+async def _patch_near_miss(request: web.Request) -> web.Response:
+    """PATCH /api/devices/{id}/near_misses/{nm} {verdict} — mark a near miss after listening to
+    it: `missed_wake` (the wake word was said, so it should have woken), `correctly_ignored`
+    (it was not the wake word), or null to clear the mark. Retention keeps a marked near miss
+    and its recording until the mark is cleared. Returns the near miss as the lists show it;
+    404 when the device has no such near miss."""
+    device_id = request.match_info["id"]
+    try:
+        near_miss_id = int(request.match_info["nm"])
+    except ValueError:
+        return _error(ErrorCode.BAD_REQUEST, "near miss must be an integer", 400)
+    body = await _json_body(request)
+    if "verdict" not in body:
+        return _error(ErrorCode.INVALID_INPUT, "verdict is required (null clears it)", 400)
+    try:
+        verdict = _near_miss_verdict(body["verdict"])
+    except ValueError as err:
+        return _error(ErrorCode.INVALID_INPUT, str(err), 400)
+    loop = asyncio.get_running_loop()
+    row = await loop.run_in_executor(None, db.set_near_miss_verdict, device_id, near_miss_id, verdict)
+    if row is None:
+        return _error(ErrorCode.NOT_FOUND, "No such near miss on this device", 404)
+    return _ok(await loop.run_in_executor(None, _near_miss_json, row))
+
+
+def _near_miss_verdict(raw: object) -> db.NearMissVerdict | None:
+    """A verdict from a request (None for null). ValueError names the allowed values."""
+    if raw is None:
+        return None
+    if isinstance(raw, str) and raw in db.NearMissVerdict:
+        return db.NearMissVerdict(raw)
+    allowed = ", ".join(db.NearMissVerdict)
+    raise ValueError(f"verdict must be one of {allowed}, or null")
 
 
 @auth.require_auth
@@ -1557,22 +1596,36 @@ async def _get_fleet_wakeclips_zip(request: web.Request) -> web.StreamResponse:
     return await _stream_zip(request, _archive_name("wakes", device_id and slugs[device_id], lo, hi), entries)
 
 
+# The word that names each near-miss archive, as the dashboard's ARCHIVE names it: every saved
+# recording, or only those marked with one verdict.
+_NEAR_MISS_ARCHIVE: dict[db.NearMissVerdict | None, str] = {
+    None: "nearmisses",
+    db.NearMissVerdict.MISSED_WAKE: "missedwakes",
+    db.NearMissVerdict.CORRECTLY_IGNORED: "correctlyignored",
+}
+
+
 @auth.require_auth
 async def _get_fleet_near_misses_zip(request: web.Request) -> web.StreamResponse:
-    """GET /api/near_misses.zip?device=&min=&max= — the recording of every near miss with a
-    peak score in [min, max], of `device` or every registered device, each named as the
-    Activity list downloads it (`<device>-nearmiss<id>.wav`). A 404 when none matches."""
+    """GET /api/near_misses.zip?device=&min=&max=&verdict= — the recording of every near miss
+    with a peak score in [min, max], of `device` or every registered device, and with
+    `verdict` (db.NearMissVerdict) only those marked with it, each named as the Activity list
+    downloads it (`<device>-nearmiss<id>.wav`). A 404 when none matches."""
     device_id, lo, hi = _clip_filter(request)
+    try:
+        verdict = _near_miss_verdict(request.query.get("verdict") or None)
+    except ValueError as err:
+        raise ApiError(ErrorCode.BAD_REQUEST, str(err), 400) from None
     slugs = await _archive_slugs(device_id)
     loop = asyncio.get_running_loop()
-    rows = await loop.run_in_executor(None, db.get_near_miss_recordings, device_id, lo, hi)
+    rows = await loop.run_in_executor(None, db.get_near_miss_recordings, device_id, lo, hi, verdict)
     entries = await loop.run_in_executor(None, lambda: [
         (f"{slugs[dev]}-nearmiss{nm}.wav", path) for dev, nm in rows
         if (path := _near_miss_path(dev, nm)) is not None])
     if not entries:
         return _error(ErrorCode.NO_RECORDING, "No saved near-miss recording matches", 404)
-    return await _stream_zip(request, _archive_name("nearmisses", device_id and slugs[device_id], lo, hi),
-                             entries)
+    return await _stream_zip(
+        request, _archive_name(_NEAR_MISS_ARCHIVE[verdict], device_id and slugs[device_id], lo, hi), entries)
 
 
 # ─── Ambient recording ────────────────────────────────────────────────────────

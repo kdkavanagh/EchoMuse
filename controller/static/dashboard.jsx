@@ -163,6 +163,12 @@ const NEAR_MISS_UNRECORDED = Object.freeze({
 const NEAR_MISS_END = Object.freeze({
   BELOW: 'below', GAP: 'gap', RESET: 'reset', MUTE: 'mute', OVERRUN: 'overrun',
 });
+// em_db.NearMissVerdict — near_misses[].verdict: what someone decided after
+// listening to a near miss (PATCH /api/devices/{id}/near_misses/{nm}), or null
+// while nobody has. A marked near miss keeps its recording past retention.
+const NEAR_MISS_VERDICT = Object.freeze({
+  MISSED_WAKE: 'missed_wake', CORRECTLY_IGNORED: 'correctly_ignored',
+});
 
 // em_session.TerminalReason — turns.terminal_reason.
 const TERMINAL_REASON = Object.freeze({
@@ -2191,10 +2197,31 @@ const NEAR_MISS_END_TEXT = Object.freeze({
   [NEAR_MISS_END.OVERRUN]: 'cut short by a detector overrun',
 });
 
+// Each verdict as Activity shows it: `answer` on its button in the detail,
+// `label` on its filter, `tag` in the row's ending column, `key` the shortcut
+// that sets it, `title` what it means, and `kept` what marking it did.
+const NEAR_MISS_VERDICTS = Object.freeze({
+  [NEAR_MISS_VERDICT.MISSED_WAKE]: {
+    answer: 'Yes — missed wake', label: 'Missed wake', tag: 'missed wake', key: 'y', color: 'var(--warn)',
+    title: 'The wake word was said and the Echo stayed quiet: a positive for wake-word training',
+    kept: 'Marked as a missed wake',
+  },
+  [NEAR_MISS_VERDICT.CORRECTLY_IGNORED]: {
+    answer: 'No — correctly ignored', label: 'Correctly ignored', tag: 'ignored', key: 'n', color: 'var(--ok)',
+    title: 'It was not the wake word, so staying quiet was right: a negative for wake-word training',
+    kept: 'Marked as correctly ignored',
+  },
+});
+// The shortcut that clears a verdict and the one that plays or stops the recording.
+const NEAR_MISS_KEY = Object.freeze({ CLEAR: 'u', PLAY: 'p' });
+
 // One near miss in detail: what nearly woke the Echo and how close it came,
-// its recording (`recording` its NEAR_MISS_RECORDING, pruned derived), and the
-// native AFE chart around it with the recording's playhead.
-function NearMissDetail({ near: n, deviceLabel, recording, playing, onPlay, onDownload, elapsed }) {
+// its recording (`recording` its NEAR_MISS_RECORDING, pruned derived), its
+// `verdict` with the buttons that set it through `onMark(verdict or null)`
+// (`markGap`: why it cannot be marked, else null; `markError`: why the last
+// mark failed), and the native AFE chart around it with the recording's playhead.
+function NearMissDetail({ near: n, deviceLabel, recording, playing, onPlay, onDownload, elapsed,
+                          verdict, onMark, markGap, markError }) {
   const [registry] = useWakeRegistry();
   const muted = { color: 'var(--muted)' };
   const fmtS = ms => (ms / 1000).toFixed(2) + ' s';
@@ -2226,6 +2253,32 @@ function NearMissDetail({ near: n, deviceLabel, recording, playing, onPlay, onDo
             {n.audio_ms != null && <span style={muted}>{fmtS(n.audio_ms)}, 300 ms either side of the scored stretch</span>}
           </div>
         ) : <span style={muted}>{NEAR_MISS_UNRECORDED[recording] || recording}</span>}
+      </DetailStage>
+      <DetailStage label="Verdict">
+        <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '4px 8px' }}>
+          <span style={{ color: 'var(--text)' }}>Was the wake word said?</span>
+          {/* Pill takes no title; each wrapper says what its verdict means. */}
+          {Object.values(NEAR_MISS_VERDICT).map(v => (
+            <span key={v} title={NEAR_MISS_VERDICTS[v].title}>
+              <Pill small accent={verdict === v} disabled={!!markGap} onClick={() => onMark(v)}>
+                {NEAR_MISS_VERDICTS[v].key.toUpperCase()} · {NEAR_MISS_VERDICTS[v].answer}
+              </Pill>
+            </span>
+          ))}
+          {verdict && !markGap && (
+            <span title="Clear the verdict: the near miss goes back to the ones to review, and retention may remove its recording">
+              <Pill small onClick={() => onMark(null)}>{NEAR_MISS_KEY.CLEAR.toUpperCase()} · Clear</Pill>
+            </span>
+          )}
+        </div>
+        <div style={markError ? { color: 'var(--warn)' } : muted}>
+          {markError || markGap || <>
+            {verdict && `${NEAR_MISS_VERDICTS[verdict].kept}: its recording is kept until the mark is cleared. `}
+            {Object.values(NEAR_MISS_VERDICT).map(v => NEAR_MISS_VERDICTS[v].key.toUpperCase()).join(' or ')} marks
+            it, then moves to the next near miss to review and plays it; {NEAR_MISS_KEY.PLAY.toUpperCase()} plays or
+            stops this one.
+          </>}
+        </div>
       </DetailStage>
       <DetailStage label="Native AFE"><NearMissAfeChart near={n} playing={playing} elapsed={elapsed}/></DetailStage>
       <div style={{ borderTop: '1px solid var(--track)', paddingTop: 4, color: 'var(--muted)', fontSize: 9 }}>
@@ -2261,6 +2314,22 @@ function NearMissAfeChart({ near: n, playing, elapsed }) {
 // The number of rows each Activity list asks for: one device's tab, or the view across devices.
 const ACTIVITY_LIMIT = Object.freeze({ DEVICE: 50, FLEET: 200 });
 
+// Which near misses an Activity list shows: none, every one, the recorded ones
+// nobody has marked yet, or the ones marked with one verdict.
+const NEAR_FILTER = Object.freeze({
+  HIDDEN: 'hidden', ALL: 'all', TO_REVIEW: 'to_review',
+  MISSED_WAKE: NEAR_MISS_VERDICT.MISSED_WAKE, CORRECTLY_IGNORED: NEAR_MISS_VERDICT.CORRECTLY_IGNORED,
+});
+const NEAR_FILTERS = Object.freeze([
+  { id: NEAR_FILTER.HIDDEN, label: 'Hide', title: 'List the turns alone' },
+  { id: NEAR_FILTER.ALL, label: 'All',
+    title: 'Every near miss: a wake score at or above the near-miss floor that did not wake it' },
+  { id: NEAR_FILTER.TO_REVIEW, label: 'To review', title: 'The recorded near misses nobody has marked yet' },
+  ...[NEAR_FILTER.MISSED_WAKE, NEAR_FILTER.CORRECTLY_IGNORED].map(v => ({
+    id: v, label: NEAR_MISS_VERDICTS[v].label, title: `Marked ${NEAR_MISS_VERDICTS[v].label.toLowerCase()}: ${NEAR_MISS_VERDICTS[v].title}`,
+  })),
+]);
+
 // One list of voice turns and near misses, with every row naming its `device_id`
 // and the oldest first: one device's on its Activity tab, or, with `fleet`,
 // the Activity view's across devices, where each row names its device and
@@ -2270,12 +2339,22 @@ const ACTIVITY_LIMIT = Object.freeze({ DEVICE: 50, FLEET: 200 });
 // reason the rows can hold no near miss (no device in view reports them),
 // else null; `state` is the device's {label, color} tile, or null; `limit` is
 // the number of rows requested; `listHeight` is the scrolling list's maximum height;
-// `emptyNote` is what an empty list says instead of "nothing recorded yet".
+// `emptyNote` is what an empty list says instead of "nothing recorded yet";
+// `isAdmin` lets the near misses be marked.
 function TurnObservability({ turns, nearMisses, nearMissGap, labels, device = null, fleet = false, onOpenDevice,
-                             recordingsOn, state = null, limit, listHeight = 230, emptyNote = null }) {
+                             recordingsOn, state = null, limit, listHeight = 230, emptyNote = null, isAdmin = false }) {
   const [hover, setHover] = useState(null);       // key of the hovered row in `rows`
   const [selected, setSelected] = useState(null); // key of the detailed row; null follows the newest turn
-  const [showNear, setShowNear] = useState(true); // near-miss rows in the list
+  const [nearFilter, setNearFilter] = useState(NEAR_FILTER.ALL); // which near misses the list shows
+  // Verdicts marked here, by near miss id, until the polled list agrees: a mark
+  // shows at once, and a failed one goes back to what it was.
+  const [marks, setMarks] = useState({});
+  const [markError, setMarkError] = useState('');
+  const [focusKey, setFocusKey] = useState(null); // a row to focus and scroll to once it is rendered
+  const rootRef = useRef(null);
+  // Whether the last click or focus landed in this list or its detail: the
+  // review keys act only then, so a list behind a device's modal stays still.
+  const engaged = useRef(false);
 
   // Saved audio — play in place or download the WAV, through one cached
   // object URL per clip (useClipPlayer).
@@ -2393,18 +2472,124 @@ function TurnObservability({ turns, nearMisses, nearMissGap, labels, device = nu
   // rest of the tab) out of view.
   const recent = turns.slice().reverse();
   const scale = Math.max(3000, ...recent.map(t => turnSegments(t).shown));
-  // Near misses interleave with the turns by time, newest first. Without
-  // near_miss_v1 the device reports none, and the panel says why instead.
-  const nearShown = !nearMissGap && showNear;
-  const rows = [
-    ...recent.map(t => ({ key: `turn:${t.turn_id}`, ts: t.ts, turn: t })),
-    ...(nearShown ? nearMisses.slice().reverse().map(n => ({ key: nearKey(n), ts: n.ts, near: n })) : []),
-  ].sort((a, b) => b.ts - a.ts);
-  // The detailed row: the one clicked while it is still listed, else the newest turn.
-  const shown = rows.find(r => r.key === selected) || rows.find(r => r.turn) || rows[0] || null;
   // A near miss's recording, `pruned` once a fetch of it has 404ed.
   const nearRecording = n => (n.recording === NEAR_MISS_RECORDING.SAVED && gone.has(nearKey(n))
     ? NEAR_MISS_RECORDING.PRUNED : n.recording);
+  // A near miss's verdict: the one marked here until the polled list agrees, else the list's.
+  const verdictOf = n => (n.id in marks ? marks[n.id] : n.verdict ?? null);
+  // To review: it has a recording to listen to, and nobody has marked it.
+  const toReview = n => verdictOf(n) == null && nearRecording(n) === NEAR_MISS_RECORDING.SAVED;
+  const nearIn = (filter, n) => filter === NEAR_FILTER.ALL
+    || (filter === NEAR_FILTER.TO_REVIEW ? toReview(n) : verdictOf(n) === filter);
+  const reviewCount = nearMisses.filter(toReview).length;
+  // Near misses interleave with the turns by time, newest first. Without
+  // near_miss_v1 the device reports none, and the panel says why instead.
+  const nearShown = !nearMissGap && nearFilter !== NEAR_FILTER.HIDDEN;
+  const rows = [
+    ...recent.map(t => ({ key: `turn:${t.turn_id}`, ts: t.ts, turn: t })),
+    ...(nearShown ? nearMisses.slice().reverse().filter(n => nearIn(nearFilter, n))
+      .map(n => ({ key: nearKey(n), ts: n.ts, near: n })) : []),
+  ].sort((a, b) => b.ts - a.ts);
+  // The detailed row: the one clicked while it is still listed, else the newest turn.
+  const shown = rows.find(r => r.key === selected) || rows.find(r => r.turn) || rows[0] || null;
+
+  // A mark the polled list now agrees with is no longer needed here.
+  useEffect(() => {
+    const listed = new Map(nearMisses.map(n => [String(n.id), n.verdict ?? null]));
+    setMarks(m => {
+      const left = Object.entries(m).filter(([id, v]) => listed.get(id) !== v);
+      return left.length === Object.keys(m).length ? m : Object.fromEntries(left);
+    });
+  }, [nearMisses]);
+
+  // Why `n` cannot be marked, or null: only an administrator marks, and only a
+  // near miss with a recording to listen to, unless it has a mark to change.
+  const markGapOf = n => (!isAdmin ? 'Only an administrator can mark near misses.'
+    : verdictOf(n) == null && nearRecording(n) !== NEAR_MISS_RECORDING.SAVED
+      ? 'There is no recording to judge this near miss by.' : null);
+
+  // Shows `n` in the detail, its row focused (so the review keys reach this
+  // list) and scrolled into view, and plays its recording.
+  const review = n => {
+    setSelected(nearKey(n));
+    setFocusKey(nearKey(n));
+    if (playing !== nearKey(n)) toggleNear(n);
+  };
+  useEffect(() => {
+    if (!focusKey) return;
+    const row = rootRef.current?.querySelector(`[data-row="${focusKey}"]`);
+    if (row) { row.focus({ preventScroll: true }); row.scrollIntoView({ block: 'nearest' }); }
+    setFocusKey(null);
+  }, [focusKey]);
+
+  // The next near miss to review listed after `n`, wrapping to the top; null when none is.
+  const nextToReview = n => {
+    const at = rows.findIndex(r => r.near?.id === n.id);
+    return [...rows.slice(at + 1), ...rows.slice(0, Math.max(at, 0))]
+      .find(r => r.near && toReview(r.near))?.near || null;
+  };
+
+  // Marks `n` with `verdict` (null clears it), shown at once and reverted if
+  // the controller refuses. A verdict moves the review on to the next near miss.
+  const mark = async (n, verdict) => {
+    if (markGapOf(n)) return;
+    const before = verdictOf(n);
+    setMarks(m => ({ ...m, [n.id]: verdict }));
+    setMarkError('');
+    if (verdict != null) {
+      const next = nextToReview(n);
+      if (next) review(next);
+    }
+    try {
+      await API.patch(`/api/devices/${n.device_id}/near_misses/${n.id}`, { verdict });
+    } catch (e) {
+      setMarks(m => ({ ...m, [n.id]: before }));
+      setMarkError(`Near miss ${n.id} was not marked: ${e.error || e.message || 'the request failed'}`);
+    }
+  };
+
+  // Starts a review at the newest near miss to review, listing the ones to
+  // review if the list hides them.
+  const startReview = () => {
+    const first = nearMisses.slice().reverse().find(toReview);
+    if (!first) return;
+    if (nearFilter !== NEAR_FILTER.ALL && nearFilter !== NEAR_FILTER.TO_REVIEW) setNearFilter(NEAR_FILTER.TO_REVIEW);
+    review(first);
+  };
+
+  // The review keys, while a near miss is shown and this list is the one in
+  // use (no other modal over it): each verdict's key marks it, CLEAR clears its
+  // mark, PLAY plays or stops it. Never while typing or with a modifier held.
+  const onReviewKey = useRef(null);
+  onReviewKey.current = e => {
+    const n = shown?.near;
+    const root = rootRef.current;
+    if (!n || !root || !engaged.current || e.ctrlKey || e.metaKey || e.altKey || e.repeat) return;
+    if (e.target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) return;
+    if (![...document.querySelectorAll('[aria-modal="true"]')].every(m => m.contains(root))) return;
+    const key = e.key.toLowerCase();
+    const verdict = Object.values(NEAR_MISS_VERDICT).find(v => NEAR_MISS_VERDICTS[v].key === key);
+    if (verdict || (key === NEAR_MISS_KEY.CLEAR && verdictOf(n) != null)) {
+      e.preventDefault();
+      mark(n, verdict || null);
+    } else if (key === NEAR_MISS_KEY.PLAY && nearRecording(n) === NEAR_MISS_RECORDING.SAVED) {
+      e.preventDefault();
+      toggleNear(n);
+    }
+  };
+  useEffect(() => {
+    const onKey = e => onReviewKey.current(e);
+    const onTouch = e => { engaged.current = !!rootRef.current?.contains(e.target); };
+    window.addEventListener('keydown', onKey);
+    window.addEventListener('pointerdown', onTouch, true);
+    window.addEventListener('focusin', onTouch, true);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('pointerdown', onTouch, true);
+      window.removeEventListener('focusin', onTouch, true);
+    };
+  }, []);
+
   const nearGapNote = nearMissGap && (
     <div style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)', margin: '0 0 8px' }}>
       Near misses unavailable — {nearMissGap}
@@ -2426,14 +2611,16 @@ function TurnObservability({ turns, nearMisses, nearMissGap, labels, device = nu
   );
 
   // One near miss, in the turn rows' columns so the two read as one
-  // timeline: an amber marker where a turn has its trace number and ending,
-  // the scores where a turn has its stage bar. Pressed, it shows its detail.
+  // timeline: an amber marker where a turn has its trace number, the scores
+  // where a turn has its stage bar, and its verdict where a turn has its
+  // ending. Pressed, it shows its detail.
   const nearRow = n => {
     const key = nearKey(n);
     const recording = nearRecording(n);
     const saved = recording === NEAR_MISS_RECORDING.SAVED;
     const sounding = playing === key;
     const isSel = shown?.key === key;
+    const verdict = verdictOf(n) && NEAR_MISS_VERDICTS[verdictOf(n)];
     const facts = [
       `peak ${n.peak.toFixed(2)}`,
       `floor ${n.floor.toFixed(2)}`,
@@ -2442,7 +2629,7 @@ function TurnObservability({ turns, nearMisses, nearMissGap, labels, device = nu
       n.end_reason !== NEAR_MISS_END.BELOW && `cut short: ${n.end_reason}`,
     ].filter(Boolean).join(' · ');
     return (
-      <div key={key}
+      <div key={key} data-row={key}
         {...pressable(() => setSelected(key), { selected: isSel })}
         onMouseEnter={() => setHover(key)} onMouseLeave={() => setHover(null)}
         style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '3px 0', cursor: 'pointer', borderRadius: 4,
@@ -2462,8 +2649,10 @@ function TurnObservability({ turns, nearMisses, nearMissGap, labels, device = nu
         <span style={{ fontFamily: MONO, fontSize: 9, color: 'var(--text2)', width: 34, flexShrink: 0 }}>{fmtS(n.duration_ms)}</span>
         <span style={{ width: 40, flexShrink: 0 }}/>
         <span style={{ width: 10, flexShrink: 0 }}/>
-        <span style={{ fontFamily: MONO, fontSize: 8, textTransform: 'uppercase', letterSpacing: '0.08em', width: 62, flexShrink: 0, color: 'var(--lcd-amber)' }}>
-          near miss
+        <span style={{ fontFamily: MONO, fontSize: 8, textTransform: 'uppercase', letterSpacing: '0.08em', width: 62, flexShrink: 0,
+          whiteSpace: 'nowrap', color: verdict ? verdict.color : 'var(--lcd-amber)' }}
+          title={verdict ? `Marked ${verdict.label.toLowerCase()}: ${verdict.title}` : 'Nobody has marked this near miss yet'}>
+          {verdict ? verdict.tag : 'near miss'}
         </span>
         <span style={{ width: 60, flexShrink: 0, display: 'flex', gap: 4, justifyContent: 'flex-end' }}>
           {saved && (<>
@@ -2484,7 +2673,7 @@ function TurnObservability({ turns, nearMisses, nearMissGap, labels, device = nu
   };
 
   return (
-    <div>
+    <div ref={rootRef}>
       {/* Stat tiles */}
       <div style={{ display: 'flex', gap: 12, alignItems: 'flex-end', flexWrap: 'wrap', marginBottom: 16 }}>
         {state && <Lcd label="State" value={state.label} color={state.color} size={16}/>}
@@ -2518,20 +2707,7 @@ function TurnObservability({ turns, nearMisses, nearMissGap, labels, device = nu
             <span title={RESPONSE_LATENCY_TITLE} style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontFamily: MONO, fontSize: 9, color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
               ↦ response latency
             </span>
-            {!nearMissGap && (
-              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontFamily: MONO, fontSize: 9, color: 'var(--lcd-amber)', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
-                ◇ near miss
-              </span>
-            )}
             <span style={{ marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 12 }}>
-              {/* Pill takes no title; the wrapper says what the toggle hides. */}
-              {!nearMissGap && (
-                <span title="Show or hide the near misses: wake scores at or above the near-miss floor that did not wake it">
-                  <Pill small accent={showNear} onClick={() => setShowNear(s => !s)}>
-                    Near misses ({nearMisses.length})
-                  </Pill>
-                </span>
-              )}
               {(recordingsOn || anyAudio) && (
                 <span style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
                   ▶ hear the mic{anyAudio ? '' : ' — next turn'}
@@ -2557,11 +2733,40 @@ function TurnObservability({ turns, nearMisses, nearMissGap, labels, device = nu
               )}
             </span>
           </div>
+          {/* Which near misses are listed, and the review that marks them. */}
+          {!nearMissGap && (
+            <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', marginBottom: 10 }}>
+              <span style={{ fontFamily: MONO, fontSize: 9, color: 'var(--lcd-amber)', textTransform: 'uppercase', letterSpacing: '0.08em', marginRight: 4 }}>
+                ◇ Near misses
+              </span>
+              {/* Pill takes no title; each wrapper says what its filter lists. */}
+              {NEAR_FILTERS.map(f => (
+                <span key={f.id} title={f.title}>
+                  <Pill small accent={nearFilter === f.id} onClick={() => setNearFilter(f.id)}>
+                    {f.label}{f.id === NEAR_FILTER.HIDDEN ? '' : ` (${nearMisses.filter(n => nearIn(f.id, n)).length})`}
+                  </Pill>
+                </span>
+              ))}
+              {isAdmin && (
+                <span style={{ marginLeft: 'auto' }}
+                  title="Show the newest near miss nobody has marked and play it. Y or N then marks it and moves on to the next one; P plays it again.">
+                  <Pill small accent disabled={!reviewCount} onClick={startReview}>
+                    {reviewCount ? '▶ Start review' : 'Nothing to review'}
+                  </Pill>
+                </span>
+              )}
+            </div>
+          )}
           {nearGapNote}
 
           {/* One stacked bar per turn and one line per near miss, newest
               first — own scroll container */}
           <div style={{ maxHeight: listHeight, overflowY: 'auto', paddingRight: 4 }}>
+          {rows.length === 0 && (
+            <div style={{ fontFamily: MONO, fontSize: 10, color: 'var(--muted)', padding: '3px 0' }}>
+              No turns, and no near misses under this filter.
+            </div>
+          )}
           {rows.map(({ key, turn: t, near }) => {
             if (near) return nearRow(near);
             const seg = turnSegments(t);
@@ -2647,7 +2852,9 @@ function TurnObservability({ turns, nearMisses, nearMissGap, labels, device = nu
             onSelect={id => setSelected(`turn:${id}`)} playback={playbackFor(shown.turn)}/>}
           {shown?.near && <NearMissDetail near={shown.near} deviceLabel={fleet ? nameOf(shown.near.device_id) : null}
             recording={nearRecording(shown.near)} playing={playing === nearKey(shown.near)}
-            onPlay={() => toggleNear(shown.near)} onDownload={() => downloadNear(shown.near)} elapsed={player.elapsed}/>}
+            onPlay={() => toggleNear(shown.near)} onDownload={() => downloadNear(shown.near)} elapsed={player.elapsed}
+            verdict={verdictOf(shown.near)} onMark={v => mark(shown.near, v)} markGap={markGapOf(shown.near)}
+            markError={markError}/>}
         </div>
       )}
     </div>
@@ -2659,28 +2866,44 @@ function TurnObservability({ turns, nearMisses, nearMissGap, labels, device = nu
 // list by time (GET /api/turns, /api/near_misses), or one device's through its
 // own endpoints, with the device tab's turn detail. It reloads every 10 s and as
 // each turn in view lands (turn_complete); near misses raise no event, so the
-// poll brings them in. A range of wake scores narrows the list, and the two
+// poll brings them in. A range of wake scores narrows the list, and the
 // archives take every saved clip that matches the same filters, not only the rows
 // listed.
 
-// The Activity view's archives (GET /api/wakeclips.zip, /api/near_misses.zip);
-// each value is also the word the controller uses in the archive file name.
-const ARCHIVE = Object.freeze({ WAKES: 'wakes', NEAR_MISSES: 'nearmisses' });
+// The Activity view's archives (GET /api/wakeclips.zip, /api/near_misses.zip,
+// which `query.verdict` narrows to the near misses marked with it); each value
+// is also the word the controller uses in the archive file name.
+const ARCHIVE = Object.freeze({
+  WAKES: 'wakes', MISSED_WAKES: 'missedwakes', CORRECTLY_IGNORED: 'correctlyignored', NEAR_MISSES: 'nearmisses',
+});
 const ARCHIVES = Object.freeze({
   [ARCHIVE.WAKES]: {
-    path: '/api/wakeclips.zip', label: 'Confirmed wakes', noun: 'wake clip',
+    path: '/api/wakeclips.zip', query: {}, label: 'Confirmed wakes', noun: 'wake clip',
     title: 'The wake clip of every confirmed wake (a wake turn not refused) with a wake score in the range, from the devices shown: '
       + 'every clip still kept (the newest 500 per device, saved while Save wake clips is on), not only the turns listed',
   },
+  [ARCHIVE.MISSED_WAKES]: {
+    path: '/api/near_misses.zip', query: { verdict: NEAR_MISS_VERDICT.MISSED_WAKE },
+    label: 'Missed wakes', noun: 'near miss marked missed wake',
+    title: 'The recording of every near miss marked Missed wake, with a peak score in the range, from the devices shown, '
+      + 'not only the ones listed: the wake word was said and the Echo stayed quiet, the positives for wake-word training',
+  },
+  [ARCHIVE.CORRECTLY_IGNORED]: {
+    path: '/api/near_misses.zip', query: { verdict: NEAR_MISS_VERDICT.CORRECTLY_IGNORED },
+    label: 'Correctly ignored', noun: 'near miss marked correctly ignored',
+    title: 'The recording of every near miss marked Correctly ignored, with a peak score in the range, from the devices shown, '
+      + 'not only the ones listed: it was not the wake word, the negatives for wake-word training',
+  },
   [ARCHIVE.NEAR_MISSES]: {
-    path: '/api/near_misses.zip', label: 'Near misses', noun: 'near-miss recording',
-    title: 'The recording of every near miss with a peak score in the range, from the devices shown: '
-      + 'every recording still kept (the newest 200 per device, recorded while Save wake clips is on), not only the near misses listed',
+    path: '/api/near_misses.zip', query: {}, label: 'All near misses', noun: 'near-miss recording',
+    title: 'The recording of every near miss, marked or not, with a peak score in the range, from the devices shown: '
+      + 'every recording still kept (the newest 200 per device, recorded while Save wake clips is on, and every marked one), '
+      + 'not only the near misses listed',
   },
 });
 const SCORE_RANGE_ALL = Object.freeze([0, 1]);
 
-function FleetActivity({ devices, globalConfig, onOpenDevice }) {
+function FleetActivity({ devices, globalConfig, onOpenDevice, isAdmin }) {
   const [choice, setChoice] = useState(null); // device_id shown alone, or null for every device
   const [load, setLoad] = useState(null);     // {scope, turns, nearMisses} of the newest load; turns null: it failed
   const [[lo, hi], setRange] = useState(SCORE_RANGE_ALL);
@@ -2740,7 +2963,7 @@ function FleetActivity({ devices, globalConfig, onOpenDevice }) {
 
   async function download(kind) {
     const a = ARCHIVES[kind];
-    const query = new URLSearchParams({ min: fmtScore(lo), max: fmtScore(hi) });
+    const query = new URLSearchParams({ min: fmtScore(lo), max: fmtScore(hi), ...a.query });
     if (scope) query.set('device', scope);
     setArchiving(kind); setArchiveError('');
     try {
@@ -2781,11 +3004,14 @@ function FleetActivity({ devices, globalConfig, onOpenDevice }) {
         </span>
         <span style={{ display: 'inline-flex', flexWrap: 'wrap', gap: 6, alignItems: 'center', marginLeft: 'auto' }}>
           {archiveError && <span style={{ fontFamily: MONO, fontSize: 9, color: 'var(--warn)' }}>{archiveError}</span>}
+          <span style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+            ⤓ .zip
+          </span>
           {/* Pill takes no title; the wrapper says what each archive holds. */}
           {Object.values(ARCHIVE).map(kind => (
             <span key={kind} title={ARCHIVES[kind].title}>
               <Pill small disabled={archiving != null} onClick={() => download(kind)}>
-                {archiving === kind ? 'Building…' : `⤓ ${ARCHIVES[kind].label} (.zip)`}
+                {archiving === kind ? 'Building…' : ARCHIVES[kind].label}
               </Pill>
             </span>
           ))}
@@ -2800,7 +3026,7 @@ function FleetActivity({ devices, globalConfig, onOpenDevice }) {
         : turns == null ? <div style={{ ...muted, color: 'var(--warn)' }}>Could not load the activity — retrying every 10 s</div>
         : <TurnObservability turns={turns} nearMisses={nearMisses}
             nearMissGap={noneReport ? gapText : null} labels={labels} fleet
-            onOpenDevice={onOpenDevice} recordingsOn={recordingsOn} limit={ACTIVITY_LIMIT.FLEET} listHeight="45vh"
+            onOpenDevice={onOpenDevice} recordingsOn={recordingsOn} limit={ACTIVITY_LIMIT.FLEET} listHeight="45vh" isAdmin={isAdmin}
             emptyNote={narrowed ? `No turn or near miss with a wake score of ${fmtScore(lo)}–${fmtScore(hi)} among the newest ${ACTIVITY_LIMIT.FLEET} of each.` : null}/>}
     </Panel>
   );
@@ -4565,6 +4791,7 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                     recordingsOn={cfgEff.saveUtterances}
                     state={{ label: state.label.toUpperCase(), color: state.dot }}
                     limit={ACTIVITY_LIMIT.DEVICE}
+                    isAdmin={isAdmin}
                   />
                 </Panel>
               </div>
@@ -9863,7 +10090,7 @@ function App() {
       </div>
 
       {view === PAGE_VIEW.ACTIVITY && (
-        <FleetActivity devices={devices} globalConfig={globalConfig} onOpenDevice={setSelected}/>
+        <FleetActivity devices={devices} globalConfig={globalConfig} onOpenDevice={setSelected} isAdmin={isAdmin}/>
       )}
 
       {/* Pending devices */}

@@ -573,8 +573,8 @@ On the controller, in its data directory:
 | Rejected wake candidates: score and reason, **no audio** | always | in the same history |
 | **Save utterances**: the STT copy sent to Home Assistant, as WAV | off by default | newest 10 per device |
 | **Save wake clips**: each accepted wake word, from 300 ms before it | off by default | newest 500 per device |
-| Near misses: time, peak score, floor, wake threshold, profile | always | newest 2,000 per device |
-| **Save wake clips**: each near miss, from 300 ms before it to 300 ms after | off by default | newest 200 per device |
+| Near misses: time, peak score, floor, wake threshold, profile, verdict | always | newest 2,000 unmarked per device, and every one marked with a verdict |
+| **Save wake clips**: each near miss, from 300 ms before it to 300 ms after | off by default | newest 200 unmarked per device, and every one marked with a verdict |
 
 Clicking a turn on the Activity tab shows it stage by stage: the wake score,
 what the controller's streaming recognizer heard and why it stopped

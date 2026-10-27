@@ -56,8 +56,9 @@ device's firmware does not announce is shown disabled with the reason.
 - **Activity** — the voice-turn history: what was heard, the transcript, how
   the turn ended, and the audio of each turn when **Save utterances** or
   **Save wake clips** is on. Near misses are listed among the turns (see
-  [Near-miss floor](#near-miss-floor)); the **Near misses** pill shows or
-  hides them. The header names the wake model with its idle and
+  [Near-miss floor](#near-miss-floor)); the **Near misses** pills choose
+  which ones: all, those to review, those marked with one verdict, or none
+  (see [Marking near misses](#marking-near-misses)). The header names the wake model with its idle and
   playback thresholds, and a counter shows **Refused wakes**. Each turn that
   played a reply shows its response latency (`↦1.9s`, the same measure as on
   Status). A turn whose answer asked a follow-up question is marked `?`
@@ -97,14 +98,18 @@ view is kept in the address (`#activity`), so a reload stays on it. API: `GET
   misses whose peak, lie in its range (both ends included); narrowed, it also
   hides turns without a score (button presses, replies) and says how many.
   The tiles count what is shown.
-- **⤓ Confirmed wakes (.zip)** and **⤓ Near misses (.zip)** download every
-  saved clip the filters match, not only the rows listed: the wake clip of
-  each wake that was not refused (Save wake clips keeps the newest 500 per
-  Echo), and each near-miss recording (the newest 200 per Echo). The files sit
+- **⤓ .zip** downloads every saved clip the filters match, not only the rows
+  listed. **Confirmed wakes** holds the wake clip of each wake that was not
+  refused (Save wake clips keeps the newest 500 per Echo). **Missed wakes**
+  and **Correctly ignored** hold the recordings of the near misses marked with
+  that verdict (see [Marking near misses](#marking-near-misses)), and **All
+  near misses** every near-miss recording, marked or not (the newest 200 per
+  Echo, plus every marked one). The files sit
   side by side, each named as its own ⤓ in the list names it
   (`kitchen-2026-10-26232503-wake.wav`, the wake's UTC time; `kitchen-nearmiss446.wav`),
   a repeated name numbered `(1)` as a browser would. API: `GET
-  /api/wakeclips.zip` and `GET /api/near_misses.zip` (`device`, `min`, `max`).
+  /api/wakeclips.zip` and `GET /api/near_misses.zip` (`device`, `min`, `max`;
+  the near misses also `verdict`).
 - **Near-miss detail.** Clicking a near miss shows its peak against the floor
   and the wake threshold, its recording, and the Echo's native AFE chart from
   a second before the scored stretch through the recording's end (taken with
@@ -311,7 +316,9 @@ controller already received for that wake. A near miss is different: the Dot
 uploads nothing for it unless this setting is on, and then only its few
 seconds, from 300 ms before the stretch the model scored to 300 ms after the
 last score at or above the floor, at most the Dot's last 6 seconds. The newest
-**500 wake clips** and **200 near-miss clips per device** are kept. Turning
+**500 wake clips** and **200 near-miss clips per device** are kept, and
+every near miss [marked with a verdict](#marking-near-misses) as well, until
+its mark is cleared. Turning
 the setting off stops new clips but keeps the saved ones until newer clips
 push them out or you delete the device. To clear them sooner, delete the
 files in the `wakes/` and `nearmiss_recordings/` folders beside the
@@ -331,13 +338,42 @@ the setting was off, capture was not permitted (privacy mute, a recording
 mode), the recording failed, or the clip has since been pushed out by newer
 ones. **Near misses** and **Near-miss peak** on the Status tab's
 [Wake health](#wake-health-status-tab) count them per 30-second report. The
-controller keeps each Echo's newest 2,000 near misses.
+controller keeps each Echo's newest 2,000 near misses that nobody has marked,
+and every marked one.
 
 Raise the floor in a noisy room, where ordinary sound reaches it often; lower
 it to hear quieter attempts. It changes only what is listed and recorded,
 never what wakes the Dot. Saving a new value reconnects the affected Echos,
 which takes a few seconds. Echos on firmware older than the controller's show
 *firmware update available* in place of the near-miss rows.
+
+### Marking near misses
+
+A near miss's score fell short, but only listening tells you whether the Dot
+was right to stay quiet. Each recorded near miss can be marked with what you
+heard, in **Activity** on a device or across every Echo:
+
+- **Missed wake** (key **Y**): the wake word was said, and the Dot should
+  have woken. These are positives for wake-word training.
+- **Correctly ignored** (key **N**): it was not the wake word. These are
+  negatives for wake-word training.
+
+Click a near miss and its detail asks *Was the wake word said?* with a button
+for each verdict, and **Clear** (key **U**) once it has one. **P** plays or
+stops its recording. **▶ Start review**, beside the near-miss pills, opens the
+newest near miss nobody has marked and plays it; marking it moves on to the
+next one and plays that, so a review is listen, then **Y** or **N**, again
+and again. The row shows the verdict where a turn shows how it ended
+(`missed wake`, `ignored`), and the **To review**, **Missed wake** and
+**Correctly ignored** pills list just those.
+
+Only an administrator can mark, and only a near miss with a recording to
+listen to. A marked near miss and its recording are kept however many come
+after it, until the mark is cleared; then the usual limits apply again. The
+Activity view's **⤓ .zip** downloads each set on its own: **Missed wakes**
+and **Correctly ignored**. API: `PATCH /api/devices/{id}/near_misses/{nm}`
+with `{"verdict": "missed_wake" | "correctly_ignored" | null}`; the near-miss
+lists name each one's `verdict`, null while nobody has marked it.
 
 ### Arbitration window
 

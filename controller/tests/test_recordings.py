@@ -194,6 +194,18 @@ def test_near_miss_recordings_keep_the_newest_200_per_device_and_only_their_own(
     assert rec.resolve("dev1", "dev2_5.wav", db, kind=near) is None              # another device's
 
 
+def test_a_marked_near_miss_recording_is_neither_pruned_nor_counted(tmp_path):
+    """The row ids in `exempt` (near misses marked with a verdict) keep their recordings and
+    leave the window for the rest; once a mark is cleared, its recording is pruned as usual."""
+    db = _db(tmp_path)
+    near = rec.RecordingKind.NEAR_MISS
+    for row_id in range(1, 6):
+        rec.save("dev1", row_id, _pcm(1), db_path=db, keep=2, kind=near, exempt={1, 3})
+    assert rec.list_for("dev1", db, kind=near) == ["dev1_5.wav", "dev1_4.wav", "dev1_3.wav", "dev1_1.wav"]
+    rec.prune("dev1", db, keep=2, kind=near, exempt={3})
+    assert rec.list_for("dev1", db, kind=near) == ["dev1_5.wav", "dev1_4.wav", "dev1_3.wav"]
+
+
 # ─── deletion ────────────────────────────────────────────────────────────────
 
 def test_delete_device_removes_only_its_own(tmp_path):

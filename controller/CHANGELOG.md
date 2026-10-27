@@ -1118,6 +1118,33 @@ both ("native VAD max 0.50 over 10 fr · Silero max 0.81 over 3 cells").
   response. Older turns, near misses (whose lease runs no Silero) and sample
   clips show no Silero lane.
 
+### Marking near misses
+
+A near miss can now be marked with what you heard in it, and the marked ones
+download as two training sets.
+
+- **Verdicts.** A near miss's detail asks *Was the wake word said?*:
+  **Missed wake** (Y) means it was, and the Echo should have woken;
+  **Correctly ignored** (N) means it was not the wake word. **Clear** (U)
+  takes the mark off, and P plays or stops the recording. Only an
+  administrator can mark, and only a near miss with a recording. The row
+  shows the verdict where a turn shows how it ended.
+- **Review.** **▶ Start review** opens the newest near miss nobody has marked
+  and plays it. Marking it moves on to the next one and plays that. The
+  **Near misses** pill became a row of filters: **Hide**, **All**, **To
+  review**, **Missed wake** and **Correctly ignored**, each with its count.
+- **Downloads.** The Activity view's archives are now **Confirmed wakes**,
+  **Missed wakes**, **Correctly ignored** and **All near misses**, each still
+  limited to the Echo and score range shown.
+- **Retention.** A marked near miss and its recording are kept however many
+  come after it, until the mark is cleared. The newest 2,000 unmarked near
+  misses and 200 unmarked recordings per device are kept as before.
+- **API and schema.** `PATCH /api/devices/{id}/near_misses/{nm}`
+  `{"verdict": "missed_wake" | "correctly_ignored" | null}`; the near-miss
+  lists carry each one's `verdict`, and `GET /api/near_misses.zip` takes
+  `verdict` (archive `echomuse-missedwakes-…` or `echomuse-correctlyignored-…`).
+  **Schema v39** adds `near_misses.verdict`.
+
 ### Earlier in this release
 
 - ASR gain: the STT copy sent to Home Assistant is amplified by

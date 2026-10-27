@@ -31,10 +31,13 @@ Three kinds (`RecordingKind`). The first two are kept only while
 Storage: files live beside the SQLite DB, so they sit inside the persisted
 Docker volume and survive image upgrades. Retention is a hard per-device
 file count per kind — these are the artefacts here that contain raw speech,
-so a bounded window, then gone, is the point, not an optimisation. Pruning
-is by row id parsed out of the filename rather than mtime: ids are
-monotonic rowids, so the order is exact even if the volume is restored from
-a backup that flattened timestamps. 16kHz mono S16_LE.
+so a bounded window, then gone, is the point, not an optimisation. The one
+exception is a near miss someone marked with a verdict in Activity: marking
+it is how they keep it for wake-word training, so pruning skips it (`exempt`)
+until the mark is cleared. Pruning is by row id parsed out of the filename
+rather than mtime: ids are monotonic rowids, so the order is exact even if
+the volume is restored from a backup that flattened timestamps. 16kHz mono
+S16_LE.
 
 Pure path/filesystem logic (no aiohttp, no db import) so it can be unit
 tested; em_session writes through it and em_api serves from it.
@@ -48,6 +51,7 @@ import logging
 import os
 import re
 import wave
+from collections.abc import Collection
 from pathlib import Path
 
 from em_samples import safe_device_id    # one definition of a device path component
@@ -149,10 +153,12 @@ def duration_ms(pcm_len: int) -> int:
 
 
 def save(device_id: str, turn_id: int, pcm: bytes, db_path: str | None = None,
-         keep: int | None = None, *, kind: RecordingKind = RecordingKind.UTTERANCE) -> str | None:
+         keep: int | None = None, *, kind: RecordingKind = RecordingKind.UTTERANCE,
+         exempt: Collection[int] = frozenset()) -> str | None:
     """
     Write one turn's recording of `kind` and prune the device back to `keep`
-    files of that kind (the kind's retention when None).
+    files of that kind (the kind's retention when None), not counting the
+    row ids in `exempt`, which stay.
 
     Returns the filename to store on the turn row, or None if nothing was
     written. Blocking (runs in an executor at the call site).
@@ -168,13 +174,12 @@ def save(device_id: str, turn_id: int, pcm: bytes, db_path: str | None = None,
     tmp = path.with_suffix(".wav.part")
     tmp.write_bytes(encode_wav(pcm))
     tmp.replace(path)
-    prune(device_id, db_path=db_path, keep=keep, kind=kind)
+    prune(device_id, db_path=db_path, keep=keep, kind=kind, exempt=exempt)
     return name
 
 
-def list_for(device_id: str, db_path: str | None = None, *,
-             kind: RecordingKind = RecordingKind.UTTERANCE) -> list[str]:
-    """This device's recording filenames of `kind`, newest turn first."""
+def _entries(device_id: str, db_path: str | None, kind: RecordingKind) -> list[tuple[int, str]]:
+    """(row id, filename) of this device's recordings of `kind`, newest row first."""
     safe = safe_device_id(device_id)
     if safe is None:
         return []
@@ -187,20 +192,28 @@ def list_for(device_id: str, db_path: str | None = None, *,
         if parsed and parsed[0] == safe:
             entries.append((parsed[1], child.name))
     entries.sort(reverse=True)
-    return [name for _, name in entries]
+    return entries
+
+
+def list_for(device_id: str, db_path: str | None = None, *,
+             kind: RecordingKind = RecordingKind.UTTERANCE) -> list[str]:
+    """This device's recording filenames of `kind`, newest turn first."""
+    return [name for _, name in _entries(device_id, db_path, kind)]
 
 
 def prune(device_id: str, db_path: str | None = None, keep: int | None = None, *,
-          kind: RecordingKind = RecordingKind.UTTERANCE) -> list[str]:
+          kind: RecordingKind = RecordingKind.UTTERANCE, exempt: Collection[int] = frozenset()) -> list[str]:
     """
     Delete all but the `keep` newest recordings of `kind` for a device (the
-    kind's retention when None). Returns the filenames removed. Never
+    kind's retention when None). The recordings of the row ids in `exempt` are
+    neither deleted nor counted. Returns the filenames removed. Never
     raises — a failed unlink costs disk, not a turn.
     """
     keep = _KEEP[kind] if keep is None else keep
     directory = recordings_dir(db_path, kind=kind)
     removed: list[str] = []
-    for name in list_for(device_id, db_path, kind=kind)[max(keep, 0):]:
+    counted = [name for row_id, name in _entries(device_id, db_path, kind) if row_id not in exempt]
+    for name in counted[max(keep, 0):]:
         try:
             (directory / name).unlink()
             removed.append(name)

@@ -191,6 +191,13 @@ class NearMissRecording(StrEnum):
     PRUNED = "pruned"                 # saved, then removed by retention: derived on read, never stored
 
 
+class NearMissVerdict(StrEnum):
+    """`near_misses.verdict`: what someone decided after listening to a near miss. NULL means
+    nobody has marked it yet."""
+    MISSED_WAKE = "missed_wake"               # the wake word was said, so the Echo should have woken
+    CORRECTLY_IGNORED = "correctly_ignored"   # it was not the wake word, so staying quiet was right
+
+
 @dataclass(frozen=True, slots=True)
 class NearMissRecord:
     """One `near_misses` row as written (insert_near_miss). `recording` is
@@ -224,11 +231,13 @@ class NearMissRow:
     end_reason: str
     recording: NearMissRecording
     audio_ms: Optional[int]
+    verdict: Optional[NearMissVerdict]
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Self:
         values = {f.name: row[f.name] for f in fields(cls)}
         values["recording"] = NearMissRecording(row["recording"])
+        values["verdict"] = None if row["verdict"] is None else NearMissVerdict(row["verdict"])
         return cls(**values)
 
 
@@ -394,8 +403,9 @@ WAKE_COUNTER_RETENTION_DAYS = 180
 # Newest wake_shadow_events rows kept per device (pruned on insert).
 WAKE_SHADOW_EVENT_RETENTION = 2_000
 
-# Newest near_misses rows kept per device (pruned on insert). Their WAVs keep
-# a shorter window (em_recordings.KEEP_NEAR_MISS_PER_DEVICE).
+# Newest unmarked near_misses rows kept per device (pruned on insert). A row
+# with a verdict is kept however old it is, as its WAV is. The WAVs of unmarked
+# rows keep a shorter window (em_recordings.KEEP_NEAR_MISS_PER_DEVICE).
 NEAR_MISS_RETENTION = 2_000
 
 # ─── Migrations ───────────────────────────────────────────────────────────────
@@ -1259,6 +1269,18 @@ MIGRATIONS: list[str] = [
     """
     ALTER TABLE near_misses ADD COLUMN afe_series TEXT;
     UPDATE system_config SET value = '38' WHERE key = 'schema_version';
+    """,
+
+    # ── v39 — near-miss verdicts ─────────────────────────────────────────────
+    #
+    # `verdict` is NearMissVerdict: someone listened to the near miss in
+    # Activity and marked it `missed_wake` (the wake word was said) or
+    # `correctly_ignored` (it was not). NULL means nobody has marked it. Marking
+    # one is how someone keeps it for wake-word training, so retention skips a
+    # marked row (insert_near_miss) and its recording (em_recordings.prune).
+    """
+    ALTER TABLE near_misses ADD COLUMN verdict TEXT;
+    UPDATE system_config SET value = '39' WHERE key = 'schema_version';
     """,
 ]
 
@@ -2571,8 +2593,9 @@ def get_fleet_turns(limit: int = 50, since: Optional[float] = None) -> list[dict
 
 def insert_near_miss(device_id: str, rec: NearMissRecord) -> int:
     """Persist one near-miss episode; returns its rowid (the recording is named
-    by it). Prunes to the newest NEAR_MISS_RETENTION rows per device, and NULLs
-    afe_series on all but the newest TRACE_RETENTION of them."""
+    by it). Prunes the device's unmarked rows to the newest NEAR_MISS_RETENTION
+    (a row with a verdict stays), and NULLs afe_series on all but the newest
+    TRACE_RETENTION rows."""
     with _tx() as conn:
         cur = conn.execute(
             "INSERT INTO near_misses (device_id, ts, near_miss_uuid, profile, floor, peak, wake_threshold, "
@@ -2582,8 +2605,8 @@ def insert_near_miss(device_id: str, rec: NearMissRecord) -> int:
              rec.wake_model_sha256, rec.duration_ms, rec.end_reason, rec.recording, rec.afe_series),
         )
         conn.execute(
-            "DELETE FROM near_misses WHERE device_id = ? AND id NOT IN ("
-            "SELECT id FROM near_misses WHERE device_id = ? ORDER BY id DESC LIMIT ?)",
+            "DELETE FROM near_misses WHERE device_id = ? AND verdict IS NULL AND id NOT IN ("
+            "SELECT id FROM near_misses WHERE device_id = ? AND verdict IS NULL ORDER BY id DESC LIMIT ?)",
             (device_id, device_id, NEAR_MISS_RETENTION),
         )
         conn.execute(
@@ -2601,6 +2624,25 @@ def set_near_miss_saved(near_miss_id: int, audio_ms: int) -> None:
             "UPDATE near_misses SET recording = ?, audio_ms = ? WHERE id = ?",
             (NearMissRecording.SAVED, audio_ms, near_miss_id),
         )
+
+
+def set_near_miss_verdict(device_id: str, near_miss_id: int,
+                          verdict: Optional[NearMissVerdict]) -> Optional[NearMissRow]:
+    """Mark one of `device_id`'s near misses with `verdict`, or clear its mark with None.
+    Returns the row as it now stands, or None when the device has no such near miss."""
+    with _tx() as conn:
+        if conn.execute("UPDATE near_misses SET verdict = ? WHERE id = ? AND device_id = ?",
+                        (verdict, near_miss_id, device_id)).rowcount == 0:
+            return None
+        row = conn.execute(f"{_NEAR_MISS_SELECT} WHERE id = ?", (near_miss_id,)).fetchone()
+    return NearMissRow.from_row(row)
+
+
+def get_marked_near_miss_ids(device_id: str) -> frozenset[int]:
+    """The row ids of `device_id`'s near misses that have a verdict. Retention keeps their
+    recordings (em_recordings.prune's `exempt`)."""
+    return frozenset(row["id"] for row in _q(
+        "SELECT id FROM near_misses WHERE device_id = ? AND verdict IS NOT NULL", (device_id,)))
 
 
 # The near-miss lists' columns: NearMissRow's, never the afe_series.
@@ -2650,14 +2692,17 @@ def get_wake_clip_turns(device_id: Optional[str], lo: float, hi: float, *, trigg
     return [(row["device_id"], row["id"], row["ts"]) for row in rows]
 
 
-def get_near_miss_recordings(device_id: Optional[str], lo: float, hi: float) -> list[tuple[str, int]]:
+def get_near_miss_recordings(device_id: Optional[str], lo: float, hi: float,
+                             verdict: Optional[NearMissVerdict] = None) -> list[tuple[str, int]]:
     """(device_id, row id), newest first, of `device_id`'s near misses (every registered
-    device's when None) whose recording was saved, with a peak in [lo, hi]."""
+    device's when None) whose recording was saved, with a peak in [lo, hi] and, when
+    `verdict` is given, marked with it."""
     scope, params = _scope(device_id, "n")
+    marked, marks = ("AND verdict = ? ", (verdict,)) if verdict is not None else ("", ())
     rows = _q(
         f"SELECT device_id, id FROM near_misses n WHERE {scope} AND recording = ? "
-        f"AND peak BETWEEN ? AND ? ORDER BY ts DESC",
-        (*params, NearMissRecording.SAVED, lo, hi))
+        f"AND peak BETWEEN ? AND ? {marked}ORDER BY ts DESC",
+        (*params, NearMissRecording.SAVED, lo, hi, *marks))
     return [(row["device_id"], row["id"]) for row in rows]
 
 

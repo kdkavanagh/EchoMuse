@@ -573,13 +573,15 @@ async def _persist_turn(device_id: str, record: Mapping[str, object]) -> int:
 
 async def _persist_near_miss(device_id: str, record: db.NearMissRecord, pcm: bytes | None) -> int:
     """A near miss's row, then its WAV, then `saved`: the row names a
-    recording only once the file exists (a failed write leaves `record.recording`)."""
+    recording only once the file exists (a failed write leaves `record.recording`).
+    Pruning the device's older recordings skips the ones marked with a verdict."""
     row_id = await asyncio.to_thread(db.insert_near_miss, device_id, record)
     if not pcm:
         return row_id
     try:
+        marked = await asyncio.to_thread(db.get_marked_near_miss_ids, device_id)
         name = await asyncio.to_thread(em_recordings.save, device_id, row_id, pcm,
-                                       kind=em_recordings.RecordingKind.NEAR_MISS)
+                                       kind=em_recordings.RecordingKind.NEAR_MISS, exempt=marked)
         if name is not None:
             await asyncio.to_thread(db.set_near_miss_saved, row_id, em_recordings.duration_ms(len(pcm)))
     except Exception:
