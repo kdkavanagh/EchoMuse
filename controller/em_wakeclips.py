@@ -11,16 +11,24 @@ This module stores that clip. When a turn started by an accepted
 `wake.candidate` ends, `em_session` reads the candidate's support span from
 the lease's mic timeline — support start −300 ms through `support_end` — and,
 if `saveWakeClips` is set for the device, writes it here once the turn's
-rowid exists. The clips serve two jobs: listening to why a device woke, and
-examples of false and true positives for BCResNet training, which lives
-outside this repository (`~/git/bcresnet`). Consequences of that shape:
+rowid exists. A candidate refused while the device was producing sound
+(`unverified_wake`, `verifier_timeout`, `self_output`, `echo_only`) keeps one
+too, under its own row: the same start, through the later of `support_end` and
+the verifier's lookahead (open + 480 ms), so it holds everything the verifier
+decoded. The clips serve three jobs: listening to why a device woke, replaying
+a refused wake through the verifier, and examples of false and true positives
+for BCResNet training, which lives outside this repository (`~/git/bcresnet`).
+Consequences of that shape:
 
   * **The clip is the audio the device scored.** The mic stream is the
     native AFE's output, the same samples the on-device detector consumed,
     with no controller gain or denoiser applied. Training material captured
     through a different path teaches a model about audio it never sees.
-  * **It contains no command audio.** It ends where the candidate's support
-    ends; the utterance recording (opt-in, separate) covers what follows.
+  * **An accepted wake's clip contains no command audio.** It ends where the
+    candidate's support ends; the utterance recording (opt-in, separate)
+    covers what follows. A refused one's can hold the first 480 ms after the
+    wake, which the verifier heard; the "Confirmed wakes" archive leaves
+    refused rows out.
   * **Nothing is written unless the feature is on** for that device.
 
 Storage follows `em_samples` rather than `em_recordings`: a per-device

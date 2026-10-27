@@ -15,6 +15,7 @@ sample time. Wall-clock deadlines (§7) use the event-loop clock.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import enum
 import inspect
 import json
@@ -152,7 +153,7 @@ from em_utterance import (
     pause_command,
     redecoded_command,
 )
-from em_wake_phrase import final_command_text
+from em_wake_phrase import final_command_text, verify_wake
 from em_wake_registry import RegistryError
 from em_wake_scorer import ReferenceCandidate
 
@@ -170,6 +171,9 @@ RENDER_RATE = 48_000             # dialog output PCM (em_media.RATE)
 
 # §7 / §9 / §16.2 / §16.6 deadlines (seconds of loop time unless noted).
 WAKE_VERIFY_S = 0.700            # verification deadline from receipt of wake.candidate
+# A refused candidate's row waits this long for a verifier that has not answered: the worker
+# answers every queued verification within its 750 ms job deadline plus one decode.
+LATE_VERIFICATION_WAIT_S = 1.5
 FOCUS_TTL_MS = 3_000             # ephemeral dialog focus; renewed every second
 RENEW_S = 1.0
 HA_TIMEOUT_S = 30.0              # intent run sent → intent-end
@@ -938,7 +942,16 @@ class _Candidate:
     comparison: EchoResult | None = None
     comparison_submitted: bool = False
     verification: VerificationResult | None = None
-    verification_submitted: bool = False
+    # The verification record kept with the row (§11.3), all loop time: when the mic covered the
+    # verifier's input and its decode was queued, when its verdict arrived (possibly after the
+    # candidate was decided), the verdict itself, and a worker failure that stood for one.
+    verification_submitted_at: float | None = None
+    verification_answered_at: float | None = None
+    verification_answer: VerificationPayload | None = None
+    verification_error: str | None = None
+    answered: asyncio.Event = field(default_factory=asyncio.Event)
+    decided_at: float | None = None
+    mic_at_decision: int | None = None        # the lease's mic frontier when it was decided
     reference_events: list[tuple[int, ReferenceCandidate]] = field(default_factory=list)
     reference_ready: bool = False
 
@@ -1185,6 +1198,9 @@ class SessionActor:
         self._generation = 0
         self._turn: _Turn | None = None
         self._candidate: _Candidate | None = None
+        # Refused candidates whose verifier had not answered yet, by lease id: their rows wait
+        # (LATE_VERIFICATION_WAIT_S at most) to keep what it would have said.
+        self._unanswered: dict[str, _Candidate] = {}
         self._expectation: _Expectation | None = None
         self._runtimes: dict[str, _Runtime] = {}
         self._focus: dict[str, _Focus] = {}
@@ -1784,18 +1800,28 @@ class SessionActor:
     async def _reject_candidate(self, candidate: _Candidate, reason: TerminalReason) -> None:
         """Close the candidate lease (also releasing any provisional duck); no turn, focus, or chime
         (a local_wake_chime device may already have chimed an idle candidate; it is not retracted).
-        While `saveUtterances` is on, what the lease heard is kept as the row's turn recording."""
+        While `saveUtterances` is on, what the lease heard is kept as the row's turn recording; while
+        `saveWakeClips` is on, a producing-sound candidate keeps the verifier's audio as its wake clip."""
         self._candidate = None
+        self._mark_decided(candidate)
         afe, series = _afe_snapshot(candidate.runtime, candidate, None)
         timeline = self._timeline(candidate.runtime)
         capture = (_lease_capture(timeline, _support(candidate), None)
                    if timeline is not None and series is not None and self._records_turn(candidate.runtime)
                    else None)
+        clip = _refused_clip(candidate, timeline) if timeline is not None and candidate.producing_sound else None
+        if candidate.verification_submitted_at is not None and not candidate.answered.is_set():
+            self._unanswered[candidate.lease_id] = candidate
         close = LeaseEnd.ARBITRATION_LOST if reason == TerminalReason.ARBITRATION_LOST else LeaseEnd.REJECTED
         await self._close_uplink(candidate.lease_id, close)
         self._release_runtime(candidate.lease_id)
         self._emit(ActorEvent(ActorEventKind.TERMINAL, self.state, reason, self._dialog_active))
-        self._persists.add(self._spawn(self._persist_candidate(candidate, reason, afe, series, capture)))
+        self._persists.add(self._spawn(self._persist_candidate(candidate, reason, afe, series, capture, clip)))
+
+    def _mark_decided(self, candidate: _Candidate) -> None:
+        candidate.decided_at = asyncio.get_running_loop().time()
+        timeline = self._timeline(candidate.runtime)
+        candidate.mic_at_decision = timeline.mic.frontier if timeline is not None else None
 
     async def _accept_candidate(self, candidate: _Candidate) -> None:
         context, target = self._command_context(candidate)
@@ -1809,6 +1835,7 @@ class SessionActor:
                 # The Dot playing the content still hears out a "stop" meant for it (§6.3 step 1).
                 local_only = True
         self._candidate = None
+        self._mark_decided(candidate)
         inherited = self._take_expectation()
         await self._supersede()
         uplink = self.uplink
@@ -2085,6 +2112,10 @@ class SessionActor:
             await self._pump(runtime)
 
     async def _observation(self, obs: Observation) -> None:
+        decided = self._unanswered.get(obs.lease_id) if obs.lease_id is not None else None
+        if decided is not None:
+            self._late_verification(decided, obs.payload)
+            return
         runtime = self._runtimes.get(obs.lease_id) if obs.lease_id is not None else None
         if runtime is None:
             return
@@ -2119,6 +2150,7 @@ class SessionActor:
             case VerificationPayload() as verification:
                 if candidate is not None and verification.candidate_id == candidate.candidate_id:
                     candidate.verification = verification.result
+                    self._verification_answer(candidate, verification)
                     await self._decide_candidate(candidate)
             case ReferenceScorePayload() as scores:
                 if candidate is not None:
@@ -2134,6 +2166,21 @@ class SessionActor:
                 return
         await self._pump(runtime)
 
+    @staticmethod
+    def _verification_answer(candidate: _Candidate, verdict: VerificationPayload) -> None:
+        candidate.verification_answer = verdict
+        candidate.verification_answered_at = asyncio.get_running_loop().time()
+        candidate.answered.set()
+
+    def _late_verification(self, candidate: _Candidate, payload: object) -> None:
+        """The verifier's answer for a candidate already refused before it came (kept for its row)."""
+        match payload:
+            case VerificationPayload() as verdict if verdict.candidate_id == candidate.candidate_id:
+                self._verification_answer(candidate, verdict)
+            case ErrorPayload(component=ObservationKind.VERIFICATION) as error:
+                candidate.verification_error = candidate.verification_error or error.reason
+                candidate.answered.set()
+
     async def _worker_error(self, runtime: _Runtime, error: ErrorPayload) -> None:
         """A worker failure aborts the affected utterance without dispatch (§8.1)."""
         log.warning("[%s] speech worker %s failed: %s", self.device_id, error.component, error.reason)
@@ -2142,6 +2189,8 @@ class SessionActor:
         if candidate is not None and candidate.runtime is runtime:
             if error.component == ObservationKind.VERIFICATION:
                 candidate.verification = VerificationResult.TIMEOUT
+                candidate.verification_error = candidate.verification_error or error.reason
+                candidate.answered.set()
             await self._decide_candidate(candidate)
             return
         turn = self._turn
@@ -2556,10 +2605,10 @@ class SessionActor:
         candidate = self._candidate
         if candidate is None or candidate.runtime is not runtime or not candidate.producing_sound:
             return
-        if not candidate.verification_submitted:
+        if candidate.verification_submitted_at is None:
             a = max(timeline.mic.floor, candidate.support_start - PREROLL)
             if timeline.mic.covers(a, candidate.open_sample + VERIFICATION_LOOKAHEAD):
-                candidate.verification_submitted = True
+                candidate.verification_submitted_at = asyncio.get_running_loop().time()
                 self.deps.worker.submit_verification(runtime.lease_id, candidate.candidate_id, timeline.mic,
                                                      candidate.support_start, candidate.open_sample,
                                                      candidate.model.verify_core)
@@ -3882,32 +3931,54 @@ class SessionActor:
 
     async def _persist_candidate(self, candidate: _Candidate, reason: TerminalReason,
                                  afe: AfeEvidence | None, series: AfeSeries | None,
-                                 capture: _Clip | None) -> None:
-        """A rejected candidate is a turn row with its attribution reason, and `capture` as its turn
-        recording, placed by the series (§11.3)."""
+                                 capture: _Clip | None, clip: _Clip | None) -> None:
+        """A rejected candidate is a turn row with its attribution reason and decision trace (§11.3),
+        `capture` as its turn recording, placed by the series, and `clip` as its wake clip. A
+        verifier that had not answered when the candidate was refused gets LATE_VERIFICATION_WAIT_S
+        to answer first, so the row keeps what it would have said and when."""
+        loop = asyncio.get_running_loop()
+        decided = candidate.decided_at if candidate.decided_at is not None else loop.time()
+        ts = time.time() - (loop.time() - decided)
+        if self._unanswered.get(candidate.lease_id) is candidate:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(candidate.answered.wait(), LATE_VERIFICATION_WAIT_S)
+            del self._unanswered[candidate.lease_id]
         if series is not None:
-            series = replace(series, recording=capture.span if capture else None)
+            series = replace(series, recording=capture.span if capture else None,
+                             wake_clip=clip.span if clip else None)
+        row = TurnRow(
+            ts=ts, trigger=UtteranceKind.WAKE, wake_model=candidate.model.wake_phrase,
+            wake_score=candidate.peak, wake_threshold=candidate.threshold,
+            total_ms=round((decided - candidate.received) * 1000),
+            wake_model_sha256=candidate.model.graph_sha256,
+            policy_hash=self.deps.worker.policy_hash,
+            wake_attribution=reason, terminal_reason=reason,
+            afe_evidence=afe.dumps() if afe is not None else None,
+            afe_series=series.dumps() if series is not None else None,
+        )
+        trace = json.dumps(_candidate_trace(candidate, reason, row, afe, clip), default=str, separators=(",", ":"))
+        log.info("[%s] refused wake %s trace %s", self.device_id, candidate.candidate_id, trace)
+        row["decision_trace"] = trace
         try:
-            row_id = await self.deps.persist_turn(TurnRow(
-                ts=time.time(), trigger=UtteranceKind.WAKE, wake_model=candidate.model.wake_phrase,
-                wake_score=candidate.peak, wake_threshold=candidate.threshold,
-                total_ms=round((asyncio.get_running_loop().time() - candidate.received) * 1000),
-                wake_model_sha256=candidate.model.graph_sha256,
-                policy_hash=self.deps.worker.policy_hash,
-                wake_attribution=reason, terminal_reason=reason,
-                afe_evidence=afe.dumps() if afe is not None else None,
-                afe_series=series.dumps() if series is not None else None,
-            ))
+            row_id = await self.deps.persist_turn(row)
         except Exception:
             log.exception("[%s] rejected candidate not persisted", self.device_id)
             return
-        if capture is None or not capture.pcm:
-            return
-        try:
-            await asyncio.get_running_loop().run_in_executor(None, _save_turn_recording, self.device_id,
-                                                             row_id, capture.pcm)
-        except Exception:
-            log.exception("[%s] turn %s audio not saved", self.device_id, row_id)
+        saves: tuple[tuple[bytes | None, Callable[[str, int, bytes], str | None],
+                           Callable[[int, str | None], None] | None], ...] = (
+            (clip.pcm if clip is not None and self._config().get("saveWakeClips") else None, em_wakeclips.save,
+             em_db.set_turn_wake),
+            (capture.pcm if capture is not None else None, _save_turn_recording, None),   # placed by the series
+        )
+        for pcm, save, attach in saves:
+            if not pcm:
+                continue
+            try:
+                name = await loop.run_in_executor(None, save, self.device_id, row_id, pcm)
+                if name and attach is not None:
+                    await loop.run_in_executor(None, attach, row_id, name)
+            except Exception:
+                log.exception("[%s] turn %s audio not saved", self.device_id, row_id)
 
     # --- turn view (docs/echo-show-companion-plan.md §11 decision 8) ------------------------------
 
@@ -4207,6 +4278,80 @@ def _support(candidate: _Candidate | None) -> tuple[int, int] | None:
     return None if candidate is None else (candidate.support_start, candidate.support_end or candidate.open_sample)
 
 
+def _refused_clip(candidate: _Candidate, timeline: LeaseTimeline) -> _Clip | None:
+    """A refused producing-sound candidate's wake clip: its support −300 ms through the later of
+    its support end and the verifier's lookahead (open + 480 ms), as far as the mic had reached,
+    so it holds the whole verifier input whenever that had arrived."""
+    mic = timeline.mic
+    a = max(mic.floor, candidate.support_start - PREROLL)
+    want = max(candidate.support_end or candidate.open_sample, candidate.open_sample + VERIFICATION_LOOKAHEAD)
+    b = min(want, mic.frontier) if mic.frontier is not None else a
+    if b <= a or not mic.covers(a, b):
+        return None
+    return _Clip(a, mic.read(a, b).tobytes())
+
+
+def _verification_trace(candidate: _Candidate) -> dict[str, object] | None:
+    """The verification record of a producing-sound candidate (§11.3, §16.6). `input` is the
+    verifier's input on the capture timeline. Times are ms after the controller received the
+    candidate: `input_ready_ms` when the mic covered that input and the decode was queued (None:
+    it never did), `answered_ms` when the verdict arrived, `decided_ms` when the candidate was
+    accepted or refused, against `deadline_ms`; `late` is a verdict that came after the decision.
+    `queued_ms`/`decode_ms` are the decode's own wait for a thread and run time;
+    `mic_past_open_ms` how much audio after the opening hop had arrived at the decision (the
+    input needs 480 ms of it). `text_passes` is whether the decoded text clears the verifier's
+    match, so a timeout says what it would have decided. None: an idle candidate, never verified."""
+    if not candidate.producing_sound:
+        return None
+
+    def ms(at: float | None) -> int | None:
+        return None if at is None else round((at - candidate.received) * 1000)
+
+    verdict = candidate.verification_answer
+    answered, decided = candidate.verification_answered_at, candidate.decided_at
+    text = verdict.text if verdict is not None else None
+    mic = candidate.mic_at_decision
+    return {
+        "deadline_ms": round(WAKE_VERIFY_S * 1000),
+        "input": [max(0, candidate.support_start - PREROLL), candidate.open_sample + VERIFICATION_LOOKAHEAD],
+        "input_ready_ms": ms(candidate.verification_submitted_at),
+        "answered_ms": ms(answered),
+        "decided_ms": ms(decided),
+        "late": answered is not None and decided is not None and answered > decided,
+        "queued_ms": verdict.queued_ms if verdict is not None else None,
+        "decode_ms": verdict.decode_ms if verdict is not None else None,
+        "mic_past_open_ms": None if mic is None else round((mic - candidate.open_sample) * 1000 / SAMPLE_RATE),
+        "result": verdict.result if verdict is not None else candidate.verification,
+        "text": text,
+        "distance": verdict.alias_distance if verdict is not None else None,
+        "text_passes": None if text is None else verify_wake(text, candidate.model.verify_core).passed,
+        "error": candidate.verification_error,
+    }
+
+
+def _candidate_trace(candidate: _Candidate, reason: TerminalReason, row: TurnRow, afe: AfeEvidence | None,
+                     clip: _Clip | None) -> dict[str, object]:
+    """The §11.3 decision trace stored with a refused candidate's row: what the device reported,
+    what §6.1 weighed (the support comparison, the reference's wake-like candidates), the
+    verification record, and where its wake clip sits on the capture timeline."""
+    wire = candidate.wire
+    alert = wire.active_alert
+    return {
+        "candidate_id": wire.candidate_id, "profile": wire.profile, "producing_sound": wire.producing_sound,
+        "chimed": wire.chimed, "rule": wire.rule.wire() if wire.rule is not None else None,
+        "hops": [asdict(h) for h in wire.hops], "lease_id": wire.lease_id, "terminal": reason,
+        "alert": {"kind": alert.kind, "name": alert.name} if alert is not None else None,
+        "support": [candidate.support_start, candidate.support_end], "open_sample": candidate.open_sample,
+        "comparison": candidate.comparison, "reference_candidates": len(candidate.reference_events),
+        "reference_ready": candidate.reference_ready,
+        "verification": _verification_trace(candidate),
+        "wake_clip": list(clip.span) if clip is not None else None,
+        # Evidence only (afe_metadata_v1): null when the device does not report it.
+        "afe_evidence": afe.wire() if afe is not None else None,
+        **{k: v for k, v in row.items() if k != "ts"},
+    }
+
+
 def _trace(turn: _Turn, row: TurnRow, utterance: UtteranceTrace, afe: AfeEvidence | None) -> dict[str, object]:
     """The §11.3 decision trace logged and stored with a turn row."""
     candidate = turn.candidate
@@ -4229,6 +4374,8 @@ def _trace(turn: _Turn, row: TurnRow, utterance: UtteranceTrace, afe: AfeEvidenc
         # Where this turn's voice snapshot was taken, for a reply window it opens.
         **({"voice_at": turn.voice.sample} if turn.voice is not None else {}),
         **({"local_only": True} if turn.local_only else {}),
+        **({"verification": _verification_trace(candidate)}
+           if candidate is not None and candidate.producing_sound else {}),
         # Evidence only (afe_metadata_v1): null when the device does not report it.
         "afe_evidence": afe.wire() if afe is not None else None,
         **{k: v for k, v in row.items() if k != "ts"},

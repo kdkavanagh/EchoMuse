@@ -262,6 +262,41 @@ def test_sustained_overload_still_makes_the_worker_unavailable():
     assert changes == [False]
 
 
+class _SlowDecoder(_ProbeModels):
+    """A Kroko stand-in whose decode holds its job past the deadline (it moves the clock)."""
+
+    def __init__(self, clock):
+        self.clock = clock
+
+    def decode_fresh(self, evidence):
+        self.clock.t += 1.0
+        return sw.AsrResult("Ophilia.", (), (), 0)
+
+
+def test_a_verification_decoded_past_its_deadline_is_a_timeout_that_keeps_its_text():
+    """The verdict is still `timeout` (§16.6), but it carries what the decode heard and how long it
+    took, so the candidate's row can say what the verifier would have decided."""
+    clock, got = _Clock(), []
+
+    async def main():
+        w = _fake_worker(clock, got, probe_interval_s=3600)
+        w.models = _SlowDecoder(clock)
+        try:
+            w.open_lease("dev", 7, "L", "g")
+            mic = SampleTimeline()
+            mic.write(0, np.zeros(40_000, np.int16))
+            w.submit_verification("L", "C", mic, 10_000, 20_000, "ophel")
+            await _until(lambda: _errors(got))
+        finally:
+            await w.close()
+
+    asyncio.run(main())
+    (verdict,) = [o.payload for o in got if o.kind == "verification"]
+    assert verdict.result == "timeout" and verdict.text == "Ophilia." and verdict.alias_distance <= 0.4
+    assert verdict.queued_ms == 0 and verdict.decode_ms is not None
+    assert "deadline" in _errors(got)[0].payload.reason
+
+
 def test_independent_errors_make_the_worker_unavailable_and_the_transitions_are_logged(caplog):
     """Exceptions always count, and the worker itself logs each error (with its device) and both
     availability transitions, so they are visible after the turn that owned the lease is gone."""

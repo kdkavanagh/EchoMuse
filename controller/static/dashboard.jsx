@@ -1938,13 +1938,9 @@ function AfeRecordingNote({ device }) {
   );
 }
 
-// Pause transcription (§16.6), from the turn's decision trace: at each pause
-// Kroko re-decodes the utterance so far and, with a Wyoming server set in
-// Pause transcription, the server transcribes the same audio, both started at
-// the same moment. Each transcriber's words, its time from the pause, and
-// when its words were judged (audio time after Kroko's decode); ★ marks the
-// words the endpoint committed on.
-function PauseTranscripts({ deviceId, turnId }) {
+// A turn's decision trace (§11.3), fetched for the detail stages that read it.
+// `load.turnId` trails `turnId` while a fetch is in flight; a 404 is no trace, not an error.
+function useTurnTrace(deviceId, turnId) {
   const [load, setLoad] = useState({ turnId: null });
   useEffect(() => {
     let live = true;
@@ -1954,6 +1950,68 @@ function PauseTranscripts({ deviceId, turnId }) {
       .catch(e => { if (live) setLoad({ turnId, error: e.status === 404 ? null : (e.error || e.message || 'request failed') }); });
     return () => { live = false; };
   }, [deviceId, turnId]);
+  return load;
+}
+
+// em_speech_worker.VerificationResult — a trace's verification.result.
+const VERIFICATION_RESULT = Object.freeze({ PASS: 'pass', FAIL: 'fail', TIMEOUT: 'timeout' });
+
+// Refusals only a wake heard while the Echo was playing can reach (§6.1): each went through the verifier.
+const VERIFIED_REFUSAL = new Set([TERMINAL_REASON.VERIFIER_TIMEOUT, TERMINAL_REASON.UNVERIFIED_WAKE,
+  TERMINAL_REASON.SELF_OUTPUT, TERMINAL_REASON.ECHO_ONLY]);
+
+// Wake verification (§16.6), from the decision trace of a wake heard while the
+// Echo was playing: what the verifier's fresh Kroko decode heard, how far it
+// was from the wake word, and where the time went against the deadline —
+// the mic covering the verifier's input (480 ms past the wake), the decode's
+// wait for a thread and its own run, and the verdict's arrival. A verdict
+// that came after the candidate was refused is still shown: a timeout on a
+// wake word the verifier did hear is a deadline problem, not a hearing one.
+function WakeVerification({ deviceId, turnId }) {
+  const load = useTurnTrace(deviceId, turnId);
+  const muted = { color: 'var(--muted)' };
+  if (load.turnId !== turnId) return <span style={muted}>loading…</span>;
+  if (load.error) return <span style={{ color: 'var(--warn)' }}>unavailable: {load.error}</span>;
+  const v = load.trace ? load.trace.verification : null;
+  if (!v) return <span style={muted}>recorded before the verification was kept</span>;
+  const ms = x => (x == null ? '—' : `${x} ms`);
+  const verdict = {
+    [VERIFICATION_RESULT.PASS]: <span style={{ color: 'var(--ok)' }}>passed</span>,
+    [VERIFICATION_RESULT.FAIL]: <span style={{ color: 'var(--warn)' }}>failed: not the wake word</span>,
+    [VERIFICATION_RESULT.TIMEOUT]: <span style={{ color: 'var(--warn)' }}>timed out</span>,
+  }[v.result] || <span style={muted}>no verdict</span>;
+  return (
+    <>
+      <div>
+        {v.text != null ? <span style={{ color: 'var(--text)' }}>“{v.text}”</span> : <span style={muted}>nothing decoded</span>}
+        {v.distance != null && <span style={muted}> · distance {v.distance.toFixed(2)}</span>}
+        {' · '}{verdict}
+        {v.result === VERIFICATION_RESULT.TIMEOUT && v.text_passes != null && (
+          <span style={muted}> · its text would have {v.text_passes ? 'passed' : 'failed'}</span>
+        )}
+      </div>
+      <div style={muted}>
+        {v.input_ready_ms != null
+          ? <>input complete {ms(v.input_ready_ms)} after the wake</>
+          : <>input never complete: the mic reached {ms(v.mic_past_open_ms)} past the wake of the 480 ms needed</>}
+        {v.decode_ms != null && <> · decode {ms(v.decode_ms)} after {ms(v.queued_ms)} waiting for a thread</>}
+        {v.answered_ms != null && <> · verdict at {ms(v.answered_ms)}</>}
+        {' · '}decided at {ms(v.decided_ms)}, deadline {ms(v.deadline_ms)}
+        {v.late && <span style={{ color: 'var(--warn)' }}> · verdict came {v.answered_ms - v.decided_ms} ms after the decision</span>}
+        {v.error && <span style={{ color: 'var(--warn)' }}> · {v.error}</span>}
+      </div>
+    </>
+  );
+}
+
+// Pause transcription (§16.6), from the turn's decision trace: at each pause
+// Kroko re-decodes the utterance so far and, with a Wyoming server set in
+// Pause transcription, the server transcribes the same audio, both started at
+// the same moment. Each transcriber's words, its time from the pause, and
+// when its words were judged (audio time after Kroko's decode); ★ marks the
+// words the endpoint committed on.
+function PauseTranscripts({ deviceId, turnId }) {
+  const load = useTurnTrace(deviceId, turnId);
 
   const muted = { color: 'var(--muted)' };
   if (load.turnId !== turnId) return <span style={muted}>loading…</span>;
@@ -2082,6 +2140,10 @@ function TurnDetail({ turn: t, turns, deviceLabel, onSelect, playback }) {
           : legacy ? null
           : t.wake_attribution === WAKE_ATTRIBUTION.VERIFIED ? 'heard while the Echo was playing; verified' : 'heard while idle'}
       </>)}
+
+      {t.trigger === TURN_TRIGGER.WAKE && !legacy
+        && (t.wake_attribution === WAKE_ATTRIBUTION.VERIFIED || VERIFIED_REFUSAL.has(t.terminal_reason))
+        && stage('Verification', <WakeVerification deviceId={t.device_id} turnId={t.turn_id}/>)}
 
       {!refused && !legacy && stage('Heard (EchoMuse)', <>
         {quote(t.asr_text)}

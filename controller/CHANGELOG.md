@@ -1145,6 +1145,34 @@ download as two training sets.
   `verdict` (archive `echomuse-missedwakes-…` or `echomuse-correctlyignored-…`).
   **Schema v39** adds `near_misses.verdict`.
 
+### Wake verification kept with every row
+
+A wake heard while an Echo is playing (a ringing timer, music, a reply) must
+pass the verifier, a fresh Kroko decode that must hear the wake word, within
+700 ms. Until now a refused one left only its reason: on 2026-10-26 three of
+eight attempts to stop a ringing timer were refused as `verifier_timeout`, and
+only an offline replay showed the verifier would have heard "Ophelia" in all
+three.
+
+- **The verification record.** Every row of a wake heard while playing,
+  accepted or refused, now has in its decision trace what the verifier
+  decoded, its distance from the wake word and its verdict; when, after the
+  wake, the mic covered the verifier's input, the verdict arrived, and the
+  wake was decided, against the deadline; how long the decode waited for a
+  thread and how long it ran; and how much audio past the wake had arrived
+  at the decision.
+- **Late verdicts.** A refused candidate's row waits up to 1.5 s for a
+  verifier that has not answered yet, and keeps its words and timing marked
+  `late`. A verification that ran past the worker's 750 ms job deadline is
+  still a timeout, but now carries the text it decoded.
+- **Refused wakes have a decision trace and a wake clip.** With **Save wake
+  clips** on, a refused wake heard while playing keeps a clip from 300 ms
+  before the wake through the verifier's 480 ms lookahead, with or without an
+  AFE chart. The **Confirmed wakes** archive still leaves refused rows out.
+- **Activity.** A turn's detail has a **Verification** stage: the verifier's
+  words and verdict, whether a timed-out verdict would have passed, and where
+  the time went.
+
 ### Earlier in this release
 
 - ASR gain: the STT copy sent to Home Assistant is amplified by

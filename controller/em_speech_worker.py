@@ -205,10 +205,17 @@ class AsrPayload:
 
 @dataclass(frozen=True, slots=True)
 class VerificationPayload:
+    """The verifier's verdict on one candidate. `queued_ms` is how long its decode waited for an
+    executor thread after the input was complete, `decode_ms` how long the decode itself took;
+    both are None when it never ran. A `timeout` whose decode ran past the job deadline still
+    carries the text and distance it reached: what the verifier would have said."""
+
     candidate_id: str
     text: str | None
     alias_distance: float | None
     result: VerificationResult
+    queued_ms: int | None = None
+    decode_ms: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -967,16 +974,22 @@ class SpeechWorker:
         if not mic.covers(a, b):
             raise SpeechWorkerError(f"verification input [{a}, {b}) is not all known")
         evidence = evidence_copy(mic.read(a, b))
-        self._submit(_Job(f"verification:{candidate_id}", ObservationKind.VERIFICATION, self._now(),
-                          lambda: self._run_verification(models, lease, candidate_id, evidence, verify_core, b),
+        created = self._now()
+        self._submit(_Job(f"verification:{candidate_id}", ObservationKind.VERIFICATION, created,
+                          lambda: self._run_verification(models, lease, candidate_id, evidence, verify_core, b,
+                                                         created),
                           lease, StreamId.MIC, b, None, candidate_id=candidate_id))
 
     def _run_verification(self, models: SpeechModels, lease: _Lease, candidate_id: str, evidence: np.ndarray,
-                          core: str, through: int) -> tuple[Observation, ...]:
+                          core: str, through: int, created: float) -> tuple[Observation, ...]:
+        queued_ms = round((self._now() - created) * 1000)
+        started = time.monotonic()
         text = models.decode_fresh(evidence).text
+        decode_ms = round((time.monotonic() - started) * 1000)
         v = verify_wake(text, core)
         payload = VerificationPayload(candidate_id, text, v.distance,
-                                      VerificationResult.PASS if v.passed else VerificationResult.FAIL)
+                                      VerificationResult.PASS if v.passed else VerificationResult.FAIL,
+                                      queued_ms, decode_ms)
         return (self._observe(lease, StreamId.MIC, ObservationKind.VERIFICATION, through, payload),)
 
     # -- committed-span re-decode ---------------------------------------------
@@ -1033,7 +1046,7 @@ class SpeechWorker:
             try:
                 observations = await loop.run_in_executor(self._executor, job.run)
                 if not job.control and self._now() - job.created > self.job_deadline_s:
-                    await self._fail(job, "job deadline exceeded", deadline=True)
+                    await self._fail(job, "job deadline exceeded", deadline=True, ran=observations)
                     continue
                 for obs in observations:
                     await self._emit(obs)
@@ -1048,8 +1061,10 @@ class SpeechWorker:
         if self._lane_tasks.get(name) is asyncio.current_task():
             del self._lane_tasks[name]
 
-    async def _fail(self, job: _Job, reason: str, *, deadline: bool = False) -> None:
-        """Report a failed job; a verification past its deadline is also a `timeout` verdict (§16.6).
+    async def _fail(self, job: _Job, reason: str, *, deadline: bool = False,
+                    ran: tuple[Observation, ...] = ()) -> None:
+        """Report a failed job; a verification past its deadline is also a `timeout` verdict (§16.6),
+        carrying the text, distance and timings of its decode when that ran (`ran`, its observations).
 
         One stall is one error: a missed deadline is counted unless the job was submitted
         by the last counted deadline failure (in any lane, since the GIL and the executor
@@ -1064,9 +1079,11 @@ class SpeechWorker:
             if job.stream == StreamId.MIC and not job.candidate_id:
                 lease.dirty = True   # the lane's recurrent state skipped audio
             if job.candidate_id is not None and deadline:
-                await self._emit(self._observe(
-                    lease, StreamId.MIC, ObservationKind.VERIFICATION, job.through,
-                    VerificationPayload(job.candidate_id, None, None, VerificationResult.TIMEOUT)))
+                late = next((o.payload for o in ran if isinstance(o.payload, VerificationPayload)), None)
+                verdict = (VerificationPayload(job.candidate_id, None, None, VerificationResult.TIMEOUT)
+                           if late is None else replace(late, result=VerificationResult.TIMEOUT))
+                await self._emit(self._observe(lease, StreamId.MIC, ObservationKind.VERIFICATION, job.through,
+                                               verdict))
             await self._emit(self._observe(lease, job.stream, ObservationKind.ERROR, job.through,
                                            ErrorPayload(job.component, reason), job.utterance_id))
         if backlog:

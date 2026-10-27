@@ -769,6 +769,67 @@ def test_a_verification_missing_the_deadline_rejects_and_never_accepts():
     run(main())
 
 
+def test_a_verifier_timeout_row_keeps_what_the_verifier_heard_after_the_deadline(monkeypatch):
+    """The 700 ms deadline refuses the candidate, but its row waits for the late verdict and keeps
+    it with its timings and the verifier's audio: a deadline miss on a real wake word is told
+    apart from a wake the verifier could not hear."""
+    saved = {}
+
+    def save_wake(device_id, row_id, pcm):
+        saved["wake"] = pcm
+        return None
+
+    monkeypatch.setattr(em_session.em_wakeclips, "save", save_wake)
+
+    def ramp(a, b):                         # each sample names its capture index
+        return (np.arange(a, b) % 32_749).astype(np.int16)
+
+    async def main():
+        h = Harness(config={"saveWakeClips": True})
+        h.device.mic_pcm = ramp
+        h.worker.verification = None        # no verdict before the deadline
+        assert await producing_sound_case(h) == ["verifier_timeout"]
+        assert h.worker.verifications == ["C1"] and not h.rows
+        h.worker.post("L1", "verification", OPEN + 7_680,
+                      VerificationPayload("C1", "Ophilia.", 0.2, "timeout", 40, 310))
+        await h.wait_for(lambda: h.rows)
+        await h.actor.close()
+        return h.rows[0]
+
+    row = run(main())
+    assert row["terminal_reason"] == "verifier_timeout"
+    trace = json.loads(row["decision_trace"])
+    v = trace["verification"]
+    assert v["result"] == "timeout" and v["late"] and v["text"] == "Ophilia." and v["text_passes"] is True
+    assert (v["queued_ms"], v["decode_ms"]) == (40, 310)
+    assert v["deadline_ms"] == round(em_session.WAKE_VERIFY_S * 1000) <= v["decided_ms"] < v["answered_ms"]
+    assert v["input_ready_ms"] is not None and v["mic_past_open_ms"] >= 480
+    assert row["total_ms"] == v["decided_ms"]            # the row times the decision, not the wait after it
+    # The wake clip holds the verifier's whole input: support −300 ms through open + 480 ms.
+    assert v["input"] == trace["wake_clip"] == [S - em_session.PREROLL, OPEN + 7_680]
+    assert saved["wake"] == ramp(S - em_session.PREROLL, OPEN + 7_680).tobytes()
+
+
+@pytest.mark.parametrize("verdict, terminal", [("pass", "no_input"), ("fail", "unverified_wake")])
+def test_a_verified_candidate_row_keeps_the_verdict_and_its_timing(verdict, terminal):
+    async def main():
+        h = Harness()
+        h.worker.verification = verdict
+        await h.start()
+        h.actor.on_message(candidate(producing_sound=True))
+        await h.settle()
+        await h.feed(S - 4_800 - 20_000, OPEN + 90_000)
+        await h.wait_for(lambda: h.rows)
+        await h.actor.close()
+        return h.rows[0]
+
+    row = run(main())
+    assert row["terminal_reason"] == terminal
+    v = json.loads(row["decision_trace"])["verification"]
+    assert v["result"] == verdict and v["text"] == "ophilia" and v["late"] is False
+    assert v["input_ready_ms"] <= v["answered_ms"] <= v["decided_ms"] < v["deadline_ms"]
+
+
 # --- wake + local command -------------------------------------------------------------------
 
 
