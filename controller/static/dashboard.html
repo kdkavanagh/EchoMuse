@@ -273,6 +273,32 @@
       outline: 2px solid var(--accent-hi); outline-offset: 2px;
     }
 
+    /* A min/max range (RangeSlider): two range inputs over one drawn track.
+       Only their thumbs take the pointer, so either can be dragged anywhere;
+       the fill between them is a div the component places. */
+    .em-range2 { position: relative; height: 20px; }
+    .em-range2__track, .em-range2__fill {
+      position: absolute; top: 8px; height: 4px; border-radius: 2px; pointer-events: none;
+    }
+    .em-range2__track { left: 0; right: 0; background: var(--track); }
+    .em-range2__fill  { background: var(--accent); }
+    .em-range2 input[type=range] {
+      position: absolute; left: 0; top: 0; width: 100%; height: 20px; margin: 0;
+      background: transparent; pointer-events: none; -webkit-appearance: none; appearance: none;
+    }
+    .em-range2 input[type=range]::-webkit-slider-runnable-track { height: 20px; background: transparent; }
+    .em-range2 input[type=range]::-moz-range-track { background: transparent; }
+    .em-range2 input[type=range]::-webkit-slider-thumb {
+      -webkit-appearance: none; pointer-events: auto; cursor: pointer; margin-top: 3px;
+      width: 14px; height: 14px; border-radius: 50%; background: var(--accent); border: 2px solid var(--raised);
+    }
+    .em-range2 input[type=range]::-moz-range-thumb {
+      pointer-events: auto; cursor: pointer;
+      width: 10px; height: 10px; border-radius: 50%; background: var(--accent); border: 2px solid var(--raised);
+    }
+    .em-range2 input[type=range]:focus-visible::-webkit-slider-thumb { outline: 2px solid var(--accent-hi); outline-offset: 1px; }
+    .em-range2 input[type=range]:focus-visible::-moz-range-thumb { outline: 2px solid var(--accent-hi); outline-offset: 1px; }
+
     /* Mobile layout — the dashboard is inline-styled, so phone-width
        adjustments live here as class-targeted media overrides (the classes
        are on the structural containers in dashboard.jsx). !important is

@@ -62,7 +62,8 @@ import em_wake_rules
 import em_shell
 import em_support
 from em_device_link import Capability, MessageType
-from em_session import ActorState, VoicePhase
+from em_session import REFUSED_WAKES, ActorState, VoicePhase
+from em_utterance import UtteranceKind
 from version import VERSION as CONTROLLER_VERSION
 from version import UpdateStatus
 from version import compare as _compare_versions
@@ -448,6 +449,7 @@ async def create_app(services: ControllerServices) -> web.Application:
     app.router.add_get("/api/devices/{id}/turns/{turn}/trace", _get_turn_decision_trace)
     app.router.add_get("/api/devices/{id}/near_misses",   _get_device_near_misses)
     app.router.add_get("/api/devices/{id}/near_misses/{nm}/recording", _get_near_miss_recording)
+    app.router.add_get("/api/devices/{id}/near_misses/{nm}/afe", _get_near_miss_afe_series)
     # Wake clips — the pre-detection audio that crossed the threshold. The
     # per-turn WAV sits beside the turn's utterance because that is the pair
     # you look at together; the archive and the purge are device-wide.
@@ -456,6 +458,9 @@ async def create_app(services: ControllerServices) -> web.Application:
     app.router.add_get("/api/devices/{id}/turns/{turn}/wake", _get_turn_wake_audio)
     app.router.add_get("/api/devices/{id}/wakeclips.zip",  _get_wakeclips_zip)
     app.router.add_delete("/api/devices/{id}/wakeclips",   _delete_wakeclips)
+    # The Activity view's filtered archives, across devices.
+    app.router.add_get("/api/wakeclips.zip",               _get_fleet_wakeclips_zip)
+    app.router.add_get("/api/near_misses.zip",             _get_fleet_near_misses_zip)
     # Wake-word sample collection. samples.zip before samples/{name} — the
     # two cannot collide (different segment counts), but the file's ordering
     # rule is worth keeping honest.
@@ -1065,6 +1070,27 @@ async def _get_near_miss_recording(request: web.Request) -> web.StreamResponse:
     )
 
 
+@auth.require_auth
+async def _get_near_miss_afe_series(request: web.Request) -> web.Response:
+    """GET /api/devices/{id}/near_misses/{nm}/afe — one near miss's native AFE series
+    (em_afe.AfeSeriesJson): every 80 ms period from a second before its support through its
+    recording's end, the support as the window and the recording placed, for the Activity
+    detail's chart. A 404 is ordinary: no lease took the records (Save wake clips off, capture
+    refused, no afe_metadata_v1), none came, the row is older than the newest
+    em_db.TRACE_RETENTION, or it predates schema 38. Served as stored."""
+    device_id = request.match_info["id"]
+    try:
+        near_miss_id = int(request.match_info["nm"])
+    except ValueError:
+        return _error(ErrorCode.BAD_REQUEST, "near miss must be an integer", 400)
+    await _device_row(device_id)
+    series = await asyncio.get_running_loop().run_in_executor(
+        None, db.get_near_miss_afe_series, device_id, near_miss_id)
+    if series is None:
+        return _error(ErrorCode.NO_AFE_SERIES, "No native AFE series for this near miss", 404)
+    return web.Response(content_type="application/json", text=series)
+
+
 # ─── Wake-word sample collection ──────────────────────────────────────────────
 #
 # Collection mode itself (em_samples, em_controller.set_collect_mode) plus the
@@ -1405,6 +1431,132 @@ async def _delete_wakeclips(request: web.Request) -> web.Response:
         f"Deleted {removed} wake clip(s)",
     )
     return _ok({"deleted": removed})
+
+
+# ─── Filtered clip archives (the Activity view) ───────────────────────────────
+#
+# Every saved clip of one kind matching the Activity view's filters: one device
+# or all of them, and a wake-score range. Streamed rather than built in memory
+# as the per-device archive is: across devices the stores reach 500 wake clips
+# and 200 near-miss recordings each, past 100 MB for a fleet, which the
+# controller should not hold for one click.
+
+ZIP_CHUNK = 256 * 1024   # bytes handed to the response at a time
+
+
+class _ResponseSink:
+    """zipfile's output, written on an executor thread: the bytes go to `response` on `loop`
+    ZIP_CHUNK at a time, each write finished before more is taken (the client's pace)."""
+
+    def __init__(self, response: web.StreamResponse, loop: asyncio.AbstractEventLoop) -> None:
+        self._response, self._loop, self._buf = response, loop, bytearray()
+
+    def write(self, b: bytes, /) -> int:
+        self._buf += b
+        if len(self._buf) >= ZIP_CHUNK:
+            self.flush()
+        return len(b)
+
+    def flush(self) -> None:
+        if self._buf:
+            data, self._buf = bytes(self._buf), bytearray()
+            asyncio.run_coroutine_threadsafe(self._response.write(data), self._loop).result()
+
+    def close(self) -> None:
+        self.flush()
+
+
+async def _stream_zip(request: web.Request, filename: str,
+                      entries: Sequence[tuple[str, Path]]) -> web.StreamResponse:
+    """`entries` (name in the archive, file) as one zip attachment, streamed. ZIP_STORED, as
+    _zip_clips: WAV does not compress. A file pruned since it was listed is left out."""
+    response = web.StreamResponse(headers={
+        "Content-Type":        "application/zip",
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Cache-Control":       "no-store",
+    })
+    await response.prepare(request)
+    loop = asyncio.get_running_loop()
+
+    def build() -> None:
+        sink = _ResponseSink(response, loop)
+        with zipfile.ZipFile(sink, "w", zipfile.ZIP_STORED) as z:
+            for arcname, path in entries:
+                with contextlib.suppress(FileNotFoundError):   # pruned since it was listed
+                    z.write(path, arcname=arcname)
+        sink.flush()
+
+    try:
+        await loop.run_in_executor(None, build)
+    except ConnectionResetError:
+        log.info("archive %s: the client went away", filename)
+        return response
+    await response.write_eof()
+    return response
+
+
+def _clip_filter(request: web.Request) -> tuple[str | None, float, float]:
+    """A filtered archive's `device` (None: every registered device) and wake-score bounds
+    `min`, `max` (0–1, inclusive; default the whole range). ApiError for a bad value."""
+    try:
+        lo = float(request.query.get("min", 0))
+        hi = float(request.query.get("max", 1))
+    except ValueError:
+        raise ApiError(ErrorCode.BAD_REQUEST, "min/max must be numeric", 400) from None
+    if not 0 <= lo <= hi <= 1:
+        raise ApiError(ErrorCode.BAD_REQUEST, "min and max must satisfy 0 ≤ min ≤ max ≤ 1", 400)
+    return request.query.get("device") or None, lo, hi
+
+
+async def _archive_slugs(device_id: str | None) -> dict[str, str]:
+    """Each device's folder name in an archive: `device_id`'s alone (404 when it is not
+    registered), or every registered device's."""
+    if device_id is not None:
+        row = await _device_row(device_id)
+        return {device_id: _slug(row.label or device_id)}
+    rows = await asyncio.get_running_loop().run_in_executor(None, db.get_all_devices)
+    return {r.device_id: _slug(r.label or r.device_id) for r in rows}
+
+
+def _archive_name(kind: str, slug: str | None, lo: float, hi: float) -> str:
+    return f"echomuse-{kind}{f'-{slug}' if slug else ''}-{lo:.2f}-{hi:.2f}.zip"
+
+
+@auth.require_auth
+async def _get_fleet_wakeclips_zip(request: web.Request) -> web.StreamResponse:
+    """GET /api/wakeclips.zip?device=&min=&max= — the wake clip of every confirmed wake (a
+    wake turn not refused: em_session.REFUSED_WAKES) with a wake score in [min, max], of
+    `device` or every registered device, as `<device>/wake<turn>.wav`. A 404 when none
+    matches."""
+    device_id, lo, hi = _clip_filter(request)
+    slugs = await _archive_slugs(device_id)
+    loop = asyncio.get_running_loop()
+    rows = await loop.run_in_executor(None, lambda: db.get_wake_clip_turns(
+        device_id, lo, hi, trigger=UtteranceKind.WAKE, refused=REFUSED_WAKES))
+    entries = await loop.run_in_executor(None, lambda: [
+        (f"{slugs[dev]}/wake{turn}.wav", path) for dev, turn in rows
+        if (path := em_wakeclips.resolve(dev, em_wakeclips.filename(turn))) is not None])
+    if not entries:
+        return _error(ErrorCode.NO_WAKE_CLIPS, "No saved wake clip matches", 404)
+    return await _stream_zip(request, _archive_name("wakes", device_id and slugs[device_id], lo, hi), entries)
+
+
+@auth.require_auth
+async def _get_fleet_near_misses_zip(request: web.Request) -> web.StreamResponse:
+    """GET /api/near_misses.zip?device=&min=&max= — the recording of every near miss with a
+    peak score in [min, max], of `device` or every registered device, as
+    `<device>/nearmiss<id>.wav`. A 404 when none matches."""
+    device_id, lo, hi = _clip_filter(request)
+    slugs = await _archive_slugs(device_id)
+    loop = asyncio.get_running_loop()
+    rows = await loop.run_in_executor(None, db.get_near_miss_recordings, device_id, lo, hi)
+    entries = await loop.run_in_executor(None, lambda: [
+        (f"{slugs[dev]}/nearmiss{nm}.wav", path) for dev, nm in rows
+        if (path := _near_miss_path(dev, nm)) is not None])
+    if not entries:
+        return _error(ErrorCode.NO_RECORDING, "No saved near-miss recording matches", 404)
+    return await _stream_zip(request, _archive_name("nearmisses", device_id and slugs[device_id], lo, hi),
+                             entries)
 
 
 # ─── Ambient recording ────────────────────────────────────────────────────────

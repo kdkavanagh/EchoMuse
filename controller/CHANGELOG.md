@@ -1062,10 +1062,28 @@ Echo's voice turns and near misses in one list by time.
 
 - **The list.** The newest 200 turns and 200 near misses across the Echos,
   each row naming its Echo; the name opens it. Pills above the list narrow it
-  to one Echo, which also offers that Echo's wake clips as one archive. The
-  tiles, recordings and turn detail are those of the device Activity tab. It
-  reloads as each turn finishes and every 10 s, and the view is kept in the
-  address (`#activity`).
+  to one Echo. The tiles, recordings and turn detail are those of the device
+  Activity tab. It reloads as each turn finishes and every 10 s, and the view
+  is kept in the address (`#activity`).
+- **Wake-score filter.** A two-thumb slider keeps the turns whose wake score,
+  and the near misses whose peak, lie in its range; narrowed, it hides turns
+  without a score (button, reply) and counts them. The tiles follow it.
+- **Filtered downloads.** **⤓ Confirmed wakes (.zip)** holds the wake clip of
+  every wake turn that was not refused (`self_output`, `echo_only`,
+  `unverified_wake`, `verifier_timeout`, `arbitration_lost`), and **⤓ Near
+  misses (.zip)** every saved near-miss recording, each limited to the Echo
+  and score range shown, over every clip still kept rather than the rows
+  listed, one folder per Echo. Both are streamed, never held in memory. API:
+  `GET /api/wakeclips.zip` and `GET /api/near_misses.zip` (`device`, `min`,
+  `max`; 404 when nothing matches).
+- **Near-miss detail.** A near miss is now clickable, here and on the device
+  Activity tab: its peak against the floor and the wake threshold, its
+  recording, and a native AFE chart from a second before the scored stretch
+  through the recording's end, with the playhead. The near-miss lease takes
+  the `afe` stream for it in an `afe_metadata` session (docs/protocol-v1.md
+  §4.5; firmware unchanged, it already served `afe` on any lease), so only
+  near misses recorded from now on, with Save wake clips on, have one. API:
+  `GET /api/devices/{id}/near_misses/{nm}/afe`.
 - **API.** `GET /api/turns` and `GET /api/near_misses`: the newest rows of
   every registered device by time (`limit`, default 50, at most 1,000;
   `since`). A deleted device's rows, which the database keeps, are left out.
@@ -1074,6 +1092,8 @@ Echo's voice turns and near misses in one list by time.
 - **Schema v37** indexes `turns` and `near_misses` by time, so a list across
   devices reads only the rows it returns. The turn lists no longer read each
   row's decision trace and AFE series (up to ~46 KB a row) only to drop them.
+  **Schema v38** adds `near_misses.afe_series`, kept for the newest 1,000
+  near misses per device.
 
 ### Earlier in this release
 

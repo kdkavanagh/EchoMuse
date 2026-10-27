@@ -205,6 +205,7 @@ class NearMissRecord:
     duration_ms: int
     end_reason: NearMissEnd
     recording: NearMissRecording
+    afe_series: Optional[str] = None   # em_afe.AfeSeries JSON; None: none taken (see v38)
 
 
 @dataclass(frozen=True, slots=True)
@@ -383,7 +384,8 @@ TURN_RETENTION = 20_000
 
 # Voice-turn rows per device that keep their §11.3 decision_trace (3–6 KB
 # each) and their afe_series (about 0.6 KB per second of turn, at most ~40 KB);
-# insert_turn NULLs both on older rows in the same transaction.
+# insert_turn NULLs both on older rows in the same transaction. Near misses keep
+# their afe_series (~3 KB) for as many rows per device (insert_near_miss).
 TRACE_RETENTION = 1_000
 
 # Hourly wake_counters rows older than this are pruned on upsert.
@@ -1242,6 +1244,21 @@ MIGRATIONS: list[str] = [
     CREATE INDEX IF NOT EXISTS idx_turns_ts ON turns (ts);
     CREATE INDEX IF NOT EXISTS idx_near_misses_ts ON near_misses (ts);
     UPDATE system_config SET value = '37' WHERE key = 'schema_version';
+    """,
+
+    # ── v38 — a near miss's chart ────────────────────────────────────────────
+    #
+    # In an afe_metadata session the near-miss lease also takes the AFE
+    # records, from a second before the support through the recording's end;
+    # `afe_series` is their em_afe.AfeSeries JSON, the support as its window
+    # and the saved WAV placed as `recording`, for the near miss's chart (GET
+    # /api/devices/{id}/near_misses/{nm}/afe). NULL: none taken (no lease:
+    # saveWakeClips off or capture refused; the device lacks afe_metadata_v1;
+    # no record came), older than the newest TRACE_RETENTION rows of its
+    # device, or a row from before this. Never read by the near-miss lists.
+    """
+    ALTER TABLE near_misses ADD COLUMN afe_series TEXT;
+    UPDATE system_config SET value = '38' WHERE key = 'schema_version';
     """,
 ]
 
@@ -2554,18 +2571,25 @@ def get_fleet_turns(limit: int = 50, since: Optional[float] = None) -> list[dict
 
 def insert_near_miss(device_id: str, rec: NearMissRecord) -> int:
     """Persist one near-miss episode; returns its rowid (the recording is named
-    by it). Prunes to the newest NEAR_MISS_RETENTION rows per device."""
+    by it). Prunes to the newest NEAR_MISS_RETENTION rows per device, and NULLs
+    afe_series on all but the newest TRACE_RETENTION of them."""
     with _tx() as conn:
         cur = conn.execute(
             "INSERT INTO near_misses (device_id, ts, near_miss_uuid, profile, floor, peak, wake_threshold, "
-            "wake_model_sha256, duration_ms, end_reason, recording) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "wake_model_sha256, duration_ms, end_reason, recording, afe_series) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (device_id, rec.ts, rec.near_miss_uuid, rec.profile, rec.floor, rec.peak, rec.wake_threshold,
-             rec.wake_model_sha256, rec.duration_ms, rec.end_reason, rec.recording),
+             rec.wake_model_sha256, rec.duration_ms, rec.end_reason, rec.recording, rec.afe_series),
         )
         conn.execute(
             "DELETE FROM near_misses WHERE device_id = ? AND id NOT IN ("
             "SELECT id FROM near_misses WHERE device_id = ? ORDER BY id DESC LIMIT ?)",
             (device_id, device_id, NEAR_MISS_RETENTION),
+        )
+        conn.execute(
+            "UPDATE near_misses SET afe_series = NULL WHERE device_id = ? AND afe_series IS NOT NULL "
+            "AND id NOT IN (SELECT id FROM near_misses WHERE device_id = ? ORDER BY id DESC LIMIT ?)",
+            (device_id, device_id, TRACE_RETENTION),
         )
         return _rowid(cur)
 
@@ -2579,17 +2603,62 @@ def set_near_miss_saved(near_miss_id: int, audio_ms: int) -> None:
         )
 
 
+# The near-miss lists' columns: NearMissRow's, never the afe_series.
+_NEAR_MISS_SELECT = "SELECT " + ", ".join(f.name for f in fields(NearMissRow)) + " FROM near_misses"
+
+
 def get_near_misses(device_id: str, limit: int = 50, since: Optional[float] = None) -> list[NearMissRow]:
     """A device's newest `limit` near misses (from `since`, epoch s), oldest first."""
-    rows = _newest("SELECT * FROM near_misses", "device_id = ?", (device_id,), limit, since)
+    rows = _newest(_NEAR_MISS_SELECT, "device_id = ?", (device_id,), limit, since)
     return [NearMissRow.from_row(r) for r in reversed(rows)]
 
 
 def get_fleet_near_misses(limit: int = 50, since: Optional[float] = None) -> list[NearMissRow]:
     """The newest `limit` near misses of every registered device (from `since`, epoch s),
     oldest first."""
-    rows = _newest("SELECT * FROM near_misses n", _REGISTERED.format(table="n"), (), limit, since)
+    rows = _newest(f"{_NEAR_MISS_SELECT} n", _REGISTERED.format(table="n"), (), limit, since)
     return [NearMissRow.from_row(r) for r in reversed(rows)]
+
+
+def get_near_miss_afe_series(device_id: str, near_miss_id: int) -> Optional[str]:
+    """The stored em_afe.AfeSeries JSON of one of `device_id`'s near misses; None when it has
+    none (see the v38 migration) or is not that device's."""
+    row = _q1("SELECT afe_series FROM near_misses WHERE id = ? AND device_id = ?", (near_miss_id, device_id))
+    return None if row is None else row["afe_series"]
+
+
+def _scope(device_id: Optional[str], table: str) -> tuple[str, tuple[object, ...]]:
+    """The WHERE term for `device_id`'s rows, or every registered device's when None."""
+    if device_id is None:
+        return _REGISTERED.format(table=table), ()
+    return f"{table}.device_id = ?", (device_id,)
+
+
+def get_wake_clip_turns(device_id: Optional[str], lo: float, hi: float, *, trigger: str,
+                        refused: Iterable[str]) -> list[tuple[str, int]]:
+    """(device_id, turn id), newest first, of `device_id`'s turns (every registered device's
+    when None) that `trigger` opened and whose end is not `refused` (a row from before terminal
+    reasons were kept counts as answered), with a saved wake clip and a wake score in [lo, hi]."""
+    reasons = tuple(refused)
+    scope, params = _scope(device_id, "t")
+    rows = _q(
+        f"SELECT device_id, id FROM turns t WHERE {scope} AND trigger_type = ? "
+        f"AND wake_file IS NOT NULL AND wake_score BETWEEN ? AND ? "
+        f"AND (terminal_reason IS NULL OR terminal_reason NOT IN ({', '.join('?' * len(reasons))})) "
+        f"ORDER BY ts DESC",
+        (*params, trigger, lo, hi, *reasons))
+    return [(row["device_id"], row["id"]) for row in rows]
+
+
+def get_near_miss_recordings(device_id: Optional[str], lo: float, hi: float) -> list[tuple[str, int]]:
+    """(device_id, row id), newest first, of `device_id`'s near misses (every registered
+    device's when None) whose recording was saved, with a peak in [lo, hi]."""
+    scope, params = _scope(device_id, "n")
+    rows = _q(
+        f"SELECT device_id, id FROM near_misses n WHERE {scope} AND recording = ? "
+        f"AND peak BETWEEN ? AND ? ORDER BY ts DESC",
+        (*params, NearMissRecording.SAVED, lo, hi))
+    return [(row["device_id"], row["id"]) for row in rows]
 
 
 def get_text_fix_history(limit: int, before_id: Optional[int] = None) -> list[tuple[int, float, str, Optional[str]]]:

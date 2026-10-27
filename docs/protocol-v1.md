@@ -515,8 +515,11 @@ A `near_miss` lease (`near_miss_v1` devices only, generation 1) records one
 near miss while the speaker's `saveWakeClips` is on and capture is permitted:
 `owner` is its `near_miss_id` and `streams` is
 `{"mic":"<support_start − 4800, rounded down to 512>"}`, served from the 6 s
-mic ring. The controller closes it (`closed`) once it holds mic through
-`support_end + 4800`. The device gives it no other effect: no duck, no focus,
+mic ring, plus in an `afe_metadata` session `"afe":"<support_start − 16000>"`
+from the 8 s AFE ring, for the near miss's chart. The controller closes it
+(`closed`) once it holds mic through `support_end + 4800` and, when it took
+`afe`, the records through it too, or the mic has run 16,000 samples past
+that without them. The device gives it no other effect: no duck, no focus,
 and it is not a diagnostic lease, so wakes and the local chime are unaffected.
 
 **`uplink.renew`** C→D, gen = the lease's generation, or +1 to convert:

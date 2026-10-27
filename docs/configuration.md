@@ -85,14 +85,29 @@ device's firmware does not announce is shown disabled with the reason.
 The page's **Activity** tab, beside **Devices**, lists every Echo's voice
 turns and near misses in one list by time: the newest 200 of each, every row
 naming the Echo it happened on, and the name opens that Echo. The pills above
-the list narrow it to one Echo, which then also offers that Echo's wake clips
-as one archive. The tiles, recordings and turn detail are those of a device's
-Activity tab. The list follows each turn as it finishes and reloads every
-10 s, which is what brings new near misses. An Echo whose firmware reports no
-near misses is named above the list with the reason. The view is kept in the
-address (`#activity`), so a reload stays on it. API: `GET /api/turns` and
-`GET /api/near_misses` (`limit`, default 50, at most 1,000; `since`, epoch
-seconds), each row naming its `device_id`.
+the list narrow it to one Echo. The tiles, recordings and turn detail are
+those of a device's Activity tab. The list follows each turn as it finishes
+and reloads every 10 s, which is what brings new near misses. An Echo whose
+firmware reports no near misses is named above the list with the reason. The
+view is kept in the address (`#activity`), so a reload stays on it. API: `GET
+/api/turns` and `GET /api/near_misses` (`limit`, default 50, at most 1,000;
+`since`, epoch seconds), each row naming its `device_id`.
+
+- **Wake score.** The slider keeps the turns whose wake score, and the near
+  misses whose peak, lie in its range (both ends included); narrowed, it also
+  hides turns without a score (button presses, replies) and says how many.
+  The tiles count what is shown.
+- **⤓ Confirmed wakes (.zip)** and **⤓ Near misses (.zip)** download every
+  saved clip the filters match, not only the rows listed: the wake clip of
+  each wake that was not refused (Save wake clips keeps the newest 500 per
+  Echo), and each near-miss recording (the newest 200 per Echo), filed under
+  one folder per Echo. API: `GET /api/wakeclips.zip` and `GET
+  /api/near_misses.zip` (`device`, `min`, `max`).
+- **Near-miss detail.** Clicking a near miss shows its peak against the floor
+  and the wake threshold, its recording, and the Echo's native AFE chart from
+  a second before the scored stretch through the recording's end (taken with
+  the recording, on firmware reporting native AFE metadata). The device
+  Activity tab does the same.
 
 ---
 

@@ -55,7 +55,8 @@ from echomuse_grammar import (
     RepeatRequest,
     TimerCancel,
 )
-from em_afe import AfeEvidence, AfeSeries, TurnStage, series_range, turn_evidence, turn_series
+from em_afe import (PRE_SAMPLES, AfeEvidence, AfeSeries, TurnStage, near_miss_series, series_range, turn_evidence,
+                    turn_series)
 from em_alert_wire import RingKind, Weekday
 from em_alerts import ActSource, AlertResult, JournalSource
 from em_attribution import (
@@ -213,6 +214,9 @@ ASR_STALL = 4 * SAMPLE_RATE      # utterance ASR this far behind the mic: the st
 
 # A near-miss recording (near_miss_v1): its support from 300 ms before through 300 ms after.
 NEAR_MISS_PAD = CANDIDATE_MIC_PREROLL
+# How far the mic may run past a near miss's recording while its AFE records catch up; then its
+# row is written with the records that came (a device whose decoder stopped sends none).
+NEAR_MISS_AFE_WAIT = SAMPLE_RATE
 
 # §16.2 priority order of already-received events.
 P_MUTE, P_STOP, P_LOSS, P_INTERRUPT, P_GAP, P_SPEECH, P_RESULT, P_DEADLINE = range(8)
@@ -300,6 +304,14 @@ class TerminalReason(enum.StrEnum):
     UNVERIFIED_WAKE = "unverified_wake"
     SELF_OUTPUT = "self_output"
     ECHO_ONLY = "echo_only"
+
+
+# The ends of a wake the controller refused rather than answered: the rejected candidates
+# (§6.1), which the dashboard counts as refused wakes. A wake turn ending any other way is a
+# confirmed wake.
+REFUSED_WAKES: frozenset[TerminalReason] = frozenset({
+    TerminalReason.ARBITRATION_LOST, TerminalReason.VERIFIER_TIMEOUT, TerminalReason.UNVERIFIED_WAKE,
+    TerminalReason.SELF_OUTPUT, TerminalReason.ECHO_ONLY})
 
 
 class FollowUp(enum.StrEnum):
@@ -886,8 +898,8 @@ class _Runtime:
 
 @dataclass
 class _NearMissCapture:
-    """A near miss whose recording lease is open: its row waits for mic through `end` (its
-    support_end + NEAR_MISS_PAD), the device ending the lease, or a refusal of `open_message`."""
+    """A near miss whose recording lease is open: its row waits for the lease to hold its span
+    (`complete`), the device ending the lease, or a refusal of `open_message`."""
 
     record: em_db.NearMissRecord
     wire: NearMiss
@@ -898,6 +910,17 @@ class _NearMissCapture:
     @property
     def end(self) -> int:
         return self.wire.support_end + NEAR_MISS_PAD
+
+    def complete(self) -> bool:
+        """It holds mic through `end` and, if it took the `afe` stream, the records through it too
+        (or the mic has run NEAR_MISS_AFE_WAIT past it without them)."""
+        mic = self.timeline.mic.frontier
+        if mic is None or mic < self.end:
+            return False
+        if StreamId.AFE not in self.timeline.lease.streams or mic >= self.end + NEAR_MISS_AFE_WAIT:
+            return True
+        afe = self.timeline.afe.frontier
+        return afe is not None and afe * AFE_PERIOD_SAMPLES >= self.end
 
 
 @dataclass
@@ -1573,8 +1596,9 @@ class SessionActor:
 
     async def _near_miss(self, wire: NearMiss, ts: float) -> None:
         """A wake.near_miss: its row, and while `saveWakeClips` is on its recording, through a
-        `near_miss` lease taking mic from its support's start −300 ms (WIRE §4.5). The lease feeds
-        nothing but the recording: no worker, no decision."""
+        `near_miss` lease taking mic from its support's start −300 ms (WIRE §4.5) and, in an
+        `afe_metadata` session, the AFE records from a second before it, for the near miss's chart.
+        The lease feeds nothing but the recording and the chart: no worker, no decision."""
         record = em_db.NearMissRecord(
             ts=ts, near_miss_uuid=wire.near_miss_id, profile=wire.profile, floor=wire.floor,
             peak=wire.peak, wake_threshold=self._wake_threshold(wire), wake_model_sha256=wire.graph_sha256,
@@ -1586,8 +1610,10 @@ class SessionActor:
             self._persist_near_miss(replace(record, recording=refusal or em_db.NearMissRecording.FAILED), None)
             return
         lease_id = str(uuid.uuid4())
-        message = uplink.open(lease_id, LeaseReason.NEAR_MISS, wire.near_miss_id, wire.capture_epoch,
-                              {StreamId.MIC: wire.support_start - NEAR_MISS_PAD})
+        streams: dict[StreamId, int | None] = {StreamId.MIC: wire.support_start - NEAR_MISS_PAD}
+        if uplink.afe_metadata:
+            streams[StreamId.AFE] = max(0, wire.support_start - PRE_SAMPLES)
+        message = uplink.open(lease_id, LeaseReason.NEAR_MISS, wire.near_miss_id, wire.capture_epoch, streams)
         timeline = uplink.timelines[lease_id]
         timeline.set_utterance_start(timeline.lease.streams[StreamId.MIC])   # retention anchor: the whole span
         capture = _NearMissCapture(record, wire, lease_id, timeline)
@@ -1600,10 +1626,9 @@ class SessionActor:
             await self._end_near_miss(capture, close=False)
 
     async def _near_miss_audio(self) -> None:
-        """Close each near-miss lease that holds mic through its span's end (frontier past it)."""
+        """Close each near-miss lease that holds its span (_NearMissCapture.complete)."""
         for capture in list(self._near_misses.values()):
-            frontier = capture.timeline.mic.frontier
-            if frontier is not None and frontier >= capture.end:
+            if capture.complete():
                 await self._end_near_miss(capture, close=True)
 
     async def _near_miss_ack(self, ack: CommandAck) -> None:
@@ -1617,16 +1642,22 @@ class SessionActor:
             await self._end_near_miss(capture, close=False)
 
     async def _end_near_miss(self, capture: _NearMissCapture, *, close: bool) -> None:
-        """Write the near miss's row with what its lease holds (`_near_miss_clip`), sending
-        `uplink.close` when `close` (not for a lease the device has ended or never opened)."""
+        """Write the near miss's row with what its lease holds: the recording (`_near_miss_clip`)
+        and the chart of its AFE records, placing the recording, sending `uplink.close` when
+        `close` (not for a lease the device has ended or never opened)."""
         if self._near_misses.pop(capture.lease_id, None) is None:
             return
-        pcm = _near_miss_clip(capture)
+        clip = _near_miss_clip(capture)
+        wire = capture.wire
+        series = near_miss_series(capture.timeline.afe, (wire.support_start, wire.support_end), capture.end)
+        if series is not None and clip is not None:
+            series = replace(series, recording=clip.span)
         if close:
             await self._close_uplink(capture.lease_id, LeaseEnd.CLOSED)
         if self.uplink is not None:
             self.uplink.release(capture.lease_id)
-        self._persist_near_miss(capture.record, pcm)
+        record = replace(capture.record, afe_series=series.dumps() if series is not None else None)
+        self._persist_near_miss(record, clip.pcm if clip is not None else None)
 
     async def _end_all_near_misses(self) -> None:
         for capture in list(self._near_misses.values()):
@@ -4109,7 +4140,7 @@ def _save_turn_recording(device_id: str, turn_id: int, pcm: bytes) -> str | None
     return em_recordings.save(device_id, turn_id, pcm, kind=em_recordings.RecordingKind.TURN)
 
 
-def _near_miss_clip(capture: _NearMissCapture) -> bytes | None:
+def _near_miss_clip(capture: _NearMissCapture) -> _Clip | None:
     """A near miss's recording: its lease's mic contiguous from the first sample it received (the
     requested start, or where the device's ring clipped it) through `capture.end`; short of that,
     what it holds if that covers the whole support; else None."""
@@ -4121,7 +4152,7 @@ def _near_miss_clip(capture: _NearMissCapture) -> bytes | None:
     end = min(run[1], capture.end)
     if end < capture.end and not (first <= wire.support_start and end >= wire.support_end):
         return None
-    return mic.read(first, end).tobytes()
+    return _Clip(first, mic.read(first, end).tobytes())
 
 
 def _mark(turn: _Turn, stage: TurnStage, start: float, end: float | None = None) -> None:

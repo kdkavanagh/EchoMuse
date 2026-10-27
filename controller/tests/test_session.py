@@ -1379,6 +1379,41 @@ def test_near_misses_with_wake_clips_on_record_their_span_through_their_own_leas
     assert rows["N2"][1] == capture_ramp(second_mic, NM_END + 12_800 + 4_800).tobytes()
 
 
+@pytest.mark.parametrize("sends", [True, False])
+def test_in_an_afe_session_a_near_miss_lease_takes_the_records_for_its_chart_but_waits_for_them_only_a_second(sends):
+    # The chart: from a second before the support through the recording's end, the WAV placed on
+    # it. A decoder that sends nothing holds the row up for one second of mic past its end, no more.
+    async def main():
+        h = Harness(config={"saveWakeClips": True}, afe=True)
+        h.device.mic_pcm = capture_ramp
+        h.device.send_afe = sends
+        await h.start()
+        h.actor.on_near_miss(near_miss(), at_wall)
+        await h.settle()
+        [(body, _)] = h.link.of("uplink.open")
+        await h.feed(NM_START - 16_000, NM_END + 4_800 + BLOCK)
+        await h.settle()
+        early = list(h.near_misses)
+        await h.feed(NM_END + 4_800 + BLOCK, NM_END + 4_800 + 16_000 + BLOCK)
+        await h.wait_for(lambda: h.near_misses)
+        await h.actor.close()
+        return h, body, early
+
+    h, body, early = run(main())
+    assert body["streams"] == {"mic": str(NM_MIC), "afe": str(NM_START - 16_000)}
+    assert len(early) == (1 if sends else 0)
+    [(rec, pcm)] = h.near_misses
+    assert pcm == capture_ramp(NM_MIC, NM_END + 4_800).tobytes()
+    if not sends:
+        assert rec.afe_series is None
+        return
+    series = json.loads(rec.afe_series)
+    assert (series["start"], series["support"], series["recording"], series["utterance"]) == (
+        NM_START - 16_000, [NM_START, NM_END], [NM_MIC, NM_END + 4_800], None)
+    assert len(series["frames"]) == -(-(NM_END + 4_800 - (NM_START - 16_000)) // PERIOD)
+    assert None not in series["frames"]
+
+
 @pytest.mark.parametrize("case, status", [
     ("off", "off"), ("muted", "not_permitted"), ("diagnostic", "not_permitted"), ("old_epoch", "failed")])
 def test_a_near_miss_that_cannot_be_recorded_is_persisted_with_why_and_opens_no_lease(case, status):

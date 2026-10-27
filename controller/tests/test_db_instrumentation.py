@@ -387,3 +387,114 @@ def test_the_activity_view_lists_the_newest_rows_of_every_registered_device_by_t
         ("dev2", 3.0), ("dev1", 4.0), ("dev2", 5.0)]
     assert [n.ts for n in db.get_fleet_near_misses(since=3.5)] == [4.0, 5.0]
     assert [(t["device_id"], t["ts"]) for t in db.get_turns("dev1")] == [("dev1", 1.0), ("dev1", 4.0)]
+
+
+def _near_miss_record(ts, peak, recording):
+    return db.NearMissRecord(
+        ts=ts, near_miss_uuid=f"n{ts:g}", profile=db.em_wake_rules.RuleProfile.IDLE, floor=0.17,
+        peak=peak, wake_threshold=0.9, wake_model_sha256=None, duration_ms=800,
+        end_reason=db.NearMissEnd.BELOW, recording=recording)
+
+
+def test_the_filtered_archives_take_confirmed_wakes_and_saved_near_misses_within_the_score_range(
+        fresh_db, tmp_path, monkeypatch):
+    """What the Activity view's two downloads hold: a wake turn's clip unless the wake was
+    refused, a near miss's only once saved; scores inclusive at both ends; one device, or
+    every registered one."""
+    em_session = pytest.importorskip("em_session")
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
+    for dev in ("dev1", "dev2", "gone"):
+        db.register_new_device(dev, "1.2.3.4", None, None)
+
+    def turn(dev, ts, score, reason, *, trigger="wake", clip=True):
+        turn_id = db.insert_turn(dev, {"ts": ts, "trigger": trigger, "wake_score": score, "terminal_reason": reason})
+        if clip:
+            db.set_turn_wake(turn_id, f"{turn_id}.wav")
+        return turn_id
+
+    answered = turn("dev1", 1.0, 0.95, "completed")
+    turn("dev1", 2.0, 0.97, "self_output")                # refused: the Echo's own sound
+    turn("dev1", 3.0, 0.40, "completed")                  # below the range
+    turn("dev1", 4.0, None, "completed", trigger="button")
+    quiet = turn("dev2", 5.0, 0.90, "no_input")           # woke, nothing said: still a confirmed wake
+    turn("dev2", 6.0, 0.93, "completed", clip=False)      # no clip saved
+    legacy = turn("dev1", 7.0, 1.0, None)                 # before terminal reasons: answered
+    turn("gone", 8.0, 0.95, "completed")
+    db.delete_device("gone")
+
+    def wakes(device, lo, hi):
+        return db.get_wake_clip_turns(device, lo, hi, trigger="wake", refused=em_session.REFUSED_WAKES)
+
+    assert wakes(None, 0.9, 1.0) == [("dev1", legacy), ("dev2", quiet), ("dev1", answered)]
+    assert wakes(None, 0.95, 0.95) == [("dev1", answered)]
+    assert wakes("dev2", 0.0, 1.0) == [("dev2", quiet)]
+
+    saved = db.NearMissRecording.SAVED
+    a = db.insert_near_miss("dev1", _near_miss_record(1.0, 0.30, saved))
+    db.insert_near_miss("dev1", _near_miss_record(2.0, 0.35, db.NearMissRecording.FAILED))
+    db.insert_near_miss("dev1", _near_miss_record(3.0, 0.60, saved))
+    b = db.insert_near_miss("dev2", _near_miss_record(4.0, 0.50, saved))
+    assert db.get_near_miss_recordings(None, 0.3, 0.5) == [("dev2", b), ("dev1", a)]
+    assert db.get_near_miss_recordings("dev1", 0.3, 0.5) == [("dev1", a)]
+
+
+def test_a_near_miss_chart_is_read_one_at_a_time_for_its_device_and_kept_for_the_newest_rows(fresh_db, monkeypatch):
+    from dataclasses import replace
+    monkeypatch.setattr(db, "TRACE_RETENTION", 2)
+    ids = [db.insert_near_miss("dev1", replace(_near_miss_record(ts, 0.3, db.NearMissRecording.FAILED),
+                                               afe_series=f'{{"start":{ts:g}}}')) for ts in (1.0, 2.0, 3.0)]
+    other = db.insert_near_miss("dev2", replace(_near_miss_record(4.0, 0.3, db.NearMissRecording.FAILED),
+                                                afe_series='{"start":4}'))
+    assert [db.get_near_miss_afe_series("dev1", i) for i in ids] == [None, '{"start":2}', '{"start":3}']
+    assert db.get_near_miss_afe_series("dev2", other) == '{"start":4}'      # its device's own newest
+    assert db.get_near_miss_afe_series("dev1", other) is None              # another device's row id
+
+
+def test_the_near_miss_archive_streams_a_zip_of_the_matching_recordings_still_on_disk(fresh_db, tmp_path, monkeypatch):
+    """GET /api/near_misses.zip through a real server: a valid zip (written to a stream that
+    cannot seek) of exactly the saved recordings in range, under each device's folder, larger
+    than one ZIP_CHUNK; 404 when none matches, 400 for a bad range."""
+    em_api = pytest.importorskip("em_api")
+    import asyncio
+    import io
+    import zipfile
+
+    from aiohttp import ClientSession, web
+    from aiohttp.test_utils import TestServer
+
+    import em_recordings
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
+    db.register_new_device("dev1", "1.2.3.4", None, None)
+    db.approve_device("dev1", "Kitchen")
+    pcm = {}
+    for ts, peak in ((1.0, 0.3), (2.0, 0.4), (3.0, 0.45), (4.0, 0.9)):
+        row = db.insert_near_miss("dev1", _near_miss_record(ts, peak, db.NearMissRecording.SAVED))
+        pcm[row] = bytes([row]) * 200_000               # 6 s each: two outrun one chunk
+        em_recordings.save("dev1", row, pcm[row], kind=em_recordings.RecordingKind.NEAR_MISS)
+    first, pruned, third, _ = pcm
+    kept = em_recordings.recordings_dir(kind=em_recordings.RecordingKind.NEAR_MISS)
+    (kept / em_recordings.filename("dev1", pruned)).unlink()
+
+    async def main():
+        app = web.Application(middlewares=[em_api._error_middleware])
+        app.router.add_get("/api/near_misses.zip", em_api._get_fleet_near_misses_zip.__wrapped__)
+        server = TestServer(app, host="127.0.0.1")
+        await server.start_server()
+        try:
+            async with ClientSession() as http:
+                async def get(query):
+                    async with http.get(server.make_url(f"/api/near_misses.zip?{query}")) as r:
+                        return r.status, r.headers.get("Content-Disposition"), await r.read()
+                return [await get(q) for q in ("min=0.2&max=0.5", "device=dev1&min=0.5&max=0.8",
+                                               "min=0.6&max=0.5", "max=x")]
+        finally:
+            await server.close()
+
+    (ok, disposition, body), (none, *_), (backwards, *_), (bad, *_) = asyncio.run(main())
+    assert (ok, none, backwards, bad) == (200, 404, 400, 400)
+    assert disposition == 'attachment; filename="echomuse-nearmisses-0.20-0.50.zip"'
+    assert len(body) > em_api.ZIP_CHUNK
+    with zipfile.ZipFile(io.BytesIO(body)) as z:
+        assert z.testzip() is None
+        assert z.namelist() == [f"kitchen/nearmiss{third}.wav", f"kitchen/nearmiss{first}.wav"]
+        assert all(z.read(f"kitchen/nearmiss{row}.wav").endswith(pcm[row]) for row in (first, third))

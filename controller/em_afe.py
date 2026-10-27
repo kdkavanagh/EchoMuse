@@ -333,7 +333,9 @@ class TurnStage(enum.StrEnum):
 
 class AfeSeriesJson(TypedDict):
     """`AfeSeries` on the wire (`turns.afe_series`, GET /api/devices/{id}/turns/{turn}/afe;
-    a recording's `.afe.json`, GET /api/devices/{id}/samples|ambient/{name}/afe).
+    `near_misses.afe_series`, GET /api/devices/{id}/near_misses/{nm}/afe, whose `support` is the
+    near miss's and `recording` its WAV; a recording's `.afe.json`, GET
+    /api/devices/{id}/samples|ambient/{name}/afe).
     Every list has one entry per period, entry i covering samples
     `[start + i·period, start + (i + 1)·period)` — capture samples for a turn,
     the recording's own for a sample clip or ambient recording (AfeTrack).
@@ -468,6 +470,20 @@ def turn_series(store: AfeTimeline, support: tuple[int, int] | None,
     received = {r.start: r for r in store.read(a, b)}
     for r in response.read(a, b) if response is not None else ():
         received.setdefault(r.start, r)
+    return _series(a, b, support, utterance, received)
+
+
+def near_miss_series(store: AfeTimeline, support: tuple[int, int], end: int) -> AfeSeries | None:
+    """A near miss's AfeSeries, its support as the window: from PRE_SAMPLES before the support
+    through `end` (its recording's end). None ("no data") when no period in it was received."""
+    a = max(0, support[0] - PRE_SAMPLES)
+    return _series(a, end, support, None, {r.start: r for r in store.read(a, end)})
+
+
+def _series(a: int, b: int, support: tuple[int, int] | None, utterance: tuple[int, int] | None,
+            received: Mapping[int, AfeRecord]) -> AfeSeries | None:
+    """The periods overlapping capture samples [a, b), each its `received` record (by start
+    sample) or None; None when nothing was received."""
     if not received:
         return None
     first, last = a // AFE_PERIOD_SAMPLES, -(-b // AFE_PERIOD_SAMPLES)
