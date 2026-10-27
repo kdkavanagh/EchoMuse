@@ -39,9 +39,9 @@ from esphome.vendor import api_pb2
 
 log = logging.getLogger("echomuse.esphome.satellite")
 
-# ESPHome native API protocol version this server implements / reports in
-# HelloResponse. linux-voice-assistant reports 1.10 — matching that rather
-# than guessing keeps us behaving like hardware HA already knows how to talk to.
+# This server implements and reports this ESPHome native API protocol version
+# in HelloResponse. linux-voice-assistant reports 1.10 — matching that rather
+# than guessing keeps us behaving like hardware that HA already supports.
 API_VERSION_MAJOR = 1
 API_VERSION_MINOR = 10
 

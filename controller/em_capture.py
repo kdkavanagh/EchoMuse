@@ -3,9 +3,9 @@ em_capture.py — script-driven recording windows, pushed to a webhook
 =====================================================================
 
 Sample collection (`em_samples`) records an unattended room and has to guess
-where the speech is, so it cuts at the silences. This module is for the
-opposite situation: something *else* knows exactly when the audio starts,
-because it is the thing playing it.
+where the speech is, so it cuts at the silences. This module handles the
+opposite situation: something *else* plays the audio, so it can tell exactly
+when the audio starts.
 
 The case it was built for is re-recording a corpus through the device. Common
 Voice on disk is clean studio speech; the same clips played from a media
@@ -191,7 +191,7 @@ class Window:
 
     def overdue(self, now_mono: float | None = None) -> bool:
         """
-        True when the wall clock says this window should have finished.
+        True when this window should have finished based on the wall clock.
 
         Audio time cannot answer this: a device that stops sending frames
         stops advancing `ms`, so a stalled link would hold the window open
@@ -302,7 +302,7 @@ def headers(result: CaptureResult, device_id: str, dropped: int = 0) -> dict[str
     `peak_db` and `floor_db` are the pair that matter operationally. A caller
     driving a long unattended run needs to notice that it has been recording
     silence — because the wrong entity was addressed, or a player was muted —
-    and the two numbers together say so, where either alone does not.
+    and the two numbers show this together, where either alone does not.
     """
     return {
         "Content-Type":   "audio/wav",
@@ -333,9 +333,9 @@ class ResultStore:
 
     Bounded and FIFO: a driver that stops collecting must not grow this
     without limit, and the OLDEST is what gets dropped because the newest is
-    the one somebody is currently waiting for. An eviction is counted — a
-    caller seeing them knows it is falling behind rather than losing
-    recordings to a fault.
+    the one somebody is currently waiting for. An eviction is counted, so a
+    caller can see that it is falling behind rather than losing recordings
+    to a fault.
     """
 
     def __init__(self, limit: int = 8):

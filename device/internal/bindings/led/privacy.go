@@ -15,7 +15,7 @@ import (
 // gpio444's sysfs node never appears under /sys/class/gpio and the LED is
 // the driver's to light.
 //
-// What the source says, matching docs/fireos6-port.md §2's evidence
+// What the source shows, matching docs/fireos6-port.md §2's evidence
 // (device attrs: enable power_button_state privacy_brightness privacy_state
 // privacy_timer_on privacy_trigger shutdown_dialog_state state):
 //   - It toggles its own state on every mute-button release: entering waits
@@ -23,7 +23,7 @@ import (
 //   - Software can ENTER privacy (write 1 to privacy_trigger) and can never
 //     leave it: "ignore exit privacy mode from software". Only the button
 //     unmutes the LED.
-//   - It always boots unmuted, whatever our persisted mute says.
+//   - It always boots unmuted, whatever our persisted mute state shows.
 //
 // Found by name under /sys/devices/soc, never by the keypad's address.
 // Never read power_button_state: it reads a mute GPIO biscuit's device tree

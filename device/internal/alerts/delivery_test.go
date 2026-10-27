@@ -55,7 +55,7 @@ func TestDeltaSequencingAndNeedSnapshot(t *testing.T) {
 	}
 }
 
-// python129 reproduces the controller-side fixture whose digest CPython
+// python129 reproduces the fixture on the controller whose digest CPython
 // computed: 129 occurrences, two per minute, sorted by due then ID.
 func python129() []occSpec {
 	base := int64(1790422200000)

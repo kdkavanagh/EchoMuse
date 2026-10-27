@@ -8,7 +8,7 @@ type state struct {
 	// Delivery position (SPEC §16.4); epoch nil until the first snapshot.
 	epoch *string
 	acked uint64
-	// occ holds the controller-delivered live occurrences by occurrence_id.
+	// occ holds live occurrences that the controller delivered, by occurrence_id.
 	occ map[string]*occurrence
 	// ops holds local operations by op_id: pending upload until result is set,
 	// then kept as protected tombstones until the target is no longer delivered.
@@ -21,8 +21,8 @@ type state struct {
 	// armed stores the due monotonic deadline and boot ID with every armed
 	// occurrence (SPEC §16.5). An entry from another boot is not reused.
 	armed map[string]*armedRecord
-	// rings holds the first-ring time and ring deadline of occurrences that
-	// have started ringing (SPEC §10.3, §16.5).
+	// rings holds the time when occurrences first rang and their deadline
+	// (SPEC §10.3, §16.5).
 	rings map[string]*ringRecord
 	// clock is the trusted UTC anchor of the boot that established it.
 	clock *clockAnchor

@@ -62,7 +62,7 @@ type control struct {
 type Detector struct {
 	cb Callbacks
 
-	// Capture-side state, guarded by ingestMu.
+	// State for capture, guarded by ingestMu.
 	ingestMu  sync.Mutex
 	epoch     uint64
 	haveEpoch bool

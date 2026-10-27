@@ -1,4 +1,4 @@
-"""EchoMuse endpoint-completeness grammar and its authoritative parses (§16.6)."""
+"""The EchoMuse grammar judges endpoint completeness and provides authoritative parses (§16.6)."""
 
 from .alerts import AlarmQuery, TimerCancel, parse_alarm_query, parse_timer_cancel
 from .core import (

@@ -49,7 +49,7 @@ const PollInterval = time.Second
 // Inserted reports whether something is plugged into the jack.
 //
 // Absent hardware reads as NOT inserted rather than as an error, because every
-// caller wants the same thing in that case: leave the speaker amp alone and
+// caller needs the same result in that case: leave the speaker amp alone and
 // behave exactly as a device with no jack always has.
 func Inserted() bool {
 	s, ok := State()

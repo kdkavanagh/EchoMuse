@@ -11,9 +11,9 @@
 // firmware binary also starts on the Dot, where Open is simply never called.
 //
 // Recorder and Player present a BLOCKING API (ReadStamped/Write) although
-// OpenSL ES is callback-driven: buffer-queue completions fire on a thread
-// OpenSL ES owns, not one Go created. That keeps slmic a read loop and
-// slspeaker a pump, and all bridging between the two models lives here.
+// OpenSL ES calls back when buffer queues complete, on a thread it owns rather
+// than one Go created. That keeps slmic a read loop and slspeaker a pump, and
+// all bridging between the two models lives here.
 package opensl
 
 /*
@@ -160,9 +160,10 @@ type Recorder struct {
 	bufBytes int
 
 	// inflight is the FIFO of slots enqueued with OpenSL ES, in enqueue
-	// order: the prime order, then each re-enqueue in onComplete. A simple
-	// buffer queue completes in enqueue order, so popping it names the slot
-	// each completion filled without OpenSL ES saying so.
+	// order: first the order in which slots are primed, then each re-enqueue
+	// in onComplete. A simple buffer queue completes in enqueue order, so
+	// popping it names the slot each completion filled without OpenSL ES
+	// saying so.
 	inflight chan int
 	frames   chan frame
 	free     chan []byte

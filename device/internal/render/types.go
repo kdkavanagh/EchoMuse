@@ -32,7 +32,7 @@ const (
 	primeFrames = PrimeWrites * SinkFrames
 )
 
-// Active-source mask bits of the final mix (SPEC §16.1).
+// Mask bits identify active sources in the final mix (SPEC §16.1).
 const (
 	MaskContent uint8 = 1
 	MaskAlert   uint8 = 2
@@ -113,16 +113,17 @@ type Sink interface {
 	Close() error
 }
 
-// PullSource is a device-local source the mixer pulls each 480-sample 48 kHz block.
-// Fill writes len(dst) samples (silence where it has none) and reports whether the
-// source is currently audible (its bit in the active-source mask). Called only from
-// the mixer goroutine; must not block or allocate.
+// PullSource is a source on the device that the mixer pulls each 480-sample
+// 48 kHz block. Fill writes len(dst) samples (silence where it has none) and
+// reports whether the source is currently audible (its bit in the active-source
+// mask). Called only from the mixer goroutine; must not block or allocate.
 type PullSource interface {
 	Fill(dst []int16) (active bool)
 }
 
-// MixBlock is one final-mix block handed to the sink. PCM is borrowed for the
-// duration of the tap call. Mask: content=1 alert=2 dialog=4 earcon=8.
+// MixBlock is one block from the final mix that the sink receives. PCM is
+// borrowed for the duration of the tap call. Mask: content=1 alert=2 dialog=4
+// earcon=8.
 type MixBlock struct {
 	First uint64 // render-epoch 48 kHz index of PCM[0]
 	PCM   []int16
@@ -140,12 +141,12 @@ type Playback struct {
 	PCM        []int16
 }
 
-// Progress is a render.progress body. Frame counts are this playback's source
-// frames handed to the sink and completed by it. MonoNS anchors the render
-// epoch's completed frontier. MissingFrom/MissingTo (render-epoch frames,
-// half-open) are meaningful only for EventUnderrun; GainDB only for EventGain.
-// Local marks a device-originated playback (Mixer.StartLocal), which the
-// controller never started and is not told about.
+// Progress is a render.progress body. Frame counts are source frames from this
+// playback that the sink completed. MonoNS anchors the completed frontier of
+// the render epoch. MissingFrom/MissingTo (render-epoch frames, half-open) are
+// meaningful only for EventUnderrun; GainDB only for EventGain. Local marks a
+// playback the device started (Mixer.StartLocal), which the controller did not
+// start and does not hear about.
 type Progress struct {
 	PlaybackID        string
 	Generation        uint32
@@ -163,7 +164,7 @@ type Progress struct {
 }
 
 // Finished is a render.finished body. LastCompletedFrame is the exclusive
-// completed source-frame frontier. Local is as for Progress.
+// frontier of completed source frames. Local is as for Progress.
 type Finished struct {
 	PlaybackID         string
 	Generation         uint32
@@ -173,7 +174,7 @@ type Finished struct {
 	TimingQuality      TimingQuality
 }
 
-// Anchor relates the render epoch's completed frontier to CLOCK_MONOTONIC.
+// Anchor relates the completed frontier of the render epoch to CLOCK_MONOTONIC.
 type Anchor struct {
 	Epoch          uint64
 	CompletedFrame uint64 // exclusive render-epoch frame
@@ -191,7 +192,7 @@ type Hooks struct {
 	Epoch    func(epoch uint64)
 }
 
-// Ramp selects the gain-ramp length of a transition.
+// Ramp selects how long a gain transition takes.
 type Ramp uint8
 
 const (

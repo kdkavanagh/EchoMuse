@@ -22,7 +22,7 @@
 // and where that frame ended (Anchor): a capture path without a timestamp
 // of its own (OpenSL on the Show) stamps its periods from it.
 //
-// No cgo and no build tag: host-testable. Decode never allocates.
+// It has no cgo or build tag, so host tests can use it. Decode never allocates.
 package afe
 
 import (

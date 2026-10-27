@@ -1,7 +1,7 @@
 """
-The device-link auth decision, as a pure function.
+This module decides whether to admit a device link, as a pure function.
 
-Split out of the controller's link-auth check so it can be tested. Its callers
+It was split out of the controller's link-auth check so it can be tested. Its callers
 (`em_device.register_device` for the device link,
 `em_controller._shell_auth_ok` for the shell plane) add a websocket header
 read, a DB lookup and a log call; the part worth getting right is the four-way

@@ -103,13 +103,12 @@ func (s *Supervisor) Hello() proto.SessionHello {
 // Ready implements client.Handler.
 func (s *Supervisor) Ready(sess *client.Session, r proto.SessionReady) { s.ready(sess, r) }
 
-// ready publishes the session, announces the current stream epochs,
-// uploads pending local alert operations before anything else alert-related
-// (§10.6 step 5), reports alert.state, and activates the named speech
-// assets. capture_permitted=false changes nothing on the device: the
-// controller refuses candidates itself. The session carries the afe stream
-// only when the controller opted in to the afe_metadata_v1 this device's
-// hello announced.
+// ready publishes the session, announces the current stream epochs, uploads
+// pending local alert operations before anything else concerning alerts
+// (§10.6 step 5), reports alert.state, and activates the named speech assets.
+// capture_permitted=false changes nothing on the device: the controller
+// refuses candidates itself. The session carries the afe stream only when the
+// controller opted in to the afe_metadata_v1 this device's hello announced.
 func (s *Supervisor) ready(sess Session, r proto.SessionReady) {
 	ctx, cancel := context.WithCancel(context.Background())
 	afe := r.AFEMetadata && s.afe.hello.Load()

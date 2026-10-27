@@ -77,7 +77,7 @@ func newSession(parent context.Context, l *Link, id, controller string, ctrl, au
 	return s
 }
 
-// ID is the controller-assigned session ID.
+// ID is the session ID that the controller assigned.
 func (s *Session) ID() string { return s.id }
 
 // Controller is the host:port the session's sockets were dialled at.

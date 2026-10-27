@@ -17,10 +17,11 @@ import (
 	"github.com/wilbowes/EchoMuse/internal/render"
 )
 
-// onTap receives every final-mix block before sink output (§4.3): it
-// records the active-source mask for cells and producing_sound, decimates
-// into the 16 kHz reference ring (§16.1 FIR; all-zero output marked digital
-// silence), and drives the LED meter level. Mixer goroutine; allocation-free.
+// onTap receives every block from the final mix before sink output (§4.3): it
+// records the mask of active sources for cells and producing_sound, decimates
+// into the 16 kHz reference ring (§16.1 FIR; output containing only zeros is
+// marked digital silence), and drives the LED meter level. It runs on the
+// mixer goroutine and does not allocate.
 func (s *Supervisor) onTap(b render.MixBlock) {
 	s.masks.Record(b.First, len(b.PCM), b.Mask)
 	s.lastMask.Store(uint32(b.Mask))
@@ -97,9 +98,9 @@ func (s *Supervisor) openReferenceStreamLocked() {
 		Kind: uint8(ema.KindReference), SampleRate: ema.RateCapture, Format: uint8(ema.FormatPCM16), Reason: s.refReason})
 }
 
-// onProgress forwards render.progress (generation in the envelope) and
-// tells focus when dialog output becomes audible. Device-local playbacks
-// are not the controller's and are not reported.
+// onProgress forwards render.progress (generation in the envelope) and tells
+// focus when dialog output becomes audible. Playbacks the device started are
+// not the controller's and are not reported.
 func (s *Supervisor) onProgress(p render.Progress) {
 	if p.Local {
 		return
@@ -129,8 +130,8 @@ func (s *Supervisor) onProgress(p render.Progress) {
 	s.logSend(proto.TypeRenderProgress, p.Generation, body)
 }
 
-// onFinished forwards render.finished and releases dialog-output focus.
-// Device-local playbacks are not reported; the offline notice's end (or
+// onFinished forwards render.finished and releases focus for dialog output.
+// Playbacks the device started are not reported; the offline notice's end (or
 // replacement) re-arms it.
 func (s *Supervisor) onFinished(f render.Finished) {
 	if f.Local {
@@ -241,9 +242,10 @@ func (s *Supervisor) renderCancel(env proto.Envelope) {
 	s.ack(env, proto.AckAccepted, "")
 }
 
-// RenderAudio pumps a validated kind-3 packet into its network playback.
-// A packet for an old generation, unknown epoch or ended playback is late
-// and dropped (§3.2 invariant 3). Audio receive goroutine; allocation-free.
+// RenderAudio pumps a validated kind-3 packet into its network playback. A
+// packet for an old generation, unknown epoch or ended playback is late and
+// dropped (§3.2 invariant 3). It runs on the audio receive goroutine and does
+// not allocate.
 func (s *Supervisor) RenderAudio(h ema.Header, pcm []byte) {
 	n := len(pcm) / 2
 	if n > len(s.renderPCM) {
@@ -314,9 +316,9 @@ func (s *Supervisor) applyFocus(out focus.Output) {
 	s.ex.SetBackground(out.AlertBackground)
 }
 
-// focusLeaseExpired clears controller-driven dialog LEDs once the last
-// dialog lease has lapsed (§11.2: remote dialog indicators have leases),
-// and the companion's cancel zone with them.
+// focusLeaseExpired clears dialog LEDs that the controller drives once the
+// last dialog lease has lapsed (§11.2: remote dialog indicators have leases),
+// and clears the companion's cancel zone with them.
 func (s *Supervisor) focusLeaseExpired(l focus.Lease) {
 	s.mu.Lock()
 	delete(s.leases, l.ID)

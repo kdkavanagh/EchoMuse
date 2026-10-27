@@ -18,7 +18,7 @@ const (
 	PeriodNs      = PeriodSamples * SampleNs // 80 ms
 )
 
-// Reason says why an epoch started; values are the WIRE stream.open reasons.
+// Reason identifies why an epoch started; values are the WIRE stream.open reasons.
 type Reason string
 
 const (

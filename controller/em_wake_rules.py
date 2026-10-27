@@ -1,4 +1,4 @@
-"""Wake candidate open rules and shadow-rule reports (SPEC §5.2, WIRE §4.1/§4.4).
+"""Wake candidate open rules and reports about shadow rules (SPEC §5.2, WIRE §4.1/§4.4).
 
 A device announcing `open_rules_v1` opens a wake candidate when any of its
 live open rules fires and evaluates shadow rules it never acts on. The

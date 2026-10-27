@@ -137,8 +137,8 @@ func TestReframerRealByteRate(t *testing.T) {
 }
 
 func TestReframerResetDropsPartialPeriod(t *testing.T) {
-	// A gap (stream re-open) must discard whatever partial period was
-	// in flight, not splice pre-gap bytes onto post-gap bytes.
+	// When a stream opens again, the reframer must discard any partial period in flight,
+	// not splice bytes from before the gap onto bytes from after it.
 	f := newReframer(10, 4, 1e9)
 	var got [][]byte
 	var stamps []int64
@@ -163,10 +163,10 @@ func TestReframerResetDropsPartialPeriod(t *testing.T) {
 }
 
 func TestReframerDroppedPeriodSlotIsReusedNotRotated(t *testing.T) {
-	// When emit declines to retain (its consumer's queue is full), the
-	// SAME pool buffer must be reused for the next period, not rotated —
-	// otherwise a retained-but-still-unread earlier period could be
-	// silently overwritten once the pool wraps around.
+	// When emit declines to retain a period because its consumer's queue is
+	// full, the SAME pool buffer must be reused for the next period, not
+	// rotated — otherwise a retained earlier period that is still unread could
+	// be silently overwritten once the pool wraps around.
 	f := newReframer(4, 2, 1e9) // pool of exactly 2 buffers
 	var retained [][]byte
 
@@ -175,9 +175,9 @@ func TestReframerDroppedPeriodSlotIsReusedNotRotated(t *testing.T) {
 		retained = append(retained, p) // keep the ACTUAL slice, not a copy
 		return true
 	})
-	// Period B: dropped (does not rotate; buffer 1 is reused next, not
-	// buffer 0 — if it rotated to buffer 0, period A's still-referenced
-	// bytes would be clobbered by period C below).
+	// Period B: dropped (does not rotate; buffer 1 is reused next, not buffer
+	// 0 — if it rotated to buffer 0, period A's bytes, which are still
+	// referenced, would be clobbered by period C below).
 	f.add(seq(10, 4), 2, func(p []byte, ns int64) bool { return false })
 	// Period C: retained. If the dropped period B had wrongly rotated the
 	// pool back to buffer 0, this would alias and corrupt period A's slice.
@@ -198,10 +198,9 @@ func TestReframerDroppedPeriodSlotIsReusedNotRotated(t *testing.T) {
 }
 
 func TestReframerPoolCyclesIndependentBuffersWithinWindow(t *testing.T) {
-	// Within one pool-size's worth of retained periods, every returned
-	// slice must be backed by a distinct array (no aliasing) — this is
-	// what lets the pump hand a period straight to a channel without an
-	// extra per-period allocation.
+	// Before the pool wraps, every returned slice must use a distinct backing
+	// array (no aliasing). That lets the pump hand a period straight to a
+	// channel without allocating for each period.
 	const poolSize = 4
 	f := newReframer(4, poolSize, 1e9)
 	var slices [][]byte

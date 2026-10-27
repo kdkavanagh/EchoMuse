@@ -177,8 +177,8 @@ def test_admission_refuses_a_hello_naming_no_platform(caplog):
 
 # What each image's current firmware announces (decisions 6 and 7 of the
 # Echo Show port plan, §3 of the LineageOS plan, decision 8 of the companion
-# plan), a Dot on firmware predating the Dot-only three, and a LineageOS Show
-# on firmware predating the companion app, which announced the Fire OS set.
+# plan), a Dot on firmware that predates the three capabilities only a Dot has,
+# and a LineageOS Show on firmware that predates the companion app, which announced the Fire OS set.
 DOT = ALL_V1 + ["leds", "led_anim", "buttons", "button_hold", "alert_prefetch",
                 "local_wake_chime", "open_rules_v1", "ambient_light", "afe_metadata_v1",
                 "near_miss_v1", "wifi_control", "ble_proxy", "privacy_mute"]
@@ -241,7 +241,7 @@ DOT_GAPS = {"screen_wake": NO_SCREEN, "screen_overlay": NO_SCREEN, "turn_view_v1
     *((platform, [c for c in caps if c != "near_miss_v1"], {**gaps, "near_miss_v1": UPDATE})
       for platform, caps, gaps in (("fireos6", DOT, DOT_GAPS), ("fireos6_crown", FIREOS_SHOW, FIREOS_SHOW_GAPS),
                                    ("lineage18_crown", LINEAGE_SHOW, SHOW_GAPS))),
-    # Absent elsewhere, the dashboard's own per-capability reason applies.
+    # Absent elsewhere, the dashboard's own reason for that capability applies.
     ("fireos6", [c for c in DOT if c != "led_anim"], DOT_GAPS),
 ])
 def test_capability_gaps_name_the_reason_the_platform_gives(platform, caps, gaps):

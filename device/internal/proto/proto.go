@@ -101,10 +101,9 @@ const (
 	// reports privacy state (the Dot; deferred on the Show, which reports
 	// privacy.muted false).
 	CapPrivacyMute Capability = "privacy_mute"
-	// CapScreenWake: on wake-candidate open the device lights the kiosk
+	// CapScreenWake: when a wake candidate opens, the device lights the kiosk
 	// screen when config screenWake is on (the Show): through Fully Kiosk's
-	// local REST API, or through the companion app on a screen_overlay
-	// device.
+	// local REST API, or through the companion app on a screen_overlay device.
 	CapScreenWake Capability = "screen_wake"
 	// CapScreenOverlay: the device keeps the EchoMuse companion app running
 	// as a light bar over the kiosk, painting the composited ring there and
@@ -426,7 +425,7 @@ const (
 	StreamAFE       StreamID = "afe" // afe_metadata_v1 sessions only
 )
 
-// StreamReason says why a stream epoch opened or ended.
+// StreamReason gives the reason a stream epoch opened or ended.
 type StreamReason string
 
 // Stream open/end reasons.

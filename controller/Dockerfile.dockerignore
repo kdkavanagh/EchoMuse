@@ -11,8 +11,8 @@
 !device/internal/
 !device/pkg/
 !device/companion/
-# Go tests are not firmware: kept out so they neither rebuild it nor move its
-# source-hash version. device/companion/test stays in: the companion stage
+# Go tests are not firmware: kept out so they neither rebuild it nor move the
+# version based on its source hash. device/companion/test stays in: the companion stage
 # runs those tests, and they are part of the app's version.
 device/**/*_test.go
 device/**/testdata

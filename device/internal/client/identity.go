@@ -24,9 +24,9 @@ func GetSerialNo() string {
 	return serial
 }
 
-// LocalIP returns the address of the interface that routes off-host, or ""
-// when there is none. It is resolved on every call because a Wi-Fi change
-// moves it.
+// LocalIP returns the address of the interface that routes away from this
+// host, or "" when there is none. It is resolved on every call because a
+// Wi-Fi change moves it.
 func LocalIP() string {
 	conn, err := net.Dial("udp", "8.8.8.8:80")
 	if err != nil {

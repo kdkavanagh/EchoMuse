@@ -327,7 +327,7 @@ class TimerCopy:
 class ActiveRing:
     """`alert.state.active` (WIRE §4.7): what rings on the device now."""
     id: str
-    kind: RingKind | None           # None: a kind this controller does not know
+    kind: RingKind | None           # None: a kind this controller does not recognise
     name: str
 
     @classmethod

@@ -13,8 +13,8 @@ import (
 	"github.com/wilbowes/EchoMuse/internal/wakeword/detector"
 )
 
-// localChimePrefix names the device-local wake chime's playback; the
-// mixer marks it Local, so it is never reported.
+// localChimePrefix names the wake chime's playback on the device; the mixer
+// marks it Local, so it is never reported.
 const localChimePrefix = "local-wake-chime:"
 
 // offlineNoticePrefix names the offline notice's (local, unreported) playback.

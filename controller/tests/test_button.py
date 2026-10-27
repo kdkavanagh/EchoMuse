@@ -25,7 +25,7 @@ def decide(held_ms=0, muted=False, turn_active=False, tap_event=False,
 # ── The mute rule ────────────────────────────────────────────────────────────
 
 def test_hold_fires_while_muted():
-    """A hold is not speech, so the mute has no opinion about it."""
+    """A hold is not speech, so the mute does not affect it."""
     assert decide(held_ms=800, muted=True) == em_button.ButtonAction.HOLD
 
 

@@ -71,7 +71,7 @@ type playback struct {
 	started  bool
 	paused   bool
 	starving bool
-	// missingFrom is the render-epoch frame where the current starvation began.
+	// missingFrom is the frame in the render epoch where the current starvation began.
 	missingFrom uint64
 	appliedDB   float64
 	gain        gainRamp
@@ -277,11 +277,11 @@ func (m *Mixer) Start(v Playback) error {
 	return m.start(v, false)
 }
 
-// StartLocal begins a device-originated local playback (no render.start
-// behind it) at the class's current generation fence, which it neither
-// raises nor can be refused by: the controller's next start at that
-// generation or newer still replaces it. Its Progress and Finished carry
-// Local, so they are never reported as controller playbacks.
+// StartLocal begins local playback that the device started (no render.start
+// behind it) at the class's current generation fence, which it neither raises
+// nor can be refused by: the controller's next start at that generation or
+// newer still replaces it. Its Progress and Finished carry Local, so they are
+// never reported as controller playbacks.
 func (m *Mixer) StartLocal(id string, class SourceClass, pcm []int16, gainDB float64) error {
 	if class.Network() {
 		return ErrInvalidClass
@@ -440,7 +440,7 @@ func (m *Mixer) EndSession() {
 	m.flush()
 }
 
-// SetPolicy applies a focus decision with per-sample ramps.
+// SetPolicy applies a focus decision with ramps for each sample.
 func (m *Mixer) SetPolicy(pol Policy) {
 	m.mu.Lock()
 	m.policy = pol

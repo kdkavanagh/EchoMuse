@@ -60,8 +60,8 @@
  * summarizes that window for both streams: how often getTimestamp succeeded,
  * the rate implied by the distinct (framePosition, timeNanos) pairs and by
  * the call returns, the completion lag of each read (its return less the
- * timestamp-derived capture time of its last frame) or the lead of each write
- * (the timestamp-derived playout time of its last frame less its return), and
+ * capture time its timestamp gives for its last frame) or the lead of each write
+ * (the playout time its timestamp gives for its last frame less its return), and
  * the capture frame at which stimulus frame 0 plays.
  *
  * Build: device/tools/build_tools.sh (NDK 21.4, armv7a-linux-androideabi30,
@@ -331,7 +331,7 @@ static void put_stamp(FILE *f, const struct stamp *s) {
 		(long long)s->tns, s->xruns);
 }
 
-/* lead_ns: the timestamp-derived time of the stamp's last frame less the
+/* lead_ns: the time the timestamp gives for the stamp's last frame less the
  * call's return. Capture: minus the completion lag; render: the write lead. */
 static double lead_ns(const struct stamp *s, int rate) {
 	return (double)(s->tns - s->ns) + (double)(s->last - s->pos) * 1e9 / rate;

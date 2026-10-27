@@ -120,8 +120,9 @@ class Shell:
         """Append one block to dest as base64 lines inside a heredoc.
 
         Every line is short (76 chars) because the PTY's canonical-mode line
-        limit mangles anything near 4096 — the failure that made a chunk-per-
-        command version of this write nothing at all while looking fine.
+        limit mangles anything near 4096 — the failure that made an earlier
+        version, which sent one chunk per command, write nothing at all while
+        looking fine.
         """
         self.buf.clear()
         await self.send(f"base64 -d << '{DELIM}' >> {dest}\n")

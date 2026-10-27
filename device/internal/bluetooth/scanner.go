@@ -31,7 +31,7 @@ const (
 	// or a firmware wedge stopped the scan. Re-init is cheap.
 	watchdogQuiet = 30 * time.Second
 
-	// Unique-address window for the stats gauge.
+	// Window over which the stats gauge counts unique addresses.
 	uniqueWindow = 5 * time.Minute
 )
 
@@ -51,7 +51,7 @@ type Stats struct {
 // Called from the scanner's flush goroutine; must not block for long.
 type BatchCallback func([]Advert)
 
-// Scanner owns the /dev/stpbt transport and the passive-scan lifecycle.
+// Scanner owns the /dev/stpbt transport and manages the passive scan's lifecycle.
 // SetEnabled(true/false) follows the controller's bleProxyEnabled config;
 // the run loop keeps the scan alive (with backoff + watchdog re-init)
 // until disabled.
@@ -238,10 +238,10 @@ func (s *Scanner) session(stopCh chan struct{}) error {
 		s.bdAddr = formatBdAddr(cc.params)
 		s.bdAddrMu.Unlock()
 	}
-	// 320/30 = ~9% radio duty, the standard passive-scan cadence (matches
+	// 320/30 = ~9% radio duty, the standard passive scan cadence (matches
 	// ESPHome's esp32_ble_tracker default). The original 100/50 (50% duty)
 	// caught ~7x the advert volume and starved this SoC's audio+control
-	// goroutines into WS ping-timeout disconnects (2026-07-12).
+	// goroutines until WS ping timeouts disconnected them (2026-07-12).
 	intervalMs := envIntDefault("BLE_SCAN_INTERVAL_MS", 320)
 	windowMs := envIntDefault("BLE_SCAN_WINDOW_MS", 30)
 	if _, err := sendCmd(opLESetScanParams, scanParams(intervalMs, windowMs)); err != nil {
@@ -317,7 +317,7 @@ func (s *Scanner) flush() {
 	for _, a := range s.pending {
 		batch = append(batch, a)
 	}
-	// Reuse the map — clear rather than reallocate (steady-state hot path).
+	// Reuse the map — clear it rather than reallocate it on the steady-state hot path.
 	for k := range s.pending {
 		delete(s.pending, k)
 	}

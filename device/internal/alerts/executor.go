@@ -23,8 +23,8 @@ const (
 	// catchUpMs: an unrung occurrence more than 30 min past due expires as
 	// missed instead of ringing (SPEC §10.7).
 	catchUpMs = int64(30 * time.Minute / time.Millisecond)
-	// pollInterval bounds the scheduling part of due-to-audible latency
-	// (SPEC §13.1: p95 <=250 ms).
+	// pollInterval bounds the scheduling part of the latency from due time to
+	// audible output (SPEC §13.1: p95 <=250 ms).
 	pollInterval = 50 * time.Millisecond
 	// persistRetryNs spaces retries of operations whose persistence failed.
 	persistRetryNs = int64(5 * time.Second)
@@ -75,7 +75,7 @@ const (
 	reasonMissed   ExpireReason = "missed"
 )
 
-// Source says who requested a local operation (WIRE alert.local_operation).
+// Source identifies who requested a local operation (WIRE alert.local_operation).
 type Source string
 
 const (
@@ -149,7 +149,7 @@ const (
 	wakeupUnavailable Wakeup = "alarm_wakeup_unavailable"
 )
 
-// EventSink receives executor-originated events. Methods are called from the
+// EventSink receives events from the executor. Methods are called from the
 // goroutine running Run/Poll, never with the executor's lock held, and must
 // not block for long.
 type EventSink interface {
@@ -710,7 +710,7 @@ func (e *Executor) assetPath(sha string) string {
 }
 
 // armedLocked lists every occurrence that may still ring: delivered or local
-// children not tombstoned by a local operation, plus in-memory snooze children
+// children not tombstoned by a local operation, plus snooze children in memory
 // whose persistence failed and that no delivered copy has superseded.
 func (e *Executor) armedLocked() []*occurrence {
 	var out []*occurrence

@@ -9,14 +9,13 @@
 // Open with an error rather than the binary at load.
 //
 // Both Recorder and Player present a BLOCKING ReadStamped/Write shape, so
-// slmic/slspeaker stay a read loop and a pump loop rather than making every
-// caller callback-shaped. libmixerAPI has no completion callback this
-// package uses (see "C prototypes" below for why); instead every
-// stream owns a goroutine, locked to one OS thread for the stream's whole
-// lifetime via runtime.LockOSThread, that makes every blocking library
-// call and bridges it to Go's channel-based API — libmixerAPI's thread
-// affinity is undemonstrated either way, so one goroutine per handle is the
-// conservative default per the port plan.
+// slmic/slspeaker stay a read loop and a pump loop rather than making callers
+// use callbacks. libmixerAPI has no completion callback this package uses (see
+// "C prototypes" below for why); instead every stream owns a goroutine, locked
+// to one OS thread for the stream's whole lifetime via runtime.LockOSThread,
+// that makes every blocking library call and bridges it to Go's channel API —
+// libmixerAPI's thread affinity is undemonstrated either way, so one goroutine
+// per handle is the conservative default per the port plan.
 //
 // # C prototypes
 //
@@ -37,7 +36,7 @@
 //
 // MixerOpenPlay is MixerOpenPlayAdv(rate, ch, bits, 0, type): mode 0
 // (PLAYBACK_MODE_MUSIC) and a stream type name, which is also the mixer's
-// volume class. The type sizes the client-side block queue (constants in
+// volume class. The type sizes the block queue on the client (constants in
 // MixerOpenPlayAdv): "Voip" 4 × 50 ms, "LineIn" 8 × 8 ms, "WHA" 64 × 16 ms,
 // anything else, NULL included, 16 × 50 ms. Player opens the default
 // "Music": "Voip" is a volume class of its own and the mixer special-cases
@@ -78,18 +77,18 @@
 //
 // # Capture clock domain
 //
-// MixerGetBufRecTimed's ts is CLOCK_MONOTONIC-equivalent on this device:
+// MixerGetBufRecTimed's ts is equivalent to CLOCK_MONOTONIC on this device:
 // comparing it against clock_gettime(CLOCK_MONOTONIC) and
 // clock_gettime(CLOCK_BOOTTIME) taken immediately after each successful
 // read shows ts in the SAME numeric range as both (not a separate epoch),
-// with a stable local-minus-ts gap of roughly 72-78ms across consecutive
-// reads — i.e. ts tracks the local monotonic clock with a slowly-varying
-// processing/IPC latency offset, not a jump or a different epoch. So ts is
-// used directly as each native block's end time (reframe.go backdates each
-// period from it). Whether ts marks a block's first or last sample could not be told
-// apart (16 ms blocks); playclock.go's constant was measured against ts
-// read as the end, the conservative reading for them. micRaw, by contrast,
-// returns ts=0 and is not used.
+// with a stable gap of roughly 72-78ms between local time and ts across
+// consecutive reads — i.e. ts tracks the local monotonic clock with a
+// processing/IPC latency offset that changes slowly, not a jump or a different
+// epoch. So ts is used directly as each native block's end time (reframe.go
+// backdates each period from it). Whether ts marks a block's first or last
+// sample could not be told apart (16 ms blocks); playclock.go's constant was
+// measured against ts read as the end, the conservative reading for them.
+// micRaw, by contrast, returns ts=0 and is not used.
 //
 // # Backpressure and render timing
 //
@@ -110,16 +109,15 @@
 // The mixer hands back exactly MixerGetBufSize(h) bytes per Get/Release
 // round-trip for playback (measured 4800 bytes = 50ms at 48kHz mono, stable
 // across every spike run) — but NOT for capture, where MixerGetBufSize
-// returned 3200 (apparently some other stream-wide figure) while actual
-// per-read blocks were consistently 512 bytes (16ms) for micAsr. So Player
-// trusts MixerGetBufSize (confirmed to equal its actual per-transfer size);
-// Recorder does not assume any fixed block size at all and re-frames
-// whatever size each read actually returns (reframe.go handles any size,
-// including ones that do not divide the period evenly). slmic/slspeaker
-// re-frame across this native-size boundary: capture accumulates native
-// blocks into 1,280-frame (80ms) periods; render accumulates
-// render.SinkFrames-sized writes into whatever native chunk size Open
-// measured.
+// returned 3200 (apparently some other figure for the whole stream) while
+// blocks returned by each read were consistently 512 bytes (16ms) for micAsr.
+// So Player trusts MixerGetBufSize (confirmed to equal its actual
+// per-transfer size); Recorder does not assume any fixed block size at all and
+// re-frames whatever size each read actually returns (reframe.go handles any
+// size, including ones that do not divide the period evenly). slmic/slspeaker
+// re-frame across this native-size boundary: capture accumulates native blocks
+// into 1,280-frame (80ms) periods; render accumulates render.SinkFrames-sized
+// writes into whatever native chunk size Open measured.
 //
 // # Wall-clock steps
 //
@@ -300,9 +298,9 @@ const recQueueDepth = 16
 // it reads 16000 by close), so the value at open cannot be trusted.
 const recByteRate = 16000 * 2
 
-// NewRecorder re-frames streamName's native blocks (e.g. "micAsr") into
-// fixed periodFrames-sample mono periods. The stream is opened once start
-// is closed (see the package doc's "Wall-clock steps"); until then, and
+// NewRecorder re-frames streamName's native blocks (e.g. "micAsr") into mono
+// periods that each contain periodFrames samples. The stream is opened once
+// start is closed (see the package doc's "Wall-clock steps"); until then, and
 // while an open fails and is retried, ReadStamped just waits.
 func (l *Lib) NewRecorder(streamName string, periodFrames int, start <-chan struct{}) (*Recorder, error) {
 	if err := checkGID(); err != nil {
@@ -570,8 +568,8 @@ func (l *Lib) NewPlayer(rateHz, ch, bits int, maxWriteBytes int) (*Player, error
 	return p, nil
 }
 
-// SetOnComplete installs the per-buffer completion callback. It must be set
-// before the first Write and must return immediately.
+// SetOnComplete installs the completion callback for each buffer. It must be
+// set before the first Write and must return immediately.
 func (p *Player) SetOnComplete(fn func(monoNs int64)) { p.onComplete.Store(&fn) }
 
 // Write copies data into the pending accumulator, first blocking while a

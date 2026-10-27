@@ -4,10 +4,10 @@ name: "EchoMuse"
 # both together: Supervisor pulls `image:version`, so a version with no
 # matching tag on GHCR fails to install.
 version: "2.19.0"
-# Pull the published multi-arch image rather than building on the user's
+# Pull the published image for multiple architectures rather than building on the user's
 # machine. Without this Supervisor builds from this directory's Dockerfile,
 # which compiles onnxruntime and ffmpeg on whatever the user runs Home
-# Assistant on — long and failure-prone on a Pi, and it cannot pass the
+# Assistant on — long and prone to failure on a Pi, and it cannot pass the
 # EM_CONTROLLER_VERSION build arg, so the controller reports "dev" and the
 # update notice goes quiet. controller-release.yml already publishes
 # linux/amd64 and linux/arm64, matching the arch list below.
@@ -19,8 +19,8 @@ init: false
 arch:
   - aarch64
   - amd64
-# Required for mDNS controller discovery and the per-device ESPHome native
-# API listeners (one TCP port per device, 16001+) — same reason the
+# Required for mDNS controller discovery and the native ESPHome API listener
+# for each device (one TCP port per device, 16001+) — the same reason the
 # docker-compose deployment sets network_mode: host. Without it, devices on
 # the LAN cannot find or connect to the controller.
 host_network: true

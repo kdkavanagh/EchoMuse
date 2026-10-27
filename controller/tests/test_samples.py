@@ -6,7 +6,7 @@ Two halves, both pure: the segmenter (frames in, clips out) and the storage
 
   * a clip carries the audio from BEFORE the level crossed — a wake word's
     onset is its quietest part, and a training set of clips missing their
-    first phoneme teaches the model to want a word nobody says
+    first phoneme teaches the model to listen for a word nobody says
   * the thresholds are relative to a tracked noise floor, so the same config
     works in a quiet study and a loud kitchen — and a room of digital
     silence (a muted device) does not read as continuous speech

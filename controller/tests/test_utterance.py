@@ -165,7 +165,7 @@ def test_local_grammar_class_is_never_replaced_by_ha():
         after_block(block_end)
         u.recognized("turn on the kitchen", GrammarClass.COMPLETE, ms=30)
     decisions = drive(u, speech_between((4_608, 11_000)), words, 60_000, after_block=answer_complete_anyway)
-    assert "turn on the kitchen" not in asked             # the local grammar knows it: HA is not asked
+    assert "turn on the kitchen" not in asked        # the local grammar already covers it: HA is not asked
     commit = decisions[-1]
     assert isinstance(commit, Commit) and commit.completeness == "extendable"
     assert commit.decided_at - commit.boundary >= 19_456  # the 1,216 ms pause still applies

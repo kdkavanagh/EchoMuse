@@ -1,4 +1,4 @@
-// Package config holds the controller-tunable device settings carried by the
+// Package config holds device settings that the controller can tune, carried by the
 // retained `config` message (WIRE §4.8): startupVolume, duckDb,
 // bleProxyEnabled, wakeSound, for screen_wake devices screenWake,
 // screenWakeUrl and screenWakePassword, for kiosk_plugin devices kioskToken

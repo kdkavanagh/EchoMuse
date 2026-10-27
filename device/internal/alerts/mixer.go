@@ -10,7 +10,7 @@ const (
 	stopStep  = focusFull / (10 * sampleRate / 1000)
 )
 
-// voice is an immutable description of the ring the executor wants audible.
+// voice is an immutable description of the ring that should be audible.
 type voice struct {
 	id  string
 	pcm []int16

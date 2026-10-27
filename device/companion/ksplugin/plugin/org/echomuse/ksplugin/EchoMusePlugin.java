@@ -28,9 +28,9 @@ import org.echomuse.companion.Link;
  * The EchoMuse turn and timer views inside Kiosk Satellite
  * (docs/echo-show-companion-plan.md §11). The firmware installs it and keeps
  * it current (decision 2); it holds the local link, role {@code plugin}
- * (§11.3), draws each turn the controller's turn.view describes in one
- * long-lived overlay (decision 9), and the speaker's HA timers from its
- * timer.view in another, in the top-right corner, hidden while a turn is up.
+ * (§11.3), draws each turn the controller's turn.view describes in an
+ * overlay that stays up (decision 9), and draws the speaker's HA timers from
+ * its timer.view in another, in the top-right corner, hidden while a turn is up.
  *
  * <p>Threads: Kiosk Satellite runs StrictMode, so the link thread alone
  * connects, writes the hello (the plugin's only line) and reads; every view

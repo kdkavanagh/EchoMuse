@@ -1,5 +1,5 @@
 // Package alerts is the device alert cache, journal, and executor (SPEC §10,
-// §16.3–§16.5): it stores controller-delivered alarm occurrences durably,
+// §16.3–§16.5): it stores alarm occurrences from the controller durably,
 // rings them and HA timer rings through one local queue, and journals local
 // dismiss/snooze/expire operations until the controller confirms them.
 package alerts

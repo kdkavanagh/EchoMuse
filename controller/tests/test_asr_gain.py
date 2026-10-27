@@ -43,7 +43,7 @@ def test_a_sample_past_the_rail_clamps_and_keeps_its_sign():
 
 
 def test_clipped_count_is_only_the_samples_that_needed_clamping():
-    # It drives an operator-facing warning, so an inflated count would send
+    # It drives a warning shown to an operator, so an inflated count would send
     # someone lowering a gain that was fine.
     out, clipped = es.apply_asr_gain(pcm(30000, 10, -20, 25000), gain_db=20.0)
     assert clipped == 2
@@ -72,10 +72,10 @@ def test_the_shipped_constant_leaves_headroom_for_this_hardware():
 
 # ── the wake word as a level anchor ────────────────────────────────────────
 #
-# Peak frame-RMS of the wake clips for the eight turns that have both a wake
-# clip and an utterance clip (2026-09-20). The band exists to be a no-op
+# The peak RMS of any frame in the wake clips for the eight turns that have both a wake
+# clip and an utterance clip (2026-09-20). The band exists to do nothing
 # across this range: normalising against these 1:1 was measured to WIDEN the
-# post-gain spread from 7.3 dB to 11.7 dB, because at a fixed listening
+# spread after applying gain from 7.3 dB to 11.7 dB, because at a fixed listening
 # position the wake word's scatter is uncorrelated noise (r = -0.17).
 MEASURED_WAKE_DBFS = [-52.8, -49.6, -52.9, -46.2, -50.0, -49.5, -49.6, -52.7]
 

@@ -572,8 +572,8 @@ async def _persist_turn(device_id: str, record: Mapping[str, object]) -> int:
 
 
 async def _persist_near_miss(device_id: str, record: db.NearMissRecord, pcm: bytes | None) -> int:
-    """A near miss's row, then its WAV, then `saved`: the row claims a recording only once
-    the file exists (a failed write leaves `record.recording`)."""
+    """A near miss's row, then its WAV, then `saved`: the row names a
+    recording only once the file exists (a failed write leaves `record.recording`)."""
     row_id = await asyncio.to_thread(db.insert_near_miss, device_id, record)
     if not pcm:
         return row_id

@@ -191,8 +191,8 @@ func TestStatusNoAttribute(t *testing.T) {
 	}
 }
 
-// The absence LOG is deliberately once-only; the status must not be, or a
-// device whose bus changed would keep reporting its first answer forever.
+// The absence LOG is deliberately logged only once; the status must not be,
+// or a device whose bus changed would keep reporting its first answer forever.
 func TestStatusRefreshesAcrossScans(t *testing.T) {
 	fakeBus(t, map[string]bool{"tsl2584tsv": false})
 	if got := Report(); got.Code != StatusNoChip {

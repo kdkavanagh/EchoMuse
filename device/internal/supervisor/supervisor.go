@@ -79,8 +79,8 @@ type RetainedHooks struct {
 	WifiChange    func(ssid, psk string)
 	WifiCommit    func()
 	WifiScan      func()
-	// Ready runs after each session.ready, for connect-time retained
-	// reports (stats, a pending wifi_result).
+	// Ready runs after each session.ready, for retained reports that the
+	// device sends when it connects (stats, a pending wifi_result).
 	Ready func()
 }
 
@@ -174,13 +174,13 @@ type Supervisor struct {
 	afeRec   [1]ema.AFERecord
 	muted    bool
 
-	// Mixer-goroutine state (tap, anchor and epoch hooks).
+	// State that the mixer goroutine owns (tap, anchor and epoch hooks).
 	dec         refdsp.Decimator
 	refBuf      [render.BlockFrames / refdsp.Factor]int16
 	renderEpoch uint64
 	completed   atomic.Uint64
 
-	// Render-audio receive goroutine state.
+	// State owned by the goroutine that receives render audio.
 	renderPCM [ema.MaxRenderFrames]int16
 
 	// Epoch announcements, guarded by announceMu.

@@ -1,5 +1,5 @@
 """Pinned controller speech bundle (§16.6): manifest, startup verification,
-and install-time trailing-blank qualification."""
+and qualification that checks trailing blanks during installation."""
 
 from __future__ import annotations
 
@@ -221,8 +221,8 @@ def read_qualification_wav(bundle: SpeechBundle) -> tuple[int, np.ndarray]:
 
 
 def qualify_bundle(bundle: SpeechBundle, recognizer: Recognizer | None = None) -> Qualification:
-    """Install-time qualification: test WAV + 4 s silence must produce a
-    22–27/s trailing-blank slope (§16.6). This is not run at every startup."""
+    """Qualify the bundle at installation: the test WAV + 4 s silence must produce a
+    22–27/s slope of trailing blanks (§16.6). This is not run at every startup."""
     recognizer = recognizer or create_recognizer(bundle)
     rate, samples = read_qualification_wav(bundle)
     stream = recognizer.create_stream()

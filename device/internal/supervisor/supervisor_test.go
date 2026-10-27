@@ -466,9 +466,9 @@ func newHarness(t *testing.T, o opts) *harness {
 	return h
 }
 
-// mix runs the real mixer for two sink writes, so every event of the first
-// write's blocks has been delivered, and returns the latest final-mix mask.
-// The mixer stays parked in its next write until cleanup.
+// mix runs the real mixer for two sink writes, so it has delivered every event
+// from the first write's blocks, and returns the latest mask from the final
+// mix. The mixer stays parked in its next write until cleanup.
 func (h *harness) mix() uint8 {
 	h.t.Helper()
 	h.mixg.Add(1)

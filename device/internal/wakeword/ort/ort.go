@@ -1,6 +1,7 @@
-// Package ort runs the BCResNet graph with a dlopen'd ONNX Runtime (SPEC §5.2,
-// §16.5). The library and the graph are hash-named speech assets; nothing
-// links against ORT, so the firmware starts without it.
+// Package ort runs the BCResNet graph with an ONNX Runtime it loads with
+// dlopen (SPEC §5.2, §16.5). The library and the graph are speech assets
+// named by their hashes; nothing links against ORT, so the firmware starts
+// without it.
 //
 // A Session is owned by one goroutine: the detector's wake thread.
 package ort
@@ -36,7 +37,7 @@ var (
 )
 
 // Open loads the runtime library at libPath. Opening the same path again
-// returns the same Runtime, so one hash-named library has one environment.
+// returns the same Runtime, so one library named by its hash has one environment.
 func Open(libPath string) (*Runtime, error) {
 	openMu.Lock()
 	defer openMu.Unlock()

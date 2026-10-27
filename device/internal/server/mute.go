@@ -5,10 +5,11 @@ import (
 	"sync"
 )
 
-// muteController owns the device-sovereign privacy state, physical ADC mute,
-// red ring and discrete mute-button LED (SPEC §3.2, §11.2). A device
-// without a privacy mute the firmware integrates (supported false: the Show
-// until Phase 7) stays unmuted and never touches the persisted state.
+// muteController owns the privacy state (the device's to decide, not the
+// controller's), physical ADC mute, the red ring and discrete mute-button LED
+// (SPEC §3.2, §11.2). A device without a privacy mute that the firmware
+// integrates (supported false: the Show until Phase 7) stays unmuted and never
+// touches the persisted state.
 type muteController struct {
 	mu sync.Mutex
 

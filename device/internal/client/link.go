@@ -22,7 +22,7 @@ import (
 	"github.com/wilbowes/EchoMuse/internal/uuid"
 )
 
-// LostReason says why a session ended (Handler.Lost).
+// LostReason identifies why a session ended (Handler.Lost).
 type LostReason string
 
 // Session loss reasons passed to Handler.Lost.

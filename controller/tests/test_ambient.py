@@ -8,9 +8,9 @@ everything below is a way of failing that promise:
   * the file is written incrementally, so its header is a lie until it is
     closed — and a header that is still a lie when the file is served is a
     recording nothing will play
-  * a controller killed mid-session leaves a `.part`. An hour of audio that
+  * a controller that is killed during a session leaves a `.part`. An hour of audio that
     needs a hex editor is the same as an hour of audio lost
-  * an in-progress recording must never be listed, served or archived — half
+  * a recording that is still in progress must never be listed, served or archived — half
     a WAV is not an artefact
   * one device's recording name can never reach another device's audio
 """

@@ -8,11 +8,11 @@ import (
 
 // DotButton handles an action-button edge. Physical events bypass queued
 // inference and carry a monotonically increasing physical sequence (§16.1).
-// A release while an alert is ringing or backgrounded stops it on the
-// device (alarm: journaled dismiss; timer: stopped) with the 10 ms
-// physical-stop ramp and reports handled:"alert_stopped"; otherwise the
-// controller applies its gesture policy. Both edges carry the capture
-// epoch/sample of the press.
+// A release while an alert is ringing or backgrounded stops it on the device
+// (alarm: journaled dismiss; timer: stopped) with the 10 ms ramp used for a
+// physical stop and reports handled:"alert_stopped"; otherwise the controller
+// applies its gesture policy. Both edges carry the capture epoch/sample of the
+// press.
 func (s *Supervisor) DotButton(ev pkgbuttons.ButtonClickEvent) {
 	now := s.now()
 	a := s.buttonAction(ev.ClickType, ev.Button.Type, ev.Down, ev.HeldMs, now)

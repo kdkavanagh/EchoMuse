@@ -88,10 +88,10 @@ const (
 	MaxShadowRules = 8
 )
 
-// OpenRule is one candidate-open condition (SPEC §5.2): at a scored hop
-// whose profile is Profile, over the last Windows raw scores of the scored
-// history (fewer right after a reset, as the smoothing mean is), the mean
-// or every score reaches Threshold.
+// OpenRule is one condition for opening a candidate (SPEC §5.2): at a scored
+// hop whose profile is Profile, over the last Windows raw scores of the scored
+// history (fewer right after a reset, as the smoothing mean is), the mean or
+// every score reaches Threshold.
 type OpenRule struct {
 	Profile   Profile     `json:"profile"`
 	Windows   int         `json:"windows"`
@@ -374,8 +374,8 @@ type ShadowStats struct {
 type Callbacks struct {
 	// Profile selects the threshold profile from the mixer state (SPEC §5.3).
 	Profile func() Profile
-	// ProducingSound reports whether the final mix was non-silent anywhere in
-	// the capture-sample range [from, to].
+	// ProducingSound reports whether sound was present anywhere in the final
+	// mix across the range of capture samples [from, to].
 	ProducingSound func(from, to uint64) bool
 	OnCandidate    func(Candidate)
 	OnCandidateEnd func(CandidateEnd)

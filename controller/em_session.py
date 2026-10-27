@@ -2397,7 +2397,7 @@ class SessionActor:
                           language: asyncio.Task[tuple[bool, str | None]],
                           job: asyncio.Task[FixOutcome | None] | None) -> None:
         """What `on` would have sent, computed beside the turn and never waited for by it (§16.8);
-        the record says whether it would have been ready within FINAL_DEADLINE_S."""
+        the record notes whether it would have been ready within FINAL_DEADLINE_S."""
         record = turn.stt_fix = FixRecord(config.mode, text, text, FixReason.NOT_READY)
         loop = asyncio.get_running_loop()
         started = loop.time()
@@ -3955,9 +3955,9 @@ class SessionActor:
         await self._send_view(view)
 
     async def _view_done(self, turn: _Turn, reason: TerminalReason) -> None:
-        """`done` as the turn ends. A completed turn keeps what it said, and `follow_up` says a
-        reply window follows (HA's continue_conversation, or EchoMuse's own question); any other
-        end (no_input, cancelled, an error) shows no answer."""
+        """`done` as the turn ends. A completed turn keeps its answer, and `follow_up` records
+        whether a reply window follows (HA's continue_conversation, or EchoMuse's own question);
+        any other end (no_input, cancelled, an error) shows no answer."""
         view = turn.view
         if view is None or view.phase == ViewPhase.DONE:
             return

@@ -1387,9 +1387,9 @@ class LeaseTable:
     def open_candidate(self, lease_id: str, candidate_id: str, capture_epoch: int,
                        support_start: int, *, afe: bool = False) -> Lease:
         """Record the lease the device opened with `wake.candidate` (gen 1).
-        `afe`: the session opted in to `afe_metadata_v1`, so the device's
-        candidate lease also wants `afe` from its reference start (the AEC
-        state before the wake), on the period grid (WIRE §4.5)."""
+        `afe`: the session opted in to `afe_metadata_v1`, so the device adds
+        `afe` to its candidate lease from the reference start (the AEC state
+        before the wake), on the period grid (WIRE §4.5)."""
         if lease_id in self._leases:
             raise LeaseError(f"lease {lease_id} already exists")
         mic = _round_down(support_start - CANDIDATE_MIC_PREROLL, CELL_SAMPLES)
@@ -1717,10 +1717,10 @@ class UplinkSession:
     # -- audio -----------------------------------------------------------
 
     def ingest(self, frame: bytes | bytearray | memoryview) -> list[Delivery]:
-        """Validate one uplink frame and place it in every lease that wants it.
+        """Validate one uplink frame and place it in every lease that asks for it.
 
-        Raises ProtocolError for a WIRE violation. A valid packet no active
-        lease wants is dropped (empty result)."""
+        Raises ProtocolError for a WIRE violation. A valid packet that no active
+        lease asks for is dropped (empty result)."""
         packet = parse_packet(frame)
         stream_id = self.streams.check(packet)
         clock = self._clocks.setdefault((packet.kind, packet.epoch), StreamClock())

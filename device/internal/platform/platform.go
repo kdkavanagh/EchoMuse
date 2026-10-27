@@ -3,17 +3,17 @@
 // backend and hardware bindings from Detect's answer once at start.
 //
 //   - KindDot: Echo Dot Gen 2 on Fire OS 6 (Android 7.1.2, API 25,
-//     biscuit_puffin), the image amonet-biscuit v2.x boots. Amazon's
-//     headless "Puffin" build: no Java framework, audio owned by Amazon's
-//     `mixer` daemon (libmixerAPI), Wi-Fi driven by the firmware itself.
-//     See docs/fireos6-port.md.
+//     biscuit_puffin), the image that amonet-biscuit v2.x boots. Amazon's
+//     headless "Puffin" build has no Java framework; Amazon's `mixer` daemon
+//     (libmixerAPI) owns audio and the firmware drives Wi-Fi itself. See
+//     docs/fireos6-port.md.
 //   - KindCrown: Echo Show 8 1st gen on Fire OS 6 (product crown) with the
 //     full Android framework: audio through AudioFlinger and Amazon's HAL,
-//     reached with OpenSL ES; Wi-Fi, Bluetooth, time and volume belong to
-//     Android. See docs/echo-show-crown.md and docs/echo-show-port-plan.md.
+//     reached with OpenSL ES; Android owns Wi-Fi, Bluetooth, time and volume.
+//     See docs/echo-show-crown.md and docs/echo-show-port-plan.md.
 //   - KindCrownLineage: the same Echo Show 8 on LineageOS 18.1 (Android 11,
 //     API 30) built from our fork with the NS6571 libasp.so: audio through
-//     AAudio, the rest Android's as on Fire OS. See
+//     AAudio, while Android handles the rest as it does on Fire OS. See
 //     docs/echo-show-crown.md §8.4–8.5 and docs/echo-show-lineage-plan.md.
 package platform
 
@@ -149,10 +149,10 @@ func osVersionFrom(getprop func(string) string) string {
 	return ""
 }
 
-// OSVersion is the build the device runs: ro.build.version.name on Fire OS
-// ("Fire OS 6.5.6.9 (NS6569/6009)" on a Dot, "Fire OS 6574.1
+// OSVersion is the build that runs on the device: ro.build.version.name on
+// Fire OS ("Fire OS 6.5.6.9 (NS6569/6009)" on a Dot, "Fire OS 6574.1
 // (NS65741/8146)" on the Show), "LineageOS " plus ro.lineage.version on
-// LineageOS ("LineageOS 18.1-20261017-UNOFFICIAL-crown"). It is read once
-// per process; empty when the properties are unreadable, as off-device.
-// Descriptive only.
+// LineageOS ("LineageOS 18.1-20261017-UNOFFICIAL-crown"). It is read once per
+// process; it is empty when the properties are unreadable, as they are when
+// not running on a device. Descriptive only.
 func OSVersion() string { return osVersion() }

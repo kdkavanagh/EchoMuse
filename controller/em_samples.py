@@ -76,7 +76,7 @@ KEEP_PER_DEVICE = 2000
 # never -inf.
 DB_FLOOR = -100.0
 
-# Lowest noise floor used for thresholding, whatever the tracker believes.
+# Lowest noise floor used for thresholding, whatever the tracker currently reports.
 # See the module docstring: a muted device streams zeroes, and an unclamped
 # floor turns the quantisation noise that follows an unmute into "speech".
 # Measured room floors on this fleet sit around -66dBFS at the level the
@@ -120,8 +120,8 @@ class SegmentConfig:
 
     # Audio kept from BEFORE the frame that crossed the open threshold. A
     # wake word's first phoneme is its quietest — "Jarvis" opens on the "ar",
-    # not the "J" — and a model trained on clips missing their onset learns
-    # to want a word that nobody says. Non-negotiable, not a nicety.
+    # not the "J" — and a model trained on clips that miss their onset learns
+    # to listen for a word that nobody says. Non-negotiable, not a nicety.
     preroll_ms: int = 320
 
     # Below-threshold audio that ends a clip, and how much of it is kept.

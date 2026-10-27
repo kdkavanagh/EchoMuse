@@ -213,7 +213,7 @@ def test_a_negation_is_never_dropped_or_added():
 
 
 def test_a_direction_is_never_dropped():
-    # "louder" and "lower" sound alike; only the first says which way.
+    # "louder" and "lower" sound alike; only the first names which way.
     proposal = unrecognized("make it louder", phrases=["make it lower"])
     assert rejected(proposal, "make it lower") == "drops an action"
     decision, _ = correct("turn on the kitchen ceiling light")
@@ -465,8 +465,8 @@ class FakeHa:
 
 
 async def ready_service(monkeypatch, ha=None, history=(), worker=None):
-    """A service whose tables are published; its jobs run inline unless `worker` (a factory) says
-    otherwise. Returns the service, HA and the worker it made."""
+    """A service whose tables are published; its jobs run inline unless a different `worker`
+    factory is given. Returns the service, HA and the worker it made."""
     monkeypatch.setattr(em_text_fix_service, "REBUILD_DEBOUNCE_S", 0.0)
     ha = ha or FakeHa()
     factory, made = inline_workers()

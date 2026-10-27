@@ -1,4 +1,4 @@
-"""Transcript correction's CPU work, in one child process (SPEC §16.8).
+"""Transcript correction does its CPU work in one child process (SPEC §16.8).
 
 The controller process also runs the speech worker, whose VAD and ASR jobs have a 750 ms
 deadline. Building the tables there held the GIL for up to 0.5 s at a time and compiling

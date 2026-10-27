@@ -11,7 +11,7 @@ turn's own context, it preserves everything the original said explicitly (negati
 polarity, actions, numbers, units, named targets, and every slot HA had resolved), and
 no competing interpretation comes within AMBIGUITY_MARGIN of it.
 
-The rules that ask what a misheard text was meant to say (slot, name, lead-in, phrase)
+The rules that work out what a misheard text was meant to say (slot, name, lead-in, phrase)
 compare pronunciations (em_phonetics): CMUdict and the user's pronunciation guides, by
 phoneme edit distance weighted by articulatory features. Text with a word that has no
 pronunciation is never compared by sound. Similarity is a retrieval and scoring
@@ -747,7 +747,7 @@ def _changed(heard: Sequence[str], phrase: Sequence[str], lexicon: Lexicon) -> t
     often as the other lacks it, in order), each side's joined: what a candidate replaces,
     and with what. A word in both is never changed, wherever it stands ("turn off the tv"
     and "turn the tv off" change nothing), and two words are the same when spelled alike or
-    sharing a pronunciation (CMUdict says "tv" as "television" too)."""
+    sharing a pronunciation (CMUdict lists "tv" as "television" too)."""
     groups: list[set[bytes]] = []
     ids: dict[str, int] = {}
 

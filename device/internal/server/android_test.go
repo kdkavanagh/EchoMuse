@@ -134,8 +134,8 @@ func TestShowVolumeChangeNeverPaintsTheArc(t *testing.T) {
 	}
 }
 
-// When the mechanism failed its startup check, nothing is applied or
-// reported and the server says why (hello then carries a null level).
+// When the mechanism failed its startup check, nothing is applied or reported.
+// session.hello carries a null level with the reason.
 func TestShowVolumeUnavailable(t *testing.T) {
 	vol := &fakeStream{index: 12}
 	s := New(Config{Hardware: NewAndroidHardware(vol), StatePath: filepath.Join(t.TempDir(), "state.json"),

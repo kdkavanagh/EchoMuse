@@ -173,9 +173,9 @@ func currentIPv4() string {
 	return ""
 }
 
-// Scan triggers a wpa_cli scan and returns networks sorted strongest
-// first, deduped by SSID (strongest AP wins — multiple APs/bands share
-// SSIDs). Safe while associated; expect a brief audio-free RF glitch.
+// Scan triggers a wpa_cli scan and returns networks sorted strongest first,
+// deduped by SSID (the strongest AP wins — multiple APs/bands share SSIDs).
+// It is safe while associated; expect a brief audio-free RF glitch.
 func Scan() ([]Network, error) {
 	if _, err := wpaCli("scan"); err != nil {
 		return nil, fmt.Errorf("scan trigger: %w", err)

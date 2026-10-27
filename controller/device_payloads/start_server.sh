@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# EchoMuse start script — A/B slot aware with auto-rollback.
+# EchoMuse start script — it handles A/B slots and rolls back automatically.
 #
 # Retry policy: if the server exits in under MIN_RUNTIME seconds,
 # it counts as a failed start. After MAX_ATTEMPTS consecutive fast
@@ -165,7 +165,7 @@ crown_rehide() {
     VISIBLE=""
     LISTS=$(crown_hide_lists)
     [ -n "$LISTS" ] || return 0
-    # Newline-framed, so a case pattern matches one whole line and
+    # This is framed by newlines, so a case pattern matches one whole line and
     # com.amazon.device.software.ota never matches its .override.
     SHOWN="
 $(pm list packages 2>/dev/null)

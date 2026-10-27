@@ -26,12 +26,12 @@ import "github.com/wilbowes/EchoMuse/internal/audio/afe"
 // reset and starts a new epoch. Completions come from CLOCK_MONOTONIC in
 // callback order, so the two never conflict.
 //
-// No cgo, no build tag: host-testable.
+// It has no cgo or build tag, so host tests can use it.
 type periodClock struct {
 	last int64 // the previous stamp; 0 before the first
 }
 
-// stampKind says where a stamp came from.
+// stampKind identifies where a stamp came from.
 type stampKind uint8
 
 const (

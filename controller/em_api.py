@@ -416,7 +416,7 @@ async def create_app(services: ControllerServices) -> web.Application:
     app.router.add_get("/dashboard",  _serve_dashboard)
     app.router.add_static("/static",  STATIC_DIR)
     app.router.add_post("/api/setup", _post_setup)
-    # Public (pre-auth) — the landing page needs to know which form to show.
+    # Public (pre-auth) — this tells the landing page which form to show.
     # Exposes only the boolean; the bootstrap token itself stays in the logs.
     app.router.add_get("/api/system/setup-state", _get_setup_state)
 
@@ -1125,9 +1125,9 @@ async def _post_device_collect(request: web.Request) -> web.Response:
     if not row.approved:
         return _error(ErrorCode.NOT_APPROVED,
                       "Approve this device before collecting from it", 409)
-    # The mirror of the guard in _post_device_ambient: the two modes want the
-    # same frames for opposite purposes, so they are mutually exclusive at
-    # the API rather than resolved by a precedence rule nobody can see.
+    # This mirrors the guard in _post_device_ambient: the two modes use the
+    # same frames for opposite purposes, so the API keeps them mutually
+    # exclusive instead of using a precedence rule nobody can see.
     if enabled and bool(row.ambient_mode):
         return _error(ErrorCode.RECORDING_AMBIENT,
                       "Stop ambient recording on this device first", 409)
@@ -1136,8 +1136,8 @@ async def _post_device_collect(request: web.Request) -> web.Response:
     await loop.run_in_executor(None, db.set_collect_mode, device_id, enabled)
 
     if live is not None:
-        # The controller writes the device log line itself, since it is the
-        # thing that knows the mode actually took effect (and how many clips
+        # The controller writes the device log line itself, since only the
+        # controller sees that the mode actually took effect (and how many clips
         # a session produced on the way out).
         await request.app[SERVICES].set_collect_mode(live, enabled)
     else:
@@ -1254,8 +1254,8 @@ async def _get_samples_zip(request: web.Request) -> web.Response:
     GET /api/devices/{id}/samples.zip — every clip in one archive.
 
     This is what the feature is FOR: the clips are training input, and a
-    training run wants the set, not one file at a time. Built in memory in
-    an executor — the retention cap bounds it at ~64MB, and streaming a zip
+    training run needs the set, not one file at a time. It is built in memory
+    in an executor — the retention cap bounds it at ~64MB, and streaming a zip
     would mean either holding the response open across a prune or writing a
     temporary file on the same volume the clips live on.
     """
@@ -1386,12 +1386,13 @@ async def _get_wakeclips_zip(request: web.Request) -> web.Response:
     GET /api/devices/{id}/wakeclips.zip — every wake clip in one archive.
 
     This is what the feature is FOR: the clips are training input, and a
-    training run wants the set, not one false positive at a time. The
-    per-turn endpoint above is for deciding whether a clip belongs in the
-    set; this is how the set leaves the controller. Built in memory in an
-    executor — KEEP_PER_DEVICE bounds it at ~23MB, and streaming a zip would
-    mean either holding the response open across a prune or writing a
-    temporary file on the same volume the clips live on.
+    training run needs the set, not one false positive at a time. The
+    endpoint above, which serves one turn's clip, is for deciding whether a
+    clip belongs in the set; this is how the set leaves the controller. It is
+    built in memory in an executor
+    — KEEP_PER_DEVICE bounds it at ~23MB, and streaming a zip would mean
+    either holding the response open across a prune or writing a temporary
+    file on the same volume the clips live on.
     """
     device_id = request.match_info["id"]
     loop = asyncio.get_running_loop()
@@ -1599,7 +1600,7 @@ async def _post_device_ambient(request: web.Request) -> web.Response:
     looks broken to everyone else in the house.
 
     Refused while sample collection is on, rather than silently sharing the
-    stream: the two modes want the same frames for opposite purposes, and a
+    stream: the two modes use the same frames for opposite purposes, and a
     user who armed both would get an ambient file full of the wake word they
     were saying for the segmenter.
 
@@ -1624,9 +1625,9 @@ async def _post_device_ambient(request: web.Request) -> web.Response:
     await loop.run_in_executor(None, db.set_ambient_mode, device_id, enabled)
 
     if live is not None:
-        # The controller writes the device log line itself: it is the thing
-        # that knows whether a file was opened, and which one was kept on the
-        # way out.
+        # The controller writes the device log line itself, since only the
+        # controller sees whether a file was opened, and which one was kept on
+        # the way out.
         await request.app[SERVICES].set_ambient_mode(live, enabled)
     else:
         await push_log_event(
@@ -4160,7 +4161,7 @@ async def _ws_shell(request: web.Request) -> web.WebSocketResponse:
     # programmatic shell mechanism entirely.
 
     try:
-        # pty:true — interactive terminal wants a real PTY (mksh prompt,
+        # pty:true — an interactive terminal needs a real PTY (mksh prompt,
         # line editing, top/vi, resize). The firmware falls back to a pipe
         # when PTY allocation fails; handle_shell reports the established
         # mode to the dashboard via shell_meta. Programmatic sessions
@@ -5195,7 +5196,7 @@ async def _post_provision_diagnostics(request: web.Request) -> web.Response:
         error=body.get("error") or "",
         probes=body.get("probes") or {},
         transcript=body.get("transcript") or None,
-        # The wizard knows which network the operator picked; the file cannot
+        # The wizard reports which network the operator picked; the file cannot
         # work it out once the names are gone, and "the one you wanted is
         # WPA3" is the whole answer on a #82-shaped failure.
         selected_ssid=body.get("selected_ssid") or None,

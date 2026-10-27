@@ -6,8 +6,8 @@
 // The firmware embeds both (embed_*.go) and owns their life: Installer
 // installs the app by version and keeps it running, KioskInstaller installs
 // the plugin by hash through Kiosk Satellite's remote API, Server is the
-// loopback link both connect to, Sink is the ring's led.Controller on that
-// link. Health is the shared stats.companion record.
+// loopback link both connect to, and Sink is the ring's led.Controller on
+// that link. Health is the shared stats.companion record.
 package companion
 
 import (

@@ -1,6 +1,6 @@
-// Package assets keeps hash-named files fetched over the assets socket
-// (SPEC §16.1, §16.5): speech assets (`<sha256>.{so,onnx,json}`) and alert
-// sounds (`<sha256>.wav`), each in its own directory.
+// Package assets keeps files named by their hash that it fetched over the
+// assets socket (SPEC §16.1, §16.5): speech assets (`<sha256>.{so,onnx,json}`)
+// and alert sounds (`<sha256>.wav`), each in its own directory.
 //
 // A download goes to `<sha256>.part`, resumes by offset after a disconnect,
 // is verified against its SHA-256, synced, and renamed into place; the
@@ -194,8 +194,8 @@ func (s *Store) Verify(sha, ext string) error {
 	return nil
 }
 
-// GC removes every hash-named file, installed or partial, whose hash is not
-// in keep. Files not named `<sha256>.<ext>` are left alone.
+// GC removes every file named by its hash, installed or partial, whose hash is
+// not in keep. Files not named `<sha256>.<ext>` are left alone.
 func (s *Store) GC(keep []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

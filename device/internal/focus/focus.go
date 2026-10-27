@@ -18,7 +18,7 @@ const (
 
 	// AlertYield bounds how long dialog output delays a newly due alert (§6.2).
 	AlertYield = 2 * time.Second
-	// AlertBackgroundCap is the occurrence-level background budget (§6.2).
+	// AlertBackgroundCap is the background budget for each occurrence (§6.2).
 	AlertBackgroundCap = 15 * time.Second
 
 	ProvisionalWindow    = 5 * time.Second // §16.6

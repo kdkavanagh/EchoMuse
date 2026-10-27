@@ -29,7 +29,7 @@ type occurrence struct {
 	Volume       *float64 `json:"volume"` // nil: ring at the current media volume
 }
 
-// TombstoneReason says why the controller removed an occurrence (SPEC §16.4).
+// TombstoneReason identifies why the controller removed an occurrence (SPEC §16.4).
 type TombstoneReason string
 
 const (

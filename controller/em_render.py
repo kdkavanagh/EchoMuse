@@ -1,4 +1,4 @@
-"""Controller-side render client: playbacks on the device mixer (§4.4, §16.1;
+"""The controller's render client plays audio on the device mixer (§4.4, §16.1;
 WIRE §4.2).
 
 Network sources (`content`, `dialog_output`) stream kind-3 packets on the
@@ -62,7 +62,7 @@ START_ACK_TIMEOUT_S = 2.0
 
 class RenderFinished(TypedDict):
     """How a playback ended: the device's `render.finished` body, or the same shape for a
-    playback that ended locally (`detail` says why)."""
+    playback that ended locally (`detail` gives the reason)."""
 
     playback_id: str
     last_completed_frame: str | None     # u64 decimal string

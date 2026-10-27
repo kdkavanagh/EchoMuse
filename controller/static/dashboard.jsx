@@ -24,8 +24,8 @@ function ingressWebSocketUrl(path) {
 const API = {
   token: null,
 
-  // One request path for everything: ingress-relative URL, Bearer auth and
-  // one error shape. Sessions are Bearer-header-only (no cookie is ever set),
+  // All requests go through one code path: a URL relative to ingress, Bearer auth and
+  // one error shape. Sessions use only Bearer headers (no cookie is ever set),
   // so anything the browser would fetch for itself — an <a download>, an
   // <audio src> — would 401; binary content comes through blob() and is
   // handed on as an object URL, which also keeps the token out of the URL bar.
@@ -238,8 +238,9 @@ const LOG_SOURCE = Object.freeze({ DEVICE: 'device' });
 const MONO = "'DM Mono',monospace";
 const SANS = "'DM Sans',sans-serif";
 
-// File-name-safe slug of a device, for downloads. em_api._slug's rule, so a
-// filtered archive names each file as its own download here does.
+// A slug of a device that is safe in a file name, for downloads. It follows
+// em_api._slug's rule, so a filtered archive names each file the same way
+// its own download here does.
 function fileSlug(label, id) {
   return (label || id).replace(/[^A-Za-z0-9]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'device';
 }
@@ -301,7 +302,7 @@ const RULE_COMBINE = Object.freeze({ MEAN: 'mean', ALL: 'all' });
 const RULE_COMBINE_LABEL = Object.freeze({
   [RULE_COMBINE.MEAN]: 'average', [RULE_COMBINE.ALL]: 'every window',
 });
-// A near miss's profile (near_misses[].profile), as the Activity list says it.
+// A near miss's profile (near_misses[].profile), as it appears in the Activity list.
 const NEAR_MISS_PROFILE_LABEL = Object.freeze({
   [RULE_PROFILE.IDLE]: 'idle', [RULE_PROFILE.PLAYBACK]: 'while playing',
 });
@@ -364,9 +365,9 @@ function _emitEvent(msg) {
 // Why a control is unavailable on a connected device that lacks a capability
 // (§11.1). Features are gated on the capability set the device announced in
 // session.hello, never on its firmware version. The controller's own reason
-// (`capability_gaps`, em_device.capability_gap) comes first: it knows the
-// platform, so an Echo Show reads "managed by the device", a Fire OS Show "no
-// LED ring on this device", where an older Dot or an older LineageOS Show
+// (`capability_gaps`, em_device.capability_gap) comes first because it is based on
+// the platform. An Echo Show reads "managed by the device", a Fire OS Show "no
+// LED ring on this device", while an older Dot or an older LineageOS Show
 // reads "firmware update available".
 const CAPABILITY_REASONS = Object.freeze({
   [CAPABILITY.DEVICE_WAKE]:     'this firmware has no on-device wake detector — update it',
@@ -388,9 +389,9 @@ function capabilityGap(capabilities, cap) {
   return capabilities.gaps[cap] || CAPABILITY_REASONS[cap] || `needs the ${cap} capability — update this Echo`;
 }
 
-// The live capability set to gate on: null unless a current-protocol session
-// is up (see capabilityGap). `names` is what the device announced; `gaps` the
-// controller's reason for each absent one whose reason depends on the platform.
+// The live capability set to gate on: null unless a session using the current
+// protocol is up (see capabilityGap). `names` is what the device announced;
+// `gaps` holds the controller's reason for each absent one whose reason depends on the platform.
 function liveCapabilities(d) {
   return d.connected ? { names: d.capabilities || [], gaps: d.capability_gaps || {} } : null;
 }
@@ -769,10 +770,10 @@ function Toggle({ label, sub, value, onChange, disabled = false }) {
   // the config dialog. flexShrink: 0 keeps the switch at full size.
   //
   // `disabled` is honoured here, not just styled: callers have passed it
-  // since the native-AFE bypass table landed, but the prop was ignored, so
-  // a control shown as off-and-greyed still WROTE the opposite value on a
-  // click — the exact "silently does something else" that disabled-with-
-  // reason exists to prevent. Slider has always taken the same prop.
+  // since the table for bypassing native AFE landed, but the prop was ignored, so
+  // a control that looked off and greyed out still WROTE the opposite value on a
+  // click — the exact "silently does something else" that showing a disabled
+  // control with a reason exists to prevent. Slider has always taken the same prop.
   return (
     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20, minWidth: 0, gap: 10 }}>
       <div style={{ minWidth: 0, flex: 1 }}>
@@ -1242,9 +1243,9 @@ function useClipPlayer(scope, { cache = true } = {}) {
 }
 
 // ─── Turn observability (Activity tab) ───────────────────────────────────────
-// Stat tiles + a stage-breakdown bar per recent turn. Colors validated
-// (dataviz six-checks) against the panel surface #dfdbd3: CVD ΔE 26.3,
-// contrast ≥3:1, chroma ≥0.1. Identity is never color-alone: legend + the
+// Stat tiles and a bar that breaks down the stages for each recent turn. Colors
+// passed six dataviz checks against the panel surface #dfdbd3: CVD ΔE 26.3,
+// contrast ≥3:1, chroma ≥0.1. Identity is never color alone: the legend and
 // tooltip name each stage.
 const TURN_STAGES = [
   { key: 'listen',     label: 'Listening',  color: '#4468a8' },
@@ -1252,8 +1253,8 @@ const TURN_STAGES = [
   { key: 'respond',    label: 'Respond',    color: '#96660a' },
 ];
 
-// Stage durations of one turn row. The row stores durations, not offsets:
-// audio_ms is the committed span (the whole open time when nothing
+// The stage durations stored in one turn row. The row stores durations, not offsets:
+// audio_ms is the committed span (the whole time it was open when nothing
 // committed), stt_ms the STT run, and respond is intent dispatch → first TTS
 // URL. An unmeasured stage (null) contributes nothing.
 function turnSegments(t) {
@@ -1508,9 +1509,9 @@ function TextFixEvidence({ fix: f, quote, trial = false, defaultOpen = false }) 
   );
 }
 
-// A turn's native AFE evidence (turns.afe_evidence) as its per-period chart:
-// null is unavailable — the Echo did not report it. The span summaries stay in
-// the decision trace and the turns API.
+// A turn's native AFE evidence (turns.afe_evidence), charted period by
+// period: null is unavailable — the Echo did not report it. The span summaries
+// stay in the decision trace and the turns API.
 function NativeAfeEvidence({ evidence, deviceId, turnId, playback }) {
   if (evidence == null) {
     return <span style={{ color: 'var(--muted)' }}>unavailable — not reported for this turn ({CAPABILITY_REASONS[CAPABILITY.AFE_METADATA]}), or recorded before it existed</span>;
@@ -1650,8 +1651,8 @@ function afeLaneRow(s, key) {
 // Axis steps in seconds: the first whose span covers what is shown.
 const AFE_TICK_STEPS = [[3, 0.5], [8, 1], [20, 2], [50, 5], [100, 10], [240, 30], [600, 60], [1200, 120], [Infinity, 300]];
 
-// The per-period chart of one AfeSeriesJson, for a turn (AfeChart) and a
-// sample clip or ambient recording (RecordingAfeChart): the `lanes` rows
+// A chart that shows each period in one AfeSeriesJson, for a turn (AfeChart)
+// and a sample clip or ambient recording (RecordingAfeChart): the `lanes` rows
 // (AFE_LANES) under `bars` ({ label, span, color }, each with its duration)
 // and across `guides` ({ at, border }), on the series' timeline, the axis in
 // seconds from `anchor` (`anchorLabel`). Evidence only. Hovering reads one
@@ -2033,7 +2034,7 @@ function PauseTranscripts({ deviceId, turnId }) {
 // transcribed and what was sent on, who handled it, what was said back, and
 // what became of any follow-up question. A stage that never ran (a refused
 // wake, no speech, a failed STT) is omitted rather than shown empty. Its
-// recordings and per-turn fetches are the turn's own device's (`device_id`);
+// recordings and fetches for each turn belong to the turn's own device (`device_id`);
 // `deviceLabel`, given across devices, names that device in the header.
 function TurnDetail({ turn: t, turns, deviceLabel, onSelect, playback }) {
   // Pre-cutover rows stored negative sentinels for unmeasured stages.
@@ -2257,19 +2258,19 @@ function NearMissAfeChart({ near: n, playing, elapsed }) {
   );
 }
 
-// The rows each Activity list asks for: a device's tab, and the view across devices.
+// The number of rows each Activity list asks for: one device's tab, or the view across devices.
 const ACTIVITY_LIMIT = Object.freeze({ DEVICE: 50, FLEET: 200 });
 
-// One list of voice turns and near misses, each oldest first and every row
-// naming its `device_id`: one device's on its Activity tab, or, with `fleet`,
+// One list of voice turns and near misses, with every row naming its `device_id`
+// and the oldest first: one device's on its Activity tab, or, with `fleet`,
 // the Activity view's across devices, where each row names its device and
-// `onOpenDevice(id)` opens it. `labels` maps each device id the rows may name
-// to its label; `device` is the one device the rows are of (its wake-clip
-// archive, and the clip player's scope), else null. `nearMissGap` is the
+// `onOpenDevice(id)` opens it. `labels` maps each device id that rows may name
+// to its label; `device` is the one device the rows are for (its archive of
+// wake clips, and the clip player's scope), else null. `nearMissGap` is the
 // reason the rows can hold no near miss (no device in view reports them),
-// else null; `state` the device's {label, color} tile, or null; `limit` the
-// rows asked for; `listHeight` the scrolling list's maximum height;
-// `emptyNote` what an empty list says instead of "nothing recorded yet".
+// else null; `state` is the device's {label, color} tile, or null; `limit` is
+// the number of rows requested; `listHeight` is the scrolling list's maximum height;
+// `emptyNote` is what an empty list says instead of "nothing recorded yet".
 function TurnObservability({ turns, nearMisses, nearMissGap, labels, device = null, fleet = false, onOpenDevice,
                              recordingsOn, state = null, limit, listHeight = 230, emptyNote = null }) {
   const [hover, setHover] = useState(null);       // key of the hovered row in `rows`
@@ -2298,10 +2299,10 @@ function TurnObservability({ turns, nearMisses, nearMissGap, labels, device = nu
   const slugOf = id => fileSlug(labels[id], id);
   const nameOf = id => labels[id] || id;
 
-  // Retention is a small per-device file count, far shorter than the turn
-  // history, so a row naming a recording that no longer exists is ordinary.
-  // Mark it gone and drop its controls rather than surfacing an error. Per
-  // clip rather than per turn: the two kinds are kept to their own counts,
+  // Retention keeps a small number of files per device, far fewer than the
+  // turns in its history, so a row that names a recording that no longer exists is ordinary.
+  // Mark it gone and drop its controls rather than surfacing an error. Each
+  // kind of clip has its own count, rather than sharing one count per turn,
   // so a turn routinely still has its wake clip long after its utterance
   // was pruned.
   const markGone = key => setGone(g => new Set(g).add(key));
@@ -2350,9 +2351,9 @@ function TurnObservability({ turns, nearMisses, nearMissGap, labels, device = nu
 
   // Every wake clip the device still holds, in one archive — the hand-off to
   // a retraining run. Deliberately not "the clips for the turns on screen":
-  // the store keeps hundreds and this list is the last 50, so most of the
-  // false positives worth training on are already off the bottom of it.
-  // Unlike the per-clip URLs there is nothing to replay it for, so it is not
+  // the store keeps hundreds and this list is the last 50, so most of the false
+  // positives worth training on are already off the bottom of it.
+  // Unlike the URLs for each clip there is nothing to replay it for, so it is not
   // kept.
   async function doWakeZip() {
     setZipping(true); setZipError('');
@@ -2656,14 +2657,14 @@ function TurnObservability({ turns, nearMisses, nearMissGap, labels, device = nu
 // ─── Activity across devices ─────────────────────────────────────────────────
 // The page's Activity view: every device's voice turns and near misses as one
 // list by time (GET /api/turns, /api/near_misses), or one device's through its
-// own endpoints, with the device tab's turn detail. Reloaded every 10 s and as
+// own endpoints, with the device tab's turn detail. It reloads every 10 s and as
 // each turn in view lands (turn_complete); near misses raise no event, so the
-// poll is what brings them. A wake-score range narrows the list, and the two
-// archives take every saved clip the same filters match, not only the rows
+// poll brings them in. A range of wake scores narrows the list, and the two
+// archives take every saved clip that matches the same filters, not only the rows
 // listed.
 
 // The Activity view's archives (GET /api/wakeclips.zip, /api/near_misses.zip);
-// each value is also the archive's file-name word, as the controller names it.
+// each value is also the word the controller uses in the archive file name.
 const ARCHIVE = Object.freeze({ WAKES: 'wakes', NEAR_MISSES: 'nearmisses' });
 const ARCHIVES = Object.freeze({
   [ARCHIVE.WAKES]: {
@@ -2719,7 +2720,7 @@ function FleetActivity({ devices, globalConfig, onOpenDevice }) {
   const labels = Object.fromEntries(devices.map(d => [d.device_id, d.label]));
   const inView = scope ? approved.filter(d => d.device_id === scope) : approved;
   const recordingsOn = inView.some(d => effectiveConfig(globalConfig, d).saveUtterances);
-  // Devices in view without near_miss_v1. When none has it the list says why
+  // Devices in view without near_miss_v1. When none has it the list explains why
   // it holds no near miss; when only some lack it, the note above names them.
   const gaps = inView.map(d => [d, capabilityGap(liveCapabilities(d), CAPABILITY.NEAR_MISS)]).filter(([, g]) => g);
   const gapText = gaps.map(([d, g]) => (scope ? g : `${nameOf(d)}: ${g}`)).join(' · ');
@@ -2727,8 +2728,8 @@ function FleetActivity({ devices, globalConfig, onOpenDevice }) {
   const current = load?.scope === scope ? load : null;
   const muted = { fontFamily: MONO, fontSize: 11, color: 'var(--muted)' };
 
-  // The wake-score range: a turn by its wake score, a near miss by its peak,
-  // both ends inclusive (as the archives). At the whole range nothing is
+  // The range of wake scores: a turn by its wake score, a near miss by its peak,
+  // with both ends inclusive (as the archives). At the whole range nothing is
   // filtered; narrowed, a turn with no score (button, reply) is outside it.
   const fmtScore = v => v.toFixed(2);
   const narrowed = lo > SCORE_RANGE_ALL[0] || hi < SCORE_RANGE_ALL[1];
@@ -2806,10 +2807,11 @@ function FleetActivity({ devices, globalConfig, onOpenDevice }) {
 }
 
 // ─── Connectivity tab ─────────────────────────────────────────────────────────
-// Per-device WiFi: shows the current connection and drives the safe network
-// switch (device-side executor with auto-rollback — see internal/wifi in the
-// firmware). The change is fire-and-forget from here: POST returns 202, the
-// device drops off while it switches, and the outcome arrives as a
+// WiFi for each device: shows the current connection and switches networks
+// safely (the device runs the switch and rolls it back automatically if it
+// fails — see internal/wifi in the firmware). The change is sent from here
+// without waiting for the outcome: POST returns 202, the device drops off
+// while it switches, and the outcome arrives as a
 // device_update event carrying device.wifi.{pending,last_result}.
 
 function ConnectivityTab({ device, row }) {

@@ -61,7 +61,7 @@ type assetFile struct {
 	dst      *string
 }
 
-// files lists want's three files, each with the Paths field it installs to.
+// files lists the three files in want and the Paths field where each is installed.
 func (want Assets) files(p *Paths) [3]assetFile {
 	return [3]assetFile{
 		{want.RuntimeSHA256, extRuntime, &p.Runtime},
@@ -70,7 +70,7 @@ func (want Assets) files(p *Paths) [3]assetFile {
 	}
 }
 
-// LoadFunc builds a scorer from installed, hash-verified files.
+// LoadFunc builds a scorer from installed files whose hashes were verified.
 type LoadFunc func(p Paths) (detector.Scorer, error)
 
 // LoadORT loads the runtime with dlopen and the graph with the SPEC §16.5

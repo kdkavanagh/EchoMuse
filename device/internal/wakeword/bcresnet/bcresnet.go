@@ -1,7 +1,7 @@
 // Package bcresnet implements the deployed BC-ResNet artifact contract of
-// SPEC §5.1: the sidecar, the per-window preparation, and the wake probability.
-// It holds no streaming state; windowing, hops, and smoothing belong to
-// wakeword/detector.
+// SPEC §5.1: the sidecar, how it prepares each window, and the wake
+// probability. It holds no streaming state; windowing, hops, and smoothing
+// belong to wakeword/detector.
 package bcresnet
 
 import (

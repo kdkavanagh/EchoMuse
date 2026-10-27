@@ -762,7 +762,7 @@ def test_recognition_reads_an_intents_slots_targets_and_unmatched_words_in_the_l
             assert sent[0]["language"] == "en" and "language" not in sent[1]   # None: HA's own language
             assert unpause.intent == "HassMediaUnpause" and unpause.details["area"].value == "Living Room"
             assert "media_player.hifi_2" in unpause.targets and list(unpause.targets) == sorted(unpause.targets)
-            assert (play.intent, play.details, play.targets) == (None, {}, ())   # a trigger says no more
+            assert (play.intent, play.details, play.targets) == (None, {}, ())   # a trigger has nothing more to give
             assert probe.unmatched == {"device_class": "time ", "state": "it zqxj"}
             assert probe.details["domain"].value == "cover" and not probe.match and probe.unfilled_slots
     run(scenario())

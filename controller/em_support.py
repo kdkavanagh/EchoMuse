@@ -65,7 +65,7 @@ _DEVICE_FIELDS = (
     "device_id", "approved", "firmware_ver", "firmware_previous", "os_version",
     "first_seen", "last_seen", "config_sections", "use_global_config",
     "esphome_port", "ble_proxy_port", "ble_proxy_enabled",
-    # A device in sample-collection or ambient-recording mode answers nothing
+    # A device in sample collection or ambient recording mode answers nothing
     # on purpose, which is exactly what a support report describes when it
     # says "it stopped working". Two booleans settle it; without them the
     # bundle shows a healthy device with no turns and no explanation.
@@ -250,9 +250,9 @@ class CpuHistory:
     Controller CPU over the windows `uptime` and `top` would give you.
 
     A lifetime average alone cannot tell "busy for the last minute" from
-    "busy for an hour four hours ago", and those want opposite investigations.
+    "busy for an hour four hours ago", and those need opposite investigations.
     Three windows are enough to point somewhere without becoming a metrics
-    system: 1m says what is happening now, 1h says whether it is new.
+    system: 1m shows what is happening now, and 1h shows whether it is new.
 
     Deliberately cheap: one `os.times()` read every `INTERVAL_S` on a ticker
     that already exists, into a ring bounded by the longest window. No task,

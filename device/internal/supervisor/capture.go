@@ -10,12 +10,12 @@ import (
 	pkgmic "github.com/wilbowes/EchoMuse/pkg/mic"
 )
 
-// captureBlock is the per-block device flow of §8.1: index the callback,
+// captureBlock handles each device block as §8.1 requires: index the callback,
 // append canonical PCM to the mic ring, complete cells into the cell ring,
 // store the period's AFE record, feed the detector, and wake the uplink
 // sender. A missing range is recorded as missing everywhere; nothing invents
-// silence. While privacy-muted the block is discarded (§3.2 invariant 10);
-// only the AFE decoder's health is still counted. Allocation-free.
+// silence. While privacy is muted, the block is discarded (§3.2 invariant 10);
+// only the AFE decoder's health is still counted. It does not allocate.
 func (s *Supervisor) captureBlock(in pkgmic.Block) {
 	s.capMu.Lock()
 	defer s.capMu.Unlock()

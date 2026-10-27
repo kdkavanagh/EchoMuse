@@ -1,7 +1,7 @@
 # check=skip=FromPlatformFlagConstDisallowed
 # ── Device firmware toolchain ────────────────────────────────────────────────
 #
-# Pinned by DIGEST, not by tag, and that is load-bearing rather than tidiness.
+# This is pinned by DIGEST, not by tag, and that is a requirement, not tidiness.
 #
 # This stage carries the Go toolchain and the NDK that compile the firmware, so
 # it is the layer sitting directly on top of Fire OS 6 — Android 7.1.2, API 25,
@@ -16,7 +16,7 @@
 #
 # The digest below is the image that has built every shipped firmware to date
 # (Go 1.24.0, NDK 21.4.7075529). It was `:latest` when pinned, so this froze a
-# known-good state rather than choosing a new one.
+# state we knew worked rather than choosing a new one.
 #
 # To move it: pull the new digest deliberately, build, and put the binary on a
 # real Dot before the pin changes. `go vet` and the host tests prove nothing
@@ -52,14 +52,14 @@ WORKDIR /sdk
 # firmware (adoption, OTA, rollback, auto-rollback) delivers the app with it.
 #
 # Pinned like everything that reaches a device: the JDK image by the digest
-# of its multi-arch index (resolved to linux/amd64 here), and the two SDK
+# of its index, which covers several architectures (resolved to linux/amd64 here), and the two SDK
 # zips from dl.google.com by SHA-256, as the ORT AAR is below. Google's
 # repository2-1.xml publishes only SHA-1s; the SHA-256s were computed on
 # download and the files' SHA-1s matched that index (build-tools 2076ea81…,
 # platform e7c62809…). build-tools r30.0.3 and platform android-30 are the
 # Show's API (Android 11); moving either is a change to test on the unit.
 #
-# No Gradle, no AndroidX: javac, d8, aapt2, zipalign and apksigner directly.
+# This uses no Gradle or AndroidX: javac, d8, aapt2, zipalign and apksigner run directly.
 # aapt2 and zipalign are linux-x86_64 binaries, hence linux/amd64 as for the
 # compiler stage; d8 and apksigner are jars run on this JDK.
 FROM --platform=linux/amd64 eclipse-temurin:17-jdk@sha256:fe947d993c32dd9cf651a4353a6ed723c2370b3a9d034ea4cab4775404ea531a AS companion
@@ -175,7 +175,7 @@ COPY --from=companion /out/ /
 #
 # The version is a hash of the firmware's own sources (Dockerfile.dockerignore
 # keeps Go tests out of the context), so it moves exactly when the firmware
-# does: a controller-only change rebuilds an image whose firmware the Dots
+# does: a change only in the controller rebuilds an image whose firmware the Dots
 # already run, and the dashboard offers them no update. It is compiled in as
 # client.Version, which the Dot reports in session.hello, and written beside
 # the binary for the controller to compare.
@@ -225,7 +225,7 @@ COPY controller/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 # GPU=1 swaps the CPU onnxruntime from requirements.txt for the CUDA build
 # (both provide the `onnxruntime` import, so they cannot coexist). Local
-# docker-compose.yml sets it; the published image is CPU-only. The GPU package
+# docker-compose.yml sets it; the published image uses only the CPU. The GPU package
 # has its own version line (no 1.20.1), so the pins differ deliberately.
 ARG GPU=0
 RUN if [ "$GPU" = "1" ]; then \

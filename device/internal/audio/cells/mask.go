@@ -7,14 +7,14 @@ import "sync"
 // 2.5 s, well past render queue depth plus a capture period.
 const maskRuns = 256
 
-// CaptureClock maps capture-epoch samples to monotonic ns (a capture
+// CaptureClock maps samples in a capture epoch to monotonic ns (a capture
 // clockfit.Fit).
 type CaptureClock interface {
 	SampleToNs(sample uint64) (ns int64, ok bool)
 }
 
-// RenderClock maps monotonic ns to render-epoch 48 kHz samples (the render
-// clockfit.Fit built from buffer-completion anchors).
+// RenderClock maps monotonic ns to 48 kHz samples in a render epoch (the
+// render clockfit.Fit built from buffer-completion anchors).
 type RenderClock interface {
 	NsToSample(ns int64) (sample int64, ok bool)
 }

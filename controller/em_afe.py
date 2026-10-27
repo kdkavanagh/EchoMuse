@@ -402,11 +402,11 @@ class AfeSeries:
     for its wake clip and utterance recording, None where it kept none;
     `recording` is the saved turn recording's (em_recordings.RecordingKind.TURN).
     `stages` places the turn's processing on the same capture timeline.
-    turn_series cannot know any of them; em_session attaches them when it
+    turn_series does not receive any of them; em_session attaches them when it
     persists the turn, so the dashboard can play a recording against the chart.
     `silero` is the controller's Silero probability from `silero_start`, one per
-    512-sample cell (VadTrack.read), turn_series's from the lease's VadTrack;
-    empty where it analysed none.
+    512-sample cell (VadTrack.read), which turn_series fills from the lease's VadTrack;
+    it is empty where it analysed none.
 
     A sample clip's or ambient recording's series (AfeTrack.series) is on the
     recording's own timeline instead, with no support window, utterance or

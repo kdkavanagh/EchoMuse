@@ -42,7 +42,7 @@ def test_background_is_prior_10_seconds_and_needs_one_second_support():
     tracker.observe(cell)  # known speech is excluded
     assert tracker.value(33 * CELL) == pytest.approx(-60.0)
 
-    # Current-cell E is never in its own floor; enough quieter cells lower later B.
+    # The E for the current cell is never in its own floor; enough quieter cells lower later B.
     first_low = Cell(33 * CELL, -80.0, 0.1)
     assert tracker.value(first_low.start) == pytest.approx(-60.0)
     for i in range(33, 45):
@@ -241,7 +241,7 @@ def test_candidate_steps_one_and_two_order_and_double_talk_rescue():
     assert self_playback_verdict(reference_candidate_overlaps=True, comparison=EchoResult.UNKNOWN) == PlaybackVerdict.SELF_OUTPUT
     assert self_playback_verdict(reference_candidate_overlaps=True, comparison=EchoResult.NEAR_END_PRESENT) is None
     assert self_playback_verdict(reference_candidate_overlaps=False, comparison=EchoResult.ECHO_ONLY) == PlaybackVerdict.ECHO_ONLY
-    # Echo-only still rejects after a reference-candidate double-talk rescue did not apply.
+    # Echo-only still rejects after a rescue for double talk with a reference candidate did not apply.
     assert self_playback_verdict(reference_candidate_overlaps=True, comparison=EchoResult.ECHO_ONLY) == PlaybackVerdict.SELF_OUTPUT
 
 
@@ -311,7 +311,7 @@ def test_an_answer_may_start_up_to_480_ms_before_the_reply_window(lead, taken):
     assert attr.answer_start == (first * CELL if taken else None)
 
 
-# A primed reply window (§16.6): trigger mid-cell, as the mic frontier at the chime's end is.
+# A primed reply window (§16.6): trigger mid-cell, where the mic frontier is at the chime's end.
 GUARD_TRIGGER = 40 * CELL + 256
 GUARD_CELLS = 11                       # cells 40‥50 overlap [trigger, trigger + 320 ms)
 
@@ -323,7 +323,7 @@ def _guarded():
 
 
 def test_no_run_opens_inside_a_primed_reply_windows_guard():
-    # Room noise the restored state still calls speech, for the guard's length: never an answer.
+    # Room noise that the restored state still calls speech, lasting the guard's length, is never an answer.
     attr = _guarded()
     noise = _vads(attr, [0.9] * GUARD_CELLS, first=40)
     assert all(c.cls == CellClass.UNKNOWN and c.rule == Rule.GUARD and not c.command for c in noise)

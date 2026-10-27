@@ -1,4 +1,4 @@
-"""Transcript correction service (SPEC §16.8): revisioned tables and the HA calls.
+"""Transcript correction service (SPEC §16.8): tables with revisions and the HA calls.
 
 The tables, their pronunciations and every computation on them live in the child process
 em_text_fix_worker runs; this side holds only the published revision (`TablesInfo`) and

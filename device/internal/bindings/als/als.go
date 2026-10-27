@@ -27,9 +27,9 @@
 // So the 2584 is NOT FITTED here (-6 is ENXIO — nothing acknowledges at
 // 0x29), and on the G090LF096 batch it is the 2584 that is present and the
 // 2540 that goes unanswered, surfacing through IIO as
-// /sys/bus/iio/devices/iio:device0 instead of on the i2c bus. That is a
-// second-sourced part, not a driver fault: matching `tsl2540` specifically is
-// right for the hardware it names, and reaching the other batch means reading
+// /sys/bus/iio/devices/iio:device0 instead of on the i2c bus. That is a part
+// from a second source, not a driver fault: matching `tsl2540` specifically
+// is right for the hardware it names, and reaching the other batch means reading
 // the IIO sensor too, not loosening this match to a "tsl" prefix.
 //
 // Do NOT try to force the driver on via /sys/bus/i2c/drivers/tsl2540/unbind.
@@ -71,11 +71,11 @@ const RetryInterval = 30 * time.Second
 // point it at a fixture directory — nothing reassigns it at runtime.
 var i2cGlob = "/sys/bus/i2c/devices/*/name"
 
-// iioDriverName is the IIO `name` attribute of the second-sourced ALS that a
-// Fire OS 6 kernel binds instead of the tsl2540 — the tsl258x driver sets
-// indio_dev->name from the i2c client name (upstream tsl2583.c), which is
-// the same "tsl2584tsv" board string already seen at i2c 0-0029 (never
-// bound there: -6/ENXIO, see above). docs/fireos6-port.md §2.
+// iioDriverName is the IIO `name` attribute of the ALS that comes from a
+// second source. A Fire OS 6 kernel binds it instead of the tsl2540 — the
+// tsl258x driver sets indio_dev->name from the i2c client name (upstream
+// tsl2583.c), which is the same "tsl2584tsv" board string already seen at i2c
+// 0-0029 (never bound there: -6/ENXIO, see above). docs/fireos6-port.md §2.
 const iioDriverName = "tsl2584tsv"
 
 // iioGlob is where the IIO bus is enumerated — one `name` file per
@@ -90,15 +90,15 @@ var alsPsPath = "/sys/bus/platform/drivers/als_ps/lux"
 // alsPsPollPath switches the als_ps driver's polling on. Fire OS's sensor
 // stack keeps it on; on LineageOS 18.1 nothing does, and lux then reads a
 // stale cache ("0 lux" until the first poll; docs/echo-show-crown.md §8.5).
-// Write-only: reading it is an I/O error. A variable for the tests.
+// You can only write it: reading it is an I/O error. A variable for the tests.
 var alsPsPollPath = "/sys/bus/platform/drivers/als_ps/enable_als_polling"
 
 // alsPsName stands for the als_ps driver in Status.Seen.
 const alsPsName = "als_ps"
 
-// StatusCode is why the sensor is or is not available. Stable identifiers,
-// because the controller and dashboard key off them; the human-readable
-// part rides in Status.Detail.
+// StatusCode is why the sensor is or is not available. These are stable
+// identifiers, because the controller and dashboard key off them; the
+// human-readable part rides in Status.Detail.
 type StatusCode string
 
 const (
@@ -127,9 +127,9 @@ const (
 // device, to a file that a reboot clears and that support bundles do not
 // collect (issue #90). Two users with no sensor could not be told apart from
 // each other, or from a device whose driver simply had not bound, without a
-// shell session on their own hardware. The reason is a hardware fact the
-// device already knows at registration — so it should be reported, not left
-// for someone to go and look for.
+// shell session on their own hardware. The reason is a hardware fact available
+// at registration, so it should be reported instead of left for someone to go
+// and look for.
 type Status struct {
 	Code StatusCode `json:"code"`
 	// Detail is a sentence for a human reading a support bundle.
@@ -180,9 +180,9 @@ func EnablePolling() {
 //
 // On the Fire OS 6 Dots measured the tsl2540 is never bound (board data
 // lists it; nothing answers at 0x39 — see the package doc). They bind the
-// second-sourced tsl2584tsv over IIO instead of the raw i2c bus, through the
-// tsl258x driver. So the i2c scan runs first — it matches a Dot whose
-// tsl2540 answers — and the IIO bus is tried only once it comes up empty.
+// tsl2584tsv, which comes from a second source, over IIO instead of the raw i2c
+// bus through the tsl258x driver. So the i2c scan runs first — it matches a Dot
+// whose tsl2540 answers — and the IIO bus is tried only once it comes up empty.
 func resolve() string {
 	mu.Lock()
 	defer mu.Unlock()
@@ -229,7 +229,7 @@ func resolve() string {
 		return path
 	}
 	// Record the verdict on EVERY scan, not only the first. The log line
-	// below is deliberately once-only, but a status that went stale would
+	// below is deliberately logged only once, but a status that went stale would
 	// report an old answer for a device whose bus has since changed.
 	if nameMatched {
 		status = Status{

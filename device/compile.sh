@@ -1,7 +1,7 @@
 #!/bin/bash
 # Builds the firmware exactly as the controller image bundles it: the
-# `firmware` stage of controller/Dockerfile (same pinned toolchain, same
-# source-hash version), exported to device/build/ as `server` + `version`.
+# `firmware` stage of controller/Dockerfile (same pinned toolchain and a
+# version based on the source hash), exported to device/build/ as `server` + `version`.
 #
 # The controller installs only the firmware inside its own image, so a
 # Docker deployment never needs this. It is for a bare-metal controller

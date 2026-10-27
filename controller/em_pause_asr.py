@@ -67,7 +67,7 @@ class WyomingServer:
 @dataclass(frozen=True, slots=True)
 class PauseDecode:
     """The server's transcript of the utterance through sample `through`, at one pause.
-    `text` None: no usable answer (`error` says why); Kroko's result stands alone.
+    `text` None: no usable answer (`error` gives the reason); Kroko's result stands alone.
     `ms`: from the pause that sent the request to its answer, or to its being dropped."""
 
     through: int

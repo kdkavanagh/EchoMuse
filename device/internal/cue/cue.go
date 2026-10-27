@@ -82,7 +82,8 @@ func Asset(name string) ([]int16, error) {
 	return pcm, nil
 }
 
-// OfflineNotice is what a wake heard with no controller plays: the spoken
-// notice, its own trailing pause, then the no-input chime. It is not a
-// render.start asset. The slice is shared and must not be modified.
+// OfflineNotice is what the device plays when it hears a wake but has no
+// controller: the spoken notice, its own trailing pause, then the no-input
+// chime. It is not a render.start asset. The slice is shared and must not be
+// modified.
 func OfflineNotice() []int16 { return offlineNotice }

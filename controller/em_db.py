@@ -759,7 +759,7 @@ MIGRATIONS: list[str] = [
     # key. Harmless to the DEVICE (get_effective_device_config only reads
     # in-scope keys) but not to the dashboard, which merged the stored dict
     # over the fleet config and so displayed a device's stale settings while
-    # every section claimed to be following the fleet — Office showed
+    # every section looked like it was following the fleet — Office showed
     # hey_rhasspy/standard while actually running hey_mycroft/malevolent.
     #
     # The display bug is fixed properly in dashboard.jsx (filter, don't
@@ -802,8 +802,8 @@ MIGRATIONS: list[str] = [
     # controller did NOT wake? Crossings with no corresponding turn are the
     # false-accept side of the comparison, which per-turn rows structurally
     # cannot show. dev_frames is the denominator that makes the rest legible,
-    # and dev_drops says whether the device kept up at all — a shadow run that
-    # dropped half its frames is not evidence about detection quality.
+    # and dev_drops reports whether the device kept up at all — a shadow run
+    # that dropped half its frames is not evidence about detection quality.
     """
     ALTER TABLE turns ADD COLUMN dev_wake_score REAL;
     ALTER TABLE turns ADD COLUMN dev_wake_delta_ms INTEGER;
@@ -945,7 +945,7 @@ MIGRATIONS: list[str] = [
     # process. The restart case is stronger here, not weaker — someone leaves
     # a room recording for an hour, and a controller that came back with the
     # mode silently off would show a device that is recording nothing while
-    # its ring says otherwise. On reconnect the mode is re-armed and a NEW
+    # its ring indicates otherwise. On reconnect the mode is re-armed and a NEW
     # file is started; the interrupted one is recovered from its `.part` by
     # em_ambient.recover rather than lost.
     """
@@ -1565,9 +1565,9 @@ def _backup_before_migrating(conn: sqlite3.Connection, current: int) -> None:
     accumulate a backup per attempt. One file per starting version is enough
     to get back to where you were, and cannot fill a disk on its own.
 
-    A backup that cannot be written is a refusal to migrate, not a warning.
-    Disk-full is precisely when you want the schema left alone, and a warning
-    logged at startup is a warning nobody reads until afterwards. Set
+    A backup that cannot be written stops the migration, rather than merely
+    warning about it. Disk-full is precisely when you want the schema left
+    alone, and nobody reads a startup warning until afterwards. Set
     EM_SKIP_DB_BACKUP=1 to proceed anyway.
     """
     if current == 0:
@@ -1608,7 +1608,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
     #
     # A database from a NEWER controller. MIGRATIONS[current:] is empty here,
     # so without this the old build starts silently and runs against a schema
-    # it does not know. That mostly works — the newer schema is a superset —
+    # it was not written for. That mostly works — the newer schema is a superset —
     # but "mostly" is the problem: the failure surfaces as odd behaviour
     # somewhere else rather than as an error here, and it happens exactly when
     # someone has rolled an image back and is already troubleshooting.

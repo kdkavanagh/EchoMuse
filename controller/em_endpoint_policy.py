@@ -81,8 +81,9 @@ def recognized_completeness(text: Recognized | None, probe: Recognized | None) -
 
     A full match is `complete`, unless the text plus a word nobody says also
     matches: then a wildcard (`(play) {query}`, `the weather [like] {when}`)
-    can take more words and it is `extendable`. No match with slots left
-    unfilled is `needs_more`; nothing recognized is `unknown`.
+    can take more words and it is `extendable`. When nothing matches but the
+    closest intent left slots unfilled, it is `needs_more`; when nothing is
+    recognized at all, it is `unknown`.
     """
     if text is None:
         return GrammarClass.UNKNOWN

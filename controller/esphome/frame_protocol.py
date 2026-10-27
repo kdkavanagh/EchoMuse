@@ -69,8 +69,8 @@ MAX_PLAINTEXT_FRAME_SIZE = 65535
 # restart. Keepalive gives the OS a way to actually detect the dead peer
 # instead of waiting indefinitely for a FIN that may never come.
 #
-# Values chosen for "a human already knows something's wrong" latency, not
-# ESPHome-protocol-mandated — the protocol has no opinion on this, it's
+# Values chosen for the latency by which a person already knows something is
+# wrong, not mandated by the ESPHome protocol, which sets no requirement; it is
 # pure TCP hygiene sitting below it. ~30s to first probe, 3 missed probes
 # 10s apart = dead connection reaped within ~60s of actually going dark.
 _KEEPALIVE_IDLE_SEC = 30

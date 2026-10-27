@@ -1,4 +1,4 @@
-"""Per-utterance evidence composition and endpoint decisions (SPEC §7, §8, §9, §16.2, §16.6).
+"""Compose per-utterance evidence and make endpoint decisions (SPEC §7, §8, §9, §16.2, §16.6).
 
 Pure: no I/O, no clocks. The session actor feeds device cell records and
 speech-worker observations in sample order; this module joins them into
@@ -320,7 +320,7 @@ class RecognitionTrace(TypedDict):
 class PauseTranscript(TypedDict):
     """One transcriber's words at one pause (§16.6). `text` is its transcript of the
     utterance through the pause, wake word included, and `ms` the wall clock from the pause
-    to it; both None while it gave none: `error` says why (`superseded`, `timeout`, a
+    to it; both None while it gave none: `error` gives the reason (`superseded`, `timeout`, a
     failure), and with no error the decision came first. `judged` is the text judged on
     those words (wake phrase cut, normalized) and `at` the block from which it was; both
     None when they never were: empty, dropped, after the decision, or, for Kroko, the

@@ -296,8 +296,8 @@ def _text(value: object) -> str | None:
 
 
 def _platform(body: Mapping[str, object]) -> DevicePlatform | None:
-    """`platform`; None when absent or naming an image this controller does
-    not know. `LinkHub.admit` refuses such a session."""
+    """`platform`; None when absent or when it names an image the controller
+    does not support. `LinkHub.admit` refuses such a session."""
     value = body.get("platform")
     return DevicePlatform(value) if isinstance(value, str) and value in DevicePlatform else None
 
@@ -309,9 +309,9 @@ class SessionHello:
     `capabilities` keeps every announced name, known or not; compare against
     `Capability` members. `alerts` is the raw `alerts` object, which the
     alert engine owns. `platform` is None when the device names no image or
-    one this controller does not know (see `_platform`); `platform_sent` is
-    what it sent, for the refusal log. `os_version` is the Fire OS build the
-    device runs (`ro.build.version.name`), separate from `firmware_version`,
+    an image the controller does not support (see `_platform`); `platform_sent`
+    is what it sent, for the refusal log. `os_version` is the Fire OS build
+    the device runs (`ro.build.version.name`), separate from `firmware_version`,
     the EchoMuse binary; None when not reported. `volume_available` is False
     when `volume.level` is JSON null: the device (an Echo Show whose Android
     volume check failed) has no volume control this session and ignores
@@ -540,7 +540,7 @@ def _validate_link_body(msg_type: MessageType, body: dict[str, object]) -> None:
 def parse_envelope(raw: str | bytes) -> Envelope | UnknownEnvelope:
     """Decode and validate one D→C control frame. Raises `ProtocolError`.
 
-    Session and device identity are checked by the caller, which knows them.
+    The caller checks the session and device identity.
     """
     if isinstance(raw, bytes):
         raise tl.ProtocolError("malformed_message", "control frames are text")

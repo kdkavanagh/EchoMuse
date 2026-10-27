@@ -24,7 +24,7 @@
 // internal/mixerapi (the Dot's mixer daemon) and internal/opensl (the
 // Show's AudioFlinger).
 //
-// No cgo, no build tag: host-testable.
+// It has no cgo or build tag, so host tests can use it.
 package playclock
 
 // Clock is one render stream's playout estimate. It is owned by the

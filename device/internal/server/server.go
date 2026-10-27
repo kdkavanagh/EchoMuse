@@ -81,7 +81,7 @@ func New(cfg Config) *Server {
 }
 
 // InitLEDs waits for the native LED boot sequence, claims the I2C ring, and
-// paints the currently sovereign local state.
+// paints the local state that currently takes precedence.
 func (s *Server) InitLEDs() error {
 	if uptime, err := getUptime(); err == nil && uptime < 5*time.Second {
 		time.Sleep(5*time.Second - uptime)
@@ -108,11 +108,11 @@ func (s *Server) SetLEDs(values []led.Led) { s.ring.setPartial(values) }
 // StartAnim starts the retained controller animation.
 func (s *Server) StartAnim(spec AnimSpec) { s.ring.animate(LayerController, spec) }
 
-// ClearControllerLEDs ends controller-owned dialog indication. Local layers
-// (privacy, alert, disconnected/pending) remain (§11.2).
+// ClearControllerLEDs ends dialog indication that the controller owns. Local
+// layers (privacy, alert, disconnected/pending) remain (§11.2).
 func (s *Server) ClearControllerLEDs() { s.ring.clear(LayerController) }
 
-// LinkState is the device-local link indication.
+// LinkState is the link indication that the device shows.
 type LinkState uint8
 
 const (
@@ -121,7 +121,7 @@ const (
 	LinkPending                  // pending approval: slow white pulse
 )
 
-// SetLinkState paints or clears the device-local link layer.
+// SetLinkState paints or clears the link layer that the device shows.
 func (s *Server) SetLinkState(state LinkState) {
 	switch state {
 	case LinkPending:
@@ -181,7 +181,7 @@ func (s *Server) SetMuteChangeCallback(cb func(bool)) { s.mute.setCallback(cb) }
 
 // SetAlertAudio applies the occurrence DAC override and alert speaker route.
 // A foreground alert forces the internal amp on even with headphones inserted
-// and restores the insertion-driven amp state on release (§16.5).
+// and restores the amp state that follows headphone insertion on release (§16.5).
 func (s *Server) SetAlertAudio(active bool, id string, foreground bool, volume *float64) {
 	s.volume.setAlert(active, id, foreground, volume)
 	s.SetAlertIndication(active, foreground)

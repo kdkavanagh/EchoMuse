@@ -55,7 +55,7 @@ def test_a_summary_covers_every_period_overlapping_the_span():
     assert (s.periods_expected, s.periods_received, s.periods_with_frames) == (4, 3, 2)
     assert (s.frames, s.frames_expected, s.playback_frames) == (18, 40, 9)
     assert (s.erle_max, s.erle_frames) == (26, 6)
-    assert s.erle_mean == pytest.approx((10 * 2 + 16 * 4) / 6)          # non-zero mean, frame-weighted
+    assert s.erle_mean == pytest.approx((10 * 2 + 16 * 4) / 6)          # non-zero mean, weighted by frames
     assert (s.dtd_max, s.dtd_frames) == (1.0, 1)
     assert (s.rms_max_db, s.rms_mean_db) == (-40, -50.0)                 # only period 1 computed RMS
     assert (s.vad_max, s.vad_frames) == (0.5, 4)
@@ -155,7 +155,7 @@ def test_stored_evidence_with_absent_fields_reads_as_no_data():
         em_afe.AfeEvidence.loads('{"wake": {"start": 0}}')
 
 
-# --- per-period series ------------------------------------------------------------------
+# --- series for each period ------------------------------------------------------------------
 
 
 def test_the_series_holds_every_period_from_the_second_before_the_wake_through_the_utterance():
@@ -201,7 +201,7 @@ def test_a_turn_series_carries_silero_for_its_cells_from_the_first_analysed_thro
     assert w["silero_start"] == 62 * 512
     assert w["silero"] == [0.2] * 3 + [0.7] + [0.2] * 5 + [None, None] + [0.912] * 8
     assert json.loads(json.dumps(w)) == w
-    # Without Silero (a near miss, a recording) both keys say so, never zeros.
+    # Without Silero (a near miss, a recording) both keys show that, never zeros.
     plain = em_afe.turn_series(store, (48_000, 60_800), (43_200, 70_400)).wire()
     assert (plain["silero_start"], plain["silero"]) == (None, [])
 

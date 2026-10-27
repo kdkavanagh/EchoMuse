@@ -26,7 +26,7 @@
 // system_server, which registers it well after audioserver runs at boot, so
 // Verify first waits a bounded time for the "audio" binder service to exist.
 //
-// Key-driven changes are noticed without polling binder every second:
+// The code notices changes from keys without polling binder every second:
 // AudioService persists every index change to the system settings
 // (volume_music_speaker in /data/system/users/0/settings_system.xml, plain
 // XML on both builds) about 0.5 s after it, so the file's modification time
@@ -304,8 +304,8 @@ func (c *Control) waitRegistered() error {
 	return nil
 }
 
-// Watch reports key-driven (or kiosk-driven) index changes to onChange
-// until ctx ends; changes made by SetIndex are not reported. onChange runs
+// Watch reports index changes from keys or the kiosk to onChange until ctx
+// ends; changes made by SetIndex are not reported. onChange runs
 // on Watch's goroutine with no lock held. Without the settings file it
 // reads the index every second instead.
 func (c *Control) Watch(ctx context.Context, onChange func(index int)) {

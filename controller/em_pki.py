@@ -1,5 +1,5 @@
 """
-EchoMuse Controller — device-link PKI.
+EchoMuse Controller — PKI for device links.
 
 Generates and persists a private CA plus a server certificate for the
 device WebSocket TLS listener. Files live in TLS_DIR (default: a tls/

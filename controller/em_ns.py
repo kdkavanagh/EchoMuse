@@ -1,5 +1,5 @@
 """
-DTLN streaming noise suppression — controller-side, ASR-bound audio only.
+DTLN streaming noise suppression runs on the controller and affects only audio sent to ASR.
 
 The device's vendored RNNoise was never usable (48kHz-native model fed
 16kHz audio) and is gone; capture processing belongs to the native AFE.

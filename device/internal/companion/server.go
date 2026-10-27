@@ -53,7 +53,7 @@ type ServerConfig struct {
 	// TurnViewLinger is config turnViewLinger at start, sent to the plugin
 	// after its hello.
 	TurnViewLinger float64
-	// Press receives honoured touches as action-button edges.
+	// Press receives touches it honours as action-button edges.
 	Press func(pkgbuttons.ButtonClickEvent)
 	// Linked, Mismatch and Overlay reach the app's Installer: an app linked
 	// or unlinked, an app speaking another link version (reinstall), an app
@@ -80,8 +80,8 @@ type ServerConfig struct {
 // zones and screen requests, and its presses in an active zone become
 // action-button edges; the plugin gets its config, frames, turn views and
 // timers.
-// One connection per role; a newly accepted one replaces the old one of its
-// role only.
+// One connection per role; a newly accepted connection replaces the old
+// connection only for its role.
 type Server struct {
 	cfg  ServerConfig
 	sink *Sink

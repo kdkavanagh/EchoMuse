@@ -194,7 +194,7 @@ static int32_t em_aa_write(const em_aa_lib *l, AAudioStream *s, const void *buf,
 }
 
 /* em_aa_timestamp reads the stream's latest (frame position, CLOCK_MONOTONIC
- * ns) pair; non-zero when AAudio has none to give. */
+ * ns) pair; it returns non-zero when AAudio has none to give. */
 static int32_t em_aa_timestamp(const em_aa_lib *l, AAudioStream *s, int64_t *pos, int64_t *ns) {
 	return l->getTimestamp(s, CLOCK_MONOTONIC, pos, ns);
 }

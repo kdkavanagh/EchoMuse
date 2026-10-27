@@ -663,7 +663,7 @@ class Device:
             body: dict[str, object] = {k: cfg[k] for k in DEVICE_CONFIG_KEYS
                                        if k in cfg and (self.volume_available or k != "startupVolume")}
             if self.local_wake_chime_capable:
-                # Only to firmware that knows the key: it chimes at candidate open (§11.2).
+                # Only to firmware that supports the key: it chimes at candidate open (§11.2).
                 body["wakeSound"] = em_config_sections.wake_sound(cfg)
             if self.screen_wake_capable:
                 # Only to firmware that lights a kiosk screen at candidate open.

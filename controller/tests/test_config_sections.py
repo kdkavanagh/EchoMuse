@@ -216,7 +216,7 @@ def test_v11_prunes_out_of_scope_values_from_migrated_rows(tmp_path, monkeypatch
     fully-inheriting device still stored a value for every key. The device
     was unaffected (merge only reads in-scope keys) but the dashboard merged
     the stored dict over the fleet config and showed stale settings under
-    sections that claimed to be following the fleet.
+    sections that appeared to be following the fleet.
     """
     db_path = tmp_path / "t.db"
     em_db.init(str(db_path))

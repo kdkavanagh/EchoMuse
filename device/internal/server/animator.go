@@ -8,7 +8,7 @@ import (
 	"github.com/wilbowes/EchoMuse/pkg/led"
 )
 
-// AnimSpec describes a device-rendered ring animation: the retained
+// AnimSpec describes a ring animation the device renders: the retained
 // `led_anim` body's "anim" object (WIRE §4.8), also used for the device's own
 // link and alert indications. Frames are rendered on the device's ticker.
 type AnimSpec struct {

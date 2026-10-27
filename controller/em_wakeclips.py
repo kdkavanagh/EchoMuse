@@ -12,7 +12,7 @@ This module stores that clip. When a turn started by an accepted
 the lease's mic timeline — support start −300 ms through `support_end` — and,
 if `saveWakeClips` is set for the device, writes it here once the turn's
 rowid exists. The clips serve two jobs: listening to why a device woke, and
-false-positive/true-positive material for BCResNet training, which lives
+examples of false and true positives for BCResNet training, which lives
 outside this repository (`~/git/bcresnet`). Consequences of that shape:
 
   * **The clip is the audio the device scored.** The mic stream is the
@@ -32,7 +32,7 @@ the ordering pruning depends on is exact even after a restore from a backup
 that flattened every timestamp, and the Activity row that shows the false
 positive links straight to the clip that caused it.
 
-Pure path/filesystem logic (no aiohttp, no db import) so it can be unit
+This module holds only path and filesystem logic (no aiohttp, no db import), so it can be unit
 tested; em_session writes through it and em_api serves from it.
 """
 

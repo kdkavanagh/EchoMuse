@@ -28,7 +28,7 @@ import "github.com/wilbowes/EchoMuse/internal/audio/clockfit"
 // so no pair from the old stream is ever mapped onto the new one's frames.
 // The previous stamp is kept, so stamps stay monotonic across the re-open.
 //
-// No cgo, no build tag: host-testable.
+// It has no cgo or build tag, so host tests can use it.
 type fitClock struct {
 	fit  *clockfit.Fit
 	last int64 // the previous stamp; 0 before the first
@@ -55,7 +55,7 @@ func newFitClock() *fitClock {
 	return &fitClock{fit: clockfit.New(16000, periodNs)}
 }
 
-// reset forgets the fit, for a re-opened stream whose frames count from 0.
+// reset forgets the fit for a stream that was reopened and whose frames count from 0.
 func (c *fitClock) reset() {
 	c.fit.Reset()
 	c.havePair = false

@@ -35,9 +35,9 @@ module rather than a flag on that one:
     80ms frame, which keeps the executor hop off the busiest path in the
     controller without holding audio that a crash would lose.
 
-  * **The header is patched at the end.** A streamed WAV cannot know its own
-    length when it is opened, so the 44-byte header is written with zero
-    sizes and rewritten on close. That makes crash recovery arithmetic
+  * **The header is patched at the end.** A streamed WAV's length is unknown
+    when it is opened, so the 44-byte header is written with zero sizes and rewritten
+    on close. That makes crash recovery arithmetic
     rather than guesswork: `finalize()` derives both size fields from the
     file length, so a `.part` left behind by a killed controller is promoted
     to a playable WAV instead of discarded (`recover()`), and the audio
@@ -50,8 +50,8 @@ module rather than a flag on that one:
     lose the rest of the night. A rolled recording is a new file with its
     own timestamp, which is visible in the list rather than implied.
 
-No zip endpoint, deliberately, and that is the mirror of the samples one:
-there the archive IS the feature (a training run wants the set), while here
+No zip endpoint, deliberately, and that mirrors the samples endpoint:
+there the archive IS the feature (a training run needs the set), while here
 one recording is one artefact and a 350MB in-memory zip would be a way to
 make the controller fall over from the dashboard.
 
@@ -218,8 +218,8 @@ class Recorder:
     One ambient recording, open on disk.
 
     Frames go in with `push`, which does no I/O and returns True when a
-    flush is due — the caller owns the executor hop, because it is the only
-    thing that knows it is on an event loop. `close` patches the header and
+    flush is due — the caller does the executor hop, because only the caller
+    can tell whether it is on an event loop. `close` patches the header and
     renames the `.part` into place, so nothing incomplete is ever listed.
     `origin` is the first frame's position in the caller's stream (`push`'s
     `at`), None before one: the recording is that stream's `[origin, origin

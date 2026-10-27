@@ -26,7 +26,7 @@ package slspeaker
 //
 // Estimates never decrease, so completions never step backwards.
 //
-// No cgo, no build tag: host-testable.
+// It has no cgo or build tag, so host tests can use it.
 type aaClock struct {
 	rate      int64 // frames per second
 	latencyNs int64

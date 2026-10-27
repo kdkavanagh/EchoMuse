@@ -1,4 +1,4 @@
-"""Audio decode for render: URLs to 48 kHz mono int16 via ffmpeg.
+"""Decode render audio from URLs to 48 kHz mono int16 via ffmpeg.
 
 `stream_url` serves HA TTS URLs (unauthenticated capability URLs that expire
 after ~300 s: fetched immediately, never cached, §16.7; the actor keeps only
