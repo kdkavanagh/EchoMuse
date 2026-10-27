@@ -1615,7 +1615,7 @@ async def _archive_entries(request: web.Request, clips: Sequence[em_clip_crop.Cl
 def _no_crop_message(noun: str, crop: em_clip_crop.CropSpec) -> str:
     """Why a cropped archive is empty though clips matched."""
     if crop.window_min is not None:
-        return f"No window of a saved {noun} scored at or above {crop.window_min:.2f}"
+        return f"No window of a saved {noun} scored at or above {crop.window_min:g}"
     return f"No saved {noun} could be scored"
 
 
