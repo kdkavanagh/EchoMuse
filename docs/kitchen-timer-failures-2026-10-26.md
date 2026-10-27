@@ -14,12 +14,12 @@ Sample numbers are capture samples at 16 kHz.
 
 | Issue | Turns it broke | Planned fix |
 |---|---|---|
-| The wake verifier cannot reliably answer within its 700 ms deadline. | 929, 931, 934 | Measure with the new verification records, then change the deadline or the scheduling. |
+| The wake verifier cannot answer within its 700 ms deadline, even when nothing else is running. | 929, 931, 934 | Decide on the verdict when it lands (capped), or make the verifier's decode cheaper. A priority thread would not help. |
 | A slow pause re-decode aborts the turn, because it runs inside the VAD job's 750 ms deadline. | 927, 936 | Take the pause re-decode out of the VAD job's deadline. |
 | An idle Dot in another room takes an utterance meant to stop a ringing Dot. | 933, 935 | Let a ringing Dot claim the utterance, and have idle Dots defer to it. |
-| The controller's event loop thread saturates one CPU core when two Dots listen at once (or one listens through a ring), and every deadline slips. | 927, 929, 931, 934, 936 | Find which work on the event loop costs 3–4 CPU-seconds per turn, and move it off that thread or make it cheaper. |
+| The controller's event loop thread saturates one CPU core when two Dots listen at once, and every deadline slips. A ringing alarm by itself costs nothing. | 927, 929, 931, 934, 936 | Find which work on the event loop costs 3–4 CPU-seconds per turn, and move it off that thread or make it cheaper. |
 | A wake turn has no wall-clock limit. | 927 | Add one, like reply turns have. |
-| The Dot and Kroko hear badly through a ringing alarm. | near misses 470 and 472, 932, 938 | No fix yet. Collect clips with the new retention and study them. |
+| The Dot and Kroko heard badly through the Kitchen alarm. | near misses 470 and 472, 932, 938 | No fix yet. The Living Room heard fine through its ring in the 2026-10-27 test. Collect clips with the new retention and study them. |
 
 ## 1. The verification deadline
 
@@ -62,6 +62,29 @@ The architecture document budgeted about 70 ms for the decode, using a
 real-time factor of 0.032 that left out the flush. With a typical input of
 1.5–2.5 s, the decode alone uses most or all of the 220 ms. Any wait behind
 other speech work, or any CPU contention, pushes it past the deadline.
+
+### The test on 2026-10-27 confirms it
+
+In a test on the Living Room Dot, three wakes were heard while a timer rang
+(956, 958, 960). Only that Dot was active, the controller was otherwise idle,
+and every verification passed. Their verification records show where the
+time goes:
+
+| Row | Input complete | Wait for a thread | Decode | Verdict | Margin to 700 ms |
+|---|---|---|---|---|---|
+| 956 | 416 ms | 0 ms | 286 ms | 703 ms | −3 ms |
+| 958 | 411 ms | 1 ms | 269 ms | 682 ms | 18 ms |
+| 960 | 383 ms | 1 ms | 222 ms | 605 ms | 95 ms |
+
+- **The input alone takes 383–416 ms**, because the verifier must wait for
+  480 ms of audio past the opening hop.
+- **The decode takes 222–286 ms.**
+- **Nothing queued**: each decode got a thread within 1 ms.
+
+So on an idle controller the verdict already lands at the deadline. 956's
+verdict came 3 ms late and still counted, only because the actor's periodic
+tick, which enforces the deadline, had not run yet. Any load at all turns
+these into `verifier_timeout`.
 
 Before that evening this was rare: there were 4 `verifier_timeout` rows ever,
 3 of them on that evening, against 61 verified wakes. That evening two Dots
@@ -109,14 +132,16 @@ ORDER BY id DESC;
 
 ### Next step
 
-1. Collect a few days of records. Look at the spread of `input_ready_ms`,
-   `queued_ms`, `decode_ms` and `answered_ms`, and count how many timeouts
-   have `text_passes` true.
-2. Then choose one or both:
-   - Decide on the verdict whenever it lands, with a cap of 1.5–2 s, and hold
-     the provisional duck while waiting.
-   - Give verification its own executor thread with priority, so other Dots'
-     VAD and ASR work cannot queue ahead of it.
+A separate executor thread with priority would not help, because the decode
+already starts within 1 ms. The time is in the 480 ms of lookahead and the
+decode itself. So choose one or both:
+
+- Decide on the verdict whenever it lands, with a cap of 1.5–2 s, and hold the
+  provisional duck while waiting.
+- Make the decode cheaper, for example with a shorter flush than 1.5 s of
+  zeros, after checking that the wake word is still recognized.
+
+Keep collecting the verification records to see the spread under load.
 
 ## 2. A slow pause re-decode aborts the turn
 
@@ -238,12 +263,43 @@ Reading each thread's CPU time from `/proc/<pid>/task/*/stat` once a second
 never pauses the process, and it separates the event loop thread (the
 process's main thread) from the pool threads.
 
+### The test on 2026-10-27
+
+With that sampler running, a 30-minute timer and then a 10 s timer rang on
+the Living Room Dot, and the user woke it during both rings. Only that Dot was
+active.
+
+| Time | What happened | Whole process | Event loop thread |
+|---|---|---|---|
+| 18:39:31–42 | The timer rang, nobody spoke | 1–2% | 1–2% |
+| 18:39:43–50 | Wake 956 during the ring ("Ophelia", then a "say that again" prompt) | 13–63% | 13–28% |
+| 18:39:50–53 | Reply turn 957 listening (no wake, no verification) | 24–110% | 16–98% |
+| 18:40:00–02 | Wake 958 during the ring, "stop" | 31–83% | 16–49% |
+| 18:40:42–46 | Idle turn 959, "set a ten second timer" | 29–98% | 20–62% |
+| 18:40:55–06 | The 10 s timer rang, nobody spoke | 1–2% | 1–2% |
+| 18:41:07–10 | Wake 960 during the ring, "stop" | 30–70% | 13–28% |
+
+What this shows:
+
+- **A ringing alarm by itself costs nothing.** Both rings ran at 1–2%.
+- **A wake during a ring costs about what any turn costs.** The verifier's
+  decode adds about 0.25 s on a pool thread. The two pool threads reached
+  30–36% each.
+- **The heaviest moment had no wake and no verification at all.** While reply
+  turn 957 listened, the event loop thread ran at 78–98% for 3 s.
+
+The cost is in how the controller processes any listening turn on its event
+loop thread, not in the ring or the verifier.
+
 **Fix:** find out which work on the event loop thread costs 3–4 CPU-seconds
-per turn, and move it off that thread or make it cheaper. Candidates to
-measure first: decoding and filing the audio frames, the session actor's
-per-cell work, and the TLS and websocket handling of the device links. Adding
-pool threads alone would not help, because the loop is the thread that
-saturates.
+per turn, and move it off that thread or make it cheaper. To find it without
+py-spy, add a sampler inside the controller that is switched on by an
+environment variable: a background thread that records the event loop
+thread's stack with `sys._current_frames()` many times a second. Candidates
+to measure first: decoding and filing the audio frames, the session actor's
+per-cell work, the TLS and websocket handling of the device links, and live
+updates pushed to an open dashboard. Adding pool threads alone would not
+help, because the loop is the thread that saturates.
 
 ## 5. Wake turns have no wall-clock limit
 
@@ -273,6 +329,11 @@ took 7–13 dB off on average (ERLE mean in the AFE evidence).
   user tried earlier, the wake model did not register those attempts at all.
 - 938 (21:04:42, score 0.80) was refused as `unverified_wake`. It kept no
   audio, because the Dot's session had no AFE metadata at the time.
+
+In the 2026-10-27 test on the Living Room Dot, all three wakes during its two
+rings opened candidates (scores 0.97–1.00) and passed verification, and Kroko
+heard "Ophelia, stop" and "Ophilia stop". So the problem may be specific to
+the Kitchen Dot or to how far the user stood from it.
 
 No fix is planned yet. With Save wake clips and Save utterances on, refused
 wakes now keep their clips and traces. Gather more of them during rings before
