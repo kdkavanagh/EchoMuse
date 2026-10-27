@@ -442,6 +442,13 @@ func (e *Executor) DiagnosticLive() bool {
 	return false
 }
 
+// Leased reports whether any lease is open, of any reason.
+func (e *Executor) Leased() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.leases) > 0
+}
+
 // Notify wakes the sender; the supervisor calls it after ring appends.
 func (e *Executor) Notify() {
 	select {

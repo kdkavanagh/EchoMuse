@@ -27,9 +27,10 @@ type LostReason string
 
 // Session loss reasons passed to Handler.Lost.
 const (
-	LostClosed   LostReason = "closed"       // a socket closed or failed
-	LostTimeout  LostReason = "session_lost" // 3 s without a control message (§16.1)
-	LostProtocol LostReason = "protocol"     // a protocol.error ended the session
+	LostClosed      LostReason = "closed"       // a socket closed or failed
+	LostTimeout     LostReason = "session_lost" // 3 s without a control message (§16.1)
+	LostProtocol    LostReason = "protocol"     // a protocol.error ended the session
+	LostRenegotiate LostReason = "renegotiate"  // the device ended it to send a new hello (Session.Renegotiate)
 )
 
 // Handler receives the session lifecycle and every C→D message the link does
@@ -97,10 +98,14 @@ func New(cfg Config, h Handler) *Link {
 	return &Link{cfg: cfg, h: h, t: defaultTimings}
 }
 
-var errRejected = errors.New("client: session rejected")
+var (
+	errRejected    = errors.New("client: session rejected")
+	errRenegotiate = errors.New("client: session ended to send a new hello")
+)
 
 // Run discovers the controller, holds a session, and reconnects from
-// session.hello after every loss until ctx ends.
+// session.hello after every loss until ctx ends. A session the device ended
+// with Session.Renegotiate reconnects at once.
 func (l *Link) Run(ctx context.Context) {
 	l.shell.ctx = ctx
 	defer l.shell.close()
@@ -109,8 +114,11 @@ func (l *Link) Run(ctx context.Context) {
 		server, err := l.find(ctx)
 		if err == nil {
 			err = l.connect(ctx, server)
-			if errors.Is(err, errRejected) {
+			switch {
+			case errors.Is(err, errRejected):
 				delay = l.t.rejected
+			case errors.Is(err, errRenegotiate):
+				delay = 0
 			}
 		}
 		if ctx.Err() != nil {
@@ -198,6 +206,9 @@ func (l *Link) connect(ctx context.Context, server *discovery.ServerInfo) error 
 	s := newSession(ctx, l, ready.SessionID, addr, ctrl, audio, newAssetTransport(assetsConn, dialAssets))
 	reason := s.run(func() { l.h.Ready(s, ready) })
 	l.h.Lost(reason)
+	if reason == LostRenegotiate {
+		return fmt.Errorf("%w (session %s)", errRenegotiate, ready.SessionID)
+	}
 	return fmt.Errorf("client: session %s lost: %s", ready.SessionID, reason)
 }
 

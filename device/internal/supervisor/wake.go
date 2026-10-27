@@ -278,8 +278,10 @@ func (s *Supervisor) activate(ctx context.Context, sess Session, r proto.Session
 	th := detector.Thresholds{Idle: d.Thresholds.Idle, Playback: d.Thresholds.Playback, NearMiss: d.Thresholds.NearMiss}
 	want := wakeword.Assets{RuntimeSHA256: r.Assets.RuntimeSHA256, GraphSHA256: r.Assets.GraphSHA256, SidecarSHA256: r.Assets.SidecarSHA256}
 	s.wg.Add(1)
+	s.activating.Add(1)
 	go func() {
 		defer s.wg.Done()
+		defer s.activating.Add(-1)
 		if err := s.act.Activate(ctx, sess.Assets(), want, th, rules); err != nil {
 			log.Printf("[wake] activate: %v", err)
 		}

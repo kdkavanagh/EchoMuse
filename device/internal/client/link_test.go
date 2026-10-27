@@ -268,6 +268,19 @@ func TestHandshakeOpensSessionSockets(t *testing.T) {
 	waitFor(t, c.hello, "second session.hello")
 }
 
+// Renegotiate ends the session with LostRenegotiate, and the link sends the
+// next session.hello without waiting out the reconnect delay.
+func TestRenegotiateReconnectsAtOnce(t *testing.T) {
+	c := newController(t)
+	rec := start(t, c, func(tm *timings) { tm.reconnect = time.Minute })
+	waitFor(t, c.hello, "session.hello")
+	waitFor(t, rec.ready, "Ready").Renegotiate()
+	if reason := waitFor(t, rec.lost, "Lost"); reason != LostRenegotiate {
+		t.Fatalf("lost %q", reason)
+	}
+	waitFor(t, c.hello, "second session.hello")
+}
+
 func TestRejectedRetriesAfterDelay(t *testing.T) {
 	c := newController(t)
 	c.onHello = func(conn *websocket.Conn) {

@@ -186,8 +186,14 @@ images. The device reports each near-miss episode that opened no candidate in
 (the ASR capture's bit 0, format v3.3; see §3) and the device's decoder is validating
 it. The firmware announces it only when a frame validated in the 2 s before
 the hello; right after start the hello waits up to 1 s for the first decoded
-capture period. With `session.ready`
-`afe_metadata`, the device serves the `afe` stream (§3, §4.5) and reports
+capture period. A hello can still go out before the first valid frame: a
+cold-booted Dot opens its microphone only after the first NTP sync, and it
+can find the controller before that. When the decoder then starts validating
+during a session whose hello lacked the capability, the device ends that
+session once it is idle (no lease, no network playback, no active alert,
+nothing audible) and sends a new hello at once, which announces it. It does
+this at most once per run. The controller sees an ordinary reconnect. With
+`session.ready` `afe_metadata`, the device serves the `afe` stream (§3, §4.5) and reports
 `wake.stats.afe` (§4.4). The values are evidence: no controller decision uses
 them (architecture §4.5).
 `wifi_control`, `ble_proxy`, `privacy_mute`: announced by firmware on the Dot

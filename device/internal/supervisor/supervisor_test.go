@@ -50,10 +50,11 @@ type ackRec struct {
 }
 
 type fakeSession struct {
-	mu     sync.Mutex
-	msgs   []sent
-	acks   []ackRec
-	assets assets.Transport // nil: the controller has no assets
+	mu           sync.Mutex
+	msgs         []sent
+	acks         []ackRec
+	assets       assets.Transport // nil: the controller has no assets
+	renegotiated int              // Renegotiate calls
 }
 
 func (f *fakeSession) Send(typ proto.MessageType, gen uint32, body any) (string, error) {
@@ -80,6 +81,18 @@ func (f *fakeSession) Ack(id string, status proto.AckStatus, code *proto.AckCode
 }
 
 func (f *fakeSession) Controller() string { return "10.0.0.2:8767" }
+
+func (f *fakeSession) Renegotiate() {
+	f.mu.Lock()
+	f.renegotiated++
+	f.mu.Unlock()
+}
+
+func (f *fakeSession) renegotiations() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.renegotiated
+}
 
 func (f *fakeSession) Audio() client.AudioSink { return nopAudio{} }
 
@@ -260,6 +273,11 @@ func (f *fakeUplink) DiagnosticLive() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.diagnostic
+}
+func (f *fakeUplink) Leased() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.diagnostic || len(f.opened) > 0
 }
 func (f *fakeUplink) SetEpochs(mic, ref uint64) {
 	f.mu.Lock()
@@ -1369,6 +1387,73 @@ func TestAFEMetadataCapabilityAndOptIn(t *testing.T) {
 	h.now.Add(int64(3 * time.Second))
 	if announced(h) {
 		t.Fatal("afe_metadata_v1 after 3 s without a valid frame")
+	}
+}
+
+// A cold-booted Dot can reach the controller before its mixer microphone
+// opens (the microphone waits for the first NTP sync), so its hello goes out
+// before the decoder's first valid frame and lacks afe_metadata_v1. Once the
+// decoder validates and the device is idle, the device ends that session,
+// and the next hello announces the capability. It does this once per run.
+func TestAFEMetadataAnnouncedAfterLateFirstValidFrame(t *testing.T) {
+	valid := afe.Period{Record: ema.AFERecord{Frames: 10, RMSMax: 200, RMSMean: 190, Volume: 70}}
+	announced := func(h *harness) bool { return slices.Contains(h.s.Hello().Capabilities, proto.CapAFEMetadata) }
+	h := newHarness(t, opts{afe: true})
+	h.afeOptIn = true
+
+	// The hello goes out before any frame validated.
+	h.afeBlock(afe.Period{})
+	if announced(h) {
+		t.Fatal("afe_metadata_v1 before any frame validated")
+	}
+	h.ready()
+	h.s.wg.Wait() // the session's speech-asset activation
+	h.s.tick()
+	if n := h.sess.renegotiations(); n != 0 {
+		t.Fatalf("%d renegotiations before a frame validated", n)
+	}
+
+	// The decoder validates during a turn: the turn finishes first.
+	h.expectAck(h.control(proto.TypeFocusAcquire, 3, proto.FocusAcquire{LeaseID: "f1", Owner: "turn", Focus: "dialog_input", TTLMs: 3000}), proto.AckAccepted, "")
+	h.afeBlock(valid)
+	h.s.tick()
+	if n := h.sess.renegotiations(); n != 0 {
+		t.Fatalf("%d renegotiations during a turn", n)
+	}
+	h.expectAck(h.control(proto.TypeFocusRelease, 3, proto.FocusRelease{LeaseID: "f1"}), proto.AckAccepted, "")
+	h.afeBlock(valid)
+	h.s.tick()
+	h.s.tick()
+	if n := h.sess.renegotiations(); n != 1 {
+		t.Fatalf("%d renegotiations once idle with frames validating, want 1", n)
+	}
+
+	// The link reconnects at once; this hello announces the capability, and
+	// the session that follows serves the afe stream.
+	h.s.Lost(client.LostRenegotiate)
+	if !announced(h) {
+		t.Fatal("afe_metadata_v1 missing from the hello after renegotiating")
+	}
+	h.ready()
+	h.s.wg.Wait()
+	h.afeBlock(valid)
+	h.s.tick()
+	if !h.up.afe || h.sess.renegotiations() != 0 {
+		t.Fatalf("after renegotiating: uplink afe %v, %d renegotiations", h.up.afe, h.sess.renegotiations())
+	}
+
+	// A later hello that misses the decoder does not end another session.
+	h.s.Lost(client.LostTimeout)
+	h.now.Add(int64(3 * time.Second))
+	if announced(h) {
+		t.Fatal("afe_metadata_v1 after 3 s without a valid frame")
+	}
+	h.ready()
+	h.s.wg.Wait()
+	h.afeBlock(valid)
+	h.s.tick()
+	if n := h.sess.renegotiations(); n != 0 {
+		t.Fatalf("%d renegotiations after the first, want none", n)
 	}
 }
 

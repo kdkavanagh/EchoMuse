@@ -92,6 +92,10 @@ func (s *Session) Assets() assets.Transport { return s.assets }
 // Degraded reports 2 s without any control message (§16.1).
 func (s *Session) Degraded() bool { return s.degraded.Load() }
 
+// Renegotiate ends the session from the device's side so that the link
+// sends a fresh session.hello at once. Handler.Lost gets LostRenegotiate.
+func (s *Session) Renegotiate() { s.fail(LostRenegotiate) }
+
 // Send queues one control envelope without blocking and returns its fresh
 // UUIDv4 message ID (the command ID).
 func (s *Session) Send(typ proto.MessageType, generation uint32, body any) (string, error) {

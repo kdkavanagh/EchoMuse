@@ -1198,6 +1198,25 @@ three.
   words and verdict, whether a timed-out verdict would have passed, and where
   the time went.
 
+### A turn no longer hangs when late results end and commit it at once
+
+When the speech worker fell behind, its late results could end a command and
+commit it in the same step. The controller acted on the "end pending" part
+but never on the commit that followed, so the command was never sent, and the
+turn sat with the mic open until something else ended it. That is what
+happened to "set a three minute timer" on 2026-10-26. The controller now acts
+on every step in such a batch, so the command commits and runs as usual.
+
+### A Dot keeps its AFE chart after a power cut
+
+An Echo Dot that was unplugged and powered back on could reach the controller
+before its microphone started, because the Dot opens its microphone only
+after its first NTP sync. Its session then lacked native AFE metadata, so its
+turns had no AFE chart and kept no turn recordings until the next reconnect.
+Now, once the AFE decoder starts working, the Dot waits until it is idle and
+reconnects once, and the new session carries the metadata. Its light ring may
+show the dim red "link down" pulse for a moment while it reconnects.
+
 ### Earlier in this release
 
 - ASR gain: the STT copy sent to Home Assistant is amplified by

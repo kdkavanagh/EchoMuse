@@ -60,6 +60,8 @@ type Uplink interface {
 	Notify()
 	// DiagnosticLive reports a live diagnostic lease (no local wake chime).
 	DiagnosticLive() bool
+	// Leased reports any open lease.
+	Leased() bool
 	Run(context.Context)
 }
 
@@ -70,6 +72,8 @@ type Session interface {
 	Audio() client.AudioSink
 	Assets() assets.Transport
 	Controller() string // host:port the session was dialled at
+	// Renegotiate ends the session so the link sends a fresh hello at once.
+	Renegotiate()
 }
 
 // RetainedHooks carry retained non-audio commands (WIRE §4.8) to their
@@ -215,7 +219,8 @@ type Supervisor struct {
 	lastMask        atomic.Uint32 // final-mix mask of the latest tap
 	alertForeground atomic.Bool
 	fetching        atomic.Bool
-	noticePlaying   atomic.Bool // the offline notice is in the earcon slot
+	activating      atomic.Int32 // speech-asset activations still running (activate)
+	noticePlaying   atomic.Bool  // the offline notice is in the earcon slot
 	physicalSeq     atomic.Uint64
 	burstSeq        uint64 // tick goroutine
 }
@@ -396,6 +401,7 @@ func (s *Supervisor) tick() {
 			s.logSend(proto.TypeClockRequest, 0, req)
 		}
 	}
+	s.renegotiateAFE()
 }
 
 // CaptureToReference implements uplink.Clock: capture sample → monotonic

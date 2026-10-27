@@ -15,8 +15,15 @@ import (
 // afe_metadata_v1 (WIRE §4.1, §3 kind 5). A hello announces the capability
 // only when the capture backend decodes native AFE metadata and a frame
 // validated recently. Right after start no period has been decoded yet, so
-// a hello waits briefly for the first one rather than racing it: the
-// capability is fixed for the session it opens.
+// a hello waits briefly for the first one rather than racing it. The
+// capability is fixed for the session the hello opens, and the wait cannot
+// cover every start: on a cold-booted Dot the mixer microphone opens only
+// after the first NTP sync, which can come after the controller was found.
+// So when the decoder starts validating during a session whose hello lacked
+// the capability, the device ends that session once it is idle, and the
+// link sends a new hello at once (renegotiateAFE). It does that at most once
+// per run, so a decoder that keeps losing its lock cannot make the session
+// flap.
 const (
 	afeValidFor  = 2 * time.Second
 	afeHelloWait = time.Second
@@ -42,6 +49,8 @@ type afeState struct {
 
 	hello atomic.Bool // the latest hello announced afe_metadata_v1
 	on    atomic.Bool // this session opted in (session.ready afe_metadata)
+	// renegotiated: renegotiateAFE has ended a session; it never does again.
+	renegotiated atomic.Bool
 }
 
 // accountAFE adds one decoded period to the window. capMu held; it does not
@@ -94,10 +103,41 @@ func (s *Supervisor) afeCapable() bool {
 	case <-t.C:
 	}
 	t.Stop()
+	return s.afeValidating()
+}
+
+// afeValidating reports whether a period held a valid frame in the last
+// afeValidFor.
+func (s *Supervisor) afeValidating() bool {
 	s.afe.mu.Lock()
 	valid := s.afe.validNs
 	s.afe.mu.Unlock()
 	return valid != 0 && s.now()-valid <= int64(afeValidFor)
+}
+
+// renegotiateAFE ends the session when its hello lacked afe_metadata_v1 but
+// the decoder now validates frames, so that the next hello announces it.
+// It waits until the device is idle: no candidate, focus or uplink lease,
+// no network playback, no active alert, nothing audible in the final mix,
+// and no speech-asset activation or alert-sound fetch on the session. It
+// acts at most once per run. The tick goroutine calls it.
+func (s *Supervisor) renegotiateAFE() {
+	if !s.cfg.AFEMetadata || s.afe.hello.Load() || s.afe.renegotiated.Load() || !s.afeValidating() {
+		return
+	}
+	if s.lastMask.Load() != 0 || s.activating.Load() != 0 || s.fetching.Load() || s.up.Leased() {
+		return
+	}
+	s.mu.Lock()
+	sess := s.session
+	busy := len(s.candidates) > 0 || len(s.leases) > 0 || len(s.playbacks) > 0 || s.alertState.Active != nil
+	s.mu.Unlock()
+	if sess == nil || busy {
+		return
+	}
+	s.afe.renegotiated.Store(true)
+	log.Printf("[afe] the decoder validates frames, but this session's hello lacked afe_metadata_v1; reconnecting to announce it")
+	sess.Renegotiate()
 }
 
 // wakeStats is the wake.stats body: the detector's fields, plus the AFE
