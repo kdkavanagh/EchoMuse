@@ -100,9 +100,11 @@ view is kept in the address (`#activity`), so a reload stays on it. API: `GET
 - **⤓ Confirmed wakes (.zip)** and **⤓ Near misses (.zip)** download every
   saved clip the filters match, not only the rows listed: the wake clip of
   each wake that was not refused (Save wake clips keeps the newest 500 per
-  Echo), and each near-miss recording (the newest 200 per Echo), filed under
-  one folder per Echo. API: `GET /api/wakeclips.zip` and `GET
-  /api/near_misses.zip` (`device`, `min`, `max`).
+  Echo), and each near-miss recording (the newest 200 per Echo). The files sit
+  side by side, each named as its own ⤓ in the list names it
+  (`kitchen-2026-10-26232503-wake.wav`, the wake's UTC time; `kitchen-nearmiss446.wav`),
+  a repeated name numbered `(1)` as a browser would. API: `GET
+  /api/wakeclips.zip` and `GET /api/near_misses.zip` (`device`, `min`, `max`).
 - **Near-miss detail.** Clicking a near miss shows its peak against the floor
   and the wake threshold, its recording, and the Echo's native AFE chart from
   a second before the scored stretch through the recording's end (taken with

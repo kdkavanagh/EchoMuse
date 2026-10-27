@@ -425,9 +425,9 @@ def test_the_filtered_archives_take_confirmed_wakes_and_saved_near_misses_within
     def wakes(device, lo, hi):
         return db.get_wake_clip_turns(device, lo, hi, trigger="wake", refused=em_session.REFUSED_WAKES)
 
-    assert wakes(None, 0.9, 1.0) == [("dev1", legacy), ("dev2", quiet), ("dev1", answered)]
-    assert wakes(None, 0.95, 0.95) == [("dev1", answered)]
-    assert wakes("dev2", 0.0, 1.0) == [("dev2", quiet)]
+    assert wakes(None, 0.9, 1.0) == [("dev1", legacy, 7.0), ("dev2", quiet, 5.0), ("dev1", answered, 1.0)]
+    assert wakes(None, 0.95, 0.95) == [("dev1", answered, 1.0)]
+    assert wakes("dev2", 0.0, 1.0) == [("dev2", quiet, 5.0)]
 
     saved = db.NearMissRecording.SAVED
     a = db.insert_near_miss("dev1", _near_miss_record(1.0, 0.30, saved))
@@ -450,10 +450,12 @@ def test_a_near_miss_chart_is_read_one_at_a_time_for_its_device_and_kept_for_the
     assert db.get_near_miss_afe_series("dev1", other) is None              # another device's row id
 
 
-def test_the_near_miss_archive_streams_a_zip_of_the_matching_recordings_still_on_disk(fresh_db, tmp_path, monkeypatch):
-    """GET /api/near_misses.zip through a real server: a valid zip (written to a stream that
-    cannot seek) of exactly the saved recordings in range, under each device's folder, larger
-    than one ZIP_CHUNK; 404 when none matches, 400 for a bad range."""
+def test_the_archives_stream_a_zip_of_the_matching_clips_named_as_their_own_downloads(fresh_db, tmp_path, monkeypatch):
+    """GET /api/near_misses.zip and /api/wakeclips.zip through a real server: a valid zip
+    (written to a stream that cannot seek, larger than one ZIP_CHUNK) of exactly the saved clips
+    in range, flat and named as the Activity list downloads each one (`<slug>-nearmiss<id>.wav`,
+    `<slug>-<UTC YYYY-MM-DDHHMMSS>-wake.wav`, the stamp as the dashboard's toISOString gives it),
+    a repeated name numbered as a browser would; 404 when none matches, 400 for a bad range."""
     em_api = pytest.importorskip("em_api")
     import asyncio
     import io
@@ -463,9 +465,11 @@ def test_the_near_miss_archive_streams_a_zip_of_the_matching_recordings_still_on
     from aiohttp.test_utils import TestServer
 
     import em_recordings
+    import em_wakeclips
     monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
-    db.register_new_device("dev1", "1.2.3.4", None, None)
-    db.approve_device("dev1", "Kitchen")
+    for dev in ("dev1", "dev2"):                        # two Echos labelled alike
+        db.register_new_device(dev, "1.2.3.4", None, None)
+        db.approve_device(dev, "Kitchen")
     pcm = {}
     for ts, peak in ((1.0, 0.3), (2.0, 0.4), (3.0, 0.45), (4.0, 0.9)):
         row = db.insert_near_miss("dev1", _near_miss_record(ts, peak, db.NearMissRecording.SAVED))
@@ -474,27 +478,39 @@ def test_the_near_miss_archive_streams_a_zip_of_the_matching_recordings_still_on
     first, pruned, third, _ = pcm
     kept = em_recordings.recordings_dir(kind=em_recordings.RecordingKind.NEAR_MISS)
     (kept / em_recordings.filename("dev1", pruned)).unlink()
+    wake_pcm = {}
+    for dev, ts in (("dev1", 1_793_057_103.793), ("dev2", 1_793_057_103.2)):   # the same second
+        turn = db.insert_turn(dev, {"ts": ts, "trigger": "wake", "wake_score": 0.95, "terminal_reason": "completed"})
+        db.set_turn_wake(turn, f"{turn}.wav")
+        wake_pcm[dev] = bytes([turn]) * 46_080
+        em_wakeclips.save(dev, turn, wake_pcm[dev])
 
     async def main():
         app = web.Application(middlewares=[em_api._error_middleware])
         app.router.add_get("/api/near_misses.zip", em_api._get_fleet_near_misses_zip.__wrapped__)
+        app.router.add_get("/api/wakeclips.zip", em_api._get_fleet_wakeclips_zip.__wrapped__)
         server = TestServer(app, host="127.0.0.1")
         await server.start_server()
         try:
             async with ClientSession() as http:
-                async def get(query):
-                    async with http.get(server.make_url(f"/api/near_misses.zip?{query}")) as r:
+                async def get(path):
+                    async with http.get(server.make_url(path)) as r:
                         return r.status, r.headers.get("Content-Disposition"), await r.read()
-                return [await get(q) for q in ("min=0.2&max=0.5", "device=dev1&min=0.5&max=0.8",
-                                               "min=0.6&max=0.5", "max=x")]
+                return [await get(p) for p in (
+                    "/api/near_misses.zip?min=0.2&max=0.5", "/api/near_misses.zip?device=dev1&min=0.5&max=0.8",
+                    "/api/near_misses.zip?min=0.6&max=0.5", "/api/near_misses.zip?max=x",
+                    "/api/wakeclips.zip?min=0.9&max=1")]
         finally:
             await server.close()
 
-    (ok, disposition, body), (none, *_), (backwards, *_), (bad, *_) = asyncio.run(main())
-    assert (ok, none, backwards, bad) == (200, 404, 400, 400)
+    (ok, disposition, body), (none, *_), (backwards, *_), (bad, *_), (wakes_ok, _, wakes) = asyncio.run(main())
+    assert (ok, none, backwards, bad, wakes_ok) == (200, 404, 400, 400, 200)
     assert disposition == 'attachment; filename="echomuse-nearmisses-0.20-0.50.zip"'
     assert len(body) > em_api.ZIP_CHUNK
     with zipfile.ZipFile(io.BytesIO(body)) as z:
         assert z.testzip() is None
-        assert z.namelist() == [f"kitchen/nearmiss{third}.wav", f"kitchen/nearmiss{first}.wav"]
-        assert all(z.read(f"kitchen/nearmiss{row}.wav").endswith(pcm[row]) for row in (first, third))
+        assert z.namelist() == [f"kitchen-nearmiss{third}.wav", f"kitchen-nearmiss{first}.wav"]
+        assert all(z.read(f"kitchen-nearmiss{row}.wav").endswith(pcm[row]) for row in (first, third))
+    with zipfile.ZipFile(io.BytesIO(wakes)) as z:
+        assert z.namelist() == ["kitchen-2026-10-26232503-wake.wav", "kitchen-2026-10-26232503-wake (1).wav"]
+        assert z.read("kitchen-2026-10-26232503-wake (1).wav").endswith(wake_pcm["dev2"])

@@ -238,9 +238,10 @@ const LOG_SOURCE = Object.freeze({ DEVICE: 'device' });
 const MONO = "'DM Mono',monospace";
 const SANS = "'DM Sans',sans-serif";
 
-// File-name-safe slug of a device, for downloads.
+// File-name-safe slug of a device, for downloads. em_api._slug's rule, so a
+// filtered archive names each file as its own download here does.
 function fileSlug(label, id) {
-  return (label || id).replace(/[^A-Za-z0-9]+/g, '-').toLowerCase();
+  return (label || id).replace(/[^A-Za-z0-9]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'device';
 }
 
 // Save an object URL under `filename` via a transient <a download>. The URL

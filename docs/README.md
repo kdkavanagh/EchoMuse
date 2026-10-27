@@ -19,6 +19,9 @@ Deeper technical references live elsewhere:
   HA-native satellite timers, and stock Local Calendar-backed durable alarms.
   Sections 16 (normative contracts) and 18 (what replaced what) are the
   most specific.
+- [text-attested-endpoint-plan.md](text-attested-endpoint-plan.md) — the
+  plan for ending a wake or button turn on Kroko's words when Silero misses a
+  quiet command (route T), with the evidence from turns 911 and 912.
 - [protocol-v1.md](protocol-v1.md) — the device ↔ controller wire protocol:
   the three WebSockets, every JSON message, the EMA1 audio frame, and the
   capability set.

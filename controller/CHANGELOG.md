@@ -1073,9 +1073,13 @@ Echo's voice turns and near misses in one list by time.
   `unverified_wake`, `verifier_timeout`, `arbitration_lost`), and **⤓ Near
   misses (.zip)** every saved near-miss recording, each limited to the Echo
   and score range shown, over every clip still kept rather than the rows
-  listed, one folder per Echo. Both are streamed, never held in memory. API:
-  `GET /api/wakeclips.zip` and `GET /api/near_misses.zip` (`device`, `min`,
-  `max`; 404 when nothing matches).
+  listed. Each file is named as its own ⤓ in the list names it
+  (`<device>-<UTC time>-wake.wav`, `<device>-nearmiss<id>.wav`), side by side,
+  a repeated name numbered `(1)`; the dashboard's file-name slug now trims
+  leading and trailing dashes as the controller's does, so the two always
+  agree. Both are streamed, never held in memory. API: `GET
+  /api/wakeclips.zip` and `GET /api/near_misses.zip` (`device`, `min`, `max`;
+  404 when nothing matches).
 - **Near-miss detail.** A near miss is now clickable, here and on the device
   Activity tab: its peak against the floor and the wake threshold, its
   recording, and a native AFE chart from a second before the scored stretch

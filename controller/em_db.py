@@ -2635,19 +2635,19 @@ def _scope(device_id: Optional[str], table: str) -> tuple[str, tuple[object, ...
 
 
 def get_wake_clip_turns(device_id: Optional[str], lo: float, hi: float, *, trigger: str,
-                        refused: Iterable[str]) -> list[tuple[str, int]]:
-    """(device_id, turn id), newest first, of `device_id`'s turns (every registered device's
+                        refused: Iterable[str]) -> list[tuple[str, int, float]]:
+    """(device_id, turn id, ts), newest first, of `device_id`'s turns (every registered device's
     when None) that `trigger` opened and whose end is not `refused` (a row from before terminal
     reasons were kept counts as answered), with a saved wake clip and a wake score in [lo, hi]."""
     reasons = tuple(refused)
     scope, params = _scope(device_id, "t")
     rows = _q(
-        f"SELECT device_id, id FROM turns t WHERE {scope} AND trigger_type = ? "
+        f"SELECT device_id, id, ts FROM turns t WHERE {scope} AND trigger_type = ? "
         f"AND wake_file IS NOT NULL AND wake_score BETWEEN ? AND ? "
         f"AND (terminal_reason IS NULL OR terminal_reason NOT IN ({', '.join('?' * len(reasons))})) "
         f"ORDER BY ts DESC",
         (*params, trigger, lo, hi, *reasons))
-    return [(row["device_id"], row["id"]) for row in rows]
+    return [(row["device_id"], row["id"], row["ts"]) for row in rows]
 
 
 def get_near_miss_recordings(device_id: Optional[str], lo: float, hi: float) -> list[tuple[str, int]]:

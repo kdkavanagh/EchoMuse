@@ -25,7 +25,7 @@ import zipfile
 from collections import Counter
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from dataclasses import asdict, dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Generic, NotRequired, Protocol, TypedDict, TypeVar
 
@@ -1436,9 +1436,10 @@ async def _delete_wakeclips(request: web.Request) -> web.Response:
 # ─── Filtered clip archives (the Activity view) ───────────────────────────────
 #
 # Every saved clip of one kind matching the Activity view's filters: one device
-# or all of them, and a wake-score range. Streamed rather than built in memory
-# as the per-device archive is: across devices the stores reach 500 wake clips
-# and 200 near-miss recordings each, past 100 MB for a fleet, which the
+# or all of them, and a wake-score range, each file named and laid out as its
+# own download from the Activity list would be. Streamed rather than built in
+# memory as the per-device archive is: across devices the stores reach 500 wake
+# clips and 200 near-miss recordings each, past 100 MB for a fleet, which the
 # controller should not hold for one click.
 
 ZIP_CHUNK = 256 * 1024   # bytes handed to the response at a time
@@ -1468,8 +1469,10 @@ class _ResponseSink:
 
 async def _stream_zip(request: web.Request, filename: str,
                       entries: Sequence[tuple[str, Path]]) -> web.StreamResponse:
-    """`entries` (name in the archive, file) as one zip attachment, streamed. ZIP_STORED, as
-    _zip_clips: WAV does not compress. A file pruned since it was listed is left out."""
+    """`entries` (download name, file) as one zip attachment, streamed, the files side by side
+    as a browser saves downloads to one folder: a name already taken gets " (1)", " (2)", ...
+    before its extension. ZIP_STORED, as _zip_clips: WAV does not compress. A file pruned
+    since it was listed is left out."""
     response = web.StreamResponse(headers={
         "Content-Type":        "application/zip",
         "Content-Disposition": f'attachment; filename="{filename}"',
@@ -1480,10 +1483,14 @@ async def _stream_zip(request: web.Request, filename: str,
 
     def build() -> None:
         sink = _ResponseSink(response, loop)
+        taken: Counter[str] = Counter()
         with zipfile.ZipFile(sink, "w", zipfile.ZIP_STORED) as z:
-            for arcname, path in entries:
+            for name, path in entries:
+                stem, dot, ext = name.rpartition(".")
+                saved = f"{stem} ({taken[name]}){dot}{ext}" if taken[name] else name
                 with contextlib.suppress(FileNotFoundError):   # pruned since it was listed
-                    z.write(path, arcname=arcname)
+                    z.write(path, arcname=saved)
+                    taken[name] += 1
         sink.flush()
 
     try:
@@ -1509,8 +1516,8 @@ def _clip_filter(request: web.Request) -> tuple[str | None, float, float]:
 
 
 async def _archive_slugs(device_id: str | None) -> dict[str, str]:
-    """Each device's folder name in an archive: `device_id`'s alone (404 when it is not
-    registered), or every registered device's."""
+    """Each device's slug, which starts its files' names: `device_id`'s alone (404 when it is
+    not registered), or every registered device's."""
     if device_id is not None:
         row = await _device_row(device_id)
         return {device_id: _slug(row.label or device_id)}
@@ -1522,19 +1529,27 @@ def _archive_name(kind: str, slug: str | None, lo: float, hi: float) -> str:
     return f"echomuse-{kind}{f'-{slug}' if slug else ''}-{lo:.2f}-{hi:.2f}.zip"
 
 
+def _clip_stamp(ts: float) -> str:
+    """A turn's time as the dashboard names its wake clip's download: `new Date(ts * 1000)
+    .toISOString()` to the second without ':' and 'T', i.e. UTC as YYYY-MM-DDHHMMSS. The
+    seconds are cut from the milliseconds as Date cuts them, never rounded."""
+    seconds = int(ts * 1000) // 1000
+    return datetime.fromtimestamp(seconds, tz=timezone.utc).strftime("%Y-%m-%d%H%M%S")
+
+
 @auth.require_auth
 async def _get_fleet_wakeclips_zip(request: web.Request) -> web.StreamResponse:
     """GET /api/wakeclips.zip?device=&min=&max= — the wake clip of every confirmed wake (a
     wake turn not refused: em_session.REFUSED_WAKES) with a wake score in [min, max], of
-    `device` or every registered device, as `<device>/wake<turn>.wav`. A 404 when none
-    matches."""
+    `device` or every registered device, each named as the Activity list downloads it
+    (`<device>-<UTC time>-wake.wav`). A 404 when none matches."""
     device_id, lo, hi = _clip_filter(request)
     slugs = await _archive_slugs(device_id)
     loop = asyncio.get_running_loop()
     rows = await loop.run_in_executor(None, lambda: db.get_wake_clip_turns(
         device_id, lo, hi, trigger=UtteranceKind.WAKE, refused=REFUSED_WAKES))
     entries = await loop.run_in_executor(None, lambda: [
-        (f"{slugs[dev]}/wake{turn}.wav", path) for dev, turn in rows
+        (f"{slugs[dev]}-{_clip_stamp(ts)}-wake.wav", path) for dev, turn, ts in rows
         if (path := em_wakeclips.resolve(dev, em_wakeclips.filename(turn))) is not None])
     if not entries:
         return _error(ErrorCode.NO_WAKE_CLIPS, "No saved wake clip matches", 404)
@@ -1544,14 +1559,14 @@ async def _get_fleet_wakeclips_zip(request: web.Request) -> web.StreamResponse:
 @auth.require_auth
 async def _get_fleet_near_misses_zip(request: web.Request) -> web.StreamResponse:
     """GET /api/near_misses.zip?device=&min=&max= — the recording of every near miss with a
-    peak score in [min, max], of `device` or every registered device, as
-    `<device>/nearmiss<id>.wav`. A 404 when none matches."""
+    peak score in [min, max], of `device` or every registered device, each named as the
+    Activity list downloads it (`<device>-nearmiss<id>.wav`). A 404 when none matches."""
     device_id, lo, hi = _clip_filter(request)
     slugs = await _archive_slugs(device_id)
     loop = asyncio.get_running_loop()
     rows = await loop.run_in_executor(None, db.get_near_miss_recordings, device_id, lo, hi)
     entries = await loop.run_in_executor(None, lambda: [
-        (f"{slugs[dev]}/nearmiss{nm}.wav", path) for dev, nm in rows
+        (f"{slugs[dev]}-nearmiss{nm}.wav", path) for dev, nm in rows
         if (path := _near_miss_path(dev, nm)) is not None])
     if not entries:
         return _error(ErrorCode.NO_RECORDING, "No saved near-miss recording matches", 404)
