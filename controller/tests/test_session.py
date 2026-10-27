@@ -1691,8 +1691,12 @@ def test_say_that_again_in_a_reply_window_replays_the_question_and_reopens_it_in
         await h.feed(drain, drain + 60_000)
         await h.wait_for(lambda: len(h.render.streams) == 2)
         assert h.render.urls() == ["http://ha/tts/1", "http://ha/tts/1"] and len(h.ha.intents) == 1
+        # The question replays while the mic runs on. Its reply lease opened as the replay started,
+        # which a slow ASR copy puts after all the mic above: a second of mic during the replay lets
+        # the window open at the drain instead of waiting for the lease's first cell.
+        await h.feed(h.device.pos[Kind.MIC], h.device.pos[Kind.MIC] + 16_000)
         h.render.streams[1].finish("drained")
-        await h.wait_for(lambda: h.actor.state == "ARMED")
+        await h.wait_for(lambda: h.actor.state == "ARMED" and h.actor._turn is not None)
         reopened = h.actor._turn.utterance.spec.trigger
         answer = (reopened + 16_000, reopened + 25_728)
         h.worker.vad = speech(answer)
