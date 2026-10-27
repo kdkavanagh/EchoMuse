@@ -1145,6 +1145,31 @@ download as two training sets.
   `verdict` (archive `echomuse-missedwakes-…` or `echomuse-correctlyignored-…`).
   **Schema v39** adds `near_misses.verdict`.
 
+### Cropped archives
+
+The Activity view's archives can cut each clip to a fixed length around the
+part the wake model scored, instead of holding it whole. A saved clip runs as
+long as the Echo's score stayed up, plus 300 ms either side (about 2–3.6 s),
+and training keeps only a clip's first 1.4 s: when the 479 saved near misses
+were re-scored, the best window started 0.48–0.96 s into eight in ten of
+them, and at the start of only one.
+
+- **Each clip: Whole or Re-scored crop**, beside the archives. A crop is the
+  length you enter (1.4 s to start with) around the best window, or around
+  every window that scored at or above the score you enter (the near-miss
+  floor to start with). Every archive takes it, Confirmed wakes included.
+- **Scoring.** The controller scores each clip again with the graph that
+  scored it on the Echo (the active one if that was deleted), one 1.4 s window
+  every 160 ms, on one thread with one ORT thread, so an export never takes
+  more than one core from the realtime path. About 70 ms a clip; the scores
+  are kept, so a second export at another length or score only reads files.
+- **Names.** `kitchen-nearmiss446-0.64s-0.41.wav`: the clip's name, where the
+  crop starts in it, and the window's score; the archive
+  `echomuse-missedwakes-0.00-1.00-crop1.40s[-min0.17].zip`.
+- **API.** `GET /api/wakeclips.zip` and `GET /api/near_misses.zip` take
+  `crop` (seconds, 0.1–10) and `window_min` (0–1); a `window_min` that no
+  window reaches is a 404 that says so.
+
 ### Wake verification kept with every row
 
 A wake heard while an Echo is playing (a ringing timer, music, a reply) must

@@ -2964,11 +2964,32 @@ const ARCHIVES = Object.freeze({
   },
 });
 const SCORE_RANGE_ALL = Object.freeze([0, 1]);
+// em_clip_crop: an archive's clips whole, or each scored again and cut to a
+// fixed length around the window the wake model scored highest (or every
+// window at or above a score). The bounds are the controller's; the length
+// starts at BCResNet's window.
+const CROP_SECONDS = Object.freeze({ MIN: 0.1, MAX: 10, DEFAULT: '1.4' });
+// Pill takes no title; these go on the wrappers.
+const CROP_TITLE = Object.freeze({
+  WHOLE: 'Each clip as saved: it runs as long as the Echo\'s score stayed up, plus 300 ms either side, so the lengths vary '
+    + '(about 2–3.6 s). Training keeps only a clip\'s first 1.4 s, which is rarely the part that scored.',
+  CROP: 'Score each clip again with the wake model that scored it (one 1.4 s window every 160 ms, as the Echo does) and cut '
+    + 'this length around a window. The first export of many clips takes a while; later ones reuse the scores.',
+  BEST: 'One crop per clip, around the window that scored highest',
+  EVERY: 'One crop around every window that scored at or above this, unsmoothed. Windows are 160 ms apart, so neighbouring '
+    + 'crops overlap; each crop\'s name starts with its clip\'s, so a training split can keep a clip\'s crops together.',
+});
 
 function FleetActivity({ devices, globalConfig, onOpenDevice, isAdmin }) {
   const [choice, setChoice] = useState(null); // device_id shown alone, or null for every device
   const [load, setLoad] = useState(null);     // {scope, turns, nearMisses} of the newest load; turns null: it failed
   const [[lo, hi], setRange] = useState(SCORE_RANGE_ALL);
+  // How the archives cut each clip: whole, or `seconds` around the best window,
+  // or (`every`) around each window scoring at least `min`. Text, as typed.
+  const [cut, setCut] = useState(() => ({
+    crop: false, seconds: CROP_SECONDS.DEFAULT, every: false,
+    min: (globalConfig?.nearMissThreshold ?? 0.17).toFixed(2),
+  }));
   const [archiving, setArchiving] = useState(null);       // the ARCHIVE being downloaded
   const [archiveError, setArchiveError] = useState('');
   const approved = devices.filter(d => d.approved);
@@ -3023,16 +3044,32 @@ function FleetActivity({ devices, globalConfig, onOpenDevice, isAdmin }) {
   const nearMisses = current && narrowed ? current.nearMisses.filter(n => inRange(n.peak)) : current?.nearMisses;
   const unscored = narrowed && current?.turns ? current.turns.filter(t => t.wake_score == null).length : 0;
 
+  // The crop the archives ask for (null: whole clips), or why it cannot be asked.
+  const cropSeconds = Number(cut.seconds);
+  const cropMin = Number(cut.min);
+  const cutError = !cut.crop ? ''
+    : !(cut.seconds.trim() && cropSeconds >= CROP_SECONDS.MIN && cropSeconds <= CROP_SECONDS.MAX)
+      ? `Crop length must be ${CROP_SECONDS.MIN}–${CROP_SECONDS.MAX} s`
+      : cut.every && !(cut.min.trim() && cropMin >= 0 && cropMin <= 1) ? 'Window score must be 0–1' : '';
+  const cropQuery = !cut.crop || cutError ? {}
+    : { crop: cropSeconds.toFixed(2), ...(cut.every ? { window_min: cropMin.toFixed(2) } : {}) };
+  // As em_api._archive_name names it.
+  const cropSuffix = !cropQuery.crop ? ''
+    : `-crop${cropQuery.crop}s${cropQuery.window_min ? `-min${cropQuery.window_min}` : ''}`;
+  const numberField = { width: 52, fontFamily: MONO, fontSize: 11, boxSizing: 'border-box' };
+  const capsLabel = { fontFamily: MONO, fontSize: 9, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.08em' };
+
   async function download(kind) {
     const a = ARCHIVES[kind];
-    const query = new URLSearchParams({ min: fmtScore(lo), max: fmtScore(hi), ...a.query });
+    const query = new URLSearchParams({ min: fmtScore(lo), max: fmtScore(hi), ...a.query, ...cropQuery });
     if (scope) query.set('device', scope);
     setArchiving(kind); setArchiveError('');
     try {
       downloadBlob(await API.blob(`${a.path}?${query}`),
-        `echomuse-${kind}${scope ? `-${fileSlug(labels[scope], scope)}` : ''}-${fmtScore(lo)}-${fmtScore(hi)}.zip`);
+        `echomuse-${kind}${scope ? `-${fileSlug(labels[scope], scope)}` : ''}-${fmtScore(lo)}-${fmtScore(hi)}${cropSuffix}.zip`);
     } catch (e) {
-      setArchiveError(e.status === 404 ? `${a.label}: no saved ${a.noun} matches`
+      // A cropped archive's 404 can also mean no window reached the score; the controller says which.
+      setArchiveError(e.status === 404 && !cropQuery.crop ? `${a.label}: no saved ${a.noun} matches`
         : `${a.label}: ${e.error || e.message || 'download failed'}`);
     }
     setArchiving(null);
@@ -3064,20 +3101,49 @@ function FleetActivity({ devices, globalConfig, onOpenDevice, isAdmin }) {
             </button>
           </>)}
         </span>
-        <span style={{ display: 'inline-flex', flexWrap: 'wrap', gap: 6, alignItems: 'center', marginLeft: 'auto' }}>
-          {archiveError && <span style={{ fontFamily: MONO, fontSize: 9, color: 'var(--warn)' }}>{archiveError}</span>}
-          <span style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
-            ⤓ .zip
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6, marginLeft: 'auto' }}>
+          <span style={{ display: 'inline-flex', flexWrap: 'wrap', gap: 6, alignItems: 'center', justifyContent: 'flex-end' }}>
+            {archiveError && <span style={{ fontFamily: MONO, fontSize: 9, color: 'var(--warn)' }}>{archiveError}</span>}
+            <span style={capsLabel}>⤓ .zip</span>
+            {/* Pill takes no title; the wrapper says what each archive holds. */}
+            {Object.values(ARCHIVE).map(kind => (
+              <span key={kind} title={ARCHIVES[kind].title}>
+                <Pill small disabled={archiving != null || !!cutError} onClick={() => download(kind)}>
+                  {archiving === kind ? (cropQuery.crop ? 'Scoring…' : 'Building…') : ARCHIVES[kind].label}
+                </Pill>
+              </span>
+            ))}
           </span>
-          {/* Pill takes no title; the wrapper says what each archive holds. */}
-          {Object.values(ARCHIVE).map(kind => (
-            <span key={kind} title={ARCHIVES[kind].title}>
-              <Pill small disabled={archiving != null} onClick={() => download(kind)}>
-                {archiving === kind ? 'Building…' : ARCHIVES[kind].label}
-              </Pill>
+          {/* How each archive cuts its clips. */}
+          <span style={{ display: 'inline-flex', flexWrap: 'wrap', gap: 6, alignItems: 'center', justifyContent: 'flex-end' }}>
+            {cutError && <span style={{ fontFamily: MONO, fontSize: 9, color: 'var(--warn)' }}>{cutError}</span>}
+            <span style={capsLabel}>each clip</span>
+            <span title={CROP_TITLE.WHOLE}>
+              <Pill small accent={!cut.crop} onClick={() => setCut(c => ({ ...c, crop: false }))}>Whole</Pill>
             </span>
-          ))}
-        </span>
+            <span title={CROP_TITLE.CROP}>
+              <Pill small accent={cut.crop} onClick={() => setCut(c => ({ ...c, crop: true }))}>Re-scored crop</Pill>
+            </span>
+            {cut.crop && (<>
+              <label title={CROP_TITLE.CROP} style={{ ...muted, display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                <input type="number" min={CROP_SECONDS.MIN} max={CROP_SECONDS.MAX} step="0.1" value={cut.seconds}
+                  aria-label="Crop length in seconds" style={numberField}
+                  onChange={e => setCut(c => ({ ...c, seconds: e.target.value }))}/>
+                s around
+              </label>
+              <span title={CROP_TITLE.BEST}>
+                <Pill small accent={!cut.every} onClick={() => setCut(c => ({ ...c, every: false }))}>the best window</Pill>
+              </span>
+              <span title={CROP_TITLE.EVERY}>
+                <Pill small accent={cut.every} onClick={() => setCut(c => ({ ...c, every: true }))}>every window ≥</Pill>
+              </span>
+              <input type="number" min="0" max="1" step="0.01" value={cut.min} disabled={!cut.every}
+                title={CROP_TITLE.EVERY} aria-label="Lowest window score to crop around"
+                style={{ ...numberField, opacity: cut.every ? 1 : 0.45 }}
+                onChange={e => setCut(c => ({ ...c, min: e.target.value }))}/>
+            </>)}
+          </span>
+        </div>
       </div>
       {!noneReport && gaps.length > 0 && (
         <div style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)', marginBottom: 8 }}>

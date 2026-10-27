@@ -109,7 +109,26 @@ view is kept in the address (`#activity`), so a reload stays on it. API: `GET
   (`kitchen-2026-10-26232503-wake.wav`, the wake's UTC time; `kitchen-nearmiss446.wav`),
   a repeated name numbered `(1)` as a browser would. API: `GET
   /api/wakeclips.zip` and `GET /api/near_misses.zip` (`device`, `min`, `max`;
-  the near misses also `verdict`).
+  the near misses also `verdict`; both `crop` and `window_min`, below).
+- **Each clip: Whole or Re-scored crop.** A saved clip runs as long as the
+  Echo's score stayed up, plus 300 ms either side, so the lengths vary (about
+  2–3.6 s), while the wake model scores one 1.4 s window, and training keeps
+  only a clip's first 1.4 s, which is rarely the part that scored. **Re-scored
+  crop** has the controller score each clip again with the wake model that
+  scored it on the Echo (the fleet's active model if that one was deleted),
+  one 1.4 s window every 160 ms as the Echo does, and cut the length you enter
+  (1.4 s to start with) around **the best window**, or around **every window
+  ≥** the score you enter (the fleet's near-miss floor to start with). The
+  scores are the controller's, close to the Echo's but not identical, and
+  unsmoothed. A crop that would run past an end of its clip moves inside it,
+  and a clip shorter than the crop comes whole. Each crop is named after its
+  clip, then where in the clip it starts and its window's score
+  (`kitchen-nearmiss446-0.64s-0.41.wav`). Windows are 160 ms apart, so the
+  crops of **every window ≥** overlap; their shared clip name lets a training
+  split keep one clip's crops on the same side. Scoring takes about 70 ms per
+  clip on one core, so the first cropped export of a few hundred clips takes
+  half a minute; later ones reuse the scores. API: `crop` (seconds, 0.1–10)
+  and `window_min` (0–1).
 - **Near-miss detail.** Clicking a near miss shows its peak against the floor
   and the wake threshold, its recording, and the Echo's native AFE chart from
   a second before the scored stretch through the recording's end (taken with

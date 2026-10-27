@@ -400,19 +400,22 @@ def test_the_filtered_archives_take_confirmed_wakes_and_saved_near_misses_within
         fresh_db, tmp_path, monkeypatch):
     """What the Activity view's two downloads hold: a wake turn's clip unless the wake was
     refused, a near miss's only once saved; scores inclusive at both ends; one device, or
-    every registered one."""
+    every registered one; and the graph that scored each clip, which a cropped archive
+    scores it with again."""
+    from dataclasses import replace
     em_session = pytest.importorskip("em_session")
     monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
     for dev in ("dev1", "dev2", "gone"):
         db.register_new_device(dev, "1.2.3.4", None, None)
 
-    def turn(dev, ts, score, reason, *, trigger="wake", clip=True):
-        turn_id = db.insert_turn(dev, {"ts": ts, "trigger": trigger, "wake_score": score, "terminal_reason": reason})
+    def turn(dev, ts, score, reason, *, trigger="wake", clip=True, graph=None):
+        turn_id = db.insert_turn(dev, {"ts": ts, "trigger": trigger, "wake_score": score, "terminal_reason": reason,
+                                       "wake_model_sha256": graph})
         if clip:
             db.set_turn_wake(turn_id, f"{turn_id}.wav")
         return turn_id
 
-    answered = turn("dev1", 1.0, 0.95, "completed")
+    answered = turn("dev1", 1.0, 0.95, "completed", graph="g1")
     turn("dev1", 2.0, 0.97, "self_output")                # refused: the Echo's own sound
     turn("dev1", 3.0, 0.40, "completed")                  # below the range
     turn("dev1", 4.0, None, "completed", trigger="button")
@@ -425,17 +428,18 @@ def test_the_filtered_archives_take_confirmed_wakes_and_saved_near_misses_within
     def wakes(device, lo, hi):
         return db.get_wake_clip_turns(device, lo, hi, trigger="wake", refused=em_session.REFUSED_WAKES)
 
-    assert wakes(None, 0.9, 1.0) == [("dev1", legacy, 7.0), ("dev2", quiet, 5.0), ("dev1", answered, 1.0)]
-    assert wakes(None, 0.95, 0.95) == [("dev1", answered, 1.0)]
-    assert wakes("dev2", 0.0, 1.0) == [("dev2", quiet, 5.0)]
+    assert wakes(None, 0.9, 1.0) == [("dev1", legacy, 7.0, None), ("dev2", quiet, 5.0, None),
+                                     ("dev1", answered, 1.0, "g1")]
+    assert wakes(None, 0.95, 0.95) == [("dev1", answered, 1.0, "g1")]
+    assert wakes("dev2", 0.0, 1.0) == [("dev2", quiet, 5.0, None)]
 
     saved = db.NearMissRecording.SAVED
     a = db.insert_near_miss("dev1", _near_miss_record(1.0, 0.30, saved))
     db.insert_near_miss("dev1", _near_miss_record(2.0, 0.35, db.NearMissRecording.FAILED))
     db.insert_near_miss("dev1", _near_miss_record(3.0, 0.60, saved))
-    b = db.insert_near_miss("dev2", _near_miss_record(4.0, 0.50, saved))
-    assert db.get_near_miss_recordings(None, 0.3, 0.5) == [("dev2", b), ("dev1", a)]
-    assert db.get_near_miss_recordings("dev1", 0.3, 0.5) == [("dev1", a)]
+    b = db.insert_near_miss("dev2", replace(_near_miss_record(4.0, 0.50, saved), wake_model_sha256="g2"))
+    assert db.get_near_miss_recordings(None, 0.3, 0.5) == [("dev2", b, "g2"), ("dev1", a, None)]
+    assert db.get_near_miss_recordings("dev1", 0.3, 0.5) == [("dev1", a, None)]
 
 
 def test_a_near_miss_chart_is_read_one_at_a_time_for_its_device_and_kept_for_the_newest_rows(fresh_db, monkeypatch):

@@ -2677,33 +2677,34 @@ def _scope(device_id: Optional[str], table: str) -> tuple[str, tuple[object, ...
 
 
 def get_wake_clip_turns(device_id: Optional[str], lo: float, hi: float, *, trigger: str,
-                        refused: Iterable[str]) -> list[tuple[str, int, float]]:
-    """(device_id, turn id, ts), newest first, of `device_id`'s turns (every registered device's
-    when None) that `trigger` opened and whose end is not `refused` (a row from before terminal
-    reasons were kept counts as answered), with a saved wake clip and a wake score in [lo, hi]."""
+                        refused: Iterable[str]) -> list[tuple[str, int, float, Optional[str]]]:
+    """(device_id, turn id, ts, wake_model_sha256), newest first, of `device_id`'s turns (every
+    registered device's when None) that `trigger` opened and whose end is not `refused` (a row
+    from before terminal reasons were kept counts as answered), with a saved wake clip and a
+    wake score in [lo, hi]."""
     reasons = tuple(refused)
     scope, params = _scope(device_id, "t")
     rows = _q(
-        f"SELECT device_id, id, ts FROM turns t WHERE {scope} AND trigger_type = ? "
+        f"SELECT device_id, id, ts, wake_model_sha256 FROM turns t WHERE {scope} AND trigger_type = ? "
         f"AND wake_file IS NOT NULL AND wake_score BETWEEN ? AND ? "
         f"AND (terminal_reason IS NULL OR terminal_reason NOT IN ({', '.join('?' * len(reasons))})) "
         f"ORDER BY ts DESC",
         (*params, trigger, lo, hi, *reasons))
-    return [(row["device_id"], row["id"], row["ts"]) for row in rows]
+    return [(row["device_id"], row["id"], row["ts"], row["wake_model_sha256"]) for row in rows]
 
 
 def get_near_miss_recordings(device_id: Optional[str], lo: float, hi: float,
-                             verdict: Optional[NearMissVerdict] = None) -> list[tuple[str, int]]:
-    """(device_id, row id), newest first, of `device_id`'s near misses (every registered
-    device's when None) whose recording was saved, with a peak in [lo, hi] and, when
+                             verdict: Optional[NearMissVerdict] = None) -> list[tuple[str, int, Optional[str]]]:
+    """(device_id, row id, wake_model_sha256), newest first, of `device_id`'s near misses (every
+    registered device's when None) whose recording was saved, with a peak in [lo, hi] and, when
     `verdict` is given, marked with it."""
     scope, params = _scope(device_id, "n")
     marked, marks = ("AND verdict = ? ", (verdict,)) if verdict is not None else ("", ())
     rows = _q(
-        f"SELECT device_id, id FROM near_misses n WHERE {scope} AND recording = ? "
+        f"SELECT device_id, id, wake_model_sha256 FROM near_misses n WHERE {scope} AND recording = ? "
         f"AND peak BETWEEN ? AND ? {marked}ORDER BY ts DESC",
         (*params, NearMissRecording.SAVED, lo, hi, *marks))
-    return [(row["device_id"], row["id"]) for row in rows]
+    return [(row["device_id"], row["id"], row["wake_model_sha256"]) for row in rows]
 
 
 def get_text_fix_history(limit: int, before_id: Optional[int] = None) -> list[tuple[int, float, str, Optional[str]]]:

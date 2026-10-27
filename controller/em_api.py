@@ -9,6 +9,7 @@ import asyncio
 import base64
 import contextlib
 import enum
+import functools
 import hashlib
 import html as _html
 import io
@@ -35,6 +36,7 @@ from aiohttp.typedefs import Handler
 
 import em_afe
 import em_alerts
+import em_clip_crop
 import em_db as db
 import em_auth as auth
 import em_ble_proxy
@@ -1508,11 +1510,12 @@ class _ResponseSink:
 
 
 async def _stream_zip(request: web.Request, filename: str,
-                      entries: Sequence[tuple[str, Path]]) -> web.StreamResponse:
+                      entries: Sequence[tuple[str, Path | Callable[[], bytes]]]) -> web.StreamResponse:
     """`entries` (download name, file) as one zip attachment, streamed, the files side by side
     as a browser saves downloads to one folder: a name already taken gets " (1)", " (2)", ...
-    before its extension. ZIP_STORED, as _zip_clips: WAV does not compress. A file pruned
-    since it was listed is left out."""
+    before its extension. A file is a path, or a callable that makes its bytes as the archive
+    streams (a crop, em_clip_crop.cut). ZIP_STORED, as _zip_clips: WAV does not compress. A
+    file pruned since it was listed is left out."""
     response = web.StreamResponse(headers={
         "Content-Type":        "application/zip",
         "Content-Disposition": f'attachment; filename="{filename}"',
@@ -1525,11 +1528,14 @@ async def _stream_zip(request: web.Request, filename: str,
         sink = _ResponseSink(response, loop)
         taken: Counter[str] = Counter()
         with zipfile.ZipFile(sink, "w", zipfile.ZIP_STORED) as z:
-            for name, path in entries:
+            for name, source in entries:
                 stem, dot, ext = name.rpartition(".")
                 saved = f"{stem} ({taken[name]}){dot}{ext}" if taken[name] else name
                 with contextlib.suppress(FileNotFoundError):   # pruned since it was listed
-                    z.write(path, arcname=saved)
+                    if isinstance(source, Path):
+                        z.write(source, arcname=saved)
+                    else:
+                        z.writestr(saved, source())
                     taken[name] += 1
         sink.flush()
 
@@ -1555,6 +1561,64 @@ def _clip_filter(request: web.Request) -> tuple[str | None, float, float]:
     return request.query.get("device") or None, lo, hi
 
 
+def _crop_spec(request: web.Request) -> em_clip_crop.CropSpec | None:
+    """A clip archive's `crop`: absent, each clip whole; else a length in seconds, and each
+    clip is scored again and cut to that length around the window the wake model scored
+    highest, or with `window_min` (0–1) around every window scoring at or above it
+    (em_clip_crop). ApiError for a bad value."""
+    raw, raw_min = request.query.get("crop"), request.query.get("window_min")
+    if not raw:
+        if raw_min:
+            raise ApiError(ErrorCode.BAD_REQUEST, "window_min needs crop", 400)
+        return None
+    try:
+        seconds = float(raw)
+        window_min = float(raw_min) if raw_min else None
+    except ValueError:
+        raise ApiError(ErrorCode.BAD_REQUEST, "crop and window_min must be numeric", 400) from None
+    if not em_clip_crop.MIN_CROP_SECONDS <= seconds <= em_clip_crop.MAX_CROP_SECONDS:
+        raise ApiError(ErrorCode.BAD_REQUEST, f"crop must be {em_clip_crop.MIN_CROP_SECONDS:g}–"
+                       f"{em_clip_crop.MAX_CROP_SECONDS:g} seconds", 400)
+    if window_min is not None and not 0 <= window_min <= 1:
+        raise ApiError(ErrorCode.BAD_REQUEST, "window_min must be 0–1", 400)
+    return em_clip_crop.CropSpec(round(seconds * em_clip_crop.SAMPLE_RATE), window_min)
+
+
+_clip_scorer_kept: em_clip_crop.ClipScorer | None = None
+
+
+def _clip_scorer(request: web.Request) -> em_clip_crop.ClipScorer:
+    """The scorer the archives crop with. One is kept per registry, so the graphs' sessions and
+    the clips' scores carry over from one export to the next."""
+    global _clip_scorer_kept
+    registry = request.app[SERVICES].registry()
+    if _clip_scorer_kept is None or _clip_scorer_kept.registry is not registry:
+        _clip_scorer_kept = em_clip_crop.ClipScorer(registry)
+    return _clip_scorer_kept
+
+
+async def _archive_entries(request: web.Request, clips: Sequence[em_clip_crop.Clip],
+                           crop: em_clip_crop.CropSpec | None) -> list[tuple[str, Path | Callable[[], bytes]]]:
+    """An archive's files: each clip whole, or with `crop` the crops cut from it, scored on
+    em_clip_crop.EXECUTOR. ApiError when a clip has no wake model to score it with."""
+    if crop is None:
+        return [(clip.name, clip.path) for clip in clips]
+    scorer = _clip_scorer(request)
+    try:
+        planned = await asyncio.get_running_loop().run_in_executor(
+            em_clip_crop.EXECUTOR, scorer.plan_archive, clips, crop)
+    except em_wake_registry.RegistryError as exc:
+        raise ApiError(ErrorCode.UNKNOWN_WAKE_MODEL, f"No wake model to score the clips with: {exc}", 409) from None
+    return [(name, functools.partial(em_clip_crop.cut, path, c.start, c.end)) for name, path, c in planned]
+
+
+def _no_crop_message(noun: str, crop: em_clip_crop.CropSpec) -> str:
+    """Why a cropped archive is empty though clips matched."""
+    if crop.window_min is not None:
+        return f"No window of a saved {noun} scored at or above {crop.window_min:.2f}"
+    return f"No saved {noun} could be scored"
+
+
 async def _archive_slugs(device_id: str | None) -> dict[str, str]:
     """Each device's slug, which starts its files' names: `device_id`'s alone (404 when it is
     not registered), or every registered device's."""
@@ -1565,8 +1629,14 @@ async def _archive_slugs(device_id: str | None) -> dict[str, str]:
     return {r.device_id: _slug(r.label or r.device_id) for r in rows}
 
 
-def _archive_name(kind: str, slug: str | None, lo: float, hi: float) -> str:
-    return f"echomuse-{kind}{f'-{slug}' if slug else ''}-{lo:.2f}-{hi:.2f}.zip"
+def _archive_name(kind: str, slug: str | None, lo: float, hi: float,
+                  crop: em_clip_crop.CropSpec | None = None) -> str:
+    """An archive's file name, as the dashboard names its download: what it holds, the device
+    when one is chosen, the score range, and how its clips were cropped."""
+    cut = "" if crop is None else (
+        f"-crop{crop.samples / em_clip_crop.SAMPLE_RATE:.2f}s"
+        + ("" if crop.window_min is None else f"-min{crop.window_min:.2f}"))
+    return f"echomuse-{kind}{f'-{slug}' if slug else ''}-{lo:.2f}-{hi:.2f}{cut}.zip"
 
 
 def _clip_stamp(ts: float) -> str:
@@ -1579,21 +1649,27 @@ def _clip_stamp(ts: float) -> str:
 
 @auth.require_auth
 async def _get_fleet_wakeclips_zip(request: web.Request) -> web.StreamResponse:
-    """GET /api/wakeclips.zip?device=&min=&max= — the wake clip of every confirmed wake (a
-    wake turn not refused: em_session.REFUSED_WAKES) with a wake score in [min, max], of
-    `device` or every registered device, each named as the Activity list downloads it
-    (`<device>-<UTC time>-wake.wav`). A 404 when none matches."""
+    """GET /api/wakeclips.zip?device=&min=&max=&crop=&window_min= — the wake clip of every
+    confirmed wake (a wake turn not refused: em_session.REFUSED_WAKES) with a wake score in
+    [min, max], of `device` or every registered device, each named as the Activity list
+    downloads it (`<device>-<UTC time>-wake.wav`), or with `crop` the crops cut from each
+    (_crop_spec). A 404 when none matches."""
     device_id, lo, hi = _clip_filter(request)
+    crop = _crop_spec(request)
     slugs = await _archive_slugs(device_id)
     loop = asyncio.get_running_loop()
     rows = await loop.run_in_executor(None, lambda: db.get_wake_clip_turns(
         device_id, lo, hi, trigger=UtteranceKind.WAKE, refused=REFUSED_WAKES))
-    entries = await loop.run_in_executor(None, lambda: [
-        (f"{slugs[dev]}-{_clip_stamp(ts)}-wake.wav", path) for dev, turn, ts in rows
+    clips = await loop.run_in_executor(None, lambda: [
+        em_clip_crop.Clip(f"{slugs[dev]}-{_clip_stamp(ts)}-wake.wav", path, graph) for dev, turn, ts, graph in rows
         if (path := em_wakeclips.resolve(dev, em_wakeclips.filename(turn))) is not None])
-    if not entries:
+    if not clips:
         return _error(ErrorCode.NO_WAKE_CLIPS, "No saved wake clip matches", 404)
-    return await _stream_zip(request, _archive_name("wakes", device_id and slugs[device_id], lo, hi), entries)
+    entries = await _archive_entries(request, clips, crop)
+    if crop is not None and not entries:
+        return _error(ErrorCode.NO_WAKE_CLIPS, _no_crop_message("wake clip", crop), 404)
+    return await _stream_zip(
+        request, _archive_name("wakes", device_id and slugs[device_id], lo, hi, crop), entries)
 
 
 # The word that names each near-miss archive, as the dashboard's ARCHIVE names it: every saved
@@ -1607,11 +1683,13 @@ _NEAR_MISS_ARCHIVE: dict[db.NearMissVerdict | None, str] = {
 
 @auth.require_auth
 async def _get_fleet_near_misses_zip(request: web.Request) -> web.StreamResponse:
-    """GET /api/near_misses.zip?device=&min=&max=&verdict= — the recording of every near miss
-    with a peak score in [min, max], of `device` or every registered device, and with
-    `verdict` (db.NearMissVerdict) only those marked with it, each named as the Activity list
-    downloads it (`<device>-nearmiss<id>.wav`). A 404 when none matches."""
+    """GET /api/near_misses.zip?device=&min=&max=&verdict=&crop=&window_min= — the recording of
+    every near miss with a peak score in [min, max], of `device` or every registered device,
+    and with `verdict` (db.NearMissVerdict) only those marked with it, each named as the
+    Activity list downloads it (`<device>-nearmiss<id>.wav`), or with `crop` the crops cut
+    from each (_crop_spec). A 404 when none matches."""
     device_id, lo, hi = _clip_filter(request)
+    crop = _crop_spec(request)
     raw = request.query.get("verdict")
     if raw and raw not in db.NearMissVerdict:
         raise ApiError(ErrorCode.BAD_REQUEST, f"verdict must be one of {', '.join(db.NearMissVerdict)}", 400)
@@ -1619,13 +1697,16 @@ async def _get_fleet_near_misses_zip(request: web.Request) -> web.StreamResponse
     slugs = await _archive_slugs(device_id)
     loop = asyncio.get_running_loop()
     rows = await loop.run_in_executor(None, db.get_near_miss_recordings, device_id, lo, hi, verdict)
-    entries = await loop.run_in_executor(None, lambda: [
-        (f"{slugs[dev]}-nearmiss{nm}.wav", path) for dev, nm in rows
+    clips = await loop.run_in_executor(None, lambda: [
+        em_clip_crop.Clip(f"{slugs[dev]}-nearmiss{nm}.wav", path, graph) for dev, nm, graph in rows
         if (path := _near_miss_path(dev, nm)) is not None])
-    if not entries:
+    if not clips:
         return _error(ErrorCode.NO_RECORDING, "No saved near-miss recording matches", 404)
+    entries = await _archive_entries(request, clips, crop)
+    if crop is not None and not entries:
+        return _error(ErrorCode.NO_RECORDING, _no_crop_message("near-miss recording", crop), 404)
     return await _stream_zip(
-        request, _archive_name(_NEAR_MISS_ARCHIVE[verdict], device_id and slugs[device_id], lo, hi), entries)
+        request, _archive_name(_NEAR_MISS_ARCHIVE[verdict], device_id and slugs[device_id], lo, hi, crop), entries)
 
 
 # ─── Ambient recording ────────────────────────────────────────────────────────
