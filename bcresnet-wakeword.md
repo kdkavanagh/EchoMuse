@@ -42,7 +42,7 @@ filename, the `.onnx` suffix and a 20 MB cap — nothing about the graph. Upload
 installs cleanly, deploys cleanly, and then fails at scoring time, because
 openWakeWord derives its feature window from the model's own input shape and
 will feed `[1, 1, 96]` to a graph that demands 22400 audio samples. Whatever
-else happens, upload-time validation should reject or classify the file
+else happens, validation during upload should reject or classify the file
 (Phase 1).
 
 ## The decision that makes this small
@@ -72,8 +72,8 @@ For comparison the openWakeWord asset set is 3.3 MB across three files
 
 ## The runtime question, settled
 
-The risk that decision took was the `STFT` kernel on the *device's* runtime. The
-controller pins `onnxruntime==1.20.1` (x86, PyPI); the device runs the vendored
+The open question was whether the `STFT` kernel was in the *device's* runtime.
+The controller pins `onnxruntime==1.20.1` (x86, PyPI); the device runs the vendored
 `onnxruntime-android` **1.19.2** AAR (`controller/Dockerfile:111`). Checked
 directly, two ways:
 
@@ -121,8 +121,8 @@ BC-ResNet's graph breaks down as `STFT` 34% (1.70 ms), `AveragePool` 19%,
 `Conv` 13%, `Add` 6% — the classifier itself is about two thirds of it.
 
 EchoMuse has already measured the oWW pipeline on the Dot: 29 ms of work per
-80 ms frame, 36.2% of one core (`ort.go:17-21`). That gives a device/x86 factor
-of **12.8×** for a workload this machine also runs, which is a far better
+80 ms frame, 36.2% of one core (`ort.go:17-21`). That gives
+a device/x86 factor of **12.8×** for a workload this machine also runs, which is a far better
 projection basis than a generic ARM-vs-x86 guess:
 
 | BC-ResNet hop | invocations/s | projected on-device | vs oWW today (36.2%) |
@@ -250,12 +250,12 @@ class BcresnetScorer:   # ring buffer + hop counter + normalize + infer + smooth
 
 ### Assets
 
-`em_oww_assets.desired_assets()` returns a fixed four-item set (runtime + two
-shared feature models + the head). Make it type-aware: a bcresnet model wants
-`libonnxruntime.so`, `<stem>.onnx`, `<stem>.json` — and *not* the 2.4 MB of
-shared feature models. `plan_sync` already computes adds/deletes by md5, so the
-shared models get cleaned off a device that no longer needs them for free.
-`md5 is the only definition of success` (`em_oww_assets.py:30`) applies
+`em_oww_assets.desired_assets()` returns a fixed set of four items (the runtime,
+two shared feature models, and the head). Make it aware of the type: a bcresnet
+model needs `libonnxruntime.so`, `<stem>.onnx`, `<stem>.json` — and *not* the
+2.4 MB of shared feature models. `plan_sync` already computes adds/deletes by
+md5, so the shared models get cleaned off a device that no longer needs them for
+free. `md5 is the only definition of success` (`em_oww_assets.py:30`) applies
 unchanged.
 
 ## Phases

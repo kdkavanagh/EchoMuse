@@ -19,7 +19,7 @@ docker exec echomuse-controller python /tmp/devshell.py "<shell command>" ["<ano
   stopping the service kills the shell mid-command and takes the device down
   until it is power cycled.
 - **pull_so.py** — pull a file off the device (toybox base64 over the
-  shell, echo disabled, split end-markers). Writes the decoded file to
+  shell, with echo disabled and markers at the end split apart). It writes the decoded file to
   stdout: `python /tmp/pull_so.py /system/lib64/libled_hal.so > out.so`.
 - **push_file.py** — the other direction, for arbitrary paths (firmware
   goes only through the controller's bundled-firmware update):

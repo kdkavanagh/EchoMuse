@@ -142,8 +142,8 @@ writes):
 
 ### Reflashing a Dot that is already registered
 
-Reflashing a Dot the controller already knows (moving one from Fire OS 5 to
-Fire OS 6, say) keeps it as the same device. The controller keys everything it
+Reflashing a Dot already registered with the controller (moving one from Fire
+OS 5 to Fire OS 6, say) keeps it as the same device. The controller keys everything it
 holds for a Dot by `ro.serialno`: its name, settings, approval, Home Assistant
 device and alarm calendar. That serial comes from the Dot's idme area, not
 from Fire OS, so the wizard sees the same one after the flash. At its first

@@ -10,15 +10,15 @@ what to watch when it runs.
 
 ## The problem
 
-Three sources of wake-word training data exist in this repo, and none of them
-produces the fourth thing that is wanted:
+Three sources of data for training wake words exist in this repo, and none of
+them produces the fourth thing that is wanted:
 
 | | what it gives | what it cannot give |
 |---|---|---|
 | `oww_forge` | synthetic TTS positives, thousands of them | a real microphone, a real room |
 | `em_samples` (collect mode) | this speaker, this room, this array | volume, quantity, labels |
 | `collect_device_clips.py` | verified wake phrases from a button press | anything at scale |
-| **this** | 1.9M already-labelled clips, re-recorded through the device | positives — Common Voice has no wake word in it |
+| **this** | 1.9M clips that already have labels, re-recorded through the device | positives — Common Voice has no wake word in it |
 
 Common Voice on disk is clean studio speech. Played into the room and captured
 off the Echo's own mic array, the same clips carry the array, the beamformer,
@@ -38,13 +38,13 @@ distance and reverb; volume gives SNR.
 it, plays something, closes it, and gets exactly one WAV POSTed back to a
 webhook. Pure logic, no I/O.
 
-**`controller/em_controller.py`** — the mode itself. Frame tap beside the
-collect-mode tap in `wake_word_listener`, so the recorded audio is
-byte-for-byte what the wake model scores. Suspends voice turns, lights the
+**`controller/em_controller.py`** — the mode itself. It adds a frame tap beside
+the tap that collect mode uses in `wake_word_listener`, so the recorded audio is
+byte-for-byte what the wake model scores. It suspends voice turns, lights the
 magenta ring, runs a delivery task and a watchdog.
 
-**`controller/em_api.py`** — four admin-only routes: arm/disarm the mode, open
-a window, stop a window, read state.
+**`controller/em_api.py`** — four routes only administrators can use: arm/disarm the
+mode, open a window, stop a window, read state.
 
 **`oww_forge/tools/playback_matrix.py`** — the driver. Owns the matrix, serves
 each source clip to Home Assistant over HTTP, plays it, receives the
@@ -84,12 +84,12 @@ closed by the caller yields one, always.
 walking the house saying the wake word should not lose their session to a
 `docker compose up`.
 
-A webhook is the address of a *running process*. A controller that came back
-up still suspended, POSTing at a socket nobody holds, would be a device
-answering nothing for a reason nothing on screen explains. So capture state
-lives on the connection only. That is why there is no schema change, nothing
-to add to the support-bundle allowlist, and why the mode requires a
-**connected** device where collect mode does not.
+A webhook is the address of a *running process*. If a controller came back up
+still suspended and POSTed to a socket nobody holds, a device would answer
+nothing for a reason nothing on screen explains. So capture state lives on the
+connection only. That is why there is no schema change, nothing to add to the
+support-bundle allowlist, and why the mode requires a **connected** device where
+collect mode does not.
 
 ### Three ways it refuses to strand a device
 

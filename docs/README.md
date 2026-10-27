@@ -6,19 +6,19 @@ walkthroughs welcome.
 
 | Document | What it covers |
 |---|---|
-| [Quickstart](quickstart.md) | Zero to talking to your Dot: controller install, Home Assistant token, first-run setup, device approval, Home Assistant hookup, everyday use. |
-| [Configuration Guide](configuration.md) | Every dashboard setting explained in plain language — what it does, when to touch it, and how to tune it. Ends with [what leaves your network](configuration.md#what-leaves-your-network) — there is no telemetry, and every outbound connection is named. |
+| [Quickstart](quickstart.md) | From zero to talking to your Dot: install the controller, add a Home Assistant token, set it up for the first time, approve the device, connect Home Assistant, and use it every day. |
+| [Configuration Guide](configuration.md) | Every dashboard setting explained in plain language — what it does, when to touch it, and how to tune it. It ends with [what leaves your network](configuration.md#what-leaves-your-network) — there is no telemetry, and it names every outbound connection. |
 | [The Voice Pipeline, Explained](voice-pipeline.md) | How your voice travels from the microphones to Home Assistant and back, stage by stage, with the benefits and caveats of each design choice. |
 | [LED Ring States](led-ring-states.md) | What every colour and animation on the ring means, and which side (Dot or controller) draws it. |
 
 Deeper technical references live elsewhere:
 
 - [post-afe-audio-architecture.md](post-afe-audio-architecture.md) — the
-  architecture EchoMuse implements above the native AFE: on-device BCResNet
-  wake detection, playback-aware barge-in, endpointing, continuation,
-  HA-native satellite timers, and stock Local Calendar-backed durable alarms.
-  Sections 16 (normative contracts) and 18 (what replaced what) are the
-  most specific.
+  architecture EchoMuse implements above the native AFE: BCResNet that runs on
+  the device to detect wakes, barge-in that accounts for playback, endpointing,
+  continuation, HA's native satellite timers, and durable alarms backed by stock
+  Local Calendar. Sections 16 (normative contracts) and 18 (what replaced what)
+  are the most specific.
 - [quiet-command-endpoint-plan.md](quiet-command-endpoint-plan.md) — the
   plan for letting a wake or button turn end on Kroko's words when Silero
   doesn't hear a quiet command, with turns 911 and 912 as the evidence.

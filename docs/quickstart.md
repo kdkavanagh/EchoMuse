@@ -254,8 +254,8 @@ A Dot that never appears as pending was refused: the controller admits only
 Dots running Fire OS 6, and Echo Show 8s running Fire OS 6 or LineageOS 18.1,
 with protocol v1 firmware. Run the
 wizard on it (after
-moving it to Fire OS 6, if needed); a device the controller already knows is
-re-adopted with **Continue**, keeping its name and settings.
+moving it to Fire OS 6, if needed); a device already registered with the
+controller is re-adopted with **Continue**, keeping its name and settings.
 
 ## Step 6 — Connect it to Home Assistant
 

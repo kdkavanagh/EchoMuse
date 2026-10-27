@@ -116,7 +116,7 @@ session is lost — a driver must re-arm after a reconnect.
 
 - **`idle_s` is a dead-man.** No window opened and no API call within it and
   the mode clears itself, the ring goes out, voice turns resume, and a device
-  log line says why. It never expires underneath an open window — a caller
+  log line gives the reason. It never expires underneath an open window — a caller
   may legitimately open a 30s window and say nothing for its duration.
 - **A window closes two ways**: on audio time at `max_ms`, noticed by the
   frame path, and on the **wall clock** at `max_ms + WINDOW_GRACE_MS` (2 s),
@@ -140,9 +140,8 @@ session is lost — a driver must re-arm after a reconnect.
   armed (`em_capture.valid_webhook`). The caller is an authenticated admin,
   so this is not authorisation; it is the cheap half of not building an SSRF
   gadget out of a controller sitting on a home LAN.
-- **An empty window is a failure, not a delivery.** A zero-length recording
-  read as success is how a caller ends up with a corpus of silence it
-  believes in.
+- **An empty window is a failure, not a delivery.** Treating a zero-length recording as
+  success is how a caller ends up with a corpus of silence they trust.
 - **A result is consumed on read** in pull mode, so one recording cannot be
   collected twice and paired with two different source files.
 - `tag` is opaque and echoed verbatim. Correlation is the caller's business,

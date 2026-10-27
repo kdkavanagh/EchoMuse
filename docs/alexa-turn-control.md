@@ -1172,7 +1172,7 @@ private void refreshWakeWordState() {
 }
 ```
 
-No condition knows the rule. A condition reports itself, the map is
+No single condition holds the rule. A condition reports itself, the map is
 re-evaluated whole, and the same evaluation drives a *second* decision —
 whether to hold the microphone exclusively. An unrecognised condition is
 logged and dropped rather than defaulting, and an unchanged value short
@@ -1981,7 +1981,7 @@ It is still the wrong trade:
   understand the design is one thing; shipping a product that loads them is
   another, and EchoMuse distributes firmware.
 - **It would re-acquire the coupling we deliberately removed.** The engine
-  wants the AFE's client properties, the loopback stream and the metadata
+  needs the AFE's client properties, the loopback stream and the metadata
   channel to work well; without those it is a strictly worse BC-ResNet.
 
 `injectWaveFile(const char*, bool)` on `WakeWordService` is worth noting for a
@@ -2067,7 +2067,7 @@ a live Alexa voice session or disassembly of the native handler.
 Worth noting independently: `InTTS` and `InAlarm` are exactly the flags
 `ASP_CMD_NOTIFY_TTS_STATUS` sets. Nothing tells our ASP that we are speaking,
 so they are permanently false — **the AFE is running without the playback-state
-input its own tuning expects.**
+input that its own tuning was built around.**
 
 #### Two things that *are* reachable, and one correction
 

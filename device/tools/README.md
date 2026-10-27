@@ -14,8 +14,8 @@ by playing a tone from known angles.
 ## Build
 
 `device/tools/build_tools.sh` (run from `device/`) builds every tool. By hand,
-inside the `echomuse-compiler` image, which is the firmware toolchain stage of
-`controller/Dockerfile`:
+inside the `echomuse-compiler` image, which is the stage in
+`controller/Dockerfile` that supplies the firmware toolchain:
 
 ```bash
 docker build -f ../../controller/Dockerfile --target compiler -t echomuse-compiler ../..

@@ -255,8 +255,8 @@ one of these ways:
   ends the turn with the error animation rather than guessing.
 
 Whether your words are complete comes from two places. The controller's own
-grammar knows timers, alarms, on/off of exposed entities and the local stop
-commands. Anything it does not know is asked of Home Assistant's own sentence
+grammar covers timers, alarms, on/off of exposed entities and the local stop
+commands. Anything outside that grammar is asked of Home Assistant's own sentence
 matcher each time the transcript changes: your built-in, custom and
 automation-trigger sentences. A full match counts as complete. When the same
 words plus one more would still match, because a sentence ends in a
@@ -363,8 +363,8 @@ may repair it. Speech-to-text sometimes gets a request almost right ("plate
 cherub rock", "what time is" with the last word lost, "watch flex"); Home
 Assistant's built-in sentences then do not recognise it and it goes to the
 conversation agent. The controller tries a few bounded repairs: a misheard
-name, a leftover piece of the wake word, a misheard or cut-short request it
-knows from your automation triggers, earlier requests or your preferred
+name, a leftover piece of the wake word, a misheard or cut-short request found
+in your automation triggers, earlier requests or your preferred
 phrases, number words. It accepts one only if Home Assistant's own sentence
 matcher, which runs nothing, fully understands it, nothing you said
 explicitly (not, on/off, numbers, the action, a room it had recognised) was

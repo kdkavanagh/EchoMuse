@@ -67,7 +67,7 @@ Stimulus B, 22 s: 1 s of silence, 20 s of white Gaussian noise at −35 dBFS RMS
 | channel-map set | 14 × 4 s, `micMultiChAsr` with the setups of alexa-afe.md "Channel layout" | B at 0.5 s | ≈4,650–4,760 s | |
 | `lp` | `loopback` | none of its own (A, from `lm`) | 231 s | no metadata |
 
-**Decoding.** For each capture, bit 0 of channel 0 was shifted sample by sample into a 128-bit register, with the first-received bit as bit 127. A frame was taken wherever bits 127:120 are `0xA5` and bits 7:0 equal the popcount of bits 127:8 modulo 256, and the fields were sliced per the v3.3 table in alexa-afe.md. Only frames at phase 0 (starting at a multiple of 128 samples) were kept; section 1.2 says why. For every frame and channel the RMS and peak of its 128 samples were computed with bit 0 cleared. In the multichannel captures, the reference channel gives the playback timeline: a *reference segment* is a run of non-zero reference samples, ended by more than 400 consecutive zeros.
+**Decoding.** For each capture, bit 0 of channel 0 was shifted sample by sample into a 128-bit register, with the first-received bit as bit 127. A frame was taken wherever bits 127:120 are `0xA5` and bits 7:0 equal the popcount of bits 127:8 modulo 256, and the fields were sliced per the v3.3 table in alexa-afe.md. Only frames at phase 0 (starting at a multiple of 128 samples) were kept; section 1.2 explains why. For every frame and channel the RMS and peak of its 128 samples were computed with bit 0 cleared. In the multichannel captures, the reference channel gives the playback timeline: a *reference segment* is a run of non-zero reference samples, ended by more than 400 consecutive zeros.
 
 Every capture opened a new record stream and a new play stream. A "first playback" below is therefore the first in a fresh stream pair. EchoMuse keeps both streams open continuously:
 - the render mixer's `Run` (`device/internal/render/mixer.go`) writes silence when idle;
@@ -489,7 +489,7 @@ Each also notes whether it applied to Fire OS 5, which EchoMuse has since stoppe
   - It is 2-bit, and it gave 0.75 for 1.1 s on own-echo residual with nobody talking. It fired only on onsets: 0.32 s of a 4 s sound sitting 15–25 dB over the floor.
   - Silero already runs on the same samples, and `B` is a 20th percentile that tolerates speech (post-afe-audio-architecture.md §16.6).
   - Its speech sensitivity was never measured.
-- **`DTD` or `UED` as near-end acceptance or rescue.** DTD reached 0.68 and UED 0.70–0.84 with no talker. §6.1 of the architecture says near-end evidence never accepts on its own, and nothing here changes that until E2.
+- **`DTD` or `UED` as near-end acceptance or rescue.** DTD reached 0.68 and UED 0.70–0.84 with no talker. §6.1 of the architecture establishes that near-end evidence never accepts on its own, and nothing here changes that until E2.
 - **ERLE-based rejection now.** Low ERLE also comes from quiet playback (2–5 after 20 s at −37 dBFS) and from real double talk. Rejecting on it would cut genuine barge-ins; it needs E1 and E2 plus shadow time.
 - **`RMS` as a noise floor or for wake-threshold context.** It is the same samples' level within 0.5 dB, so it duplicates `E`. A device floor (for example the p20 of `E` while PA = 0) needs no metadata. Only the PA gating is new, and that is a minor gain.
 - **`SSL`/`FD` direction, `ULTRA_PROX`, `SIGNAL_TO_ECHO_RATIO`, `LPM`.** All constant.

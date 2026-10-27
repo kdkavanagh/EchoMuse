@@ -66,7 +66,7 @@ public issue.
 
 ## If a provisioning step failed instead
 
-A support bundle describes a device the controller already knows about. A Dot
+A support bundle describes a device already registered with the controller. A Dot
 that is halfway through the provisioning wizard is not one of those, so the
 wizard collects its own file.
 
