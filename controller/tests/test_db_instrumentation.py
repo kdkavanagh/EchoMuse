@@ -426,20 +426,24 @@ def test_the_filtered_archives_take_confirmed_wakes_and_saved_near_misses_within
     db.delete_device("gone")
 
     def wakes(device, lo, hi):
-        return db.get_wake_clip_turns(device, lo, hi, trigger="wake", refused=em_session.REFUSED_WAKES)
+        return [(r.device_id, r.row_id, r.ts, r.wake_model_sha256) for r in
+                db.get_wake_clip_turns(device, lo, hi, trigger="wake", refused=em_session.REFUSED_WAKES)]
 
     assert wakes(None, 0.9, 1.0) == [("dev1", legacy, 7.0, None), ("dev2", quiet, 5.0, None),
                                      ("dev1", answered, 1.0, "g1")]
     assert wakes(None, 0.95, 0.95) == [("dev1", answered, 1.0, "g1")]
     assert wakes("dev2", 0.0, 1.0) == [("dev2", quiet, 5.0, None)]
 
+    def near_misses(device, lo, hi):
+        return [(r.device_id, r.row_id, r.wake_model_sha256) for r in db.get_near_miss_recordings(device, lo, hi)]
+
     saved = db.NearMissRecording.SAVED
     a = db.insert_near_miss("dev1", _near_miss_record(1.0, 0.30, saved))
     db.insert_near_miss("dev1", _near_miss_record(2.0, 0.35, db.NearMissRecording.FAILED))
     db.insert_near_miss("dev1", _near_miss_record(3.0, 0.60, saved))
     b = db.insert_near_miss("dev2", replace(_near_miss_record(4.0, 0.50, saved), wake_model_sha256="g2"))
-    assert db.get_near_miss_recordings(None, 0.3, 0.5) == [("dev2", b, "g2"), ("dev1", a, None)]
-    assert db.get_near_miss_recordings("dev1", 0.3, 0.5) == [("dev1", a, None)]
+    assert near_misses(None, 0.3, 0.5) == [("dev2", b, "g2"), ("dev1", a, None)]
+    assert near_misses("dev1", 0.3, 0.5) == [("dev1", a, None)]
 
 
 def test_a_near_miss_chart_is_read_one_at_a_time_for_its_device_and_kept_for_the_newest_rows(fresh_db, monkeypatch):

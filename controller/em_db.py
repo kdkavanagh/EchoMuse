@@ -26,7 +26,7 @@ import os
 import sqlite3
 import threading
 import time
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, fields
 from enum import StrEnum
@@ -232,6 +232,7 @@ class NearMissRow:
     recording: NearMissRecording
     audio_ms: Optional[int]
     verdict: Optional[NearMissVerdict]
+    windows: Optional[str]   # em_clip_windows.ClipWindows JSON of its recording; None until scored
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Self:
@@ -239,6 +240,24 @@ class NearMissRow:
         values["recording"] = NearMissRecording(row["recording"])
         values["verdict"] = None if row["verdict"] is None else NearMissVerdict(row["verdict"])
         return cls(**values)
+
+
+@dataclass(frozen=True, slots=True)
+class SavedClipRow:
+    """A turn's wake clip or a near miss's recording, as the clip archives and the window
+    scorer read it: its row, when it happened, the graph that scored it on the Echo, and
+    the windows the controller scored over it (em_clip_windows.ClipWindows JSON; None
+    until scored)."""
+    device_id: str
+    row_id: int
+    ts: float
+    wake_model_sha256: Optional[str]
+    windows: Optional[str]
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> Self:
+        return cls(row["device_id"], row["id"], row["ts"], row["wake_model_sha256"], row["windows"])
+
 
 
 # ─── Default device config ────────────────────────────────────────────────────
@@ -1281,6 +1300,20 @@ MIGRATIONS: list[str] = [
     """
     ALTER TABLE near_misses ADD COLUMN verdict TEXT;
     UPDATE system_config SET value = '39' WHERE key = 'schema_version';
+    """,
+
+    # ── v40 — the wake model's windows over each saved clip ──────────────────
+    #
+    # em_clip_windows scores every saved wake clip and near-miss recording
+    # again on the controller, one 1.4 s BCResNet window every 160 ms, and keeps
+    # the result as em_clip_windows.ClipWindows JSON: `near_misses.windows` for
+    # a near miss's recording, `turns.wake_windows` for a turn's wake clip.
+    # NULL means not scored yet (or never saved). Activity shows the windows
+    # and plays the best one, and the archives crop around them.
+    """
+    ALTER TABLE near_misses ADD COLUMN windows TEXT;
+    ALTER TABLE turns ADD COLUMN wake_windows TEXT;
+    UPDATE system_config SET value = '40' WHERE key = 'schema_version';
     """,
 ]
 
@@ -2433,14 +2466,15 @@ TURN_WRITE_ONLY_COLUMNS = frozenset({"decision_trace", "afe_series"})
 # Columns get_turns returns but nothing writes any more (SPEC §18.4 step 3):
 # the legacy data-plane delivery measurements and the shadow/device-wake
 # comparison. They keep their history. audio_file/wake_file are written after
-# the insert by set_turn_audio/set_turn_wake (their names embed the rowid).
+# the insert by set_turn_audio/set_turn_wake (their names embed the rowid), and
+# wake_windows once em_clip_windows has scored the wake clip.
 _TURN_READ_ONLY_COLUMNS = (
     "noise_floor", "vad_end_ms", "tts_bytes", "underruns", "playback_periods",
     "min_depth", "prime_wait_ms", "recv_span_ms", "max_gap_ms", "bytes_recv",
     "send_ms", "delivery_ms", "eq_ms",
     "dev_wake_score", "dev_wake_delta_ms", "dev_shadow", "dev_threshold",
     "ctrl_wake_score", "ctrl_wake_delta_ms",
-    "audio_file", "wake_file",
+    "audio_file", "wake_file", "wake_windows",
 )
 
 
@@ -2529,6 +2563,45 @@ def set_turn_wake(turn_id: int, wake_file: Optional[str]) -> None:
             "UPDATE turns SET wake_file = ? WHERE id = ?",
             (wake_file, turn_id),
         )
+
+
+def set_turn_wake_windows(turn_id: int, windows: str) -> None:
+    """Store the windows em_clip_windows scored over a turn's wake clip (ClipWindows JSON)."""
+    with _tx() as conn:
+        conn.execute("UPDATE turns SET wake_windows = ? WHERE id = ?", (windows, turn_id))
+
+
+def set_near_miss_windows(near_miss_id: int, windows: str) -> None:
+    """Store the windows em_clip_windows scored over a near miss's recording (ClipWindows JSON)."""
+    with _tx() as conn:
+        conn.execute("UPDATE near_misses SET windows = ? WHERE id = ?", (windows, near_miss_id))
+
+
+# Row ids per IN (...) list: under SQLite's oldest limit of 999 bound parameters.
+_IN_CHUNK = 500
+
+
+def _unscored(table: str, column: str, ids: Collection[int]) -> list[SavedClipRow]:
+    out: list[SavedClipRow] = []
+    ordered = sorted(ids, reverse=True)
+    for i in range(0, len(ordered), _IN_CHUNK):
+        chunk = ordered[i:i + _IN_CHUNK]
+        rows = _q(f"SELECT device_id, id, ts, wake_model_sha256, {column} AS windows FROM {table} "
+                  f"WHERE {column} IS NULL AND id IN ({', '.join('?' * len(chunk))}) ORDER BY id DESC", chunk)
+        out.extend(SavedClipRow.from_row(r) for r in rows)
+    return out
+
+
+def get_unscored_wake_clips(turn_ids: Collection[int]) -> list[SavedClipRow]:
+    """Of the turns `turn_ids` (the wake clips on disk), those whose clip has no windows yet,
+    newest first."""
+    return _unscored("turns", "wake_windows", turn_ids)
+
+
+def get_unscored_near_misses(near_miss_ids: Collection[int]) -> list[SavedClipRow]:
+    """Of the near misses `near_miss_ids` (the recordings on disk), those whose recording has
+    no windows yet, newest first."""
+    return _unscored("near_misses", "windows", near_miss_ids)
 
 
 def set_turn_continuation(turn_id: int, continuation: str) -> None:
@@ -2677,34 +2750,32 @@ def _scope(device_id: Optional[str], table: str) -> tuple[str, tuple[object, ...
 
 
 def get_wake_clip_turns(device_id: Optional[str], lo: float, hi: float, *, trigger: str,
-                        refused: Iterable[str]) -> list[tuple[str, int, float, Optional[str]]]:
-    """(device_id, turn id, ts, wake_model_sha256), newest first, of `device_id`'s turns (every
-    registered device's when None) that `trigger` opened and whose end is not `refused` (a row
-    from before terminal reasons were kept counts as answered), with a saved wake clip and a
-    wake score in [lo, hi]."""
+                        refused: Iterable[str]) -> list[SavedClipRow]:
+    """Newest first, `device_id`'s turns (every registered device's when None) that `trigger`
+    opened and whose end is not `refused` (a row from before terminal reasons were kept counts
+    as answered), with a saved wake clip and a wake score in [lo, hi]."""
     reasons = tuple(refused)
     scope, params = _scope(device_id, "t")
     rows = _q(
-        f"SELECT device_id, id, ts, wake_model_sha256 FROM turns t WHERE {scope} AND trigger_type = ? "
-        f"AND wake_file IS NOT NULL AND wake_score BETWEEN ? AND ? "
+        f"SELECT device_id, id, ts, wake_model_sha256, wake_windows AS windows FROM turns t "
+        f"WHERE {scope} AND trigger_type = ? AND wake_file IS NOT NULL AND wake_score BETWEEN ? AND ? "
         f"AND (terminal_reason IS NULL OR terminal_reason NOT IN ({', '.join('?' * len(reasons))})) "
         f"ORDER BY ts DESC",
         (*params, trigger, lo, hi, *reasons))
-    return [(row["device_id"], row["id"], row["ts"], row["wake_model_sha256"]) for row in rows]
+    return [SavedClipRow.from_row(row) for row in rows]
 
 
 def get_near_miss_recordings(device_id: Optional[str], lo: float, hi: float,
-                             verdict: Optional[NearMissVerdict] = None) -> list[tuple[str, int, Optional[str]]]:
-    """(device_id, row id, wake_model_sha256), newest first, of `device_id`'s near misses (every
-    registered device's when None) whose recording was saved, with a peak in [lo, hi] and, when
-    `verdict` is given, marked with it."""
+                             verdict: Optional[NearMissVerdict] = None) -> list[SavedClipRow]:
+    """Newest first, `device_id`'s near misses (every registered device's when None) whose
+    recording was saved, with a peak in [lo, hi] and, when `verdict` is given, marked with it."""
     scope, params = _scope(device_id, "n")
     marked, marks = ("AND verdict = ? ", (verdict,)) if verdict is not None else ("", ())
     rows = _q(
-        f"SELECT device_id, id, wake_model_sha256 FROM near_misses n WHERE {scope} AND recording = ? "
-        f"AND peak BETWEEN ? AND ? {marked}ORDER BY ts DESC",
+        f"SELECT device_id, id, ts, wake_model_sha256, windows FROM near_misses n WHERE {scope} "
+        f"AND recording = ? AND peak BETWEEN ? AND ? {marked}ORDER BY ts DESC",
         (*params, NearMissRecording.SAVED, lo, hi, *marks))
-    return [(row["device_id"], row["id"], row["wake_model_sha256"]) for row in rows]
+    return [SavedClipRow.from_row(row) for row in rows]
 
 
 def get_text_fix_history(limit: int, before_id: Optional[int] = None) -> list[tuple[int, float, str, Optional[str]]]:

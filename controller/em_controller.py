@@ -48,6 +48,7 @@ import em_auth as auth
 import em_button
 import em_ble_proxy
 import em_capture
+import em_clip_windows
 import em_config_sections
 import em_db as db
 import em_device
@@ -146,6 +147,7 @@ _registry: em_wake_registry.WakeRegistry | None = None
 _assets: em_device_assets.DeviceAssets | None = None
 _firmware: em_firmware.BundledFirmware | None = None
 _worker: em_speech_worker.SpeechWorker | None = None
+_clip_windows: em_clip_windows.ClipWindowsService | None = None
 _links = em_device_link.LinkRegistry()
 _arbiter = em_arbiter.WakeArbiter()
 _ha_status: dict[em_ha_client.HaFeature, em_ha_client.FeatureStatus] = {}
@@ -196,6 +198,12 @@ def registry() -> em_wake_registry.WakeRegistry:
     if _registry is None:
         raise NotStarted("controller not started")
     return _registry
+
+
+def clip_windows() -> em_clip_windows.ClipWindowsService:
+    if _clip_windows is None:
+        raise NotStarted("controller not started")
+    return _clip_windows
 
 
 def device_assets() -> em_device_assets.DeviceAssets:
@@ -1291,6 +1299,9 @@ class Services:
     def registry(self) -> em_wake_registry.WakeRegistry:
         return registry()
 
+    def clip_windows(self) -> em_clip_windows.ClipWindowsService:
+        return clip_windows()
+
     def device_assets(self) -> em_device_assets.DeviceAssets:
         return device_assets()
 
@@ -1377,7 +1388,7 @@ def _route_observation(obs: em_speech_worker.Observation) -> None:
 
 
 async def main() -> None:
-    global _ha, _text_fix, _alerts, _registry, _assets, _firmware, _worker
+    global _ha, _text_fix, _alerts, _registry, _assets, _firmware, _worker, _clip_windows
     log.info("EchoMuse Controller %s", api.CONTROLLER_VERSION)
     db.init(DB_PATH)
     auth.maybe_generate_bootstrap_token()
@@ -1400,6 +1411,7 @@ async def main() -> None:
              bundled.version, bundled.size, bundled.sha256[:12])
 
     wake_registry = _registry = _open_registry()
+    windows = _clip_windows = em_clip_windows.ClipWindowsService(wake_registry)
     assets = _assets = em_device_assets.DeviceAssets(wake_registry, alert_lookup=em_sounds.asset_path)
     worker = _worker = em_speech_worker.SpeechWorker(wake_registry, on_observation=_route_observation)
     await worker.start()
@@ -1439,6 +1451,7 @@ async def main() -> None:
         _spawn(api.controller_release_poll_loop(), "controller-release-poll"),
         _spawn(api.session_prune_loop(), "session-prune"),
         _spawn(event_loop_lag_monitor(), "loop-lag"),
+        _spawn(windows.run(), "clip-windows"),
     ]
 
     runner = await api.create_runner(_devices, Services())

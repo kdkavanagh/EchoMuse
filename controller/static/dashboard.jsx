@@ -1183,19 +1183,23 @@ function Shell({ deviceId, token, height = 320 }) {
 // until revoked. Without it a URL lives only while its clip is the current
 // one, for recordings too large to hold on to (ambient sessions run to tens of
 // megabytes), and `url()` hands the caller a fresh URL that is theirs to
-// revoke.
+// revoke. A clip may play one stretch of itself (`stretch` {from, to}, seconds):
+// `segment` is the stretch sounding, null while a whole clip plays.
 function useClipPlayer(scope, { cache = true } = {}) {
   const [playing, setPlaying] = useState(null);
+  const [segment, setSegment] = useState(null);
   const audioRef   = useRef(null);
   const urlsRef    = useRef({});    // key -> cached object URL
   const currentRef = useRef(null);  // uncached: the current clip's URL
   const seqRef     = useRef(0);     // bumped on every stop
+  const timerRef   = useRef(null);  // ends a stretch
 
   const stop = () => {
     seqRef.current++;
+    clearTimeout(timerRef.current); timerRef.current = null;
     if (audioRef.current) { audioRef.current.pause(); audioRef.current = null; }
     if (currentRef.current) { URL.revokeObjectURL(currentRef.current); currentRef.current = null; }
-    setPlaying(null);
+    setPlaying(null); setSegment(null);
   };
 
   const url = async (key, path) => {
@@ -1205,9 +1209,11 @@ function useClipPlayer(scope, { cache = true } = {}) {
     return u;
   };
 
-  // Resolves false when the recording could not be fetched.
-  const toggle = async (key, path) => {
-    const wasPlaying = playing === key;
+  // Resolves false when the recording could not be fetched. Pressed again for
+  // what is sounding, it stops; for another stretch of the same clip, it plays that.
+  const toggle = async (key, path, stretch = null) => {
+    const sameStretch = (segment?.from === stretch?.from && segment?.to === stretch?.to);
+    const wasPlaying = playing === key && sameStretch;
     stop();
     if (wasPlaying) return true;
     const seq = seqRef.current;
@@ -1219,10 +1225,20 @@ function useClipPlayer(scope, { cache = true } = {}) {
     }
     if (!cache) currentRef.current = u;
     const el = new Audio(u);
-    const ended = () => setPlaying(p => (p === key ? null : p));
+    const ended = () => { setPlaying(p => (p === key ? null : p)); setSegment(null); };
     el.onended = el.onerror = ended;
+    if (stretch) {
+      // Before the metadata loads this sets where playback starts. The timer
+      // starts (again) whenever sound does, so a stall cannot cut the stretch short.
+      el.currentTime = stretch.from;
+      el.addEventListener('playing', () => {
+        clearTimeout(timerRef.current);
+        timerRef.current = setTimeout(() => { if (seq === seqRef.current) stop(); },
+          Math.max(0, (stretch.to - el.currentTime) * 1000));
+      });
+    }
     audioRef.current = el;
-    setPlaying(key);
+    setPlaying(key); setSegment(stretch);
     el.play().catch(ended);
     return true;
   };
@@ -1245,7 +1261,7 @@ function useClipPlayer(scope, { cache = true } = {}) {
   // closures are safe to run at teardown.
   useEffect(() => () => { stop(); forgetAll(); }, [scope]);
 
-  return { playing, toggle, stop, url, forget, forgetAll, elapsed };
+  return { playing, segment, toggle, stop, url, forget, forgetAll, elapsed };
 }
 
 // ─── Turn observability (Activity tab) ───────────────────────────────────────
@@ -2145,6 +2161,13 @@ function TurnDetail({ turn: t, turns, deviceLabel, onSelect, playback }) {
         && (t.wake_attribution === WAKE_ATTRIBUTION.VERIFIED || VERIFIED_REFUSAL.has(t.terminal_reason))
         && stage('Verification', <WakeVerification deviceId={t.device_id} turnId={t.turn_id}/>)}
 
+      {/* The wake clip's windows, as the controller scored them once it was saved. */}
+      {t.trigger === TURN_TRIGGER.WAKE && (t.wake_windows || playback?.kept(TURN_CLIP.WAKE)) && stage('Windows',
+        <ClipWindowsView windows={t.wake_windows} threshold={t.wake_threshold}
+          playing={playback?.playing === TURN_CLIP.WAKE}
+          playingBest={playback?.playing === TURN_CLIP.WAKE && playback.segment != null}
+          elapsed={playback?.elapsed} onPlayBest={playback?.kept(TURN_CLIP.WAKE) ? s => playback.toggle(TURN_CLIP.WAKE, s) : null}/>)}
+
       {!refused && !legacy && stage('Heard (EchoMuse)', <>
         {quote(t.asr_text)}
         <div style={{ color: 'var(--muted)' }}>
@@ -2277,13 +2300,85 @@ const NEAR_MISS_VERDICTS = Object.freeze({
 // The shortcut that clears a verdict and the one that plays or stops the recording.
 const NEAR_MISS_KEY = Object.freeze({ CLEAR: 'u', PLAY: 'p' });
 
+// The wake model's windows over a saved clip, as the controller scored them
+// once it was saved (em_clip_windows; `windows` is ClipWindowsJson, null until
+// scored): a bar per window at its centre, as tall as its score, the best
+// window's stretch shaded, the wake `threshold` dashed, and the clip's playhead
+// while it plays (`playing`, `elapsed()` seconds into the clip).
+// `onPlayBest({from, to})` plays the best window alone, in seconds (`playingBest`
+// while it does); null: no clip to play.
+function ClipWindowsView({ windows: w, threshold, playing, playingBest, elapsed, onPlayBest }) {
+  const [registry] = useWakeRegistry();
+  const cursorRef = useRef(null);
+  const elapsedRef = useRef(elapsed);
+  elapsedRef.current = elapsed;
+  const muted = { color: 'var(--muted)' };
+  const duration = w ? w.samples / CAPTURE_RATE : 0;
+
+  // The playhead moves every frame by writing its own style, as AfeLanes' does.
+  useEffect(() => {
+    if (!playing || !w) return undefined;
+    let raf = 0;
+    const tick = () => {
+      const t = elapsedRef.current();
+      if (t != null && cursorRef.current) cursorRef.current.style.left = `${Math.min(100, t / duration * 100)}%`;
+      raf = requestAnimationFrame(tick);
+    };
+    tick();
+    return () => cancelAnimationFrame(raf);
+  }, [playing, w, duration]);
+
+  if (!w) return <span style={muted}>not scored yet: the controller scores each saved clip in the background</span>;
+  const span = w.window / CAPTURE_RATE;
+  const best = w.scores.reduce((b, s) => (!b || s[1] > b[1] ? s : b), null);
+  const x = sample => sample / w.samples * 1000;
+  const H = 40;
+  const fmt = s => `${s.toFixed(2)} s`;
+  return (
+    <div>
+      <div style={{ position: 'relative', height: H + 2, marginBottom: 3 }}>
+        <svg viewBox={`0 0 1000 ${H}`} preserveAspectRatio="none" width="100%" height={H}
+          style={{ display: 'block', background: 'var(--track)', borderRadius: 3 }}
+          aria-label={best ? `Best window ${fmt(best[0] / CAPTURE_RATE)} to ${fmt(best[0] / CAPTURE_RATE + span)}, score ${best[1].toFixed(2)}` : 'No window scored'}>
+          {best && <rect x={x(best[0])} y={0} width={x(w.window)} height={H} fill="var(--accent)" opacity={0.18}/>}
+          {threshold != null && <line x1={0} x2={1000} y1={H - threshold * H} y2={H - threshold * H}
+            stroke="var(--warn)" strokeDasharray="4 3" vectorEffect="non-scaling-stroke"/>}
+          {w.scores.map(([start, p]) => (
+            <rect key={start} x={x(start + w.window / 2) - 4} width={8} y={H - p * H} height={Math.max(1, p * H)}
+              fill={best && start === best[0] ? 'var(--accent)' : 'var(--muted)'}>
+              <title>{`${fmt(start / CAPTURE_RATE)}–${fmt(start / CAPTURE_RATE + span)}: ${p.toFixed(3)}`}</title>
+            </rect>
+          ))}
+        </svg>
+        {playing && <div ref={cursorRef} style={{ position: 'absolute', top: 0, bottom: 2, width: 1, left: 0,
+          background: 'var(--text)', pointerEvents: 'none' }}/>}
+      </div>
+      <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '4px 8px' }}>
+        {best ? <>
+          <span>best window {fmt(best[0] / CAPTURE_RATE)}–{fmt(best[0] / CAPTURE_RATE + span)} · {best[1].toFixed(3)}</span>
+          {onPlayBest && <Pill small onClick={() => onPlayBest({ from: best[0] / CAPTURE_RATE, to: best[0] / CAPTURE_RATE + span })}>
+            {playingBest ? '▮ Stop' : '▶ Best window'}
+          </Pill>}
+        </> : <span style={muted}>no window loud enough to score</span>}
+      </div>
+      <div style={muted}>
+        {w.scores.length} windows of {fmt(span)}, every 160 ms across {fmt(duration)}, scored again on the controller
+        {' '}with {wakeModelLabel(registry.models, w.graph_sha256)}; unsmoothed, so not the Echo's own numbers
+        {threshold != null && <> · dashed: wake threshold {threshold.toFixed(2)}</>}
+      </div>
+    </div>
+  );
+}
+
 // One near miss in detail: what nearly woke the Echo and how close it came,
-// its recording (`recording` its NEAR_MISS_RECORDING, pruned derived), its
-// `verdict` with the buttons that set it through `onMark(verdict or null)`
-// (`markGap`: why it cannot be marked, else null; `markError`: why the last
-// mark failed), and the native AFE chart around it with the recording's playhead.
-function NearMissDetail({ near: n, deviceLabel, recording, playing, onPlay, onDownload, elapsed,
-                          verdict, onMark, markGap, markError }) {
+// its recording (`recording` its NEAR_MISS_RECORDING, pruned derived), the
+// wake model's windows over it with `onPlayBest` (`playingBest` while the best
+// one sounds), its `verdict` with the buttons that set it through
+// `onMark(verdict or null)` (`markGap`: why it cannot be marked, else null;
+// `markError`: why the last mark failed), and the native AFE chart around it
+// with the recording's playhead.
+function NearMissDetail({ near: n, deviceLabel, recording, playing, playingBest, onPlay, onPlayBest, onDownload,
+                          elapsed, verdict, onMark, markGap, markError }) {
   const [registry] = useWakeRegistry();
   const muted = { color: 'var(--muted)' };
   const fmtS = ms => (ms / 1000).toFixed(2) + ' s';
@@ -2310,12 +2405,18 @@ function NearMissDetail({ near: n, deviceLabel, recording, playing, onPlay, onDo
       <DetailStage label="Recording">
         {recording === NEAR_MISS_RECORDING.SAVED ? (
           <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '4px 8px' }}>
-            <Pill small onClick={onPlay}>{playing ? '▮ Stop' : '▶ Play'}</Pill>
+            <Pill small onClick={onPlay}>{playing && !playingBest ? '▮ Stop' : '▶ Play'}</Pill>
             <Pill small onClick={onDownload}>⤓ Download</Pill>
             {n.audio_ms != null && <span style={muted}>{fmtS(n.audio_ms)}, 300 ms either side of the scored stretch</span>}
           </div>
         ) : <span style={muted}>{NEAR_MISS_UNRECORDED[recording] || recording}</span>}
       </DetailStage>
+      {(recording === NEAR_MISS_RECORDING.SAVED || n.windows) && (
+        <DetailStage label="Windows">
+          <ClipWindowsView windows={n.windows} threshold={n.wake_threshold} playing={playing} playingBest={playingBest}
+            elapsed={elapsed} onPlayBest={recording === NEAR_MISS_RECORDING.SAVED ? onPlayBest : null}/>
+        </DetailStage>
+      )}
       <DetailStage label="Verdict">
         <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '4px 8px' }}>
           <span style={{ color: 'var(--text)' }}>Was the wake word said?</span>
@@ -2448,9 +2549,9 @@ function TurnObservability({ turns, nearMisses, nearMissGap, labels, device = nu
   // was pruned.
   const markGone = key => setGone(g => new Set(g).add(key));
 
-  const toggleAudio = async (t, kind) => {
+  const toggleAudio = async (t, kind, stretch = null) => {
     const key = clipKey(t, kind);
-    if (!(await player.toggle(key, clipPath(t, kind)))) markGone(key);
+    if (!(await player.toggle(key, clipPath(t, kind), stretch))) markGone(key);
   };
 
   const downloadAudio = async (t, kind) => {
@@ -2469,8 +2570,8 @@ function TurnObservability({ turns, nearMisses, nearMissGap, labels, device = nu
   // so the one player stops whichever else is sounding.
   const nearKey  = n => `near:${n.id}`;
   const nearPath = n => `/api/devices/${n.device_id}/near_misses/${n.id}/recording`;
-  const toggleNear = async n => {
-    if (!(await player.toggle(nearKey(n), nearPath(n)))) markGone(nearKey(n));
+  const toggleNear = async (n, stretch = null) => {
+    if (!(await player.toggle(nearKey(n), nearPath(n), stretch))) markGone(nearKey(n));
   };
   const downloadNear = async n => {
     let url;
@@ -2482,11 +2583,14 @@ function TurnObservability({ turns, nearMisses, nearMissGap, labels, device = nu
   // whether each is kept (null: never saved; false: pruned since), and the
   // playhead. One player, so the chart and these rows stop each other. The
   // turn recording has no row column: its series says whether it was saved.
+  // `segment` is the stretch of the sounding clip that plays ({from, to} s), or
+  // null while all of it does.
   const playbackFor = t => ({
     playing: [WAKE, MIC, RECORDING].find(kind => playing === clipKey(t, kind)) || null,
+    segment: player.segment,
     kept: kind => (kind === RECORDING ? !gone.has(clipKey(t, kind))
       : (kind === WAKE ? t.wake_file : t.audio_file) ? !gone.has(clipKey(t, kind)) : null),
-    toggle: kind => toggleAudio(t, kind),
+    toggle: (kind, stretch = null) => toggleAudio(t, kind, stretch),
     elapsed: player.elapsed,
   });
 
@@ -2914,7 +3018,9 @@ function TurnObservability({ turns, nearMisses, nearMissGap, labels, device = nu
             onSelect={id => setSelected(`turn:${id}`)} playback={playbackFor(shown.turn)}/>}
           {shown?.near && <NearMissDetail near={shown.near} deviceLabel={fleet ? nameOf(shown.near.device_id) : null}
             recording={nearRecording(shown.near)} playing={playing === nearKey(shown.near)}
-            onPlay={() => toggleNear(shown.near)} onDownload={() => downloadNear(shown.near)} elapsed={player.elapsed}
+            playingBest={playing === nearKey(shown.near) && player.segment != null}
+            onPlay={() => toggleNear(shown.near)} onPlayBest={s => toggleNear(shown.near, s)}
+            onDownload={() => downloadNear(shown.near)} elapsed={player.elapsed}
             verdict={verdictOf(shown.near)} onMark={v => mark(shown.near, v)} markGap={markGapOf(shown.near)}
             markError={markError}/>}
         </div>
@@ -2964,17 +3070,18 @@ const ARCHIVES = Object.freeze({
   },
 });
 const SCORE_RANGE_ALL = Object.freeze([0, 1]);
-// em_clip_crop: an archive's clips whole, or each scored again and cut to a
-// fixed length around the window the wake model scored highest (or every
-// window at or above a score). The bounds are the controller's; the length
-// starts at BCResNet's window.
+// em_clip_windows: an archive's clips whole, or cut to a fixed length around
+// the window the wake model scored highest (or every window at or above a
+// score), from the windows the controller scored once each clip was saved. The
+// bounds are the controller's; the length starts at BCResNet's window.
 const CROP_SECONDS = Object.freeze({ MIN: 0.1, MAX: 10, DEFAULT: '1.4' });
 // Pill takes no title; these go on the wrappers.
 const CROP_TITLE = Object.freeze({
   WHOLE: 'Each clip as saved: it runs as long as the Echo\'s score stayed up, plus 300 ms either side, so the lengths vary '
     + '(about 2–3.6 s). Training keeps only a clip\'s first 1.4 s, which is rarely the part that scored.',
-  CROP: 'Score each clip again with the wake model that scored it (one 1.4 s window every 160 ms, as the Echo does) and cut '
-    + 'this length around a window. The first export of many clips takes a while; later ones reuse the scores.',
+  CROP: 'Cut this length around a window of each clip, from the windows the controller scored (one 1.4 s window every '
+    + '160 ms, with the wake model that scored the clip on the Echo) once the clip was saved. A clip it has not reached '
+    + 'yet is scored before the archive is cut.',
   BEST: 'One crop per clip, around the window that scored highest',
   EVERY: 'One crop around every window that scored at or above this, unsmoothed. Windows are 160 ms apart, so neighbouring '
     + 'crops overlap; each crop\'s name starts with its clip\'s, so a training split can keep a clip\'s crops together.',
@@ -2991,6 +3098,7 @@ function FleetActivity({ devices, globalConfig, onOpenDevice, isAdmin }) {
     min: (globalConfig?.nearMissThreshold ?? 0.17).toFixed(2),
   }));
   const [archiving, setArchiving] = useState(null);       // the ARCHIVE being downloaded
+  const [scoring, setScoring] = useState(null);           // saved clips the controller has still to score; null: unknown
   const [archiveError, setArchiveError] = useState('');
   const approved = devices.filter(d => d.approved);
   // A device deleted while chosen falls back to every device.
@@ -3005,8 +3113,10 @@ function FleetActivity({ devices, globalConfig, onOpenDevice, isAdmin }) {
       Promise.all([
         API.get(`${base}/turns?limit=${ACTIVITY_LIMIT.FLEET}`).catch(() => null),
         API.get(`${base}/near_misses?limit=${ACTIVITY_LIMIT.FLEET}`).catch(() => null),
-      ]).then(([turns, nearMisses]) => {
+        API.get('/api/clip_windows').catch(() => null),
+      ]).then(([turns, nearMisses, windows]) => {
         if (!live || n !== seq) return;   // overtaken by a newer load
+        setScoring(windows?.pending ?? null);
         // A failed request keeps what this scope last showed.
         setLoad(prev => {
           const kept = prev?.scope === scope ? prev : null;
@@ -3109,7 +3219,7 @@ function FleetActivity({ devices, globalConfig, onOpenDevice, isAdmin }) {
             {Object.values(ARCHIVE).map(kind => (
               <span key={kind} title={ARCHIVES[kind].title}>
                 <Pill small disabled={archiving != null || !!cutError} onClick={() => download(kind)}>
-                  {archiving === kind ? (cropQuery.crop ? 'Scoring…' : 'Building…') : ARCHIVES[kind].label}
+                  {archiving === kind ? (cropQuery.crop && scoring > 0 ? 'Scoring…' : 'Building…') : ARCHIVES[kind].label}
                 </Pill>
               </span>
             ))}
@@ -3117,12 +3227,18 @@ function FleetActivity({ devices, globalConfig, onOpenDevice, isAdmin }) {
           {/* How each archive cuts its clips. */}
           <span style={{ display: 'inline-flex', flexWrap: 'wrap', gap: 6, alignItems: 'center', justifyContent: 'flex-end' }}>
             {cutError && <span style={{ fontFamily: MONO, fontSize: 9, color: 'var(--warn)' }}>{cutError}</span>}
+            {scoring > 0 && (
+              <span style={{ fontFamily: MONO, fontSize: 9, color: 'var(--muted)' }}
+                title="The controller scores the wake model's windows over each saved clip in the background, once. A cropped archive scores any clip it has not reached yet before cutting.">
+                scoring saved clips · {scoring} left
+              </span>
+            )}
             <span style={capsLabel}>each clip</span>
             <span title={CROP_TITLE.WHOLE}>
               <Pill small accent={!cut.crop} onClick={() => setCut(c => ({ ...c, crop: false }))}>Whole</Pill>
             </span>
             <span title={CROP_TITLE.CROP}>
-              <Pill small accent={cut.crop} onClick={() => setCut(c => ({ ...c, crop: true }))}>Re-scored crop</Pill>
+              <Pill small accent={cut.crop} onClick={() => setCut(c => ({ ...c, crop: true }))}>Crop</Pill>
             </span>
             {cut.crop && (<>
               <label title={CROP_TITLE.CROP} style={{ ...muted, display: 'inline-flex', alignItems: 'center', gap: 4 }}>
