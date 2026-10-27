@@ -92,6 +92,7 @@ from em_audio_timeline import (
     ReferenceView,
     StreamId,
     UplinkSession,
+    VadTrack,
     parse_u64,
 )
 from em_device_link import AckStatus, CloseReason, CommandAck, Envelope, MessageType
@@ -891,9 +892,12 @@ class _Runtime:
     echo_total: int = 0
     last_mic_end: int | None = None
     # The lease's native AFE records when it takes the session's `afe` stream
-    # (afe_metadata_v1), else None. Held past the lease's release so the turn or
-    # candidate can summarise them when it ends; evidence only, never a decision input.
+    # (afe_metadata_v1), else None, and the Silero probabilities the worker
+    # reported for its mic (the lease timeline's, so mute erases them with it).
+    # Held past the lease's release so the turn or candidate can summarise them
+    # when it ends; evidence only, never a decision input.
     afe: AfeTimeline | None = None
+    vad: VadTrack | None = None
 
 
 @dataclass
@@ -2020,7 +2024,7 @@ class SessionActor:
     def _new_runtime(self, lease_id: str) -> _Runtime:
         timeline = self.uplink.timelines.get(lease_id) if self.uplink is not None else None
         afe = timeline.afe if timeline is not None and StreamId.AFE in timeline.lease.streams else None
-        runtime = _Runtime(lease_id, CellAssembler(), afe=afe)
+        runtime = _Runtime(lease_id, CellAssembler(), afe=afe, vad=timeline.vad if timeline is not None else None)
         self._runtimes[lease_id] = runtime
         return runtime
 
@@ -2088,6 +2092,8 @@ class SessionActor:
         match obs.payload:
             case VadPayload() as vad:
                 runtime.assembler.add_vad(vad.first_cell_sample, vad.probabilities)
+                if runtime.vad is not None:
+                    runtime.vad.write(vad.first_cell_sample, vad.probabilities)
             case AsrPayload() as asr:
                 if runtime.utterance is not None and obs.utterance_id == runtime.utterance.utterance_id:
                     runtime.utterance.push_asr(asr.tokens, asr.token_emission_sample,
@@ -4098,14 +4104,16 @@ def _afe_snapshot(runtime: _Runtime, candidate: _Candidate | None,
     if runtime.afe is None:
         return None, None
     support = _support(candidate)
-    return turn_evidence(runtime.afe, support, utterance), turn_series(runtime.afe, support, utterance)
+    return (turn_evidence(runtime.afe, support, utterance),
+            turn_series(runtime.afe, support, utterance, vad=runtime.vad))
 
 
 def _afe_series(turn: _Turn, response: AfeTimeline) -> AfeSeries | None:
     """The turn's AfeSeries carried on through its response lease's records."""
     if turn.runtime.afe is None:
         return None
-    return turn_series(turn.runtime.afe, _support(turn.candidate), _utterance_span(turn), response=response)
+    return turn_series(turn.runtime.afe, _support(turn.candidate), _utterance_span(turn), response=response,
+                       vad=turn.runtime.vad)
 
 
 def _lease_capture(timeline: LeaseTimeline, support: tuple[int, int] | None,

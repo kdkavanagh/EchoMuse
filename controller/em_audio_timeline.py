@@ -18,7 +18,7 @@ import struct
 import time
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
-from typing import Callable, Iterable, TypedDict
+from typing import Callable, Iterable, Sequence, TypedDict
 
 import numpy as np
 
@@ -126,6 +126,7 @@ CELL_CAPACITY = (PCM_CAPACITY + ROLLING_SAMPLES) // CELL_SAMPLES
 # AFE records reach as far back as the reference: mic retention plus its 2.5 s
 # lead, plus the period the floor cuts.
 AFE_CAPACITY = -(-(PCM_CAPACITY + REFERENCE_EXTRA) // AFE_PERIOD_SAMPLES) + 1
+VAD_CAPACITY = -(-(PCM_CAPACITY + REFERENCE_EXTRA) // CELL_SAMPLES) + 1   # cells, retained as AFE records
 LEASE_BYTES_CAP = 2_600_000         # §8.1 per-lease bound
 
 # -- Clock fit (§4.3) -------------------------------------------------------
@@ -818,6 +819,66 @@ class AfeTimeline:
         self.floor, self.frontier = 0, None
 
 
+class VadTrack:
+    """The controller's Silero speech probability (em_speech_worker.VadPayload) for each
+    512-sample cell of one lease's mic, indexed by cell number j (capture samples
+    `[512j, 512j + 512)`), the newest value winning, ring of `capacity` cells, retained and
+    erased with the lease's AFE records. A cell Silero did not analyse has none, never a zero.
+    Evidence for the turn's chart (em_afe.AfeSeries.silero); no decision reads it."""
+
+    def __init__(self, capacity: int = VAD_CAPACITY):
+        self.capacity = capacity
+        self._p: np.ndarray | None = None      # float32 ring, NaN where none; allocated with the first value
+        self.floor = 0                          # cell number
+        self.frontier: int | None = None        # cell number past the newest
+
+    @property
+    def nbytes(self) -> int:
+        return 0 if self._p is None else int(self._p.nbytes)
+
+    def write(self, first_cell_sample: int, probabilities: Sequence[float]) -> None:
+        j0 = first_cell_sample // CELL_SAMPLES
+        j1 = j0 + len(probabilities)
+        if j1 <= self.floor:
+            return
+        if self._p is None:
+            self._p = np.full(self.capacity, np.nan, dtype=np.float32)
+        elif self.frontier is not None and j1 > self.frontier:
+            # The slots the new cells take still hold cells `capacity` older.
+            self._p[np.arange(max(self.frontier, j1 - self.capacity), j1) % self.capacity] = np.nan
+        if self.frontier is None or j1 > self.frontier:
+            self.frontier = j1
+            self.floor = max(self.floor, j1 - self.capacity)
+        lo = max(j0, self.floor)
+        self._p[np.arange(lo, j1) % self.capacity] = np.asarray(probabilities[lo - j0:], dtype=np.float32)
+
+    def read(self, a_sample: int, b_sample: int) -> tuple[int, tuple[float | None, ...]] | None:
+        """The retained cells overlapping capture samples `[a, b)` from the first Silero analysed
+        through the last: the first one's start sample, and each cell's probability, None for a
+        cell between them it did not analyse. None when it analysed none there."""
+        if self._p is None or self.frontier is None or a_sample >= b_sample:
+            return None
+        lo = max(a_sample // CELL_SAMPLES, self.floor)
+        hi = min(-(-b_sample // CELL_SAMPLES), self.frontier)
+        if lo >= hi:
+            return None
+        values = self._p[np.arange(lo, hi) % self.capacity]
+        known = np.flatnonzero(~np.isnan(values))
+        if known.size == 0:
+            return None
+        first, last = int(known[0]), int(known[-1])
+        return (lo + first) * CELL_SAMPLES, tuple(None if np.isnan(v) else float(v) for v in values[first:last + 1])
+
+    def trim_before(self, sample: int) -> None:
+        """Forget the cells that end at or before capture sample `sample`."""
+        self.floor = max(self.floor, sample // CELL_SAMPLES)
+
+    def clear(self) -> None:
+        """Erase every value (mute or session loss, with the lease's audio): as if none had come."""
+        self._p = None
+        self.floor, self.frontier = 0, None
+
+
 class ReferenceView:
     """Read access to one reference epoch of a `ReferenceTimeline`, in that
     epoch's own sample indices."""
@@ -1488,9 +1549,9 @@ class LeaseTable:
 # ---------------------------------------------------------------------------
 
 class LeaseTimeline:
-    """Mic, reference, cells and AFE records a lease received. The open
-    utterance (≤30 s) plus a rolling 10 s before it are kept; the rest ages
-    out (§8.1)."""
+    """Mic, reference, cells and AFE records a lease received, and the controller's Silero
+    probabilities for its mic. The open utterance (≤30 s) plus a rolling 10 s before it are
+    kept; the rest ages out (§8.1)."""
 
     def __init__(self, lease: Lease):
         self.lease = lease
@@ -1498,11 +1559,12 @@ class LeaseTimeline:
         self.cells = CellTimeline(CELL_CAPACITY)
         self.reference = ReferenceTimeline(PCM_CAPACITY)
         self.afe = AfeTimeline(AFE_CAPACITY)
+        self.vad = VadTrack(VAD_CAPACITY)
         self.utterance_start: int | None = None
 
     @property
     def nbytes(self) -> int:
-        return self.mic.nbytes + self.cells.nbytes + self.reference.nbytes + self.afe.nbytes
+        return self.mic.nbytes + self.cells.nbytes + self.reference.nbytes + self.afe.nbytes + self.vad.nbytes
 
     def set_utterance_start(self, sample: int | None) -> None:
         """Retention anchor: an open utterance's first sample, or None."""
@@ -1510,11 +1572,12 @@ class LeaseTimeline:
         self._retain()
 
     def trim_before(self, sample: int) -> None:
-        """Forget mic before capture sample `sample`, AFE records before it
-        less the reference's 2.5 s lead, cells before it less the 10 s lead
+        """Forget mic before capture sample `sample`, AFE records and Silero probabilities
+        before it less the reference's 2.5 s lead, cells before it less the 10 s lead
         that `B` needs, and the reference beyond what remains."""
         self.mic.trim_before(sample)
         self.afe.trim_before(max(0, sample - REFERENCE_EXTRA))
+        self.vad.trim_before(max(0, sample - REFERENCE_EXTRA))
         self.cells.trim_before(max(0, sample - ROLLING_SAMPLES))
         if self.mic.frontier is not None:
             span = self.mic.frontier - self.mic.floor
@@ -1638,12 +1701,13 @@ class UplinkSession:
         self.leases.forget(lease_id)
 
     def clear(self, reason: LeaseEnd) -> list[Lease]:
-        """Mute or session loss: end every lease and erase buffered audio and
-        AFE records (also where the actor still holds a lease's mic or records)."""
+        """Mute or session loss: end every lease and erase buffered audio, AFE records and
+        Silero probabilities (also where the actor still holds a lease's mic or records)."""
         ended = self.leases.end_all(reason)
         for timeline in self.timelines.values():
             timeline.mic.clear()
             timeline.afe.clear()
+            timeline.vad.clear()
         self.timelines.clear()
         if reason == LeaseEnd.SESSION:
             self.streams.clear()

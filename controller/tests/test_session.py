@@ -1115,6 +1115,16 @@ def test_an_opted_in_wake_turn_records_native_afe_evidence_and_decides_exactly_a
     assert stages["intent"][0] <= stages["intent"][1] and stages["intent"][1] <= stages["tts"][1]
     assert stages["tts"][1] == stages["reply"][0] <= stages["reply"][1]
 
+    # Beside the native VAD, the controller's own: the Silero probability the worker reported for
+    # each cell of the committed lease's mic, from its first cell (support −300 ms, down to the cell
+    # grid as the lease rounds it) through past the utterance, as the decisions read it. The
+    # afe-only response lease runs no Silero.
+    first = (S - em_session.PREROLL) // CELL * CELL
+    silero, start = series["silero"], series["silero_start"]
+    assert start == first and start + len(silero) * CELL >= utt["end"]
+    assert silero == [round(native.worker.vad(c), 3) for c in range(start, start + len(silero) * CELL, CELL)]
+    assert {0.05, 0.95} <= set(silero)                    # speech and quiet both drawn
+
 
 def test_privacy_mute_during_the_response_ends_its_lease_and_erases_what_it_carried(monkeypatch):
     saved = {}

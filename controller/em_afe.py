@@ -7,7 +7,9 @@ kind 5, `em_audio_timeline.AfeRecord`) and its decoder counters in
 evidence for turn rows, the decision trace and the dashboard (the summaries),
 and the dashboard's per-turn and per-recording charts (the series): a turn's
 from its leases, a sample clip's or ambient recording's from the diagnostic
-lease its recording mode holds (`AfeTrack`).
+lease its recording mode holds (`AfeTrack`). A turn's series also carries the
+controller's own Silero speech probability for each cell of its mic, so the
+chart can set the native VAD beside the one the controller's decisions read.
 
 Evidence only: no wake acceptance, attribution verdict, endpoint or threshold
 reads anything here — nothing has yet related these fields to outcomes.
@@ -28,7 +30,7 @@ import enum
 import itertools
 import json
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TypedDict, TypeVar
 
 from em_audio_timeline import (
@@ -42,6 +44,7 @@ from em_audio_timeline import (
     AFE_PERIOD_SAMPLES,
     AfeRecord,
     AfeTimeline,
+    VadTrack,
 )
 
 DTD_SCALE = 31.0        # DTD value = raw / 31
@@ -349,8 +352,14 @@ class AfeSeriesJson(TypedDict):
     Whether the wake clip and utterance were saved is the turn row's wake_file /
     audio_file; `recording` is set only when the turn recording is saved, and
     for a sample clip or ambient recording is `[0, its length)`.
-    `stages` places each TurnStage that ran; an absent stage did not run. Rows
-    written before a key existed lack it."""
+    `stages` places each TurnStage that ran; an absent stage did not run.
+    `silero` is the one list not per period: the controller's Silero v5 speech
+    probability (what its VAD decisions read, on its +30 dB input) for each
+    512-sample cell, entry j covering `[silero_start + 512j, … + 512)`, from the
+    first cell of the series Silero analysed through the last, null for a cell
+    between them it did not; empty, `silero_start` null, where it analysed none
+    (a near miss, a sample clip or ambient recording). Rows written before a
+    key existed lack it."""
 
     start: int
     period: int
@@ -374,6 +383,8 @@ class AfeSeriesJson(TypedDict):
     audio_clip: list[int] | None    # the utterance recording's capture [start, end); null: none captured
     recording: list[int] | None     # the turn recording's capture [start, end); null: none saved
     stages: dict[str, list[int]]    # TurnStage → capture [start, end)
+    silero_start: int | None        # silero[0]'s first capture sample; null: no Silero
+    silero: list[float | None]      # Silero probability per 512-sample cell
 
 
 @dataclass(frozen=True, slots=True)
@@ -393,6 +404,9 @@ class AfeSeries:
     `stages` places the turn's processing on the same capture timeline.
     turn_series cannot know any of them; em_session attaches them when it
     persists the turn, so the dashboard can play a recording against the chart.
+    `silero` is the controller's Silero probability from `silero_start`, one per
+    512-sample cell (VadTrack.read), turn_series's from the lease's VadTrack;
+    empty where it analysed none.
 
     A sample clip's or ambient recording's series (AfeTrack.series) is on the
     recording's own timeline instead, with no support window, utterance or
@@ -406,6 +420,8 @@ class AfeSeries:
     audio_clip: tuple[int, int] | None = None
     recording: tuple[int, int] | None = None
     stages: Mapping[TurnStage, tuple[int, int]] = field(default_factory=dict)
+    silero_start: int | None = None
+    silero: tuple[float | None, ...] = ()
 
     def wire(self) -> AfeSeriesJson:
         recs = self.records
@@ -433,6 +449,8 @@ class AfeSeries:
             audio_clip=list(self.audio_clip) if self.audio_clip is not None else None,
             recording=list(self.recording) if self.recording is not None else None,
             stages={str(stage): list(span) for stage, span in self.stages.items()},
+            silero_start=self.silero_start,
+            silero=[None if p is None else round(p, 3) for p in self.silero],
         )
 
     def dumps(self) -> str:
@@ -455,12 +473,12 @@ def series_range(support: tuple[int, int] | None, utterance: tuple[int, int] | N
 
 def turn_series(store: AfeTimeline, support: tuple[int, int] | None,
                 utterance: tuple[int, int] | None, *,
-                response: AfeTimeline | None = None) -> AfeSeries | None:
+                response: AfeTimeline | None = None, vad: VadTrack | None = None) -> AfeSeries | None:
     """The AfeSeries of a lease's AFE records over series_range, and on through
     `response`, the records of the response lease that followed the commit, to
-    its last one. None ("no data") without a window or an utterance, or when no
-    period in the range was received. Where both stores hold a period,
-    `store`'s record is kept."""
+    its last one, with `vad`'s Silero probabilities for the cells it spans. None
+    ("no data") without a window or an utterance, or when no period in the range
+    was received. Where both stores hold a period, `store`'s record is kept."""
     span = series_range(support, utterance)
     if span is None:
         return None
@@ -470,7 +488,11 @@ def turn_series(store: AfeTimeline, support: tuple[int, int] | None,
     received = {r.start: r for r in store.read(a, b)}
     for r in response.read(a, b) if response is not None else ():
         received.setdefault(r.start, r)
-    return _series(a, b, support, utterance, received)
+    series = _series(a, b, support, utterance, received)
+    if series is None or vad is None:
+        return series
+    cells = vad.read(series.start, series.start + len(series.records) * AFE_PERIOD_SAMPLES)
+    return series if cells is None else replace(series, silero_start=cells[0], silero=cells[1])
 
 
 def near_miss_series(store: AfeTimeline, support: tuple[int, int], end: int) -> AfeSeries | None:

@@ -1520,12 +1520,15 @@ function NativeAfeEvidence({ evidence, deviceId, turnId, playback }) {
 
 const CAPTURE_RATE = 16000;     // capture samples per second
 const AFE_PERIOD_FRAMES = 10;   // em_audio_timeline.AFE_PERIOD_FRAMES: AFE frames per 80 ms period
+const SILERO_CELL = 512;        // em_speech_worker.VAD_CELL_SAMPLES: one Silero analysis cell (32 ms)
 
-// One lane's values as step paths in period units (x = period index, y = 0
-// top … 1 bottom; values are 0–1 of the lane's scale). A null value breaks
-// both paths: a period without data is a gap, never a zero.
-function afeStepPaths(ys) {
+// One lane's values as step paths in period units (y = 0 top … 1 bottom;
+// values are 0–1 of the lane's scale), value i spanning x0 + i·dx … + dx: a
+// period index by default, a Silero cell's place with x0 and dx. A null value
+// breaks both paths: a period without data is a gap, never a zero.
+function afeStepPaths(ys, x0 = 0, dx = 1) {
   let area = '', line = '', open = false;
+  const x = i => +(x0 + i * dx).toFixed(3);
   ys.forEach((y, i) => {
     if (y == null) {
       if (open) area += 'V1Z';
@@ -1533,8 +1536,8 @@ function afeStepPaths(ys) {
       return;
     }
     const v = (1 - 0.94 * Math.max(0, Math.min(1, y))).toFixed(3);
-    area += open ? `V${v}H${i + 1}` : `M${i},1V${v}H${i + 1}`;
-    line += open ? `V${v}H${i + 1}` : `M${i},${v}H${i + 1}`;
+    area += open ? `V${v}H${x(i + 1)}` : `M${x(i)},1V${v}H${x(i + 1)}`;
+    line += open ? `V${v}H${x(i + 1)}` : `M${x(i)},${v}H${x(i + 1)}`;
     open = true;
   });
   if (open) area += 'V1Z';
@@ -1575,26 +1578,42 @@ function useAfeSeries(url) {
 }
 
 // What an AFE chart draws: a recording's the four native values, a turn's
-// also its Playback lane and its Frames and Flags strips.
+// also the controller's Silero VAD beside the native one, its Playback lane
+// and its Frames and Flags strips.
 const AFE_LANES = Object.freeze({
   RECORDING: Object.freeze(['vad', 'dtd', 'erle', 'rms']),
-  TURN:      Object.freeze(['vad', 'dtd', 'erle', 'rms', 'playback', 'frames', 'flags']),
+  TURN:      Object.freeze(['vad', 'silero', 'dtd', 'erle', 'rms', 'playback', 'frames', 'flags']),
 });
 
 // One AFE_LANES row of series `s`: a value lane (traces as step paths, each
 // on a fixed scale so charts compare by eye) or a strip; null when it has
-// nothing to draw. `read(i)` is the row's part of period i's readout.
+// nothing to draw. `read(i)` is the row's part of period i's readout; `own`
+// marks a row whose values do not come from the period's AFE record.
 function afeLaneRow(s, key) {
   const scaled = (k, f) => s[k].map(v => (v == null ? null : f(v)));
   const fr = k => `${k} fr`;
   const valued = i => s.frames[i] > 0;    // a record with frames carries values
   const lane = (label, scale, color, traces, read) => ({
-    label, scale, color, read, traces: traces.map(tr => ({ ...tr, paths: afeStepPaths(tr.ys) })),
+    label, scale, color, read, traces: traces.map(tr => ({ ...tr, paths: afeStepPaths(tr.ys, tr.x0, tr.dx) })),
   });
   switch (key) {
     case 'vad':
-      return lane('VAD', '0–0.75', 'var(--ok)', [{ ys: scaled('vad_max', v => v / 0.75), fill: true }],
-        i => valued(i) && `VAD max ${s.vad_max[i].toFixed(2)} over ${fr(s.vad_frames[i])}`);
+      return lane('Native VAD', '0–0.75', 'var(--ok)', [{ ys: scaled('vad_max', v => v / 0.75), fill: true }],
+        i => valued(i) && `native VAD max ${s.vad_max[i].toFixed(2)} over ${fr(s.vad_frames[i])}`);
+    case 'silero': {
+      // At Silero's own 32 ms cells; a period reads the cells overlapping it.
+      // Absent (an older row) or empty (a near miss, a recording): no lane.
+      if (!s.silero?.length) return null;
+      const cellsIn = i => {
+        const a = s.start + i * s.period - s.silero_start;
+        return s.silero.slice(Math.max(0, Math.floor(a / SILERO_CELL)), Math.max(0, Math.ceil((a + s.period) / SILERO_CELL)))
+          .filter(p => p != null);
+      };
+      return { ...lane('Silero VAD', '0–1', 'var(--ok)',
+        [{ ys: s.silero, fill: true, x0: (s.silero_start - s.start) / s.period, dx: SILERO_CELL / s.period }],
+        i => { const ps = cellsIn(i); return ps.length > 0 && `Silero max ${Math.max(...ps).toFixed(2)} over ${ps.length} cells`; }),
+      own: true };
+    }
     case 'dtd':
       return lane('DTD', '0–1', 'var(--warn)', [{ ys: scaled('dtd_max', v => v), fill: true }],
         i => valued(i) && `DTD max ${s.dtd_max[i].toFixed(2)} over ${fr(s.dtd_frames[i])}`);
@@ -1738,7 +1757,7 @@ function AfeLanes({ series: s, lanes, bars = [], guides = [], anchor, anchorLabe
     const a = s.start + i * s.period;
     const within = bars.filter(r => r.span[0] < a + s.period && r.span[1] > a).map(r => r.label);
     const head = [`${fmtT(secs(a), 2)} s`, within.length > 0 && within.join(', ')].filter(Boolean).join(' · ');
-    if (s.frames[i] == null) return [head, 'no record'].join(' · ');
+    if (s.frames[i] == null) return [head, 'no record', ...laneRows.filter(r => r.own).map(r => r.read(i))].filter(Boolean).join(' · ');
     return [head, !s.frames[i] && 'no frames', ...laneRows.flatMap(r => [r.read(i)].flat())].filter(Boolean).join(' · ');
   };
   const shownAt = hover ?? playAt;
@@ -1842,8 +1861,8 @@ function AfeChart({ deviceId, turnId, onset, playback }) {
     <AfeLanes series={s} lanes={AFE_LANES.TURN} bars={bars} guides={guides}
       anchor={s.support ? s.support[0] : s.utterance ? s.utterance[0] : s.start} anchorLabel={s.support ? 'wake' : 'start'}
       playSpan={playingKind ? s[AFE_CLIP_SPANS[playingKind]] : null} elapsed={playback.elapsed}
-      label="Native AFE values for each 80 ms period of this turn, with its processing stages"
-      legend={<>each 80 ms period · gaps: no data · Frames: short (amber) or empty (red) periods · processing bars use the controller's clock and can run ~0.3 s early (Playback is the Echo's own){onsetShown && ' · dotted: playback began'} · hover to read one</>}>
+      label="Native AFE values for each 80 ms period of this turn and the controller's Silero VAD, with its processing stages"
+      legend={<>each 80 ms period · Silero VAD: the controller's speech probability for each 32 ms cell, as its decisions read it · gaps: no data · Frames: short (amber) or empty (red) periods · processing bars use the controller's clock and can run ~0.3 s early (Playback is the Echo's own){onsetShown && ' · dotted: playback began'} · hover to read one</>}>
       <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '4px 12px', marginTop: 6 }}>
         <Pill small disabled={recordingReason != null} onClick={() => playback.toggle(TURN_CLIP.RECORDING)}>
           {playingRecording ? '▮ Stop recording' : '▶ Play recording'}

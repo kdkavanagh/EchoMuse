@@ -1099,6 +1099,25 @@ Echo's voice turns and near misses in one list by time.
   **Schema v38** adds `near_misses.afe_series`, kept for the newest 1,000
   near misses per device.
 
+### Silero VAD on the turn chart
+
+A turn's chart now sets the controller's own VAD beside the Echo's: the
+**Native VAD** lane (renamed from VAD) is the AFE metadata's DNN VAD per
+80 ms period as before, and the new **Silero VAD** lane is the speech
+probability the controller's Silero v5 computed for each 32 ms cell of the
+lease's mic, the values its attribution and endpointing read. Hovering reads
+both ("native VAD max 0.50 over 10 fr · Silero max 0.81 over 3 cells").
+
+- **Recorded per lease.** Each lease timeline keeps the probabilities the
+  speech worker reports (`em_audio_timeline.VadTrack`, bounded as the lease's
+  AFE records and erased with them on mute or session loss), and the turn's
+  series stores them as `silero_start` and `silero` (one entry per 512-sample
+  cell) in `turns.afe_series`. No schema change; no decision reads them.
+- **Where it shows.** Turns from now on, on devices with native AFE charts.
+  It covers the committed lease's mic (from support −300 ms), not the
+  response. Older turns, near misses (whose lease runs no Silero) and sample
+  clips show no Silero lane.
+
 ### Earlier in this release
 
 - ASR gain: the STT copy sent to Home Assistant is amplified by

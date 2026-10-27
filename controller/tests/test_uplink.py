@@ -286,8 +286,10 @@ def test_afe_records_land_in_the_leases_of_their_capture_epoch_from_the_lease_st
     assert [r.start for r in store.read(0, 20_000)] == [3840, 5120, 8960]
     assert store.read(6400, 8960) == [] and store.read(7000, 7001) == []
     assert [r.start for r in store.read(6000, 9000)] == [5120, 8960]       # periods overlapping the span
+    vad = s.timelines["L"].vad
+    vad.write(3584, [0.9, 0.8])                        # the worker's Silero for the lease's mic
     s.clear(at.LeaseEnd.MUTE)
-    assert store.read(0, 20_000) == []                 # erased with the lease's audio
+    assert store.read(0, 20_000) == [] and vad.read(0, 20_000) is None   # erased with the lease's audio
 
 
 def test_afe_of_another_capture_epoch_is_not_delivered():

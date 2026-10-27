@@ -189,6 +189,34 @@ def test_a_series_without_a_span_or_any_record_is_no_data():
     assert series is not None and series.wire()["frames"] == [10, None]
 
 
+def test_a_turn_series_carries_silero_for_its_cells_from_the_first_analysed_through_the_last():
+    store = _store(rec(k * 1280) for k in range(20, 60))
+    vad = at.VadTrack()
+    vad.write(60 * 512, [0.2] * 11)                       # cells 60–70; 60 and 61 end before the window
+    vad.write(73 * 512, [0.91234] * 8)                    # cells 73–80: 71 and 72 never analysed
+    vad.write(65 * 512, [0.7])                            # re-analysed: the newest value wins
+    vad.write(140 * 512, [0.5] * 4)                       # past the window's end
+    w = em_afe.turn_series(store, (48_000, 60_800), (43_200, 70_400), vad=vad).wire()
+    # The window is [32 000, 70 400): cells 62 (31 744–32 256) … 137 overlap it.
+    assert w["silero_start"] == 62 * 512
+    assert w["silero"] == [0.2] * 3 + [0.7] + [0.2] * 5 + [None, None] + [0.912] * 8
+    assert json.loads(json.dumps(w)) == w
+    # Without Silero (a near miss, a recording) both keys say so, never zeros.
+    plain = em_afe.turn_series(store, (48_000, 60_800), (43_200, 70_400)).wire()
+    assert (plain["silero_start"], plain["silero"]) == (None, [])
+
+
+def test_the_silero_ring_forgets_its_oldest_cells_and_never_reads_a_reused_slot_as_old_data():
+    vad = at.VadTrack(capacity=4)
+    vad.write(0, [0.1, 0.2, 0.3, 0.4])                    # cells 0–3 fill the ring
+    vad.write(5 * 512, [0.6])                             # cell 5: cells 4 and 5 take cells 0 and 1's slots
+    assert vad.read(0, 6 * 512) == (2 * 512, (pytest.approx(0.3), pytest.approx(0.4), None, pytest.approx(0.6)))
+    vad.trim_before(5 * 512)
+    assert vad.read(0, 6 * 512) == (5 * 512, (pytest.approx(0.6),))
+    vad.clear()
+    assert vad.read(0, 6 * 512) is None
+
+
 # --- recordings from the diagnostic tap -------------------------------------------------
 
 
