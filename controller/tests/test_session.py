@@ -294,7 +294,8 @@ class FakeWorker:
     result there is Kroko's pause decode with the server's answer already in, as the worker
     reports a fast server; `span_text` is the server's committed-span transcript. A pause
     finalizes at each of `pauses`: an utterance's first result fed through one carries a
-    voice snapshot taken there. `primes` records `prime_vad`."""
+    voice snapshot taken there. `primes` records `prime_vad`. While `held_vad` is a list, VAD
+    results wait in it, and `release_vad` posts them as one late result."""
 
     policy_hash = "post_afe_1"
 
@@ -314,6 +315,7 @@ class FakeWorker:
         self.pauses: list[int] = []
         self.primes: list[tuple[str, int, VoiceSnapshot | None]] = []
         self.span_requests = 0
+        self.held_vad: list[tuple[str, int, float]] | None = None
 
     def post(self, lease_id, kind, through, payload, utterance_id=None, stream="mic"):
         self.actor.on_observation(Observation(
@@ -375,11 +377,19 @@ class FakeWorker:
         while lease["next_cell"] + CELL <= end:
             cells.append(self.vad(lease["next_cell"]))
             lease["next_cell"] += CELL
-        if cells:
+        if cells and self.held_vad is not None:
+            self.held_vad += [(lease_id, start + i * CELL, p) for i, p in enumerate(cells)]
+        elif cells:
             self.post(lease_id, "vad", lease["next_cell"], VadPayload(start, tuple(cells)))
         if lease["utt"] is not None and end > lease["utt"][2]:
             lease["utt"][2] = end
             self._asr(lease_id)
+
+    def release_vad(self):
+        held, self.held_vad = self.held_vad or [], None
+        if held:
+            lease_id, first, _ = held[0]
+            self.post(lease_id, "vad", held[-1][1] + CELL, VadPayload(first, tuple(p for _, _, p in held)))
 
     def submit_echo(self, lease_id, first_cell_sample, through_sample, compare, utterance_id=None):
         results, lag = compare()
@@ -1624,6 +1634,48 @@ def test_a_button_turn_lease_requests_afe_from_its_reference_start_only_when_opt
         assert streams["afe"] == str(int(streams["reference"]) // PERIOD * PERIOD)
     else:
         assert "afe" not in streams
+
+
+def test_late_evidence_that_ends_and_commits_the_command_in_one_batch_still_commits(monkeypatch):
+    """Turn 927: the worker's VAD fell behind, and when it caught up a single `advance()`
+    returned both the Pending and the Commit. The actor must act on the Commit too; dropping
+    it left the turn hanging with the mic open, since a done utterance takes no more evidence."""
+    batches: list[list[str]] = []
+    advance = Utterance.advance
+
+    def recording(self, valid_audio_end):
+        decisions = advance(self, valid_audio_end)
+        batches.append([type(d).__name__ for d in decisions])
+        return decisions
+
+    monkeypatch.setattr(Utterance, "advance", recording)
+
+    async def main():
+        h = Harness()
+        h.worker.vad = speech(QUESTION)
+        h.device.level = levels(QUESTION)
+        h.worker.tokens = WHAT_TIME
+        h.ha.next_run = FakeRun([IntentEnded("It is 3 PM.", "c", False, "action_done", True),
+                                 TtsReady("http://ha/tts/1", False), RunEnded()])
+        await h.start()
+        h.actor.button_turn(button())
+        await h.settle()
+        await h.feed(PRESS - 4_800, QUESTION[1] - BLOCK)
+        h.worker.held_vad = []                       # the VAD falls behind before the speech ends
+        await h.feed(QUESTION[1] - BLOCK, PRESS + 50_000)
+        assert h.rows == [] and h.ha.intents == []
+        h.worker.release_vad()
+        await h.settle()
+        assert ["Pending", "Commit"] in batches
+        await h.wait_for(lambda: h.ha.intents)
+        assert h.ha.intents[0][0] == "What time is it?"
+        await h.wait_for(lambda: h.render.streams)
+        h.render.streams[0].finish("drained")
+        await h.wait_for(lambda: h.rows)
+        assert h.rows[0]["commit_id"] is not None and h.rows[0]["terminal_reason"] == "completed"
+        await h.actor.close()
+    run(main())
+
 
 
 def test_a_timer_cancel_home_assistant_may_have_received_is_never_resent():

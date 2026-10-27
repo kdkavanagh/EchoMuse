@@ -2235,10 +2235,17 @@ class SessionActor:
             return
         self._measure_wake(turn, runtime)
         mic_end = timeline.mic.frontier or utterance.spec.start
+        # One call can return several decisions when evidence arrives in a batch, say a Pending
+        # and then the Commit that follows it. The utterance is already done while the Pending is
+        # handled, so the loop acts on every decision and stops early only when one ends or
+        # replaces the turn. A Commit or Close is always the last one, and after a Commit the
+        # lease is closed, so there is nothing more to pump.
         for decision in utterance.advance(mic_end):
             await self._decision(turn, decision)
-            if turn.terminal is not None or utterance.done:
+            if not self._current(turn) or turn.utterance is not utterance:
                 return
+        if turn.commit is not None:
+            return
         if self.deps.recognizer():
             text = utterance.recognizer_query()
             if text is not None:
