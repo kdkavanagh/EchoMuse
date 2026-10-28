@@ -145,11 +145,25 @@ Keep collecting the verification records to see the spread under load.
 
 ## 2. A slow pause re-decode aborts the turn
 
-At each pause, the speech worker re-decodes the whole utterance so far with a
-fresh Kroko decode. That decode runs inside the mic lane's VAD job, and the
-VAD job has a 750 ms deadline. When the decode runs long, the job misses its
-deadline, the worker reports `speech worker vad failed: job deadline
-exceeded`, and the session aborts the turn as `interrupted`.
+The streaming Kroko decoder emits tokens only at the edges of its 1.28 s
+chunks, so at a pause the last words are often not out yet. So when VAD has
+seen 320 ms of non-speech after the last speech cell (`FINALIZE_PAUSE`), the
+speech worker finalizes: it decodes the whole utterance so far with a fresh
+Kroko stream, flushed with 1.5 s of zeros (architecture §16.6). The endpoint
+judges that text to decide whether the command is complete and can commit at
+this pause. The same audio also goes to the Wyoming pause server
+(`pauseAsr`) on a separate pool, and the worker copies the Silero state for a
+later reply window.
+
+The finalize decode runs inside the mic lane's job for that block
+(`_run_mic` → `_asr_observation`). That job also runs Silero VAD on the
+block's cells and feeds the streaming decoder, and it is reported as a VAD
+job. Every job has a 750 ms deadline (`JOB_DEADLINE_S`), counted from when the
+job was created, so time waiting in the queue counts too. The finalize decode
+re-reads the whole utterance each time, so its cost grows with the
+utterance's length. When the job misses its deadline, the worker reports
+`speech worker vad failed: job deadline exceeded`, and the session aborts the
+turn as `interrupted`.
 
 - **927** (20:54:01.575): the turn had been listening for about 19 s, because
   of the dropped commit. On an idle core, a re-decode of 19 s of audio takes
@@ -171,14 +185,22 @@ While the Kitchen Dot rang, the Living Room Dot heard the user too:
 - **933** (20:57:42.5, Living Room, idle): superseded.
 - **935** (20:57:48.4, Living Room, idle): it won the utterance and sent
   "stop" to Home Assistant as `HassMediaPause` for the Living Room. Home
-  Assistant paused nothing and said "Okay." The Kitchen's own candidate for
-  the same words (934) was refused as `verifier_timeout` 0.4 s later.
+  Assistant paused nothing and said "Okay."
+
+The Kitchen heard the user first both times. Its candidates arrived at
+20:57:42.19 (931) and 20:57:48.11 (934), about 300 ms before the Living Room
+accepted its own. (These older rows store the decision time, so the arrival
+time is the row's time minus `total_ms`.)
 
 `_accept_candidate` calls `arbiter.claim()` only when the candidate has no
-context or a media context, so a candidate heard during an alert never claims
-the utterance. It also cannot be accepted until the verifier answers, while an
-idle Dot accepts at once. So the idle Dot claims first and nothing contests
-it.
+context or a media context. A candidate that captures a ringing alert or a
+reply being cancelled skips arbitration. Architecture §5.3 says why: "so a
+nearby speaker cannot steal a local stop". That rule has been there since the
+cutover (`561d156`). It covers only one direction: the ringing Dot can never
+lose. Because it never claims, it also never stops another Dot from claiming.
+And it cannot be accepted until the verifier answers, while an idle Dot is
+accepted at once. So the idle Dot claims the utterance even when the ringing
+Dot heard it first, and nothing contests it.
 
 **Fix:** let a ringing Dot claim the utterance as soon as its candidate
 arrives, and have an idle Dot defer to a ringing Dot's candidate inside the
@@ -303,14 +325,23 @@ help, because the loop is the thread that saturates.
 
 ## 5. Wake turns have no wall-clock limit
 
-In 927 the utterance stopped taking evidence once its commit was dropped, so
-neither `no_input` nor `too_long` could fire. Nothing else on a wake turn has a
-wall-clock limit, so the turn stayed open with the mic live until the
-unrelated VAD deadline in issue 2 ended it, about 12 s later. Reply turns
-already have such a limit.
+No failure on 2026-10-26 came from this alone. It decides how long a hung turn
+keeps the mic open:
 
-**Fix:** add a wall-clock limit to wake turns as a backstop, so any future
-stall ends the turn instead of leaving the mic open.
+- In 927 the utterance stopped taking evidence once its commit was dropped,
+  so neither `no_input` nor `too_long` could fire. The turn stayed open with
+  the mic live until the unrelated VAD deadline in issue 2 ended it, about
+  12 s later.
+- On 2026-10-27 the Living Room turn at 18:31:44 hung in the listening state
+  while py-spy was stalling the controller. It stayed open for about 2.5
+  minutes, until the controller restarted.
+
+Nothing else on a wake turn has a wall-clock limit. Reply turns already have
+one (`_reply_wall_clock`).
+
+**Fix:** add a wall-clock limit to wake turns as a backstop. With the dropped
+commit fixed, no known bug leaves a wake turn hanging, so this only limits the
+damage from the next unknown stall.
 
 ## 6. Hearing through a ringing alarm (open finding)
 
