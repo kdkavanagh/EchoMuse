@@ -1440,7 +1440,7 @@ async def _get_wakeclips_zip(request: web.Request) -> web.Response:
     endpoint above, which serves one turn's clip, is for deciding whether a
     clip belongs in the set; this is how the set leaves the controller. It is
     built in memory in an executor
-    — KEEP_PER_DEVICE bounds it at ~23MB, and streaming a zip would mean
+    — KEEP_PER_DEVICE bounds it at ~46MB, and streaming a zip would mean
     either holding the response open across a prune or writing a temporary
     file on the same volume the clips live on.
     """
@@ -1489,9 +1489,9 @@ async def _delete_wakeclips(request: web.Request) -> web.Response:
 # Every saved clip of one kind matching the Activity view's filters: one device
 # or all of them, and a wake-score range, each file named and laid out as its
 # own download from the Activity list would be. Streamed rather than built in
-# memory as the per-device archive is: across devices the stores reach 500 wake
-# clips and 200 near-miss recordings each, past 100 MB for a fleet, which the
-# controller should not hold for one click.
+# memory as the per-device archive is: across devices the stores reach 1,000
+# wake clips and 1,000 near-miss recordings each, about 100 MB per device,
+# which the controller should not hold for one click.
 
 ZIP_CHUNK = 256 * 1024   # bytes handed to the response at a time
 

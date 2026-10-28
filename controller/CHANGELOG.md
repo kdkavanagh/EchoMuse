@@ -1231,6 +1231,15 @@ Now, once the AFE decoder starts working, the Dot waits until it is idle and
 reconnects once, and the new session carries the metadata. Its light ring may
 show the dim red "link down" pulse for a moment while it reconnects.
 
+### More wake clips and near-miss recordings kept
+
+Each Echo now keeps its newest 1,000 wake clips (was 500) and its newest
+1,000 unmarked near-miss recordings (was 200). The two are counted
+separately, as before, and a marked near miss still keeps its recording
+until the mark is cleared. A busy room filled the 200 near-miss recordings
+in under a week; 1,000 holds about a month of them. At the full count the
+two take about 46 MB and 60 MB per Echo.
+
 ### Earlier in this release
 
 - ASR gain: the STT copy sent to Home Assistant is amplified by

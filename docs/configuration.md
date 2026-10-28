@@ -100,10 +100,10 @@ view is kept in the address (`#activity`), so a reload stays on it. API: `GET
   The tiles count what is shown.
 - **⤓ .zip** downloads every saved clip the filters match, not only the rows
   listed. **Confirmed wakes** holds the wake clip of each wake that was not
-  refused (Save wake clips keeps the newest 500 per Echo). **Missed wakes**
+  refused (Save wake clips keeps the newest 1,000 per Echo). **Missed wakes**
   and **Correctly ignored** hold the recordings of the near misses marked with
   that verdict (see [Marking near misses](#marking-near-misses)), and **All
-  near misses** every near-miss recording, marked or not (the newest 200 per
+  near misses** every near-miss recording, marked or not (the newest 1,000 per
   Echo, plus every marked one). The files sit
   side by side, each named as its own ⤓ in the list names it
   (`kitchen-2026-10-26232503-wake.wav`, the wake's UTC time; `kitchen-nearmiss446.wav`),
@@ -348,7 +348,8 @@ controller already received for that wake. A near miss is different: the Dot
 uploads nothing for it unless this setting is on, and then only its few
 seconds, from 300 ms before the stretch the model scored to 300 ms after the
 last score at or above the floor, at most the Dot's last 6 seconds. The newest
-**500 wake clips** and **200 near-miss clips per device** are kept, and
+**1,000 wake clips** and **1,000 near-miss clips per device** are kept, each
+counted on its own, and
 every near miss [marked with a verdict](#marking-near-misses) as well, until
 its mark is cleared. Turning
 the setting off stops new clips but keeps the saved ones until newer clips

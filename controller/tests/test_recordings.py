@@ -179,15 +179,16 @@ def test_a_turns_utterance_and_turn_recording_are_kept_apart(tmp_path):
     assert rec.resolve("dev1", "dev1_2.wav", db, kind=turn) == tmp_path / "turn_recordings" / "dev1_2.wav"
 
 
-def test_near_miss_recordings_keep_the_newest_200_per_device_and_only_their_own(tmp_path):
+def test_near_miss_recordings_keep_their_own_newest_window_per_device(tmp_path):
     db = _db(tmp_path)
     near = rec.RecordingKind.NEAR_MISS
+    keep = rec.KEEP_NEAR_MISS_PER_DEVICE
     rec.save("dev1", 1, _pcm(20), db_path=db, kind=rec.RecordingKind.TURN)   # a turn's row 1 is another file
-    for row_id in range(1, 202):
+    for row_id in range(1, keep + 2):
         rec.save("dev1", row_id, _pcm(1), db_path=db, kind=near)
     rec.save("dev2", 5, _pcm(1), db_path=db, kind=near)
     kept = rec.list_for("dev1", db, kind=near)
-    assert len(kept) == 200 and kept[0] == "dev1_201.wav" and kept[-1] == "dev1_2.wav"
+    assert len(kept) == keep and kept[0] == f"dev1_{keep + 1}.wav" and kept[-1] == "dev1_2.wav"
     assert rec.resolve("dev1", "dev1_1.wav", db, kind=near) is None              # pruned
     assert rec.resolve("dev1", "dev1_1.wav", db, kind=rec.RecordingKind.TURN) is not None
     assert rec.resolve("dev1", "dev1_5.wav", db, kind=near) == tmp_path / "nearmiss_recordings" / "dev1_5.wav"

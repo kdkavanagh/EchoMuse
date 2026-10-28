@@ -75,12 +75,12 @@ CLIP_FRAMES = 18
 CLIP_MS     = CLIP_FRAMES * FRAME_MS      # 1440
 
 # Clips kept per device before the oldest go. A false-positive corpus is the
-# point here, not a diagnostic sample, so this is two orders of magnitude
-# above em_recordings.KEEP_PER_DEVICE — but well below em_samples, because
-# these accumulate unattended and a device with a badly-tuned threshold
-# should not be able to fill a volume on its own. CLIP_MS is ~46kB, so the
-# cap is ~23MB per device.
-KEEP_PER_DEVICE = 500
+# point here, not a diagnostic sample, so this is well above
+# em_recordings.KEEP_PER_DEVICE — but below em_samples, because these
+# accumulate unattended and a device with a badly-tuned threshold should not
+# be able to fill a volume on its own. CLIP_MS is ~46kB, so the cap is ~46MB
+# per device.
+KEEP_PER_DEVICE = 1_000
 
 # `<turn_id>.wav`, inside a per-device directory. turn_id is a rowid and
 # device_id is ro.serialno, but both come back off disk or out of a URL, so

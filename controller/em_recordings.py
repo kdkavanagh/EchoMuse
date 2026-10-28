@@ -84,8 +84,9 @@ KEEP_PER_DEVICE = 300
 KEEP_TURN_PER_DEVICE = 100
 
 # How many near-miss recordings to keep per device: each is ~2 s (~60 kB),
-# so 200 is ~12 MB per device — a few days of a chatty room's false starts.
-KEEP_NEAR_MISS_PER_DEVICE = 200
+# so 1,000 is ~60 MB per device — about four weeks of a chatty room's false
+# starts (Living Room, ~36 a day in October 2026).
+KEEP_NEAR_MISS_PER_DEVICE = 1_000
 
 _SUBDIRS = {RecordingKind.UTTERANCE: RECORDINGS_SUBDIR, RecordingKind.TURN: TURN_RECORDINGS_SUBDIR,
             RecordingKind.NEAR_MISS: NEAR_MISS_RECORDINGS_SUBDIR}

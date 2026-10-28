@@ -3048,7 +3048,7 @@ const ARCHIVES = Object.freeze({
   [ARCHIVE.WAKES]: {
     path: '/api/wakeclips.zip', query: {}, label: 'Confirmed wakes', noun: 'wake clip',
     title: 'The wake clip of every confirmed wake (a wake turn not refused) with a wake score in the range, from the devices shown: '
-      + 'every clip still kept (the newest 500 per device, saved while Save wake clips is on), not only the turns listed',
+      + 'every clip still kept (the newest 1,000 per device, saved while Save wake clips is on), not only the turns listed',
   },
   [ARCHIVE.MISSED_WAKES]: {
     path: '/api/near_misses.zip', query: { verdict: NEAR_MISS_VERDICT.MISSED_WAKE },
@@ -3065,7 +3065,7 @@ const ARCHIVES = Object.freeze({
   [ARCHIVE.NEAR_MISSES]: {
     path: '/api/near_misses.zip', query: {}, label: 'All near misses', noun: 'near-miss recording',
     title: 'The recording of every near miss, marked or not, with a peak score in the range, from the devices shown: '
-      + 'every recording still kept (the newest 200 per device, recorded while Save wake clips is on, and every marked one), '
+      + 'every recording still kept (the newest 1,000 per device, recorded while Save wake clips is on, and every marked one), '
       + 'not only the near misses listed',
   },
 });
