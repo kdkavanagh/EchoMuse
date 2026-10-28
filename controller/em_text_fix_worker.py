@@ -12,11 +12,12 @@ results, and never holds the tables. HA's matcher is asked by the controller.
 
 Wire: frames of a 4-byte big-endian length and a pickle, `(id, job)` over the child's
 stdin and `(id, Reply)` over a private copy of its stdout; the child points its own fd 1
-at stderr, so nothing it prints can corrupt a frame. Jobs run on two lanes of one thread
-each: BUILD (tables, history, pronunciations: up to a second) and SERVE (a correction's
-candidates and acceptance, pronouncing a trial), so a correction is not queued behind a
-build. A correction whose lexicon is not yet compiled for its tables goes to BUILD, where
-the compile it needs is already queued or done.
+at stderr, so nothing it prints can corrupt a frame. Jobs run in the build pool and the
+serve pool, one thread each. BUILD takes tables, history and pronunciations (up to a
+second), and SERVE takes a correction's candidates and acceptance and pronounces a trial,
+so a slow build never delays a correction. The two share the child's state under
+`Engine._lock`. A correction whose lexicon is not yet compiled for its tables goes to
+BUILD, where the compile it needs is already queued or done.
 
 `ChildWorker` is the controller's side. It starts the child as a fresh interpreter
 (`asyncio.create_subprocess_exec`: fork and exec at once, never a fork of the threaded
@@ -78,7 +79,7 @@ R = TypeVar("R")
 T = TypeVar("T")
 
 
-class Lane(StrEnum):
+class Pool(StrEnum):
     BUILD = "build"     # tables, history layers, pronunciations, unknown words
     SERVE = "serve"     # a correction's candidates and acceptance, a trial's pronunciations
 
@@ -126,7 +127,7 @@ class TablesInfo:
 
 class Engine:
     """The child's tables (the RECENT_TABLES newest revisions), the history they were built
-    from, and pronunciations compiled per lexicon. Used from both lanes."""
+    from, and pronunciations compiled per lexicon. The build pool and the serve pool both use it."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -193,7 +194,7 @@ class Engine:
             gate = self._compiling.setdefault(digest, threading.Lock())
         with gate:
             with self._lock:
-                held = self._phonetic.get(digest)          # the other lane may have compiled it meanwhile
+                held = self._phonetic.get(digest)          # the other pool may have compiled it meanwhile
             if held is not None and held.compiled_from(tables, lexicon):
                 return held
             phonetic = compile_phonetic(tables, lexicon, held)
@@ -226,10 +227,10 @@ class Engine:
 
 class Job(Generic[R]):
     """One unit of work: `run` executes it in the child, `accept` checks its result in the
-    controller, `lane` picks the child's thread."""
+    controller, `pool` picks the child's thread."""
 
-    def lane(self, engine: Engine) -> Lane:
-        return Lane.BUILD
+    def pool(self, engine: Engine) -> Pool:
+        return Pool.BUILD
 
     def run(self, engine: Engine) -> R:
         raise NotImplementedError
@@ -290,8 +291,8 @@ class Propose(Job[Proposal]):
     phrases: tuple[str, ...]
     lexicon: Lexicon
 
-    def lane(self, engine: Engine) -> Lane:
-        return Lane.SERVE if engine.compiled(self.revision, self.lexicon) else Lane.BUILD
+    def pool(self, engine: Engine) -> Pool:
+        return Pool.SERVE if engine.compiled(self.revision, self.lexicon) else Pool.BUILD
 
     def run(self, engine: Engine) -> Proposal:
         tables = engine.tables(self.revision)
@@ -310,8 +311,8 @@ class Decide(Job[Decision]):
     verdicts: tuple[SentenceRecognition | None, ...]
     original: SentenceRecognition | None
 
-    def lane(self, engine: Engine) -> Lane:
-        return Lane.SERVE
+    def pool(self, engine: Engine) -> Pool:
+        return Pool.SERVE
 
     def run(self, engine: Engine) -> Decision:
         return decide(self.proposal, self.verdicts, self.original, engine.tables(self.revision))
@@ -326,8 +327,8 @@ class Unknown(Job[Counter[str]]):
     revision: int
     lexicon: Lexicon
 
-    def lane(self, engine: Engine) -> Lane:
-        return Lane.SERVE if engine.compiled(self.revision, self.lexicon) else Lane.BUILD
+    def pool(self, engine: Engine) -> Pool:
+        return Pool.SERVE if engine.compiled(self.revision, self.lexicon) else Pool.BUILD
 
     def run(self, engine: Engine) -> Counter[str]:
         return engine.phonetic(engine.tables(self.revision), self.lexicon).unknown
@@ -345,8 +346,8 @@ class Pronounce(Job[tuple[Pronounced, ...]]):
     lexicon: Lexicon
     texts: tuple[str, ...]
 
-    def lane(self, engine: Engine) -> Lane:
-        return Lane.SERVE
+    def pool(self, engine: Engine) -> Pool:
+        return Pool.SERVE
 
     def run(self, engine: Engine) -> tuple[Pronounced, ...]:
         return tuple(self.lexicon.pronounce(text) for text in self.texts)
@@ -397,14 +398,14 @@ def _run(engine: Engine, job: Job[object]) -> Reply:
 
 
 def serve() -> None:
-    """The child's main loop: read jobs until stdin closes, run each on its lane, reply."""
+    """The child's main loop: read jobs until stdin closes, run each in its pool, reply."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s — %(message)s")
     replies = os.fdopen(os.dup(1), "wb")
     os.dup2(2, 1)                                # stray prints go to stderr, never into a frame
     sys.stdout = sys.stderr
     jobs = os.fdopen(0, "rb")
     engine = Engine()
-    lanes = {lane: ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"text-fix-{lane}") for lane in Lane}
+    pools = {pool: ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"text-fix-{pool}") for pool in Pool}
     writing = threading.Lock()
 
     def answer(request_id: int, job: Job[object]) -> None:
@@ -420,11 +421,11 @@ def serve() -> None:
         except OSError:
             os._exit(0)                          # the controller is gone
 
-    lanes[Lane.BUILD].submit(load_dictionary)    # CMUdict (0.1–0.4 s) before the first job needs it
+    pools[Pool.BUILD].submit(load_dictionary)    # CMUdict (0.1–0.4 s) before the first job needs it
     while (frame := _read_frame(jobs)) is not None:
         request_id, job = pickle.loads(frame)
         if isinstance(request_id, int) and isinstance(job, Job):
-            lanes[job.lane(engine)].submit(answer, request_id, job)
+            pools[job.pool(engine)].submit(answer, request_id, job)
         else:
             log.error("transcript fix worker: not a job: %r", type(job).__name__)
     os._exit(0)                                  # without waiting for a build nobody will read

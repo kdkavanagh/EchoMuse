@@ -2,13 +2,14 @@
 wake scoring (§3.1, §8.1, §16.6).
 
 The asyncio thread owns every per-lease record and submits jobs; one
-`ThreadPoolExecutor(2)` runs them. Jobs of one lane (a lease's mic analysis,
-its reference scoring, or one verification) run strictly in order and never
-concurrently with each other, so per-lane state (Silero recurrent state and
-context, the utterance's decoder stream, BCResNet smoothing) needs no locks.
-Model sessions are loaded once and shared read-only. A remote pause
-transcription (`em_pause_asr`) runs on its own small pool while the lane's
-Kroko decode runs, bounded so the lane keeps its deadline.
+`ThreadPoolExecutor(2)` runs them. The jobs of one serial work queue (a
+lease's mic analysis, its reference scoring, or one verification) run strictly
+in order and never at the same time as each other, so the state each queue
+keeps (Silero recurrent state and context, the utterance's decoder stream,
+BCResNet smoothing) needs no locks. Model sessions are loaded once and shared
+read-only. A remote pause transcription (`em_pause_asr`) runs on its own small
+pool while the mic queue's Kroko decode runs, and has a time limit so that
+queue still meets its deadline.
 
 The worker only produces evidence (`Observation`s); it never opens, commits,
 or closes a turn.
@@ -65,11 +66,11 @@ VERIFICATION_LOOKAHEAD = 7_680        # candidate open + 480 ms
 # chunk edge needs up to 141 frames (1.41 s) of padding before it is decoded.
 ASR_FLUSH = 24_000                    # 1.5 s
 FINALIZE_PAUSE = 5_120                # 10 VAD cells (320 ms) past the last speech-positive cell
-# A remote pause transcription never holds the lane: Kroko's result is reported
+# A remote pause transcription never holds up the mic serial work queue: Kroko's result is reported
 # at once and the server's words replace its text when they arrive. An answer
 # later than this could no longer shorten even the 1,792 ms pause.
 PAUSE_REMOTE_TIMEOUT_S = 1.5
-SPAN_REMOTE_TIMEOUT_S = 2.0           # route B / fallback re-decode, off the lanes
+SPAN_REMOTE_TIMEOUT_S = 2.0           # route B / fallback re-decode, outside the serial work queues
 BLANK_FRAME_SAMPLES = 640             # one trailing blank frame = 40 ms
 JOB_DEADLINE_S = 0.750                # §4.4
 ERROR_WINDOW_S = 60.0                 # §8.1: three errors within 60 s
@@ -185,7 +186,7 @@ class AsrPayload:
     for the tokens, which stay Kroko's. `pause_decode` reports the request on
     the result where it was answered or dropped, including one that gave no text.
 
-    `voice` is the lane's Silero state at a finalize, on that result only."""
+    `voice` is the mic serial work queue's Silero state at a finalize, on that result only."""
 
     tokens: tuple[str, ...]
     token_emission_sample: tuple[int, ...]
@@ -417,7 +418,7 @@ def vad_input(canonical_pcm: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Per-lane state
+# State kept by each serial work queue
 # ---------------------------------------------------------------------------
 
 class _VadState:
@@ -498,7 +499,7 @@ class _Lease:
 
 @dataclass(frozen=True, slots=True)
 class _Job:
-    lane: str
+    queue_name: str
     component: ObservationKind
     created: float
     run: Callable[[], tuple[Observation, ...]]
@@ -510,7 +511,7 @@ class _Job:
     candidate_id: str | None = None
 
 
-_Lane = asyncio.Queue[_Job | None]      # None stops the lane
+_SerialWorkQueue = asyncio.Queue[_Job | None]      # None stops the queue's drain task
 
 
 @dataclass(frozen=True, slots=True)
@@ -521,10 +522,10 @@ class _WorkerError:
     component: ObservationKind
     reason: str
     device_id: str | None             # None: no lease (a committed-span re-decode)
-    lane: str
+    queue_name: str
 
     def __str__(self) -> str:
-        return f"{self.component} on {self.device_id or '-'} ({self.lane}): {self.reason}"
+        return f"{self.component} on {self.device_id or '-'} ({self.queue_name}): {self.reason}"
 
 
 # ---------------------------------------------------------------------------
@@ -567,8 +568,8 @@ class SpeechWorker:
         self._executor: ThreadPoolExecutor | None = None
         self._wake: dict[str, WakeGraph] = {}
         self._leases: dict[str, _Lease] = {}
-        self._lanes: dict[str, _Lane] = {}
-        self._lane_tasks: dict[str, asyncio.Task[None]] = {}
+        self._serial_work_queues: dict[str, _SerialWorkQueue] = {}
+        self._drain_tasks: dict[str, asyncio.Task[None]] = {}
         self._errors: collections.deque[_WorkerError] = collections.deque()
         # `_now()` at the last counted deadline failure: a deadline failure of a job submitted
         # by then is that stall's backlog, reported but not counted again (§8.1).
@@ -616,11 +617,11 @@ class SpeechWorker:
         if self._probe_task is not None:
             self._probe_task.cancel()
             await asyncio.gather(self._probe_task, return_exceptions=True)
-        for queue in self._lanes.values():
+        for queue in self._serial_work_queues.values():
             queue.put_nowait(None)
-        await asyncio.gather(*list(self._lane_tasks.values()), return_exceptions=True)
-        self._lanes.clear()
-        self._lane_tasks.clear()
+        await asyncio.gather(*list(self._drain_tasks.values()), return_exceptions=True)
+        self._serial_work_queues.clear()
+        self._drain_tasks.clear()
         self._leases.clear()
         if self._executor is not None:
             self._executor.shutdown(wait=True, cancel_futures=True)
@@ -645,8 +646,8 @@ class SpeechWorker:
         lease = self._leases.pop(lease_id, None)
         if lease is None:
             return
-        for lane in (f"mic:{lease_id}", f"reference:{lease_id}"):
-            queue = self._lanes.pop(lane, None)
+        for queue_name in (f"mic:{lease_id}", f"reference:{lease_id}"):
+            queue = self._serial_work_queues.pop(queue_name, None)
             if queue is not None:
                 queue.put_nowait(None)
 
@@ -827,7 +828,7 @@ class SpeechWorker:
         dropped when new speech replaces that result or a later pause sends
         another.
 
-        A finalize also copies the lane's Silero state: the utterance's voice snapshot."""
+        A finalize also copies the mic serial work queue's Silero state: the utterance's voice snapshot."""
         analyzed = lease.vad.next_sample
         finalize = (u.speech_end is not None and u.speech_end != u.finalized_end
                     and analyzed is not None and analyzed - u.speech_end >= FINALIZE_PAUSE)
@@ -1022,18 +1023,18 @@ class SpeechWorker:
         except (OSError, em_pause_asr.WyomingError) as exc:
             raise SpeechWorkerError(f"span transcription failed: {type(exc).__name__}: {exc}") from exc
 
-    # -- lanes, deadlines, errors, availability --------------------------------
+    # -- serial work queues, deadlines, errors, availability --------------------
 
     def _submit(self, job: _Job) -> None:
         if self._executor is None or self._closed:
             raise SpeechWorkerError("worker is not running")
-        queue = self._lanes.get(job.lane)
+        queue = self._serial_work_queues.get(job.queue_name)
         if queue is None:
-            queue = self._lanes[job.lane] = _Lane()
-            self._lane_tasks[job.lane] = asyncio.create_task(self._lane(job.lane, queue))
+            queue = self._serial_work_queues[job.queue_name] = _SerialWorkQueue()
+            self._drain_tasks[job.queue_name] = asyncio.create_task(self._drain(job.queue_name, queue))
         queue.put_nowait(job)
 
-    async def _lane(self, name: str, queue: _Lane) -> None:
+    async def _drain(self, name: str, queue: _SerialWorkQueue) -> None:
         loop = asyncio.get_running_loop()
         one_shot = name.startswith("verification:")
         while True:
@@ -1056,10 +1057,10 @@ class SpeechWorker:
                 await self._fail(job, f"{type(exc).__name__}: {exc}")
             if one_shot and queue.empty():
                 break
-        if self._lanes.get(name) is queue:
-            del self._lanes[name]
-        if self._lane_tasks.get(name) is asyncio.current_task():
-            del self._lane_tasks[name]
+        if self._serial_work_queues.get(name) is queue:
+            del self._serial_work_queues[name]
+        if self._drain_tasks.get(name) is asyncio.current_task():
+            del self._drain_tasks[name]
 
     async def _fail(self, job: _Job, reason: str, *, deadline: bool = False,
                     ran: tuple[Observation, ...] = ()) -> None:
@@ -1067,7 +1068,7 @@ class SpeechWorker:
         carrying the text, distance and timings of its decode when that ran (`ran`, its observations).
 
         One stall is one error: a missed deadline is counted unless the job was submitted
-        by the last counted deadline failure (in any lane, since the GIL and the executor
+        by the last counted deadline failure (in any serial work queue, since the GIL and the executor
         are shared), which makes it that stall's backlog. Its error is still reported."""
         now = self._now()
         backlog = deadline and self._stall_mark is not None and job.created <= self._stall_mark
@@ -1077,7 +1078,7 @@ class SpeechWorker:
         device_id = None if lease is None else lease.device_id
         if lease is not None:
             if job.stream == StreamId.MIC and not job.candidate_id:
-                lease.dirty = True   # the lane's recurrent state skipped audio
+                lease.dirty = True   # the mic serial work queue's recurrent state skipped audio
             if job.candidate_id is not None and deadline:
                 late = next((o.payload for o in ran if isinstance(o.payload, VerificationPayload)), None)
                 verdict = (VerificationPayload(job.candidate_id, None, None, VerificationResult.TIMEOUT)
@@ -1088,13 +1089,13 @@ class SpeechWorker:
                                            ErrorPayload(job.component, reason), job.utterance_id))
         if backlog:
             log.debug("speech worker: %s on %s (%s): %s; backlog of the stall at %.3f, not counted",
-                      job.component, device_id or "-", job.lane, reason, self._stall_mark)
+                      job.component, device_id or "-", job.queue_name, reason, self._stall_mark)
             return
-        self._record_error(job.component, reason, device_id, job.lane, now)
+        self._record_error(job.component, reason, device_id, job.queue_name, now)
 
-    def _record_error(self, component: ObservationKind, reason: str, device_id: str | None, lane: str,
+    def _record_error(self, component: ObservationKind, reason: str, device_id: str | None, queue_name: str,
                       now: float | None = None) -> None:
-        error = _WorkerError(self._now() if now is None else now, component, reason, device_id, lane)
+        error = _WorkerError(self._now() if now is None else now, component, reason, device_id, queue_name)
         self._errors.append(error)
         while self._errors and error.at - self._errors[0].at > ERROR_WINDOW_S:
             self._errors.popleft()

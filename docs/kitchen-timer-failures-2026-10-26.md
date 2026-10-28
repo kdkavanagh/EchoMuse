@@ -154,7 +154,7 @@ this pause. The same audio also goes to the Wyoming pause server
 (`pauseAsr`) on a separate pool, and the worker copies the Silero state for a
 later reply window.
 
-The finalize decode runs inside the mic lane's job for that block
+The finalize decode runs inside the mic serial work queue's job for that block
 (`_run_mic` → `_asr_observation`). That job also runs Silero VAD on the
 block's cells and feeds the streaming decoder, and it is reported as a VAD
 job. Every job has a 750 ms deadline (`JOB_DEADLINE_S`), counted from when the
@@ -192,7 +192,8 @@ The model work goes to a separate pool of 2 threads (`ThreadPoolExecutor(2)`
 in `em_speech_worker`): Silero VAD, Kroko streaming ASR, the Kroko re-decodes
 at pauses and for wake verification, BCResNet scoring of what the speaker
 played, and the echo comparison. Each model runs single-threaded. Jobs from
-one lane (one lease's mic, its reference, or one verification) run in order.
+one serial work queue (one lease's mic, its reference, or one verification) run in
+order.
 Remote pause transcription has its own 2 threads, which only wait on the
 network.
 

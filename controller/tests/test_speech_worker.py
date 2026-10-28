@@ -191,8 +191,8 @@ def _worker_logs(caplog, text):
     return [r for r in caplog.records if r.name == "echomuse.speech" and text in r.getMessage()]
 
 
-def test_one_stall_is_one_error_however_much_backlog_it_leaves_in_every_lane(caplog):
-    """§8.1: one stall that makes every queued job miss its deadline, in every lane, reports
+def test_one_stall_is_one_error_however_much_backlog_it_leaves_in_every_serial_work_queue(caplog):
+    """§8.1: one stall that makes every queued job miss its deadline, in every serial work queue, reports
     each job's error but counts once: alone it cannot make the worker unavailable, and two
     later independent errors are needed to do so."""
     caplog.set_level(logging.DEBUG, logger="echomuse.speech")
@@ -498,7 +498,7 @@ def test_finalize_at_each_pause_carries_the_last_word_before_the_live_chunk(bund
     for speech_end, i in zip(pauses, finals):
         assert 0 <= asr[i].through_sample - (speech_end + sw.FINALIZE_PAUSE) < sw.BLOCK_SAMPLES
         assert asr[i].payload.text.lower().endswith("your country")
-        # Each finalize carries the lane's Silero state there: the utterance's voice snapshot.
+        # Each finalize carries the mic serial work queue's Silero state there: the utterance's voice snapshot.
         voice = asr[i].payload.voice
         assert voice.sample == asr[i].through_sample and voice.state.shape == sw.VAD_STATE_SHAPE
         assert voice.context.shape == (sw.VAD_CONTEXT_SAMPLES,) and np.any(voice.state)
