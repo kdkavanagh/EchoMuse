@@ -222,7 +222,7 @@ def test_the_silero_ring_forgets_its_oldest_cells_and_never_reads_a_reused_slot_
 
 def test_a_recordings_series_is_on_its_own_timeline_whichever_arrives_first():
     track = em_afe.AfeTrack(capacity=100)
-    capture = 200 * 1280                                        # the lease's capture position
+    capture = 200 * 1280                                        # the subscription's capture position
     for k in range(6):                                          # 80 ms blocks, their records trailing
         track.mic("L", capture + k * 1280, 1280)
         if k >= 1:
@@ -244,9 +244,9 @@ def test_a_recording_starting_mid_period_keeps_its_offset():
     assert (w["start"], w["recording"], w["vad_max"]) == (-640, [0, 1920], [0.25, 0.5])
 
 
-def test_a_new_lease_maps_the_tap_onto_its_own_records():
-    # A reconnect restarts the capture timeline: the tap goes on, and the new lease's period 0
-    # is not the old lease's.
+def test_a_new_subscription_maps_the_tap_onto_its_own_records():
+    # A reconnect restarts the capture timeline: the tap goes on, and the new subscription's period 0
+    # is not the old subscription's.
     track = em_afe.AfeTrack(capacity=100)
     track.mic("A", 0, 2560)
     track.afe("A", [rec(0, vad_max=1), rec(1280, vad_max=1)])

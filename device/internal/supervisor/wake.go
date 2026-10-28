@@ -45,20 +45,20 @@ func (s *Supervisor) producingSound(from, to uint64) bool {
 	return s.masks.MaskFor(from, to+1) != 0
 }
 
-// onCandidate opens the candidate lease and, when the device was producing
-// sound, the provisional duck, starts the local wake chime when it applies,
-// lights the kiosk screen when screen wake is on, then reports the
-// candidate. The controller decides every candidate, including while
-// capture is not permitted. With no session there is no one to decide it:
-// the screen still lights, and offlineWake answers instead.
+// onCandidate opens the candidate's audio subscription and, when the device
+// was producing sound, the provisional duck, starts the local wake chime
+// when it applies, lights the kiosk screen when screen wake is on, then
+// reports the candidate. The controller decides every candidate, including
+// while capture is not permitted. With no session there is no one to decide
+// it: the screen still lights, and offlineWake answers instead.
 func (s *Supervisor) onCandidate(c detector.Candidate) {
 	if !s.connected() {
 		s.screenWake()
 		s.offlineWake(c)
 		return
 	}
-	s.up.OpenCandidate(c.LeaseID, c.SupportStart)
-	// The provisional duck waits for the ack exactly as long as its lease.
+	s.up.OpenCandidate(c.SubscriptionID, c.SupportStart)
+	// The provisional duck waits for the ack exactly as long as its subscription.
 	s.fm.CandidateOpen(c.CandidateID, c.ProducingSound, uplink.CandidateAckWait)
 	body := wakeCandidate{Candidate: c, ActiveAlert: s.activeAlert()}
 	// Before the report and outside mu: the mixer delivers its queued
@@ -68,7 +68,7 @@ func (s *Supervisor) onCandidate(c detector.Candidate) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.candidates[c.LeaseID] = candidateState{id: c.CandidateID}
+	s.candidates[c.SubscriptionID] = candidateState{id: c.CandidateID}
 	if s.session == nil {
 		return
 	}
@@ -78,11 +78,11 @@ func (s *Supervisor) onCandidate(c detector.Candidate) {
 		log.Printf("[wake] send candidate: %v", err)
 		return
 	}
-	s.candidateAck[id] = c.LeaseID
+	s.candidateAck[id] = c.SubscriptionID
 }
 
 // offlineWake answers a wake heard with no controller with the offline
-// notice. Nothing is leased, ducked or reported. A wake heard while the
+// notice. Nothing is uploaded, ducked or reported. A wake heard while the
 // device produced sound is ignored: only the controller can tell the wake
 // word from the device's own output (§6.1), and that includes the notice
 // itself. So is one during an alert, which the action button stops.
@@ -134,10 +134,10 @@ func (s *Supervisor) restoreWake() {
 
 // localWakeChime plays the wake chime the moment an idle candidate opens
 // (config wakeSound) instead of after the controller's acceptance. Never
-// while disconnected (offlineWake answers those), during a diagnostic lease
-// (wakes are refused), producing sound (the controller verifies those wakes)
-// or with an alert active: the controller chimes those on acceptance. A
-// rejected candidate keeps its chime. Must not hold mu.
+// while disconnected (offlineWake answers those), during a diagnostic
+// subscription (wakes are refused), producing sound (the controller verifies
+// those wakes) or with an alert active: the controller chimes those on
+// acceptance. A rejected candidate keeps its chime. Must not hold mu.
 func (s *Supervisor) localWakeChime(c detector.Candidate, alertActive bool) bool {
 	if !s.cfg.DeviceConfig.Get().WakeSound || c.ProducingSound || alertActive ||
 		!s.connected() || s.up.DiagnosticLive() {
@@ -188,37 +188,38 @@ func (s *Supervisor) onStats(st detector.Stats) {
 }
 
 // candidateAcked applies the controller's command.ack for a wake.candidate:
-// accepted releases the lease's audio and extends its provisional duck to
-// the lease TTL; rejected ends both.
+// accepted releases the subscription's audio and extends its provisional duck
+// to the subscription TTL; rejected ends both.
 func (s *Supervisor) candidateAcked(a proto.CommandAck) bool {
 	s.mu.Lock()
-	lease, ok := s.candidateAck[a.MessageID]
+	subscriptionID, ok := s.candidateAck[a.MessageID]
 	delete(s.candidateAck, a.MessageID)
-	cand, live := s.candidates[lease]
+	cand, live := s.candidates[subscriptionID]
 	s.mu.Unlock()
 	if !ok {
 		return false
 	}
 	accepted := a.Status == proto.AckAccepted
-	s.up.AcceptCandidate(lease, accepted)
+	s.up.AcceptCandidate(subscriptionID, accepted)
 	switch {
 	case !live:
 	case accepted:
 		s.fm.CandidateRenew(cand.id, focus.DefaultTTL)
 	default:
-		s.releaseCandidateLease(lease)
+		s.releaseCandidateSubscription(subscriptionID)
 	}
 	return true
 }
 
-// releaseCandidateLease restores the policy the provisional duck replaced
-// (§16.6): uplink.close rejected/arbitration_lost, TTL or any other end.
-func (s *Supervisor) releaseCandidateLease(leaseID string) {
+// releaseCandidateSubscription restores the policy the provisional duck
+// replaced (§16.6): uplink.close rejected/arbitration_lost, TTL or any other
+// end.
+func (s *Supervisor) releaseCandidateSubscription(subscriptionID string) {
 	s.mu.Lock()
-	cand, ok := s.candidates[leaseID]
-	delete(s.candidates, leaseID)
-	for id, l := range s.candidateAck {
-		if l == leaseID {
+	cand, ok := s.candidates[subscriptionID]
+	delete(s.candidates, subscriptionID)
+	for id, subID := range s.candidateAck {
+		if subID == subscriptionID {
 			delete(s.candidateAck, id)
 		}
 	}
@@ -231,12 +232,12 @@ func (s *Supervisor) releaseCandidateLease(leaseID string) {
 func (s *Supervisor) releaseAllCandidates() {
 	s.mu.Lock()
 	ids := make([]string, 0, len(s.candidates))
-	for lease := range s.candidates {
-		ids = append(ids, lease)
+	for subscriptionID := range s.candidates {
+		ids = append(ids, subscriptionID)
 	}
 	s.mu.Unlock()
-	for _, lease := range ids {
-		s.releaseCandidateLease(lease)
+	for _, subscriptionID := range ids {
+		s.releaseCandidateSubscription(subscriptionID)
 	}
 }
 

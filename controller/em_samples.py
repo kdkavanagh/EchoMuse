@@ -8,14 +8,14 @@ is only as good as its real positives and negatives: *this* speaker at
 a laptop and `arecord` records the wrong microphone.
 
 Sample collection mode records from the Echo instead. While it is armed the
-device's session actor holds a `diagnostic` uplink lease, so the Dot streams
+device's session actor holds a `diagnostic` audio subscription, so the Dot streams
 its live mic timeline — the native AFE's output, continuous and ungated —
 whether anyone said anything or not, and the actor accepts no wake. The
 feature is what this module does with those blocks — chop them into clips at
 the silences and write each clip to disk.
 
 **The audio is what the on-device wake detector scores**, sample for sample:
-the lease reads the same capture ring the detector consumes, and nothing on
+the subscription reads the same capture ring the detector consumes, and nothing on
 the controller applies gain, denoising or resampling before the tap. That is
 the property that makes the clips worth training on: a sample captured
 through a different path teaches the model about audio it never sees in

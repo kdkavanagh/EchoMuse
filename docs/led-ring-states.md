@@ -257,9 +257,9 @@ device's alert layer takes over with the cyan ring pulse.
 
 While any of the dashboard's recording modes is on — wake-word sample
 collection, ambient recording, or webhook capture — the controller holds a
-diagnostic uplink lease, suspends voice turns, and shows the magenta pulse.
-Wake words and button presses during a recording mode are refused with the
-error cue.
+diagnostic audio subscription, suspends voice turns, and shows the magenta
+pulse. Wake words and button presses during a recording mode are refused
+with the error cue.
 
 ### Leases and controller loss
 

@@ -1,4 +1,4 @@
-"""EMA1 validation, stream epochs, uplink leases, per-lease timelines, and the
+"""EMA1 validation, stream epochs, audio subscriptions and their buffers, and the
 capture↔reference clock map (§4.2–4.4, §16.1, WIRE §3–§5)."""
 
 import struct
@@ -223,7 +223,7 @@ def test_sequence_must_increase_and_samples_may_not_go_back_without_a_backfill()
     now = [0.0]
     s = opened_session(now)
     s.open("L", "diagnostic", "d", MIC_EPOCH, {"mic": None})
-    s.ingest(mic(12800, seq=0))       # the lease's run starts here
+    s.ingest(mic(12800, seq=0))       # the subscription's run starts here
     with pytest.raises(ProtocolError, match="sequence"):
         s.ingest(mic(14080, seq=0))
     s.ingest(mic(14080, seq=1))
@@ -231,7 +231,7 @@ def test_sequence_must_increase_and_samples_may_not_go_back_without_a_backfill()
         s.ingest(mic(0, seq=2))
 
 
-def test_second_lease_backfill_may_interleave_with_live_packets():
+def test_second_subscription_backfill_may_interleave_with_live_packets():
     now = [0.0]
     s = opened_session(now)
     s.open("A", "diagnostic", "d", MIC_EPOCH, {"mic": None})
@@ -244,21 +244,21 @@ def test_second_lease_backfill_may_interleave_with_live_packets():
         s.ingest(mic(1280, seq=4))    # a second run nobody granted
 
 
-# -- leases -----------------------------------------------------------------
+# -- subscriptions -----------------------------------------------------------------
 
-def test_candidate_lease_starts_on_the_cell_and_wire_offsets():
-    table = at.LeaseTable(now=lambda: 0.0)
-    lease = table.open_candidate("L", "C", MIC_EPOCH, support_start=300_000)
-    assert lease.streams == {"mic": 294_912, "cells": 134_656, "reference": 254_912}
-    assert lease.generation == 1 and lease.ack is at.AckState.PENDING and not lease.active
+def test_candidate_subscription_starts_on_the_cell_and_wire_offsets():
+    table = at.SubscriptionTable(now=lambda: 0.0)
+    subscription = table.open_candidate("L", "C", MIC_EPOCH, support_start=300_000)
+    assert subscription.streams == {"mic": 294_912, "cells": 134_656, "reference": 254_912}
+    assert subscription.generation == 1 and subscription.ack is at.AckState.PENDING and not subscription.active
 
 
-def test_an_opted_in_candidate_lease_wants_afe_from_its_reference_start_on_the_period_grid():
-    table = at.LeaseTable(now=lambda: 0.0)
-    lease = table.open_candidate("L", "C", MIC_EPOCH, support_start=300_000, afe=True)
+def test_an_opted_in_candidate_subscription_wants_afe_from_its_reference_start_on_the_period_grid():
+    table = at.SubscriptionTable(now=lambda: 0.0)
+    subscription = table.open_candidate("L", "C", MIC_EPOCH, support_start=300_000, afe=True)
     # mic 294,912 − 40,000 = 254,912 → 254,720 on the 1280 grid
-    assert lease.streams == {"mic": 294_912, "cells": 134_656, "reference": 254_912, "afe": 254_720}
-    assert lease.streams["afe"] % 1280 == 0
+    assert subscription.streams == {"mic": 294_912, "cells": 134_656, "reference": 254_912, "afe": 254_720}
+    assert subscription.streams["afe"] % 1280 == 0
     early = table.open_candidate("E", "C2", MIC_EPOCH, support_start=10_000, afe=True)
     assert early.streams["afe"] == 0
     s = opened_session([0.0], afe_metadata=True)
@@ -266,19 +266,19 @@ def test_an_opted_in_candidate_lease_wants_afe_from_its_reference_start_on_the_p
     assert "afe" not in opened_session([0.0]).candidate("S", "C3", MIC_EPOCH, 300_000).streams
 
 
-def test_controller_lease_rounds_the_afe_start_down_to_the_period_grid():
-    t = at.LeaseTable(now=lambda: 0.0)
-    lease, msg = t.open("L", "turn", "T", MIC_EPOCH, {"mic": 1000, "afe": 3000})
-    assert lease.streams["afe"] == 2560 and msg.body["streams"]["afe"] == "2560"
+def test_controller_subscription_rounds_the_afe_start_down_to_the_period_grid():
+    t = at.SubscriptionTable(now=lambda: 0.0)
+    subscription, msg = t.open("L", "turn", "T", MIC_EPOCH, {"mic": 1000, "afe": 3000})
+    assert subscription.streams["afe"] == 2560 and msg.body["streams"]["afe"] == "2560"
     _, live = t.open("R", "reply", "R", MIC_EPOCH, {"mic": None, "afe": None})
     assert live.body["streams"]["afe"] == "live"
 
 
-def test_afe_records_land_in_the_leases_of_their_capture_epoch_from_the_lease_start():
+def test_afe_records_land_in_the_subscriptions_of_their_capture_epoch_from_the_subscription_start():
     s = opened_session([0.0], afe_metadata=True)
     s.open("L", "turn", "t", MIC_EPOCH, {"mic": None, "afe": 3840})
     got = s.ingest(afe(1280, [afe_rec(10, volume=v) for v in (1, 2, 3, 4)], seq=0))
-    assert [(d.lease_id, d.stream_id, d.ranges) for d in got] == [("L", "afe", ((3840, 6400),))]
+    assert [(d.subscription_id, d.stream_id, d.ranges) for d in got] == [("L", "afe", ((3840, 6400),))]
     store = s.timelines["L"].afe
     assert [(r.start, r.volume) for r in store.read(0, 10_000)] == [(3840, 3), (5120, 4)]
     # A period nobody sent has no record — never a zero record.
@@ -287,9 +287,9 @@ def test_afe_records_land_in_the_leases_of_their_capture_epoch_from_the_lease_st
     assert store.read(6400, 8960) == [] and store.read(7000, 7001) == []
     assert [r.start for r in store.read(6000, 9000)] == [5120, 8960]       # periods overlapping the span
     vad = s.timelines["L"].vad
-    vad.write(3584, [0.9, 0.8])                        # the worker's Silero for the lease's mic
-    s.clear(at.LeaseEnd.MUTE)
-    assert store.read(0, 20_000) == [] and vad.read(0, 20_000) is None   # erased with the lease's audio
+    vad.write(3584, [0.9, 0.8])                        # the worker's Silero for the subscription's mic
+    s.clear(at.SubscriptionEnd.MUTE)
+    assert store.read(0, 20_000) == [] and vad.read(0, 20_000) is None   # erased with the subscription's audio
 
 
 def test_afe_of_another_capture_epoch_is_not_delivered():
@@ -300,19 +300,19 @@ def test_afe_of_another_capture_epoch_is_not_delivered():
     assert s.ingest(frame) == []
 
 
-def test_audio_for_an_unacknowledged_candidate_lease_is_dropped():
+def test_audio_for_an_unacknowledged_candidate_subscription_is_dropped():
     now = [0.0]
     s = opened_session(now)
     s.candidate("L", "C", MIC_EPOCH, 20_000)
     assert s.ingest(mic(15360, seq=0)) == []
     s.acknowledge("L", accepted=True)
     got = s.ingest(mic(16640, seq=1))
-    assert [(d.lease_id, d.ranges) for d in got] == [("L", ((16640, 17920),))]
+    assert [(d.subscription_id, d.ranges) for d in got] == [("L", ((16640, 17920),))]
 
 
 def test_unacknowledged_candidate_ends_by_ttl_after_one_second():
     now = [10.0]
-    t = at.LeaseTable(now=lambda: now[0])
+    t = at.SubscriptionTable(now=lambda: now[0])
     t.open_candidate("L", "C", MIC_EPOCH, 50_000)
     now[0] = 10.9
     assert t.expire() == []
@@ -321,35 +321,36 @@ def test_unacknowledged_candidate_ends_by_ttl_after_one_second():
 
 
 def test_conversion_to_turn_bumps_generation_and_emits_renew():
-    t = at.LeaseTable(now=lambda: 0.0)
+    t = at.SubscriptionTable(now=lambda: 0.0)
     t.open_candidate("L", "C", MIC_EPOCH, 50_000)
-    with pytest.raises(at.LeaseError):
+    with pytest.raises(at.SubscriptionError):
         t.convert_to_turn("L", "T")                 # not acknowledged yet
     t.acknowledge("L", True)
     msg = t.convert_to_turn("L", "T")
-    assert msg == at.LeaseMessage("uplink.renew", 2, {"lease_id": "L", "ttl_ms": 3000, "reason": "turn", "owner": "T"})
-    assert t.get("L").reason is at.LeaseReason.TURN and t.get("L").owner == "T"
+    assert msg == at.SubscriptionMessage("uplink.renew", 2,
+                                         {"lease_id": "L", "ttl_ms": 3000, "reason": "turn", "owner": "T"})
+    assert t.get("L").reason is at.SubscriptionReason.TURN and t.get("L").owner == "T"
 
 
-def test_controller_lease_open_message_uses_decimal_strings_and_live():
-    t = at.LeaseTable(now=lambda: 0.0)
-    lease, msg = t.open("L", "turn", "T", MIC_EPOCH, {"mic": 1000, "cells": 900, "reference": 1234})
+def test_controller_subscription_open_message_uses_decimal_strings_and_live():
+    t = at.SubscriptionTable(now=lambda: 0.0)
+    subscription, msg = t.open("L", "turn", "T", MIC_EPOCH, {"mic": 1000, "cells": 900, "reference": 1234})
     assert msg.type == "uplink.open" and msg.generation == 1
     assert msg.body["streams"] == {"mic": "512", "cells": "512", "reference": "1234"}
     _, msg = t.open("R", "reply", "E", MIC_EPOCH, {"mic": None, "reference": None, "cells": 0})
     assert msg.body["streams"] == {"mic": "live", "reference": "live", "cells": "0"}
-    with pytest.raises(at.LeaseError):
+    with pytest.raises(at.SubscriptionError):
         t.open("X", "candidate", "C", MIC_EPOCH, {"mic": None})
 
 
 def test_renewals_are_due_each_second_and_ttl_is_three_seconds():
     now = [0.0]
-    t = at.LeaseTable(now=lambda: now[0])
+    t = at.SubscriptionTable(now=lambda: now[0])
     t.open("L", "turn", "T", MIC_EPOCH, {"mic": None})
     now[0] = 0.99
     assert t.due_renewals() == []
     now[0] = 1.0
-    assert [l.lease_id for l in t.due_renewals()] == ["L"]
+    assert [l.subscription_id for l in t.due_renewals()] == ["L"]
     t.renew("L")
     now[0] = 3.99
     assert t.expire() == []
@@ -357,13 +358,13 @@ def test_renewals_are_due_each_second_and_ttl_is_three_seconds():
     assert [l.ended for l in t.expire()] == ["ttl"]
 
 
-def test_diagnostic_lease_is_not_renewed_past_thirty_minutes():
+def test_diagnostic_subscription_is_not_renewed_past_thirty_minutes():
     now = [0.0]
-    t = at.LeaseTable(now=lambda: now[0])
+    t = at.SubscriptionTable(now=lambda: now[0])
     t.open("D", "diagnostic", "rec", MIC_EPOCH, {"mic": None})
     now[0] = 30 * 60
     assert t.due_renewals() == []
-    with pytest.raises(at.LeaseError):
+    with pytest.raises(at.SubscriptionError):
         t.renew("D")
 
 
@@ -372,27 +373,28 @@ def test_close_and_device_end_stop_delivery():
     s = opened_session(now)
     msg = s.open("L", "turn", "T", MIC_EPOCH, {"mic": None})
     assert msg.body["reason"] == "turn"
-    assert s.leases.close("L", "committed").body == {"lease_id": "L", "reason": "committed"}
+    assert s.subscriptions.close("L", "committed").body == {"lease_id": "L", "reason": "committed"}
     assert s.ingest(mic(0)) == []
     s.open("M", "turn", "T", MIC_EPOCH, {"mic": None})
-    lease = s.leases.device_ended({"lease_id": "M", "reason": "overrun", "last_sample": {"mic": "1280"},
-                                   "clipped_start": {"mic": None}})
-    assert lease.ended == "overrun" and lease.last_sample == {"mic": 1280} and lease.clipped_start == {"mic": None}
+    subscription = s.subscriptions.device_ended({"lease_id": "M", "reason": "overrun", "last_sample": {"mic": "1280"},
+                                                 "clipped_start": {"mic": None}})
+    assert subscription.ended == "overrun" and subscription.last_sample == {"mic": 1280}
+    assert subscription.clipped_start == {"mic": None}
     assert s.ingest(mic(1280, seq=1)) == []
 
 
-def test_device_end_of_a_lease_that_sent_nothing_has_null_last_sample():
+def test_device_end_of_a_subscription_that_sent_nothing_has_null_last_sample():
     # The device reports null for a wanted stream it never sent (e.g. a
-    # candidate lease that expired unacknowledged); that is not malformed.
+    # candidate subscription that expired unacknowledged); that is not malformed.
     s = opened_session([0.0])
     s.open("N", "turn", "T", MIC_EPOCH, {"mic": None, "cells": None})
-    lease = s.leases.device_ended({"lease_id": "N", "reason": "ttl",
-                                   "last_sample": {"mic": None, "cells": None},
-                                   "clipped_start": {"mic": None, "cells": None}})
-    assert lease.ended == "ttl" and lease.last_sample == {"mic": None, "cells": None}
+    subscription = s.subscriptions.device_ended({"lease_id": "N", "reason": "ttl",
+                                                 "last_sample": {"mic": None, "cells": None},
+                                                 "clipped_start": {"mic": None, "cells": None}})
+    assert subscription.ended == "ttl" and subscription.last_sample == {"mic": None, "cells": None}
 
 
-def test_packet_for_a_stream_no_lease_wants_is_dropped():
+def test_packet_for_a_stream_no_subscription_wants_is_dropped():
     now = [0.0]
     s = opened_session(now)
     s.open("L", "diagnostic", "d", MIC_EPOCH, {"mic": None})
@@ -400,7 +402,7 @@ def test_packet_for_a_stream_no_lease_wants_is_dropped():
     assert s.ingest(cells(0, [-100])) == []
 
 
-def test_session_loss_ends_every_lease_and_erases_audio():
+def test_session_loss_ends_every_subscription_and_erases_audio():
     now = [0.0]
     s = opened_session(now)
     s.open("L", "turn", "T", MIC_EPOCH, {"mic": None})
@@ -413,15 +415,15 @@ def test_session_loss_ends_every_lease_and_erases_audio():
 
 # -- timelines ----------------------------------------------------------------
 
-def test_first_copy_of_each_sample_wins_across_overlapping_leases():
+def test_first_copy_of_each_sample_wins_across_overlapping_subscriptions():
     now = [0.0]
     s = opened_session(now)
     s.open("A", "diagnostic", "d", MIC_EPOCH, {"mic": None})
     s.ingest(mic(0, value=1, seq=0))
     s.open("B", "turn", "t", MIC_EPOCH, {"mic": 0})
     got = s.ingest(mic(640, value=2, seq=1))
-    by_lease = {d.lease_id: d.ranges for d in got}
-    assert by_lease == {"A": ((1280, 1920),), "B": ((640, 1920),)}
+    by_subscription = {d.subscription_id: d.ranges for d in got}
+    assert by_subscription == {"A": ((1280, 1920),), "B": ((640, 1920),)}
     a = s.timelines["A"].mic
     assert (a.read(0, 1280) == 1).all() and (a.read(1280, 1920) == 2).all()
 
@@ -436,7 +438,7 @@ def test_gap_is_an_explicit_missing_range_never_silence():
         tl.read(1000, 3000)
 
 
-def test_backfill_start_before_the_lease_start_is_cut_at_the_lease_start():
+def test_backfill_start_before_the_subscription_start_is_cut_at_the_subscription_start():
     now = [0.0]
     s = opened_session(now)
     s.open("L", "turn", "t", MIC_EPOCH, {"mic": 1024, "cells": 1024})
@@ -484,8 +486,9 @@ def test_reference_epoch_restart_keeps_both_epochs_addressable_in_one_ring():
 
 
 def test_retention_keeps_rolling_ten_seconds_before_an_open_utterance():
-    lease = at.Lease("L", at.LeaseReason.TURN, "t", 1, MIC_EPOCH, {"mic": None, "cells": None}, 3000, 0, 0)
-    tl = at.LeaseTimeline(lease)
+    subscription = at.Subscription("L", at.SubscriptionReason.TURN, "t", 1, MIC_EPOCH, {"mic": None, "cells": None},
+                                   3000, 0, 0)
+    tl = at.SubscriptionBuffer(subscription)
     block = np.zeros(1280, np.int16)
     for k in range(0, 200 * 1280, 1280):
         tl.mic.write(k, block)
@@ -502,7 +505,7 @@ def test_retention_keeps_rolling_ten_seconds_before_an_open_utterance():
     assert tl.mic.floor == 500 * 1280 - 160_000
 
 
-def test_lease_memory_stays_under_the_2_6_mb_bound():
+def test_subscription_memory_stays_under_the_2_6_mb_bound():
     now = [0.0]
     s = opened_session(now)
     s.open("L", "turn", "t", MIC_EPOCH, {"mic": None, "reference": None, "cells": None})
@@ -513,7 +516,7 @@ def test_lease_memory_stays_under_the_2_6_mb_bound():
         seq += 1
     for k in range(0, 60 * 16000, 320 * 512):
         s.ingest(cells(k, [-100] * 320, seq=k))
-    assert s.timelines["L"].nbytes <= at.LEASE_BYTES_CAP
+    assert s.timelines["L"].nbytes <= at.SUBSCRIPTION_BYTES_CAP
 
 
 # -- clocks -------------------------------------------------------------------

@@ -1,9 +1,9 @@
 """Controller speech worker: VAD, streaming ASR, wake verification, reference
 wake scoring (§3.1, §8.1, §16.6).
 
-The asyncio thread owns every per-lease record and submits jobs; one
-`ThreadPoolExecutor(2)` runs them. The jobs of one serial work queue (a
-lease's mic analysis, its reference scoring, or one verification) run strictly
+The asyncio thread owns the stream state of every audio subscription and submits
+jobs; one `ThreadPoolExecutor(2)` runs them. The jobs of one serial work queue (a
+subscription's mic analysis, its reference scoring, or one verification) run strictly
 in order and never at the same time as each other, so the state each queue
 keeps (Silero recurrent state and context, the utterance's decoder stream,
 BCResNet smoothing) needs no locks. Model sessions are loaded once and shared
@@ -112,7 +112,7 @@ class VerificationResult(enum.StrEnum):
 @dataclass(frozen=True, slots=True)
 class CandidatePayload:
     candidate_id: str
-    lease_id: str
+    subscription_id: str
     profile: str
     threshold: float
     producing_sound: bool
@@ -159,7 +159,7 @@ class VoiceSnapshot:
     """Silero's recurrent state (2×1×128) and 64-sample context as an utterance's pause
     finalized (§16.6): tuned to that speaker's voice in that room just after they stopped.
     `sample` is the mic frontier the utterance had been fed through then (VAD had analyzed
-    every whole cell before it). Restored into a reply lease as its window opens
+    every whole cell before it). Restored into a reply subscription as its window opens
     (`SpeechWorker.prime_vad`), it hears an answer from the first cell."""
 
     state: np.ndarray
@@ -242,7 +242,7 @@ class Observation:
     policy_hash: str | None
     payload: Payload
     computed_at_ms: int               # host time, diagnostics only
-    lease_id: str | None = None       # the uplink lease whose audio this covers
+    subscription_id: str | None = None   # the audio subscription whose audio this covers
 
 
 class SpeechWorkerError(Exception):
@@ -482,10 +482,10 @@ class _Utterance:
 
 
 @dataclass
-class _Lease:
+class _StreamState:
     device_id: str
     capture_epoch: int
-    lease_id: str
+    subscription_id: str
     wake: WakeGraph
     vad: _VadState = field(default_factory=_VadState)
     utterance: _Utterance | None = None
@@ -503,7 +503,7 @@ class _Job:
     component: ObservationKind
     created: float
     run: Callable[[], tuple[Observation, ...]]
-    lease: _Lease | None
+    stream_state: _StreamState | None
     stream: StreamId
     through: int
     utterance_id: str | None
@@ -521,7 +521,7 @@ class _WorkerError:
     at: float
     component: ObservationKind
     reason: str
-    device_id: str | None             # None: no lease (a committed-span re-decode)
+    device_id: str | None             # None: no subscription (a committed-span re-decode)
     queue_name: str
 
     def __str__(self) -> str:
@@ -535,7 +535,7 @@ class _WorkerError:
 class SpeechWorker:
     """The actor's handle on controller speech inference.
 
-    Lifecycle: `await start()`; per lease `open_lease()` … `close_lease()`;
+    Lifecycle: `await start()`; for each subscription `open_subscription()` … `close_subscription()`;
     submissions return immediately; results go to `on_observation(obs)` or,
     without that callback, to the `observations` asyncio queue. Availability
     changes arrive in `availability` and `on_availability(bool)`.
@@ -567,7 +567,7 @@ class SpeechWorker:
         self.models: SpeechModels | None = None
         self._executor: ThreadPoolExecutor | None = None
         self._wake: dict[str, WakeGraph] = {}
-        self._leases: dict[str, _Lease] = {}
+        self._stream_states: dict[str, _StreamState] = {}
         self._serial_work_queues: dict[str, _SerialWorkQueue] = {}
         self._drain_tasks: dict[str, asyncio.Task[None]] = {}
         self._errors: collections.deque[_WorkerError] = collections.deque()
@@ -602,7 +602,7 @@ class SpeechWorker:
             raise
 
     async def load_wake_graph(self, sha256: str) -> None:
-        """Load (once) the registry graph a lease will name. Leases opened
+        """Load (once) the registry graph a subscription will name. Subscriptions opened
         earlier keep their graph: revisions change between utterances."""
         if sha256 in self._wake:
             return
@@ -622,66 +622,67 @@ class SpeechWorker:
         await asyncio.gather(*list(self._drain_tasks.values()), return_exceptions=True)
         self._serial_work_queues.clear()
         self._drain_tasks.clear()
-        self._leases.clear()
+        self._stream_states.clear()
         if self._executor is not None:
             self._executor.shutdown(wait=True, cancel_futures=True)
             self._executor = None
         self._remote.shutdown(wait=False, cancel_futures=True)
 
-    # -- leases -------------------------------------------------------------
+    # -- subscriptions ------------------------------------------------------
 
-    def open_lease(self, device_id: str, capture_epoch: int, lease_id: str, graph_sha256: str) -> None:
-        """Fresh VAD state/context from the lease's first mic sample; empty
+    def open_subscription(self, device_id: str, capture_epoch: int, subscription_id: str,
+                          graph_sha256: str) -> None:
+        """Fresh VAD state/context from the subscription's first mic sample; empty
         reference smoothing history from its first reference sample."""
         self._require_started()
-        if lease_id in self._leases:
-            raise SpeechWorkerError(f"lease {lease_id} is already open")
+        if subscription_id in self._stream_states:
+            raise SpeechWorkerError(f"subscription {subscription_id} is already open")
         wake = self._wake.get(graph_sha256)
         if wake is None:
             raise SpeechWorkerError(f"wake graph {graph_sha256} is not loaded")
-        self._leases[lease_id] = _Lease(device_id, capture_epoch, lease_id, wake)
+        self._stream_states[subscription_id] = _StreamState(device_id, capture_epoch, subscription_id, wake)
 
-    def close_lease(self, lease_id: str) -> None:
-        """Discard the lease's state; queued jobs for it still drain."""
-        lease = self._leases.pop(lease_id, None)
-        if lease is None:
+    def close_subscription(self, subscription_id: str) -> None:
+        """Discard the subscription's stream state; queued jobs for it still drain."""
+        stream_state = self._stream_states.pop(subscription_id, None)
+        if stream_state is None:
             return
-        for queue_name in (f"mic:{lease_id}", f"reference:{lease_id}"):
+        for queue_name in (f"mic:{subscription_id}", f"reference:{subscription_id}"):
             queue = self._serial_work_queues.pop(queue_name, None)
             if queue is not None:
                 queue.put_nowait(None)
 
-    def reset_mic(self, lease_id: str) -> None:
+    def reset_mic(self, subscription_id: str) -> None:
         """Epoch change, discontinuity, or mute: reset VAD state and context
         and close any open ASR stream (the actor ends that utterance)."""
-        lease = self._lease(lease_id)
-        lease.mic_through = None
+        stream_state = self._stream_state(subscription_id)
+        stream_state.mic_through = None
 
         def run() -> tuple[Observation, ...]:
-            lease.vad.reset()
-            lease.utterance = None
+            stream_state.vad.reset()
+            stream_state.utterance = None
             return ()
-        self._submit(_Job(f"mic:{lease_id}", ObservationKind.VAD, self._now(), run, lease, StreamId.MIC, 0, None,
-                          control=True))
+        self._submit(_Job(f"mic:{subscription_id}", ObservationKind.VAD, self._now(), run, stream_state, StreamId.MIC,
+                          0, None, control=True))
 
-    def prime_vad(self, lease_id: str, from_sample: int, voice: VoiceSnapshot | None) -> None:
-        """§16.6 reply window: restore `voice` (None: a fresh state) into the lease's VAD from
+    def prime_vad(self, subscription_id: str, from_sample: int, voice: VoiceSnapshot | None) -> None:
+        """§16.6 reply window: restore `voice` (None: a fresh state) into the subscription's VAD from
         the first cell at or after `from_sample` it has yet to analyze; earlier cells keep the
-        state they carried. Ordered with the lease's mic blocks: blocks submitted before it
+        state they carried. Ordered with the subscription's mic blocks: blocks submitted before it
         are analyzed first."""
-        lease = self._lease(lease_id)
+        stream_state = self._stream_state(subscription_id)
 
         def run() -> tuple[Observation, ...]:
-            lease.vad.prime = (from_sample, voice)
+            stream_state.vad.prime = (from_sample, voice)
             return ()
-        self._submit(_Job(f"mic:{lease_id}", ObservationKind.VAD, self._now(), run, lease, StreamId.MIC, 0, None,
-                          control=True))
+        self._submit(_Job(f"mic:{subscription_id}", ObservationKind.VAD, self._now(), run, stream_state, StreamId.MIC,
+                          0, None, control=True))
 
     # -- utterance ASR ------------------------------------------------------
 
     def open_utterance(
         self,
-        lease_id: str,
+        subscription_id: str,
         utterance_id: str,
         start_sample: int,
         trigger_sample: int,
@@ -698,9 +699,9 @@ class SpeechWorker:
         and grammar judge (the §16.6 wake-phrase cut for wake turns);
         `grammar(text)` supplies `grammar_result`; `pause_server` also
         transcribes the utterance at each pause."""
-        lease = self._lease(lease_id)
+        stream_state = self._stream_state(subscription_id)
         models = self._require_started()
-        through = lease.mic_through if lease.mic_through is not None else start_sample
+        through = stream_state.mic_through if stream_state.mic_through is not None else start_sample
         preroll = None
         if through > start_sample:
             if not mic.covers(start_sample, through):
@@ -711,66 +712,66 @@ class SpeechWorker:
                                text_transform, grammar, start_sample, pause_server=pause_server)
 
         def run() -> tuple[Observation, ...]:
-            lease.utterance = utterance
+            stream_state.utterance = utterance
             if preroll is None:
                 return ()
             for i in range(0, preroll.size, BLOCK_SAMPLES):
                 models.decode(stream, preroll[i:i + BLOCK_SAMPLES])
             utterance.evidence.append(preroll)
             utterance.fed_through = start_sample + preroll.size
-            return (self._asr_observation(models, lease, utterance),)
-        self._submit(_Job(f"mic:{lease_id}", ObservationKind.ASR, self._now(), run, lease, StreamId.MIC,
+            return (self._asr_observation(models, stream_state, utterance),)
+        self._submit(_Job(f"mic:{subscription_id}", ObservationKind.ASR, self._now(), run, stream_state, StreamId.MIC,
                           max(through, start_sample), utterance_id, control=True))
 
-    def close_utterance(self, lease_id: str) -> None:
+    def close_utterance(self, subscription_id: str) -> None:
         """Commit or close: the stream is dropped, never reused."""
-        lease = self._lease(lease_id)
+        stream_state = self._stream_state(subscription_id)
 
         def run() -> tuple[Observation, ...]:
-            if lease.utterance is not None and lease.utterance.pause is not None:
-                lease.utterance.pause.answer.cancel()
-            lease.utterance = None
+            if stream_state.utterance is not None and stream_state.utterance.pause is not None:
+                stream_state.utterance.pause.answer.cancel()
+            stream_state.utterance = None
             return ()
-        self._submit(_Job(f"mic:{lease_id}", ObservationKind.ASR, self._now(), run, lease, StreamId.MIC, 0, None,
-                          control=True))
+        self._submit(_Job(f"mic:{subscription_id}", ObservationKind.ASR, self._now(), run, stream_state, StreamId.MIC,
+                          0, None, control=True))
 
     # -- mic blocks ---------------------------------------------------------
 
-    def submit_mic_block(self, lease_id: str, first_sample: int, canonical_pcm: np.ndarray,
+    def submit_mic_block(self, subscription_id: str, first_sample: int, canonical_pcm: np.ndarray,
                          *, flags: int = 0) -> None:
         """One uploaded mic block (canonical int16). Its VAD input and its
         evidence copy for the utterance's ASR are each built once here."""
-        lease = self._lease(lease_id)
+        stream_state = self._stream_state(subscription_id)
         models = self._require_started()
         pcm = np.asarray(canonical_pcm)
         if pcm.dtype != np.int16 or pcm.ndim != 1 or pcm.size == 0:
             raise ValueError("canonical PCM must be a non-empty 1-D int16 array")
         if flags & (FLAG_DISCONTINUITY | FLAG_MUTED):
-            self.reset_mic(lease_id)
+            self.reset_mic(subscription_id)
             if flags & FLAG_MUTED:
                 return
         vad_in = vad_input(pcm)
         evidence = evidence_copy(pcm)
         end = first_sample + pcm.size
-        lease.mic_through = end
-        utterance_id = lease.utterance.utterance_id if lease.utterance else None
-        self._submit(_Job(f"mic:{lease_id}", ObservationKind.VAD, self._now(),
-                          lambda: self._run_mic(models, lease, first_sample, vad_in, evidence),
-                          lease, StreamId.MIC, end, utterance_id))
+        stream_state.mic_through = end
+        utterance_id = stream_state.utterance.utterance_id if stream_state.utterance else None
+        self._submit(_Job(f"mic:{subscription_id}", ObservationKind.VAD, self._now(),
+                          lambda: self._run_mic(models, stream_state, first_sample, vad_in, evidence),
+                          stream_state, StreamId.MIC, end, utterance_id))
 
-    def _run_mic(self, models: SpeechModels, lease: _Lease, first: int,
+    def _run_mic(self, models: SpeechModels, stream_state: _StreamState, first: int,
                  vad_in: np.ndarray, evidence: np.ndarray) -> tuple[Observation, ...]:
-        if lease.dirty:
-            lease.vad.reset()
-            lease.utterance = None
-            lease.dirty = False
+        if stream_state.dirty:
+            stream_state.vad.reset()
+            stream_state.utterance = None
+            stream_state.dirty = False
         out: list[Observation] = []
-        vad = lease.vad
+        vad = stream_state.vad
         if vad.next_sample is not None and first != vad.next_sample + vad.pending.size:
             # Missing range: VAD context never crosses a gap (the actor closes
             # any open utterance as interrupted); the ASR stream is dropped.
             vad.reset()
-            lease.utterance = None
+            stream_state.utterance = None
         if vad.next_sample is None:
             skip = (-first) % VAD_CELL_SAMPLES   # cells lie on the epoch's 512 grid
             vad.next_sample = first + skip
@@ -789,27 +790,27 @@ class SpeechWorker:
                 probs.append(models.vad(vad, cells[i * VAD_CELL_SAMPLES:(i + 1) * VAD_CELL_SAMPLES]))
             vad.pending = vad.pending[n_cells * VAD_CELL_SAMPLES:]
             vad.next_sample = first_cell + n_cells * VAD_CELL_SAMPLES
-            u = lease.utterance
+            u = stream_state.utterance
             if u is not None:
                 for i, p in enumerate(probs):
                     if p >= SPEECH_POSITIVE_VAD:
                         u.speech_end = first_cell + (i + 1) * VAD_CELL_SAMPLES
-            out.append(self._observe(lease, StreamId.MIC, ObservationKind.VAD, vad.next_sample,
+            out.append(self._observe(stream_state, StreamId.MIC, ObservationKind.VAD, vad.next_sample,
                                      VadPayload(first_cell, tuple(probs)), u.utterance_id if u else None))
-        u = lease.utterance
+        u = stream_state.utterance
         if u is not None:
             end = first + evidence.size
             if first > u.fed_through:
-                lease.utterance = None   # gap inside the utterance: stream is dead
+                stream_state.utterance = None   # gap inside the utterance: stream is dead
             elif end > u.fed_through:
                 fed = evidence[u.fed_through - first:]
                 models.decode(u.stream, fed)
                 u.evidence.append(fed)
                 u.fed_through = end
-                out.append(self._asr_observation(models, lease, u))
+                out.append(self._asr_observation(models, stream_state, u))
         return tuple(out)
 
-    def _asr_observation(self, models: SpeechModels, lease: _Lease, u: _Utterance) -> Observation:
+    def _asr_observation(self, models: SpeechModels, stream_state: _StreamState, u: _Utterance) -> Observation:
         """The block's ASR result (§16.6 finalize at the pause).
 
         Once VAD has analyzed `FINALIZE_PAUSE` past the last speech-positive
@@ -829,7 +830,7 @@ class SpeechWorker:
         another.
 
         A finalize also copies the mic serial work queue's Silero state: the utterance's voice snapshot."""
-        analyzed = lease.vad.next_sample
+        analyzed = stream_state.vad.next_sample
         finalize = (u.speech_end is not None and u.speech_end != u.finalized_end
                     and analyzed is not None and analyzed - u.speech_end >= FINALIZE_PAUSE)
         live: AsrResult | None = None
@@ -849,7 +850,7 @@ class SpeechWorker:
             finalize_ms = round((time.monotonic() - sent) * 1000)
             u.finalized = _Finalized(shadow.tokens, self._emissions(u, shadow), shadow.text)
             u.finalized_end = u.speech_end
-            voice = lease.vad.snapshot(u.fed_through)
+            voice = stream_state.vad.snapshot(u.fed_through)
         elif u.finalized is not None:
             live = models.result(u.stream)
             if live.tokens != u.finalized.tokens[:len(live.tokens)]:
@@ -884,7 +885,7 @@ class SpeechWorker:
         payload = AsrPayload(tokens, emissions, raw_text, stable.prefix if stable.prefix_sample is not None else None,
                              blanks, None if u.grammar is None else u.grammar(text), finalize_ms,
                              pause_text=pause_text, pause_decode=decode, voice=voice)
-        return self._observe(lease, StreamId.MIC, ObservationKind.ASR, u.fed_through, payload, u.utterance_id)
+        return self._observe(stream_state, StreamId.MIC, ObservationKind.ASR, u.fed_through, payload, u.utterance_id)
 
     @staticmethod
     def _emissions(u: _Utterance, result: AsrResult) -> tuple[int, ...]:
@@ -892,34 +893,34 @@ class SpeechWorker:
 
     # -- echo ----------------------------------------------------------------
 
-    def submit_echo(self, lease_id: str, first_cell_sample: int, through_sample: int,
+    def submit_echo(self, subscription_id: str, first_cell_sample: int, through_sample: int,
                     compare: Callable[[], tuple[tuple[EchoResult, ...], int | None]],
                     utterance_id: str | None = None) -> None:
         """Run the pure per-cell reference comparison (`em_attribution`) on
-        the executor, serialized with this lease's mic analysis."""
-        lease = self._lease(lease_id)
+        the executor, serialized with this subscription's mic analysis."""
+        stream_state = self._stream_state(subscription_id)
 
         def run() -> tuple[Observation, ...]:
             results, lag = compare()
             if not results or any(not isinstance(r, EchoResult) for r in results):
                 raise SpeechWorkerError(f"echo comparison returned {results!r}")
-            return (self._observe(lease, StreamId.MIC, ObservationKind.ECHO, through_sample,
+            return (self._observe(stream_state, StreamId.MIC, ObservationKind.ECHO, through_sample,
                                   EchoPayload(first_cell_sample, results, lag), utterance_id),)
-        self._submit(_Job(f"mic:{lease_id}", ObservationKind.ECHO, self._now(), run, lease, StreamId.MIC,
+        self._submit(_Job(f"mic:{subscription_id}", ObservationKind.ECHO, self._now(), run, stream_state, StreamId.MIC,
                           through_sample, utterance_id))
 
     # -- reference scoring --------------------------------------------------
 
-    def submit_reference(self, lease_id: str, reference: ReferenceView) -> None:
+    def submit_reference(self, subscription_id: str, reference: ReferenceView) -> None:
         """Score every newly complete reference hop (windows ending on the
         epoch's multiples of 2,560) of one reference epoch. Digital-silence
         windows are not scored; a window with missing samples is invalid."""
-        lease = self._lease(lease_id)
+        stream_state = self._stream_state(subscription_id)
         first, frontier = reference.first_sample, reference.frontier
         if first is None or frontier is None:
             return
         epoch = reference.epoch
-        next_end = lease.ref_next.get(epoch)
+        next_end = stream_state.ref_next.get(epoch)
         if next_end is None:
             next_end = ceil_to(first + WINDOW_SAMPLES, REFERENCE_HOP)
         slots: list[tuple[int, np.ndarray | None, bool]] = []
@@ -931,19 +932,19 @@ class SpeechWorker:
             else:
                 slots.append((next_end, None, False))
             next_end += REFERENCE_HOP
-        lease.ref_next[epoch] = next_end
+        stream_state.ref_next[epoch] = next_end
         if slots:
-            self._submit(_Job(f"reference:{lease_id}", ObservationKind.REFERENCE_SCORE, self._now(),
-                              lambda: self._run_reference(lease, epoch, slots),
-                              lease, StreamId.REFERENCE, slots[-1][0], None))
+            self._submit(_Job(f"reference:{subscription_id}", ObservationKind.REFERENCE_SCORE, self._now(),
+                              lambda: self._run_reference(stream_state, epoch, slots),
+                              stream_state, StreamId.REFERENCE, slots[-1][0], None))
 
-    def _run_reference(self, lease: _Lease, epoch: int,
+    def _run_reference(self, stream_state: _StreamState, epoch: int,
                        slots: list[tuple[int, np.ndarray | None, bool]]) -> tuple[Observation, ...]:
-        detector = lease.detector
-        if detector is None or lease.reference_epoch != epoch:
-            detector = lease.detector = ReferenceDetector(BcresnetScorer(lease.wake.infer, lease.wake.spec),
-                                                          lease.wake.reference_threshold)
-            lease.reference_epoch = epoch
+        detector = stream_state.detector
+        if detector is None or stream_state.reference_epoch != epoch:
+            detector = stream_state.detector = ReferenceDetector(
+                BcresnetScorer(stream_state.wake.infer, stream_state.wake.spec), stream_state.wake.reference_threshold)
+            stream_state.reference_epoch = epoch
         raw: list[float | None] = []
         smoothed: list[float | None] = []
         events: list[ReferenceCandidate] = []
@@ -958,16 +959,17 @@ class SpeechWorker:
             raw.append(score.raw)
             smoothed.append(score.smoothed)
         payload = ReferenceScorePayload(slots[0][0], epoch, tuple(raw), tuple(smoothed), tuple(events))
-        return (self._observe(lease, StreamId.REFERENCE, ObservationKind.REFERENCE_SCORE, slots[-1][0], payload),)
+        return (self._observe(stream_state, StreamId.REFERENCE, ObservationKind.REFERENCE_SCORE, slots[-1][0],
+                              payload),)
 
     # -- wake verification --------------------------------------------------
 
-    def submit_verification(self, lease_id: str, candidate_id: str, mic: SampleTimeline,
+    def submit_verification(self, subscription_id: str, candidate_id: str, mic: SampleTimeline,
                             support_start: int, open_sample: int, verify_core: str) -> None:
         """Fresh greedy decode of the evidence copy over
         [support_start − 300 ms, open + 480 ms), flushed with `ASR_FLUSH` zeros.
         Call once the mic timeline covers that range."""
-        lease = self._lease(lease_id)
+        stream_state = self._stream_state(subscription_id)
         models = self._require_started()
         a = max(0, support_start - VERIFICATION_PREROLL)
         b = open_sample + VERIFICATION_LOOKAHEAD
@@ -977,12 +979,12 @@ class SpeechWorker:
         evidence = evidence_copy(mic.read(a, b))
         created = self._now()
         self._submit(_Job(f"verification:{candidate_id}", ObservationKind.VERIFICATION, created,
-                          lambda: self._run_verification(models, lease, candidate_id, evidence, verify_core, b,
+                          lambda: self._run_verification(models, stream_state, candidate_id, evidence, verify_core, b,
                                                          created),
-                          lease, StreamId.MIC, b, None, candidate_id=candidate_id))
+                          stream_state, StreamId.MIC, b, None, candidate_id=candidate_id))
 
-    def _run_verification(self, models: SpeechModels, lease: _Lease, candidate_id: str, evidence: np.ndarray,
-                          core: str, through: int, created: float) -> tuple[Observation, ...]:
+    def _run_verification(self, models: SpeechModels, stream_state: _StreamState, candidate_id: str,
+                          evidence: np.ndarray, core: str, through: int, created: float) -> tuple[Observation, ...]:
         queued_ms = round((self._now() - created) * 1000)
         started = time.monotonic()
         text = models.decode_fresh(evidence).text
@@ -991,7 +993,7 @@ class SpeechWorker:
         payload = VerificationPayload(candidate_id, text, v.distance,
                                       VerificationResult.PASS if v.passed else VerificationResult.FAIL,
                                       queued_ms, decode_ms)
-        return (self._observe(lease, StreamId.MIC, ObservationKind.VERIFICATION, through, payload),)
+        return (self._observe(stream_state, StreamId.MIC, ObservationKind.VERIFICATION, through, payload),)
 
     # -- committed-span re-decode ---------------------------------------------
 
@@ -1074,18 +1076,18 @@ class SpeechWorker:
         backlog = deadline and self._stall_mark is not None and job.created <= self._stall_mark
         if deadline and not backlog:
             self._stall_mark = now
-        lease = job.lease
-        device_id = None if lease is None else lease.device_id
-        if lease is not None:
+        stream_state = job.stream_state
+        device_id = None if stream_state is None else stream_state.device_id
+        if stream_state is not None:
             if job.stream == StreamId.MIC and not job.candidate_id:
-                lease.dirty = True   # the mic serial work queue's recurrent state skipped audio
+                stream_state.dirty = True   # the mic serial work queue's recurrent state skipped audio
             if job.candidate_id is not None and deadline:
                 late = next((o.payload for o in ran if isinstance(o.payload, VerificationPayload)), None)
                 verdict = (VerificationPayload(job.candidate_id, None, None, VerificationResult.TIMEOUT)
                            if late is None else replace(late, result=VerificationResult.TIMEOUT))
-                await self._emit(self._observe(lease, StreamId.MIC, ObservationKind.VERIFICATION, job.through,
+                await self._emit(self._observe(stream_state, StreamId.MIC, ObservationKind.VERIFICATION, job.through,
                                                verdict))
-            await self._emit(self._observe(lease, job.stream, ObservationKind.ERROR, job.through,
+            await self._emit(self._observe(stream_state, job.stream, ObservationKind.ERROR, job.through,
                                            ErrorPayload(job.component, reason), job.utterance_id))
         if backlog:
             log.debug("speech worker: %s on %s (%s): %s; backlog of the stall at %.3f, not counted",
@@ -1149,22 +1151,22 @@ class SpeechWorker:
         if inspect.isawaitable(value):
             await value
 
-    def _revision(self, lease: _Lease, stream: StreamId) -> str | None:
+    def _revision(self, stream_state: _StreamState, stream: StreamId) -> str | None:
         if stream == StreamId.REFERENCE:
-            return lease.wake.sha256
+            return stream_state.wake.sha256
         return None if self.models is None else self.models.revision
 
-    def _observe(self, lease: _Lease, stream: StreamId, kind: ObservationKind, through: int,
+    def _observe(self, stream_state: _StreamState, stream: StreamId, kind: ObservationKind, through: int,
                  payload: Payload, utterance_id: str | None = None) -> Observation:
-        return Observation(lease.device_id, lease.capture_epoch, stream, ObservationSource.CONTROLLER, kind,
-                           through, utterance_id, self._revision(lease, stream), self.policy_hash, payload,
-                           int(time.time() * 1000), lease.lease_id)
+        return Observation(stream_state.device_id, stream_state.capture_epoch, stream, ObservationSource.CONTROLLER,
+                           kind, through, utterance_id, self._revision(stream_state, stream), self.policy_hash,
+                           payload, int(time.time() * 1000), stream_state.subscription_id)
 
-    def _lease(self, lease_id: str) -> _Lease:
-        lease = self._leases.get(lease_id)
-        if lease is None:
-            raise SpeechWorkerError(f"unknown lease {lease_id}")
-        return lease
+    def _stream_state(self, subscription_id: str) -> _StreamState:
+        stream_state = self._stream_states.get(subscription_id)
+        if stream_state is None:
+            raise SpeechWorkerError(f"unknown subscription {subscription_id}")
+        return stream_state
 
     def _require_started(self) -> SpeechModels:
         if self._executor is None or self.models is None:

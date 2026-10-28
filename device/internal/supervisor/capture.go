@@ -118,7 +118,7 @@ func (s *Supervisor) endCaptureStreamsLocked(reason proto.StreamReason) {
 }
 
 // setPrivacy applies a physical mute transition (§3.2 invariant 10, §18.2
-// mute.go): muting ends the capture epoch, every uplink lease and the
+// mute.go): muting ends the capture epoch, every audio subscription and the
 // open candidate, and erases the mic, cell and AFE rings; unmuting starts a
 // new epoch at once so privacy.changed can name it. Alerts are unaffected.
 func (s *Supervisor) setPrivacy(muted bool) {

@@ -8,7 +8,7 @@ listener:
 - ``/shell/{device_id}``               → the retained shell plane
 
 Recording modes (sample collection, ambient recording, script-driven capture)
-hold a ``diagnostic`` uplink lease through the device's actor; while one runs
+hold a ``diagnostic`` audio subscription through the device's actor; while one runs
 the actor accepts no wake, alerts still ring and physical stop still works.
 """
 
@@ -685,7 +685,7 @@ async def stop_preview(device: em_device.Device) -> None:
             await playback.cancel("stopped")
 
 
-# ─── Recording modes over the diagnostic lease ───────────────────────────────
+# ─── Recording modes over the diagnostic subscription ───────────────────────────────
 
 async def _push_modes(device: em_device.Device) -> None:
     await api.push_device_update(device.device_id, {
@@ -702,7 +702,7 @@ async def _push_modes(device: em_device.Device) -> None:
 
 
 async def _sync_diagnostic(device: em_device.Device) -> None:
-    """Hold exactly one diagnostic lease while any recording mode is on."""
+    """Hold exactly one diagnostic subscription while any recording mode is on."""
     want = device.collect_mode or device.ambient_mode or device.capture_mode
     if want and not device.diagnostic:
         queue = device.diag_queue
@@ -727,8 +727,8 @@ async def _sync_diagnostic(device: em_device.Device) -> None:
         device.diag_track = None
 
 
-def _diagnostic_block(device: em_device.Device, lease_id: str, start: int, pcm: np.ndarray) -> None:
-    """A mic block of the diagnostic lease: queued for the modes at its tap position, which
+def _diagnostic_block(device: em_device.Device, subscription_id: str, start: int, pcm: np.ndarray) -> None:
+    """A mic block of the diagnostic subscription: queued for the modes at its tap position, which
     only a queued block takes, so the tap stream is exactly what the modes are fed."""
     queue, track = device.diag_queue, device.diag_track
     if queue is None or track is None:
@@ -738,12 +738,12 @@ def _diagnostic_block(device: em_device.Device, lease_id: str, start: int, pcm: 
     except asyncio.QueueFull:
         log.warning("[%s] recording tap fell behind; block dropped", device.device_id)
         return
-    track.mic(lease_id, start, pcm.size)
+    track.mic(subscription_id, start, pcm.size)
 
 
-def _diagnostic_afe(device: em_device.Device, lease_id: str, records: list[AfeRecord]) -> None:
+def _diagnostic_afe(device: em_device.Device, subscription_id: str, records: list[AfeRecord]) -> None:
     if device.diag_track is not None:
-        device.diag_track.afe(lease_id, records)
+        device.diag_track.afe(subscription_id, records)
 
 
 def _recording_series(device: em_device.Device, origin: int | None, samples: int) -> em_afe.AfeSeries | None:

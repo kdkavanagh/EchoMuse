@@ -40,8 +40,9 @@ the pre-v1 `/control` link is gone, so firmware predating v1 gets no answer.
 ```
 
 - `message_id`: a fresh UUIDv4 per message; it is the command ID.
-- `generation`: the owner generation of the object the message acts on (lease,
-  playback, candidate lease). `0` when the message has no generation.
+- `generation`: the owner generation of the object the message acts on (focus
+  lease, audio subscription, playback, candidate subscription). `0` when the
+  message has no generation.
 - uint64 values (sample indices, epochs, monotonic ns, UTC ms) are JSON
   **decimal strings**. Small counters are JSON numbers.
 - Epoch values are random nonzero uint64s, written as decimal strings.
@@ -50,7 +51,7 @@ the pre-v1 `/control` link is gone, so firmware predating v1 gets no answer.
 
 Each side sends `heartbeat` every 1 s; any received control message counts as
 liveness. 2 s of silence = degraded (dashboard only). 3 s = session lost: both
-sides close all three sockets and end every dialog/focus/uplink lease. The
+sides close all three sockets and end every dialog/focus lease and subscription. The
 device keeps executing alerts, and until the next `session.ready` answers the
 wake word itself with its offline notice (architecture §11.2).
 
@@ -77,7 +78,7 @@ wake word itself with its offline notice (architecture §11.2).
 | 56 | u32 | active-source mask (kind 2): content=1 alert=2 dialog=4 earcon=8; 0 otherwise |
 | 60 | u32 | payload bytes: frames×2 (PCM), 0 (digital silence), cells×4 (kind 4), records×14 (kind 5) |
 
-Uplink (device → controller): kinds 1, 2, 4, 5, only under a lease (§5).
+Uplink (device → controller): kinds 1, 2, 4, 5, only under a subscription (§5).
 Downlink (controller → device): kind 3 only.
 
 Cell record (kind 4, 4 bytes): int16 LE `E` in hundredths of dB clamped to
@@ -181,7 +182,7 @@ counters in `wake.stats.shadow` (§4.4; architecture §5.2).
 `near_miss_v1`: announced by every firmware from this tree, on all three
 images. The device reports each near-miss episode that opened no candidate in
 `wake.near_miss` as it closes (§4.4) and accepts `uplink.open` reason
-`near_miss` (§4.5); the controller opens that lease to no other device.
+`near_miss` (§4.5); the controller opens that subscription to no other device.
 `afe_metadata_v1`: the capture carries the native AFE's per-frame metadata
 (the ASR capture's bit 0, format v3.3; see §3) and the device's decoder is validating
 it. The firmware announces it only when a frame validated in the 2 s before
@@ -190,9 +191,10 @@ capture period. A hello can still go out before the first valid frame: a
 cold-booted Dot opens its microphone only after the first NTP sync, and it
 can find the controller before that. When the decoder then starts validating
 during a session whose hello lacked the capability, the device ends that
-session once it is idle (no lease, no network playback, no active alert,
-nothing audible) and sends a new hello at once, which announces it. It does
-this at most once per run. The controller sees an ordinary reconnect. With
+session once it is idle (no focus lease or subscription, no network playback,
+no active alert, nothing audible) and sends a new hello at once, which
+announces it. It does this at most once per run. The controller sees an
+ordinary reconnect. With
 `session.ready` `afe_metadata`, the device serves the `afe` stream (§3, §4.5) and reports
 `wake.stats.afe` (§4.4). The values are evidence: no controller decision uses
 them (architecture §4.5).
@@ -303,7 +305,7 @@ the controller refuses every candidate (diagnostics/approval states).
 
 `afe_metadata: true` is sent only to a device announcing `afe_metadata_v1`;
 absent or false, the device sends nothing of the `afe` stream: no `stream.open`
-or `stream.end` for it, no kind-5 frames, no `afe` key in a candidate lease or
+or `stream.end` for it, no kind-5 frames, no `afe` key in a candidate subscription or
 `uplink.ended`, no `wake.stats.afe`. The opt-in exists because a controller
 predating kind 5 rejects an unknown EMA1 kind as malformed (`protocol.error`,
 and it closes the session); unknown control types and fields, by contrast, it
@@ -326,7 +328,7 @@ trusted, then every 10 min.
 The device acks every C→D `focus.*`, `render.*`, `uplink.*`, `alert.act`,
 `alert.ring`, `alert.prefetch`: `accepted` on receipt, `rejected` with a code on refusal; `alert.act`
 on an alarm acks `durable` once journaled. The controller acks `wake.candidate`
-(`accepted`, which releases the candidate lease's audio, or `rejected`).
+(`accepted`, which releases the candidate subscription's audio, or `rejected`).
 
 **`protocol.error`** both: `{"code":"…","detail":"…"}`.
 
@@ -396,7 +398,7 @@ playback plays unless ducked or paused by an alert foreground.
 
 ### 4.4 Wake
 
-**`wake.candidate`** D→C, gen = 1 (the candidate lease's generation):
+**`wake.candidate`** D→C, gen = 1 (the candidate subscription's generation):
 ```json
 {"candidate_id":"uuid","lease_id":"uuid","capture_epoch":"…","graph_sha256":"…",
  "scorer_revision":3,"profile":"idle|playback","threshold":0.9,
@@ -419,7 +421,7 @@ candidate opened on the baseline rule of its `profile`.
 `chimed` is true iff the device started the built-in wake chime for this
 candidate. It does so before sending `wake.candidate`, only with `config`
 `wakeSound` true, a session, `producing_sound` false, `active_alert` null and
-no live `diagnostic` lease, as an `earcon` at the slot's current generation
+no live `diagnostic` subscription, as an `earcon` at the slot's current generation
 (the fence is not raised; the controller's next earcon `render.start` replaces
 it). The chime is not cancelled if the candidate is rejected. The controller
 plays the chime on acceptance only when `chimed` is false; absent (older
@@ -475,7 +477,7 @@ privacy-muted: `periods` capture periods decoded (10 frames expected each),
 locked decoder expected one, `syncs` lock acquisitions, `gaps`
 discontinuities and `lost_frames` the AFE frames they skipped (§3). It carries
 no acoustic values: those leave the device only in kind-5 records under a
-lease. Absent means no data, never zero counts.
+subscription. Absent means no data, never zero counts.
 
 **`wake.near_miss`** D→C, `generation` 0, `near_miss_v1` only, while a session
 exists:
@@ -495,10 +497,13 @@ was ≥ `floor`; `mono_ns` the opening hop's, the same value as the episode's
 `wake.stats` entry. `reason` is `below` after two consecutive scored hops
 below the floor, otherwise the invalidation that ended it (the
 `wake.candidate_end` vocabulary). Sample indices and `mono_ns` are uint64
-decimal strings. The device leases nothing for a near miss; an episode that
+decimal strings. The device opens no subscription for a near miss; an episode that
 closes with no session is only counted in `wake.stats`.
 
-### 4.5 Uplink leases
+### 4.5 Audio subscriptions
+
+The code calls these audio subscriptions, while the wire keeps the older names
+`lease_id` and `uplink_leases_v1`.
 
 Stream keys: `mic`, `reference`, `cells`, and `afe` in an `afe_metadata`
 session (anywhere else naming it is `rejected` `invalid`). Starts are
@@ -507,17 +512,18 @@ a reference start to the reference epoch through its clock fits, then rounds
 down (mic/cells to 512, afe to 1280, reference to 2560) and clips to the ring
 (afe: 8 s, like the reference).
 
-**`uplink.open`** C→D, gen = lease generation (starts at 1):
+**`uplink.open`** C→D, gen = subscription generation (starts at 1):
 `{"lease_id":"uuid","owner":"…","reason":"turn|reply|diagnostic|near_miss","streams":{"mic":"…|live","reference":"…|live","cells":"…|live","afe":"…|live"},"ttl_ms":3000}`.
 An omitted stream key is not wanted. In an `afe_metadata` session the
-controller opens one more `turn` lease when a turn commits, before closing the
-committed lease: same owner, `streams` `{"afe":"…"}` from where the committed
-lease's records reached, plus `"mic":"…"` from the committed lease's last
-contiguous sample while the speaker's `saveUtterances` is on. It carries the
-AEC state, and then the turn recording, through the response and closes 1 s
-after the turn ends, or 30 s after the commit (architecture §4.4).
+controller opens one more `turn` subscription when a turn commits, before
+closing the committed subscription: same owner, `streams` `{"afe":"…"}` from
+where the committed subscription's records reached, plus `"mic":"…"` from the
+committed subscription's last contiguous sample while the speaker's
+`saveUtterances` is on. It carries the AEC state, and then the turn
+recording, through the response and closes 1 s after the turn ends, or 30 s
+after the commit (architecture §4.4).
 
-A `near_miss` lease (`near_miss_v1` devices only, generation 1) records one
+A `near_miss` subscription (`near_miss_v1` devices only, generation 1) records one
 near miss while the speaker's `saveWakeClips` is on and capture is permitted:
 `owner` is its `near_miss_id` and `streams` is
 `{"mic":"<support_start − 4800, rounded down to 512>"}`, served from the 6 s
@@ -526,15 +532,15 @@ from the 8 s AFE ring, for the near miss's chart. The controller closes it
 (`closed`) once it holds mic through `support_end + 4800` and, when it took
 `afe`, the records through it too, or the mic has run 16,000 samples past
 that without them. The device gives it no other effect: no duck, no focus,
-and it is not a diagnostic lease, so wakes and the local chime are unaffected.
+and it is not a diagnostic subscription, so wakes and the local chime are unaffected.
 
-**`uplink.renew`** C→D, gen = the lease's generation, or +1 to convert:
+**`uplink.renew`** C→D, gen = the subscription's generation, or +1 to convert:
 `{"lease_id":"…","ttl_ms":3000,"reason":"turn","owner":"turn-uuid"}` (`reason`/`owner`
-only when converting a candidate lease into a turn lease).
+only when converting a candidate subscription into a turn subscription).
 
-**`uplink.close`** C→D, gen = lease generation:
+**`uplink.close`** C→D, gen = subscription generation:
 `{"lease_id":"…","reason":"rejected|arbitration_lost|committed|closed"}`.
-Closing a candidate lease releases its provisional duck.
+Closing a candidate subscription releases its provisional duck.
 
 **`uplink.ended`** D→C:
 `{"lease_id":"…","reason":"closed|ttl|mute|epoch|overrun|session","last_sample":{"mic":"…|null"},"clipped_start":{"mic":"…|null"}}`.
@@ -542,13 +548,13 @@ One key per wanted stream. `last_sample` is the last index sent (inclusive;
 null when nothing was sent); `clipped_start` is the backfill start after
 clipping to the ring, in that stream's header index domain, or null when unclipped.
 
-A candidate lease (opened by the device with `wake.candidate`, generation 1)
+A candidate subscription (opened by the device with `wake.candidate`, generation 1)
 wants mic from `support_start − 4800`, cells from mic start − 160000, and
 reference from mic start − 40000 (capture samples; a silent mix costs only
 payload-less digital-silence packets). In an `afe_metadata` session it also
 wants afe from mic start − 40000, so the AEC state over the playback before a
 wake is there. The afe stream costs 64 + 14 bytes per 80 ms record:
-**975 B/s** while a lease is live (mic: 32.8 kB/s), and at most 1,464 bytes
+**975 B/s** while a subscription is live (mic: 32.8 kB/s), and at most 1,464 bytes
 for a candidate's 8 s backfill.
 The device uploads nothing for it until the controller's `command.ack`
 `accepted` for the `wake.candidate`; no ack within 1 s ends it with `ttl`.
@@ -754,15 +760,16 @@ them all when no line has arrived for 5 s or its link is lost.
 
 ## 5. Transport rules
 
-- Audio for a lease is sent only while that lease is open; backfill precedes
-  live audio per stream, in the order mic, cells, afe, reference.
+- Audio for a subscription is sent only while that subscription is open;
+  backfill precedes live audio per stream, in the order mic, cells, afe,
+  reference.
 - Per stream, the device keeps ≤400 ms of queued live audio beyond backfill;
-  live audio older than 1,000 ms in the send queue ends every lease wanting that
-  stream with `overrun`.
+  live audio older than 1,000 ms in the send queue ends every subscription
+  wanting that stream with `overrun`.
 - A reference packet whose samples are all zero is sent with flag bit4 and no
   payload.
 - The controller keeps the first copy of each sample index per epoch and drops
-  packets for a stream no active lease wants.
+  packets for a stream no active subscription wants.
 - Session loss discards queued audio; nothing is sent on the next session.
 
 ## 6. Assets socket

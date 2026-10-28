@@ -183,17 +183,17 @@ transcript should cost evidence for that pause, not end the turn.
 
 The controller is one Python process. One thread runs the asyncio event loop,
 and that thread does all the coordination for every Dot: it reads every audio
-frame off every device link, writes it into the lease timelines, runs each
-Dot's session actor and endpoint, talks to Home Assistant, writes the
-database and serves the dashboard. Only one thread can run Python code at a
-time (the GIL), so all of that shares one core.
+frame off every device link, writes it into each audio subscription's
+buffer, runs each Dot's session actor and endpoint, talks to Home Assistant,
+writes the database and serves the dashboard. Only one thread can run Python
+code at a time (the GIL), so all of that shares one core.
 
 The model work goes to a separate pool of 2 threads (`ThreadPoolExecutor(2)`
 in `em_speech_worker`): Silero VAD, Kroko streaming ASR, the Kroko re-decodes
 at pauses and for wake verification, BCResNet scoring of what the speaker
 played, and the echo comparison. Each model runs single-threaded. Jobs from
-one serial work queue (one lease's mic, its reference, or one verification) run in
-order.
+one serial work queue (one subscription's mic, its reference, or one
+verification) run in order.
 Remote pause transcription has its own 2 threads, which only wait on the
 network.
 

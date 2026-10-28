@@ -3,8 +3,8 @@
 // Command server is the EchoMuse device firmware, one binary for every
 // supported image: it detects the platform (internal/platform), builds the
 // physical server, the audio supervisor (capture, mixer, focus, wake
-// detector, alert executor, uplink leases) and the three-socket controller
-// link, and runs them until SIGTERM/SIGINT.
+// detector, alert executor, audio subscriptions) and the three-socket
+// controller link, and runs them until SIGTERM/SIGINT.
 //
 // What runs where:
 //

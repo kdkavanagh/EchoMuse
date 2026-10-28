@@ -381,7 +381,7 @@ func (c *core) openCandidate(it queueItem, rule OpenRule, oldestEnd uint64, smoo
 	}
 	c.d.cb.OnCandidate(Candidate{
 		CandidateID:      cs.id,
-		LeaseID:          c.d.cb.NewID(),
+		SubscriptionID:   c.d.cb.NewID(),
 		CaptureEpoch:     it.epoch,
 		GraphSHA256:      c.model.GraphSHA256,
 		ScorerRevision:   c.revision,

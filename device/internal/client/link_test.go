@@ -241,7 +241,7 @@ func TestHandshakeOpensSessionSockets(t *testing.T) {
 		t.Fatalf("oversized control frame: %v", err)
 	}
 
-	sendEnv(t, ctrl, proto.TypeUplinkOpen, proto.UplinkOpen{LeaseID: "L"})
+	sendEnv(t, ctrl, proto.TypeUplinkOpen, proto.UplinkOpen{SubscriptionID: "L"})
 	if got := waitFor(t, rec.control, "Control"); got.Type != proto.TypeUplinkOpen {
 		t.Fatalf("control %+v", got)
 	}

@@ -1842,7 +1842,7 @@ function AfeLanes({ series: s, lanes, bars = [], guides = [], anchor, anchorLabe
 // One turn's native AFE series (em_afe.AfeSeriesJson), fetched when the turn
 // is opened: each 80 ms period from the second before the wake through the
 // utterance and on through the spoken answer (a committed turn keeps a
-// response lease until a second after it ends, at most 30 s past the commit).
+// response audio subscription until a second after it ends, at most 30 s past the commit).
 // Bars above the lanes place the wake, the utterance and the controller's
 // processing. The turn recording (or a row's wake clip or utterance) draws a
 // playhead over the span it covers.
@@ -4759,11 +4759,11 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                 </span>
               )}
               {/* §11.3: microphone audio leaves the device outside a turn only
-                  under a diagnostic lease, and the dashboard says so while it
+                  under a diagnostic audio subscription, and the dashboard says so while it
                   is open. */}
               {device.diagnostic && (
                 <span className="em-pill em-pill--small em-pill--danger"
-                      title="A diagnostic lease is streaming live microphone audio; wakes are refused"
+                      title="A diagnostic audio subscription is streaming live microphone audio; wakes are refused"
                       style={{ display: 'inline-block', pointerEvents: 'none',
                                fontFamily: MONO, letterSpacing: '0.05em' }}>
                   MIC LIVE

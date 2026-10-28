@@ -6,8 +6,8 @@ kind 5, `em_audio_timeline.AfeRecord`) and its decoder counters in
 `wake.stats.afe` (docs/protocol-v1.md). This module turns both into typed
 evidence for turn rows, the decision trace and the dashboard (the summaries),
 and the dashboard's per-turn and per-recording charts (the series): a turn's
-from its leases, a sample clip's or ambient recording's from the diagnostic
-lease its recording mode holds (`AfeTrack`). A turn's series also carries the
+from its audio subscriptions, a sample clip's or ambient recording's from the diagnostic
+subscription its recording mode holds (`AfeTrack`). A turn's series also carries the
 controller's own Silero speech probability for each cell of its mic, so the
 chart can set the native VAD beside the one the controller's decisions read.
 
@@ -293,7 +293,7 @@ def playback_onset(records: Sequence[AfeRecord], at: int) -> int | None:
 
 def turn_evidence(store: AfeTimeline, support: tuple[int, int] | None,
                   utterance: tuple[int, int] | None) -> AfeEvidence:
-    """Evidence from a lease's AFE records: around the candidate's support
+    """Evidence from a subscription's AFE records: around the candidate's support
     window `[support_start, support_end)` when there is a candidate, and over
     `utterance` when there is one."""
     start: int | None = None
@@ -394,7 +394,7 @@ class AfeSeries:
     the dashboard's chart: from the second before the candidate's support
     window (the utterance's start without a candidate) through the later of
     the window's and the utterance's ends, and on through the response to
-    where the committed turn's response lease stopped (em_session).
+    where the committed turn's response subscription stopped (em_session).
     `records[i]` is the period starting at `start + i·1280`, None where no
     record arrived. Raw device units; `wire()` scales them as AfeSummary does.
 
@@ -405,7 +405,7 @@ class AfeSeries:
     turn_series does not receive any of them; em_session attaches them when it
     persists the turn, so the dashboard can play a recording against the chart.
     `silero` is the controller's Silero probability from `silero_start`, one per
-    512-sample cell (VadTrack.read), which turn_series fills from the lease's VadTrack;
+    512-sample cell (VadTrack.read), which turn_series fills from the subscription's VadTrack;
     it is empty where it analysed none.
 
     A sample clip's or ambient recording's series (AfeTrack.series) is on the
@@ -474,8 +474,8 @@ def series_range(support: tuple[int, int] | None, utterance: tuple[int, int] | N
 def turn_series(store: AfeTimeline, support: tuple[int, int] | None,
                 utterance: tuple[int, int] | None, *,
                 response: AfeTimeline | None = None, vad: VadTrack | None = None) -> AfeSeries | None:
-    """The AfeSeries of a lease's AFE records over series_range, and on through
-    `response`, the records of the response lease that followed the commit, to
+    """The AfeSeries of a subscription's AFE records over series_range, and on through
+    `response`, the records of the response subscription that followed the commit, to
     its last one, with `vad`'s Silero probabilities for the cells it spans. None
     ("no data") without a window or an utterance, or when no period in the range
     was received. Where both stores hold a period, `store`'s record is kept."""
@@ -525,16 +525,16 @@ _HALF_PERIOD = AFE_PERIOD_SAMPLES // 2
 
 
 class AfeTrack:
-    """The diagnostic lease's mic as em_controller's recording modes take it —
+    """The diagnostic subscription's mic as em_controller's recording modes take it —
     every block the tap took, end to end (the tap stream) — and the native AFE
     record of each of that stream's periods, so a recording cut from it (a
     sample clip, an ambient file) gets an AfeSeries on its own timeline.
 
     Tap period j is tap samples `[1280j, 1280j + 1280)`. Its record is the one
-    whose capture period holds the tap period's middle sample, from the lease
+    whose capture period holds the tap period's middle sample, from the subscription
     that delivered that sample: while blocks are contiguous and on the period
     grid (the device's 80 ms blocks are) that is the capture period itself, and
-    across a gap or a new lease nothing after it shifts. Blocks and records
+    across a gap or a new subscription nothing after it shifts. Blocks and records
     arrive in either order; a period waits TRACK_WAIT_PERIODS for its record and
     an early record as long for its period, and one that never comes is no
     record. The newest `capacity` periods are kept. Evidence only."""
@@ -544,18 +544,18 @@ class AfeTrack:
         self.samples = 0                                            # tap samples taken
         self._floor = 0                                             # tap period of _periods[0]
         self._periods: collections.deque[AfeRecord | None] = collections.deque()
-        self._waiting: dict[tuple[str, int], int] = {}              # (lease, capture period) → tap period
+        self._waiting: dict[tuple[str, int], int] = {}              # (subscription, capture period) → tap period
         self._early: dict[tuple[str, int], AfeRecord] = {}          # records no tap period claimed yet
 
-    def mic(self, lease_id: str, start: int, n: int) -> None:
-        """The tap took `lease_id`'s capture samples `[start, start + n)` as tap
+    def mic(self, subscription_id: str, start: int, n: int) -> None:
+        """The tap took `subscription_id`'s capture samples `[start, start + n)` as tap
         samples `[samples, samples + n)`."""
         t = self.samples
         self.samples += n
         # The tap periods whose middle sample this block holds; they follow the last one taken.
         for j in range(-(-(t - _HALF_PERIOD) // AFE_PERIOD_SAMPLES),
                        -(-(t + n - _HALF_PERIOD) // AFE_PERIOD_SAMPLES)):
-            key = (lease_id, (start + j * AFE_PERIOD_SAMPLES + _HALF_PERIOD - t) // AFE_PERIOD_SAMPLES)
+            key = (subscription_id, (start + j * AFE_PERIOD_SAMPLES + _HALF_PERIOD - t) // AFE_PERIOD_SAMPLES)
             record = self._early.pop(key, None)
             if record is None:
                 self._waiting[key] = j
@@ -570,10 +570,10 @@ class AfeTrack:
                 break
             del self._waiting[key]
 
-    def afe(self, lease_id: str, records: Sequence[AfeRecord]) -> None:
-        """`lease_id`'s records, each new to it."""
+    def afe(self, subscription_id: str, records: Sequence[AfeRecord]) -> None:
+        """`subscription_id`'s records, each new to it."""
         for r in records:
-            key = (lease_id, r.start // AFE_PERIOD_SAMPLES)
+            key = (subscription_id, r.start // AFE_PERIOD_SAMPLES)
             j = self._waiting.pop(key, None)
             if j is None:
                 self._early[key] = r

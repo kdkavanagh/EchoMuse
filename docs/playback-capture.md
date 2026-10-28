@@ -44,13 +44,15 @@ What it shares with the other recording modes (sample collection, ambient
 recording):
 
 - **the audio source.** While any recording mode is armed, the device's
-  session actor holds one `diagnostic` uplink lease and every mode taps its
-  live mic timeline — the native AFE's 16 kHz output, the same samples the
-  on-device wake detector scores. The controller applies no gain, denoising
-  or resampling before the tap. All armed modes receive the same blocks.
+  session actor holds one `diagnostic` audio subscription and every mode taps
+  its live mic timeline — the native AFE's 16 kHz output, the same samples
+  the on-device wake detector scores. The controller applies no gain,
+  denoising or resampling before the tap. All armed modes receive the same
+  blocks.
 - **the assistant suspension.** The actor refuses wake candidates and button
-  turns while a diagnostic lease is wanted (refusal reason `diagnostic`, with
-  the error cue on the ring). Alerts still ring and physical stop still works.
+  turns while a diagnostic subscription is wanted (refusal reason
+  `diagnostic`, with the error cue on the ring). Alerts still ring and
+  physical stop still works.
 - **the ring.** A slow magenta pulse (`em_device`) for as long as any
   recording mode is armed: "this device is recording and will not answer
   you".

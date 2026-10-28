@@ -18,8 +18,8 @@ Three kinds (`RecordingKind`). The first two are kept only while
   * **The turn recording** (`turn_recordings/`) is the whole turn as the
     native AFE output it: canonical mic PCM, no gain, from where the turn's
     chart starts through the spoken answer and a second past the turn's end
-    (em_session's response lease). A turn that never committed, a refused
-    wake included, is recorded through its lease's close. Only turns with an
+    (em_session's response audio subscription). A turn that never committed, a refused
+    wake included, is recorded through its subscription's close. Only turns with an
     AFE chart (Fire OS 6, `afe_metadata_v1`) have one; the dashboard plays it
     against the chart.
   * **The near-miss recording** (`nearmiss_recordings/`) is a near miss's

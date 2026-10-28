@@ -283,8 +283,8 @@ func TestLatchedThresholdAcrossProfileChange(t *testing.T) {
 	if e.Reason != detector.ReasonBelow || e.SupportEnd != 23040 || e.PeakSmoothed != 0.9 || e.CandidateID != cands[0].CandidateID {
 		t.Fatalf("end %+v", e)
 	}
-	if cands[0].LeaseID == cands[0].CandidateID {
-		t.Fatal("lease ID reuses the candidate ID")
+	if cands[0].SubscriptionID == cands[0].CandidateID {
+		t.Fatal("subscription ID reuses the candidate ID")
 	}
 }
 

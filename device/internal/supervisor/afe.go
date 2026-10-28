@@ -117,15 +117,15 @@ func (s *Supervisor) afeValidating() bool {
 
 // renegotiateAFE ends the session when its hello lacked afe_metadata_v1 but
 // the decoder now validates frames, so that the next hello announces it.
-// It waits until the device is idle: no candidate, focus or uplink lease,
-// no network playback, no active alert, nothing audible in the final mix,
-// and no speech-asset activation or alert-sound fetch on the session. It
-// acts at most once per run. The tick goroutine calls it.
+// It waits until the device is idle: no candidate, focus lease or audio
+// subscription, no network playback, no active alert, nothing audible in the
+// final mix, and no speech-asset activation or alert-sound fetch on the
+// session. It acts at most once per run. The tick goroutine calls it.
 func (s *Supervisor) renegotiateAFE() {
 	if !s.cfg.AFEMetadata || s.afe.hello.Load() || s.afe.renegotiated.Load() || !s.afeValidating() {
 		return
 	}
-	if s.lastMask.Load() != 0 || s.activating.Load() != 0 || s.fetching.Load() || s.up.Leased() {
+	if s.lastMask.Load() != 0 || s.activating.Load() != 0 || s.fetching.Load() || s.up.Subscribed() {
 		return
 	}
 	s.mu.Lock()

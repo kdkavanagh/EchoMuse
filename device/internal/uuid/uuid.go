@@ -1,6 +1,6 @@
 // Package uuid is the RFC 4122 subset the device link needs: random v4 IDs
-// for messages, leases and operations, and v5 IDs that must equal Python's
-// uuid.uuid5 (SPEC §16.3).
+// for messages, audio subscriptions and operations, and v5 IDs that must
+// equal Python's uuid.uuid5 (SPEC §16.3).
 package uuid
 
 import (

@@ -110,7 +110,7 @@ func (h *harness) appendRef(n int, v int16) {
 
 func (h *harness) open(id string, gen uint32, streams map[proto.StreamID]string) error {
 	return h.e.Open(proto.Envelope{Generation: gen}, proto.UplinkOpen{
-		LeaseID: id, Owner: "turn-" + id, Reason: proto.LeaseTurn, Streams: streams, TTLMs: 3000})
+		SubscriptionID: id, Owner: "turn-" + id, Reason: proto.SubscriptionTurn, Streams: streams, TTLMs: 3000})
 }
 
 // frames decodes and drains everything the sink received.
@@ -198,7 +198,7 @@ func TestOpenRoundsStartsToGridsAndClipsToRing(t *testing.T) {
 		t.Fatalf("reference backfill [%d, %d)", refFirst, refEnd)
 	}
 
-	if _, err := h.e.Close(proto.Envelope{Generation: 1}, proto.UplinkClose{LeaseID: "L", Reason: proto.CloseCommitted}); err != nil {
+	if _, err := h.e.Close(proto.Envelope{Generation: 1}, proto.UplinkClose{SubscriptionID: "L", Reason: proto.CloseCommitted}); err != nil {
 		t.Fatal(err)
 	}
 	msgs := h.ended()
@@ -213,30 +213,30 @@ func TestOpenRoundsStartsToGridsAndClipsToRing(t *testing.T) {
 	}
 }
 
-// A near_miss lease is served from the ring like a turn lease, and is not
-// a diagnostic lease. uplink.open refuses any other reason.
-func TestNearMissLeaseBackfillsMic(t *testing.T) {
+// A near_miss subscription is served from the ring like a turn subscription,
+// and is not a diagnostic subscription. uplink.open refuses any other reason.
+func TestNearMissSubscriptionBackfillsMic(t *testing.T) {
 	h := newHarness(t)
 	h.appendMic(40) // 51,200 samples
 	must(t, h.e.Open(proto.Envelope{Generation: 1}, proto.UplinkOpen{
-		LeaseID: "N", Owner: "nm-1", Reason: proto.LeaseNearMiss, Streams: map[proto.StreamID]string{"mic": "20480"}, TTLMs: 3000}))
+		SubscriptionID: "N", Owner: "nm-1", Reason: proto.SubscriptionNearMiss, Streams: map[proto.StreamID]string{"mic": "20480"}, TTLMs: 3000}))
 	if h.e.DiagnosticLive() {
-		t.Fatal("near_miss lease counted as diagnostic")
+		t.Fatal("near_miss subscription counted as diagnostic")
 	}
 	h.e.step()
 	if first, end := span(t, byKind(h.frames(), ema.KindMic), ema.MaxUplinkPCMFrames); first != 20480 || end != 51200 {
 		t.Fatalf("mic backfill [%d, %d)", first, end)
 	}
-	if _, err := h.e.Close(proto.Envelope{Generation: 1}, proto.UplinkClose{LeaseID: "N", Reason: proto.CloseClosed}); err != nil {
+	if _, err := h.e.Close(proto.Envelope{Generation: 1}, proto.UplinkClose{SubscriptionID: "N", Reason: proto.CloseClosed}); err != nil {
 		t.Fatal(err)
 	}
 	if msgs := h.ended(); len(msgs) != 1 || msgs[0].body.Reason != proto.EndedClosed || msgs[0].body.LastSample["mic"] != u64(51199) {
 		t.Fatalf("ended %+v", msgs)
 	}
 
-	for _, reason := range []proto.LeaseReason{proto.LeaseCandidate, "unknown"} {
+	for _, reason := range []proto.SubscriptionReason{proto.SubscriptionCandidate, "unknown"} {
 		err := h.e.Open(proto.Envelope{Generation: 1}, proto.UplinkOpen{
-			LeaseID: "X", Owner: "x", Reason: reason, Streams: map[proto.StreamID]string{"mic": "live"}, TTLMs: 3000})
+			SubscriptionID: "X", Owner: "x", Reason: reason, Streams: map[proto.StreamID]string{"mic": "live"}, TTLMs: 3000})
 		if !errors.Is(err, ErrInvalid) {
 			t.Fatalf("reason %q: %v", reason, err)
 		}
@@ -254,7 +254,7 @@ func TestReferenceStartOutsideClockFitIsClipped(t *testing.T) {
 	if got := byKind(h.frames(), ema.KindReference); len(got) == 0 || got[0].FirstSample != 0 {
 		t.Fatalf("reference packets %+v", got)
 	}
-	h.e.Close(proto.Envelope{Generation: 1}, proto.UplinkClose{LeaseID: "L"})
+	h.e.Close(proto.Envelope{Generation: 1}, proto.UplinkClose{SubscriptionID: "L"})
 	if b := h.ended()[0].body; b.ClippedStart["reference"] != u64(0) {
 		t.Fatalf("clipped_start %+v", b.ClippedStart)
 	}
@@ -405,10 +405,10 @@ func TestCandidateWithoutAckEndsWithTTL(t *testing.T) {
 		msgs[0].body.LastSample["mic"].Valid || len(h.frames()) != 0 {
 		t.Fatalf("ended %+v", msgs)
 	}
-	h.e.AcceptCandidate("C", true) // too late: no lease
+	h.e.AcceptCandidate("C", true) // too late: no subscription
 	h.e.step()
 	if len(h.frames()) != 0 {
-		t.Fatal("audio for an expired candidate lease")
+		t.Fatal("audio for an expired candidate subscription")
 	}
 
 	h.e.OpenCandidate("D", 10000)
@@ -418,21 +418,21 @@ func TestCandidateWithoutAckEndsWithTTL(t *testing.T) {
 	}
 }
 
-func TestCandidateConvertsToTurnLease(t *testing.T) {
+func TestCandidateConvertsToTurnSubscription(t *testing.T) {
 	h := newHarness(t)
 	h.appendMic(10)
 	h.e.OpenCandidate("C", 10000)
-	renew := func(gen uint32, reason proto.LeaseReason, owner string) (bool, error) {
-		return h.e.Renew(proto.Envelope{Generation: gen}, proto.UplinkRenew{LeaseID: "C", TTLMs: 3000, Reason: reason, Owner: owner})
+	renew := func(gen uint32, reason proto.SubscriptionReason, owner string) (bool, error) {
+		return h.e.Renew(proto.Envelope{Generation: gen}, proto.UplinkRenew{SubscriptionID: "C", TTLMs: 3000, Reason: reason, Owner: owner})
 	}
-	if _, err := renew(2, proto.LeaseTurn, "T"); !errors.Is(err, ErrInvalid) {
+	if _, err := renew(2, proto.SubscriptionTurn, "T"); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("converting an unacknowledged candidate: %v", err)
 	}
 	h.e.AcceptCandidate("C", true)
-	if _, err := renew(1, proto.LeaseTurn, "T"); !errors.Is(err, ErrInvalid) {
+	if _, err := renew(1, proto.SubscriptionTurn, "T"); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("conversion without generation + 1: %v", err)
 	}
-	if converted, err := renew(2, proto.LeaseTurn, "T"); err != nil || !converted {
+	if converted, err := renew(2, proto.SubscriptionTurn, "T"); err != nil || !converted {
 		t.Fatalf("conversion: %v %v", converted, err)
 	}
 	if _, err := renew(1, "", ""); !errors.Is(err, ErrStaleGeneration) {
@@ -441,11 +441,11 @@ func TestCandidateConvertsToTurnLease(t *testing.T) {
 	if converted, err := renew(2, "", ""); err != nil || converted {
 		t.Fatalf("renew: %v %v", converted, err)
 	}
-	if _, err := h.e.Close(proto.Envelope{Generation: 1}, proto.UplinkClose{LeaseID: "C"}); !errors.Is(err, ErrStaleGeneration) {
+	if _, err := h.e.Close(proto.Envelope{Generation: 1}, proto.UplinkClose{SubscriptionID: "C"}); !errors.Is(err, ErrStaleGeneration) {
 		t.Fatalf("stale close: %v", err)
 	}
 	h.e.step()
-	candidate, err := h.e.Close(proto.Envelope{Generation: 2}, proto.UplinkClose{LeaseID: "C", Reason: proto.CloseCommitted})
+	candidate, err := h.e.Close(proto.Envelope{Generation: 2}, proto.UplinkClose{SubscriptionID: "C", Reason: proto.CloseCommitted})
 	if err != nil || candidate {
 		t.Fatalf("close: %v %v", candidate, err)
 	}
@@ -453,28 +453,28 @@ func TestCandidateConvertsToTurnLease(t *testing.T) {
 	if len(msgs) != 1 || msgs[0].gen != 2 || msgs[0].body.LastSample["mic"] != u64(12799) {
 		t.Fatalf("ended %+v", msgs)
 	}
-	if _, err := renew(2, "", ""); !errors.Is(err, ErrUnknownLease) {
+	if _, err := renew(2, "", ""); !errors.Is(err, ErrUnknownSubscription) {
 		t.Fatalf("renew after close: %v", err)
 	}
 
 	h.e.OpenCandidate("E", 10000)
-	if candidate, err := h.e.Close(proto.Envelope{Generation: 1}, proto.UplinkClose{LeaseID: "E", Reason: proto.CloseRejected}); err != nil || !candidate {
-		t.Fatalf("closing a candidate lease: %v %v", candidate, err)
+	if candidate, err := h.e.Close(proto.Envelope{Generation: 1}, proto.UplinkClose{SubscriptionID: "E", Reason: proto.CloseRejected}); err != nil || !candidate {
+		t.Fatalf("closing a candidate subscription: %v %v", candidate, err)
 	}
 }
 
-func TestLeaseExpiresUnlessRenewed(t *testing.T) {
+func TestSubscriptionExpiresUnlessRenewed(t *testing.T) {
 	h := newHarness(t)
 	h.appendMic(1)
 	must(t, h.open("L", 1, map[proto.StreamID]string{"mic": "live"}))
 	h.now += int64(2500 * time.Millisecond)
-	if _, err := h.e.Renew(proto.Envelope{Generation: 1}, proto.UplinkRenew{LeaseID: "L", TTLMs: 3000}); err != nil {
+	if _, err := h.e.Renew(proto.Envelope{Generation: 1}, proto.UplinkRenew{SubscriptionID: "L", TTLMs: 3000}); err != nil {
 		t.Fatal(err)
 	}
 	h.now += int64(2999 * time.Millisecond)
 	h.e.step()
 	if msgs := h.ended(); len(msgs) != 0 {
-		t.Fatalf("renewed lease ended: %+v", msgs)
+		t.Fatalf("renewed subscription ended: %+v", msgs)
 	}
 	h.now += int64(time.Millisecond)
 	h.e.step()
@@ -483,7 +483,7 @@ func TestLeaseExpiresUnlessRenewed(t *testing.T) {
 	}
 }
 
-func TestLiveAudioQueuedOverOneSecondEndsLeasesWantingIt(t *testing.T) {
+func TestLiveAudioQueuedOverOneSecondEndsSubscriptionsWantingIt(t *testing.T) {
 	h := newHarness(t)
 	h.appendMic(1)
 	must(t, h.open("M", 1, map[proto.StreamID]string{"mic": "live"}))
@@ -504,15 +504,15 @@ func TestLiveAudioQueuedOverOneSecondEndsLeasesWantingIt(t *testing.T) {
 	h.now++
 	h.e.step()
 	msgs := h.ended()
-	if len(msgs) != 1 || msgs[0].body.LeaseID != "M" || msgs[0].body.Reason != proto.EndedOverrun {
+	if len(msgs) != 1 || msgs[0].body.SubscriptionID != "M" || msgs[0].body.Reason != proto.EndedOverrun {
 		t.Fatalf("ended %+v", msgs)
 	}
-	if _, err := h.e.Renew(proto.Envelope{Generation: 1}, proto.UplinkRenew{LeaseID: "R", TTLMs: 3000}); err != nil {
-		t.Fatalf("reference lease: %v", err)
+	if _, err := h.e.Renew(proto.Envelope{Generation: 1}, proto.UplinkRenew{SubscriptionID: "R", TTLMs: 3000}); err != nil {
+		t.Fatalf("reference subscription: %v", err)
 	}
 }
 
-func TestMuteEndsLeasesAndBlocksOpenUntilNewEpoch(t *testing.T) {
+func TestMuteEndsSubscriptionsAndBlocksOpenUntilNewEpoch(t *testing.T) {
 	h := newHarness(t)
 	h.appendMic(1)
 	must(t, h.open("L", 1, map[proto.StreamID]string{"mic": "live", "cells": "live"}))
@@ -548,20 +548,21 @@ func TestEpochChanges(t *testing.T) {
 	h.e.step()
 	h.frames()
 
-	// A new render epoch restarts the reference stream; the lease goes on.
+	// A new render epoch restarts the reference stream; the subscription
+	// goes on.
 	h.ref.Reset(0)
 	h.e.SetEpochs(micEpoch, 0x4444)
 	h.appendRef(block, 5)
 	h.e.step()
 	if msgs := h.ended(); len(msgs) != 0 {
-		t.Fatalf("reference epoch ended leases: %+v", msgs)
+		t.Fatalf("reference epoch ended subscriptions: %+v", msgs)
 	}
 	fs := byKind(h.frames(), ema.KindReference)
 	if len(fs) != 1 || fs[0].Epoch != 0x4444 || fs[0].Sequence != 0 || fs[0].FirstSample != 0 {
 		t.Fatalf("reference after its epoch change %+v", fs)
 	}
 
-	// A new capture epoch ends every lease.
+	// A new capture epoch ends every subscription.
 	h.mic.Reset(0)
 	h.cells.Reset(0)
 	h.e.SetEpochs(0x5555, 0x4444)
@@ -571,7 +572,7 @@ func TestEpochChanges(t *testing.T) {
 	}
 }
 
-func TestSessionLossDiscardsLeasesAndAudio(t *testing.T) {
+func TestSessionLossDiscardsSubscriptionsAndAudio(t *testing.T) {
 	h := newHarness(t)
 	h.appendMic(3)
 	must(t, h.open("L", 1, map[proto.StreamID]string{"mic": "0"}))
@@ -583,8 +584,8 @@ func TestSessionLossDiscardsLeasesAndAudio(t *testing.T) {
 	if len(sink.frames) != 0 || len(h.ended()) != 0 {
 		t.Fatalf("after session loss: %d packets, messages %+v", len(sink.frames), h.sent)
 	}
-	if _, err := h.e.Renew(proto.Envelope{Generation: 1}, proto.UplinkRenew{LeaseID: "L"}); !errors.Is(err, ErrUnknownLease) {
-		t.Fatalf("lease survived session loss: %v", err)
+	if _, err := h.e.Renew(proto.Envelope{Generation: 1}, proto.UplinkRenew{SubscriptionID: "L"}); !errors.Is(err, ErrUnknownSubscription) {
+		t.Fatalf("subscription survived session loss: %v", err)
 	}
 }
 
@@ -632,10 +633,10 @@ func afeRecords(t *testing.T, frames [][]byte) (first uint64, recs []ema.AFEReco
 	return first, recs
 }
 
-// In an afe_metadata_v1 session a candidate lease wants the afe stream from
-// its reference start on the 1,280-sample grid; backfill order is mic,
+// In an afe_metadata_v1 session a candidate subscription wants the afe stream
+// from its reference start on the 1,280-sample grid; backfill order is mic,
 // cells, afe, reference, and live records follow one per packet.
-func TestCandidateLeaseCarriesAFEFromTheReferenceStart(t *testing.T) {
+func TestCandidateSubscriptionCarriesAFEFromTheReferenceStart(t *testing.T) {
 	h := newHarnessAFE(t, true)
 	h.appendMic(40) // 51,200 samples
 	h.appendRef(51200, 7)
@@ -663,7 +664,7 @@ func TestCandidateLeaseCarriesAFEFromTheReferenceStart(t *testing.T) {
 	if first, recs := afeRecords(t, h.sink.frames); first != 51200 || len(recs) != 1 || recs[0].Volume != 40 {
 		t.Fatalf("live afe from %d: %+v", first, recs)
 	}
-	if _, err := h.e.Close(proto.Envelope{Generation: 1}, proto.UplinkClose{LeaseID: "C", Reason: proto.CloseRejected}); err != nil {
+	if _, err := h.e.Close(proto.Envelope{Generation: 1}, proto.UplinkClose{SubscriptionID: "C", Reason: proto.CloseRejected}); err != nil {
 		t.Fatal(err)
 	}
 	b := h.ended()[0].body
@@ -672,8 +673,9 @@ func TestCandidateLeaseCarriesAFEFromTheReferenceStart(t *testing.T) {
 	}
 }
 
-// Without the opt-in nothing of the afe stream exists: candidate leases do
-// not want it, uplink.ended does not name it, and uplink.open may not.
+// Without the opt-in nothing of the afe stream exists: candidate
+// subscriptions do not want it, uplink.ended does not name it, and
+// uplink.open may not.
 func TestAFEStreamNeedsTheSessionOptIn(t *testing.T) {
 	h := newHarness(t)
 	h.appendMic(40)
@@ -684,7 +686,7 @@ func TestAFEStreamNeedsTheSessionOptIn(t *testing.T) {
 	if len(byKind(h.frames(), ema.KindAFE)) != 0 {
 		t.Fatal("afe packets without the opt-in")
 	}
-	if _, err := h.e.Close(proto.Envelope{Generation: 1}, proto.UplinkClose{LeaseID: "C", Reason: proto.CloseRejected}); err != nil {
+	if _, err := h.e.Close(proto.Envelope{Generation: 1}, proto.UplinkClose{SubscriptionID: "C", Reason: proto.CloseRejected}); err != nil {
 		t.Fatal(err)
 	}
 	if b := h.ended()[0].body; len(b.LastSample) != 3 {
@@ -715,7 +717,7 @@ func TestOpenAFERoundsClipsAndSkipsGaps(t *testing.T) {
 	if len(fs) != 1 || fs[0].FirstSample != 143360 || fs[0].Flags&ema.FlagDiscontinuity == 0 {
 		t.Fatalf("afe after a gap %+v", fs)
 	}
-	if _, err := h.e.Close(proto.Envelope{Generation: 1}, proto.UplinkClose{LeaseID: "L", Reason: proto.CloseCommitted}); err != nil {
+	if _, err := h.e.Close(proto.Envelope{Generation: 1}, proto.UplinkClose{SubscriptionID: "L", Reason: proto.CloseCommitted}); err != nil {
 		t.Fatal(err)
 	}
 	if b := h.ended()[0].body; b.ClippedStart["afe"] != u64(12800) || b.LastSample["afe"] != u64(144639) {

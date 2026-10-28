@@ -9,7 +9,7 @@ Assistant. Neither is the wake word itself as the device's BCResNet heard it.
 
 This module stores that clip. When a turn started by an accepted
 `wake.candidate` ends, `em_session` reads the candidate's support span from
-the lease's mic timeline — support start −300 ms through `support_end` — and,
+the audio subscription's mic timeline — support start −300 ms through `support_end` — and,
 if `saveWakeClips` is set for the device, writes it here once the turn's
 rowid exists. A candidate refused while the device was producing sound
 (`unverified_wake`, `verifier_timeout`, `self_output`, `echo_only`) keeps one

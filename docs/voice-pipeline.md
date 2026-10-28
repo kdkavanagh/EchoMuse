@@ -176,12 +176,12 @@ audio says it, the two can be indistinguishable, and the wake may be missed.
 
 ## Stage 5 — Opening the window
 
-Accepting a wake opens an **uplink lease**: permission for the Dot to send
+Accepting a wake opens an **audio subscription**: permission for the Dot to send
 audio for this turn. It starts with a backfill from the Dot's memory,
 beginning 300 ms before the wake word, followed by live microphone audio. It
 also carries the loudness readings and, when the Dot is making sound, what it
-played. The controller renews the lease every second; if the controller
-disappears, the lease expires on its own within 3 seconds.
+played. The controller renews the subscription every second; if the controller
+disappears, the subscription expires on its own within 3 seconds.
 
 If **Wake chime** is on (off by default), the Dot plays a short earcon. On
 current firmware it does not wait for this stage: it chimes the moment it
@@ -194,7 +194,7 @@ your controller.
 ## Stage 6 — Listening: speech evidence on the controller
 
 The controller's speech worker (`em_speech_worker`, using sherpa-onnx) runs
-two models on the uploaded audio, only while a lease is open:
+two models on the uploaded audio, only while a subscription is open:
 
 - **Silero VAD**, a speech detector: "is this 32 ms slice speech?"
 - **Kroko**, a streaming speech recogniser that transcribes as you speak. It
@@ -560,7 +560,7 @@ checks against its own playback (Stage 4) are weaker while it plays.
 
 The mute button is enforced on the Dot. It mutes the microphone hardware,
 lights the mute button, turns the ring red, and survives a reboot. On mute the Dot stops
-wake detection, ends every uplink lease, and erases its microphone memory; a
+wake detection, ends every subscription, and erases its microphone memory; a
 turn in progress ends. Alarms and timers still ring and the button still
 stops them. Unmuting starts fresh.
 
@@ -586,7 +586,7 @@ conversation agent, the alarm engine or a local command) and what was said
 back. Both recordings play from the Activity tab. Local commands such as "stop"
 never reach speech-to-text, so they have no utterance recording. The Dot's
 own buffers are RAM only. Dashboard recording modes (the Samples tab,
-Ambient recording) hold their own lease and show while they run; no wake is
+Ambient recording) hold their own subscription and show while they run; no wake is
 accepted while one runs.
 
 Your committed speech goes to the STT engine configured in Home Assistant,

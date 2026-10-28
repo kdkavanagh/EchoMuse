@@ -1260,6 +1260,11 @@ pause, Home Assistant answered "Okay.", and the Kitchen rang on (turns 934 and
   ringing, the words go to Home Assistant as before. The turn's decision trace
   names the other Echo in `context_device`.
 
+### The decision trace names the subscription
+
+A candidate's and a turn's decision trace now give the audio subscription in
+`subscription_id`, which replaces `lease_id`. The device link keeps `lease_id`.
+
 ### Earlier in this release
 
 - ASR gain: the STT copy sent to Home Assistant is amplified by

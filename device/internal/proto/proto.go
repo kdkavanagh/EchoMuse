@@ -46,14 +46,14 @@ type Capability string
 
 // Capabilities (SPEC §11.1) plus the retained hardware capabilities.
 const (
-	CapAudioTimeline   Capability = "audio_timeline_v1"
-	CapUplinkLeases    Capability = "uplink_leases_v1"
-	CapDeviceWake      Capability = "device_wake_v1"
-	CapRenderReference Capability = "render_reference_v1"
-	CapRenderProgress  Capability = "render_progress_v1"
-	CapFocusLeases     Capability = "focus_leases_v1"
-	CapAlertCache      Capability = "alert_cache_v1"
-	CapTurnProtocol    Capability = "turn_protocol_v1"
+	CapAudioTimeline       Capability = "audio_timeline_v1"
+	CapUplinkSubscriptions Capability = "uplink_leases_v1"
+	CapDeviceWake          Capability = "device_wake_v1"
+	CapRenderReference     Capability = "render_reference_v1"
+	CapRenderProgress      Capability = "render_progress_v1"
+	CapFocusLeases         Capability = "focus_leases_v1"
+	CapAlertCache          Capability = "alert_cache_v1"
+	CapTurnProtocol        Capability = "turn_protocol_v1"
 
 	CapLEDs         Capability = "leds"
 	CapLEDAnim      Capability = "led_anim"
@@ -80,11 +80,11 @@ const (
 	// CapAFEMetadata: the capture carries the native AFE's per-frame
 	// metadata (Fire OS 6 micAsr, v3.3) and its decoder is validating
 	// frames. On session.ready's afe_metadata the device announces the afe
-	// stream, serves it under leases and reports wake.stats.afe.
+	// stream, serves it under audio subscriptions and reports wake.stats.afe.
 	CapAFEMetadata Capability = "afe_metadata_v1"
 	// CapNearMiss: the device reports every near-miss episode (the smoothed
 	// score reached session.ready's near_miss floor and no candidate opened)
-	// in wake.near_miss and serves uplink leases with reason near_miss.
+	// in wake.near_miss and serves uplink subscriptions with reason near_miss.
 	CapNearMiss Capability = "near_miss_v1"
 
 	// Optional platform capabilities. A device announces each only where
@@ -414,7 +414,7 @@ type ProtocolError struct {
 
 // ── Streams and render (WIRE §4.2) ──────────────────────────────────────────
 
-// StreamID names an uplink stream; also the uplink lease stream keys.
+// StreamID names an uplink stream; also the uplink subscription stream keys.
 type StreamID string
 
 // Uplink stream IDs.
@@ -543,24 +543,27 @@ type AFEStats struct {
 	LostFrames uint64 `json:"lost_frames"`
 }
 
-// ── Uplink leases (WIRE §4.5) ───────────────────────────────────────────────
+// ── Uplink subscriptions (WIRE §4.5) ────────────────────────────────────────
+//
+// The wire calls a subscription a lease, so the JSON key stays lease_id for
+// compatibility with every firmware and controller version.
 
 // StartLive is the uplink stream start meaning "from now".
 const StartLive = "live"
 
-// LeaseReason is an uplink lease's purpose.
-type LeaseReason string
+// SubscriptionReason is an uplink subscription's purpose.
+type SubscriptionReason string
 
-// Uplink lease reasons.
+// Uplink subscription reasons.
 const (
-	LeaseCandidate  LeaseReason = "candidate"
-	LeaseTurn       LeaseReason = "turn"
-	LeaseReply      LeaseReason = "reply"
-	LeaseDiagnostic LeaseReason = "diagnostic"
-	// LeaseNearMiss uploads a near-miss episode's microphone audio
+	SubscriptionCandidate  SubscriptionReason = "candidate"
+	SubscriptionTurn       SubscriptionReason = "turn"
+	SubscriptionReply      SubscriptionReason = "reply"
+	SubscriptionDiagnostic SubscriptionReason = "diagnostic"
+	// SubscriptionNearMiss uploads a near-miss episode's microphone audio
 	// (near_miss_v1). It has no other effect: no duck, no focus, and it is
-	// not a diagnostic lease.
-	LeaseNearMiss LeaseReason = "near_miss"
+	// not a diagnostic subscription.
+	SubscriptionNearMiss SubscriptionReason = "near_miss"
 )
 
 // CloseReason is an uplink.close reason.
@@ -590,32 +593,32 @@ const (
 // UplinkOpen.Streams maps a stream key to a decimal capture-epoch sample
 // index or "live"; an absent key is not wanted.
 type UplinkOpen struct {
-	LeaseID string              `json:"lease_id"`
-	Owner   string              `json:"owner"`
-	Reason  LeaseReason         `json:"reason"`
-	Streams map[StreamID]string `json:"streams"`
-	TTLMs   int64               `json:"ttl_ms"`
+	SubscriptionID string              `json:"lease_id"`
+	Owner          string              `json:"owner"`
+	Reason         SubscriptionReason  `json:"reason"`
+	Streams        map[StreamID]string `json:"streams"`
+	TTLMs          int64               `json:"ttl_ms"`
 }
 
-// UplinkRenew converts a candidate lease when Reason == "turn" and the
-// envelope generation is the lease's + 1.
+// UplinkRenew converts a candidate subscription when Reason == "turn" and
+// the envelope generation is the subscription's + 1.
 type UplinkRenew struct {
-	LeaseID string      `json:"lease_id"`
-	TTLMs   int64       `json:"ttl_ms"`
-	Reason  LeaseReason `json:"reason,omitempty"`
-	Owner   string      `json:"owner,omitempty"`
+	SubscriptionID string             `json:"lease_id"`
+	TTLMs          int64              `json:"ttl_ms"`
+	Reason         SubscriptionReason `json:"reason,omitempty"`
+	Owner          string             `json:"owner,omitempty"`
 }
 
 type UplinkClose struct {
-	LeaseID string      `json:"lease_id"`
-	Reason  CloseReason `json:"reason"`
+	SubscriptionID string      `json:"lease_id"`
+	Reason         CloseReason `json:"reason"`
 }
 
 type UplinkEnded struct {
-	LeaseID      string               `json:"lease_id"`
-	Reason       EndedReason          `json:"reason"`
-	LastSample   map[StreamID]NullU64 `json:"last_sample"`
-	ClippedStart map[StreamID]NullU64 `json:"clipped_start"`
+	SubscriptionID string               `json:"lease_id"`
+	Reason         EndedReason          `json:"reason"`
+	LastSample     map[StreamID]NullU64 `json:"last_sample"`
+	ClippedStart   map[StreamID]NullU64 `json:"clipped_start"`
 }
 
 // ── Physical events (WIRE §4.6) ─────────────────────────────────────────────

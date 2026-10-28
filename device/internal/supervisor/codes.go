@@ -67,7 +67,7 @@ func focusCode(err error) proto.AckCode {
 
 func uplinkCode(err error) proto.AckCode {
 	switch {
-	case errors.Is(err, uplink.ErrUnknownLease):
+	case errors.Is(err, uplink.ErrUnknownSubscription):
 		return codeUnknownLease
 	case errors.Is(err, uplink.ErrStaleGeneration):
 		return codeStaleGeneration

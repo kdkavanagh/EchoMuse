@@ -34,7 +34,7 @@ def classify(attributor, specs, *, background=-60.0, start=0):
 def test_background_is_prior_10_seconds_and_needs_one_second_support():
     tracker = BackgroundTracker()
     for i in range(32):
-        cell = Cell(i * CELL, -60.0, None)  # pre-lease: no VAD, so valid cells count
+        cell = Cell(i * CELL, -60.0, None)  # before the subscription: no VAD, so valid cells count
         assert tracker.value(cell.start) is None
         tracker.observe(cell)
     cell = Cell(32 * CELL, -30.0, 0.9)
@@ -201,7 +201,7 @@ def test_echo_tracker_reports_no_reference_and_unknown_without_lag():
     cells = 6
     mic = np.zeros(cells * CELL, dtype=np.int16)
     reference = np.zeros(MAX_LAG + cells * CELL, dtype=np.int16)
-    tracker = EchoTracker(open_sample=0, lease_mic_start=0)
+    tracker = EchoTracker(open_sample=0, subscription_mic_start=0)
     got = tracker.label(
         mic,
         reference,
@@ -222,8 +222,8 @@ def test_echo_tracker_reports_no_reference_and_unknown_without_lag():
     ) == EchoResult.UNKNOWN
 
 
-def test_echo_tracker_lag_window_uses_preceding_second_or_first_lease_second():
-    preceding = EchoTracker(open_sample=32_000, lease_mic_start=0)
+def test_echo_tracker_lag_window_uses_preceding_second_or_first_subscription_second():
+    preceding = EchoTracker(open_sample=32_000, subscription_mic_start=0)
     start, end = preceding.estimate_window(32_000)
     assert end <= 32_000
     assert end - start >= 16_000
@@ -231,7 +231,7 @@ def test_echo_tracker_lag_window_uses_preceding_second_or_first_lease_second():
     assert preceding.lag == 123
     assert preceding.estimate_window(end + 15_999) is None
 
-    no_history = EchoTracker(open_sample=32_000, lease_mic_start=32_000)
+    no_history = EchoTracker(open_sample=32_000, subscription_mic_start=32_000)
     assert no_history.estimate_window(48_383) is None
     start, end = no_history.estimate_window(48_384)
     assert start == 32_000 and end == 48_384

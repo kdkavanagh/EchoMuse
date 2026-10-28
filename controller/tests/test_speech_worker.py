@@ -81,7 +81,7 @@ def test_vad_reads_its_own_input_and_asr_the_evidence_copy():
         w._executor = sw.ThreadPoolExecutor(max_workers=1)
         w.models = probe
         w._wake["g"] = object()
-        w.open_lease("dev", 7, "L", "g")
+        w.open_subscription("dev", 7, "L", "g")
         w.open_utterance("L", "U", 0, 0, SampleTimeline())
         w.submit_mic_block("L", 0, pcm[:1_280])
         w.submit_mic_block("L", 1_280, pcm[1_280:])
@@ -121,7 +121,7 @@ class _StateVad:
         return p
 
 
-def test_a_primed_lease_restores_the_voice_from_the_first_cell_at_its_sample():
+def test_a_primed_subscription_restores_the_voice_from_the_first_cell_at_its_sample():
     """§16.6 reply window: cells before the prime keep the carried state, the first cell at
     or after its sample runs from the snapshot (state and context), a later prime without a
     snapshot starts a fresh state."""
@@ -131,8 +131,8 @@ def test_a_primed_lease_restores_the_voice_from_the_first_cell_at_its_sample():
         w = sw.SpeechWorker(None, on_observation=got.append)
         w._executor = sw.ThreadPoolExecutor(max_workers=1)
         w.models = _StateVad()
-        w._wake["g"] = object()                             # the lease's wake graph: unused here
-        w.open_lease("dev", 7, "L", "g")
+        w._wake["g"] = object()                             # the subscription's wake graph: unused here
+        w.open_subscription("dev", 7, "L", "g")
         silence = np.zeros(1_280, dtype=np.int16)
         w.submit_mic_block("L", 0, silence)                 # cells 0, 512 (256 samples pending)
         voice = sw.VoiceSnapshot(np.full((2, 1, 128), 100, dtype=np.float32),
@@ -209,10 +209,10 @@ def test_one_stall_is_one_error_however_much_backlog_it_leaves_in_every_serial_w
     async def main():
         w = _fake_worker(clock, got, on_availability=changes.append, probe_interval_s=3600)
         try:
-            for device, lease in (("office", "L1"), ("kitchen", "L2")):
-                w.open_lease(device, 7, lease, "g")
+            for device, subscription in (("office", "L1"), ("kitchen", "L2")):
+                w.open_subscription(device, 7, subscription, "g")
                 for i in range(4):
-                    w.submit_echo(lease, i * 512, (i + 1) * 512, stall)
+                    w.submit_echo(subscription, i * 512, (i + 1) * 512, stall)
             await _until(lambda: len(_errors(got)) == 8)
             stalled = w.available
             w.submit_echo("L1", 2_048, 2_560, boom)
@@ -246,7 +246,7 @@ def test_sustained_overload_still_makes_the_worker_unavailable():
     async def main():
         w = _fake_worker(clock, got, on_availability=changes.append, probe_interval_s=3600)
         try:
-            w.open_lease("office", 7, "L", "g")
+            w.open_subscription("office", 7, "L", "g")
             available = []
             for n in range(3):
                 clock.t += 0.08                  # the next block arrives after the last failure
@@ -282,7 +282,7 @@ def test_a_verification_decoded_past_its_deadline_is_a_timeout_that_keeps_its_te
         w = _fake_worker(clock, got, probe_interval_s=3600)
         w.models = _SlowDecoder(clock)
         try:
-            w.open_lease("dev", 7, "L", "g")
+            w.open_subscription("dev", 7, "L", "g")
             mic = SampleTimeline()
             mic.write(0, np.zeros(40_000, np.int16))
             w.submit_verification("L", "C", mic, 10_000, 20_000, "ophel")
@@ -299,7 +299,7 @@ def test_a_verification_decoded_past_its_deadline_is_a_timeout_that_keeps_its_te
 
 def test_independent_errors_make_the_worker_unavailable_and_the_transitions_are_logged(caplog):
     """Exceptions always count, and the worker itself logs each error (with its device) and both
-    availability transitions, so they are visible after the turn that owned the lease is gone."""
+    availability transitions, so they are visible after the turn that owned the subscription is gone."""
     caplog.set_level(logging.INFO, logger="echomuse.speech")
     clock, got, changes = _Clock(), [], []
 
@@ -309,11 +309,11 @@ def test_independent_errors_make_the_worker_unavailable_and_the_transitions_are_
     async def main():
         w = _fake_worker(clock, got, on_availability=changes.append, probe_interval_s=0.01)
         try:
-            w.open_lease("office", 7, "L1", "g")
-            w.open_lease("kitchen", 7, "L2", "g")
-            for i, lease in enumerate(("L1", "L2", "L1")):
+            w.open_subscription("office", 7, "L1", "g")
+            w.open_subscription("kitchen", 7, "L2", "g")
+            for i, subscription in enumerate(("L1", "L2", "L1")):
                 clock.t += 20.0                  # three errors, all within 60 s
-                w.submit_echo(lease, i * 512, (i + 1) * 512, boom)
+                w.submit_echo(subscription, i * 512, (i + 1) * 512, boom)
                 await _until(lambda: len(_errors(got)) == i + 1)
             await _until(lambda: changes == [False, True])
             return w.available
@@ -342,7 +342,7 @@ def test_errors_further_apart_than_the_window_never_add_up():
     async def main():
         w = _fake_worker(clock, got, on_availability=changes.append, probe_interval_s=3600)
         try:
-            w.open_lease("office", 7, "L", "g")
+            w.open_subscription("office", 7, "L", "g")
             for i in range(4):
                 clock.t += 31.0                  # only two ever fall within 60 s
                 w.submit_echo("L", i * 512, (i + 1) * 512, boom)
@@ -435,7 +435,7 @@ def test_real_vad_and_streaming_asr_over_an_utterance(bundle_dir, registry, spee
             silence = np.zeros(16_000, np.int16)
             audio = np.concatenate([silence, speech, silence, silence])
             audio = audio[: audio.size // 1280 * 1280]
-            w.open_lease("dev", 7, "L", registry.active().graph_sha256)
+            w.open_subscription("dev", 7, "L", registry.active().graph_sha256)
             w.open_utterance("L", "U", 0, 0, SampleTimeline())
             for k in range(0, audio.size, 1280):
                 w.submit_mic_block("L", k, audio[k:k + 1280])
@@ -478,7 +478,7 @@ def test_finalize_at_each_pause_carries_the_last_word_before_the_live_chunk(bund
             silence = np.zeros(16_000, np.int16)
             audio = np.concatenate([silence, speech, silence, speech, silence, silence, silence])
             audio = audio[: audio.size // 1280 * 1280]
-            w.open_lease("dev", 7, "L", registry.active().graph_sha256)
+            w.open_subscription("dev", 7, "L", registry.active().graph_sha256)
             w.open_utterance("L", "U", 0, 0, SampleTimeline())
             for k in range(0, audio.size, 1280):
                 w.submit_mic_block("L", k, audio[k:k + 1280])
@@ -538,7 +538,7 @@ def two_pauses(registry, bundle_dir, speech, server):
             silence = np.zeros(16_000, np.int16)
             audio = np.concatenate([silence, speech, silence, speech, silence, silence, silence])
             audio = audio[: audio.size // 1280 * 1280]
-            w.open_lease("dev", 7, "L", registry.active().graph_sha256)
+            w.open_subscription("dev", 7, "L", registry.active().graph_sha256)
             w.open_utterance("L", "U", 0, 0, SampleTimeline(), pause_server=server)
             for k in range(0, audio.size, 1280):
                 w.submit_mic_block("L", k, audio[k:k + 1280])
@@ -604,7 +604,7 @@ def test_the_flush_reaches_speech_just_past_a_chunk_edge(bundle_dir, registry, s
             tokens, _ = await w.decode_span(window)
             mic = SampleTimeline()
             mic.write(0, np.concatenate([np.zeros(16_000, np.int16), speech]))
-            w.open_lease("dev", 7, "L", registry.active().graph_sha256)
+            w.open_subscription("dev", 7, "L", registry.active().graph_sha256)
             # Verification input [support_start − 300 ms, open + 480 ms) is exactly the window.
             end = 16_000 + window.size
             w.submit_verification("L", "C", mic, 16_000 + sw.VERIFICATION_PREROLL, end - sw.VERIFICATION_LOOKAHEAD,
@@ -626,7 +626,7 @@ def test_verification_decodes_candidate_window_and_matches_the_core(bundle_dir, 
         try:
             mic = SampleTimeline()
             mic.write(0, np.concatenate([np.zeros(16_000, np.int16), speech]))
-            w.open_lease("dev", 7, "L", registry.active().graph_sha256)
+            w.open_subscription("dev", 7, "L", registry.active().graph_sha256)
             # "ask not what your country ..." begins ~0.5 s into the clip.
             support_start, open_sample = 16_000 + 4_800, 16_000 + 40_000
             w.submit_verification("L", "C1", mic, support_start, open_sample, "country")
@@ -649,7 +649,7 @@ def test_verification_needs_the_whole_lookahead(bundle_dir, registry):
         try:
             mic = SampleTimeline()
             mic.write(0, np.zeros(20_000, np.int16))
-            w.open_lease("dev", 7, "L", registry.active().graph_sha256)
+            w.open_subscription("dev", 7, "L", registry.active().graph_sha256)
             with pytest.raises(sw.SpeechWorkerError, match="not all known"):
                 w.submit_verification("L", "C", mic, 10_000, 15_000, "ophel")
         finally:
@@ -667,7 +667,7 @@ def test_reference_scoring_on_its_own_hop_grid_skips_digital_silence(bundle_dir,
             ref.write(9, 1000, None, 30_000)                                   # digital silence
             noise = (rng.normal(0, 2000, 30_000)).astype(np.int16)
             ref.write(9, 31_000, noise, noise.size)
-            w.open_lease("dev", 7, "L", registry.active().graph_sha256)
+            w.open_subscription("dev", 7, "L", registry.active().graph_sha256)
             w.submit_reference("L", ref.segment(9))
             return await drain(w, lambda got: any(o.kind == "reference_score" for o in got))
         finally:
@@ -694,7 +694,7 @@ def test_errors_mark_unavailable_and_two_good_probes_recover(bundle_dir, registr
                             on_availability=changes.append)
         await w.start()
         try:
-            w.open_lease("dev", 7, "L", registry.active().graph_sha256)
+            w.open_subscription("dev", 7, "L", registry.active().graph_sha256)
 
             def boom():
                 raise RuntimeError("comparator failed")
@@ -720,7 +720,7 @@ def test_job_older_than_its_deadline_is_an_error(bundle_dir, registry):
         w = sw.SpeechWorker(registry, bundle_dir=str(bundle_dir), job_deadline_s=0.05)
         await w.start()
         try:
-            w.open_lease("dev", 7, "L", registry.active().graph_sha256)
+            w.open_subscription("dev", 7, "L", registry.active().graph_sha256)
 
             def slow():
                 time.sleep(0.2)

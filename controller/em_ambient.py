@@ -18,7 +18,7 @@ made the recording worth taking: continuity. So the contract here is the
 blunt one — **the mode opens the mic, and closing it hands back a single WAV
 covering the whole time it was open**.
 
-Like collect mode, the audio comes from the `diagnostic` uplink lease the
+Like collect mode, the audio comes from the `diagnostic` audio subscription the
 session actor holds while the mode is armed: the device's live mic timeline,
 the native AFE's output that the on-device wake detector also scores. Also
 like collect mode, the mode SUSPENDS voice turns — a device whose mic is

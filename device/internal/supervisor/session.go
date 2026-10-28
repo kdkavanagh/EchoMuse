@@ -18,7 +18,7 @@ import (
 // v1Capabilities are the protocol capabilities this firmware implements
 // (SPEC §11.1); alert_cache_v1 is added only while the wakelock works.
 var v1Capabilities = []proto.Capability{
-	proto.CapAudioTimeline, proto.CapUplinkLeases, proto.CapDeviceWake, proto.CapRenderReference,
+	proto.CapAudioTimeline, proto.CapUplinkSubscriptions, proto.CapDeviceWake, proto.CapRenderReference,
 	proto.CapRenderProgress, proto.CapFocusLeases, proto.CapTurnProtocol,
 }
 
@@ -156,8 +156,9 @@ func (s *Supervisor) Rejected(reason proto.RejectReason, controller string) {
 	s.companionLink(companion.LinkDown, string(reason), controller)
 }
 
-// Lost implements client.Handler: every dialog/uplink lease and network
-// playback ends; local alerts, privacy and physical stop continue (§16.1).
+// Lost implements client.Handler: every dialog focus lease, audio
+// subscription and network playback ends; local alerts, privacy and physical
+// stop continue (§16.1).
 // A wake or dialog the controller was still handling gets the offline
 // notice, so the user is not left with silence, and a turn view it was
 // still showing ends and its timers clear; the detector keeps (or
@@ -180,7 +181,7 @@ func (s *Supervisor) Lost(reason client.LostReason) {
 }
 
 // endSession tears the session down and reports whether a wake or dialog
-// was in flight: a candidate lease the controller had not closed, or a
+// was in flight: a candidate subscription the controller had not closed, or a
 // dialog focus lease (a turn, its reply window, or its response).
 func (s *Supervisor) endSession() bool {
 	s.announceMu.Lock()
@@ -256,7 +257,7 @@ func (s *Supervisor) Control(env proto.Envelope) {
 	}
 }
 
-// Uplink lease commands (WIRE §4.5).
+// Uplink subscription commands (WIRE §4.5).
 
 func (s *Supervisor) uplinkOpen(env proto.Envelope) {
 	var b proto.UplinkOpen
@@ -274,8 +275,9 @@ func (s *Supervisor) uplinkOpen(env proto.Envelope) {
 	s.ackErr(env, s.up.Open(env, b), uplinkCode)
 }
 
-// uplinkRenew extends a lease. Converting a candidate lease into its turn's
-// lease converts the provisional duck into the turn's input focus (§16.6).
+// uplinkRenew extends a subscription. Converting a candidate subscription
+// into its turn's subscription converts the provisional duck into the turn's
+// input focus (§16.6).
 func (s *Supervisor) uplinkRenew(env proto.Envelope) {
 	var b proto.UplinkRenew
 	if err := json.Unmarshal(env.Body, &b); err != nil {
@@ -288,9 +290,9 @@ func (s *Supervisor) uplinkRenew(env proto.Envelope) {
 		return
 	}
 	s.mu.Lock()
-	cand, ok := s.candidates[b.LeaseID]
+	cand, ok := s.candidates[b.SubscriptionID]
 	if converted {
-		delete(s.candidates, b.LeaseID)
+		delete(s.candidates, b.SubscriptionID)
 	}
 	s.mu.Unlock()
 	switch {
@@ -315,7 +317,7 @@ func (s *Supervisor) uplinkClose(env proto.Envelope) {
 		return
 	}
 	if candidate {
-		s.releaseCandidateLease(b.LeaseID)
+		s.releaseCandidateSubscription(b.SubscriptionID)
 	}
 	s.ack(env, proto.AckAccepted, "")
 }

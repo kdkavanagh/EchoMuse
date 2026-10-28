@@ -308,7 +308,7 @@ class FakeWorker:
         self.tokens: list[tuple[str, int]] = []
         self.verification: str | None = "pass"
         self.reference_candidates: list[ReferenceCandidate] = []
-        self.leases: dict[str, dict] = {}
+        self.stream_states: dict[str, dict] = {}
         self.closed: list[str] = []
         self.verifications: list[str] = []
         self.pause_servers: list = []
@@ -319,35 +319,35 @@ class FakeWorker:
         self.span_requests = 0
         self.held_vad: list[tuple[str, int, float]] | None = None
 
-    def post(self, lease_id, kind, through, payload, utterance_id=None, stream="mic"):
+    def post(self, subscription_id, kind, through, payload, utterance_id=None, stream="mic"):
         self.actor.on_observation(Observation(
             self.actor.device_id, MIC_EPOCH, stream, "controller", kind, through, utterance_id,
-            None, self.policy_hash, payload, 0, lease_id))
+            None, self.policy_hash, payload, 0, subscription_id))
 
     async def load_wake_graph(self, sha):
         return None
 
-    def open_lease(self, device_id, epoch, lease_id, sha):
-        self.leases[lease_id] = {"next_cell": None, "utt": None, "mic_through": None}
+    def open_subscription(self, device_id, epoch, subscription_id, sha):
+        self.stream_states[subscription_id] = {"next_cell": None, "utt": None, "mic_through": None}
 
-    def close_lease(self, lease_id):
-        if self.leases.pop(lease_id, None) is not None:
-            self.closed.append(lease_id)
+    def close_subscription(self, subscription_id):
+        if self.stream_states.pop(subscription_id, None) is not None:
+            self.closed.append(subscription_id)
 
-    def open_utterance(self, lease_id, utterance_id, start, trigger, mic, *, pause_server=None, **_):
+    def open_utterance(self, subscription_id, utterance_id, start, trigger, mic, *, pause_server=None, **_):
         self.pause_servers.append(pause_server)
-        lease = self.leases[lease_id]
-        fed = max(lease["mic_through"] or start, start)
-        lease["utt"] = [utterance_id, start, fed, pause_server, False, set()]
+        stream_state = self.stream_states[subscription_id]
+        fed = max(stream_state["mic_through"] or start, start)
+        stream_state["utt"] = [utterance_id, start, fed, pause_server, False, set()]
         if fed > start:
-            self._asr(lease_id)
+            self._asr(subscription_id)
 
-    def close_utterance(self, lease_id):
-        if lease_id in self.leases:
-            self.leases[lease_id]["utt"] = None
+    def close_utterance(self, subscription_id):
+        if subscription_id in self.stream_states:
+            self.stream_states[subscription_id]["utt"] = None
 
-    def _asr(self, lease_id):
-        utt = self.leases[lease_id]["utt"]
+    def _asr(self, subscription_id):
+        utt = self.stream_states[subscription_id]["utt"]
         utt_id, start, fed, server = utt[:4]
         emitted = [(t, s) for t, s in self.tokens if start <= s <= fed]
         last = emitted[-1][1] if emitted else start
@@ -361,50 +361,51 @@ class FakeWorker:
         if due:
             utt[5] |= due
             voice = VoiceSnapshot(np.full((2, 1, 128), 0.5, dtype=np.float32), np.zeros(64, dtype=np.float32), fed)
-        self.post(lease_id, "asr", fed, AsrPayload(
+        self.post(subscription_id, "asr", fed, AsrPayload(
             tuple(t for t, _ in emitted), tuple(s for _, s in emitted), "", None, (fed - last) // 640, None,
             120 if decode is not None else None, pause_text=text, pause_decode=decode, voice=voice), utt_id)
 
-    def prime_vad(self, lease_id, from_sample, voice):
-        self.primes.append((lease_id, from_sample, voice))
+    def prime_vad(self, subscription_id, from_sample, voice):
+        self.primes.append((subscription_id, from_sample, voice))
 
-    def submit_mic_block(self, lease_id, first, pcm, *, flags=0):
-        lease = self.leases[lease_id]
+    def submit_mic_block(self, subscription_id, first, pcm, *, flags=0):
+        stream_state = self.stream_states[subscription_id]
         end = first + pcm.size
-        lease["mic_through"] = end
-        if lease["next_cell"] is None:
-            lease["next_cell"] = -(-first // CELL) * CELL
+        stream_state["mic_through"] = end
+        if stream_state["next_cell"] is None:
+            stream_state["next_cell"] = -(-first // CELL) * CELL
         cells = []
-        start = lease["next_cell"]
-        while lease["next_cell"] + CELL <= end:
-            cells.append(self.vad(lease["next_cell"]))
-            lease["next_cell"] += CELL
+        start = stream_state["next_cell"]
+        while stream_state["next_cell"] + CELL <= end:
+            cells.append(self.vad(stream_state["next_cell"]))
+            stream_state["next_cell"] += CELL
         if cells and self.held_vad is not None:
-            self.held_vad += [(lease_id, start + i * CELL, p) for i, p in enumerate(cells)]
+            self.held_vad += [(subscription_id, start + i * CELL, p) for i, p in enumerate(cells)]
         elif cells:
-            self.post(lease_id, "vad", lease["next_cell"], VadPayload(start, tuple(cells)))
-        if lease["utt"] is not None and end > lease["utt"][2]:
-            lease["utt"][2] = end
-            self._asr(lease_id)
+            self.post(subscription_id, "vad", stream_state["next_cell"], VadPayload(start, tuple(cells)))
+        if stream_state["utt"] is not None and end > stream_state["utt"][2]:
+            stream_state["utt"][2] = end
+            self._asr(subscription_id)
 
     def release_vad(self):
         held, self.held_vad = self.held_vad or [], None
         if held:
-            lease_id, first, _ = held[0]
-            self.post(lease_id, "vad", held[-1][1] + CELL, VadPayload(first, tuple(p for _, _, p in held)))
+            subscription_id, first, _ = held[0]
+            self.post(subscription_id, "vad", held[-1][1] + CELL, VadPayload(first, tuple(p for _, _, p in held)))
 
-    def submit_echo(self, lease_id, first_cell_sample, through_sample, compare, utterance_id=None):
+    def submit_echo(self, subscription_id, first_cell_sample, through_sample, compare, utterance_id=None):
         results, lag = compare()
-        self.post(lease_id, "echo", through_sample, EchoPayload(first_cell_sample, tuple(results), lag), utterance_id)
+        self.post(subscription_id, "echo", through_sample, EchoPayload(first_cell_sample, tuple(results), lag),
+                  utterance_id)
 
-    def submit_reference(self, lease_id, view):
-        self.post(lease_id, "reference_score", view.frontier, ReferenceScorePayload(
+    def submit_reference(self, subscription_id, view):
+        self.post(subscription_id, "reference_score", view.frontier, ReferenceScorePayload(
             view.first_sample, REF_EPOCH, (), (), tuple(self.reference_candidates)), stream="reference")
 
-    def submit_verification(self, lease_id, candidate_id, mic, support_start, open_sample, core):
+    def submit_verification(self, subscription_id, candidate_id, mic, support_start, open_sample, core):
         self.verifications.append(candidate_id)
         if self.verification is not None:
-            self.post(lease_id, "verification", open_sample + 7_680,
+            self.post(subscription_id, "verification", open_sample + 7_680,
                       VerificationPayload(candidate_id, "ophilia", 0.2, self.verification))
 
     async def decode_span(self, pcm):
@@ -622,12 +623,12 @@ S = 48_000                  # candidate support start
 OPEN = S + 12_800           # opening hop end = trigger
 
 
-def candidate(*, producing_sound=False, active_alert=None, lease="L1", cid="C1", chimed=None, start=S):
+def candidate(*, producing_sound=False, active_alert=None, subscription="L1", cid="C1", chimed=None, start=S):
     hops = [{"end_sample": str(start + 2_560 * k), "raw": 0.95 if k == 5 else 0.3,
              "smoothed": 0.92 if k == 5 else 0.3, "profile": "playback" if producing_sound else "idle"}
             for k in range(1, 6)]
     body = {
-        "candidate_id": cid, "lease_id": lease, "capture_epoch": str(MIC_EPOCH), "graph_sha256": "g" * 64,
+        "candidate_id": cid, "lease_id": subscription, "capture_epoch": str(MIC_EPOCH), "graph_sha256": "g" * 64,
         "scorer_revision": 3, "profile": hops[0]["profile"], "threshold": 0.9 if not producing_sound else 0.65,
         "producing_sound": producing_sound, "first_crossing_end": str(start + 12_800),
         "support_start": str(start), "mono_ns": "1", "active_alert": active_alert, "hops": hops}
@@ -647,7 +648,7 @@ def levels(*spans):
 # --- wake acceptance ----------------------------------------------------------------------------
 
 
-def test_idle_wake_is_accepted_and_its_candidate_lease_becomes_the_turn_lease():
+def test_idle_wake_is_accepted_and_its_candidate_subscription_becomes_the_turn_subscription():
     async def main():
         h = Harness()
         await h.start()
@@ -1275,8 +1276,8 @@ def test_an_opted_in_wake_turn_records_native_afe_evidence_and_decides_exactly_a
     assert utt["frames"] > 0 and utt["vad_max"] == 0.25 and utt["volume"] == 70
 
     # The per-period series behind the summaries: its own column, never the logged trace. It runs
-    # on through the response, to the last record the device sent, on an afe-only `turn` lease
-    # opened at the commit before the committed lease closed (not one period is missing), and
+    # on through the response, to the last record the device sent, on an afe-only `turn` subscription
+    # opened at the commit before the committed subscription closed (not one period is missing), and
     # closed once the turn had ended. Without Save utterances no mic follows the commit.
     assert plain_row["afe_series"] is None and "afe_series" not in json.loads(native_row["decision_trace"])
     series = json.loads(native_row["afe_series"])
@@ -1303,9 +1304,9 @@ def test_an_opted_in_wake_turn_records_native_afe_evidence_and_decides_exactly_a
     assert stages["tts"][1] == stages["reply"][0] <= stages["reply"][1]
 
     # Beside the native VAD, the controller's own: the Silero probability the worker reported for
-    # each cell of the committed lease's mic, from its first cell (support −300 ms, down to the cell
-    # grid as the lease rounds it) through past the utterance, as the decisions read it. The
-    # afe-only response lease runs no Silero.
+    # each cell of the committed subscription's mic, from its first cell (support −300 ms, down to the cell
+    # grid as the subscription rounds it) through past the utterance, as the decisions read it. The
+    # afe-only response subscription runs no Silero.
     first = (S - em_session.PREROLL) // CELL * CELL
     silero, start = series["silero"], series["silero_start"]
     assert start == first and start + len(silero) * CELL >= utt["end"]
@@ -1313,7 +1314,7 @@ def test_an_opted_in_wake_turn_records_native_afe_evidence_and_decides_exactly_a
     assert {0.05, 0.95} <= set(silero)                    # speech and quiet both drawn
 
 
-def test_privacy_mute_during_the_response_ends_its_lease_and_erases_what_it_carried(monkeypatch):
+def test_privacy_mute_during_the_response_ends_its_subscription_and_erases_what_it_carried(monkeypatch):
     saved = {}
     monkeypatch.setattr(em_session.em_recordings, "save",
                         lambda device_id, row_id, pcm, kind=em_session.em_recordings.RecordingKind.UTTERANCE:
@@ -1329,8 +1330,8 @@ def test_privacy_mute_during_the_response_ends_its_lease_and_erases_what_it_carr
 
     h, row = run(main())
     assert row["terminal_reason"] == "muted"
-    # The series and the turn recording keep only what the committed lease carried: the response's
-    # records and mic went with the mute, which ended its lease on the device, so the controller
+    # The series and the turn recording keep only what the committed subscription carried: the response's
+    # records and mic went with the mute, which ended its subscription on the device, so the controller
     # closed nothing.
     utt = json.loads(row["afe_evidence"])["utterance"]
     series = json.loads(row["afe_series"])
@@ -1339,20 +1340,21 @@ def test_privacy_mute_during_the_response_ends_its_lease_and_erases_what_it_carr
     assert [b for b, _ in h.link.of("uplink.close") if b["lease_id"] == body["lease_id"]] == []
     mic = int(body["streams"]["mic"])
     a, b = series["recording"]
-    assert mic <= b < mic + CELL < h.device.pos[Kind.MIC]      # the capture, up to the response lease's start
+    assert mic <= b < mic + CELL < h.device.pos[Kind.MIC]      # the capture, up to the response subscription's start
     assert len(saved["turn"]) == 2 * (b - a)
 
 
-def test_a_response_lease_closes_at_its_cap_even_while_the_response_plays(monkeypatch):
-    monkeypatch.setattr(em_session, "RESPONSE_LEASE_MAX_S", 0.2)
+def test_a_response_subscription_closes_at_its_cap_even_while_the_response_plays(monkeypatch):
+    monkeypatch.setattr(em_session, "RESPONSE_SUBSCRIPTION_MAX_S", 0.2)
 
     async def main():
         h = Harness(afe=True)
         await wake_question_playing(h)
         await asyncio.sleep(0.3)
         await h.settle()
-        [lease] = [b["lease_id"] for b, _ in h.link.of("uplink.open")]
-        closed_while_playing = {"lease_id": lease, "reason": "closed"} in [b for b, _ in h.link.of("uplink.close")]
+        [subscription] = [b["lease_id"] for b, _ in h.link.of("uplink.open")]
+        closed_while_playing = ({"lease_id": subscription, "reason": "closed"}
+                                in [b for b, _ in h.link.of("uplink.close")])
         h.render.streams[0].finish("drained")
         await h.wait_for(lambda: h.rows)
         await h.actor.close()
@@ -1395,9 +1397,9 @@ def test_the_afe_series_places_each_saved_recording_on_its_timeline_sample_for_s
     for key, kind in (("wake_clip", "wake"), ("audio_clip", "utterance")):
         a, b = series[key]
         assert len(saved[kind]) == 2 * (b - a)
-    # The turn recording: the candidate lease's mic from its start, then the response lease's mic
+    # The turn recording: the candidate subscription's mic from its start, then the response subscription's mic
     # from where it stopped, through the last sample the device sent — no sample lost or repeated
-    # at the seam. The response lease took the mic because Save utterances is on.
+    # at the seam. The response subscription took the mic because Save utterances is on.
     [body] = [b for b, _ in h.link.of("uplink.open")]
     assert sorted(body["streams"]) == ["afe", "mic"]
     a, b = series["recording"]
@@ -1436,7 +1438,7 @@ def test_a_turn_that_never_commits_keeps_its_turn_recording_too(monkeypatch, ter
 
     h, row = run(main())
     assert row["terminal_reason"] == terminal and row.get("commit_id") is None
-    # What the lease heard, from the candidate lease's mic start through its close, placed on the
+    # What the subscription heard, from the candidate subscription's mic start through its close, placed on the
     # chart sample for sample.
     series = json.loads(row["afe_series"])
     heard = series["utterance"] or series["support"]
@@ -1446,13 +1448,13 @@ def test_a_turn_that_never_commits_keeps_its_turn_recording_too(monkeypatch, ter
 
 
 
-def test_an_opted_in_candidate_lease_mirrors_the_afe_stream_from_its_reference_start():
+def test_an_opted_in_candidate_subscription_mirrors_the_afe_stream_from_its_reference_start():
     async def main(afe: bool):
         h = Harness(afe=afe)
         await h.start()
         h.actor.on_message(candidate())
         await h.settle()
-        streams = dict(h.actor.uplink.leases.get("L1").streams)
+        streams = dict(h.actor.uplink.subscriptions.get("L1").streams)
         await h.actor.close()
         return streams
 
@@ -1493,15 +1495,15 @@ def test_a_rejected_candidate_row_carries_its_wake_evidence(afe, sends, expected
 
 
 @pytest.mark.parametrize("afe", [False, True])
-def test_the_diagnostic_lease_feeds_its_tap_the_mic_and_in_an_afe_session_the_records(afe):
+def test_the_diagnostic_subscription_feeds_its_tap_the_mic_and_in_an_afe_session_the_records(afe):
     # The recording modes' charts: only a session that opted in to `afe` asks for it.
     async def main():
         h = Harness(afe=afe)
         await h.start()
         mic, records = [], []
         await h.actor.open_diagnostic(em_session.DiagnosticTap(
-            lambda lease, start, pcm: mic.append((lease, start, pcm.size)),
-            lambda lease, recs: records.extend((lease, r.start) for r in recs)))
+            lambda subscription, start, pcm: mic.append((subscription, start, pcm.size)),
+            lambda subscription, recs: records.extend((subscription, r.start) for r in recs)))
         await h.settle()
         [(body, _)] = h.link.of("uplink.open")
         await h.feed(0, 4 * PERIOD)
@@ -1511,15 +1513,15 @@ def test_the_diagnostic_lease_feeds_its_tap_the_mic_and_in_an_afe_session_the_re
     body, mic, records = run(main())
     assert body["reason"] == "diagnostic"
     assert body["streams"] == ({"mic": "live", "afe": "live"} if afe else {"mic": "live"})
-    lease = body["lease_id"]
-    assert mic and {m[0] for m in mic} == {lease}
-    assert records == ([(lease, k * PERIOD) for k in range(4)] if afe else [])
+    subscription = body["lease_id"]
+    assert mic and {m[0] for m in mic} == {subscription}
+    assert records == ([(subscription, k * PERIOD) for k in range(4)] if afe else [])
 
 
 # --- near misses (near_miss_v1) -------------------------------------------------------------------
 
 NM_START, NM_END = 48_000, 73_600          # support: the floor reached, no candidate opened
-NM_MIC = (NM_START - 4_800) // CELL * CELL  # the lease's mic start
+NM_MIC = (NM_START - 4_800) // CELL * CELL  # the subscription's mic start
 
 
 def near_miss(nm_id="N1", *, start=NM_START, end=NM_END, epoch=MIC_EPOCH):
@@ -1537,7 +1539,7 @@ def at_wall(mono_ns):
     return 1_000.0 + (mono_ns - MONO_BASE) / 1e9
 
 
-def test_near_misses_with_wake_clips_on_record_their_span_through_their_own_leases_beside_the_worker():
+def test_near_misses_with_wake_clips_on_record_their_span_through_their_own_subscriptions_beside_the_worker():
     async def main():
         h = Harness(config={"saveWakeClips": True})
         h.device.mic_pcm = capture_ramp
@@ -1546,7 +1548,7 @@ def test_near_misses_with_wake_clips_on_record_their_span_through_their_own_leas
         real_audio = h.actor._audio
 
         async def spy(deliveries):
-            audio.update(d.lease_id for d in deliveries)
+            audio.update(d.subscription_id for d in deliveries)
             await real_audio(deliveries)
         h.actor._audio = spy
         # Two in flight at once: the second opens while the first still waits for its tail.
@@ -1563,11 +1565,11 @@ def test_near_misses_with_wake_clips_on_record_their_span_through_their_own_leas
     second_mic = (NM_START + 12_800 - 4_800) // CELL * CELL
     assert [(b["owner"], b["reason"], b["streams"], b["ttl_ms"], g) for b, g in opens] == [
         ("N1", "near_miss", {"mic": str(NM_MIC)}, 3_000, 1), ("N2", "near_miss", {"mic": str(second_mic)}, 3_000, 1)]
-    leases = [b["lease_id"] for b, _ in opens]
-    assert sorted(b["lease_id"] for b, _ in h.link.of("uplink.close")) == sorted(leases)
+    subscriptions = [b["lease_id"] for b, _ in opens]
+    assert sorted(b["lease_id"] for b, _ in h.link.of("uplink.close")) == sorted(subscriptions)
     assert {b["reason"] for b, _ in h.link.of("uplink.close")} == {"closed"}
     # Their mic never reached the speech pipeline.
-    assert not audio & set(leases) and h.worker.leases == {}
+    assert not audio & set(subscriptions) and h.worker.stream_states == {}
     rows = {rec.near_miss_uuid: (rec, pcm) for rec, pcm in h.near_misses}
     rec, pcm = rows["N1"]
     assert (rec.ts, rec.profile, rec.floor, rec.peak, rec.wake_threshold, rec.wake_model_sha256,
@@ -1577,7 +1579,7 @@ def test_near_misses_with_wake_clips_on_record_their_span_through_their_own_leas
 
 
 @pytest.mark.parametrize("sends", [True, False])
-def test_in_an_afe_session_a_near_miss_lease_takes_the_records_for_its_chart_but_waits_for_them_only_a_second(sends):
+def test_in_an_afe_session_a_near_miss_subscription_takes_the_records_for_its_chart_but_waits_for_them_only_a_second(sends):
     # The chart: from a second before the support through the recording's end, the WAV placed on
     # it. A decoder that sends nothing holds the row up for one second of mic past its end, no more.
     async def main():
@@ -1613,7 +1615,7 @@ def test_in_an_afe_session_a_near_miss_lease_takes_the_records_for_its_chart_but
 
 @pytest.mark.parametrize("case, status", [
     ("off", "off"), ("muted", "not_permitted"), ("diagnostic", "not_permitted"), ("old_epoch", "failed")])
-def test_a_near_miss_that_cannot_be_recorded_is_persisted_with_why_and_opens_no_lease(case, status):
+def test_a_near_miss_that_cannot_be_recorded_is_persisted_with_why_and_opens_no_subscription(case, status):
     async def main():
         h = Harness(config={"saveWakeClips": case != "off"})
         await h.start()
@@ -1635,7 +1637,7 @@ def test_a_near_miss_that_cannot_be_recorded_is_persisted_with_why_and_opens_no_
 
 
 @pytest.mark.parametrize("held, keeps", [(NM_START + 6_400, False), (NM_END, True)])
-def test_a_near_miss_lease_the_device_ends_early_keeps_its_audio_only_if_it_covers_the_support(held, keeps):
+def test_a_near_miss_subscription_the_device_ends_early_keeps_its_audio_only_if_it_covers_the_support(held, keeps):
     async def main():
         h = Harness(config={"saveWakeClips": True})
         h.device.mic_pcm = capture_ramp
@@ -1659,13 +1661,13 @@ def test_a_near_miss_lease_the_device_ends_early_keeps_its_audio_only_if_it_cove
 
 
 @pytest.mark.parametrize("case", ["refused", "session_lost"])
-def test_a_refused_or_lost_near_miss_lease_still_writes_its_row_as_failed(case):
+def test_a_refused_or_lost_near_miss_subscription_still_writes_its_row_as_failed(case):
     async def main():
         h = Harness(config={"saveWakeClips": True})
         await h.start()
         h.actor.on_near_miss(near_miss(), at_wall)
         await h.settle()
-        if case == "refused":                   # the device opened no lease: no audio comes
+        if case == "refused":                   # the device opened no subscription: no audio comes
             [capture] = h.actor._near_misses.values()
             h.actor.on_message(envelope("command.ack", {"message_id": capture.open_message,
                                                         "status": "rejected", "error": "muted"}))
@@ -1719,7 +1721,7 @@ async def button_turn(h: Harness, until: int):
     await h.feed(PRESS - 4_800, until)
 
 
-def test_a_button_turn_opens_its_own_lease_from_the_press_minus_300_ms():
+def test_a_button_turn_opens_its_own_subscription_from_the_press_minus_300_ms():
     async def main():
         h = Harness()
         await h.start()
@@ -1735,7 +1737,7 @@ def test_a_button_turn_opens_its_own_lease_from_the_press_minus_300_ms():
 
 
 @pytest.mark.parametrize("afe", [False, True])
-def test_a_button_turn_lease_requests_afe_from_its_reference_start_only_when_opted_in(afe):
+def test_a_button_turn_subscription_requests_afe_from_its_reference_start_only_when_opted_in(afe):
     async def main():
         h = Harness(afe=afe)
         await h.start()
@@ -1920,9 +1922,9 @@ def test_say_that_again_in_a_reply_window_replays_the_question_and_reopens_it_in
         await h.feed(drain, drain + 60_000)
         await h.wait_for(lambda: len(h.render.streams) == 2)
         assert h.render.urls() == ["http://ha/tts/1", "http://ha/tts/1"] and len(h.ha.intents) == 1
-        # The question replays while the mic runs on. Its reply lease opened as the replay started,
+        # The question replays while the mic runs on. Its reply subscription opened as the replay started,
         # which a slow ASR copy puts after all the mic above: a second of mic during the replay lets
-        # the window open at the drain instead of waiting for the lease's first cell.
+        # the window open at the drain instead of waiting for the subscription's first cell.
         await h.feed(h.device.pos[Kind.MIC], h.device.pos[Kind.MIC] + 16_000)
         h.render.streams[1].finish("drained")
         await h.wait_for(lambda: h.actor.state == "ARMED" and h.actor._turn is not None)
@@ -2082,8 +2084,8 @@ def test_ha_turn_with_continue_conversation_opens_a_reply_turn_that_ends_silentl
         await h.wait_for(lambda: h.actor.state == "ARMED")
         assert len(reply_focus(h, reply_open[0]["owner"])) == 1
         base = PRESS + 50_000
-        await h.feed(base, base + 4_000)            # no audio reached the reply lease before the drain
-        # The wake chime cues the window, which opens once it has finished, on the lease's first
+        await h.feed(base, base + 4_000)            # no audio reached the reply subscription before the drain
+        # The wake chime cues the window, which opens once it has finished, on the subscription's first
         # audio: no wake word needed.
         assert h.render.local == ([("earcon", "builtin:wake_chime")] if wake_sound else [])
         await h.wait_for(lambda: h.rows)
@@ -2205,7 +2207,7 @@ def test_a_reply_window_that_never_gets_mic_closes_no_input_by_the_wall_clock(mo
                                                         preannounce_url=None, start_conversation=True))
         await h.wait_for(lambda: h.render.streams)
         reply_open = [b for b, _ in h.link.of("uplink.open") if b["reason"] == "reply"]
-        h.render.streams[0].finish("drained")                 # no mic ever reached the reply lease
+        h.render.streams[0].finish("drained")                 # no mic ever reached the reply subscription
         await asyncio.wait_for(announce, 2)
         assert h.actor.state == "ARMED" and h.actor._turn is None
         await h.wait_for(lambda: h.actor.state == "IDLE", timeout=3)
@@ -2372,9 +2374,9 @@ def test_the_reply_window_opens_once_the_chime_has_finished_with_the_askers_voic
         question = h.rows[0]
         voice_at = json.loads(question["decision_trace"])["voice_at"]
         assert voice_at >= QUESTION[1] + 5_120
-        # The question turn's snapshot, restored into the reply lease from the trigger on.
-        [(lease, at, voice)] = h.worker.primes
-        assert (lease, at, voice.sample) == (turn.runtime.lease_id, trigger, voice_at)
+        # The question turn's snapshot, restored into the reply subscription from the trigger on.
+        [(subscription, at, voice)] = h.worker.primes
+        assert (subscription, at, voice.sample) == (turn.evidence.subscription_id, trigger, voice_at)
         await h.feed(trigger, trigger + 7 * 16_000 + 4_000)
         await h.wait_for(lambda: len(h.rows) == 2)
         trace = json.loads(h.rows[1]["decision_trace"])
@@ -2396,15 +2398,15 @@ def test_a_reply_windows_vad_starts_from_the_askers_voice_else_fresh_from_the_dr
         drain = await question_asked(h, voice=voice, held_chime=wake_sound)
         if wake_sound:
             # No snapshot: a fresh state from the drain, set before the chime so it warms over it.
-            lease = h.actor._expectation.runtime.lease_id
-            assert not reply_open(h) and h.worker.primes == [(lease, drain, None)]
+            subscription = h.actor._expectation.evidence.subscription_id
+            assert not reply_open(h) and h.worker.primes == [(subscription, drain, None)]
             h.render.local_playbacks[0].finish("drained")
         await h.wait_for(lambda: reply_open(h))
         turn = h.actor._turn
         assert h.render.local == ([("earcon", "builtin:wake_chime")] if wake_sound else [])
         assert turn.utterance.spec.trigger == drain            # no mic arrived in between
-        [(lease, at, snapshot)] = h.worker.primes
-        assert lease == turn.runtime.lease_id and at == drain and (snapshot is not None) is voice
+        [(subscription, at, snapshot)] = h.worker.primes
+        assert subscription == turn.evidence.subscription_id and at == drain and (snapshot is not None) is voice
         window = turn.expectation.window
         assert window["vad"] == ("voice" if voice else "fresh") and window["primed_at"] == drain
         assert window["chime"] == ("drained" if wake_sound else None)
@@ -2474,7 +2476,7 @@ def test_a_reply_window_never_takes_its_voice_from_a_reply_that_did_not_commit()
 
     def asked_by(kind, committed):
         origin = em_session._Turn("t", 0, kind, 0.0, Utterance(UtteranceSpec("u", kind, 0, 0)),
-                                  em_session._Runtime("L", CellAssembler()), voice=voice)
+                                  em_session._Evidence("L", CellAssembler()), voice=voice)
         origin.commit = object() if committed else None
         return em_session._Expectation("e", "o", 0, UtteranceKind.REPLY, None, "t", 0.0, 1, origin=origin)
 

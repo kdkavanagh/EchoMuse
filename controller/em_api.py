@@ -1125,7 +1125,7 @@ async def _get_near_miss_afe_series(request: web.Request) -> web.Response:
     """GET /api/devices/{id}/near_misses/{nm}/afe — one near miss's native AFE series
     (em_afe.AfeSeriesJson): every 80 ms period from a second before its support through its
     recording's end, the support as the window and the recording placed, for the Activity
-    detail's chart. A 404 is ordinary: no lease took the records (Save wake clips off, capture
+    detail's chart. A 404 is ordinary: no audio subscription took the records (Save wake clips off, capture
     refused, no afe_metadata_v1), none came, the row is older than the newest
     em_db.TRACE_RETENTION, or it predates schema 38. Served as stored."""
     device_id = request.match_info["id"]
@@ -5843,7 +5843,7 @@ def _merge_device(row: db.DeviceRow) -> DeviceJson:
         "wake_stats":         device.wake_stats if device is not None else None,
         "afe_stats":          (device.afe_stats.wire()
                                if device is not None and device.afe_stats is not None else None),
-        # A diagnostic uplink lease is held, so the device answers no wake (§4.4).
+        # A diagnostic audio subscription is held, so the device answers no wake (§4.4).
         "diagnostic":         bool(live is not None and live.diagnostic),
         "stats":              live.stats if live is not None else None,
         # Recording modes. collect/ambient are persisted device-row columns

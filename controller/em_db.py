@@ -186,8 +186,8 @@ class NearMissRecording(StrEnum):
     """`near_misses.recording`: the episode's WAV, or why there is none."""
     SAVED = "saved"
     OFF = "off"                       # saveWakeClips off
-    NOT_PERMITTED = "not_permitted"   # capture not permitted, a diagnostic lease live, or muted
-    FAILED = "failed"                 # lease refused or ended short, epoch changed, or the write failed
+    NOT_PERMITTED = "not_permitted"   # capture not permitted, a diagnostic audio subscription live, or muted
+    FAILED = "failed"                 # subscription refused or ended short, epoch changed, or the write failed
     PRUNED = "pruned"                 # saved, then removed by retention: derived on read, never stored
 
 
@@ -1277,11 +1277,11 @@ MIGRATIONS: list[str] = [
 
     # ── v38 — a near miss's chart ────────────────────────────────────────────
     #
-    # In an afe_metadata session the near-miss lease also takes the AFE
+    # In an afe_metadata session the near-miss subscription also takes the AFE
     # records, from a second before the support through the recording's end;
     # `afe_series` is their em_afe.AfeSeries JSON, the support as its window
     # and the saved WAV placed as `recording`, for the near miss's chart (GET
-    # /api/devices/{id}/near_misses/{nm}/afe). NULL: none taken (no lease:
+    # /api/devices/{id}/near_misses/{nm}/afe). NULL: none taken (no subscription:
     # saveWakeClips off or capture refused; the device lacks afe_metadata_v1;
     # no record came), older than the newest TRACE_RETENTION rows of its
     # device, or a row from before this. Never read by the near-miss lists.

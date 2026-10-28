@@ -42,7 +42,7 @@ log = logging.getLogger("em_device")
 
 REQUIRED_CAPABILITIES: frozenset[Capability] = frozenset({
     Capability.AUDIO_TIMELINE,
-    Capability.UPLINK_LEASES,
+    Capability.UPLINK_SUBSCRIPTIONS,
     Capability.DEVICE_WAKE,
     Capability.RENDER_REFERENCE,
     Capability.RENDER_PROGRESS,
@@ -457,8 +457,8 @@ class Device:
         self.preview_playback: em_render.Playback | None = None
         self._diagnostic = False
         # Recording modes (§18.1); em_controller drives them over the
-        # diagnostic lease, whose mic blocks feed `diag_queue` with their
-        # position on `diag_track`, which also takes the lease's AFE records.
+        # diagnostic audio subscription, whose mic blocks feed `diag_queue` with their
+        # position on `diag_track`, which also takes the subscription's AFE records.
         self.diag_queue: asyncio.Queue[tuple[int, np.ndarray]] | None = None
         self.diag_track: em_afe.AfeTrack | None = None
         self.diag_task: asyncio.Task[None] | None = None
@@ -497,7 +497,7 @@ class Device:
 
     @property
     def diagnostic(self) -> bool:
-        """A diagnostic uplink lease is armed (recording modes, §18.1)."""
+        """A diagnostic audio subscription is armed (recording modes, §18.1)."""
         return self._diagnostic
 
     @diagnostic.setter

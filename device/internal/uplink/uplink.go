@@ -1,10 +1,10 @@
-// Package uplink executes the device's uplink leases (SPEC §4.4, WIRE §4.5,
-// §5). Each lease names the streams it wants and where each starts; the
-// executor maps those starts onto the mic, cell, AFE and reference rings,
-// uploads backfill and then live audio as EMA1 packets, and ends the lease
-// on close, TTL, mute, capture-epoch change, overrun or session loss with an
-// uplink.ended report. The afe stream exists only in sessions whose
-// session.ready opted into afe_metadata_v1.
+// Package uplink executes the device's audio subscriptions (SPEC §4.4, WIRE
+// §4.5, §5). Each subscription names the streams it wants and where each
+// starts; the executor maps those starts onto the mic, cell, AFE and
+// reference rings, uploads backfill and then live audio as EMA1 packets, and
+// ends the subscription on close, TTL, mute, capture-epoch change, overrun or
+// session loss with an uplink.ended report. The afe stream exists only in
+// sessions whose session.ready opted into afe_metadata_v1.
 //
 // The rings are the send queue: audio waits there, uncopied, until the single
 // sender goroutine (Run) packs it into a reused frame for the audio sink.
@@ -28,16 +28,16 @@ import (
 // Errors returned for controller commands; the caller maps them to
 // command.ack error codes.
 var (
-	ErrUnknownLease    = errors.New("uplink: unknown lease")
-	ErrStaleGeneration = errors.New("uplink: stale generation")
-	ErrInvalid         = errors.New("uplink: invalid request")
+	ErrUnknownSubscription = errors.New("uplink: unknown subscription")
+	ErrStaleGeneration     = errors.New("uplink: stale generation")
+	ErrInvalid             = errors.New("uplink: invalid request")
 )
 
-// Lease timing and bounds (§4.4).
+// Subscription timing and bounds (§4.4).
 const (
 	DefaultTTL       = 3 * time.Second // when a command carries no ttl_ms
-	CandidateAckWait = time.Second     // candidate lease without command.ack(accepted) ends with ttl
-	OverrunAge       = time.Second     // live audio older than this in the queue ends its leases
+	CandidateAckWait = time.Second     // candidate subscription without command.ack(accepted) ends with ttl
+	OverrunAge       = time.Second     // live audio older than this in the queue ends its subscriptions
 
 	// liveFlush sends a short live packet once its first sample has
 	// waited one capture block.
@@ -45,8 +45,9 @@ const (
 	tick      = 20 * time.Millisecond
 )
 
-// Candidate lease stream leads in capture samples (WIRE §4.5). AFE records
-// start with the reference, so the AEC state before the wake word is there.
+// Candidate subscription stream leads in capture samples (WIRE §4.5). AFE
+// records start with the reference, so the AEC state before the wake word is
+// there.
 const (
 	candidateMicLead   = 4800   // mic from support_start − 300 ms
 	candidateCellsLead = 160000 // cells from mic start − 10 s
@@ -114,9 +115,9 @@ type startReq struct {
 	capture uint64
 }
 
-type lease struct {
+type subscription struct {
 	id, owner string
-	reason    proto.LeaseReason
+	reason    proto.SubscriptionReason
 	gen       uint32
 	accepted  bool  // false only for a candidate awaiting its ack
 	deadline  int64 // ack deadline, then TTL expiry (now() clock)
@@ -128,9 +129,9 @@ type lease struct {
 	last    [numStreams]proto.NullU64 // header-domain last sample sent
 }
 
-// run is a backfill range [next, end) of ring indices owed to one lease.
+// run is a backfill range [next, end) of ring indices owed to one subscription.
 type run struct {
-	lease     *lease
+	sub       *subscription
 	next, end uint64
 	disc      bool
 }
@@ -146,7 +147,7 @@ const maxMarks = 256
 type stream struct {
 	epoch  uint64
 	seq    uint64 // next packet sequence in epoch
-	active bool   // some accepted lease wants the stream
+	active bool   // some accepted subscription wants the stream
 	next   uint64 // live cursor: next ring index to send live
 	disc   bool   // the live cursor skipped missing audio
 	runs   []run  // backfill, sent in order before live
@@ -168,8 +169,8 @@ type pending struct {
 	end      uint64 // ring index after the packet
 }
 
-// Executor owns the uplink lease table and the sender. Controller commands
-// and the sender may run on different goroutines.
+// Executor owns the uplink subscription table and the sender. Controller
+// commands and the sender may run on different goroutines.
 type Executor struct {
 	mu    sync.Mutex
 	rings Rings
@@ -181,7 +182,7 @@ type Executor struct {
 	afe  bool // the session opted into afe_metadata_v1
 
 	micEpoch, refEpoch uint64
-	leases             map[string]*lease
+	subscriptions      map[string]*subscription
 	streams            [numStreams]stream
 	wake               chan struct{}
 
@@ -200,15 +201,15 @@ func New(r Rings, c Clock, now func() int64) *Executor {
 		now = monoclock.Now
 	}
 	e := &Executor{
-		rings:  r,
-		clock:  c,
-		now:    now,
-		leases: make(map[string]*lease),
-		wake:   make(chan struct{}, 1),
-		frame:  make([]byte, ema.HeaderSize+ema.MaxUplinkPCMFrames*2),
-		pcm:    make([]int16, ema.MaxUplinkPCMFrames),
-		cells:  make([]ema.Cell, ema.MaxCells),
-		afes:   make([]ema.AFERecord, ema.MaxAFERecords),
+		rings:         r,
+		clock:         c,
+		now:           now,
+		subscriptions: make(map[string]*subscription),
+		wake:          make(chan struct{}, 1),
+		frame:         make([]byte, ema.HeaderSize+ema.MaxUplinkPCMFrames*2),
+		pcm:           make([]int16, ema.MaxUplinkPCMFrames),
+		cells:         make([]ema.Cell, ema.MaxCells),
+		afes:          make([]ema.AFERecord, ema.MaxAFERecords),
 		// A read of n indices yields at most n segments.
 		segs: make([]ring.Segment, 0, ema.MaxUplinkPCMFrames),
 	}
@@ -219,8 +220,8 @@ func New(r Rings, c Clock, now func() int64) *Executor {
 }
 
 // Attach binds a new session's audio sink and control sender. afe is true
-// when the session opted into afe_metadata_v1: candidate leases then want
-// the afe stream, and uplink.open may name it.
+// when the session opted into afe_metadata_v1: candidate subscriptions then
+// want the afe stream, and uplink.open may name it.
 func (e *Executor) Attach(sink client.AudioSink, send SendFunc, afe bool) {
 	e.mu.Lock()
 	e.sink, e.send, e.afe = sink, send, afe
@@ -228,28 +229,29 @@ func (e *Executor) Attach(sink client.AudioSink, send SendFunc, afe bool) {
 	e.Notify()
 }
 
-// Detach ends every lease with reason session and discards queued audio.
-// Nothing is reported: the session is gone, and leases do not survive it.
+// Detach ends every subscription with reason session and discards queued
+// audio. Nothing is reported: the session is gone, and subscriptions do not
+// survive it.
 func (e *Executor) Detach() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.sink, e.send, e.afe = nil, nil, false
-	for _, l := range e.leases {
-		e.endLocked(l, proto.EndedSession)
+	for _, sb := range e.subscriptions {
+		e.endLocked(sb, proto.EndedSession)
 	}
 }
 
 // SetEpochs records the current capture and reference epochs. Call it after
 // resetting a ring for a new epoch and before the epoch's first append. A
-// capture-epoch change ends every lease (epoch); a reference-epoch change
-// restarts the reference stream at the new epoch's live position. mic 0
-// means no capture epoch (muted): leases cannot open.
+// capture-epoch change ends every subscription (epoch); a reference-epoch
+// change restarts the reference stream at the new epoch's live position. mic
+// 0 means no capture epoch (muted): subscriptions cannot open.
 func (e *Executor) SetEpochs(mic, ref uint64) {
 	var out []ended
 	e.mu.Lock()
 	if mic != e.micEpoch {
-		for _, l := range e.leases {
-			out = append(out, e.endLocked(l, proto.EndedEpoch))
+		for _, sb := range e.subscriptions {
+			out = append(out, e.endLocked(sb, proto.EndedEpoch))
 		}
 		e.micEpoch = mic
 		e.restartLocked(micStream, mic)
@@ -264,9 +266,9 @@ func (e *Executor) SetEpochs(mic, ref uint64) {
 		if s.active {
 			s.next, s.observed = end, end
 		}
-		for _, l := range e.leases {
-			if l.want[refStream] {
-				l.start[refStream], l.last[refStream] = end, proto.NullU64{}
+		for _, sb := range e.subscriptions {
+			if sb.want[refStream] {
+				sb.start[refStream], sb.last[refStream] = end, proto.NullU64{}
 			}
 		}
 	}
@@ -276,13 +278,13 @@ func (e *Executor) SetEpochs(mic, ref uint64) {
 	e.Notify()
 }
 
-// Mute ends every lease with reason mute and drops queued audio. Capture has
-// no epoch until the next SetEpochs.
+// Mute ends every subscription with reason mute and drops queued audio.
+// Capture has no epoch until the next SetEpochs.
 func (e *Executor) Mute() {
 	var out []ended
 	e.mu.Lock()
-	for _, l := range e.leases {
-		out = append(out, e.endLocked(l, proto.EndedMute))
+	for _, sb := range e.subscriptions {
+		out = append(out, e.endLocked(sb, proto.EndedMute))
 	}
 	e.micEpoch = 0
 	e.restartLocked(micStream, 0)
@@ -293,38 +295,38 @@ func (e *Executor) Mute() {
 	emit(send, out)
 }
 
-// OpenCandidate opens the candidate lease announced with wake.candidate
+// OpenCandidate opens the candidate subscription announced with wake.candidate
 // (generation 1). It uploads nothing until AcceptCandidate(true); without
 // that within CandidateAckWait it ends with ttl.
-func (e *Executor) OpenCandidate(leaseID string, supportStart uint64) {
+func (e *Executor) OpenCandidate(subscriptionID string, supportStart uint64) {
 	mic := down(sub(supportStart, candidateMicLead), micGrid)
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.send == nil || e.micEpoch == 0 || e.leases[leaseID] != nil {
+	if e.send == nil || e.micEpoch == 0 || e.subscriptions[subscriptionID] != nil {
 		return
 	}
-	l := &lease{id: leaseID, owner: leaseID, reason: proto.LeaseCandidate, gen: 1,
+	sb := &subscription{id: subscriptionID, owner: subscriptionID, reason: proto.SubscriptionCandidate, gen: 1,
 		deadline: e.now() + int64(CandidateAckWait)}
-	l.want = [numStreams]bool{micStream: true, cellsStream: true, afeStream: e.afe, refStream: true}
-	l.req[micStream] = startReq{capture: mic}
-	l.req[cellsStream] = startReq{capture: sub(mic, candidateCellsLead)}
-	l.req[afeStream] = startReq{capture: sub(mic, candidateRefLead)}
-	l.req[refStream] = startReq{capture: sub(mic, candidateRefLead)}
-	e.leases[leaseID] = l
+	sb.want = [numStreams]bool{micStream: true, cellsStream: true, afeStream: e.afe, refStream: true}
+	sb.req[micStream] = startReq{capture: mic}
+	sb.req[cellsStream] = startReq{capture: sub(mic, candidateCellsLead)}
+	sb.req[afeStream] = startReq{capture: sub(mic, candidateRefLead)}
+	sb.req[refStream] = startReq{capture: sub(mic, candidateRefLead)}
+	e.subscriptions[subscriptionID] = sb
 }
 
 // AcceptCandidate applies the controller's command.ack for wake.candidate:
-// accepted releases the lease's audio; rejected ends it (closed).
-func (e *Executor) AcceptCandidate(leaseID string, accepted bool) {
+// accepted releases the subscription's audio; rejected ends it (closed).
+func (e *Executor) AcceptCandidate(subscriptionID string, accepted bool) {
 	var out []ended
 	e.mu.Lock()
-	if l := e.leases[leaseID]; l != nil && !l.accepted {
+	if sb := e.subscriptions[subscriptionID]; sb != nil && !sb.accepted {
 		if accepted {
-			l.accepted = true
-			l.deadline = e.now() + int64(DefaultTTL)
-			e.activateLocked(l)
+			sb.accepted = true
+			sb.deadline = e.now() + int64(DefaultTTL)
+			e.activateLocked(sb)
 		} else {
-			out = append(out, e.endLocked(l, proto.EndedClosed))
+			out = append(out, e.endLocked(sb, proto.EndedClosed))
 		}
 	}
 	send := e.send
@@ -334,119 +336,119 @@ func (e *Executor) AcceptCandidate(leaseID string, accepted bool) {
 }
 
 // Open applies uplink.open for a turn, reply, diagnostic or near-miss
-// lease. The afe stream is a valid key only in a session that opted into
-// it.
+// subscription. The afe stream is a valid key only in a session that opted
+// into it.
 func (e *Executor) Open(env proto.Envelope, b proto.UplinkOpen) error {
 	switch b.Reason {
-	case proto.LeaseTurn, proto.LeaseReply, proto.LeaseDiagnostic, proto.LeaseNearMiss:
+	case proto.SubscriptionTurn, proto.SubscriptionReply, proto.SubscriptionDiagnostic, proto.SubscriptionNearMiss:
 	default:
 		return ErrInvalid
 	}
-	if b.LeaseID == "" || env.Generation == 0 || len(b.Streams) == 0 {
+	if b.SubscriptionID == "" || env.Generation == 0 || len(b.Streams) == 0 {
 		return ErrInvalid
 	}
-	l := &lease{id: b.LeaseID, owner: b.Owner, reason: b.Reason, gen: env.Generation, accepted: true}
+	sb := &subscription{id: b.SubscriptionID, owner: b.Owner, reason: b.Reason, gen: env.Generation, accepted: true}
 	for key, v := range b.Streams {
 		id, ok := streamOf(key)
 		if !ok {
 			return ErrInvalid
 		}
-		l.want[id] = true
+		sb.want[id] = true
 		if v == proto.StartLive {
-			l.req[id] = startReq{live: true}
+			sb.req[id] = startReq{live: true}
 			continue
 		}
 		n, err := strconv.ParseUint(v, 10, 64)
 		if err != nil {
 			return ErrInvalid
 		}
-		l.req[id] = startReq{capture: n}
+		sb.req[id] = startReq{capture: n}
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.micEpoch == 0 || e.leases[b.LeaseID] != nil || (l.want[afeStream] && !e.afe) {
+	if e.micEpoch == 0 || e.subscriptions[b.SubscriptionID] != nil || (sb.want[afeStream] && !e.afe) {
 		return ErrInvalid
 	}
-	l.deadline = e.now() + ttl(b.TTLMs)
-	e.leases[l.id] = l
-	e.activateLocked(l)
+	sb.deadline = e.now() + ttl(b.TTLMs)
+	e.subscriptions[sb.id] = sb
+	e.activateLocked(sb)
 	e.Notify()
 	return nil
 }
 
-// Renew applies uplink.renew. At the lease's generation it extends the TTL;
-// at generation + 1 with reason turn it converts an accepted candidate lease
-// into the turn's lease in place.
+// Renew applies uplink.renew. At the subscription's generation it extends the
+// TTL; at generation + 1 with reason turn it converts an accepted candidate
+// subscription into the turn's subscription in place.
 func (e *Executor) Renew(env proto.Envelope, b proto.UplinkRenew) (converted bool, err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	l := e.leases[b.LeaseID]
+	sb := e.subscriptions[b.SubscriptionID]
 	switch {
-	case l == nil:
-		return false, ErrUnknownLease
-	case env.Generation < l.gen:
+	case sb == nil:
+		return false, ErrUnknownSubscription
+	case env.Generation < sb.gen:
 		return false, ErrStaleGeneration
-	case !l.accepted:
+	case !sb.accepted:
 		return false, ErrInvalid
-	case env.Generation == l.gen:
+	case env.Generation == sb.gen:
 		if b.Reason != "" || b.Owner != "" {
 			return false, ErrInvalid
 		}
-	case env.Generation == l.gen+1 && l.reason == proto.LeaseCandidate && b.Reason == proto.LeaseTurn && b.Owner != "":
-		l.gen, l.reason, l.owner = env.Generation, proto.LeaseTurn, b.Owner
+	case env.Generation == sb.gen+1 && sb.reason == proto.SubscriptionCandidate && b.Reason == proto.SubscriptionTurn && b.Owner != "":
+		sb.gen, sb.reason, sb.owner = env.Generation, proto.SubscriptionTurn, b.Owner
 		converted = true
 	default:
 		return false, ErrInvalid
 	}
-	l.deadline = e.now() + ttl(b.TTLMs)
+	sb.deadline = e.now() + ttl(b.TTLMs)
 	return converted, nil
 }
 
 // Close applies uplink.close and reports uplink.ended (closed).
-// candidateLease is true when the lease was still a candidate lease, whose
-// provisional duck the caller releases.
-func (e *Executor) Close(env proto.Envelope, b proto.UplinkClose) (candidateLease bool, err error) {
+// candidateSubscription is true when the subscription was still a candidate
+// subscription, whose provisional duck the caller releases.
+func (e *Executor) Close(env proto.Envelope, b proto.UplinkClose) (candidateSubscription bool, err error) {
 	e.mu.Lock()
-	l := e.leases[b.LeaseID]
+	sb := e.subscriptions[b.SubscriptionID]
 	switch {
-	case l == nil:
-		err = ErrUnknownLease
-	case env.Generation < l.gen:
+	case sb == nil:
+		err = ErrUnknownSubscription
+	case env.Generation < sb.gen:
 		err = ErrStaleGeneration
-	case env.Generation > l.gen:
+	case env.Generation > sb.gen:
 		err = ErrInvalid
 	}
 	if err != nil {
 		e.mu.Unlock()
 		return false, err
 	}
-	candidateLease = l.reason == proto.LeaseCandidate
-	out := []ended{e.endLocked(l, proto.EndedClosed)}
+	candidateSubscription = sb.reason == proto.SubscriptionCandidate
+	out := []ended{e.endLocked(sb, proto.EndedClosed)}
 	send := e.send
 	e.mu.Unlock()
 	emit(send, out)
-	return candidateLease, nil
+	return candidateSubscription, nil
 }
 
-// DiagnosticLive reports whether a diagnostic lease is live; the controller
-// refuses every wake while one is.
+// DiagnosticLive reports whether a diagnostic subscription is live; the
+// controller refuses every wake while one is.
 func (e *Executor) DiagnosticLive() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	now := e.now()
-	for _, l := range e.leases {
-		if l.reason == proto.LeaseDiagnostic && now < l.deadline {
+	for _, sb := range e.subscriptions {
+		if sb.reason == proto.SubscriptionDiagnostic && now < sb.deadline {
 			return true
 		}
 	}
 	return false
 }
 
-// Leased reports whether any lease is open, of any reason.
-func (e *Executor) Leased() bool {
+// Subscribed reports whether any subscription is open, of any reason.
+func (e *Executor) Subscribed() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return len(e.leases) > 0
+	return len(e.subscriptions) > 0
 }
 
 // Notify wakes the sender; the supervisor calls it after ring appends.
@@ -472,23 +474,23 @@ func (e *Executor) Run(ctx context.Context) {
 	}
 }
 
-// step expires leases, checks overruns, and sends packets until the sink
-// pushes back or nothing is ready.
+// step expires subscriptions, checks overruns, and sends packets until the
+// sink pushes back or nothing is ready.
 func (e *Executor) step() {
 	e.mu.Lock()
 	now := e.now()
 	var out []ended
-	for _, l := range e.leases {
-		if now >= l.deadline {
-			out = append(out, e.endLocked(l, proto.EndedTTL))
+	for _, sb := range e.subscriptions {
+		if now >= sb.deadline {
+			out = append(out, e.endLocked(sb, proto.EndedTTL))
 		}
 	}
 	for id := range numStreams {
 		e.observeLocked(id, now)
 		if age, ok := e.liveAgeLocked(id, now); ok && age > int64(OverrunAge) {
-			for _, l := range e.leases {
-				if l.accepted && l.want[id] {
-					out = append(out, e.endLocked(l, proto.EndedOverrun))
+			for _, sb := range e.subscriptions {
+				if sb.accepted && sb.want[id] {
+					out = append(out, e.endLocked(sb, proto.EndedOverrun))
 				}
 			}
 		}
@@ -514,25 +516,25 @@ func emit(send SendFunc, out []ended) {
 	}
 }
 
-// endLocked removes l, drops its backfill and returns its uplink.ended.
-func (e *Executor) endLocked(l *lease, reason proto.EndedReason) ended {
-	delete(e.leases, l.id)
+// endLocked removes sb, drops its backfill and returns its uplink.ended.
+func (e *Executor) endLocked(sb *subscription, reason proto.EndedReason) ended {
+	delete(e.subscriptions, sb.id)
 	body := proto.UplinkEnded{
-		LeaseID:      l.id,
-		Reason:       reason,
-		LastSample:   make(map[proto.StreamID]proto.NullU64, numStreams),
-		ClippedStart: make(map[proto.StreamID]proto.NullU64, numStreams),
+		SubscriptionID: sb.id,
+		Reason:         reason,
+		LastSample:     make(map[proto.StreamID]proto.NullU64, numStreams),
+		ClippedStart:   make(map[proto.StreamID]proto.NullU64, numStreams),
 	}
 	for id := range numStreams {
-		if !l.want[id] {
+		if !sb.want[id] {
 			continue
 		}
-		body.LastSample[streamKeys[id]] = l.last[id]
-		body.ClippedStart[streamKeys[id]] = l.clipped[id]
+		body.LastSample[streamKeys[id]] = sb.last[id]
+		body.ClippedStart[streamKeys[id]] = sb.clipped[id]
 		s := &e.streams[id]
 		kept := s.runs[:0]
 		for _, r := range s.runs {
-			if r.lease != l {
+			if r.sub != sb {
 				kept = append(kept, r)
 			}
 		}
@@ -543,12 +545,12 @@ func (e *Executor) endLocked(l *lease, reason proto.EndedReason) ended {
 			s.head, s.count = 0, 0
 		}
 	}
-	return ended{gen: l.gen, body: body}
+	return ended{gen: sb.gen, body: body}
 }
 
 func (e *Executor) wantedLocked(id streamID) bool {
-	for _, l := range e.leases {
-		if l.accepted && l.want[id] {
+	for _, sb := range e.subscriptions {
+		if sb.accepted && sb.want[id] {
 			return true
 		}
 	}
@@ -564,15 +566,15 @@ func (e *Executor) restartLocked(id streamID, epoch uint64) {
 	s.head, s.count = 0, 0
 }
 
-// activateLocked resolves an accepted lease's starts and queues its
+// activateLocked resolves an accepted subscription's starts and queues its
 // backfill ahead of the stream's live cursor.
-func (e *Executor) activateLocked(l *lease) {
+func (e *Executor) activateLocked(sb *subscription) {
 	for id := range numStreams {
-		if !l.want[id] {
+		if !sb.want[id] {
 			continue
 		}
-		start, clipped := e.resolveLocked(id, l.req[id])
-		l.start[id], l.clipped[id] = start, clipped
+		start, clipped := e.resolveLocked(id, sb.req[id])
+		sb.start[id], sb.clipped[id] = start, clipped
 		s := &e.streams[id]
 		end := e.ringEnd(id)
 		switch {
@@ -583,10 +585,10 @@ func (e *Executor) activateLocked(l *lease) {
 			s.observed = end
 			s.next = max(start, end)
 			if start < end {
-				s.runs = append(s.runs, run{lease: l, next: start, end: end})
+				s.runs = append(s.runs, run{sub: sb, next: start, end: end})
 			}
 		case start < s.next:
-			s.runs = append(s.runs, run{lease: l, next: start, end: s.next})
+			s.runs = append(s.runs, run{sub: sb, next: start, end: s.next})
 		}
 	}
 }
@@ -702,7 +704,7 @@ func (e *Executor) packLocked(now int64) (frame []byte, enqueued int64, ok bool)
 }
 
 // commitLocked advances the cursor of the packet the sink accepted and
-// records the last sample sent for every lease it serves.
+// records the last sample sent for every subscription it serves.
 func (e *Executor) commitLocked() {
 	p := e.pending
 	s := &e.streams[p.id]
@@ -717,10 +719,10 @@ func (e *Executor) commitLocked() {
 		s.next, s.disc = p.end, false
 	}
 	last := headerIndex(p.id, p.end) - 1
-	for _, l := range e.leases {
-		if l.accepted && l.want[p.id] && p.end > l.start[p.id] &&
-			(!l.last[p.id].Valid || last > l.last[p.id].V) {
-			l.last[p.id] = proto.U64(last)
+	for _, sb := range e.subscriptions {
+		if sb.accepted && sb.want[p.id] && p.end > sb.start[p.id] &&
+			(!sb.last[p.id].Valid || last > sb.last[p.id].V) {
+			sb.last[p.id] = proto.U64(last)
 		}
 	}
 }

@@ -85,10 +85,10 @@ from em_audio_timeline import (
     AfeRecord,
     AfeTimeline,
     Delivery,
-    LeaseEnd,
-    LeaseMessage,
-    LeaseReason,
-    LeaseTimeline,
+    SubscriptionEnd,
+    SubscriptionMessage,
+    SubscriptionReason,
+    SubscriptionBuffer,
     ProtocolError,
     ReferenceView,
     StreamId,
@@ -186,7 +186,7 @@ WAKE_CHIME_S = 3.0               # the wake chime's drain, before a reply window
 # answer may overlap the chime's or the question's end, plus the pre-roll (§16.6).
 REPLY_LEAD = REPLY_OVERLAP + PREROLL
 # Wall-clock bound on a reply window without command speech (§16.2): the 7 s window is sample
-# time, so a lease that delivers no mic, or stops, would otherwise leave the Dot listening.
+# time, so an audio subscription that delivers no mic, or stops, would otherwise leave the Dot listening.
 REPLY_WALL_S = 10.0
 REPLY_CHAIN_MAX = 5              # no-wake replies per chain
 REPLY_CHAIN_S = 60.0
@@ -206,12 +206,12 @@ REPEAT_WINDOW_S = 120.0
 FINAL_DEADLINE_S = 0.1
 FIX_COMPUTE_LIMIT_S = 10.0
 
-# A committed turn's response lease (§4.4) carries its AFE records, and while `saveUtterances` is on
+# A committed turn's response subscription (§4.4) carries its AFE records, and while `saveUtterances` is on
 # its mic, on through the response: at most this long after the commit, and this long past the
 # turn's end, for the AEC settling after the last of the response and the audio still in flight
 # when it drained.
-RESPONSE_LEASE_MAX_S = 30.0
-RESPONSE_LEASE_TAIL_S = 1.0
+RESPONSE_SUBSCRIPTION_MAX_S = 30.0
+RESPONSE_SUBSCRIPTION_TAIL_S = 1.0
 
 # Sample-time bounds on evidence the actor waits for.
 ECHO_WAIT = SAMPLE_RATE          # reference for a cell's echo label: wait ≤1 s of mic time
@@ -394,9 +394,10 @@ ERROR_LINE_REASONS = frozenset({TerminalReason.SPEECH_UNAVAILABLE, TerminalReaso
 CLARIFY_REASONS = frozenset({TerminalReason.EMPTY_TRANSCRIPT, TerminalReason.RETRY})
 ERROR_CUE_REASONS = frozenset({TerminalReason.INTERRUPTED, TerminalReason.AUDIO_OVERRUN})
 
-# A lease the device ended under an open utterance ends the turn with this reason.
-_LEASE_END_TERMINAL = {LeaseEnd.OVERRUN: TerminalReason.AUDIO_OVERRUN, LeaseEnd.MUTE: TerminalReason.MUTED,
-                       LeaseEnd.SESSION: TerminalReason.SESSION_LOST}
+# A subscription the device ended under an open utterance ends the turn with this reason.
+_SUBSCRIPTION_END_TERMINAL = {SubscriptionEnd.OVERRUN: TerminalReason.AUDIO_OVERRUN,
+                              SubscriptionEnd.MUTE: TerminalReason.MUTED,
+                              SubscriptionEnd.SESSION: TerminalReason.SESSION_LOST}
 _VERDICT_TERMINAL = {PlaybackVerdict.SELF_OUTPUT: TerminalReason.SELF_OUTPUT,
                      PlaybackVerdict.ECHO_ONLY: TerminalReason.ECHO_ONLY}
 _MESSAGE_PRIORITY = {
@@ -405,7 +406,7 @@ _MESSAGE_PRIORITY = {
     MessageType.WAKE_CANDIDATE: P_SPEECH,
     MessageType.WAKE_CANDIDATE_END: P_SPEECH,
     MessageType.ALERT_STATE: P_RESULT,
-    # Only a refusal of a near-miss lease's uplink.open is acted on (other acks have waiters).
+    # Only a refusal of a near-miss subscription's uplink.open is acted on (other acks have waiters).
     MessageType.COMMAND_ACK: P_LOSS,
 }
 
@@ -612,9 +613,9 @@ def _opening_rule(raw: object) -> em_wake_rules.OpenRule | None:
 
 @dataclass(frozen=True, slots=True)
 class DiagnosticTap:
-    """What a diagnostic lease feeds (em_controller's recording modes): each new
+    """What a diagnostic subscription feeds (em_controller's recording modes): each new
     mic block, capture samples `[start, start + len(pcm))`, and in an
-    `afe_metadata` session each batch of new AFE records, both with the lease
+    `afe_metadata` session each batch of new AFE records, both with the subscription
     they came from (every reconnect opens another). Evidence for the recordings'
     charts; nothing decides on them."""
 
@@ -635,7 +636,7 @@ class ActiveAlert:
 class WakeCandidate:
     """A `wake.candidate` body (WIRE §4.4), validated as the actor needs it."""
 
-    lease_id: str
+    subscription_id: str
     candidate_id: str
     capture_epoch: int
     support_start: int
@@ -672,7 +673,7 @@ class WakeCandidate:
                                 RingKind(kind) if isinstance(kind, str) and kind in RingKind else None,
                                 name if isinstance(name, str) else None)
         return cls(
-            lease_id=str(body["lease_id"]),
+            subscription_id=str(body["lease_id"]),
             candidate_id=str(body["candidate_id"]),
             capture_epoch=parse_u64(body.get("capture_epoch"), "capture_epoch"),
             support_start=parse_u64(body.get("support_start"), "support_start"),
@@ -854,7 +855,7 @@ class _NearMissHeard:
 
 @dataclass(frozen=True, slots=True)
 class _NearMissAudio:
-    """Mic arrived on a near-miss lease: see whether its capture is complete."""
+    """Mic arrived on a near-miss subscription: see whether its capture is complete."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -883,10 +884,10 @@ class _Focus:
 
 
 @dataclass
-class _Runtime:
-    """Actor-side evidence state of one uplink lease the speech worker analyses."""
+class _Evidence:
+    """Actor-side evidence state of one audio subscription the speech worker analyses."""
 
-    lease_id: str
+    subscription_id: str
     assembler: CellAssembler
     utterance: Utterance | None = None
     echo: EchoTracker | None = None
@@ -895,10 +896,10 @@ class _Runtime:
     echo_known: int = 0               # cells labelled with a trusted reference (coverage)
     echo_total: int = 0
     last_mic_end: int | None = None
-    # The lease's native AFE records when it takes the session's `afe` stream
+    # The subscription's native AFE records when it takes the session's `afe` stream
     # (afe_metadata_v1), else None, and the Silero probabilities the worker
-    # reported for its mic (the lease timeline's, so mute erases them with it).
-    # Held past the lease's release so the turn or candidate can summarise them
+    # reported for its mic (the subscription buffer's, so mute erases them with it).
+    # Held past the subscription's release so the turn or candidate can summarise them
     # when it ends; evidence only, never a decision input.
     afe: AfeTimeline | None = None
     vad: VadTrack | None = None
@@ -906,13 +907,13 @@ class _Runtime:
 
 @dataclass
 class _NearMissCapture:
-    """A near miss whose recording lease is open: its row waits for the lease to hold its span
-    (`complete`), the device ending the lease, or a refusal of `open_message`."""
+    """A near miss whose recording subscription is open: its row waits for the subscription to hold its span
+    (`complete`), the device ending the subscription, or a refusal of `open_message`."""
 
     record: em_db.NearMissRecord
     wire: NearMiss
-    lease_id: str
-    timeline: LeaseTimeline
+    subscription_id: str
+    timeline: SubscriptionBuffer
     open_message: str | None = None   # the uplink.open's message_id, which a command.ack names
 
     @property
@@ -925,7 +926,7 @@ class _NearMissCapture:
         mic = self.timeline.mic.frontier
         if mic is None or mic < self.end:
             return False
-        if StreamId.AFE not in self.timeline.lease.streams or mic >= self.end + NEAR_MISS_AFE_WAIT:
+        if StreamId.AFE not in self.timeline.subscription.streams or mic >= self.end + NEAR_MISS_AFE_WAIT:
             return True
         afe = self.timeline.afe.frontier
         return afe is not None and afe * AFE_PERIOD_SAMPLES >= self.end
@@ -935,7 +936,7 @@ class _NearMissCapture:
 class _Candidate:
     wire: WakeCandidate
     model: WakeModel
-    runtime: _Runtime
+    evidence: _Evidence
     received: float
     peak: float | None
     support_end: int | None = None
@@ -951,7 +952,7 @@ class _Candidate:
     verification_error: str | None = None
     answered: asyncio.Event = field(default_factory=asyncio.Event)
     decided_at: float | None = None
-    mic_at_decision: int | None = None        # the lease's mic frontier when it was decided
+    mic_at_decision: int | None = None        # the subscription's mic frontier when it was decided
     reference_events: list[tuple[int, ReferenceCandidate]] = field(default_factory=list)
     reference_ready: bool = False
 
@@ -960,8 +961,8 @@ class _Candidate:
         return self.wire.candidate_id
 
     @property
-    def lease_id(self) -> str:
-        return self.wire.lease_id
+    def subscription_id(self) -> str:
+        return self.wire.subscription_id
 
     @property
     def capture_epoch(self) -> int:
@@ -986,7 +987,7 @@ class _Candidate:
 
 @dataclass(frozen=True, slots=True)
 class _Clip:
-    """Canonical PCM read off a lease's mic timeline, starting at capture sample `start`."""
+    """Canonical PCM read off a subscription's mic timeline, starting at capture sample `start`."""
 
     start: int
     pcm: bytes
@@ -1001,14 +1002,14 @@ class _Clip:
 
 
 @dataclass
-class _ResponseLease:
-    """A committed turn's response `turn` lease (§4.4) and what it received: `afe` always, `mic`
-    when the turn recording is made. It closes at `close_at`: RESPONSE_LEASE_MAX_S after the
-    commit, or RESPONSE_LEASE_TAIL_S after the turn ends, whichever is first; `done` resolves once
+class _ResponseSubscription:
+    """A committed turn's response `turn` subscription (§4.4) and what it received: `afe` always, `mic`
+    when the turn recording is made. It closes at `close_at`: RESPONSE_SUBSCRIPTION_MAX_S after the
+    commit, or RESPONSE_SUBSCRIPTION_TAIL_S after the turn ends, whichever is first; `done` resolves once
     it has ended, however it ended."""
 
-    lease_id: str
-    timeline: LeaseTimeline
+    subscription_id: str
+    timeline: SubscriptionBuffer
     close_at: float
     done: asyncio.Future[None]
 
@@ -1037,7 +1038,7 @@ class ReplyVad(enum.StrEnum):
 
     VOICE = "voice"        # the asking turn's voice snapshot, restored at the trigger
     FRESH = "fresh"        # no snapshot: a fresh state from the question's drain
-    CARRIED = "carried"    # an answer early or under way: the lease's state, untouched
+    CARRIED = "carried"    # an answer early or under way: the subscription's state, untouched
 
 
 class ReplyWindowTrace(TypedDict):
@@ -1058,7 +1059,7 @@ class ReplyWindowTrace(TypedDict):
 
 @dataclass
 class _Expectation:
-    """A §9.1 reply expectation. `owner` names its focus/uplink leases and becomes
+    """A §9.1 reply expectation. `owner` names its focus leases and audio subscription, and becomes
     the reply turn's id."""
 
     expectation_id: str
@@ -1072,10 +1073,10 @@ class _Expectation:
     choices: tuple[Choice, ...] | None = None
     pending_operation: _PendingOperation | None = None
     reprompted: bool = False
-    runtime: _Runtime | None = None
+    evidence: _Evidence | None = None
     watch: ReplyWatch = field(default_factory=ReplyWatch)
     prompt: Playback | None = None    # the question, then the wake chime after it
-    awaiting_audio: bool = False      # the window opened before the lease had any mic: open at its first cell
+    awaiting_audio: bool = False      # the window opened before the subscription had any mic: open at its first cell
     window_opened: float | None = None   # loop time the reply window opened (after the chime, or an early answer)
     window: ReplyWindowTrace | None = None   # how it opened; None until the drain or an early answer
     opening: bool = False             # its reply turn is opening: nothing opens another
@@ -1089,7 +1090,7 @@ class _Turn:
     trigger: UtteranceKind
     opened: float
     utterance: Utterance
-    runtime: _Runtime
+    evidence: _Evidence
     model: WakeModel | None = None
     candidate: _Candidate | None = None
     context: CommandContext | None = None
@@ -1110,7 +1111,7 @@ class _Turn:
     persisted: asyncio.Task[int | None] | None = None   # the row write; its result is the row id
     wake_db: float | None = None
     wake_clip: _Clip | None = None
-    capture: _Clip | None = None              # the turn lease's mic for the turn recording; None: not made
+    capture: _Clip | None = None              # the turn subscription's mic for the turn recording; None: not made
     stt_copy: bytes | None = None             # the committed span as sent to STT, sample for sample
     stt_raw: str | None = None                # HA's transcript before wake-phrase removal
     stt_text: str | None = None               # what was routed: stripped HA transcript or local command
@@ -1123,7 +1124,7 @@ class _Turn:
     coverage: float | None = None
     afe_evidence: AfeEvidence | None = None   # native AFE evidence; None: unavailable (or not yet taken)
     afe_series: AfeSeries | None = None       # the per-period records behind it; None: unavailable or no data
-    response_lease: _ResponseLease | None = None   # the lease after the commit; None: none opened
+    response_subscription: _ResponseSubscription | None = None   # the subscription after the commit; None: none opened
     stages: dict[TurnStage, tuple[float, float]] = field(default_factory=dict)   # monotonic [start, end]
     timings: dict[str, int] = field(default_factory=dict)
     reopened: list[UtteranceTrace] = field(default_factory=list)   # a reply's utterances before a gap
@@ -1199,25 +1200,25 @@ class SessionActor:
         self._generation = 0
         self._turn: _Turn | None = None
         self._candidate: _Candidate | None = None
-        # Refused candidates whose verifier had not answered yet, by lease id: their rows wait
+        # Refused candidates whose verifier had not answered yet, by subscription id: their rows wait
         # (LATE_VERIFICATION_WAIT_S at most) to keep what it would have said.
         self._unanswered: dict[str, _Candidate] = {}
         self._expectation: _Expectation | None = None
-        self._runtimes: dict[str, _Runtime] = {}
+        self._evidence: dict[str, _Evidence] = {}
         self._focus: dict[str, _Focus] = {}
         self._dialog_playback: Playback | None = None
         self._listeners: list[Callable[[ActorEvent], object]] = []
         self._muted = False
         self._alert_foreground: bool | None = None
         self._diagnostic: DiagnosticTap | None = None
-        self._diagnostic_lease: str | None = None
+        self._diagnostic_subscription: str | None = None
         self._announcements = asyncio.Lock()
         self._tasks: set[asyncio.Task[object]] = set()
         self._persists: set[asyncio.Task[object]] = set()
         self._listener_futures: set[asyncio.Future[object]] = set()   # awaitables listeners returned
         self._dialog_active = False
-        self._response_leases: dict[str, _ResponseLease] = {}   # by lease id, until each has ended
-        self._near_misses: dict[str, _NearMissCapture] = {}     # by lease id, until each row is written
+        self._response_subscriptions: dict[str, _ResponseSubscription] = {}   # by subscription id, until each has ended
+        self._near_misses: dict[str, _NearMissCapture] = {}     # by subscription id, until each row is written
         self._last_spoken: _Spoken | None = None   # what "say that again" replays; memory only
 
     # --- public surface -------------------------------------------------------
@@ -1293,16 +1294,16 @@ class SessionActor:
         """One uplink EMA1 frame. Raises `em_audio_timeline.ProtocolError` for a WIRE violation."""
         if self.uplink is None:
             return
-        # `ingest` has already stored AFE records, and a response or near-miss lease's mic, in their
-        # leases' timelines; they are read only when a turn, candidate or near miss ends, so they
-        # never reach the queue, the worker, or a decision. The diagnostic lease's records go to its tap.
+        # `ingest` has already stored AFE records, and a response or near-miss subscription's mic, in their
+        # subscriptions' buffers; they are read only when a turn, candidate or near miss ends, so they
+        # never reach the queue, the worker, or a decision. The diagnostic subscription's records go to its tap.
         deliveries: list[Delivery] = []
         near_miss = False
         for d in self.uplink.ingest(frame):
-            if d.lease_id in self._near_misses:
+            if d.subscription_id in self._near_misses:
                 near_miss = True
-            elif ((d.stream_id != StreamId.AFE or d.lease_id == self._diagnostic_lease)
-                  and d.lease_id not in self._response_leases):
+            elif ((d.stream_id != StreamId.AFE or d.subscription_id == self._diagnostic_subscription)
+                  and d.subscription_id not in self._response_subscriptions):
                 deliveries.append(d)
         if deliveries:
             gap = any(d.packet.discontinuity or d.packet.muted for d in deliveries)
@@ -1338,7 +1339,7 @@ class SessionActor:
         await future
 
     async def open_diagnostic(self, tap: DiagnosticTap) -> None:
-        """Hold a live-mic diagnostic lease (re-opened after every reconnect); wakes are refused meanwhile."""
+        """Hold a live-mic diagnostic subscription (re-opened after every reconnect); wakes are refused meanwhile."""
         self._diagnostic = tap
         self._post(P_INTERRUPT, _Diagnostic())
 
@@ -1426,9 +1427,10 @@ class SessionActor:
                 await self._privacy(body)
             case MessageType.UPLINK_ENDED:
                 if self.uplink is not None:
-                    lease = self.uplink.leases.device_ended(body)
-                    if lease is not None:
-                        await self._lease_ended(lease.lease_id, lease.ended or LeaseEnd.CLOSED)
+                    subscription = self.uplink.subscriptions.device_ended(body)
+                    if subscription is not None:
+                        await self._subscription_ended(subscription.subscription_id,
+                                                       subscription.ended or SubscriptionEnd.CLOSED)
             case MessageType.WAKE_CANDIDATE:
                 await self._wake_candidate(envelope)
             case MessageType.WAKE_CANDIDATE_END:
@@ -1442,12 +1444,12 @@ class SessionActor:
         loop = asyncio.get_running_loop()
         now = loop.time()
         if self.link is not None and self.uplink is not None:
-            for lease in self.uplink.leases.due_renewals():
-                await self._lease_message(self.uplink.leases.renew(lease.lease_id))
-            for lease in self.uplink.leases.expire():
-                await self._lease_ended(lease.lease_id, lease.ended or LeaseEnd.TTL)
-        for response in [r for r in self._response_leases.values() if now >= r.close_at]:
-            await self._end_response_lease(response)
+            for subscription in self.uplink.subscriptions.due_renewals():
+                await self._subscription_message(self.uplink.subscriptions.renew(subscription.subscription_id))
+            for subscription in self.uplink.subscriptions.expire():
+                await self._subscription_ended(subscription.subscription_id, subscription.ended or SubscriptionEnd.TTL)
+        for response in [r for r in self._response_subscriptions.values() if now >= r.close_at]:
+            await self._end_response_subscription(response)
         for focus in list(self._focus.values()):
             if now - focus.renewed >= RENEW_S:
                 focus.renewed = now
@@ -1479,7 +1481,7 @@ class SessionActor:
         if self._turn is not None:
             await self._finish_turn(self._turn, TerminalReason.SESSION_LOST, feedback=False)
         await self._drop_expectation(TerminalReason.SESSION_LOST)
-        await self._end_all_response_leases(close=True)   # the rows wait for none of them
+        await self._end_all_response_subscriptions(close=True)   # the rows wait for none of them
         await self._end_all_near_misses()
         if self._persists:
             await asyncio.wait(list(self._persists), timeout=PERSIST_SHUTDOWN_S)
@@ -1490,19 +1492,20 @@ class SessionActor:
     # --- session lifecycle -----------------------------------------------------------
 
     async def _session_lost(self, uplink: UplinkSession | None, render: RenderClient | None) -> None:
-        # Every dialog and uplink lease ended with the session (§16.1); nothing is released on the wire.
+        # Every dialog focus lease and audio subscription ended with the session (§16.1); nothing is
+        # released on the wire.
         self._focus.clear()
         if uplink is not None:
-            for lease in uplink.clear(LeaseEnd.SESSION):
-                self.deps.worker.close_lease(lease.lease_id)
+            for subscription in uplink.clear(SubscriptionEnd.SESSION):
+                self.deps.worker.close_subscription(subscription.subscription_id)
         await self._end_all_near_misses()   # their audio is gone with the session: `failed`
-        await self._end_all_response_leases(close=False)
+        await self._end_all_response_subscriptions(close=False)
         self._candidate = None
         if self._turn is not None:
             await self._finish_turn(self._turn, TerminalReason.SESSION_LOST)
         await self._drop_expectation(TerminalReason.SESSION_LOST)
-        self._runtimes.clear()
-        self._diagnostic_lease = None
+        self._evidence.clear()
+        self._diagnostic_subscription = None
         self._alert_foreground = None
         if render is not None:
             render.fail_all(TerminalReason.SESSION_LOST)
@@ -1514,18 +1517,18 @@ class SessionActor:
         self._muted = bool(body.get("muted"))
         if not self._muted:
             return
-        # Device-sovereign mute ends every lease and erases buffered audio (§3.2 inv. 10).
+        # Device-sovereign mute ends every subscription and erases buffered audio (§3.2 inv. 10).
         if self.uplink is not None:
-            for lease in self.uplink.clear(LeaseEnd.MUTE):
-                self.deps.worker.close_lease(lease.lease_id)
+            for subscription in self.uplink.clear(SubscriptionEnd.MUTE):
+                self.deps.worker.close_subscription(subscription.subscription_id)
         await self._end_all_near_misses()   # mute erased their audio: `failed`
-        await self._end_all_response_leases(close=False)
+        await self._end_all_response_subscriptions(close=False)
         self._candidate = None
-        self._diagnostic_lease = None
+        self._diagnostic_subscription = None
         if self._turn is not None:
             await self._finish_turn(self._turn, TerminalReason.MUTED)
         await self._drop_expectation(TerminalReason.MUTED)
-        self._runtimes.clear()
+        self._evidence.clear()
         if self._turn is None:
             self._set_state(ActorState.IDLE)
 
@@ -1538,69 +1541,70 @@ class SessionActor:
         if was is False and foreground and turn is not None and turn.commit is None:
             await self._finish_turn(turn, TerminalReason.ALERT_PREEMPTED)
 
-    async def _lease_ended(self, lease_id: str, reason: LeaseEnd) -> None:
-        capture = self._near_misses.get(lease_id)
+    async def _subscription_ended(self, subscription_id: str, reason: SubscriptionEnd) -> None:
+        capture = self._near_misses.get(subscription_id)
         if capture is not None:
             # Ended before it held the whole span: what it holds is kept if it covers the support.
             await self._end_near_miss(capture, close=False)
             return
         if self.uplink is not None:
-            self.uplink.release(lease_id)
-        runtime = self._runtimes.pop(lease_id, None)
-        if runtime is not None:
-            self.deps.worker.close_lease(lease_id)
-        response = self._response_leases.get(lease_id)
+            self.uplink.release(subscription_id)
+        evidence = self._evidence.pop(subscription_id, None)
+        if evidence is not None:
+            self.deps.worker.close_subscription(subscription_id)
+        response = self._response_subscriptions.get(subscription_id)
         if response is not None:
-            await self._end_response_lease(response, close=False)
+            await self._end_response_subscription(response, close=False)
             return
-        if lease_id == self._diagnostic_lease:
-            self._diagnostic_lease = None
-            if reason not in (LeaseEnd.TTL, LeaseEnd.CLOSED):   # 30 min cap and explicit closes stay closed
+        if subscription_id == self._diagnostic_subscription:
+            self._diagnostic_subscription = None
+            # The 30 min cap and explicit closes stay closed.
+            if reason not in (SubscriptionEnd.TTL, SubscriptionEnd.CLOSED):
                 await self._sync_diagnostic()
             return
         candidate = self._candidate
-        if candidate is not None and candidate.lease_id == lease_id:
+        if candidate is not None and candidate.subscription_id == subscription_id:
             await self._reject_candidate(candidate, TerminalReason.VERIFIER_TIMEOUT)
             return
         turn = self._turn
-        if turn is not None and turn.runtime.lease_id == lease_id and turn.commit is None:
-            await self._finish_turn(turn, _LEASE_END_TERMINAL.get(reason, TerminalReason.INTERRUPTED))
+        if turn is not None and turn.evidence.subscription_id == subscription_id and turn.commit is None:
+            await self._finish_turn(turn, _SUBSCRIPTION_END_TERMINAL.get(reason, TerminalReason.INTERRUPTED))
         exp = self._expectation
-        if exp is not None and exp.runtime is not None and exp.runtime.lease_id == lease_id:
-            exp.runtime = None
+        if exp is not None and exp.evidence is not None and exp.evidence.subscription_id == subscription_id:
+            exp.evidence = None
             await self._end_expectation(TerminalReason.INTERRUPTED)
 
-    # --- diagnostic lease --------------------------------------------------------------
+    # --- diagnostic subscription --------------------------------------------------------------
 
     async def _sync_diagnostic(self) -> None:
         if self._diagnostic is None:
-            if self._diagnostic_lease is not None:
-                await self._close_uplink(self._diagnostic_lease, LeaseEnd.CLOSED)
+            if self._diagnostic_subscription is not None:
+                await self._close_uplink(self._diagnostic_subscription, SubscriptionEnd.CLOSED)
                 if self.uplink is not None:
-                    self.uplink.release(self._diagnostic_lease)
-                self._diagnostic_lease = None
+                    self.uplink.release(self._diagnostic_subscription)
+                self._diagnostic_subscription = None
             return
-        if self._diagnostic_lease is not None or self.uplink is None or self._muted:
+        if self._diagnostic_subscription is not None or self.uplink is None or self._muted:
             return
         epoch = self.uplink.streams.current(StreamId.MIC)
         if epoch is None:
             return
-        # In an afe_metadata session the lease also takes the AFE records, for the recordings' charts.
+        # In an afe_metadata session the subscription also takes the AFE records, for the recordings' charts.
         streams: dict[StreamId, int | None] = {StreamId.MIC: None}
         if self.uplink.afe_metadata:
             streams[StreamId.AFE] = None
-        lease_id = str(uuid.uuid4())
-        await self._lease_message(self.uplink.open(
-            lease_id, LeaseReason.DIAGNOSTIC, f"diagnostic:{self.device_id}", epoch, streams))
-        self._diagnostic_lease = lease_id
+        subscription_id = str(uuid.uuid4())
+        await self._subscription_message(self.uplink.open(
+            subscription_id, SubscriptionReason.DIAGNOSTIC, f"diagnostic:{self.device_id}", epoch, streams))
+        self._diagnostic_subscription = subscription_id
 
     # --- near misses (near_miss_v1) ------------------------------------------------------------
 
     def _near_miss_refusal(self, wire: NearMiss) -> em_db.NearMissRecording | None:
-        """Why a near miss gets no recording lease, or None when it gets one."""
+        """Why a near miss gets no recording subscription, or None when it gets one."""
         if not self._config().get("saveWakeClips"):
             return em_db.NearMissRecording.OFF
-        if self._diagnostic is not None or self._diagnostic_lease is not None or self._muted:
+        if self._diagnostic is not None or self._diagnostic_subscription is not None or self._muted:
             return em_db.NearMissRecording.NOT_PERMITTED
         if self.uplink is None or self.uplink.streams.current(StreamId.MIC) != wire.capture_epoch:
             return em_db.NearMissRecording.FAILED   # its capture epoch is over: the audio is gone
@@ -1617,9 +1621,9 @@ class SessionActor:
 
     async def _near_miss(self, wire: NearMiss, ts: float) -> None:
         """A wake.near_miss: its row, and while `saveWakeClips` is on its recording, through a
-        `near_miss` lease taking mic from its support's start −300 ms (WIRE §4.5) and, in an
+        `near_miss` subscription taking mic from its support's start −300 ms (WIRE §4.5) and, in an
         `afe_metadata` session, the AFE records from a second before it, for the near miss's chart.
-        The lease feeds nothing but the recording and the chart: no worker, no decision."""
+        The subscription feeds nothing but the recording and the chart: no worker, no decision."""
         record = em_db.NearMissRecord(
             ts=ts, near_miss_uuid=wire.near_miss_id, profile=wire.profile, floor=wire.floor,
             peak=wire.peak, wake_threshold=self._wake_threshold(wire), wake_model_sha256=wire.graph_sha256,
@@ -1630,15 +1634,16 @@ class SessionActor:
         if refusal is not None or link is None or uplink is None:
             self._persist_near_miss(replace(record, recording=refusal or em_db.NearMissRecording.FAILED), None)
             return
-        lease_id = str(uuid.uuid4())
+        subscription_id = str(uuid.uuid4())
         streams: dict[StreamId, int | None] = {StreamId.MIC: wire.support_start - NEAR_MISS_PAD}
         if uplink.afe_metadata:
             streams[StreamId.AFE] = max(0, wire.support_start - PRE_SAMPLES)
-        message = uplink.open(lease_id, LeaseReason.NEAR_MISS, wire.near_miss_id, wire.capture_epoch, streams)
-        timeline = uplink.timelines[lease_id]
-        timeline.set_utterance_start(timeline.lease.streams[StreamId.MIC])   # retention anchor: the whole span
-        capture = _NearMissCapture(record, wire, lease_id, timeline)
-        self._near_misses[lease_id] = capture
+        message = uplink.open(subscription_id, SubscriptionReason.NEAR_MISS, wire.near_miss_id, wire.capture_epoch,
+                              streams)
+        timeline = uplink.timelines[subscription_id]
+        timeline.set_utterance_start(timeline.subscription.streams[StreamId.MIC])   # retention anchor: the whole span
+        capture = _NearMissCapture(record, wire, subscription_id, timeline)
+        self._near_misses[subscription_id] = capture
         try:
             capture.open_message = await link.send(MessageType(message.type), message.body,
                                                    generation=message.generation)
@@ -1647,13 +1652,13 @@ class SessionActor:
             await self._end_near_miss(capture, close=False)
 
     async def _near_miss_audio(self) -> None:
-        """Close each near-miss lease that holds its span (_NearMissCapture.complete)."""
+        """Close each near-miss subscription that holds its span (_NearMissCapture.complete)."""
         for capture in list(self._near_misses.values()):
             if capture.complete():
                 await self._end_near_miss(capture, close=True)
 
     async def _near_miss_ack(self, ack: CommandAck) -> None:
-        """A refused near-miss uplink.open: the device opened no lease."""
+        """A refused near-miss uplink.open: the device opened no subscription."""
         if ack.status != AckStatus.REJECTED:
             return
         capture = next((c for c in self._near_misses.values() if c.open_message == ack.message_id), None)
@@ -1663,10 +1668,10 @@ class SessionActor:
             await self._end_near_miss(capture, close=False)
 
     async def _end_near_miss(self, capture: _NearMissCapture, *, close: bool) -> None:
-        """Write the near miss's row with what its lease holds: the recording (`_near_miss_clip`)
+        """Write the near miss's row with what its subscription holds: the recording (`_near_miss_clip`)
         and the chart of its AFE records, placing the recording, sending `uplink.close` when
-        `close` (not for a lease the device has ended or never opened)."""
-        if self._near_misses.pop(capture.lease_id, None) is None:
+        `close` (not for a subscription the device has ended or never opened)."""
+        if self._near_misses.pop(capture.subscription_id, None) is None:
             return
         clip = _near_miss_clip(capture)
         wire = capture.wire
@@ -1674,9 +1679,9 @@ class SessionActor:
         if series is not None and clip is not None:
             series = replace(series, recording=clip.span)
         if close:
-            await self._close_uplink(capture.lease_id, LeaseEnd.CLOSED)
+            await self._close_uplink(capture.subscription_id, SubscriptionEnd.CLOSED)
         if self.uplink is not None:
-            self.uplink.release(capture.lease_id)
+            self.uplink.release(capture.subscription_id)
         record = replace(capture.record, afe_series=series.dumps() if series is not None else None)
         self._persist_near_miss(record, clip.pcm if clip is not None else None)
 
@@ -1712,34 +1717,34 @@ class SessionActor:
         try:
             wire = WakeCandidate.parse(envelope.body)
             model = self.deps.registry.get(wire.graph_sha256)
-            uplink.candidate(wire.lease_id, wire.candidate_id, wire.capture_epoch, wire.support_start)
+            uplink.candidate(wire.subscription_id, wire.candidate_id, wire.capture_epoch, wire.support_start)
         except Exception as exc:
             log.warning("[%s] refused malformed wake.candidate: %s", self.device_id, exc)
             await link.ack(message_id, AckStatus.REJECTED, CandidateRefusal.MALFORMED)
             return
-        lease_id = wire.lease_id
+        subscription_id = wire.subscription_id
         refusal = self._refusal() or (CandidateRefusal.CANDIDATE_PENDING if self._candidate is not None else None)
         if refusal is not None:
-            uplink.acknowledge(lease_id, False)
-            uplink.release(lease_id)
+            uplink.acknowledge(subscription_id, False)
+            uplink.release(subscription_id)
             await link.ack(message_id, AckStatus.REJECTED, refusal)
             if refusal in (CandidateRefusal.DIAGNOSTIC, CandidateRefusal.SPEECH_UNAVAILABLE):
                 self._cue(Cue.ERROR_ANIM)
             return
         try:
             await self.deps.worker.load_wake_graph(model.graph_sha256)
-            self.deps.worker.open_lease(self.device_id, wire.capture_epoch, lease_id, model.graph_sha256)
+            self.deps.worker.open_subscription(self.device_id, wire.capture_epoch, subscription_id, model.graph_sha256)
         except Exception as exc:
             log.warning("[%s] wake candidate refused, speech worker: %s", self.device_id, exc)
-            uplink.acknowledge(lease_id, False)
-            uplink.release(lease_id)
+            uplink.acknowledge(subscription_id, False)
+            uplink.release(subscription_id)
             await link.ack(message_id, AckStatus.REJECTED, CandidateRefusal.SPEECH_UNAVAILABLE)
             self._cue(Cue.ERROR_ANIM)
             return
-        uplink.acknowledge(lease_id, True)
+        uplink.acknowledge(subscription_id, True)
         await link.ack(message_id, AckStatus.ACCEPTED)
-        runtime = self._new_runtime(lease_id)
-        candidate = _Candidate(wire, model, runtime, asyncio.get_running_loop().time(), wire.peak)
+        evidence = self._new_evidence(subscription_id)
+        candidate = _Candidate(wire, model, evidence, asyncio.get_running_loop().time(), wire.peak)
         self._candidate = candidate
         if self.deps.recognizer():
             # The command's prefixes are asked about in a second or two (§16.6): make sure
@@ -1799,29 +1804,30 @@ class SessionActor:
             await self._reject_candidate(candidate, TerminalReason.VERIFIER_TIMEOUT)
 
     async def _reject_candidate(self, candidate: _Candidate, reason: TerminalReason) -> None:
-        """Close the candidate lease (also releasing any provisional duck); no turn, focus, or chime
+        """Close the candidate subscription (also releasing any provisional duck); no turn, focus, or chime
         (a local_wake_chime device may already have chimed an idle candidate; it is not retracted).
-        While `saveUtterances` is on, what the lease heard is kept as the row's turn recording; while
+        While `saveUtterances` is on, what the subscription heard is kept as the row's turn recording; while
         `saveWakeClips` is on, a producing-sound candidate keeps the verifier's audio as its wake clip."""
         self._candidate = None
         self._mark_decided(candidate)
-        afe, series = _afe_snapshot(candidate.runtime, candidate, None)
-        timeline = self._timeline(candidate.runtime)
-        capture = (_lease_capture(timeline, _support(candidate), None)
-                   if timeline is not None and series is not None and self._records_turn(candidate.runtime)
+        afe, series = _afe_snapshot(candidate.evidence, candidate, None)
+        timeline = self._timeline(candidate.evidence)
+        capture = (_subscription_capture(timeline, _support(candidate), None)
+                   if timeline is not None and series is not None and self._records_turn(candidate.evidence)
                    else None)
         clip = _refused_clip(candidate, timeline) if timeline is not None and candidate.producing_sound else None
         if candidate.verification_submitted_at is not None and not candidate.answered.is_set():
-            self._unanswered[candidate.lease_id] = candidate
-        close = LeaseEnd.ARBITRATION_LOST if reason == TerminalReason.ARBITRATION_LOST else LeaseEnd.REJECTED
-        await self._close_uplink(candidate.lease_id, close)
-        self._release_runtime(candidate.lease_id)
+            self._unanswered[candidate.subscription_id] = candidate
+        close = (SubscriptionEnd.ARBITRATION_LOST if reason == TerminalReason.ARBITRATION_LOST
+                 else SubscriptionEnd.REJECTED)
+        await self._close_uplink(candidate.subscription_id, close)
+        self._release_evidence(candidate.subscription_id)
         self._emit(ActorEvent(ActorEventKind.TERMINAL, self.state, reason, self._dialog_active))
         self._persists.add(self._spawn(self._persist_candidate(candidate, reason, afe, series, capture, clip)))
 
     def _mark_decided(self, candidate: _Candidate) -> None:
         candidate.decided_at = asyncio.get_running_loop().time()
-        timeline = self._timeline(candidate.runtime)
+        timeline = self._timeline(candidate.evidence)
         candidate.mic_at_decision = timeline.mic.frontier if timeline is not None else None
 
     async def _accept_candidate(self, candidate: _Candidate) -> None:
@@ -1846,16 +1852,16 @@ class SessionActor:
         if uplink is None:
             return
         turn_id = str(uuid.uuid4())
-        await self._lease_message(uplink.leases.convert_to_turn(candidate.lease_id, turn_id))
+        await self._subscription_message(uplink.subscriptions.convert_to_turn(candidate.subscription_id, turn_id))
         trigger = wake_trigger_sample(candidate.wire.hops, candidate.threshold)
-        lease = uplink.leases.get(candidate.lease_id)
-        mic_start = lease.streams.get(StreamId.MIC) if lease is not None else None
+        subscription = uplink.subscriptions.get(candidate.subscription_id)
+        mic_start = subscription.streams.get(StreamId.MIC) if subscription is not None else None
         start = max(candidate.support_start - PREROLL, mic_start or 0)
         spec = self._spec(UtteranceKind.WAKE, start, trigger, inherited,
                           seed_start=candidate.support_start, wake_open=candidate.open_sample,
                           wake_phrase=candidate.model.wake_phrase, context=context)
         turn = _Turn(turn_id, self._generation, UtteranceKind.WAKE, asyncio.get_running_loop().time(),
-                     Utterance(spec), candidate.runtime, candidate.model, candidate, context, target,
+                     Utterance(spec), candidate.evidence, candidate.model, candidate, context, target,
                      context_device=context_device,
                      conversation_id=inherited.conversation_id if inherited else None,
                      expectation=inherited, local_only=local_only)
@@ -1914,7 +1920,7 @@ class SessionActor:
         press = parse_u64(body["capture_sample"], "capture_sample")
         inherited = self._take_expectation()
         await self._supersede()
-        turn_id, lease_id = str(uuid.uuid4()), str(uuid.uuid4())
+        turn_id, subscription_id = str(uuid.uuid4()), str(uuid.uuid4())
         mic = max(0, press - PREROLL)
         streams: dict[StreamId, int | None] = {
             StreamId.MIC: mic,
@@ -1922,18 +1928,19 @@ class SessionActor:
             StreamId.REFERENCE: max(0, mic - CANDIDATE_REFERENCE_LEAD),
         }
         if uplink.afe_metadata:
-            # From the reference start (the AEC state before the press); the lease rounds it to 1280.
+            # From the reference start (the AEC state before the press); the subscription rounds it to 1280.
             streams[StreamId.AFE] = streams[StreamId.REFERENCE]
-        await self._lease_message(uplink.open(lease_id, LeaseReason.TURN, turn_id, capture_epoch, streams))
+        await self._subscription_message(uplink.open(subscription_id, SubscriptionReason.TURN, turn_id, capture_epoch,
+                                                     streams))
         model = self.deps.registry.for_config(self._config())
         await self.deps.worker.load_wake_graph(model.graph_sha256)
-        self.deps.worker.open_lease(self.device_id, capture_epoch, lease_id, model.graph_sha256)
-        runtime = self._new_runtime(lease_id)
-        lease = uplink.leases.get(lease_id)
-        mic_start = lease.streams.get(StreamId.MIC) if lease is not None else None
-        start = mic if mic_start is None else mic_start      # the lease rounds it to the cell grid
+        self.deps.worker.open_subscription(self.device_id, capture_epoch, subscription_id, model.graph_sha256)
+        evidence = self._new_evidence(subscription_id)
+        subscription = uplink.subscriptions.get(subscription_id)
+        mic_start = subscription.streams.get(StreamId.MIC) if subscription is not None else None
+        start = mic if mic_start is None else mic_start      # the subscription rounds it to the cell grid
         turn = _Turn(turn_id, self._generation, UtteranceKind.BUTTON, asyncio.get_running_loop().time(),
-                     Utterance(self._spec(UtteranceKind.BUTTON, start, press, inherited)), runtime,
+                     Utterance(self._spec(UtteranceKind.BUTTON, start, press, inherited)), evidence,
                      conversation_id=inherited.conversation_id if inherited else None, expectation=inherited)
         self._turn = turn
         await self._acquire_focus(turn_id, Focus.DIALOG_INPUT, turn.generation)
@@ -1996,27 +2003,27 @@ class SessionActor:
         )
 
     async def _open_utterance(self, turn: _Turn) -> None:
-        """Bind the utterance to its lease: ASR from its pre-roll, per-cell echo from its start."""
-        runtime, spec = turn.runtime, turn.utterance.spec
-        timeline = self._timeline(runtime)
+        """Bind the utterance to its subscription: ASR from its pre-roll, per-cell echo from its start."""
+        evidence, spec = turn.evidence, turn.utterance.spec
+        timeline = self._timeline(evidence)
         if timeline is None:
             await self._finish_turn(turn, TerminalReason.SESSION_LOST)
             return
         timeline.set_utterance_start(spec.start)
         try:
-            self.deps.worker.open_utterance(runtime.lease_id, spec.utterance_id, spec.start, spec.trigger,
+            self.deps.worker.open_utterance(evidence.subscription_id, spec.utterance_id, spec.start, spec.trigger,
                                             timeline.mic, pause_server=spec.pause_server)
         except SpeechWorkerError as exc:
             log.warning("[%s] utterance ASR failed to open: %s", self.device_id, exc)
             await self._finish_turn(turn, TerminalReason.INTERRUPTED)
             return
-        runtime.utterance = turn.utterance
-        runtime.echo_open = spec.start
-        runtime.echo = None
-        runtime.assembler.require_echo_from(spec.start)
-        for ev in list(runtime.assembler.history):
+        evidence.utterance = turn.utterance
+        evidence.echo_open = spec.start
+        evidence.echo = None
+        evidence.assembler.require_echo_from(spec.start)
+        for ev in list(evidence.assembler.history):
             turn.utterance.push_cell(ev)
-        await self._pump(runtime)
+        await self._pump(evidence)
 
     async def _open_reply(self, exp: _Expectation, trigger: int, *, early: bool = False,
                           guarded: bool = False) -> None:
@@ -2024,12 +2031,12 @@ class SessionActor:
         like a button turn: as its window opens (`_begin_window`) with its trigger there, or at
         an early answer's onset. The normal reducer then decides what is the answer; a silent
         window closes `no_input`. The utterance starts REPLY_LEAD before a window's trigger
-        (300 ms before an early answer's onset), never before the lease's first retained
+        (300 ms before an early answer's onset), never before the subscription's first retained
         sample. `guarded`: its VAD was primed for the window, so no run opens in the first
         REPLY_GUARD after the trigger."""
-        runtime = exp.runtime
-        timeline = self._timeline(runtime) if runtime is not None else None
-        if exp is not self._expectation or exp.opening or runtime is None or timeline is None:
+        evidence = exp.evidence
+        timeline = self._timeline(evidence) if evidence is not None else None
+        if exp is not self._expectation or exp.opening or evidence is None or timeline is None:
             return
         exp.opening = True
         exp.awaiting_audio = False
@@ -2051,7 +2058,7 @@ class SessionActor:
         start = min(trigger, max(trigger - (PREROLL if early else REPLY_LEAD), first))
         kind = UtteranceKind.HA_REPLY if exp.source == UtteranceKind.HA_REPLY else UtteranceKind.REPLY
         spec = self._spec(kind, start, trigger, exp, guard_until=trigger + REPLY_GUARD if guarded else None)
-        turn = _Turn(exp.owner, self._generation, kind, asyncio.get_running_loop().time(), Utterance(spec), runtime,
+        turn = _Turn(exp.owner, self._generation, kind, asyncio.get_running_loop().time(), Utterance(spec), evidence,
                      conversation_id=exp.conversation_id, expectation=exp)
         self._turn = turn
         await self._view_listening(turn)    # its input focus was taken above, or at the drain
@@ -2063,91 +2070,94 @@ class SessionActor:
 
     # --- audio and evidence ---------------------------------------------------------------
 
-    def _new_runtime(self, lease_id: str) -> _Runtime:
-        timeline = self.uplink.timelines.get(lease_id) if self.uplink is not None else None
-        afe = timeline.afe if timeline is not None and StreamId.AFE in timeline.lease.streams else None
-        runtime = _Runtime(lease_id, CellAssembler(), afe=afe, vad=timeline.vad if timeline is not None else None)
-        self._runtimes[lease_id] = runtime
-        return runtime
+    def _new_evidence(self, subscription_id: str) -> _Evidence:
+        timeline = self.uplink.timelines.get(subscription_id) if self.uplink is not None else None
+        afe = timeline.afe if timeline is not None and StreamId.AFE in timeline.subscription.streams else None
+        evidence = _Evidence(subscription_id, CellAssembler(), afe=afe,
+                             vad=timeline.vad if timeline is not None else None)
+        self._evidence[subscription_id] = evidence
+        return evidence
 
-    def _release_runtime(self, lease_id: str) -> None:
-        if self._runtimes.pop(lease_id, None) is not None:
-            self.deps.worker.close_lease(lease_id)
+    def _release_evidence(self, subscription_id: str) -> None:
+        if self._evidence.pop(subscription_id, None) is not None:
+            self.deps.worker.close_subscription(subscription_id)
         if self.uplink is not None:
-            self.uplink.release(lease_id)
+            self.uplink.release(subscription_id)
 
-    def _timeline(self, runtime: _Runtime | None) -> LeaseTimeline | None:
-        if runtime is None or self.uplink is None or self._runtimes.get(runtime.lease_id) is not runtime:
+    def _timeline(self, evidence: _Evidence | None) -> SubscriptionBuffer | None:
+        if evidence is None or self.uplink is None or self._evidence.get(evidence.subscription_id) is not evidence:
             return None
-        return self.uplink.timelines.get(runtime.lease_id)
+        return self.uplink.timelines.get(evidence.subscription_id)
 
     async def _audio(self, deliveries: list[Delivery]) -> None:
         if self.uplink is None:
             return
-        touched: dict[str, _Runtime] = {}
+        touched: dict[str, _Evidence] = {}
         for d in deliveries:
-            timeline = self.uplink.timelines.get(d.lease_id)
+            timeline = self.uplink.timelines.get(d.subscription_id)
             if timeline is None:
                 continue
-            runtime = self._runtimes.get(d.lease_id)
+            evidence = self._evidence.get(d.subscription_id)
             if d.stream_id == StreamId.MIC:
                 for start, end in d.ranges:
                     pcm = timeline.mic.read(start, end)
-                    if d.lease_id == self._diagnostic_lease and self._diagnostic is not None:
+                    if d.subscription_id == self._diagnostic_subscription and self._diagnostic is not None:
                         try:
-                            self._diagnostic.on_mic(d.lease_id, start, pcm)
+                            self._diagnostic.on_mic(d.subscription_id, start, pcm)
                         except Exception:
                             log.exception("[%s] diagnostic consumer failed", self.device_id)
-                    if runtime is None:
+                    if evidence is None:
                         continue
-                    runtime.assembler.set_vad_from(start)
-                    if runtime.last_mic_end is not None and start > runtime.last_mic_end:
-                        runtime.assembler.mark_gap(runtime.last_mic_end, start)
-                    runtime.last_mic_end = max(runtime.last_mic_end or end, end)
-                    self.deps.worker.submit_mic_block(d.lease_id, start, pcm, flags=d.packet.flags)
+                    evidence.assembler.set_vad_from(start)
+                    if evidence.last_mic_end is not None and start > evidence.last_mic_end:
+                        evidence.assembler.mark_gap(evidence.last_mic_end, start)
+                    evidence.last_mic_end = max(evidence.last_mic_end or end, end)
+                    self.deps.worker.submit_mic_block(d.subscription_id, start, pcm, flags=d.packet.flags)
             elif d.stream_id == StreamId.AFE:
-                if d.lease_id == self._diagnostic_lease and self._diagnostic is not None:
+                if d.subscription_id == self._diagnostic_subscription and self._diagnostic is not None:
                     try:
-                        self._diagnostic.on_afe(d.lease_id, [r for a, b in d.ranges for r in timeline.afe.read(a, b)])
+                        self._diagnostic.on_afe(d.subscription_id,
+                                                [r for a, b in d.ranges for r in timeline.afe.read(a, b)])
                     except Exception:
                         log.exception("[%s] diagnostic consumer failed", self.device_id)
-            elif runtime is not None and d.stream_id == StreamId.CELLS:
+            elif evidence is not None and d.stream_id == StreamId.CELLS:
                 for start, end in d.ranges:
                     records = timeline.cells.read(start, end)
-                    runtime.assembler.add_cells(start, records.e_db.tolist(), records.flags.tolist())
-            elif runtime is not None and d.stream_id == StreamId.REFERENCE:
+                    evidence.assembler.add_cells(start, records.e_db.tolist(), records.flags.tolist())
+            elif evidence is not None and d.stream_id == StreamId.REFERENCE:
                 candidate = self._candidate
-                if candidate is not None and candidate.lease_id == d.lease_id and candidate.producing_sound:
+                if (candidate is not None and candidate.subscription_id == d.subscription_id
+                        and candidate.producing_sound):
                     view = timeline.reference.segment(d.epoch)
                     if view is not None:
-                        self.deps.worker.submit_reference(d.lease_id, view)
-            if runtime is not None:
-                touched[d.lease_id] = runtime
-        for runtime in touched.values():
-            await self._pump(runtime)
+                        self.deps.worker.submit_reference(d.subscription_id, view)
+            if evidence is not None:
+                touched[d.subscription_id] = evidence
+        for evidence in touched.values():
+            await self._pump(evidence)
 
     async def _observation(self, obs: Observation) -> None:
-        decided = self._unanswered.get(obs.lease_id) if obs.lease_id is not None else None
+        decided = self._unanswered.get(obs.subscription_id) if obs.subscription_id is not None else None
         if decided is not None:
             self._late_verification(decided, obs.payload)
             return
-        runtime = self._runtimes.get(obs.lease_id) if obs.lease_id is not None else None
-        if runtime is None:
+        evidence = self._evidence.get(obs.subscription_id) if obs.subscription_id is not None else None
+        if evidence is None:
             return
-        candidate = self._candidate if self._candidate and self._candidate.runtime is runtime else None
+        candidate = self._candidate if self._candidate and self._candidate.evidence is evidence else None
         match obs.payload:
             case VadPayload() as vad:
-                runtime.assembler.add_vad(vad.first_cell_sample, vad.probabilities)
-                if runtime.vad is not None:
-                    runtime.vad.write(vad.first_cell_sample, vad.probabilities)
+                evidence.assembler.add_vad(vad.first_cell_sample, vad.probabilities)
+                if evidence.vad is not None:
+                    evidence.vad.write(vad.first_cell_sample, vad.probabilities)
             case AsrPayload() as asr:
-                if runtime.utterance is not None and obs.utterance_id == runtime.utterance.utterance_id:
-                    runtime.utterance.push_asr(asr.tokens, asr.token_emission_sample,
-                                               asr.trailing_blank_frames, obs.through_sample,
-                                               finalize_ms=asr.finalize_ms, pause_text=asr.pause_text,
-                                               pause_decode=asr.pause_decode)
+                if evidence.utterance is not None and obs.utterance_id == evidence.utterance.utterance_id:
+                    evidence.utterance.push_asr(asr.tokens, asr.token_emission_sample,
+                                                asr.trailing_blank_frames, obs.through_sample,
+                                                finalize_ms=asr.finalize_ms, pause_text=asr.pause_text,
+                                                pause_decode=asr.pause_decode)
                     turn = self._turn
-                    if asr.voice is not None and turn is not None and turn.utterance is runtime.utterance:
+                    if asr.voice is not None and turn is not None and turn.utterance is evidence.utterance:
                         turn.voice = asr.voice
             case EchoPayload() as echo:
                 if obs.utterance_id and obs.utterance_id.startswith(CANDIDATE_TAG):
@@ -2155,13 +2165,13 @@ class SessionActor:
                         candidate.comparison = echo.results[-1]
                         await self._decide_candidate(candidate)
                 else:
-                    runtime.echo_inflight = False
-                    runtime.assembler.add_echo(echo.first_cell_sample, echo.results)
-                    start = runtime.utterance.spec.start if runtime.utterance is not None else None
+                    evidence.echo_inflight = False
+                    evidence.assembler.add_echo(echo.first_cell_sample, echo.results)
+                    start = evidence.utterance.spec.start if evidence.utterance is not None else None
                     for i, result in enumerate(echo.results):
                         if start is None or echo.first_cell_sample + i * CELL >= start:
-                            runtime.echo_total += 1
-                            runtime.echo_known += result != EchoResult.UNKNOWN   # a trusted reference
+                            evidence.echo_total += 1
+                            evidence.echo_known += result != EchoResult.UNKNOWN   # a trusted reference
             case VerificationPayload() as verification:
                 if candidate is not None and verification.candidate_id == candidate.candidate_id:
                     candidate.verification = verification.result
@@ -2177,9 +2187,9 @@ class SessionActor:
                         candidate.reference_ready = True
                     await self._decide_candidate(candidate)
             case ErrorPayload() as error:
-                await self._worker_error(runtime, error)
+                await self._worker_error(evidence, error)
                 return
-        await self._pump(runtime)
+        await self._pump(evidence)
 
     @staticmethod
     def _verification_answer(candidate: _Candidate, verdict: VerificationPayload) -> None:
@@ -2196,12 +2206,12 @@ class SessionActor:
                 candidate.verification_error = candidate.verification_error or error.reason
                 candidate.answered.set()
 
-    async def _worker_error(self, runtime: _Runtime, error: ErrorPayload) -> None:
+    async def _worker_error(self, evidence: _Evidence, error: ErrorPayload) -> None:
         """A worker failure aborts the affected utterance without dispatch (§8.1)."""
         log.warning("[%s] speech worker %s failed: %s", self.device_id, error.component, error.reason)
-        runtime.echo_inflight = False
+        evidence.echo_inflight = False
         candidate = self._candidate
-        if candidate is not None and candidate.runtime is runtime:
+        if candidate is not None and candidate.evidence is evidence:
             if error.component == ObservationKind.VERIFICATION:
                 candidate.verification = VerificationResult.TIMEOUT
                 candidate.verification_error = candidate.verification_error or error.reason
@@ -2209,25 +2219,25 @@ class SessionActor:
             await self._decide_candidate(candidate)
             return
         turn = self._turn
-        if turn is not None and turn.runtime is runtime and turn.commit is None:
+        if turn is not None and turn.evidence is evidence and turn.commit is None:
             await self._finish_turn(turn, TerminalReason.INTERRUPTED)
             return
         exp = self._expectation
-        if exp is not None and exp.runtime is runtime:
+        if exp is not None and exp.evidence is evidence:
             await self._end_expectation(TerminalReason.INTERRUPTED)
 
-    async def _pump(self, runtime: _Runtime) -> None:
-        """Advance one lease's evidence to its frontier and act on what it decides."""
-        timeline = self._timeline(runtime)
+    async def _pump(self, evidence: _Evidence) -> None:
+        """Advance one subscription's evidence to its frontier and act on what it decides."""
+        timeline = self._timeline(evidence)
         if timeline is None:
             return
-        await self._schedule_echo(runtime, timeline)
-        released = runtime.assembler.release()
+        await self._schedule_echo(evidence, timeline)
+        released = evidence.assembler.release()
         exp = self._expectation
-        if exp is not None and exp.runtime is runtime and runtime.utterance is None:
+        if exp is not None and exp.evidence is evidence and evidence.utterance is None:
             if exp.awaiting_audio:
-                if runtime.assembler.history:
-                    await self._open_reply(exp, runtime.assembler.history[0].start, guarded=True)
+                if evidence.assembler.history:
+                    await self._open_reply(exp, evidence.assembler.history[0].start, guarded=True)
                     return
             else:
                 for ev in released:
@@ -2235,9 +2245,9 @@ class SessionActor:
                     if onset is not None:
                         await self._open_reply(exp, onset, early=True)
                         return
-        utterance = runtime.utterance
+        utterance = evidence.utterance
         if utterance is None:
-            await self._schedule_candidate_comparison(runtime, timeline)
+            await self._schedule_candidate_comparison(evidence, timeline)
             return
         for ev in released:
             utterance.push_cell(ev)
@@ -2248,13 +2258,13 @@ class SessionActor:
         if reopen is not None:
             await self._reopen_reply(turn, reopen)
             return
-        self._measure_wake(turn, runtime)
+        self._measure_wake(turn, evidence)
         mic_end = timeline.mic.frontier or utterance.spec.start
         # One call can return several decisions when evidence arrives in a batch, say a Pending
         # and then the Commit that follows it. The utterance is already done while the Pending is
         # handled, so the loop acts on every decision and stops early only when one ends or
         # replaces the turn. A Commit or Close is always the last one, and after a Commit the
-        # lease is closed, so there is nothing more to pump.
+        # subscription is closed, so there is nothing more to pump.
         for decision in utterance.advance(mic_end):
             await self._decision(turn, decision)
             if not self._current(turn) or turn.utterance is not utterance:
@@ -2281,7 +2291,7 @@ class SessionActor:
         log.info("[%s] reply turn %s: gap before any answer, listening on from %d", self.device_id,
                  turn.turn_id, at)
         turn.reopened.append(old.trace())
-        self.deps.worker.close_utterance(turn.runtime.lease_id)
+        self.deps.worker.close_utterance(turn.evidence.subscription_id)
         turn.utterance = Utterance(self._spec(old.spec.kind, at, max(old.spec.trigger, at), turn.expectation,
                                               no_input_at=old.no_input_at, guard_until=old.spec.guard_until))
         await self._open_utterance(turn)
@@ -2498,15 +2508,15 @@ class SessionActor:
             log.info("[%s] transcript correction (shadow, %s): %r → %r", self.device_id, selected.candidate.rule,
                      text, selected.candidate.text)
 
-    def _measure_wake(self, turn: _Turn, runtime: _Runtime) -> None:
+    def _measure_wake(self, turn: _Turn, evidence: _Evidence) -> None:
         """Peak cell level over the accepted candidate's support: the STT copy's gain anchor."""
         candidate = turn.candidate
         if candidate is None or turn.wake_db is not None:
             return
         a = candidate.support_start - candidate.support_start % CELL
         b = candidate.open_sample - candidate.open_sample % CELL
-        cells = runtime.assembler.lookup(a, b)
-        if runtime.assembler.frontier is None or runtime.assembler.frontier < b or not cells:
+        cells = evidence.assembler.lookup(a, b)
+        if evidence.assembler.frontier is None or evidence.assembler.frontier < b or not cells:
             return
         levels = [ev.cell.level for ev in cells if ev.cell.level is not None]
         if levels:
@@ -2514,19 +2524,19 @@ class SessionActor:
 
     # --- attribution jobs -----------------------------------------------------------------
 
-    def _reference_ready(self, timeline: LeaseTimeline, capture_end: int) -> bool | None:
+    def _reference_ready(self, timeline: SubscriptionBuffer, capture_end: int) -> bool | None:
         """Reference received through `capture_end` in mic time; None when timing is unknown."""
         epoch = timeline.reference.current_epoch
         if epoch is None or self.uplink is None:
             return None
-        mapping = self.uplink.clock_map(timeline.lease.capture_epoch, epoch)
+        mapping = self.uplink.clock_map(timeline.subscription.capture_epoch, epoch)
         view = timeline.reference.segment(epoch)
         if mapping is None or view is None:
             return None
         frontier = view.frontier
         return frontier is not None and frontier >= mapping.capture_to_reference(capture_end).sample
 
-    def _reference_window(self, timeline: LeaseTimeline, a: int,
+    def _reference_window(self, timeline: SubscriptionBuffer, a: int,
                           b: int) -> tuple[np.ndarray, np.ndarray, Coverage] | None:
         """Final-mix reference for mic [a, b) laid out MAX_LAG samples early (em_attribution).
 
@@ -2536,7 +2546,7 @@ class SessionActor:
         epoch = timeline.reference.current_epoch
         if epoch is None or self.uplink is None:
             return None
-        mapping = self.uplink.clock_map(timeline.lease.capture_epoch, epoch)
+        mapping = self.uplink.clock_map(timeline.subscription.capture_epoch, epoch)
         view = timeline.reference.segment(epoch)
         if mapping is None or view is None:
             return None
@@ -2544,9 +2554,9 @@ class SessionActor:
         reference, valid = read_reference(view, r0, r0 + (b - a) + MAX_LAG)
         return reference, valid, Coverage.FULL if valid.all() else Coverage.PARTIAL
 
-    def _cell_arrays(self, runtime: _Runtime, timeline: LeaseTimeline, a: int, b: int) -> _CellArrays | None:
+    def _cell_arrays(self, evidence: _Evidence, timeline: SubscriptionBuffer, a: int, b: int) -> _CellArrays | None:
         """Mic PCM, reference, and per-cell evidence for whole cells [a, b), or None if incomplete."""
-        cells = runtime.assembler.lookup(a, b)
+        cells = evidence.assembler.lookup(a, b)
         if len(cells) != (b - a) // CELL or not timeline.mic.covers(a, b):
             return None
         reference = self._reference_window(timeline, a, b)
@@ -2556,20 +2566,21 @@ class SessionActor:
         return _CellArrays(timeline.mic.read(a, b), ref, [ev.cell.valid for ev in cells],
                            [ev.cell.vad for ev in cells], [ev.background for ev in cells], ref_valid, coverage)
 
-    async def _schedule_echo(self, runtime: _Runtime, timeline: LeaseTimeline) -> None:
-        """Per-cell echo labels for an open utterance or reply lease (§16.6), one job at a time."""
-        if runtime.echo_inflight:
+    async def _schedule_echo(self, evidence: _Evidence, timeline: SubscriptionBuffer) -> None:
+        """Per-cell echo labels for an open utterance or reply subscription (§16.6), one job at a time."""
+        if evidence.echo_inflight:
             return
-        pending = runtime.assembler.echo_pending()
+        pending = evidence.assembler.echo_pending()
         if not pending:
             return
-        if runtime.echo is None:
+        if evidence.echo is None:
             first = timeline.mic.first_sample
             if first is None:
                 return
             first = -(-first // CELL) * CELL
-            runtime.echo = EchoTracker(open_sample=max(runtime.echo_open or first, first), lease_mic_start=first)
-        tracker = runtime.echo
+            evidence.echo = EchoTracker(open_sample=max(evidence.echo_open or first, first),
+                                        subscription_mic_start=first)
+        tracker = evidence.echo
         mic_frontier = timeline.mic.frontier or 0
         steps: list[_EchoStep] = []
         next_cell = pending[0].start
@@ -2588,7 +2599,7 @@ class SessionActor:
             if not lag_step:
                 window = tracker.estimate_window(ev.end)
                 if window is not None:
-                    lag_arrays = self._cell_arrays(runtime, timeline, *window)
+                    lag_arrays = self._cell_arrays(evidence, timeline, *window)
                     if lag_arrays is None:
                         tracker.update_lag(None)
                     else:
@@ -2597,14 +2608,14 @@ class SessionActor:
             run_start = ev.start
             while run_start - CELL >= ev.end - ECHO_WINDOW_CELLS * CELL \
                     and timeline.mic.covers(run_start - CELL, run_start) \
-                    and len(runtime.assembler.lookup(run_start - CELL, run_start)) == 1:
+                    and len(evidence.assembler.lookup(run_start - CELL, run_start)) == 1:
                 run_start -= CELL
-            arrays = self._cell_arrays(runtime, timeline, run_start, ev.end)
+            arrays = self._cell_arrays(evidence, timeline, run_start, ev.end)
             steps.append(_LabelStep(arrays) if arrays is not None else _FixedLabel(EchoResult.UNKNOWN))
         if all(isinstance(step, _LagStep) for step in steps):
             return
-        runtime.assembler.echo_requested(next_cell)
-        runtime.echo_inflight = True
+        evidence.assembler.echo_requested(next_cell)
+        evidence.echo_inflight = True
 
         def compare() -> tuple[tuple[EchoResult, ...], int | None]:
             results: list[EchoResult] = []
@@ -2620,18 +2631,18 @@ class SessionActor:
                                                      reference_valid=a.reference_valid))
             return tuple(results), tracker.lag
 
-        self.deps.worker.submit_echo(runtime.lease_id, pending[0].start, next_cell, compare, ECHO_TAG)
+        self.deps.worker.submit_echo(evidence.subscription_id, pending[0].start, next_cell, compare, ECHO_TAG)
 
-    async def _schedule_candidate_comparison(self, runtime: _Runtime, timeline: LeaseTimeline) -> None:
+    async def _schedule_candidate_comparison(self, evidence: _Evidence, timeline: SubscriptionBuffer) -> None:
         """§6.1 inputs for a producing-sound candidate: verification and the support comparison."""
         candidate = self._candidate
-        if candidate is None or candidate.runtime is not runtime or not candidate.producing_sound:
+        if candidate is None or candidate.evidence is not evidence or not candidate.producing_sound:
             return
         if candidate.verification_submitted_at is None:
             a = max(timeline.mic.floor, candidate.support_start - PREROLL)
             if timeline.mic.covers(a, candidate.open_sample + VERIFICATION_LOOKAHEAD):
                 candidate.verification_submitted_at = asyncio.get_running_loop().time()
-                self.deps.worker.submit_verification(runtime.lease_id, candidate.candidate_id, timeline.mic,
+                self.deps.worker.submit_verification(evidence.subscription_id, candidate.candidate_id, timeline.mic,
                                                      candidate.support_start, candidate.open_sample,
                                                      candidate.model.verify_core)
         if candidate.comparison_submitted:
@@ -2639,12 +2650,12 @@ class SessionActor:
         a = candidate.support_start - candidate.support_start % CELL
         end = candidate.support_end or candidate.open_sample
         b = -(-end // CELL) * CELL
-        if runtime.assembler.frontier is None or runtime.assembler.frontier < b:
+        if evidence.assembler.frontier is None or evidence.assembler.frontier < b:
             return
         ready = self._reference_ready(timeline, b)
         if ready is False:
             return
-        arrays = self._cell_arrays(runtime, timeline, a, b) if ready else None
+        arrays = self._cell_arrays(evidence, timeline, a, b) if ready else None
         candidate.comparison_submitted = True
         if arrays is None:
             candidate.comparison = EchoResult.UNKNOWN    # missing timing or audio is unknown, not "no playback"
@@ -2659,7 +2670,7 @@ class SessionActor:
                                        coverage=support.coverage, reference_valid=support.reference_valid)
             return (result.result,) * len(support.cell_valid), result.lag
 
-        self.deps.worker.submit_echo(runtime.lease_id, a, b, compare, CANDIDATE_TAG + candidate.candidate_id)
+        self.deps.worker.submit_echo(evidence.subscription_id, a, b, compare, CANDIDATE_TAG + candidate.candidate_id)
 
     # --- endpoint decisions and dispatch ----------------------------------------------------
 
@@ -2675,7 +2686,7 @@ class SessionActor:
                 await self._commit(turn, decision)
 
     async def _commit(self, turn: _Turn, commit: Commit) -> None:
-        timeline = self._timeline(turn.runtime)
+        timeline = self._timeline(turn.evidence)
         if timeline is None or not timeline.mic.covers(commit.start, commit.end):
             await self._finish_turn(turn, TerminalReason.INTERRUPTED)
             return
@@ -2684,19 +2695,20 @@ class SessionActor:
             self._settle(turn.expectation, FollowUp.ANSWERED)   # only a committed reply answers (§9.1)
         turn.committed_at = time.monotonic()
         turn.commit_frontier = timeline.mic.frontier
-        fit = self.uplink.clock_fit(StreamId.MIC, timeline.lease.capture_epoch) if self.uplink is not None else None
+        fit = (self.uplink.clock_fit(StreamId.MIC, timeline.subscription.capture_epoch)
+               if self.uplink is not None else None)
         turn.utterance_end_ns = fit.to_mono(commit.boundary) if fit is not None else None
-        turn.coverage = (turn.runtime.echo_known / turn.runtime.echo_total) if turn.runtime.echo_total else None
+        turn.coverage = (turn.evidence.echo_known / turn.evidence.echo_total) if turn.evidence.echo_total else None
         self._set_state(ActorState.COMMITTED)
         pcm = timeline.mic.read(commit.start, commit.end)
         turn.wake_clip = self._wake_clip(turn, timeline)
-        turn.afe_evidence, turn.afe_series = _afe_snapshot(turn.runtime, turn.candidate, _utterance_span(turn))
+        turn.afe_evidence, turn.afe_series = _afe_snapshot(turn.evidence, turn.candidate, _utterance_span(turn))
         turn.timings["audio_ms"] = round((commit.end - commit.start) * 1000 / SAMPLE_RATE)
-        if self._records_turn(turn.runtime):
-            turn.capture = _lease_capture(timeline, _support(turn.candidate), _utterance_span(turn))
-        await self._open_response_lease(turn, commit)
-        await self._close_uplink(turn.runtime.lease_id, LeaseEnd.COMMITTED)
-        self._release_runtime(turn.runtime.lease_id)
+        if self._records_turn(turn.evidence):
+            turn.capture = _subscription_capture(timeline, _support(turn.candidate), _utterance_span(turn))
+        await self._open_response_subscription(turn, commit)
+        await self._close_uplink(turn.evidence.subscription_id, SubscriptionEnd.COMMITTED)
+        self._release_evidence(turn.evidence.subscription_id)
         turn.task = self._spawn(self._run_committed(turn, commit, pcm))
 
     def _current(self, turn: _Turn) -> bool:
@@ -2941,7 +2953,7 @@ class SessionActor:
 
     async def _play_response(self, turn: _Turn, url: str,
                              start_by: Callable[[], float] | None = None) -> PlaybackEnd:
-        """The turn's response as dialog output; the reply lease opens when its audio starts (§9.1).
+        """The turn's response as dialog output; the reply subscription opens when its audio starts (§9.1).
         `start_by`: as `_play_dialog`'s."""
         async def started() -> None:
             turn.audible_at = time.monotonic()
@@ -2965,7 +2977,7 @@ class SessionActor:
         return reason
 
     async def _watch_reply(self, turn: _Turn) -> None:
-        """An audible response that asks a question: open its reply lease so early answers are
+        """An audible response that asks a question: open its reply subscription so early answers are
         watched while it plays (§9.1). Input focus waits for the drain: taking it now would cancel
         the question itself on the device (§6.2)."""
         exp = turn.next_expectation
@@ -2974,14 +2986,14 @@ class SessionActor:
             return
         exp.prompt = turn.playback
         self._expectation = exp
-        await self._open_expectation_lease(exp)
+        await self._open_expectation_subscription(exp)
 
     async def _continue(self, turn: _Turn, exp: _Expectation) -> None:
         """Turn the drained response into a live reply expectation, then close the turn."""
         self._expectation = exp
-        if exp.runtime is None:
-            await self._open_expectation_lease(exp)
-        if exp.runtime is None:
+        if exp.evidence is None:
+            await self._open_expectation_subscription(exp)
+        if exp.evidence is None:
             self._settle(exp, FollowUp.NO_MIC)
             self._expectation = None
             await self._release_owner(exp.owner)
@@ -2994,30 +3006,30 @@ class SessionActor:
 
     async def _hold_reply_focus(self, exp: _Expectation) -> None:
         """Dialog-input focus for a live expectation whose prompt has drained (§6.2 "Expected reply")."""
-        if exp is self._expectation and exp.runtime is not None:
+        if exp is self._expectation and exp.evidence is not None:
             await self._acquire_focus(exp.owner, Focus.DIALOG_INPUT, exp.generation)
 
     async def _begin_window(self, exp: _Expectation) -> None:
         """After the guarded drain (or without prompt audio) the reply window opens (§9.1, §16.6).
 
-        The lease's VAD carried the question's echo, which leaves Silero deaf to a quieter answer
+        The subscription's VAD carried the question's echo, which leaves Silero deaf to a quieter answer
         for seconds. So unless an answer is already under way (`answer_under_way`: it opens at
         once, its VAD untouched), the asking turn's voice snapshot is restored as the window
         opens; without one, a fresh state starts at the drain and warms over the chime. With
         Wake Sound on, the wake chime plays first and the window opens once it has finished
         (bounded by WAKE_CHIME_S), so it never sounds inside the window; the early-answer watch
         runs on through it. The reply turn's trigger is the mic frontier as the window opens;
-        before the lease has any mic, its first released cell."""
-        if exp is not self._expectation or exp.runtime is None:
+        before the subscription has any mic, its first released cell."""
+        if exp is not self._expectation or exp.evidence is None:
             return
         await self._hold_reply_focus(exp)
         self._set_state(ActorState.ARMED)
-        runtime = exp.runtime
-        timeline = self._timeline(runtime)
+        evidence = exp.evidence
+        timeline = self._timeline(evidence)
         drain = timeline.mic.frontier if timeline is not None else None
         if timeline is not None and drain is not None:
             first = timeline.mic.first_sample if timeline.mic.first_sample is not None else drain
-            if answer_under_way(runtime.assembler.history, max(drain - REPLY_LEAD, first), drain):
+            if answer_under_way(evidence.assembler.history, max(drain - REPLY_LEAD, first), drain):
                 exp.window_opened = asyncio.get_running_loop().time()
                 exp.window = ReplyWindowTrace(drain=drain, chime=None, vad=ReplyVad.CARRIED, voice_from=None,
                                               voice_at=None, primed_at=None)
@@ -3026,20 +3038,20 @@ class SessionActor:
         voice = self._voice(exp)
         fresh_at = drain if drain is not None else 0
         if voice is None:
-            self.deps.worker.prime_vad(runtime.lease_id, fresh_at, None)
+            self.deps.worker.prime_vad(evidence.subscription_id, fresh_at, None)
         window = exp.window = ReplyWindowTrace(
             drain=drain, chime=None, vad=ReplyVad.FRESH if voice is None else ReplyVad.CARRIED,
             voice_from=None, voice_at=None, primed_at=fresh_at if voice is None else None)
         if em_config_sections.wake_sound(self._config()) and self.render is not None:
             window["chime"] = await self._reply_chime(exp)
-            if exp is not self._expectation or exp.opening or exp.runtime is not runtime:
+            if exp is not self._expectation or exp.opening or exp.evidence is not evidence:
                 return                                # an early answer, a wake or a stop took over
         exp.window_opened = asyncio.get_running_loop().time()
-        timeline = self._timeline(runtime)
+        timeline = self._timeline(evidence)
         trigger = timeline.mic.frontier if timeline is not None else None
         if voice is not None:
             primed_at = trigger if trigger is not None else 0
-            self.deps.worker.prime_vad(runtime.lease_id, primed_at, voice)
+            self.deps.worker.prime_vad(evidence.subscription_id, primed_at, voice)
             window["vad"], window["voice_at"], window["primed_at"] = ReplyVad.VOICE, voice.sample, primed_at
             window["voice_from"] = exp.origin.turn_id if exp.origin is not None else None
         if trigger is None:
@@ -3512,26 +3524,27 @@ class SessionActor:
         except Exception:
             log.exception("[%s] follow-up outcome of turn %s not recorded", self.device_id, turn.turn_id)
 
-    async def _open_expectation_lease(self, exp: _Expectation) -> None:
-        """The `reply` uplink lease: live mic, cells, and reference (§9.1). No focus: dialog-input
+    async def _open_expectation_subscription(self, exp: _Expectation) -> None:
+        """The `reply` audio subscription: live mic, cells, and reference (§9.1). No focus: dialog-input
         focus cancels current dialog output on the device (§6.2), so `_hold_reply_focus` takes it
         only once the prompt has drained or an early answer has cut it off."""
-        if exp.runtime is not None or self.uplink is None or self.link is None or self._muted:
+        if exp.evidence is not None or self.uplink is None or self.link is None or self._muted:
             return
         epoch = self.uplink.streams.current(StreamId.MIC)
         if epoch is None:
             return
-        lease_id = str(uuid.uuid4())
+        subscription_id = str(uuid.uuid4())
         streams: dict[StreamId, int | None] = {StreamId.MIC: None, StreamId.CELLS: None, StreamId.REFERENCE: None}
         if self.uplink.afe_metadata:
             streams[StreamId.AFE] = None
-        await self._lease_message(self.uplink.open(lease_id, LeaseReason.REPLY, exp.owner, epoch, streams))
+        await self._subscription_message(self.uplink.open(subscription_id, SubscriptionReason.REPLY, exp.owner, epoch,
+                                                          streams))
         model = self.deps.registry.for_config(self._config())
         await self.deps.worker.load_wake_graph(model.graph_sha256)
-        self.deps.worker.open_lease(self.device_id, epoch, lease_id, model.graph_sha256)
-        runtime = self._new_runtime(lease_id)
-        runtime.assembler.require_echo_from(0)
-        exp.runtime = runtime
+        self.deps.worker.open_subscription(self.device_id, epoch, subscription_id, model.graph_sha256)
+        evidence = self._new_evidence(subscription_id)
+        evidence.assembler.require_echo_from(0)
+        exp.evidence = evidence
 
     async def _prompt(self, exp: _Expectation, text: str) -> None:
         """An EchoMuse question: TTS-only prompt, then its reply window."""
@@ -3549,7 +3562,7 @@ class SessionActor:
             return
 
         async def started() -> None:
-            await self._open_expectation_lease(exp)
+            await self._open_expectation_subscription(exp)
 
         def bind(playback: Playback) -> None:
             exp.prompt = playback
@@ -3559,7 +3572,7 @@ class SessionActor:
                                          fence=lambda: exp is self._expectation, said=lambda: _Said.of(text, exp))
         if exp is not self._expectation:
             return
-        if reason != FinishReason.DRAINED or exp.runtime is None:
+        if reason != FinishReason.DRAINED or exp.evidence is None:
             # A failed prompt invalidates its expectation (§9.1).
             outcome = (FollowUp.PROMPT_CANCELLED if reason == FinishReason.CANCELLED
                        else FollowUp.NO_MIC if reason == FinishReason.DRAINED else FollowUp.PROMPT_FAILED)
@@ -3584,10 +3597,10 @@ class SessionActor:
         self._settle(exp, outcome)
         if exp.prompt is not None and not exp.prompt.done:
             await exp.prompt.cancel("expectation_closed")
-        if exp.runtime is not None:
-            await self._close_uplink(exp.runtime.lease_id, LeaseEnd.CLOSED)
-            self._release_runtime(exp.runtime.lease_id)
-            exp.runtime = None
+        if exp.evidence is not None:
+            await self._close_uplink(exp.evidence.subscription_id, SubscriptionEnd.CLOSED)
+            self._release_evidence(exp.evidence.subscription_id)
+            exp.evidence = None
         await self._release_owner(exp.owner)
 
     # --- announcements ------------------------------------------------------------------------
@@ -3616,7 +3629,7 @@ class SessionActor:
                 self._expectation = exp
 
                 async def started() -> None:
-                    await self._open_expectation_lease(exp)
+                    await self._open_expectation_subscription(exp)
 
                 def bind(playback: Playback) -> None:
                     exp.prompt = playback
@@ -3626,7 +3639,7 @@ class SessionActor:
                                                  fence=lambda: exp is self._expectation)
                 if exp is not self._expectation:
                     return
-                if reason != FinishReason.DRAINED or exp.runtime is None:
+                if reason != FinishReason.DRAINED or exp.evidence is None:
                     await self._end_expectation(TerminalReason.INTERRUPTED)
                     return
                 await self._begin_window(exp)
@@ -3771,7 +3784,8 @@ class SessionActor:
     # --- close, feedback, persistence ------------------------------------------------------------
 
     async def _finish_turn(self, turn: _Turn, reason: TerminalReason, *, feedback: bool = True) -> None:
-        """Enter CLOSING exactly once: fence, release owned leases, persist, give §7 feedback."""
+        """Enter CLOSING exactly once: fence, release owned focus leases and subscriptions, persist, give §7
+        feedback."""
         if turn.terminal is not None:
             return
         turn.terminal = reason
@@ -3787,21 +3801,22 @@ class SessionActor:
             turn.task.cancel()
         if turn.playback is not None and not turn.playback.done:
             await turn.playback.cancel(reason)
-        timeline = self._timeline(turn.runtime)
+        timeline = self._timeline(turn.evidence)
         if timeline is not None and turn.wake_clip is None:
             turn.wake_clip = self._wake_clip(turn, timeline)
-        if timeline is not None and turn.commit is None and self._records_turn(turn.runtime):
-            # A turn that never committed is recorded too: what its lease heard, through its close.
-            turn.capture = _lease_capture(timeline, _support(turn.candidate), _utterance_span(turn))
-        if turn.coverage is None and turn.runtime.echo_total:
-            turn.coverage = turn.runtime.echo_known / turn.runtime.echo_total
+        if timeline is not None and turn.commit is None and self._records_turn(turn.evidence):
+            # A turn that never committed is recorded too: what its subscription heard, through its close.
+            turn.capture = _subscription_capture(timeline, _support(turn.candidate), _utterance_span(turn))
+        if turn.coverage is None and turn.evidence.echo_total:
+            turn.coverage = turn.evidence.echo_known / turn.evidence.echo_total
         if turn.afe_evidence is None:
-            turn.afe_evidence, turn.afe_series = _afe_snapshot(turn.runtime, turn.candidate, _utterance_span(turn))
-        await self._close_uplink(turn.runtime.lease_id, LeaseEnd.CLOSED)
-        self._release_runtime(turn.runtime.lease_id)
-        if turn.response_lease is not None:
-            turn.response_lease.close_at = min(turn.response_lease.close_at,
-                                               asyncio.get_running_loop().time() + RESPONSE_LEASE_TAIL_S)
+            turn.afe_evidence, turn.afe_series = _afe_snapshot(turn.evidence, turn.candidate, _utterance_span(turn))
+        await self._close_uplink(turn.evidence.subscription_id, SubscriptionEnd.CLOSED)
+        self._release_evidence(turn.evidence.subscription_id)
+        if turn.response_subscription is not None:
+            turn.response_subscription.close_at = min(
+                turn.response_subscription.close_at,
+                asyncio.get_running_loop().time() + RESPONSE_SUBSCRIPTION_TAIL_S)
         next_exp = turn.next_expectation
         if next_exp is not None and reason != TerminalReason.COMPLETED:
             # A question that was never fully asked invalidates its expectation (§9.1).
@@ -3810,10 +3825,10 @@ class SessionActor:
             if next_exp is self._expectation:
                 await self._drop_expectation(outcome)
         if next_exp is not None and next_exp is not self._expectation:
-            if next_exp.runtime is not None:
-                await self._close_uplink(next_exp.runtime.lease_id, LeaseEnd.CLOSED)
-                self._release_runtime(next_exp.runtime.lease_id)
-                next_exp.runtime = None
+            if next_exp.evidence is not None:
+                await self._close_uplink(next_exp.evidence.subscription_id, SubscriptionEnd.CLOSED)
+                self._release_evidence(next_exp.evidence.subscription_id)
+                next_exp.evidence = None
             await self._release_owner(next_exp.owner)
         await self._release_owner(turn.turn_id)
         self.awaiting_intent = False
@@ -3859,7 +3874,7 @@ class SessionActor:
 
     async def _play_no_input_chime(self, generation: int) -> None:
         """With `wakeSound` on, a wake that heard no command ends with the no-input chime
-        (§11.2), after its lease closed: the Dot has stopped listening."""
+        (§11.2), after its subscription closed: the Dot has stopped listening."""
         if (not self._no_input_chime_capable or self.render is None
                 or not em_config_sections.wake_sound(self._config())):
             return
@@ -3868,7 +3883,7 @@ class SessionActor:
         except Exception:
             log.warning("[%s] no-input chime failed", self.device_id, exc_info=True)
 
-    def _wake_clip(self, turn: _Turn, timeline: LeaseTimeline) -> _Clip | None:
+    def _wake_clip(self, turn: _Turn, timeline: SubscriptionBuffer) -> _Clip | None:
         """Accepted candidate support −300 ms … support_end, canonical PCM."""
         candidate = turn.candidate
         if candidate is None:
@@ -3879,10 +3894,10 @@ class SessionActor:
             return None
         return _Clip(a, timeline.mic.read(a, b).tobytes())
 
-    def _records_turn(self, runtime: _Runtime) -> bool:
-        """A turn recording is made of a lease that took `afe` (its turn has a chart to play it
+    def _records_turn(self, evidence: _Evidence) -> bool:
+        """A turn recording is made of a subscription that took `afe` (its turn has a chart to play it
         against) while `saveUtterances` is on, however the turn ends."""
-        return runtime.afe is not None and bool(self._config().get("saveUtterances"))
+        return evidence.afe is not None and bool(self._config().get("saveUtterances"))
 
     async def _persist(self, turn: _Turn) -> int | None:
         """The turn row with its §11.3 decision trace; utterance WAV, wake clip and turn recording
@@ -3936,9 +3951,9 @@ class SessionActor:
         row["decision_trace"] = trace
         row["afe_evidence"] = turn.afe_evidence.dumps() if turn.afe_evidence is not None else None
         series = turn.afe_series
-        response = turn.response_lease
+        response = turn.response_subscription
         if response is not None:
-            # The row waits for the response lease, until RESPONSE_LEASE_TAIL_S past the turn's end.
+            # The row waits for the response subscription, until RESPONSE_SUBSCRIPTION_TAIL_S past the turn's end.
             await response.done
             series = _afe_series(turn, response.timeline.afe) or series
         cfg = self._config()
@@ -3990,10 +4005,10 @@ class SessionActor:
         loop = asyncio.get_running_loop()
         decided = candidate.decided_at if candidate.decided_at is not None else loop.time()
         ts = time.time() - (loop.time() - decided)
-        if self._unanswered.get(candidate.lease_id) is candidate:
+        if self._unanswered.get(candidate.subscription_id) is candidate:
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(candidate.answered.wait(), LATE_VERIFICATION_WAIT_S)
-            del self._unanswered[candidate.lease_id]
+            del self._unanswered[candidate.subscription_id]
         if series is not None:
             series = replace(series, recording=capture.span if capture else None,
                              wake_clip=clip.span if clip else None)
@@ -4111,56 +4126,57 @@ class SessionActor:
         except Exception as exc:
             log.debug("[%s] %s not sent: %s", self.device_id, msg_type, exc)
 
-    async def _lease_message(self, message: LeaseMessage) -> None:
-        # LeaseCommand values are the uplink message types.
+    async def _subscription_message(self, message: SubscriptionMessage) -> None:
+        # SubscriptionCommand values are the uplink message types.
         await self._send(MessageType(message.type), message.body, message.generation)
 
-    async def _close_uplink(self, lease_id: str, reason: LeaseEnd) -> None:
+    async def _close_uplink(self, subscription_id: str, reason: SubscriptionEnd) -> None:
         if self.uplink is None:
             return
-        lease = self.uplink.leases.get(lease_id)
-        if lease is not None and lease.ended is None:
-            await self._lease_message(self.uplink.leases.close(lease_id, reason))
+        subscription = self.uplink.subscriptions.get(subscription_id)
+        if subscription is not None and subscription.ended is None:
+            await self._subscription_message(self.uplink.subscriptions.close(subscription_id, reason))
 
-    async def _open_response_lease(self, turn: _Turn, commit: Commit) -> None:
+    async def _open_response_subscription(self, turn: _Turn, commit: Commit) -> None:
         """Carry a committed turn's AFE records, and while `saveUtterances` is on its mic, on through
-        its response (§4.4): a `turn` lease taking `afe` from where the committed lease's records
+        its response (§4.4): a `turn` subscription taking `afe` from where the committed subscription's records
         reached (the commit's end before any arrived) and `mic` from the end of `turn.capture`,
-        opened before the committed lease closes so both run on unbroken. Only after a lease that
+        opened before the committed subscription closes so both run on unbroken. Only after a subscription that
         took `afe`. Evidence for the turn's chart and recording; nothing reads it to decide."""
-        uplink, store = self.uplink, turn.runtime.afe
-        lease = uplink.leases.get(turn.runtime.lease_id) if uplink is not None else None
-        if uplink is None or store is None or lease is None:
+        uplink, store = self.uplink, turn.evidence.afe
+        subscription = uplink.subscriptions.get(turn.evidence.subscription_id) if uplink is not None else None
+        if uplink is None or store is None or subscription is None:
             return
         streams: dict[StreamId, int | None] = {
             StreamId.AFE: store.frontier * AFE_PERIOD_SAMPLES if store.frontier is not None else commit.end}
         if turn.capture is not None:
             streams[StreamId.MIC] = turn.capture.end
-        lease_id = str(uuid.uuid4())
-        await self._lease_message(uplink.open(lease_id, LeaseReason.TURN, turn.turn_id, lease.capture_epoch,
-                                              streams))
-        timeline = uplink.timelines[lease_id]
+        subscription_id = str(uuid.uuid4())
+        await self._subscription_message(uplink.open(subscription_id, SubscriptionReason.TURN, turn.turn_id,
+                                                     subscription.capture_epoch, streams))
+        timeline = uplink.timelines[subscription_id]
         if turn.capture is not None:
             timeline.set_utterance_start(turn.capture.end)   # retention anchor: the whole response is kept
         loop = asyncio.get_running_loop()
-        response = _ResponseLease(lease_id, timeline, loop.time() + RESPONSE_LEASE_MAX_S, loop.create_future())
-        self._response_leases[lease_id] = response
-        turn.response_lease = response
+        response = _ResponseSubscription(subscription_id, timeline, loop.time() + RESPONSE_SUBSCRIPTION_MAX_S,
+                                         loop.create_future())
+        self._response_subscriptions[subscription_id] = response
+        turn.response_subscription = response
 
-    async def _end_response_lease(self, response: _ResponseLease, *, close: bool = True) -> None:
-        """End a response lease, sending `uplink.close` when `close` (not for one that has already
+    async def _end_response_subscription(self, response: _ResponseSubscription, *, close: bool = True) -> None:
+        """End a response subscription, sending `uplink.close` when `close` (not for one that has already
         ended on the device). What it received stays with the turn for the row."""
-        if self._response_leases.pop(response.lease_id, None) is None:
+        if self._response_subscriptions.pop(response.subscription_id, None) is None:
             return
         if close:
-            await self._close_uplink(response.lease_id, LeaseEnd.CLOSED)
+            await self._close_uplink(response.subscription_id, SubscriptionEnd.CLOSED)
         if self.uplink is not None:
-            self.uplink.release(response.lease_id)
+            self.uplink.release(response.subscription_id)
         response.done.set_result(None)
 
-    async def _end_all_response_leases(self, *, close: bool) -> None:
-        for response in list(self._response_leases.values()):
-            await self._end_response_lease(response, close=close)
+    async def _end_all_response_subscriptions(self, *, close: bool) -> None:
+        for response in list(self._response_subscriptions.values()):
+            await self._end_response_subscription(response, close=close)
 
     async def _acquire_focus(self, owner: str, focus: Focus, generation: int) -> None:
         if any(f.owner == owner and f.focus == focus for f in self._focus.values()):
@@ -4216,33 +4232,33 @@ def _utterance_span(turn: _Turn) -> tuple[int, int] | None:
     return (start, end) if end > start else None
 
 
-def _afe_snapshot(runtime: _Runtime, candidate: _Candidate | None,
+def _afe_snapshot(evidence: _Evidence, candidate: _Candidate | None,
                   utterance: tuple[int, int] | None) -> tuple[AfeEvidence | None, AfeSeries | None]:
     """Native AFE evidence around the candidate's support window (support_start → support_end,
     else the opening hop's end) and over `utterance`, and the per-period series behind it.
-    (None, None) — unavailable — when the lease took no `afe` stream (the device lacks
+    (None, None) — unavailable — when the subscription took no `afe` stream (the device lacks
     afe_metadata_v1); a part without data is None inside the evidence, and a series without
     any record is None. Read only to record evidence: no decision depends on it."""
-    if runtime.afe is None:
+    if evidence.afe is None:
         return None, None
     support = _support(candidate)
-    return (turn_evidence(runtime.afe, support, utterance),
-            turn_series(runtime.afe, support, utterance, vad=runtime.vad))
+    return (turn_evidence(evidence.afe, support, utterance),
+            turn_series(evidence.afe, support, utterance, vad=evidence.vad))
 
 
 def _afe_series(turn: _Turn, response: AfeTimeline) -> AfeSeries | None:
-    """The turn's AfeSeries carried on through its response lease's records."""
-    if turn.runtime.afe is None:
+    """The turn's AfeSeries carried on through its response subscription's records."""
+    if turn.evidence.afe is None:
         return None
-    return turn_series(turn.runtime.afe, _support(turn.candidate), _utterance_span(turn), response=response,
-                       vad=turn.runtime.vad)
+    return turn_series(turn.evidence.afe, _support(turn.candidate), _utterance_span(turn), response=response,
+                       vad=turn.evidence.vad)
 
 
-def _lease_capture(timeline: LeaseTimeline, support: tuple[int, int] | None,
-                   utterance: tuple[int, int] | None) -> _Clip | None:
-    """A lease's canonical mic for the turn recording: the contiguous run holding the utterance's
+def _subscription_capture(timeline: SubscriptionBuffer, support: tuple[int, int] | None,
+                           utterance: tuple[int, int] | None) -> _Clip | None:
+    """A subscription's canonical mic for the turn recording: the contiguous run holding the utterance's
     start (the support window's without one), from where the turn's chart starts (or the run's first
-    sample, if later) through its newest sample. After a commit the response lease takes the mic on
+    sample, if later) through its newest sample. After a commit the response subscription takes the mic on
     from its end."""
     chart, anchor = series_range(support, utterance), utterance or support
     run = timeline.mic.known.containing(anchor[0]) if anchor is not None else None
@@ -4253,13 +4269,13 @@ def _lease_capture(timeline: LeaseTimeline, support: tuple[int, int] | None,
 
 
 def _turn_recording(turn: _Turn) -> _Clip | None:
-    """The turn recording: `turn.capture`, and after a commit the response lease's mic contiguous
+    """The turn recording: `turn.capture`, and after a commit the response subscription's mic contiguous
     from its end. Mute and session loss erase the response's mic (UplinkSession.clear), leaving the
     capture."""
     capture = turn.capture
     if capture is None:
         return None
-    response = turn.response_lease
+    response = turn.response_subscription
     run = response.timeline.mic.known.containing(capture.end) if response is not None else None
     if response is None or run is None:
         return capture
@@ -4271,7 +4287,7 @@ def _save_turn_recording(device_id: str, turn_id: int, pcm: bytes) -> str | None
 
 
 def _near_miss_clip(capture: _NearMissCapture) -> _Clip | None:
-    """A near miss's recording: its lease's mic contiguous from the first sample it received (the
+    """A near miss's recording: its subscription's mic contiguous from the first sample it received (the
     requested start, or where the device's ring clipped it) through `capture.end`; short of that,
     what it holds if that covers the whole support; else None."""
     mic, wire = capture.timeline.mic, capture.wire
@@ -4329,7 +4345,7 @@ def _support(candidate: _Candidate | None) -> tuple[int, int] | None:
     return None if candidate is None else (candidate.support_start, candidate.support_end or candidate.open_sample)
 
 
-def _refused_clip(candidate: _Candidate, timeline: LeaseTimeline) -> _Clip | None:
+def _refused_clip(candidate: _Candidate, timeline: SubscriptionBuffer) -> _Clip | None:
     """A refused producing-sound candidate's wake clip: its support −300 ms through the later of
     its support end and the verifier's lookahead (open + 480 ms), as far as the mic had reached,
     so it holds the whole verifier input whenever that had arrived."""
@@ -4390,7 +4406,7 @@ def _candidate_trace(candidate: _Candidate, reason: TerminalReason, row: TurnRow
     return {
         "candidate_id": wire.candidate_id, "profile": wire.profile, "producing_sound": wire.producing_sound,
         "chimed": wire.chimed, "rule": wire.rule.wire() if wire.rule is not None else None,
-        "hops": [asdict(h) for h in wire.hops], "lease_id": wire.lease_id, "terminal": reason,
+        "hops": [asdict(h) for h in wire.hops], "subscription_id": wire.subscription_id, "terminal": reason,
         "alert": {"kind": alert.kind, "name": alert.name} if alert is not None else None,
         "support": [candidate.support_start, candidate.support_end], "open_sample": candidate.open_sample,
         "comparison": candidate.comparison, "reference_candidates": len(candidate.reference_events),
@@ -4415,7 +4431,7 @@ def _trace(turn: _Turn, row: TurnRow, utterance: UtteranceTrace, afe: AfeEvidenc
         "chimed": wire.chimed if wire is not None else None,
         "rule": wire.rule.wire() if wire is not None and wire.rule is not None else None,
         "hops": [asdict(h) for h in wire.hops] if wire is not None else None,
-        "lease_id": turn.runtime.lease_id, "terminal": turn.terminal,
+        "subscription_id": turn.evidence.subscription_id, "terminal": turn.terminal,
         "utterance": utterance,
         # A reply that met a gap before any answer listened on with a fresh utterance (§16.6).
         **({"reopened": turn.reopened} if turn.reopened else {}),

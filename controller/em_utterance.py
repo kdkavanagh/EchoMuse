@@ -5,7 +5,7 @@ speech-worker observations in sample order; this module joins them into
 classified cells, runs the endpoint reducer only at the evidence frontier, and
 returns decisions. Positions are capture-epoch sample indices at 16 kHz.
 
-- `CellAssembler` (one per uplink lease) joins device `E`/flags, controller VAD
+- `CellAssembler` (one per audio subscription) joins device `E`/flags, controller VAD
   and per-cell echo labels into `em_attribution.Cell`s with the room floor `B`.
 - `Utterance` (one per utterance) classifies cells (`Attributor`), tracks
   streaming-text stability over the wake-cut text, and evaluates
@@ -86,7 +86,7 @@ class TextSource(enum.StrEnum):
     SERVER = "server"
 
 
-# --- Lease-level evidence ----------------------------------------------------------
+# --- Evidence for each subscription ----------------------------------------------------------
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,13 +106,13 @@ class Evidence:
 
 
 class CellAssembler:
-    """Joins one lease's device cells, VAD and echo labels in sample order (§8.1, §16.6).
+    """Joins one subscription's device cells, VAD and echo labels in sample order (§8.1, §16.6).
 
     Invariants: cells are released strictly in order and exactly once; a cell is
-    complete when its device record is known and, if it holds lease mic audio,
+    complete when its device record is known and, if it holds subscription mic audio,
     its VAD is known, and, from `echo_from` on, its echo label is known. Gap and
     muted cells (device-flagged or marked by the actor for a transport hole) need
-    neither. Cells before the lease's first mic sample have no VAD and still count
+    neither. Cells before the subscription's first mic sample have no VAD and still count
     toward `B` (§16.6).
     """
 
@@ -139,7 +139,7 @@ class CellAssembler:
         return self._vad_from
 
     def set_vad_from(self, first_mic_sample: int) -> None:
-        """First mic sample of the lease: VAD covers whole cells from here on."""
+        """First mic sample of the subscription: VAD covers whole cells from here on."""
         if self._vad_from is None:
             self._vad_from = -(-first_mic_sample // CELL) * CELL
 
@@ -463,7 +463,7 @@ def local_action(
 class Utterance:
     """One utterance's cells, text stability and endpoint reducer (§8, §16.6).
 
-    Feed `push_cell` with released lease evidence and `push_asr` with the
+    Feed `push_cell` with released subscription evidence and `push_asr` with the
     utterance's ASR results, then call `advance(valid_audio_end)`. The reducer is
     stepped once per 80 ms block end, and only for blocks both cells and ASR
     have reached. After a `Commit` or `Close` nothing further happens.
@@ -780,7 +780,7 @@ def redecoded_command(spec: UtteranceSpec, tokens: Sequence[str], seconds: Seque
 class ReplyWatch:
     """Finds an early answer (§16.6) while a question carrying a reply expectation plays.
 
-    Push every released cell of the reply lease until the reply window opens, through
+    Push every released cell of the reply subscription until the reply window opens, through
     the question and the wake chime after it; returns the onset sample once. The
     reply turn's trigger is the onset, and its utterance starts 300 ms before it.
     """
@@ -793,7 +793,7 @@ class ReplyWatch:
 
 def answer_under_way(history: Sequence[Evidence], start: int, trigger: int) -> bool:
     """At a question's drain (§16.6): a command-speech run that opened by `trigger`, and no more
-    than REPLY_OVERLAP before it, is open at the newest of the lease's released cells, as a reply
+    than REPLY_OVERLAP before it, is open at the newest of the subscription's released cells, as a reply
     utterance from `start` with its trigger there classifies them: an answer begun over the
     question's end, which the wake chime would cover. `history` is contiguous and in order."""
     attributor = Attributor(trigger_sample=trigger, reply=True)

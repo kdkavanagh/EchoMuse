@@ -129,7 +129,7 @@ class Cell:
     """Evidence for one 32 ms cell.
 
     `level` is the device's `E` (None for a gap cell), `vad` the controller's
-    Silero probability (None before the lease), `echo` the per-cell echo result
+    Silero probability (None before the audio subscription), `echo` the per-cell echo result
     (None when not computed).
     """
 
@@ -214,10 +214,10 @@ def wake_trigger_sample(hops: Sequence[WakeHop], threshold: float) -> int:
 
 
 class BackgroundTracker:
-    """Rolling room floor `B` for one lease's cell stream (§16.6).
+    """Rolling room floor `B` for one subscription's cell stream (§16.6).
 
     Query `value(cell.start)` then `observe(cell)` for every cell in order, once
-    that cell's VAD is final (None for cells uploaded from before the lease).
+    that cell's VAD is final (None for cells uploaded from before the subscription).
     Reset on capture-epoch change, discontinuity, or mute.
     """
 
@@ -644,17 +644,17 @@ def self_playback_verdict(*, reference_candidate_overlaps: bool, comparison: Ech
 
 
 class EchoTracker:
-    """Per-cell echo labels while an utterance or reply lease is open (§16.6).
+    """Per-cell echo labels while an utterance or reply subscription is open (§16.6).
 
-    Lag is estimated at open from the preceding 1 s when the lease holds it,
-    otherwise from the first 1 s of the lease, then re-estimated every second.
+    Lag is estimated at open from the preceding 1 s when the subscription holds it,
+    otherwise from the first 1 s of the subscription, then re-estimated every second.
     A failed re-estimate keeps the established lag; without one, cells are `unknown`.
     """
 
-    def __init__(self, *, open_sample: int, lease_mic_start: int) -> None:
+    def __init__(self, *, open_sample: int, subscription_mic_start: int) -> None:
         first = open_sample - open_sample % CELL
         span = LAG_ESTIMATE_CELLS * CELL
-        self._end = first if first - span >= lease_mic_start else lease_mic_start + span
+        self._end = first if first - span >= subscription_mic_start else subscription_mic_start + span
         self.lag: int | None = None
 
     @staticmethod
@@ -715,7 +715,7 @@ class EchoTracker:
 class EarlyAnswerDetector:
     """§16.6 early answer during a prompt carrying a reply expectation.
 
-    Push every cell of the reply lease with its `B`; returns the onset (first
+    Push every cell of the reply subscription with its `B`; returns the onset (first
     cell of 15 consecutive qualifying cells) once, when the run completes.
     """
 

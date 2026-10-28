@@ -419,7 +419,7 @@ def test_reply_choices_make_a_bare_am_complete():
     assert isinstance(decisions[-1], Commit) and decisions[-1].text == "p m"
 
 
-# --- lease evidence assembly -------------------------------------------------------------------
+# --- subscription evidence assembly -------------------------------------------------------------------
 
 
 def test_cells_release_in_order_once_vad_and_echo_are_known():
@@ -428,7 +428,7 @@ def test_cells_release_in_order_once_vad_and_echo_are_known():
     assert a.release() == []                              # no mic yet: VAD coverage unknown
     a.set_vad_from(1_024)
     released = a.release()
-    assert [ev.start for ev in released] == [0, 512]      # before the lease: no VAD, still counted
+    assert [ev.start for ev in released] == [0, 512]      # before the subscription: no VAD, still counted
     assert all(ev.cell.vad is None for ev in released)
     a.require_echo_from(1_024)
     a.add_vad(1_024, [0.1, 0.9])

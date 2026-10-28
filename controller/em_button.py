@@ -8,7 +8,7 @@ The device is sovereign over two things this module never overrides:
   device reports `handled: "alert_stopped"` with the `occurrence_id` it stopped.
   That press is consumed: it starts no turn and fires no HA event.
 - **Privacy mute (SPEC §3.2 rule 10).** While muted a press never starts a
-  voice turn. The device also refuses every uplink lease while muted, so a
+  voice turn. The device also refuses every audio subscription while muted, so a
   controller with a stale mute state can at worst open a turn that hears
   nothing.
 

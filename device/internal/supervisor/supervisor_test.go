@@ -274,7 +274,7 @@ func (f *fakeUplink) DiagnosticLive() bool {
 	defer f.mu.Unlock()
 	return f.diagnostic
 }
-func (f *fakeUplink) Leased() bool {
+func (f *fakeUplink) Subscribed() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.diagnostic || len(f.opened) > 0
@@ -304,11 +304,11 @@ func (f *fakeUplink) Open(proto.Envelope, proto.UplinkOpen) error { return nil }
 func (f *fakeUplink) Renew(env proto.Envelope, b proto.UplinkRenew) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if _, ok := f.opened[b.LeaseID]; !ok {
-		return false, uplink.ErrUnknownLease
+	if _, ok := f.opened[b.SubscriptionID]; !ok {
+		return false, uplink.ErrUnknownSubscription
 	}
-	if env.Generation == f.gens[b.LeaseID]+1 && b.Reason == proto.LeaseTurn {
-		f.gens[b.LeaseID] = env.Generation
+	if env.Generation == f.gens[b.SubscriptionID]+1 && b.Reason == proto.SubscriptionTurn {
+		f.gens[b.SubscriptionID] = env.Generation
 		return true, nil
 	}
 	return false, nil
@@ -316,11 +316,11 @@ func (f *fakeUplink) Renew(env proto.Envelope, b proto.UplinkRenew) (bool, error
 func (f *fakeUplink) Close(env proto.Envelope, b proto.UplinkClose) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if _, ok := f.opened[b.LeaseID]; !ok {
-		return false, uplink.ErrUnknownLease
+	if _, ok := f.opened[b.SubscriptionID]; !ok {
+		return false, uplink.ErrUnknownSubscription
 	}
-	delete(f.opened, b.LeaseID)
-	return f.gens[b.LeaseID] == 1, nil
+	delete(f.opened, b.SubscriptionID)
+	return f.gens[b.SubscriptionID] == 1, nil
 }
 func (f *fakeUplink) lastEpochs() epochCall {
 	f.mu.Lock()
@@ -623,19 +623,20 @@ func TestEpochSequencingAndStreamOpens(t *testing.T) {
 	}
 }
 
-// §4.4, §16.6: a candidate opens its lease, applies the provisional duck when
-// the device was producing sound, and reports wake.candidate (generation 1,
-// flat body plus active_alert). The controller's ack releases the lease's
-// audio; uplink.close(rejected) restores the previous policy.
-func TestCandidateLeaseDuckAndRelease(t *testing.T) {
+// §4.4, §16.6: a candidate opens its audio subscription, applies the
+// provisional duck when the device was producing sound, and reports
+// wake.candidate (generation 1, flat body plus active_alert). The
+// controller's ack releases the subscription's audio; uplink.close(rejected)
+// restores the previous policy.
+func TestCandidateSubscriptionDuckAndRelease(t *testing.T) {
 	h := newHarness(t, opts{})
 	h.blocks(2)
 	h.ready()
 	h.ringTimer("t1")
 
-	h.s.onCandidate(detector.Candidate{CandidateID: "c1", LeaseID: "L1", SupportStart: 20000, ProducingSound: true, Profile: detector.ProfilePlayback, Threshold: 0.65})
+	h.s.onCandidate(detector.Candidate{CandidateID: "c1", SubscriptionID: "L1", SupportStart: 20000, ProducingSound: true, Profile: detector.ProfilePlayback, Threshold: 0.65})
 	if h.up.opened["L1"] != 20000 {
-		t.Fatalf("candidate lease not opened: %v", h.up.opened)
+		t.Fatalf("candidate subscription not opened: %v", h.up.opened)
 	}
 	out := h.s.fm.Output()
 	if out.Mix.ContentDuckDB != -18 || out.Mix.DialogDuckDB != -18 || !out.AlertBackground {
@@ -652,9 +653,9 @@ func TestCandidateLeaseDuckAndRelease(t *testing.T) {
 
 	h.control(proto.TypeCommandAck, 0, proto.CommandAck{MessageID: wc[0].id, Status: proto.AckAccepted})
 	if !h.up.accepted["L1"] {
-		t.Fatal("controller ack did not release the candidate lease")
+		t.Fatal("controller ack did not release the candidate subscription")
 	}
-	id := h.control(proto.TypeUplinkClose, 1, proto.UplinkClose{LeaseID: "L1", Reason: proto.CloseRejected})
+	id := h.control(proto.TypeUplinkClose, 1, proto.UplinkClose{SubscriptionID: "L1", Reason: proto.CloseRejected})
 	h.expectAck(id, proto.AckAccepted, "")
 	out = h.s.fm.Output()
 	if out.Mix.ContentDuckDB != 0 || out.Mix.DialogDuckDB != 0 || out.AlertBackground {
@@ -662,20 +663,20 @@ func TestCandidateLeaseDuckAndRelease(t *testing.T) {
 	}
 }
 
-// §16.6: converting the candidate lease into the turn's lease keeps the duck
-// as the turn's input focus instead of restoring.
+// §16.6: converting the candidate subscription into the turn's subscription
+// keeps the duck as the turn's input focus instead of restoring.
 func TestCandidateConversionKeepsDuckAsTurnFocus(t *testing.T) {
 	h := newHarness(t, opts{})
 	h.ready()
-	h.s.onCandidate(detector.Candidate{CandidateID: "c1", LeaseID: "L1", SupportStart: 9000, ProducingSound: true})
-	id := h.control(proto.TypeUplinkRenew, 2, proto.UplinkRenew{LeaseID: "L1", TTLMs: 3000, Reason: proto.LeaseTurn, Owner: "turn-1"})
+	h.s.onCandidate(detector.Candidate{CandidateID: "c1", SubscriptionID: "L1", SupportStart: 9000, ProducingSound: true})
+	id := h.control(proto.TypeUplinkRenew, 2, proto.UplinkRenew{SubscriptionID: "L1", TTLMs: 3000, Reason: proto.SubscriptionTurn, Owner: "turn-1"})
 	h.expectAck(id, proto.AckAccepted, "")
 	if out := h.s.fm.Output(); out.Mix.ContentDuckDB != -18 {
 		t.Fatalf("conversion restored the duck: %+v", out)
 	}
-	h.s.releaseCandidateLease("L1")
+	h.s.releaseCandidateSubscription("L1")
 	if out := h.s.fm.Output(); out.Mix.ContentDuckDB != -18 {
-		t.Fatalf("a converted lease's end released turn focus: %+v", out)
+		t.Fatalf("a converted subscription's end released turn focus: %+v", out)
 	}
 }
 
@@ -683,7 +684,7 @@ func TestCandidateConversionKeepsDuckAsTurnFocus(t *testing.T) {
 func TestSilentCandidateDoesNotDuck(t *testing.T) {
 	h := newHarness(t, opts{})
 	h.ready()
-	h.s.onCandidate(detector.Candidate{CandidateID: "c1", LeaseID: "L1", ProducingSound: false})
+	h.s.onCandidate(detector.Candidate{CandidateID: "c1", SubscriptionID: "L1", ProducingSound: false})
 	if out := h.s.fm.Output(); out.Mix.ContentDuckDB != 0 {
 		t.Fatalf("idle candidate ducked: %+v", out)
 	}
@@ -696,8 +697,8 @@ func (h *harness) wakeSound(on bool) {
 
 // local_wake_chime: with config wakeSound on, an idle candidate on a
 // connected device starts the built-in chime and reports chimed:true; while
-// producing sound, with an alert active, during a diagnostic lease or with
-// wakeSound off the chime is left to the controller.
+// producing sound, with an alert active, during a diagnostic subscription or
+// with wakeSound off the chime is left to the controller.
 func TestLocalWakeChimeOnlyForIdleConnectedCandidates(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -709,7 +710,7 @@ func TestLocalWakeChimeOnlyForIdleConnectedCandidates(t *testing.T) {
 		{name: "wakeSound off", setup: func(h *harness) { h.wakeSound(false) }},
 		{name: "producing sound", producing: true},
 		{name: "active alert", setup: func(h *harness) { h.ringTimer("t1") }},
-		{name: "diagnostic lease", setup: func(h *harness) { h.up.diagnostic = true }},
+		{name: "diagnostic subscription", setup: func(h *harness) { h.up.diagnostic = true }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -719,7 +720,7 @@ func TestLocalWakeChimeOnlyForIdleConnectedCandidates(t *testing.T) {
 			if tc.setup != nil {
 				tc.setup(h)
 			}
-			h.s.onCandidate(detector.Candidate{CandidateID: "c1", LeaseID: "L1", ProducingSound: tc.producing})
+			h.s.onCandidate(detector.Candidate{CandidateID: "c1", SubscriptionID: "L1", ProducingSound: tc.producing})
 			if earcon := h.mix()&render.MaskEarcon != 0; earcon != tc.chimed {
 				t.Fatalf("earcon in the final mix = %v, want %v", earcon, tc.chimed)
 			}
@@ -733,9 +734,9 @@ func TestLocalWakeChimeOnlyForIdleConnectedCandidates(t *testing.T) {
 	}
 }
 
-// With no session, an idle wake plays the offline notice itself — no lease,
-// no report, whatever wakeSound says. A wake heard over the device's own
-// sound or during an alert gets nothing.
+// With no session, an idle wake plays the offline notice itself — no
+// subscription, no report, whatever wakeSound says. A wake heard over the
+// device's own sound or during an alert gets nothing.
 func TestOfflineWakePlaysTheNotice(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -755,12 +756,12 @@ func TestOfflineWakePlaysTheNotice(t *testing.T) {
 			if tc.setup != nil {
 				tc.setup(h)
 			}
-			h.s.onCandidate(detector.Candidate{CandidateID: "c1", LeaseID: "L1", ProducingSound: tc.producing})
+			h.s.onCandidate(detector.Candidate{CandidateID: "c1", SubscriptionID: "L1", ProducingSound: tc.producing})
 			if earcon := h.mix()&render.MaskEarcon != 0; earcon != tc.notice {
 				t.Fatalf("earcon in the final mix = %v, want %v", earcon, tc.notice)
 			}
-			if _, leased := h.up.opened["L1"]; leased {
-				t.Fatal("candidate lease opened with no session")
+			if _, subscribed := h.up.opened["L1"]; subscribed {
+				t.Fatal("candidate subscription opened with no session")
 			}
 			if out := h.s.fm.Output(); out.Mix.ContentDuckDB != 0 {
 				t.Fatalf("offline candidate ducked: %+v", out)
@@ -782,10 +783,10 @@ func TestSessionLossDuringAWakeOrDialogPlaysTheNotice(t *testing.T) {
 	}{
 		{name: "idle"},
 		{name: "candidate awaiting its ack", notice: true, setup: func(h *harness) {
-			h.s.onCandidate(detector.Candidate{CandidateID: "c1", LeaseID: "L1"})
+			h.s.onCandidate(detector.Candidate{CandidateID: "c1", SubscriptionID: "L1"})
 		}},
 		{name: "rejected candidate", setup: func(h *harness) {
-			h.s.onCandidate(detector.Candidate{CandidateID: "c1", LeaseID: "L1"})
+			h.s.onCandidate(detector.Candidate{CandidateID: "c1", SubscriptionID: "L1"})
 			id := h.sess.of(proto.TypeWakeCandidate)[0].id
 			h.control(proto.TypeCommandAck, 0, proto.CommandAck{MessageID: id, Status: proto.AckRejected})
 		}},
@@ -820,7 +821,7 @@ func TestLocalWakeChimeIsUnreportedAndUnfenced(t *testing.T) {
 		return h.control(proto.TypeRenderStart, 3, proto.RenderStart{PlaybackID: id, SourceClass: render.Earcon, Format: 1, LocalAsset: &chime})
 	}
 	h.expectAck(start("e1"), proto.AckAccepted, "")
-	h.s.onCandidate(detector.Candidate{CandidateID: "c1", LeaseID: "L1"})
+	h.s.onCandidate(detector.Candidate{CandidateID: "c1", SubscriptionID: "L1"})
 	if wc := h.sess.of(proto.TypeWakeCandidate); len(wc) != 1 || wc[0].body["chimed"] != true {
 		t.Fatalf("wake.candidate %v", wc)
 	}
@@ -889,19 +890,19 @@ func TestDotReleaseWithoutAlertIsUnhandled(t *testing.T) {
 	}
 }
 
-// §3.2 invariant 10: privacy mute ends every lease and the capture epoch,
-// clears the mic and cell rings and drops capture; unmute announces a new
-// epoch in privacy.changed before audio resumes.
-func TestPrivacyMuteEndsLeasesAndClearsRings(t *testing.T) {
+// §3.2 invariant 10: privacy mute ends every audio subscription and the
+// capture epoch, clears the mic and cell rings and drops capture; unmute
+// announces a new epoch in privacy.changed before audio resumes.
+func TestPrivacyMuteEndsSubscriptionsAndClearsRings(t *testing.T) {
 	h := newHarness(t, opts{})
 	h.blocks(4)
 	h.ready()
 	first := epochOf(h.sess.of(proto.TypeStreamOpen)[0])
-	h.s.onCandidate(detector.Candidate{CandidateID: "c1", LeaseID: "L1", ProducingSound: true})
+	h.s.onCandidate(detector.Candidate{CandidateID: "c1", SubscriptionID: "L1", ProducingSound: true})
 
 	h.phys.MuteToggle()
 	if h.up.mutes != 1 {
-		t.Fatal("uplink leases not ended")
+		t.Fatal("audio subscriptions not ended")
 	}
 	if e := h.up.lastEpochs(); e.mic != 0 {
 		t.Fatalf("uplink still on capture epoch %d", e.mic)
@@ -954,7 +955,7 @@ func TestUplinkOpenRefusedWhileMuted(t *testing.T) {
 	h := newHarness(t, opts{})
 	h.ready()
 	h.phys.MuteToggle()
-	id := h.control(proto.TypeUplinkOpen, 1, proto.UplinkOpen{LeaseID: "L", Reason: proto.LeaseTurn, Streams: map[proto.StreamID]string{"mic": "live"}, TTLMs: 3000})
+	id := h.control(proto.TypeUplinkOpen, 1, proto.UplinkOpen{SubscriptionID: "L", Reason: proto.SubscriptionTurn, Streams: map[proto.StreamID]string{"mic": "live"}, TTLMs: 3000})
 	h.expectAck(id, proto.AckRejected, codeMuted)
 }
 
@@ -1255,7 +1256,7 @@ func TestScreenWakeOnCandidateOpen(t *testing.T) {
 		if tc.lost {
 			h.s.Lost(client.LostTimeout)
 		}
-		h.s.onCandidate(detector.Candidate{CandidateID: "c1", LeaseID: "L1"})
+		h.s.onCandidate(detector.Candidate{CandidateID: "c1", SubscriptionID: "L1"})
 		if got := h.screenCalls(); !slices.Equal(got, tc.want) {
 			t.Errorf("%s: ScreenOn calls %v, want %v", tc.name, got, tc.want)
 		}

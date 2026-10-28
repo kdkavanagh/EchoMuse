@@ -1083,8 +1083,8 @@ channel.
    **Implemented** as the optional capability `afe_metadata_v1`
    ([protocol-v1.md](protocol-v1.md) §3 and §4.1, `post-afe-audio-architecture.md`
    §4.5). The decoder is `device/internal/audio/afe`. Per-80 ms records ride
-   under uplink leases, and the controller keeps them as evidence on turns. No
-   decision reads them. On the device every steady 30 s window validated
+   under audio subscriptions, and the controller keeps them as evidence on
+   turns. No decision reads them. On the device every steady 30 s window validated
    3,750 of 3,750 frames, idle and during playback (3,719 of 3,720 in the
    first window after start, where one frame confirms the lock). A forced
    stream re-open kept the lock and was counted as 72 lost frames. How those
@@ -1139,7 +1139,7 @@ channel.
      89 ms against the estimate in steady state.
    - *Cost:* the mixer 68.7 % vs 67.8 % of a core (unmeasurable). The firmware
      reads 3 channels (96 kB/s) and de-interleaves them. Uplink is unchanged,
-     because a kind 2 reference is uploaded under leases either way.
+     because a kind 2 reference is uploaded under subscriptions either way.
    - *Risks and requirements:*
      - At least one mic channel is mandatory (`[]` is invalid).
      - The AEC-out config is global HAL state, and a rejected setup silently

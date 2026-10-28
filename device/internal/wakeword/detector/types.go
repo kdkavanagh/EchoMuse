@@ -240,7 +240,7 @@ type Hop struct {
 // transport adds `active_alert`, which the detector does not know.
 type Candidate struct {
 	CandidateID      string  `json:"candidate_id"`
-	LeaseID          string  `json:"lease_id"`
+	SubscriptionID   string  `json:"lease_id"`
 	CaptureEpoch     uint64  `json:"capture_epoch,string"`
 	GraphSHA256      string  `json:"graph_sha256"`
 	ScorerRevision   uint64  `json:"scorer_revision"`
@@ -387,6 +387,6 @@ type Callbacks struct {
 	OnStats func(Stats)
 	// NowMonoNS is the device monotonic clock in ns.
 	NowMonoNS func() int64
-	// NewID returns a fresh UUID for candidate and lease IDs.
+	// NewID returns a fresh UUID for candidate and subscription IDs.
 	NewID func() string
 }

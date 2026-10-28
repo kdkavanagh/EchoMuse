@@ -1,4 +1,8 @@
-"""Uplink audio: EMA1 frames, stream epochs, uplink leases, per-lease timelines.
+"""Uplink audio: EMA1 frames, stream epochs, audio subscriptions, and a buffer for each subscription.
+
+An audio subscription is the controller's permission for the device to upload named
+streams (mic, cells, reference, afe) from given start samples. The controller renews it
+every second, and it lapses after 3 s without a renewal.
 
 SPEC §4.2–4.4 and §16.1; the byte layout and JSON spellings are the WIRE
 (`docs/protocol-v1.md` §3, §4.2, §4.5, §5). Pure Python + numpy: the transport
@@ -107,12 +111,12 @@ AFE_VOLUME_MAX = 127
 # Samples one EMA1 frame stands for, where that is not one sample.
 _FRAME_SAMPLES = {Kind.CELLS: CELL_SAMPLES, Kind.AFE: AFE_PERIOD_SAMPLES}
 
-# -- Leases and retention (§4.4, §8.1) --------------------------------------
+# -- Subscriptions and retention (§4.4, §8.1) --------------------------------
 
 REFERENCE_HOP = 2_560               # reference backfill grid, samples (§4.4)
-LEASE_TTL_MS = 3_000                # §4.4
-LEASE_RENEW_S = 1.0                 # the controller renews every second (§4.4)
-CANDIDATE_ACK_S = 1.0               # unacknowledged candidate lease ends with `ttl` (§4.4)
+SUBSCRIPTION_TTL_MS = 3_000         # §4.4
+SUBSCRIPTION_RENEW_S = 1.0          # the controller renews every second (§4.4)
+CANDIDATE_ACK_S = 1.0               # unacknowledged candidate subscription ends with `ttl` (§4.4)
 DIAGNOSTIC_MAX_S = 30 * 60          # §4.4
 CANDIDATE_MIC_PREROLL = 4_800       # support_start − 300 ms (WIRE §4.5)
 CANDIDATE_REFERENCE_LEAD = 40_000   # mic start − 2,500 ms
@@ -127,7 +131,7 @@ CELL_CAPACITY = (PCM_CAPACITY + ROLLING_SAMPLES) // CELL_SAMPLES
 # lead, plus the period the floor cuts.
 AFE_CAPACITY = -(-(PCM_CAPACITY + REFERENCE_EXTRA) // AFE_PERIOD_SAMPLES) + 1
 VAD_CAPACITY = -(-(PCM_CAPACITY + REFERENCE_EXTRA) // CELL_SAMPLES) + 1   # cells, retained as AFE records
-LEASE_BYTES_CAP = 2_600_000         # §8.1 per-lease bound
+SUBSCRIPTION_BYTES_CAP = 2_600_000  # §8.1: the most one subscription may hold
 
 # -- Clock fit (§4.3) -------------------------------------------------------
 
@@ -147,8 +151,8 @@ class ProtocolError(Exception):
         self.detail = detail
 
 
-class LeaseError(Exception):
-    """A lease operation that does not apply to the lease's current state."""
+class SubscriptionError(Exception):
+    """A subscription operation that does not apply to the subscription's current state."""
 
 
 # ---------------------------------------------------------------------------
@@ -813,7 +817,7 @@ class AfeTimeline:
             self.known.trim_before(period)
 
     def clear(self) -> None:
-        """Erase every record (mute or session loss, with the lease's audio): as if none had come."""
+        """Erase every record (mute or session loss, with the subscription's audio): as if none had come."""
         self._rec = None
         self.known.clear()
         self.floor, self.frontier = 0, None
@@ -821,9 +825,9 @@ class AfeTimeline:
 
 class VadTrack:
     """The controller's Silero speech probability (em_speech_worker.VadPayload) for each
-    512-sample cell of one lease's mic, indexed by cell number j (capture samples
+    512-sample cell of one subscription's mic, indexed by cell number j (capture samples
     `[512j, 512j + 512)`), the newest value winning, ring of `capacity` cells, retained and
-    erased with the lease's AFE records. A cell Silero did not analyse has none, never a zero.
+    erased with the subscription's AFE records. A cell Silero did not analyse has none, never a zero.
     Evidence for the turn's chart (em_afe.AfeSeries.silero); no decision reads it."""
 
     def __init__(self, capacity: int = VAD_CAPACITY):
@@ -874,7 +878,7 @@ class VadTrack:
         self.floor = max(self.floor, sample // CELL_SAMPLES)
 
     def clear(self) -> None:
-        """Erase every value (mute or session loss, with the lease's audio): as if none had come."""
+        """Erase every value (mute or session loss, with the subscription's audio): as if none had come."""
         self._p = None
         self.floor, self.frontier = 0, None
 
@@ -957,9 +961,9 @@ class _Segment:
 
 
 class ReferenceTimeline:
-    """The lease's final-mix reference, bounded to `capacity` samples in total.
+    """The subscription's final-mix reference, bounded to `capacity` samples in total.
 
-    The reference epoch restarts with the render epoch while a lease lives on.
+    The reference epoch restarts with the render epoch while a subscription lives on.
     Every epoch is mapped affinely into one internal ring: a new epoch starts
     at the ring's current frontier, and an older epoch is closed at that point,
     so epochs never alias and memory never exceeds one ring."""
@@ -1063,7 +1067,7 @@ class StreamRegistry:
     """Epochs announced by the device for the current session.
 
     A packet must name an open epoch of its stream, with a strictly increasing
-    sequence. First samples advance, except that each lease that starts
+    sequence. First samples advance, except that each subscription that starts
     wanting the stream grants one backfill run: packets below the live
     position that start a new run or continue an existing one in sample order
     (possibly interleaved with live packets). Duplicate samples are then
@@ -1114,7 +1118,7 @@ class StreamRegistry:
         return state is not None and not state.ended
 
     def grant_backfill(self, stream_id: StreamId, epoch: int | None = None) -> None:
-        """A lease starts wanting `stream_id`: allow one backfill run on the
+        """A subscription starts wanting `stream_id`: allow one backfill run on the
         named epoch (or every open epoch of it, for the reference)."""
         for (sid, ep), state in self._epochs.items():
             # Before the epoch's first packet a backfill is simply its start.
@@ -1250,10 +1254,10 @@ class ClockMap:
 
 
 # ---------------------------------------------------------------------------
-# Leases (§4.4, WIRE §4.5)
+# Subscriptions (§4.4, WIRE §4.5)
 # ---------------------------------------------------------------------------
 
-class LeaseReason(enum.StrEnum):
+class SubscriptionReason(enum.StrEnum):
     CANDIDATE = "candidate"
     TURN = "turn"
     REPLY = "reply"
@@ -1267,8 +1271,8 @@ class AckState(enum.StrEnum):
     REJECTED = "rejected"
 
 
-class LeaseEnd(enum.StrEnum):
-    """Why a lease is over: an `uplink.close` reason (controller) or an `uplink.ended` reason (device)."""
+class SubscriptionEnd(enum.StrEnum):
+    """Why a subscription is over: an `uplink.close` reason (controller) or an `uplink.ended` reason (device)."""
 
     REJECTED = "rejected"
     ARBITRATION_LOST = "arbitration_lost"
@@ -1282,15 +1286,16 @@ class LeaseEnd(enum.StrEnum):
 
 
 LIVE = "live"
-CLOSE_REASONS = frozenset({LeaseEnd.REJECTED, LeaseEnd.ARBITRATION_LOST, LeaseEnd.COMMITTED, LeaseEnd.CLOSED})
-ENDED_REASONS = frozenset({LeaseEnd.CLOSED, LeaseEnd.TTL, LeaseEnd.MUTE, LeaseEnd.EPOCH, LeaseEnd.OVERRUN,
-                           LeaseEnd.SESSION})
+CLOSE_REASONS = frozenset({SubscriptionEnd.REJECTED, SubscriptionEnd.ARBITRATION_LOST, SubscriptionEnd.COMMITTED,
+                           SubscriptionEnd.CLOSED})
+ENDED_REASONS = frozenset({SubscriptionEnd.CLOSED, SubscriptionEnd.TTL, SubscriptionEnd.MUTE, SubscriptionEnd.EPOCH,
+                           SubscriptionEnd.OVERRUN, SubscriptionEnd.SESSION})
 
 
 @dataclass
-class Lease:
-    lease_id: str
-    reason: LeaseReason
+class Subscription:
+    subscription_id: str
+    reason: SubscriptionReason
     owner: str
     generation: int
     capture_epoch: int
@@ -1298,15 +1303,15 @@ class Lease:
     ttl_ms: int
     opened_at: float
     renewed_at: float
-    ack: AckState | None = None         # candidate leases only
+    ack: AckState | None = None         # candidate subscriptions only
     candidate_id: str | None = None
-    ended: LeaseEnd | None = None       # close/ended reason once over
+    ended: SubscriptionEnd | None = None   # close/ended reason once over
     last_sample: dict[StreamId, int | None] = field(default_factory=dict)   # None: nothing sent
     clipped_start: dict[StreamId, int | None] = field(default_factory=dict)
 
     @property
     def active(self) -> bool:
-        """Receiving audio: open, and acknowledged if it is a candidate lease."""
+        """Receiving audio: open, and acknowledged if it is a candidate subscription."""
         return self.ended is None and self.ack in (None, AckState.ACCEPTED)
 
     def wants(self, stream_id: StreamId) -> bool:
@@ -1317,18 +1322,20 @@ class Lease:
         return self.renewed_at + self.ttl_ms / 1000.0
 
 
-class LeaseCommand(enum.StrEnum):
-    """The control message types of controller lease commands (WIRE §4.5)."""
+class SubscriptionCommand(enum.StrEnum):
+    """The control message types of controller subscription commands (WIRE §4.5)."""
 
     OPEN = "uplink.open"
     RENEW = "uplink.renew"
     CLOSE = "uplink.close"
 
 
+# The wire calls a subscription a lease, so the key stays `lease_id` for compatibility
+# with every firmware and controller version.
 class UplinkOpenBody(TypedDict):
     lease_id: str
     owner: str
-    reason: LeaseReason
+    reason: SubscriptionReason
     streams: dict[StreamId, str]          # start as a u64 decimal string, or LIVE
     ttl_ms: int
 
@@ -1339,22 +1346,22 @@ class UplinkRenewBody(TypedDict):
 
 
 class UplinkConvertBody(UplinkRenewBody):
-    """The renewal that converts a candidate lease into the turn's lease."""
+    """The renewal that converts a candidate subscription into the turn's subscription."""
 
-    reason: LeaseReason
+    reason: SubscriptionReason
     owner: str
 
 
 class UplinkCloseBody(TypedDict):
     lease_id: str
-    reason: LeaseEnd
+    reason: SubscriptionEnd
 
 
 @dataclass(frozen=True, slots=True)
-class LeaseMessage:
+class SubscriptionMessage:
     """A control message to send: envelope `type`, `generation`, `body`."""
 
-    type: LeaseCommand
+    type: SubscriptionCommand
     generation: int
     body: UplinkOpenBody | UplinkRenewBody | UplinkConvertBody | UplinkCloseBody
 
@@ -1363,35 +1370,35 @@ def _round_down(x: int, grid: int) -> int:
     return max(0, x - x % grid)
 
 
-class LeaseTable:
-    """Controller-side record of the session's uplink leases."""
+class SubscriptionTable:
+    """Controller-side record of the session's uplink subscriptions."""
 
     def __init__(self, now: Callable[[], float] = time.monotonic):
         self._now = now
-        self._leases: dict[str, Lease] = {}
+        self._subscriptions: dict[str, Subscription] = {}
 
-    def __iter__(self) -> Iterator[Lease]:
-        return iter(list(self._leases.values()))
+    def __iter__(self) -> Iterator[Subscription]:
+        return iter(list(self._subscriptions.values()))
 
-    def get(self, lease_id: str) -> Lease | None:
-        return self._leases.get(lease_id)
+    def get(self, subscription_id: str) -> Subscription | None:
+        return self._subscriptions.get(subscription_id)
 
-    def _live(self, lease_id: str) -> Lease:
-        lease = self._leases.get(lease_id)
-        if lease is None:
-            raise LeaseError(f"unknown lease {lease_id}")
-        if lease.ended is not None:
-            raise LeaseError(f"lease {lease_id} already ended ({lease.ended})")
-        return lease
+    def _live(self, subscription_id: str) -> Subscription:
+        subscription = self._subscriptions.get(subscription_id)
+        if subscription is None:
+            raise SubscriptionError(f"unknown subscription {subscription_id}")
+        if subscription.ended is not None:
+            raise SubscriptionError(f"subscription {subscription_id} already ended ({subscription.ended})")
+        return subscription
 
-    def open_candidate(self, lease_id: str, candidate_id: str, capture_epoch: int,
-                       support_start: int, *, afe: bool = False) -> Lease:
-        """Record the lease the device opened with `wake.candidate` (gen 1).
+    def open_candidate(self, subscription_id: str, candidate_id: str, capture_epoch: int,
+                       support_start: int, *, afe: bool = False) -> Subscription:
+        """Record the subscription the device opened with `wake.candidate` (gen 1).
         `afe`: the session opted in to `afe_metadata_v1`, so the device adds
-        `afe` to its candidate lease from the reference start (the AEC state
+        `afe` to its candidate subscription from the reference start (the AEC state
         before the wake), on the period grid (WIRE §4.5)."""
-        if lease_id in self._leases:
-            raise LeaseError(f"lease {lease_id} already exists")
+        if subscription_id in self._subscriptions:
+            raise SubscriptionError(f"subscription {subscription_id} already exists")
         mic = _round_down(support_start - CANDIDATE_MIC_PREROLL, CELL_SAMPLES)
         streams: dict[StreamId, int | None] = {
             StreamId.MIC: mic,
@@ -1401,34 +1408,35 @@ class LeaseTable:
         if afe:
             streams[StreamId.AFE] = _round_down(mic - CANDIDATE_REFERENCE_LEAD, AFE_PERIOD_SAMPLES)
         now = self._now()
-        lease = Lease(
-            lease_id, LeaseReason.CANDIDATE, candidate_id, 1, capture_epoch, streams,
-            LEASE_TTL_MS, now, now, ack=AckState.PENDING, candidate_id=candidate_id,
+        subscription = Subscription(
+            subscription_id, SubscriptionReason.CANDIDATE, candidate_id, 1, capture_epoch, streams,
+            SUBSCRIPTION_TTL_MS, now, now, ack=AckState.PENDING, candidate_id=candidate_id,
         )
-        self._leases[lease_id] = lease
-        return lease
+        self._subscriptions[subscription_id] = subscription
+        return subscription
 
-    def acknowledge(self, lease_id: str, accepted: bool) -> Lease:
+    def acknowledge(self, subscription_id: str, accepted: bool) -> Subscription:
         """The controller's `command.ack` for the `wake.candidate`."""
-        lease = self._live(lease_id)
-        if lease.ack is not AckState.PENDING:
-            raise LeaseError(f"lease {lease_id} is not awaiting acknowledgement")
-        lease.ack = AckState.ACCEPTED if accepted else AckState.REJECTED
-        lease.renewed_at = self._now()
+        subscription = self._live(subscription_id)
+        if subscription.ack is not AckState.PENDING:
+            raise SubscriptionError(f"subscription {subscription_id} is not awaiting acknowledgement")
+        subscription.ack = AckState.ACCEPTED if accepted else AckState.REJECTED
+        subscription.renewed_at = self._now()
         if not accepted:
-            lease.ended = LeaseEnd.REJECTED
-        return lease
+            subscription.ended = SubscriptionEnd.REJECTED
+        return subscription
 
-    def open(self, lease_id: str, reason: LeaseReason, owner: str, capture_epoch: int,
-             streams: Mapping[StreamId, int | None], ttl_ms: int = LEASE_TTL_MS) -> tuple[Lease, LeaseMessage]:
-        """A controller-opened lease (`turn`, `reply`, `diagnostic`, `near_miss`)."""
-        reason = LeaseReason(reason)
-        if reason is LeaseReason.CANDIDATE:
-            raise LeaseError("candidate leases are opened by the device")
-        if lease_id in self._leases:
-            raise LeaseError(f"lease {lease_id} already exists")
+    def open(self, subscription_id: str, reason: SubscriptionReason, owner: str, capture_epoch: int,
+             streams: Mapping[StreamId, int | None],
+             ttl_ms: int = SUBSCRIPTION_TTL_MS) -> tuple[Subscription, SubscriptionMessage]:
+        """A controller-opened subscription (`turn`, `reply`, `diagnostic`, `near_miss`)."""
+        reason = SubscriptionReason(reason)
+        if reason is SubscriptionReason.CANDIDATE:
+            raise SubscriptionError("candidate subscriptions are opened by the device")
+        if subscription_id in self._subscriptions:
+            raise SubscriptionError(f"subscription {subscription_id} already exists")
         if not streams or any(sid not in StreamId for sid in streams):
-            raise LeaseError(f"invalid streams {sorted(streams)}")
+            raise SubscriptionError(f"invalid streams {sorted(streams)}")
         starts: dict[StreamId, int | None] = {}
         for sid, start in streams.items():
             sid = StreamId(sid)
@@ -1441,120 +1449,122 @@ class LeaseTable:
             else:
                 starts[sid] = _round_down(start, CELL_SAMPLES)
         now = self._now()
-        lease = Lease(lease_id, reason, owner, 1, capture_epoch, starts, ttl_ms, now, now)
-        self._leases[lease_id] = lease
+        subscription = Subscription(subscription_id, reason, owner, 1, capture_epoch, starts, ttl_ms, now, now)
+        self._subscriptions[subscription_id] = subscription
         body = UplinkOpenBody(
-            lease_id=lease_id, owner=owner, reason=reason,
+            lease_id=subscription_id, owner=owner, reason=reason,
             streams={sid: LIVE if s is None else format_u64(s) for sid, s in starts.items()},
             ttl_ms=ttl_ms,
         )
-        return lease, LeaseMessage(LeaseCommand.OPEN, lease.generation, body)
+        return subscription, SubscriptionMessage(SubscriptionCommand.OPEN, subscription.generation, body)
 
-    def convert_to_turn(self, lease_id: str, owner: str) -> LeaseMessage:
-        """Convert an accepted candidate lease into the turn's lease in place."""
-        lease = self._live(lease_id)
-        if lease.reason is not LeaseReason.CANDIDATE or lease.ack is not AckState.ACCEPTED:
-            raise LeaseError(f"lease {lease_id} is not an accepted candidate lease")
-        lease.reason = LeaseReason.TURN
-        lease.owner = owner
-        lease.generation += 1
-        lease.renewed_at = self._now()
-        return LeaseMessage(LeaseCommand.RENEW, lease.generation, UplinkConvertBody(
-            lease_id=lease_id, ttl_ms=lease.ttl_ms, reason=LeaseReason.TURN, owner=owner))
+    def convert_to_turn(self, subscription_id: str, owner: str) -> SubscriptionMessage:
+        """Convert an accepted candidate subscription into the turn's subscription in place."""
+        subscription = self._live(subscription_id)
+        if subscription.reason is not SubscriptionReason.CANDIDATE or subscription.ack is not AckState.ACCEPTED:
+            raise SubscriptionError(f"subscription {subscription_id} is not an accepted candidate subscription")
+        subscription.reason = SubscriptionReason.TURN
+        subscription.owner = owner
+        subscription.generation += 1
+        subscription.renewed_at = self._now()
+        return SubscriptionMessage(SubscriptionCommand.RENEW, subscription.generation, UplinkConvertBody(
+            lease_id=subscription_id, ttl_ms=subscription.ttl_ms, reason=SubscriptionReason.TURN, owner=owner))
 
-    def renew(self, lease_id: str) -> LeaseMessage:
-        lease = self._live(lease_id)
+    def renew(self, subscription_id: str) -> SubscriptionMessage:
+        subscription = self._live(subscription_id)
         now = self._now()
-        if lease.reason is LeaseReason.DIAGNOSTIC and now - lease.opened_at >= DIAGNOSTIC_MAX_S:
-            raise LeaseError(f"diagnostic lease {lease_id} reached {DIAGNOSTIC_MAX_S} s")
-        if lease.ack is AckState.PENDING:
-            raise LeaseError(f"candidate lease {lease_id} is not acknowledged")
-        lease.renewed_at = now
-        return LeaseMessage(LeaseCommand.RENEW, lease.generation, UplinkRenewBody(lease_id=lease_id, ttl_ms=lease.ttl_ms))
+        if subscription.reason is SubscriptionReason.DIAGNOSTIC and now - subscription.opened_at >= DIAGNOSTIC_MAX_S:
+            raise SubscriptionError(f"diagnostic subscription {subscription_id} reached {DIAGNOSTIC_MAX_S} s")
+        if subscription.ack is AckState.PENDING:
+            raise SubscriptionError(f"candidate subscription {subscription_id} is not acknowledged")
+        subscription.renewed_at = now
+        return SubscriptionMessage(SubscriptionCommand.RENEW, subscription.generation,
+                                   UplinkRenewBody(lease_id=subscription_id, ttl_ms=subscription.ttl_ms))
 
-    def due_renewals(self) -> list[Lease]:
-        """Leases whose once-a-second renewal is due."""
+    def due_renewals(self) -> list[Subscription]:
+        """Subscriptions whose once-a-second renewal is due."""
         now = self._now()
-        return [l for l in self._leases.values()
-                if l.active and now - l.renewed_at >= LEASE_RENEW_S
-                and not (l.reason is LeaseReason.DIAGNOSTIC and now - l.opened_at >= DIAGNOSTIC_MAX_S)]
+        return [l for l in self._subscriptions.values()
+                if l.active and now - l.renewed_at >= SUBSCRIPTION_RENEW_S
+                and not (l.reason is SubscriptionReason.DIAGNOSTIC and now - l.opened_at >= DIAGNOSTIC_MAX_S)]
 
-    def close(self, lease_id: str, reason: LeaseEnd) -> LeaseMessage:
+    def close(self, subscription_id: str, reason: SubscriptionEnd) -> SubscriptionMessage:
         if reason not in CLOSE_REASONS:
-            raise LeaseError(f"invalid close reason {reason!r}")
-        lease = self._live(lease_id)
-        lease.ended = reason
-        return LeaseMessage(LeaseCommand.CLOSE, lease.generation, UplinkCloseBody(lease_id=lease_id, reason=reason))
+            raise SubscriptionError(f"invalid close reason {reason!r}")
+        subscription = self._live(subscription_id)
+        subscription.ended = reason
+        return SubscriptionMessage(SubscriptionCommand.CLOSE, subscription.generation,
+                                   UplinkCloseBody(lease_id=subscription_id, reason=reason))
 
-    def device_ended(self, body: Mapping[str, object]) -> Lease | None:
-        """Apply `uplink.ended`; returns the lease, or None if unknown."""
-        lease_id = body.get("lease_id")
-        lease = self._leases.get(lease_id) if isinstance(lease_id, str) else None
-        if lease is None:
+    def device_ended(self, body: Mapping[str, object]) -> Subscription | None:
+        """Apply `uplink.ended`; returns the subscription, or None if unknown."""
+        subscription_id = body.get("lease_id")
+        subscription = self._subscriptions.get(subscription_id) if isinstance(subscription_id, str) else None
+        if subscription is None:
             return None
         reason = body.get("reason")
         if not isinstance(reason, str) or reason not in ENDED_REASONS:
             raise ProtocolError("malformed_message", f"uplink.ended reason {reason!r}")
-        if lease.ended is None:
-            lease.ended = LeaseEnd(reason)
-        for key, target in (("last_sample", lease.last_sample), ("clipped_start", lease.clipped_start)):
+        if subscription.ended is None:
+            subscription.ended = SubscriptionEnd(reason)
+        for key, target in (("last_sample", subscription.last_sample), ("clipped_start", subscription.clipped_start)):
             values = body.get(key) or {}
             if not isinstance(values, Mapping):
                 raise ProtocolError("malformed_message", f"uplink.ended {key} must be an object")
             for sid, value in values.items():
                 if isinstance(sid, str) and sid in StreamId:
                     target[StreamId(sid)] = None if value is None else parse_u64(value, f"{key}.{sid}")
-        return lease
+        return subscription
 
-    def expire(self) -> list[Lease]:
-        """End leases the device has certainly ended by TTL: past their TTL,
-        or candidate leases still unacknowledged after 1 s."""
+    def expire(self) -> list[Subscription]:
+        """End subscriptions the device has certainly ended by TTL: past their TTL,
+        or candidate subscriptions still unacknowledged after 1 s."""
         now = self._now()
         out = []
-        for lease in self._leases.values():
-            if lease.ended is not None:
+        for subscription in self._subscriptions.values():
+            if subscription.ended is not None:
                 continue
-            if lease.ack is AckState.PENDING and now - lease.opened_at >= CANDIDATE_ACK_S:
-                lease.ended = LeaseEnd.TTL
-            elif now >= lease.expires_at:
-                lease.ended = LeaseEnd.TTL
+            if subscription.ack is AckState.PENDING and now - subscription.opened_at >= CANDIDATE_ACK_S:
+                subscription.ended = SubscriptionEnd.TTL
+            elif now >= subscription.expires_at:
+                subscription.ended = SubscriptionEnd.TTL
             else:
                 continue
-            out.append(lease)
+            out.append(subscription)
         return out
 
-    def end_all(self, reason: LeaseEnd) -> list[Lease]:
-        """Mute, epoch change, or session loss: every open lease ends."""
+    def end_all(self, reason: SubscriptionEnd) -> list[Subscription]:
+        """Mute, epoch change, or session loss: every open subscription ends."""
         if reason not in ENDED_REASONS:
-            raise LeaseError(f"invalid end reason {reason!r}")
+            raise SubscriptionError(f"invalid end reason {reason!r}")
         out = []
-        for lease in self._leases.values():
-            if lease.ended is None:
-                lease.ended = reason
-                out.append(lease)
+        for subscription in self._subscriptions.values():
+            if subscription.ended is None:
+                subscription.ended = reason
+                out.append(subscription)
         return out
 
-    def forget(self, lease_id: str) -> None:
-        self._leases.pop(lease_id, None)
+    def forget(self, subscription_id: str) -> None:
+        self._subscriptions.pop(subscription_id, None)
 
-    def wanting(self, stream_id: StreamId, epoch: int) -> list[Lease]:
-        """Active leases that take this packet's stream/epoch. Mic, cells and
-        AFE belong to the lease's capture epoch; the reference has its own epochs."""
-        return [l for l in self._leases.values()
+    def wanting(self, stream_id: StreamId, epoch: int) -> list[Subscription]:
+        """Active subscriptions that take this packet's stream/epoch. Mic, cells and
+        AFE belong to the subscription's capture epoch; the reference has its own epochs."""
+        return [l for l in self._subscriptions.values()
                 if l.wants(stream_id) and (stream_id == StreamId.REFERENCE or l.capture_epoch == epoch)]
 
 
 # ---------------------------------------------------------------------------
-# Per-lease timeline
+# The buffer of each subscription
 # ---------------------------------------------------------------------------
 
-class LeaseTimeline:
-    """Mic, reference, cells and AFE records a lease received, and the controller's Silero
+class SubscriptionBuffer:
+    """Mic, reference, cells and AFE records a subscription received, and the controller's Silero
     probabilities for its mic. The open utterance (≤30 s) plus a rolling 10 s before it are
     kept; the rest ages out (§8.1)."""
 
-    def __init__(self, lease: Lease):
-        self.lease = lease
+    def __init__(self, subscription: Subscription):
+        self.subscription = subscription
         self.mic = SampleTimeline(PCM_CAPACITY)
         self.cells = CellTimeline(CELL_CAPACITY)
         self.reference = ReferenceTimeline(PCM_CAPACITY)
@@ -1591,7 +1601,7 @@ class LeaseTimeline:
 
     def store(self, stream_id: StreamId, packet: Packet) -> list[tuple[int, int]]:
         """Place a validated packet; returns newly known ranges."""
-        start = self.lease.streams.get(stream_id)
+        start = self.subscription.streams.get(stream_id)
         if stream_id == StreamId.MIC:
             first = packet.first_sample
             if packet.discontinuity:
@@ -1636,14 +1646,14 @@ class LeaseTimeline:
 
 
 # ---------------------------------------------------------------------------
-# Session: registry + leases + timelines + clocks
+# Session: registry + subscriptions + timelines + clocks
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True, slots=True)
 class Delivery:
-    """New samples a packet contributed to one lease's timeline."""
+    """New samples a packet contributed to one subscription's timeline."""
 
-    lease_id: str
+    subscription_id: str
     stream_id: StreamId
     epoch: int
     ranges: tuple[tuple[int, int], ...]
@@ -1658,8 +1668,8 @@ class UplinkSession:
     def __init__(self, now: Callable[[], float] = time.monotonic, *, afe_metadata: bool = False):
         self.afe_metadata = afe_metadata
         self.streams = StreamRegistry()
-        self.leases = LeaseTable(now)
-        self.timelines: dict[str, LeaseTimeline] = {}
+        self.subscriptions = SubscriptionTable(now)
+        self.timelines: dict[str, SubscriptionBuffer] = {}
         self._clocks: dict[tuple[Kind, int], StreamClock] = {}
 
     # -- stream messages -------------------------------------------------
@@ -1672,44 +1682,46 @@ class UplinkSession:
         self._clocks.pop((_STREAM_KIND[stream_id], epoch), None)
         return stream_id, epoch, final
 
-    # -- leases ----------------------------------------------------------
+    # -- subscriptions ----------------------------------------------------------
 
-    def _attach(self, lease: Lease) -> None:
-        self.timelines[lease.lease_id] = LeaseTimeline(lease)
-        for sid in lease.streams:
-            self.streams.grant_backfill(sid, None if sid == StreamId.REFERENCE else lease.capture_epoch)
+    def _attach(self, subscription: Subscription) -> None:
+        self.timelines[subscription.subscription_id] = SubscriptionBuffer(subscription)
+        for sid in subscription.streams:
+            self.streams.grant_backfill(sid, None if sid == StreamId.REFERENCE else subscription.capture_epoch)
 
-    def candidate(self, lease_id: str, candidate_id: str, capture_epoch: int, support_start: int) -> Lease:
-        return self.leases.open_candidate(lease_id, candidate_id, capture_epoch, support_start,
-                                          afe=self.afe_metadata)
+    def candidate(self, subscription_id: str, candidate_id: str, capture_epoch: int,
+                  support_start: int) -> Subscription:
+        return self.subscriptions.open_candidate(subscription_id, candidate_id, capture_epoch, support_start,
+                                                 afe=self.afe_metadata)
 
-    def acknowledge(self, lease_id: str, accepted: bool) -> Lease:
-        lease = self.leases.acknowledge(lease_id, accepted)
+    def acknowledge(self, subscription_id: str, accepted: bool) -> Subscription:
+        subscription = self.subscriptions.acknowledge(subscription_id, accepted)
         if accepted:
-            self._attach(lease)
-        return lease
+            self._attach(subscription)
+        return subscription
 
-    def open(self, lease_id: str, reason: LeaseReason, owner: str, capture_epoch: int,
-             streams: Mapping[StreamId, int | None], ttl_ms: int = LEASE_TTL_MS) -> LeaseMessage:
-        lease, msg = self.leases.open(lease_id, reason, owner, capture_epoch, streams, ttl_ms)
-        self._attach(lease)
+    def open(self, subscription_id: str, reason: SubscriptionReason, owner: str, capture_epoch: int,
+             streams: Mapping[StreamId, int | None],
+             ttl_ms: int = SUBSCRIPTION_TTL_MS) -> SubscriptionMessage:
+        subscription, msg = self.subscriptions.open(subscription_id, reason, owner, capture_epoch, streams, ttl_ms)
+        self._attach(subscription)
         return msg
 
-    def release(self, lease_id: str) -> None:
-        """Drop an ended lease's timeline and record once the actor is done."""
-        self.timelines.pop(lease_id, None)
-        self.leases.forget(lease_id)
+    def release(self, subscription_id: str) -> None:
+        """Drop an ended subscription's timeline and record once the actor is done."""
+        self.timelines.pop(subscription_id, None)
+        self.subscriptions.forget(subscription_id)
 
-    def clear(self, reason: LeaseEnd) -> list[Lease]:
-        """Mute or session loss: end every lease and erase buffered audio, AFE records and
-        Silero probabilities (also where the actor still holds a lease's mic or records)."""
-        ended = self.leases.end_all(reason)
+    def clear(self, reason: SubscriptionEnd) -> list[Subscription]:
+        """Mute or session loss: end every subscription and erase buffered audio, AFE records and
+        Silero probabilities (also where the actor still holds a subscription's mic or records)."""
+        ended = self.subscriptions.end_all(reason)
         for timeline in self.timelines.values():
             timeline.mic.clear()
             timeline.afe.clear()
             timeline.vad.clear()
         self.timelines.clear()
-        if reason == LeaseEnd.SESSION:
+        if reason == SubscriptionEnd.SESSION:
             self.streams.clear()
             self._clocks.clear()
         return ended
@@ -1717,22 +1729,22 @@ class UplinkSession:
     # -- audio -----------------------------------------------------------
 
     def ingest(self, frame: bytes | bytearray | memoryview) -> list[Delivery]:
-        """Validate one uplink frame and place it in every lease that asks for it.
+        """Validate one uplink frame and place it in every subscription that asks for it.
 
         Raises ProtocolError for a WIRE violation. A valid packet that no active
-        lease asks for is dropped (empty result)."""
+        subscription asks for is dropped (empty result)."""
         packet = parse_packet(frame)
         stream_id = self.streams.check(packet)
         clock = self._clocks.setdefault((packet.kind, packet.epoch), StreamClock())
         clock.add(packet)
         out: list[Delivery] = []
-        for lease in self.leases.wanting(stream_id, packet.epoch):
-            timeline = self.timelines.get(lease.lease_id)
+        for subscription in self.subscriptions.wanting(stream_id, packet.epoch):
+            timeline = self.timelines.get(subscription.subscription_id)
             if timeline is None:
                 continue
             ranges = timeline.store(stream_id, packet)
             if ranges or packet.discontinuity or packet.muted:
-                out.append(Delivery(lease.lease_id, stream_id, packet.epoch, tuple(ranges), packet))
+                out.append(Delivery(subscription.subscription_id, stream_id, packet.epoch, tuple(ranges), packet))
         return out
 
     def clock_fit(self, stream_id: StreamId, epoch: int) -> ClockFit | None:

@@ -46,22 +46,22 @@ const (
 	assetInterval = 2 * time.Second
 )
 
-// Uplink is the lease executor (internal/uplink).
+// Uplink executes the audio subscriptions (internal/uplink).
 type Uplink interface {
 	Attach(sink client.AudioSink, send uplink.SendFunc, afe bool)
 	Detach()
 	SetEpochs(mic, reference uint64)
 	Mute()
-	OpenCandidate(leaseID string, supportStart uint64)
-	AcceptCandidate(leaseID string, accepted bool)
+	OpenCandidate(subscriptionID string, supportStart uint64)
+	AcceptCandidate(subscriptionID string, accepted bool)
 	Open(proto.Envelope, proto.UplinkOpen) error
 	Renew(proto.Envelope, proto.UplinkRenew) (converted bool, err error)
-	Close(proto.Envelope, proto.UplinkClose) (candidateLease bool, err error)
+	Close(proto.Envelope, proto.UplinkClose) (candidateSubscription bool, err error)
 	Notify()
-	// DiagnosticLive reports a live diagnostic lease (no local wake chime).
+	// DiagnosticLive reports a live diagnostic subscription (no local wake chime).
 	DiagnosticLive() bool
-	// Leased reports any open lease.
-	Leased() bool
+	// Subscribed reports any open subscription.
+	Subscribed() bool
 	Run(context.Context)
 }
 
@@ -129,7 +129,7 @@ type Deps struct {
 	Sink      render.Sink
 	LoadModel wakeword.LoadFunc
 	Alerts    alerts.Config // Events is set to the supervisor
-	// NewUplink builds the lease executor; nil selects uplink.New.
+	// NewUplink builds the subscription executor; nil selects uplink.New.
 	NewUplink func(uplink.Rings, uplink.Clock, func() int64) Uplink
 }
 
@@ -201,8 +201,8 @@ type Supervisor struct {
 	sessCancel   context.CancelFunc
 	offCtx       context.Context // live while no session is up; ready cancels it (restoreWake yields)
 	offCancel    context.CancelFunc
-	candidates   map[string]candidateState // candidate lease id → candidate
-	candidateAck map[string]string         // wake.candidate message id → lease id
+	candidates   map[string]candidateState // candidate subscription id → candidate
+	candidateAck map[string]string         // wake.candidate message id → subscription id
 	playbacks    map[string]playbackState
 	dialogOwner  string              // owner of the newest dialog_output focus lease
 	leases       map[string]struct{} // live focus leases
@@ -451,11 +451,11 @@ func (s *Supervisor) logSend(typ proto.MessageType, gen uint32, body any) {
 	}
 }
 
-// sendUplink is the uplink executor's send: an ended candidate lease also
-// ends its provisional duck (§16.6).
+// sendUplink is the uplink executor's send: an ended candidate subscription
+// also ends its provisional duck (§16.6).
 func (s *Supervisor) sendUplink(typ proto.MessageType, gen uint32, body any) (string, error) {
 	if ended, ok := body.(proto.UplinkEnded); ok && typ == proto.TypeUplinkEnded {
-		s.releaseCandidateLease(ended.LeaseID)
+		s.releaseCandidateSubscription(ended.SubscriptionID)
 	}
 	return s.send(typ, gen, body)
 }
