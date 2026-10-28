@@ -19,6 +19,8 @@ import pytest
 
 import em_session
 import em_text_fix_service
+from em_alerts import ActiveRing
+from em_alert_wire import RingKind
 from em_arbiter import WakeArbiter
 from em_audio_timeline import (
     FLAG_DIGITAL_SILENCE,
@@ -418,6 +420,8 @@ class FakeAlerts:
         self.calls = []
         self.alarms: list[dict] = []
         self.set_result: dict = {"ok": True}
+        self.rings: dict[str, ActiveRing] = {}      # what rings on each Dot, as `alert.state` reported it
+        self.act_result: dict = {"ok": True}
 
     async def set_alarm(self, *args, **kwargs):
         self.calls.append(("set_alarm", args, kwargs))
@@ -425,6 +429,17 @@ class FakeAlerts:
 
     def list_alarms(self, endpoint_id):
         return {"ok": True, "alarms": self.alarms}
+
+    def active_rings(self):
+        return dict(self.rings)
+
+    async def dismiss_alert(self, endpoint_id, **kwargs):
+        self.calls.append(("dismiss_alert", (endpoint_id,), kwargs))
+        return self.act_result
+
+    async def snooze_alarm(self, endpoint_id, **kwargs):
+        self.calls.append(("snooze_alarm", (endpoint_id,), kwargs))
+        return self.act_result
 
 
 class Device:
@@ -864,6 +879,107 @@ def test_wake_then_stop_with_a_ringing_alarm_dismisses_it_locally_without_home_a
         row = h.rows[0]
         assert row["outcome"] == "local_command" and row["terminal_reason"] == "completed"
         assert row["commit_route"] == "A" and row["stt_text"] == "stop"
+        await h.actor.close()
+    run(main())
+
+
+# Turns 934/935 (2026-10-26, Living Room): "Ophelia, stop" at the Kitchen Dot's ringing timer
+# reached the idle Living Room Dot first, about 300 ms before the Kitchen's candidates. The
+# Living Room took the utterance with no alert context and sent "stop" to HA as HassMediaPause;
+# HA answered "Okay." while the Kitchen rang on.
+@pytest.mark.parametrize("word, kind, call, action", [("▁STOP", RingKind.TIMER, "dismiss_alert", "dismiss"),
+                                                      ("▁SNOOZE", RingKind.ALARM, "snooze_alarm", "snooze")])
+def test_an_idle_dot_that_hears_stop_while_one_other_dot_rings_acts_on_that_ring(word, kind, call, action):
+    async def main():
+        h = Harness()
+        said = (OPEN + 3_200, OPEN + 7_296)
+        h.worker.vad = speech((S, OPEN - 512), said)
+        h.device.level = levels((S, OPEN - 512), said)
+        h.worker.tokens = [("▁OPHELIA", OPEN - 1_800), (word, OPEN + 5_200)]
+        h.ha.stt_text = "Stop."
+        h.ha.next_run = FakeRun([IntentEnded("", None, False, "action_done", True), RunEnded()])
+        h.alerts.rings = {"kitchen": ActiveRing("t-1", kind, "")}
+        await h.start()
+        h.actor.on_message(candidate())
+        await h.settle()
+        assert h.render.local == [("earcon", "builtin:wake_chime")]
+        await h.feed(S - 4_800 - 20_000, OPEN + 40_000)
+        await h.wait_for(lambda: h.rows)
+        row = h.rows[0]
+        trace = json.loads(row["decision_trace"])
+        op_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{trace['turn_id']}|{action}"))
+        assert h.alerts.calls == [(call, ("kitchen",), {"source": "voice", "op_id": op_id})]
+        assert h.link.requests == []                  # nothing goes to this Dot's own link
+        assert h.ha.stt_calls == [] and h.ha.intents == []
+        assert row["outcome"] == "local_command" and row["terminal_reason"] == "completed"
+        assert trace["context_device"] == "kitchen"
+        await h.actor.close()
+    run(main())
+
+
+def test_a_ringing_dots_wake_heard_after_another_dot_claimed_closes_as_arbitration_lost():
+    async def main():
+        h = Harness()
+        h.worker.verification = "pass"
+        await h.start()
+        h.arbiter.claim("living_room", 0.7)
+        alert = {"id": "t-1", "kind": "timer", "name": "", "foreground": True}
+        h.actor.on_message(candidate(producing_sound=True, active_alert=alert))
+        await h.settle()
+        await h.feed(S - 4_800 - 20_000, OPEN + 9_000)
+        await h.wait_for(lambda: h.terminals())
+        assert h.terminals() == ["arbitration_lost"]
+        assert h.link.of("uplink.close")[0][0] == {"lease_id": "L1", "reason": "arbitration_lost"}
+        assert not h.link.of("focus.acquire") and not h.render.local
+        assert h.link.requests == [] and h.alerts.calls == []
+        await h.wait_for(lambda: h.rows)
+        assert h.rows[0]["terminal_reason"] == "arbitration_lost"
+        await h.actor.close()
+    run(main())
+
+
+def test_a_dot_playing_its_own_content_keeps_the_media_context_while_another_dot_rings():
+    async def main():
+        h = Harness()
+        h.media_playing = True
+        said = (OPEN + 3_200, OPEN + 7_296)
+        h.worker.vad = speech((S, OPEN - 512), said)
+        h.device.level = levels((S, OPEN - 512), said)
+        h.worker.tokens = [("▁OPHELIA", OPEN - 1_800), ("▁STOP", OPEN + 5_200)]
+        h.alerts.rings = {"kitchen": ActiveRing("t-1", RingKind.TIMER, "")}
+        await h.start()
+        h.actor.on_message(candidate())
+        await h.settle()
+        await h.feed(S - 4_800 - 20_000, OPEN + 40_000)
+        await h.wait_for(lambda: h.rows)
+        row = h.rows[0]
+        assert row["outcome"] == "local_command" and h.media_pauses == 1
+        assert h.alerts.calls == [] and h.ha.intents == []
+        assert "context_device" not in json.loads(row["decision_trace"])
+        await h.actor.close()
+    run(main())
+
+
+def test_stop_while_two_other_dots_ring_names_neither_and_goes_to_home_assistant():
+    async def main():
+        h = Harness()
+        said = (OPEN + 3_200, OPEN + 7_296)
+        h.worker.vad = speech((S, OPEN - 512), said)
+        h.device.level = levels((S, OPEN - 512), said)
+        h.worker.tokens = [("▁OPHELIA", OPEN - 1_800), ("▁STOP", OPEN + 5_200)]
+        h.ha.stt_text = "Stop."
+        h.ha.next_run = FakeRun([IntentEnded("", None, False, "action_done", True), RunEnded()])
+        h.alerts.rings = {"kitchen": ActiveRing("t-1", RingKind.TIMER, ""),
+                          "bedroom": ActiveRing("a-1", RingKind.ALARM, "Wake up")}
+        await h.start()
+        h.actor.on_message(candidate())
+        await h.settle()
+        await h.feed(S - 4_800 - 20_000, OPEN + 40_000)
+        await h.wait_for(lambda: h.rows)
+        row = h.rows[0]
+        assert row["outcome"] == "ha" and len(h.ha.intents) == 1
+        assert h.alerts.calls == []
+        assert "context_device" not in json.loads(row["decision_trace"])
         await h.actor.close()
     run(main())
 

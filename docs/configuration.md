@@ -418,8 +418,10 @@ moment it hears the wake word, before arbitration.
 
 Default **700 ms**; the slider runs from 0 to 2000 ms. The winner does not wait
 out the window, so a single Echo answers just as fast. `0` turns arbitration
-off. It never applies to the action button, and it never blocks an Echo from
-stopping its own ringing alarm.
+off. It never applies to the action button. A ringing Echo takes part like any
+other. It hears you over its own ring and checks the wake word first, so an
+idle Echo nearby often wins; when exactly one other Echo is ringing, "stop" or
+"snooze" said to the winner stops or snoozes that ring.
 
 ### Open rules
 

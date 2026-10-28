@@ -1094,6 +1094,7 @@ class _Turn:
     candidate: _Candidate | None = None
     context: CommandContext | None = None
     context_target: str | None = None
+    context_device: str | None = None         # the Dot whose ring the context is; None: this Dot's own
     conversation_id: str | None = None
     expectation: _Expectation | None = None
     next_expectation: _Expectation | None = None
@@ -1824,12 +1825,15 @@ class SessionActor:
         candidate.mic_at_decision = timeline.mic.frontier if timeline is not None else None
 
     async def _accept_candidate(self, candidate: _Candidate) -> None:
-        context, target = self._command_context(candidate)
+        context, target, context_device = self._command_context(candidate)
         local_only = False
-        if context is None or context.kind == ContextKind.MEDIA:
+        # A wake that cancels this Dot's own reply skips arbitration: no other Dot plays that reply.
+        # An alert-context wake claims like any other, so the first Dot to hear the wake takes the
+        # utterance and acts on the ring wherever it sounds (§5.3).
+        if context is None or context.kind != ContextKind.DIALOG:
             window = _config_number(self._config(), "wakeArbitrationMs", WAKE_ARBITRATION_MS) / 1000.0
             if self.deps.arbiter.claim(self.device_id, window) != self.device_id:
-                if context is None:
+                if context is None or context.kind == ContextKind.ALERT:
                     await self._reject_candidate(candidate, TerminalReason.ARBITRATION_LOST)
                     return
                 # The Dot playing the content still hears out a "stop" meant for it (§6.3 step 1).
@@ -1852,7 +1856,9 @@ class SessionActor:
                           wake_phrase=candidate.model.wake_phrase, context=context)
         turn = _Turn(turn_id, self._generation, UtteranceKind.WAKE, asyncio.get_running_loop().time(),
                      Utterance(spec), candidate.runtime, candidate.model, candidate, context, target,
-                     inherited.conversation_id if inherited else None, inherited, local_only=local_only)
+                     context_device=context_device,
+                     conversation_id=inherited.conversation_id if inherited else None,
+                     expectation=inherited, local_only=local_only)
         self._turn = turn
         await self._acquire_focus(turn_id, Focus.DIALOG_INPUT, turn.generation)
         await self._view_listening(turn)
@@ -1872,20 +1878,29 @@ class SessionActor:
         self._set_state(ActorState.ARMED)
         await self._open_utterance(turn)
 
-    def _command_context(self, candidate: _Candidate) -> tuple[CommandContext | None, str | None]:
+    def _command_context(self, candidate: _Candidate) -> tuple[CommandContext | None, str | None, str | None]:
         """§6.3 step 1: the alert occurrence, else the dialog output this wake cancels —
         only a reply the user can hear: one whose audio has not started is not yet a context
         (`started` fails only together with `finished`, so an undone playback that has
-        started is audible) — else the device's own content, while it plays."""
+        started is audible) — else the device's own content, while it plays — else the ring
+        on another Dot, when exactly one other Dot rings. Returns the context, its target,
+        and the other Dot's device id when the ring is that Dot's (None: this Dot's own)."""
         active = candidate.wire.active_alert
         if active is not None:
-            return CommandContext(ContextKind.ALERT, active.kind, active.name), active.id
+            return CommandContext(ContextKind.ALERT, active.kind, active.name), active.id, None
         playback = self._dialog_playback
         if playback is not None and not playback.done and playback.started.done():
-            return CommandContext(ContextKind.DIALOG), playback.playback_id
+            return CommandContext(ContextKind.DIALOG), playback.playback_id, None
         if self.deps.media_playing():
-            return CommandContext(ContextKind.MEDIA), None
-        return None, None
+            return CommandContext(ContextKind.MEDIA), None, None
+        # A Dot near the user often hears the wake first while another Dot rings: its "stop" stops
+        # that ring. With two or more other Dots ringing, "stop" names none of them.
+        others = [(device, ring) for device, ring in self.deps.alerts.active_rings().items()
+                  if device != self.device_id]
+        if len(others) == 1:
+            device, ring = others[0]
+            return CommandContext(ContextKind.ALERT, ring.kind, ring.name), ring.id, device
+        return None, None, None
 
     # --- button, cancel, replies --------------------------------------------------------
 
@@ -3077,12 +3092,16 @@ class SessionActor:
             await self.deps.pause_media()
             await self._finish_turn(turn, TerminalReason.COMPLETED, feedback=False)
             return
+        op_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{turn.turn_id}|{action}"))
+        if turn.context_device is not None:
+            await self._act_on_other_ring(turn, turn.context_device, action, op_id)
+            return
         link = self.link
         if link is None:
             await self._finish_turn(turn, TerminalReason.SESSION_LOST)
             return
         body = _AlertAct(
-            op_id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"{turn.turn_id}|{action}")),
+            op_id=op_id,
             target_id=turn.context_target,
             action=action,
             source=ActSource.VOICE,
@@ -3101,6 +3120,31 @@ class SessionActor:
             error = ack.error
             log.log(logging.INFO if error in ("unknown_target", "already_handled") else logging.WARNING,
                     "[%s] alert.act %s on %s rejected: %s", self.device_id, action, turn.context_target, error)
+        if self._current(turn):
+            await self._finish_turn(turn, TerminalReason.COMPLETED, feedback=False)
+
+    async def _act_on_other_ring(self, turn: _Turn, device: str, action: LocalAction, op_id: str) -> None:
+        """Dismiss or snooze the ring on another Dot (§6.3 step 1). The alert engine sends that Dot
+        its `alert.act` over that Dot's own link and waits for the result."""
+        alerts = self.deps.alerts
+        result: AlertResult
+        try:
+            if action == LocalAction.SNOOZE:
+                result = await alerts.snooze_alarm(device, source=ActSource.VOICE, op_id=op_id)
+            else:                             # LocalAction.DISMISS: an alert context resolves to no other
+                result = await alerts.dismiss_alert(device, source=ActSource.VOICE, op_id=op_id)
+        except Exception as exc:
+            log.warning("[%s] alert.act %s on %s unanswered: %s", self.device_id, action, device, exc)
+            if self._current(turn):
+                await self._finish_turn(turn, TerminalReason.OUTCOME_UNKNOWN)
+            return
+        if not result.get("ok"):
+            # The ring already ended when nothing rings there any more or the device no longer knows
+            # it. Anything else means the ring may still be going.
+            error = result.get("error")
+            ended = error in ("unknown_target", "already_handled", "nothing is ringing")
+            log.log(logging.INFO if ended else logging.WARNING, "[%s] alert.act %s on %s's %s rejected: %s",
+                    self.device_id, action, device, turn.context_target, error)
         if self._current(turn):
             await self._finish_turn(turn, TerminalReason.COMPLETED, feedback=False)
 
@@ -4381,6 +4425,8 @@ def _trace(turn: _Turn, row: TurnRow, utterance: UtteranceTrace, afe: AfeEvidenc
         # Where this turn's voice snapshot was taken, for a reply window it opens.
         **({"voice_at": turn.voice.sample} if turn.voice is not None else {}),
         **({"local_only": True} if turn.local_only else {}),
+        # The other Dot whose ring this turn's alert context is (§6.3 step 1).
+        **({"context_device": turn.context_device} if turn.context_device is not None else {}),
         **({"verification": _verification_trace(candidate)}
            if candidate is not None and candidate.producing_sound else {}),
         # Evidence only (afe_metadata_v1): null when the device does not report it.

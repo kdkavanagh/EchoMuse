@@ -162,9 +162,10 @@ second listener competing with the first.
   happens.
 - **More than one Dot:** the first Dot whose candidate is accepted answers;
   any other Dot accepting within the **arbitration window** (default 700 ms,
-  0 disables) stands down silently. A wake word said to stop a ringing alarm
-  or a reply skips arbitration, so a Dot in the next room cannot steal your
-  "stop".
+  0 disables) stands down silently. A wake word said to stop a reply skips
+  arbitration. A ringing Dot takes part like any other: when exactly one other
+  Dot is ringing, a "stop" or "snooze" that the winning Dot hears stops or
+  snoozes that ring.
 
 **Benefit:** you can say the wake word over music, a reply, or an alarm, and
 the Dot's own voice saying "Ophelia" does not start a turn. Barge-in is

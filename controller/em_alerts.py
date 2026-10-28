@@ -1110,6 +1110,12 @@ class AlertEngine:
         if was is not now:
             self.notify(endpoint_id, AlertNotice.ALERT_RINGING, {"ringing": now})
 
+    def active_rings(self) -> dict[str, ActiveRing]:
+        """What rings on each endpoint now, by endpoint id, from its latest `alert.state`. An endpoint
+        whose session was lost has no state until its next `alert.state`, so it is left out."""
+        return {ep.endpoint_id: ep.active for ep in self._eps.values()
+                if ep.alert_state is not None and ep.active is not None}
+
     def on_alert_ring_ended(self, endpoint_id: str, body: Mapping[str, object]) -> None:
         """Telemetry; completes a pending timer `alert.act` for that ring."""
         ep = self._eps.get(endpoint_id)

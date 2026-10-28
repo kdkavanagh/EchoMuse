@@ -16,7 +16,6 @@ Sample numbers are capture samples at 16 kHz.
 |---|---|---|
 | The wake verifier cannot answer within its 700 ms deadline, even when nothing else is running. | 929, 931, 934 | Decide on the verdict when it lands (capped), or make the verifier's decode cheaper. A priority thread would not help. |
 | A slow pause re-decode aborts the turn, because it runs inside the VAD job's 750 ms deadline. | 927, 936 | Take the pause re-decode out of the VAD job's deadline. |
-| An idle Dot in another room takes an utterance meant to stop a ringing Dot. | 933, 935 | Let a ringing Dot claim the utterance, and have idle Dots defer to it. |
 | The controller's event loop thread saturates one CPU core when two Dots listen at once, and every deadline slips. A ringing alarm by itself costs nothing. | 927, 929, 931, 934, 936 | Find which work on the event loop costs 3–4 CPU-seconds per turn, and move it off that thread or make it cheaper. |
 | A wake turn has no wall-clock limit. | 927 | Add one, like reply turns have. |
 | The Dot and Kroko heard badly through the Kitchen alarm. | near misses 470 and 472, 932, 938 | No fix yet. The Living Room heard fine through its ring in the 2026-10-27 test. Collect clips with the new retention and study them. |
@@ -89,7 +88,7 @@ these into `verifier_timeout`.
 Before that evening this was rare: there were 4 `verifier_timeout` rows ever,
 3 of them on that evening, against 61 verified wakes. That evening two Dots
 were busy at once while the ring was being scored, and the controller process
-was at full CPU (section 4).
+was at full CPU (section 3).
 
 ### What we now record
 
@@ -178,36 +177,7 @@ deadline.
 **Fix:** run the pause re-decode outside the VAD job's deadline. A late pause
 transcript should cost evidence for that pause, not end the turn.
 
-## 3. Arbitration during a ring
-
-While the Kitchen Dot rang, the Living Room Dot heard the user too:
-
-- **933** (20:57:42.5, Living Room, idle): superseded.
-- **935** (20:57:48.4, Living Room, idle): it won the utterance and sent
-  "stop" to Home Assistant as `HassMediaPause` for the Living Room. Home
-  Assistant paused nothing and said "Okay."
-
-The Kitchen heard the user first both times. Its candidates arrived at
-20:57:42.19 (931) and 20:57:48.11 (934), about 300 ms before the Living Room
-accepted its own. (These older rows store the decision time, so the arrival
-time is the row's time minus `total_ms`.)
-
-`_accept_candidate` calls `arbiter.claim()` only when the candidate has no
-context or a media context. A candidate that captures a ringing alert or a
-reply being cancelled skips arbitration. Architecture §5.3 says why: "so a
-nearby speaker cannot steal a local stop". That rule has been there since the
-cutover (`561d156`). It covers only one direction: the ringing Dot can never
-lose. Because it never claims, it also never stops another Dot from claiming.
-And it cannot be accepted until the verifier answers, while an idle Dot is
-accepted at once. So the idle Dot claims the utterance even when the ringing
-Dot heard it first, and nothing contests it.
-
-**Fix:** let a ringing Dot claim the utterance as soon as its candidate
-arrives, and have an idle Dot defer to a ringing Dot's candidate inside the
-arbitration window. A bare "stop" that an idle Dot hears while another Dot
-rings should dismiss that ring, not go to Home Assistant.
-
-## 4. Controller CPU
+## 3. Controller CPU
 
 ### How the controller is built
 
@@ -323,7 +293,7 @@ per-cell work, the TLS and websocket handling of the device links, and live
 updates pushed to an open dashboard. Adding pool threads alone would not
 help, because the loop is the thread that saturates.
 
-## 5. Wake turns have no wall-clock limit
+## 4. Wake turns have no wall-clock limit
 
 No failure on 2026-10-26 came from this alone. It decides how long a hung turn
 keeps the mic open:
@@ -343,7 +313,7 @@ one (`_reply_wall_clock`).
 commit fixed, no known bug leaves a wake turn hanging, so this only limits the
 damage from the next unknown stall.
 
-## 6. Hearing through a ringing alarm (open finding)
+## 5. Hearing through a ringing alarm (open finding)
 
 During the ring the mic peaked at −24 dBFS RMS (volume 70). The native AEC
 took 7–13 dB off on average (ERLE mean in the AFE evidence).

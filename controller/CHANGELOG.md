@@ -1240,6 +1240,26 @@ until the mark is cleared. A busy room filled the 200 near-miss recordings
 in under a week; 1,000 holds about a month of them. At the full count the
 two take about 46 MB and 60 MB per Echo.
 
+### "Stop" heard by another Echo stops the ring
+
+On 2026-10-26 the Kitchen Echo rang a timer and the user said "Ophelia,
+stop". The idle Living Room Echo heard it too and took the utterance, though
+the Kitchen's wake reached the controller about 300 ms sooner: a ringing Echo
+skipped arbitration, and its wake waits for the verifier while an idle one is
+accepted at once. The Living Room sent "stop" to Home Assistant as a media
+pause, Home Assistant answered "Okay.", and the Kitchen rang on (turns 934 and
+935).
+
+- **A ringing Echo takes part in arbitration.** Its wake claims like any other
+  and, if another Echo already claimed, closes as `arbitration_lost` with no
+  turn and no chime. Its ring comes back up until the winner stops it.
+- **An Echo with nothing of its own to stop acts on the one other ring.** When
+  a wake has no alert, reply or content of its own and exactly one other Echo
+  is ringing, "stop", "cancel" or "snooze" stops or snoozes that ring through
+  the alert engine, without Home Assistant. With two or more other Echos
+  ringing, the words go to Home Assistant as before. The turn's decision trace
+  names the other Echo in `context_device`.
+
 ### Earlier in this release
 
 - ASR gain: the STT copy sent to Home Assistant is amplified by

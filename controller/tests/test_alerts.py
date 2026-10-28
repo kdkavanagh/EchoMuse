@@ -796,6 +796,22 @@ def test_dismiss_and_snooze_complete_through_device_local_operation():
     run(go())
 
 
+def test_active_rings_reports_what_rings_and_forgets_a_lost_session():
+    async def go():
+        rig = Rig()
+        await rig.up(online=True)
+        assert rig.engine.active_rings() == {}
+        rig.engine.on_alert_state("dev1", {"active": {"id": "t-9", "kind": "timer", "name": "Pasta"}})
+        (ring,) = rig.engine.active_rings().values()
+        assert list(rig.engine.active_rings()) == ["dev1"]
+        assert (ring.id, ring.kind, ring.name) == ("t-9", "timer", "Pasta")
+        rig.engine.on_session_lost("dev1")      # unknown until the next alert.state, so not ringing
+        assert rig.engine.active_rings() == {}
+        rig.engine.on_alert_state("dev1", {"active": None, "queue": []})
+        assert rig.engine.active_rings() == {}
+    run(go())
+
+
 # ── timers (§10.8) ──────────────────────────────────────────────────────────
 
 def test_timer_display_copy_ring_missed_and_undeliverable():
