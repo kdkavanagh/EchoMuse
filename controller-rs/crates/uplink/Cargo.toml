@@ -1,0 +1,16 @@
+[package]
+name = "echomuse-uplink"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+echomuse-protocol = { version = "0.1.0", path = "../protocol" }
+echomuse-turn = { version = "0.1.0", path = "../turn" }
+serde.workspace = true
+uuid = { version = "1.29", features = ["v4"] }
+
+[dev-dependencies]
+serde_json.workspace = true

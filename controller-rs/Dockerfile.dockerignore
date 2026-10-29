@@ -1,0 +1,29 @@
+# The build context is the repository root: the image needs the device firmware sources,
+# the dashboard, the speech bundle manifest, the device payloads and the root wake model
+# seed besides controller-rs/. Send only what controller-rs/Dockerfile copies.
+*
+!bcresnet_audio.onnx
+!bcresnet_audio.json
+!controller/speech_bundle.json
+!controller/static/
+!controller/device_payloads/
+!device/go.mod
+!device/go.sum
+!device/cmd/
+!device/internal/
+!device/pkg/
+!device/companion/
+!controller-rs/
+# The firmware's exclusions are controller/Dockerfile.dockerignore's, so the same tree
+# gives the same fw- version in both images. Go tests are not firmware; the companion
+# stage builds the app, so a stale local copy must not reach the image.
+device/**/*_test.go
+device/**/testdata
+device/internal/companion/app.apk
+device/internal/companion/app.version
+device/internal/companion/ksplugin.zip
+controller/static/dashboard.js
+# Build outputs and local fetches.
+controller-rs/target
+controller-rs/native
+controller-rs/local

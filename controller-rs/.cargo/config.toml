@@ -1,0 +1,12 @@
+# Cargo reads this file only when it runs inside controller-rs/.
+
+[build]
+# Compile with at most 8 parallel jobs so builds leave the rest of the machine usable.
+jobs = 8
+
+[env]
+# The pinned sherpa-onnx 1.13.8 libraries (the sherpa-onnx-core wheel's lib/ directory),
+# which tools/fetch-native.sh downloads, verifies and unpacks here. sherpa-onnx-sys links
+# against them instead of downloading its own, differently built archive. A variable
+# already set in the environment wins, so cross builds can point at another architecture.
+SHERPA_ONNX_LIB_DIR = { value = "native/sherpa-onnx/lib", relative = true }

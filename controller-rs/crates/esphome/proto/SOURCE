@@ -1,0 +1,16 @@
+These two files are the ESPHome native API schema, copied unchanged from the
+aioesphomeapi Python client, the library Home Assistant 2026.8.1 pins
+(homeassistant/components/esphome/manifest.json: aioesphomeapi==45.6.1).
+
+  Upstream:  https://github.com/esphome/aioesphomeapi
+  Tag:       v45.6.1
+  Files:     aioesphomeapi/api.proto, aioesphomeapi/api_options.proto
+  SHA-256:   2d4f2cb35edb77ab98a9a217606e9e90e62ef2c19a51839ae501db8eafa6db4f  api.proto
+             c4ba32a9d34e8785442112aed5b202a1614a9d74d59a90c992cdb13902bd79f5  api_options.proto
+
+aioesphomeapi is published under the MIT licence; its licence text, with the
+copyright notice, is in LICENSE beside this file.
+
+build.rs compiles them with protox (a protobuf compiler written in Rust, so
+no protoc binary is needed) and prost-build, and reads each message's
+`(id)` and `(source)` options to generate the message-type table.

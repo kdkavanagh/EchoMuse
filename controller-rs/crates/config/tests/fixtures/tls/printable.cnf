@@ -1,0 +1,13 @@
+[req]
+distinguished_name = dn
+string_mask = default
+[dn]
+[ca_ext]
+basicConstraints = critical,CA:TRUE,pathlen:0
+keyUsage = critical,keyCertSign,cRLSign
+subjectKeyIdentifier = hash
+[leaf_ext]
+subjectAltName = DNS:echomuse-controller
+basicConstraints = critical,CA:FALSE
+extendedKeyUsage = serverAuth
+authorityKeyIdentifier = keyid

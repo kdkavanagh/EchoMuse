@@ -1,0 +1,27 @@
+[package]
+name = "echomuse-firmware"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+base64 = "0.23.1"
+bytes = "1"
+echomuse-core = { version = "0.1.0", path = "../core" }
+echomuse-db = { version = "0.1.0", path = "../db" }
+echomuse-link = { version = "0.1.0", path = "../link" }
+echomuse-protocol = { version = "0.1.0", path = "../protocol" }
+getrandom = "0.4.3"
+http = "1.5"
+md-5 = "0.11"
+rusqlite = "0.41.1"
+serde = { workspace = true, features = ["derive"] }
+sha2 = "0.11.1"
+tokio = { workspace = true, features = ["sync", "time", "fs", "rt", "macros"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile = "3.27"
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }

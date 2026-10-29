@@ -1,0 +1,78 @@
+[package]
+name = "echomuse-controller"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+echomuse-core = { path = "crates/core" }
+tokio.workspace = true
+tokio-util.workspace = true
+serde_json.workspace = true
+echomuse-config = { version = "0.1.0", path = "crates/config" }
+echomuse-db = { version = "0.1.0", path = "crates/db" }
+echomuse-discovery = { version = "0.1.0", path = "crates/discovery" }
+echomuse-link = { version = "0.1.0", path = "crates/link" }
+echomuse-protocol = { version = "0.1.0", path = "crates/protocol" }
+echomuse-api = { version = "0.1.0", path = "crates/api" }
+echomuse-ha = { version = "0.1.0", path = "crates/ha" }
+echomuse-esphome = { version = "0.1.0", path = "crates/esphome" }
+echomuse-settings = { version = "0.1.0", path = "crates/settings" }
+rusqlite = "0.41.1"
+base64 = "0.23.1"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "env-filter", "std", "ansi"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+echomuse-speech = { version = "0.1.0", path = "crates/speech" }
+serde = { workspace = true, features = ["derive"] }
+echomuse-alerts = { version = "0.1.0", path = "crates/alerts" }
+echomuse-firmware = { version = "0.1.0", path = "crates/firmware" }
+echomuse-voice = { version = "0.1.0", path = "crates/voice" }
+echomuse-grammar = { version = "0.1.0", path = "crates/grammar" }
+echomuse-correction = { version = "0.1.0", path = "crates/correction" }
+echomuse-playback = { version = "0.1.0", path = "crates/playback" }
+echomuse-uplink = { version = "0.1.0", path = "crates/uplink" }
+echomuse-presentation = { version = "0.1.0", path = "crates/presentation" }
+rustls-native-certs = "0.8.5"
+jiff = "0.2.38"
+uuid = "1.29"
+echomuse-records = { version = "0.1.0", path = "crates/records" }
+echomuse-turn = { version = "0.1.0", path = "crates/turn" }
+echomuse-recorder = { version = "0.1.0", path = "crates/recorder" }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider"] }
+libc = "0.2.191"
+echomuse-wyoming = { version = "0.1.0", path = "crates/wyoming" }
+
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+publish = false
+
+[workspace.dependencies]
+bytes = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "sync", "time", "signal", "io-util", "process", "fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio-util = { version = "0.7", features = ["rt"] }
+
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
+
+[dev-dependencies]
+echomuse-voice = { path = "crates/voice", features = ["testing"] }
+futures-util = "0.3.34"
+tempfile = "3.27"
+tokio = { workspace = true, features = ["test-util"] }
+tokio-tungstenite = "0.30"
+uuid = { version = "1.29", features = ["v4"] }
+echomuse-wyoming = { path = "crates/wyoming", features = ["testing"] }

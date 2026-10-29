@@ -1,0 +1,35 @@
+Vendored upstream data and the code it is read by
+===================================================
+
+home-assistant-intents/en.json
+  The English intent sentence templates, lists, expansion rules and skip words of
+  home-assistant-intents 2026.7.30, the release Home Assistant 2026.8.1 pins
+  (homeassistant/components/conversation/manifest.json at core tag 2026.8.1:
+  "hassil==3.11.0", "home-assistant-intents==2026.7.30").
+  Upstream project: https://github.com/OHF-Voice/intents (formerly home-assistant/intents)
+  Taken unmodified from the published wheel:
+    https://files.pythonhosted.org/packages/78/48/ef3e92a7c47ce4a7d3272b10786b58821104d3d9574e9dce62c7dbf3208b/home_assistant_intents-2026.7.30-py3-none-any.whl
+    wheel SHA-256:  9e9f6cb787b47db87de7266656932d270135b7be2ef4c491e02086c874ed08a0
+    member home_assistant_intents/data/en.json
+    file SHA-256:   d3e540da6e624bffd9271f52ab97a547a39410f096782d6d31af849ca714712f
+  Licence: Apache-2.0, the wheel's licenses/LICENSE.md, copied to home-assistant-intents/LICENSE
+    (SHA-256 c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4).
+  Copyright: The Home Assistant Authors.
+
+hassil/LICENSE
+  src/template.rs and src/compile.rs implement the hassil template language (alternatives,
+  optionals, permutations, list and rule references, backslash escapes) and src/matcher.rs a
+  matcher with hassil's semantics for range, wildcard and value lists and skip words, written
+  in Rust for this crate from hassil 3.11.0, the version Home Assistant 2026.8.1 pins. No hassil
+  source is included.
+  Upstream project: https://github.com/OHF-Voice/hassil (formerly home-assistant/hassil)
+  Reference wheel:
+    https://files.pythonhosted.org/packages/50/19/c994e74132f7d0860ed53d2a17817975bfcd05b01f790ac9914aa8bf96d6/hassil-3.11.0-py3-none-any.whl
+    wheel SHA-256:  3ffbee1153ef93a5eb16ec3468cd10ad8f240cc5f1302974039327cac20fda2e
+  Licence: Apache-2.0, the wheel's licenses/LICENSE.md, copied to hassil/LICENSE
+    (SHA-256 c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4).
+  Copyright: The Home Assistant Authors.
+
+To update: replace en.json with the member of the wheel of the release the installed Home
+Assistant pins, update the URLs and hashes above, and run the crate's tests; the generated
+template tests cover every sentence of the new file.

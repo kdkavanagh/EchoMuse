@@ -1,0 +1,19 @@
+[package]
+name = "echomuse-correction"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+echomuse-core = { version = "0.1.0", path = "../core" }
+echomuse-grammar = { version = "0.1.0", path = "../grammar" }
+echomuse-settings = { version = "0.1.0", path = "../settings" }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2 = "0.11.1"
+tokio = { workspace = true, features = ["sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
+tokio-util.workspace = true

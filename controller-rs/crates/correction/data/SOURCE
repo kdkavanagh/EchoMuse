@@ -1,0 +1,18 @@
+Vendored upstream data
+======================
+
+cmudict/cmudict.dict
+  The Carnegie Mellon Pronouncing Dictionary, as published by the CMU Sphinx project.
+  Upstream project: https://github.com/cmusphinx/cmudict
+  Taken unmodified at commit 74790861f652b15e4ac49015a90074ad62a27690 (2025-10-24):
+    https://raw.githubusercontent.com/cmusphinx/cmudict/74790861f652b15e4ac49015a90074ad62a27690/cmudict.dict
+    file SHA-256: 81917843c7f44ce2b094ac63873c2c7a4cf802040792c455ba3ca406891c3d22
+  Licence: BSD-style, the repository's LICENSE, copied to cmudict/LICENSE
+    (SHA-256 bd4ce8e44170a5f9f481310ca85c51de3c4f851a65e679b40e603b143bd3542a).
+  The repository's README (cmudict/README, SHA-256
+    00c34e7564f1f6a68de02e12c123d801471da92bc3091f7d89b605f238bf8554) asks that
+    redistributions acknowledge the dictionary's origin; src/lexicon.rs and the crate
+    documentation do.
+  Copyright (C) 1993-2015 Carnegie Mellon University. All rights reserved.
+  Only the data is included. No code from any CMUdict wrapper (such as the GPL Python
+  `cmudict` package) is used; src/lexicon.rs reads the file format itself.

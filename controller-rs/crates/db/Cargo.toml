@@ -1,0 +1,16 @@
+[package]
+name = "echomuse-db"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+base64 = "0.23.1"
+echomuse-core = { path = "../core" }
+getrandom = "0.4.3"
+rusqlite = { version = "0.41.1", features = ["bundled", "backup"] }
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"

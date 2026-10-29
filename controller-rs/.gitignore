@@ -1,0 +1,6 @@
+/target/
+# Fetched native libraries (tools/fetch-native.sh).
+/native/
+# Local run layout: speech assets and dashboard (tools/fetch-speech-assets.sh,
+# tools/build-dashboard.sh) and any data copied in for testing.
+/local/

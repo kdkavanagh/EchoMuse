@@ -1,0 +1,16 @@
+[package]
+name = "echomuse-discovery"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+echomuse-config = { version = "0.1.0", path = "../config" }
+echomuse-core = { version = "0.1.0", path = "../core" }
+mdns-sd = { version = "0.21.6", features = ["async"] }
+thiserror = "2.0.21"
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

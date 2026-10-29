@@ -1,0 +1,13 @@
+[package]
+name = "echomuse-echo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+echomuse-speech = { version = "0.1.0", path = "../speech" }
+echomuse-turn = { version = "0.1.0", path = "../turn" }
+realfft = "3.5.1"
+serde = { workspace = true, features = ["derive"] }
+thiserror = "2.0.21"

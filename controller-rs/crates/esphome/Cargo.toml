@@ -1,0 +1,25 @@
+[package]
+name = "echomuse-esphome"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+echomuse-core = { version = "0.1.0", path = "../core" }
+echomuse-discovery = { version = "0.1.0", path = "../discovery" }
+echomuse-protocol = { version = "0.1.0", path = "../protocol" }
+prost = "0.14.4"
+thiserror = "2.0.21"
+tokio.workspace = true
+tokio-util.workspace = true
+
+[build-dependencies]
+heck = "0.5"
+prost-build = "0.14.4"
+prost-reflect = "0.16.5"
+protox = "0.10.0"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
