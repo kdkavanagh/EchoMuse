@@ -17,8 +17,9 @@ use echomuse_config::{ControllerConfig, Environment};
 use echomuse_controller::{
     control_plane::{ControlPlane, ControlPlaneOptions, SpeechSource},
     device::{DeviceRuntimeConfig, DeviceSnapshot, Lifecycle},
+    supervision::Availability,
 };
-use echomuse_core::types::DeviceId;
+use echomuse_core::types::{DeviceId, QueueLimits};
 use echomuse_db::OpenedDatabase;
 use echomuse_esphome::{
     api::{self, ApiMessage},
@@ -224,6 +225,10 @@ impl Fixture {
     }
 
     async fn start(&self) -> ControlPlane {
+        self.start_with(DeviceRuntimeConfig::default()).await
+    }
+
+    async fn start_with(&self, runtime: DeviceRuntimeConfig) -> ControlPlane {
         let config = ControllerConfig::from_env(&self.env, Some("test")).unwrap();
         let options = ControlPlaneOptions {
             config,
@@ -231,7 +236,7 @@ impl Fixture {
             wake_seed_graph: repo_root().join("bcresnet_audio.onnx"),
             wake_seed_sidecar: repo_root().join("bcresnet_audio.json"),
             qualifier_program: PathBuf::from(env!("CARGO_BIN_EXE_echomuse-controller")),
-            runtime: DeviceRuntimeConfig::default(),
+            runtime,
             firmware_timings: FirmwareTimings {
                 shell_open: WAIT,
                 command: WAIT,
@@ -368,9 +373,13 @@ impl Control {
 
     /// Connects as firmware `version` with `extra` capabilities.
     async fn connect_running(address: SocketAddr, extra: &[&str], version: &str) -> Self {
+        Self::connect_hello(address, hello_running(extra, version)).await
+    }
+
+    /// Connects with the hello `body`.
+    async fn connect_hello(address: SocketAddr, body: Value) -> Self {
         let socket = dial(address, "/device/v1/control", None).await;
         let (mut sink, mut incoming) = socket.split();
-        let body = hello_running(extra, version);
         sink.send(Message::text(envelope("session.hello", None, body)))
             .await
             .unwrap();
@@ -771,6 +780,88 @@ async fn a_device_attaches_streams_mutes_reconnects_and_detaches() {
         "{:?}",
         started.elapsed()
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hello_that_does_not_report_unmuted_grants_no_capture_until_the_device_unmutes() {
+    let fixture = Fixture::new().await;
+    let plane = fixture.start().await;
+    let mut snapshots = device_snapshots(&plane);
+
+    // A muted hello attaches with no live capture scope.
+    let mut muted_hello = hello(&[]);
+    muted_hello["privacy"] = json!({"muted": true, "capture_epoch": null});
+    let control = Control::connect_hello(plane.device_address(), muted_hello).await;
+    let attached = wait_for(&mut snapshots, "the muted session", |s| {
+        s.link
+            .as_ref()
+            .is_some_and(|link| link.session_id.as_str() == control.session)
+    })
+    .await;
+    assert_eq!(attached.muted, Some(true));
+    let refused = attached.capture.clone().expect("a capture scope");
+    assert!(refused.is_cancelled());
+
+    // The device's unmute grants a fresh scope; the refused one stays revoked.
+    control.send(
+        "privacy.changed",
+        json!({"muted": false, "capture_epoch": "8", "physical_seq": 1}),
+    );
+    let unmuted = wait_for(&mut snapshots, "the unmute", |s| s.muted == Some(false)).await;
+    assert!(!unmuted.capture.as_ref().unwrap().is_cancelled());
+    assert!(refused.is_cancelled());
+
+    // A hello that does not say whether the mute is off attaches muted too.
+    let mut silent_hello = hello(&[]);
+    silent_hello.as_object_mut().unwrap().remove("privacy");
+    let replacement = Control::connect_hello(plane.device_address(), silent_hello).await;
+    let attached = wait_for(
+        &mut snapshots,
+        "the session without a privacy report",
+        |s| {
+            s.link
+                .as_ref()
+                .is_some_and(|link| link.session_id.as_str() == replacement.session)
+        },
+    )
+    .await;
+    assert_eq!(attached.muted, None);
+    assert!(attached.capture.as_ref().unwrap().is_cancelled());
+    drop((control, replacement));
+    assert!(plane.shutdown().await.is_clean());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_attach_the_runtime_takes_up_late_is_declined_and_the_runtime_keeps_running() {
+    let fixture = Fixture::new().await;
+    // Every command waits past its age limit, as on a starved host.
+    let plane = fixture
+        .start_with(DeviceRuntimeConfig {
+            ingress: QueueLimits {
+                max_age: Duration::from_nanos(1),
+                ..QueueLimits::default()
+            },
+            ..DeviceRuntimeConfig::default()
+        })
+        .await;
+    let snapshots = device_snapshots(&plane);
+    let before = snapshots.borrow().clone();
+
+    let socket = dial(plane.device_address(), "/device/v1/control", None).await;
+    let (mut sink, mut incoming) = socket.split();
+    sink.send(Message::text(envelope("session.hello", None, hello(&[]))))
+        .await
+        .unwrap();
+    // The controller declines by closing the socket; the device dials again later.
+    assert_eq!(within(next_json(&mut incoming)).await, None);
+
+    let after = snapshots.borrow().clone();
+    assert_eq!(after.runtime, before.runtime, "the runtime was not rebuilt");
+    assert_eq!(after.lifecycle, Lifecycle::Ready);
+    assert_eq!(after.failure, None);
+    assert_eq!(after.session, None);
+    assert_eq!(after.health.availability, Availability::Available);
+    assert!(plane.shutdown().await.is_clean());
 }
 
 /// One HTTP/1.1 request with an optional bearer token and JSON body; returns the status

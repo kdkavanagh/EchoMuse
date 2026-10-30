@@ -139,13 +139,13 @@ impl Passwords {
         self.run(move || {
             let mut salt = [0u8; 16];
             getrandom::fill(&mut salt).map_err(|error| {
-                eprintln!("api: no randomness for a password salt: {error}");
+                tracing::error!(%error, "no randomness for a password salt");
                 ApiError::internal("The password could not be stored")
             })?;
             bcrypt::non_truncating_hash_with_salt(password.0.as_bytes(), cost, salt)
                 .map(|parts| PasswordHash(parts.format_for_version(Version::TwoB)))
                 .map_err(|error| {
-                    eprintln!("api: bcrypt refused to hash a password: {error}");
+                    tracing::error!(%error, "bcrypt refused to hash a password");
                     ApiError::internal("The password could not be stored")
                 })
         })
@@ -163,7 +163,7 @@ impl Passwords {
             move || match bcrypt::verify(password.as_bytes(), hash.as_str()) {
                 Ok(matches) => matches,
                 Err(error) => {
-                    eprintln!("api: a stored password hash is not readable bcrypt: {error}");
+                    tracing::warn!(%error, "a stored password hash is not readable bcrypt");
                     false
                 }
             },

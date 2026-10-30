@@ -15,6 +15,7 @@ use echomuse_turn::MonoInstant;
 
 use crate::grant::lock;
 use crate::record::{EndReason, Event, IngressOrdinal, RelTime, Tally};
+use crate::writer::RecorderState;
 
 /// How much a recording's write queue may hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -285,19 +286,19 @@ impl Queue {
     }
 
     /// The recording's state, for the runtime and the dashboard.
-    pub(crate) fn status(&self) -> QueueStatus {
+    pub(crate) fn status(&self) -> RecorderState {
         let s = lock(&self.state);
         if let Some(e) = &s.failed {
-            QueueStatus::Failed(e.clone())
+            RecorderState::Failed(e.clone())
         } else if s.aborted {
-            QueueStatus::Deleted
+            RecorderState::Deleted
         } else if let Some(c) = s.closing {
-            QueueStatus::Ended {
+            RecorderState::Ended {
                 reason: c.reason,
                 written: s.done,
             }
         } else {
-            QueueStatus::Open {
+            RecorderState::Recording {
                 incomplete: s.tally.lost_entries > 0 || s.tally.discarded_events > 0,
             }
         }
@@ -353,13 +354,4 @@ impl Queue {
     pub(crate) fn pending(&self) -> usize {
         lock(&self.state).items.len()
     }
-}
-
-/// A recording's state as its queue knows it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum QueueStatus {
-    Open { incomplete: bool },
-    Ended { reason: EndReason, written: bool },
-    Deleted,
-    Failed(String),
 }

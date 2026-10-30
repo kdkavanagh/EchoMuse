@@ -142,7 +142,7 @@ impl SoundHandle {
     }
 }
 
-/// The running service.
+/// The running service. Dropping it stops the thread.
 #[derive(Debug)]
 pub struct SoundService {
     handle: SoundHandle,
@@ -177,24 +177,16 @@ impl SoundService {
     pub fn handle(&self) -> SoundHandle {
         self.handle.clone()
     }
+}
 
+impl Drop for SoundService {
     /// Stops the thread, killing a running `ffmpeg`, and waits for it. Requests still
     /// queued are answered [`ServiceError::Stopped`].
-    pub fn stop(mut self) {
-        self.shutdown();
-    }
-
-    fn shutdown(&mut self) {
+    fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
-    }
-}
-
-impl Drop for SoundService {
-    fn drop(&mut self) {
-        self.shutdown();
     }
 }
 

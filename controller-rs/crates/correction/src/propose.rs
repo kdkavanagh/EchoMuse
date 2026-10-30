@@ -117,8 +117,6 @@ impl Candidate {
 /// The proposer's result for one transcript.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Proposal {
-    /// The transcript's canonical words.
-    pub heard: Vec<String>,
     /// Candidates that keep what was said, merged by text, best rank first.
     pub candidates: Vec<Candidate>,
     /// Candidates refused before Home Assistant because they change what was said.
@@ -145,7 +143,6 @@ pub fn propose(
 ) -> Proposal {
     let heard_words = words(heard);
     let mut proposal = Proposal {
-        heard: heard_words.clone(),
         candidates: Vec::new(),
         rejected: Vec::new(),
         work: Work::default(),
@@ -360,9 +357,15 @@ impl<'a> Proposer<'a> {
         }
         let a = self.pron.text(&rest_from)?;
         let b = self.pron.text(&rest_to)?;
+        self.best_similarity(&a, &b, min)
+    }
+
+    /// The best similarity of any pronunciation in `a` to any in `b` that reaches `min`.
+    /// Comparison stops when the work budget runs out.
+    fn best_similarity(&mut self, a: &[Sounds], b: &[Sounds], min: f32) -> Option<f32> {
         let mut best: Option<f32> = None;
-        for x in &a {
-            for y in &b {
+        for x in a {
+            for y in b {
                 if self.budget.exhausted() {
                     return best;
                 }
@@ -425,18 +428,7 @@ impl<'a> Proposer<'a> {
             let Some(lead) = self.pron.text(&self.heard[..k]) else {
                 continue;
             };
-            let mut best: Option<f32> = None;
-            for l in &lead {
-                for t in &tails {
-                    if self.budget.exhausted() {
-                        break;
-                    }
-                    if let Some(s) = similarity(l, t, LEAD_IN_MIN, &mut self.budget.work) {
-                        best = Some(best.map_or(s, |b: f32| b.max(s)));
-                    }
-                }
-            }
-            if let Some(score) = best {
+            if let Some(score) = self.best_similarity(&lead, &tails, LEAD_IN_MIN) {
                 let edit = Edit::Span {
                     start: 0,
                     end: k,
@@ -542,19 +534,10 @@ impl<'a> Proposer<'a> {
             if self.full() {
                 return;
             }
-            let mut raw: f32 = 0.0;
-            if let Some(theirs) = self.pron.text(&entry.words) {
-                for x in &heard {
-                    for y in &theirs {
-                        if self.budget.exhausted() {
-                            break;
-                        }
-                        if let Some(s) = similarity(x, y, 0.0, &mut self.budget.work) {
-                            raw = raw.max(s);
-                        }
-                    }
-                }
-            }
+            let raw = match self.pron.text(&entry.words) {
+                Some(theirs) => self.best_similarity(&heard, &theirs, 0.0).unwrap_or(0.0),
+                None => 0.0,
+            };
             self.push(
                 entry.text.clone(),
                 Rule::Cutoff,
@@ -674,7 +657,7 @@ impl<'a> Proposer<'a> {
             hits.truncate(HITS_PER_QUERY);
             for (entry, score) in hits {
                 // A template verb only stands in for a garbled command word.
-                if crate::meaning::has_verb(&entry.words) && !no_verb {
+                if has_verb(&entry.words) && !no_verb {
                     continue;
                 }
                 let edit = Edit::Span {

@@ -2972,6 +2972,83 @@ async fn a_speech_worker_panic_rebuilds_only_that_device_and_its_session_returns
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_device_deleted_while_it_waits_to_be_rebuilt_stays_deleted() {
+    let fixture = Fixture::new(&[
+        DeviceRow::plain(KITCHEN, "Kitchen"),
+        DeviceRow::plain(HALL, "Hall"),
+    ])
+    .await;
+    let faults = Arc::new(Faults::default());
+    let (fatal, fatal_reasons) = recording_hook();
+    let backoff = Duration::from_secs(2);
+    let plane = fixture
+        .start_with(
+            Arc::new(FaultyModels {
+                inner: models(),
+                faults: Arc::clone(&faults),
+            }),
+            SupervisionOptions {
+                fatal,
+                restart: RestartPolicy {
+                    initial: backoff,
+                    max: Duration::from_secs(8),
+                    stable: Duration::from_secs(60),
+                },
+                ..SupervisionOptions::default()
+            },
+        )
+        .await;
+    let kitchen = Speaker::connect(plane.device_address(), KITCHEN, &[]).await;
+    let hall = Speaker::connect(plane.device_address(), HALL, &[]).await;
+    let mut kitchen_state = device_snapshots(&plane, KITCHEN);
+    let hall_before = device_snapshots(&plane, HALL).borrow().clone();
+    let first_runtime = kitchen_state.borrow().runtime;
+
+    faults
+        .panic_next
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let _candidate = kitchen.wake("c1", false);
+    kitchen.say(words(&["turn", "on", "the", "kitchen", "light"]));
+    within(
+        "the kitchen's runtime to fail",
+        kitchen_state
+            .wait_for(|state| matches!(state.health.availability, Availability::Restarting { .. })),
+    )
+    .await
+    .unwrap();
+
+    // Deleting it does not wait out the backoff.
+    within(
+        "the kitchen to be retired",
+        plane.registry().retire(DeviceId(KITCHEN.to_owned())),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(backoff + Duration::from_secs(1)).await;
+
+    // The backoff passed and nothing rebuilt it.
+    assert!(
+        plane
+            .registry()
+            .directory()
+            .get(&DeviceId(KITCHEN.to_owned()))
+            .is_none()
+    );
+    let last = kitchen_state.borrow().clone();
+    assert_eq!(last.runtime, first_runtime);
+    assert_ne!(last.health.availability, Availability::Available);
+    assert_eq!(hello_reply(plane.device_address(), KITCHEN).await, None);
+
+    let hall_now = device_snapshots(&plane, HALL).borrow().clone();
+    assert_eq!(hall_now.runtime, hall_before.runtime);
+    assert_eq!(hall_now.session, hall_before.session);
+    assert_eq!(hall_now.health.availability, Availability::Available);
+    assert!(fatal_reasons.lock().unwrap().is_empty());
+    drop((kitchen, hall));
+    shut_down(plane).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_stuck_model_call_refuses_that_devices_wakes_and_then_ends_the_process() {
     let fixture = Fixture::new(&[
         DeviceRow::plain(KITCHEN, "Kitchen"),
@@ -3555,7 +3632,7 @@ async fn a_sound_preview_starts_on_the_device_and_stops_on_request() {
         .expect("a runtime")
         .clone();
     let sha = "ab".repeat(32);
-    let sound = echomuse_controller::device::AlertPreviewSound::Sound(
+    let sound = echomuse_protocol::alerts::AlertSound::Asset(
         echomuse_protocol::Sha256::parse(&sha).unwrap(),
     );
     within("the preview to start", handle.preview_sound(sound))

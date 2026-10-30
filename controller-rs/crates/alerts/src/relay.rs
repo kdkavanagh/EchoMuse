@@ -10,8 +10,10 @@
 use serde_json::{Map, Value, json};
 
 use crate::{
+    api::{ActOutcome, AlarmEntry, AlarmSet, CancelOutcome, Outcome},
     ids::OpId,
     schedule::{TimeOfDay, Weekdays},
+    wire::RingKind,
 };
 
 /// How a cancellation picks its alarms.
@@ -209,6 +211,129 @@ pub fn pending_result(op_id: OpId) -> Value {
 /// The `echomuse_alert_result` event data.
 pub fn result_event(request_id: &str, result: &Value) -> Value {
     json!({"request_id": request_id, "result": result})
+}
+
+/// The answer for a request still unanswered when the relay's deadline passes.
+pub(crate) fn unconfirmed_result(op_id: OpId) -> Value {
+    json!({
+        "ok": false,
+        "pending": true,
+        "op_id": op_id.to_string(),
+        "error": "the speaker has not confirmed yet",
+    })
+}
+
+/// How a relay answer is worded.
+#[derive(Clone, Debug)]
+pub(crate) enum RelayShape {
+    Set {
+        speaker: String,
+    },
+    Cancel,
+    Stop {
+        kind: RingKind,
+        name: String,
+        snooze: bool,
+    },
+}
+
+/// The answer to `list_alarms`.
+pub(crate) fn list_result(speaker: &str, entries: &[AlarmEntry]) -> Value {
+    json!({
+        "ok": true,
+        "speaker": speaker,
+        "alarms": entries.iter().map(|e| json!({
+            "label": e.label,
+            "due": e.due_local,
+            "repeats": e.rrule,
+            "kind": e.kind.as_str(),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// The answer to `set_alarm`.
+pub(crate) fn set_result(outcome: &Outcome<AlarmSet>, shape: &RelayShape) -> Value {
+    let speaker = match shape {
+        RelayShape::Set { speaker } => speaker.clone(),
+        _ => String::new(),
+    };
+    match outcome {
+        Outcome::Applied { op_id, result } => json!({
+            "ok": true,
+            "stored_in_ha": true,
+            "armed_on_endpoint": result.armed_on_endpoint,
+            "delivery_pending": !result.armed_on_endpoint,
+            "speaker": speaker,
+            "first_due": result.first_due_local,
+            "op_id": op_id.to_string(),
+        }),
+        Outcome::Pending { op_id } => pending_result(*op_id),
+        Outcome::Rejected { op_id, reason } => json!({
+            "ok": false, "error": reason.code, "detail": reason.detail, "op_id": op_id.to_string(),
+        }),
+        Outcome::Refused(refusal) => error_result(&refusal.to_string()),
+    }
+}
+
+/// The answer to `cancel_alarm`.
+pub(crate) fn cancel_result(outcome: &CancelOutcome) -> Value {
+    match outcome {
+        CancelOutcome::Refused(refusal) => error_result(&refusal.to_string()),
+        CancelOutcome::Journaled { root, targets } => {
+            let state = |o: &Outcome<()>| match o {
+                Outcome::Applied { .. } => "cancelled",
+                Outcome::Pending { .. } => "pending",
+                Outcome::Rejected { .. } => "failed",
+                Outcome::Refused(_) => "refused",
+            };
+            json!({
+                "ok": targets.iter().all(|t| !matches!(t.outcome, Outcome::Rejected { .. } | Outcome::Refused(_))),
+                "stored_in_ha": targets.iter().all(|t| matches!(t.outcome, Outcome::Applied { .. })),
+                "cancelled": targets.iter().map(|t| json!({"label": t.label, "state": state(&t.outcome)})).collect::<Vec<_>>(),
+                "op_id": root.to_string(),
+            })
+        }
+    }
+}
+
+/// The answer to `dismiss_alert` and `snooze_alarm`; `snooze_due` is when an applied
+/// snooze rings again, as its stored result says.
+pub(crate) fn stop_result(
+    outcome: &ActOutcome,
+    shape: &RelayShape,
+    snooze_due: Option<&Value>,
+) -> Value {
+    let (kind, name, snooze) = match shape {
+        RelayShape::Stop { kind, name, snooze } => (*kind, name.clone(), *snooze),
+        _ => (RingKind::Alarm, String::new(), false),
+    };
+    let what = json!({"kind": kind.as_str(), "name": name});
+    match outcome {
+        ActOutcome::Applied { op_id, .. } => {
+            let mut result = json!({"ok": true, "stored_in_ha": kind != RingKind::Timer, "op_id": op_id.to_string()});
+            if snooze {
+                result["snoozed"] = what;
+                if let Some(due) = snooze_due {
+                    result["due"] = due.clone();
+                }
+            } else {
+                result["stopped"] = what;
+            }
+            result
+        }
+        ActOutcome::Pending { op_id } => {
+            let mut result = pending_result(*op_id);
+            result[if snooze { "snoozed" } else { "stopped" }] = what;
+            result
+        }
+        ActOutcome::Rejected { op_id, reason } => json!({
+            "ok": false, "error": reason.code, "detail": reason.detail, "op_id": op_id.to_string(),
+        }),
+        ActOutcome::Unknown { op_id, .. } => json!({
+            "ok": false, "error": "the speaker did not confirm", "op_id": op_id.to_string(),
+        }),
+        ActOutcome::Refused(refusal) => error_result(&refusal.to_string()),
+    }
 }
 
 #[cfg(test)]

@@ -120,6 +120,11 @@ impl SimDevice {
         self.mic.len() as u64
     }
 
+    /// The mic it captured, from its first sample.
+    pub fn mic(&self) -> &[i16] {
+        &self.mic
+    }
+
     /// The room says `pcm` while the device plays nothing.
     pub fn hear(&mut self, pcm: &[i16]) {
         self.mic.extend_from_slice(pcm);

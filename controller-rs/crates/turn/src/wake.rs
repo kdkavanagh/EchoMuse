@@ -92,8 +92,10 @@ impl WakeCandidate {
 
     /// What is wrong with the candidate, if anything.
     fn malformed(&self) -> Option<&'static str> {
+        let Some(open) = self.open() else {
+            return Some("no hops");
+        };
         let ordered = self.hops.windows(2).all(|w| w[0].end < w[1].end);
-        let open = self.open()?;
         if self.candidate_id.is_empty() {
             Some("empty candidate id")
         } else if !(self.threshold > 0.0 && self.threshold <= 1.0) {
@@ -310,11 +312,7 @@ impl WakeDecider {
         now: MonoInstant,
     ) -> Self {
         let deadline = now.after(Duration::from_millis(policy.decision_budget_ms));
-        let malformed = candidate.malformed().or(if candidate.hops.is_empty() {
-            Some("no hops")
-        } else {
-            None
-        });
+        let malformed = candidate.malformed();
         let verification_window = if candidate.producing_sound && malformed.is_none() {
             candidate.verification_window(&policy)
         } else {

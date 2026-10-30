@@ -471,9 +471,9 @@ pub fn run_child(input: impl Read, mut output: impl Write) -> io::Result<()> {
     output.flush()
 }
 
-/// Qualifies a model in the calling process. Only the qualification child should call this:
-/// a bad model can crash the process that runs it.
-pub fn qualify_in_this_process(
+/// Qualifies a model in the calling process. Only the qualification child runs this: a bad
+/// model can crash the process that runs it.
+fn qualify_in_this_process(
     request: &QualificationRequest,
 ) -> Result<QualifiedModel, QualificationFailure> {
     match &request.model {
@@ -729,7 +729,7 @@ mod tests {
 
     fn request() -> QualificationRequest {
         QualificationRequest {
-            native: NativeLibraries::pinned("/nonexistent/libonnxruntime.so", None).unwrap(),
+            native: NativeLibraries::pinned("/nonexistent/libonnxruntime.so").unwrap(),
             model: ModelUnderTest::SileroVad {
                 model: PinnedFile::new("/nonexistent/vad.onnx", crate::Sha256Digest::of_bytes(b"")),
             },

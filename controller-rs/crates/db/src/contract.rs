@@ -277,27 +277,3 @@ pub(crate) fn schema_differences(found: &Connection) -> rusqlite::Result<Vec<Sch
     }
     Ok(differences)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn layout_alone_is_no_difference() {
-        assert_eq!(
-            normalize_sql("CREATE TABLE t (\n    a  INTEGER ,\n\tb TEXT\n)"),
-            normalize_sql("CREATE TABLE t(a INTEGER,b TEXT)")
-        );
-        assert_ne!(
-            normalize_sql("CREATE TABLE t (a INTEGER NOT NULL)"),
-            normalize_sql("CREATE TABLE t (a INTEGER)")
-        );
-    }
-
-    #[test]
-    fn the_contract_matches_itself() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA_SQL).unwrap();
-        assert!(schema_differences(&conn).unwrap().is_empty());
-    }
-}

@@ -64,8 +64,6 @@ use crate::native::SherpaRuntime;
 pub const KROKO_SAMPLE_RATE: u32 = 16_000;
 /// Fbank feature bins the Kroko model was trained with.
 const FEATURE_DIM: i32 = 80;
-/// One blank frame of the decoder output lasts 40 ms (10 ms features, subsampling 4).
-pub const BLANK_FRAME_SECONDS: f64 = 0.04;
 
 /// The four Kroko model files.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -357,11 +355,6 @@ impl AsrResult {
             num_trailing_blanks,
         })
     }
-
-    /// The trailing blank run as seconds.
-    pub fn trailing_blank_seconds(&self) -> f64 {
-        f64::from(self.num_trailing_blanks) * BLANK_FRAME_SECONDS
-    }
 }
 
 #[cfg(test)]
@@ -377,7 +370,6 @@ mod tests {
         assert_eq!(r.tokens, vec![" Ask", " not"]);
         assert_eq!(r.timestamps, vec![0.32, 0.44]);
         assert_eq!(r.num_trailing_blanks, 32);
-        assert!((r.trailing_blank_seconds() - 1.28).abs() < 1e-9);
     }
 
     #[test]

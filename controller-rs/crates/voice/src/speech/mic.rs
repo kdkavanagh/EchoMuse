@@ -509,13 +509,11 @@ impl MicAnalysis {
                 return empty(Some(key));
             }
             MicJob::StartUtterance { ref key, .. }
-            | MicJob::EndUtterance { ref key }
             | MicJob::Mic { ref key, .. }
             | MicJob::MicMissing { ref key, .. }
             | MicJob::Reference { ref key, .. }
             | MicJob::ReferenceSilence { ref key, .. }
             | MicJob::ReferenceMissing { ref key, .. }
-            | MicJob::ReferenceEnded { ref key }
             | MicJob::DeviceCells { ref key, .. }
             | MicJob::CompareCandidate { ref key, .. } => key.clone(),
         };
@@ -535,10 +533,6 @@ impl MicAnalysis {
         match job {
             MicJob::StartUtterance { from, .. } => {
                 start_utterance(stream, models, from, &mut out);
-            }
-            MicJob::EndUtterance { .. } => {
-                stream.utterance = None;
-                stream.analyzer.stop_labels();
             }
             MicJob::Mic {
                 first,
@@ -628,9 +622,6 @@ impl MicAnalysis {
                     .push_reference_missing(epoch, reference_epoch, first, end),
                 &mut out,
             ),
-            MicJob::ReferenceEnded { .. } => {
-                echo(stream.analyzer.reference_ended(epoch), &mut out);
-            }
             MicJob::DeviceCells { first, cells, .. } => {
                 echo(
                     stream.analyzer.push_device_cells(epoch, first, &cells),
@@ -1059,7 +1050,15 @@ mod tests {
             support: SampleSpan::new(Sample(START), Sample(START + 4_096)),
         });
         assert!(asked.comparisons.is_empty());
-        w.run(MicJob::ReferenceEnded { key: k.clone() });
+        // The device plays nothing: its reference is digital silence over the support.
+        w.run(MicJob::ReferenceSilence {
+            key: k.clone(),
+            reference_epoch: Epoch::new(7).unwrap(),
+            first: START - 16_000,
+            frames: 96_000,
+            mono_ns: (START - 16_000) * 62_500,
+            coverage: OutputCoverage::Full,
+        });
         let pcm = command(&m);
         let cells: Vec<DeviceInput> = pcm
             .as_chunks::<512>()
@@ -1193,21 +1192,5 @@ mod tests {
         assert!(outs[1..].iter().all(|o| o.failure.is_none()));
         // VAD is unaffected.
         assert!(!vad_run(&outs).1.is_empty());
-    }
-
-    #[test]
-    fn ending_the_utterance_stops_observations() {
-        let m = ToneModels::new(&WORDS);
-        let (mut w, k) = worker(&m);
-        w.run(MicJob::StartUtterance {
-            key: k.clone(),
-            from: Sample(START),
-        });
-        let pcm = command(&m);
-        assert_eq!(asr(&feed(&mut w, &k, START, &pcm[..2_560])).len(), 2);
-        w.run(MicJob::EndUtterance { key: k.clone() });
-        let rest = feed(&mut w, &k, START + 2_560, &pcm[2_560..]);
-        assert!(asr(&rest).is_empty());
-        assert!(!vad_run(&rest).1.is_empty());
     }
 }

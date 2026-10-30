@@ -96,7 +96,7 @@ pub enum UploadFormat {
 
 impl UploadFormat {
     /// Every format, in the order a duplicate upload is chosen.
-    pub const ALL: [Self; 5] = [Self::Mp3, Self::Wav, Self::Flac, Self::Ogg, Self::M4a];
+    const ALL: [Self; 5] = [Self::Mp3, Self::Wav, Self::Flac, Self::Ogg, Self::M4a];
 
     /// The extension, lowercase, without the dot.
     pub fn extension(self) -> &'static str {
@@ -110,7 +110,7 @@ impl UploadFormat {
     }
 
     /// The format of an extension, in any case.
-    pub fn from_extension(extension: &str) -> Option<Self> {
+    fn from_extension(extension: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
             .find(|f| f.extension().eq_ignore_ascii_case(extension))
@@ -136,52 +136,62 @@ impl SoundsDir {
     }
 
     /// A sounds directory at `root`.
-    pub fn at(root: PathBuf) -> Self {
+    fn at(root: PathBuf) -> Self {
         Self { root }
     }
 
     /// The directory.
-    pub fn root(&self) -> &Path {
+    fn root(&self) -> &Path {
         &self.root
     }
 
     /// The assets directory.
-    pub fn assets(&self) -> PathBuf {
+    fn assets(&self) -> PathBuf {
         self.root.join("assets")
+    }
+
+    /// An exported asset's file name: its hash.
+    fn asset_name(sha256: &Sha256) -> String {
+        format!("{sha256}.wav")
     }
 
     /// Where an exported asset lives; the asset socket serves it under its hash.
     pub fn asset_path(&self, sha256: &Sha256) -> PathBuf {
-        self.assets().join(format!("{sha256}.wav"))
+        self.assets().join(Self::asset_name(sha256))
     }
 
     /// An upload's file name.
-    pub fn upload_name(id: &SoundId, format: UploadFormat) -> String {
+    fn upload_name(id: &SoundId, format: UploadFormat) -> String {
         format!("{id}.{}", format.extension())
     }
 
     /// An upload's path.
-    pub fn upload_path(&self, id: &SoundId, format: UploadFormat) -> PathBuf {
+    fn upload_path(&self, id: &SoundId, format: UploadFormat) -> PathBuf {
         self.root.join(Self::upload_name(id, format))
     }
 
     /// An export record's file name.
-    pub fn record_name(id: &SoundId) -> String {
+    fn record_name(id: &SoundId) -> String {
         format!("{id}{RECORD_SUFFIX}")
+    }
+
+    /// An export record's path.
+    fn record_path(&self, id: &SoundId) -> PathBuf {
+        self.root.join(Self::record_name(id))
     }
 
     /// The files an upload's id owns besides the upload: its record and the older
     /// decode cache.
     fn derived_files(&self, id: &SoundId) -> [PathBuf; 3] {
         [
-            self.root.join(Self::record_name(id)),
+            self.record_path(id),
             self.root.join(format!("{id}{LEGACY_PCM_SUFFIX}")),
             self.root.join(format!("{id}{LEGACY_STAMP_SUFFIX}")),
         ]
     }
 
     /// Creates the directory and its assets directory.
-    pub fn create(&self) -> io::Result<()> {
+    fn create(&self) -> io::Result<()> {
         fs::create_dir_all(self.assets())
     }
 }
@@ -217,7 +227,7 @@ fn classify(name: &str) -> Entry {
 
 /// An upload's stamp: its file name, modification time in ns and size. An export record
 /// holds the stamp of the upload it was made from.
-pub fn upload_stamp(path: &Path) -> io::Result<String> {
+fn upload_stamp(path: &Path) -> io::Result<String> {
     let meta = fs::metadata(path)?;
     let mtime_ns = meta
         .modified()?
@@ -232,7 +242,7 @@ pub fn upload_stamp(path: &Path) -> io::Result<String> {
 
 /// An `.alert.json` export record.
 #[derive(Clone, Debug, PartialEq)]
-pub struct ExportRecord {
+struct ExportRecord {
     /// The stamp of the upload it was made from.
     pub stamp: String,
     /// The asset's hash; `None` when the export failed.
@@ -247,7 +257,7 @@ pub struct ExportRecord {
 
 impl ExportRecord {
     /// Reads a record; `None` when it is not one.
-    pub fn parse(text: &str) -> Option<Self> {
+    fn parse(text: &str) -> Option<Self> {
         let value: Value = serde_json::from_str(text).ok()?;
         let object = value.as_object()?;
         let stamp = object.get("stamp")?.as_str()?.to_owned();
@@ -277,7 +287,7 @@ impl ExportRecord {
     }
 
     /// The record's text, laid out as the existing records are.
-    pub fn to_text(&self) -> String {
+    fn to_text(&self) -> String {
         let string = |s: &str| serde_json::to_string(s).expect("strings serialize");
         let sha = self
             .sha256

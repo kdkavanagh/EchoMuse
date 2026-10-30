@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
-    api::{Outcome, Rejection, SetAlarm},
+    api::{AlarmSet, Outcome, Rejection, SetAlarm},
     calendar::Occurrence,
     ids::OpId,
     journal::{OpRow, State},
@@ -126,6 +126,30 @@ pub(crate) fn created_result(occurrence: &Occurrence) -> Value {
     })
 }
 
+/// The alarm a Set row's [`created_result`] names; `armed` says whether the speaker holds
+/// its first occurrence.
+pub(crate) fn alarm_set_of(row: &OpRow, armed: impl FnOnce(Uuid) -> bool) -> AlarmSet {
+    let occurrence_id = Uuid::parse_str(&result_text(row, "occurrence_id")).unwrap_or_default();
+    AlarmSet {
+        schedule_id: Uuid::parse_str(&result_text(row, "schedule_id")).unwrap_or_default(),
+        occurrence_id,
+        first_due_local: result_text(row, "due_local"),
+        first_due_utc_ms: result_text(row, "due_utc_ms").parse().unwrap_or_default(),
+        armed_on_endpoint: armed(occurrence_id),
+    }
+}
+
+/// The result of a snooze whose child alarm `child` is on the calendar.
+pub(crate) fn snoozed_result(child: &Occurrence) -> Value {
+    json!({
+        "ok": true,
+        "child_schedule_id": child.schedule_id.to_string(),
+        "child_occurrence_id": child.occurrence_id.to_string(),
+        "due_local": child.due_local,
+        "due_utc_ms": child.due_utc_ms.to_string(),
+    })
+}
+
 pub(crate) fn deleted_result(written: bool) -> Value {
     json!({"ok": true, "written": written})
 }
@@ -143,18 +167,20 @@ pub(crate) mod code {
     pub const INVALID_CHILD: &str = "invalid_child";
 }
 
+/// A text field of the row's result; empty when absent.
+fn result_text(row: &OpRow, key: &str) -> String {
+    row.result
+        .as_ref()
+        .and_then(|result| result.get(key))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
 pub(crate) fn rejection_of(row: &OpRow) -> Rejection {
-    let result = row.result.as_ref();
-    let text = |key: &str| {
-        result
-            .and_then(|r| r.get(key))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned()
-    };
     Rejection {
-        code: text("error"),
-        detail: text("detail"),
+        code: result_text(row, "error"),
+        detail: result_text(row, "detail"),
     }
 }
 

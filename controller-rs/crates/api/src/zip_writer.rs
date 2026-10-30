@@ -17,7 +17,11 @@ use std::{
     path::PathBuf,
 };
 
-use axum::body::{Body, Bytes};
+use axum::{
+    body::{Body, Bytes},
+    http::{HeaderValue, header},
+    response::{IntoResponse, Response},
+};
 use tokio::sync::mpsc;
 
 /// The most entries a plain ZIP holds.
@@ -406,22 +410,25 @@ impl Write for ChannelSink {
     }
 }
 
-/// A response body that is the archive of `entries`, in order, written on a blocking thread
-/// as the client reads it. An entry whose file is gone by the time it is reached is left
-/// out. Any other failure ends the body with an error, so the client sees a broken transfer
-/// rather than a short archive. Check the size with [`ZipPlan`] first.
-pub(crate) fn stream_zip(entries: Vec<ZipEntry>) -> Body {
-    stream_zip_parts(
-        entries
-            .into_iter()
-            .map(|entry| ZipPart { entry, span: None })
-            .collect(),
-    )
+/// The download of the archive of `parts`, in order, named `filename`: whole files and spans
+/// of WAV files, written on a blocking thread as the client reads it. An entry whose file is
+/// gone by the time it is reached, or a span whose file is not a 16-bit mono PCM WAV, is
+/// left out. Any other failure ends the body with an error, so the client sees a broken
+/// transfer rather than a short archive. Check the size with [`ZipPlan`] first.
+pub(crate) fn zip_download(parts: Vec<ZipPart>, filename: &str) -> Response {
+    let mut response = stream_parts(parts).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/zip"),
+    );
+    if let Ok(value) = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")) {
+        headers.insert(header::CONTENT_DISPOSITION, value);
+    }
+    response
 }
 
-/// [`stream_zip`] of whole files and spans of WAV files. A span whose file is not a 16-bit
-/// mono PCM WAV is left out, as a file that is gone is.
-pub(crate) fn stream_zip_parts(parts: Vec<ZipPart>) -> Body {
+fn stream_parts(parts: Vec<ZipPart>) -> Body {
     let (chunks, receiver) = mpsc::channel(STREAM_CHUNKS);
     tokio::task::spawn_blocking(move || {
         let failure = chunks.clone();
@@ -443,8 +450,8 @@ pub(crate) fn stream_zip_parts(parts: Vec<ZipPart>) -> Body {
                         let mut bytes = Vec::new();
                         file.read_to_end(&mut bytes)?;
                         let Some(cropped) = crop_wav(&bytes, span) else {
-                            eprintln!(
-                                "api: {} is not a 16-bit mono WAV; left out of the archive",
+                            tracing::warn!(
+                                "{} is not a 16-bit mono WAV; left out of the archive",
                                 entry.path.display()
                             );
                             continue;
@@ -458,7 +465,7 @@ pub(crate) fn stream_zip_parts(parts: Vec<ZipPart>) -> Body {
         if let Err(error) = written
             && error.kind() != io::ErrorKind::BrokenPipe
         {
-            eprintln!("api: an archive could not be written: {error}");
+            tracing::error!(%error, "an archive could not be written");
             let _ = failure.blocking_send(Err(error));
         }
     });

@@ -102,7 +102,7 @@ impl Default for AttributionPolicy {
 
 /// The reply-only attribution rules.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReplyAttribution {
+pub(crate) struct ReplyAttribution {
     /// The opening guard's end: no run opens on a cell after the trigger that starts before it.
     /// `None` for a reply opened at an early answer, which has no guard.
     pub guard_until: Option<Sample>,
@@ -110,7 +110,7 @@ pub struct ReplyAttribution {
 
 /// A classified cell.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Classified {
+pub(crate) struct Classified {
     /// The class.
     pub class: CellClass,
     /// The rule that decided it.
@@ -121,7 +121,7 @@ pub struct Classified {
 
 /// A command-speech run that opened on a cell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RunOpen {
+pub(crate) struct RunOpen {
     /// Where the run starts. Normally the opening cell's start; for a guarded reply whose speech
     /// began inside the guard, where that speech began, but never before the cell holding the
     /// trigger.
@@ -139,7 +139,7 @@ struct Run {
 
 /// Classifies one utterance's cells in sample order.
 #[derive(Debug)]
-pub struct CellClassifier {
+pub(crate) struct CellClassifier {
     policy: AttributionPolicy,
     trigger: Sample,
     reply: Option<ReplyAttribution>,

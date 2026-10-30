@@ -10,8 +10,7 @@ use echomuse_protocol::ema::Packet;
 use echomuse_protocol::envelope::{ControlFrame, DeviceMessage, Inbound};
 use echomuse_protocol::session::{ClockReply, ClockRequest, Heartbeat};
 use echomuse_protocol::{
-    ControlBody, MessageType, ProtocolError, ProtocolErrorCode, check_live_session,
-    encode_envelope, parse_envelope,
+    ControlBody, MessageType, ProtocolError, ProtocolErrorCode, check_live_session, parse_envelope,
 };
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
@@ -396,8 +395,7 @@ impl ControlTask<'_> {
     }
 
     fn send<B: ControlBody>(&mut self, body: &B) -> Result<(), CloseReason> {
-        let encoded = match encode_envelope(body, Some(&self.core.session_id), &self.core.device, 0)
-        {
+        let encoded = match self.core.encode(body, 0) {
             Ok(encoded) => encoded,
             Err(error) => {
                 tracing::error!(%error, "a transport message did not encode");
@@ -455,7 +453,7 @@ async fn control_writer(
     }
     rx.close();
     if let Some(CloseReason::ProtocolViolation(error)) = core.reason()
-        && let Ok(encoded) = encode_envelope(&error, Some(&core.session_id), &core.device, 0)
+        && let Ok(encoded) = core.encode(&error, 0)
     {
         let _ = timeout(write, sink.send(Message::text(encoded.text))).await;
     }

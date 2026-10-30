@@ -20,12 +20,12 @@
 //!    [`service::SettingsHandle::apply_device_edit`]. Wake models:
 //!    [`service::SettingsHandle::add_wake_model`] and
 //!    [`service::SettingsHandle::delete_wake_model`].
-//! 5. A control's capability conditions: [`SettingKey::requirements`] and
-//!    [`SettingKey::unmet`]; the reason shown for a gap is the caller's.
+//! 5. A control's capability conditions: [`SettingKey::requirements`]; the reason shown
+//!    for a gap is the caller's.
 
 #![warn(missing_docs)]
 
-pub mod db;
+mod db;
 pub mod edit;
 pub mod json;
 pub mod ready;

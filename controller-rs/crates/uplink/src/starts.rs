@@ -16,14 +16,14 @@ use echomuse_protocol::ema::{AFE_PERIOD_SAMPLES, CELL_SAMPLES};
 use echomuse_turn::{Sample, Samples, TurnSpec};
 
 /// The reference and AFE lead before the mic start: 2.5 s.
-pub const REFERENCE_LEAD: Samples = Samples(40_000);
+const REFERENCE_LEAD: Samples = Samples(40_000);
 /// A near miss's AFE lead before its support start: 1 s.
-pub const NEAR_MISS_AFE_LEAD: Samples = Samples(16_000);
+pub(crate) const NEAR_MISS_AFE_LEAD: Samples = Samples(16_000);
 /// How far past a near miss's support end its mic must reach: 300 ms.
-pub const NEAR_MISS_TAIL: Samples = Samples(4_800);
+pub(crate) const NEAR_MISS_TAIL: Samples = Samples(4_800);
 /// How much further the mic may run while a near miss's AFE records are
 /// still missing before the controller closes it anyway: 1 s.
-pub const NEAR_MISS_GRACE: Samples = Samples(16_000);
+pub(crate) const NEAR_MISS_GRACE: Samples = Samples(16_000);
 
 /// The starts the device gives a candidate subscription, in capture samples.
 /// The reference start is a capture sample too: the device maps it onto the
@@ -56,26 +56,32 @@ impl CandidateStarts {
 }
 
 /// The reference start for a mic start: 40,000 capture samples before it.
-pub fn reference_start(mic_start: Sample) -> Sample {
+fn reference_start(mic_start: Sample) -> Sample {
     mic_start - REFERENCE_LEAD
 }
 
 /// The AFE start for a mic start: 40,000 samples before it, rounded down to a
 /// 1,280-sample capture period.
-pub fn afe_start(mic_start: Sample) -> Sample {
+fn afe_start(mic_start: Sample) -> Sample {
     (mic_start - REFERENCE_LEAD).round_down(AFE_PERIOD_SAMPLES)
 }
 
-/// Where a capture stream requested at capture sample `requested` really
-/// starts: the device rounds mic and cell starts down to 512 and AFE starts
-/// down to 1,280. `None` for the reference, whose start the device maps into
-/// another epoch.
-pub fn device_grid_start(stream: StreamId, requested: Sample) -> Option<Sample> {
+/// The grid the device rounds a stream's start to, in stream samples: 512
+/// for mic and cells, 1,280 for AFE records, and 2,560 for the reference
+/// (after mapping the start into the reference epoch).
+pub(crate) const fn device_grid(stream: StreamId) -> u64 {
     match stream {
-        StreamId::Mic | StreamId::Cells => Some(requested.round_down(CELL_SAMPLES)),
-        StreamId::Afe => Some(requested.round_down(AFE_PERIOD_SAMPLES)),
-        StreamId::Reference => None,
+        StreamId::Mic | StreamId::Cells => CELL_SAMPLES,
+        StreamId::Afe => AFE_PERIOD_SAMPLES,
+        StreamId::Reference => 2_560,
     }
+}
+
+/// Where a capture stream requested at capture sample `requested` really
+/// starts, on its [`device_grid`]. `None` for the reference, whose start the
+/// device maps into another epoch.
+pub(crate) fn device_grid_start(stream: StreamId, requested: Sample) -> Option<Sample> {
+    (stream != StreamId::Reference).then(|| requested.round_down(device_grid(stream)))
 }
 
 /// How much of a stream the device's ring holds, in stream samples (capture
@@ -83,19 +89,13 @@ pub fn device_grid_start(stream: StreamId, requested: Sample) -> Option<Sample> 
 /// cells and 8 s of AFE records (`device/internal/audio/ring`). Once the
 /// stream's live position is this far past a sample, the device can never
 /// send it again.
-pub const fn device_history(stream: StreamId) -> u64 {
+pub(crate) const fn device_history(stream: StreamId) -> u64 {
     match stream {
         StreamId::Mic => 96_000,
         StreamId::Reference => 128_000,
         StreamId::Cells => 500 * CELL_SAMPLES,
         StreamId::Afe => 100 * AFE_PERIOD_SAMPLES,
     }
-}
-
-/// The stream samples one record stands for: 1 for PCM, 512 for a cell,
-/// 1,280 for an AFE record.
-pub const fn record_samples(stream: StreamId) -> u64 {
-    stream.kind().samples_per_frame()
 }
 
 #[cfg(test)]
@@ -149,7 +149,7 @@ mod tests {
     }
 
     #[test]
-    fn device_grids_and_histories() {
+    fn device_grids() {
         assert_eq!(
             device_grid_start(StreamId::Mic, Sample(1_023)),
             Some(Sample(512))
@@ -163,8 +163,5 @@ mod tests {
             Some(Sample(1_280))
         );
         assert_eq!(device_grid_start(StreamId::Reference, Sample(9)), None);
-        assert_eq!(device_history(StreamId::Cells), 256_000);
-        assert_eq!(device_history(StreamId::Afe), 128_000);
-        assert_eq!(record_samples(StreamId::Afe), 1_280);
     }
 }

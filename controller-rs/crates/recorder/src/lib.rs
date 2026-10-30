@@ -25,8 +25,8 @@
 //! - **Withdrawal** discards everything not yet written, from whichever thread withdraws, and
 //!   ends the recording. What was already written stays until its retention ends or it is
 //!   deleted.
-//! - **Credentials.** HA bodies are redacted inside the recorder before they are queued
-//!   ([`redact()`]): tokens, cookies, passwords, secrets, `Authorization` values, JSON Web Tokens
+//! - **Credentials.** HA bodies are redacted inside the recorder before they are queued:
+//!   tokens, cookies, passwords, secrets, `Authorization` values, JSON Web Tokens
 //!   and signed-URL parameters. Only the HA operations of the controller's `HomeAssistant`
 //!   service can be recorded ([`HaOperation`]): there is no way to record shell traffic or
 //!   other HTTP, and [`SessionRecorder::frame`] takes only valid EMA1 uplink frames.
@@ -64,7 +64,8 @@
 //! - **HA.** [`SessionRecorder::ha_request`] as a request is sent and
 //!   [`SessionRecorder::ha_reply`] when it is answered or fails.
 //! - **Lifecycle.** [`SessionRecorder::cancelled`] when the runtime cancels a turn, candidate,
-//!   exchange or playback; [`SessionRecorder::poll`] at [`SessionRecorder::next_deadline`];
+//!   exchange or playback; [`SessionRecorder::poll`] on ingress and during maintenance.
+//!   Calls refuse expired grants; an idle recorder is finalized at the next poll.
 //!   [`SessionRecorder::disconnected`] when the session ends, or
 //!   [`SessionRecorder::finish`].
 //!
@@ -125,7 +126,7 @@ pub mod grant;
 pub mod queue;
 pub mod reader;
 pub mod record;
-pub mod redact;
+mod redact;
 pub mod replay;
 pub mod store;
 pub mod writer;
@@ -146,7 +147,6 @@ pub use record::{
     ModelRevision, ModelRole, PrivacyState, RecordingId, RelTime, Revisions, Sha256Hex, Tally,
     Transcript, TurnCause, TurnControl,
 };
-pub use redact::redact;
 pub use replay::{
     CommittedSpan, Divergence, EchoComparison, EchoSource, Equivalence, GrammarSource, Mismatch,
     ReplayOptions, ReplayReport, Terminal, TurnComparison, TurnOutcome, WakeComparison, replay,

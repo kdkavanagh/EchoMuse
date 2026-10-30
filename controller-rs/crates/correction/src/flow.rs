@@ -124,7 +124,7 @@ impl Outcome {
 pub enum Prepared {
     /// Decided without Home Assistant: off, a follow-up, or not ready.
     Done(Box<Outcome>),
-    /// Ask Home Assistant's matcher, then [`Check::finish`].
+    /// Ask Home Assistant's matcher: [`run`].
     Check(Box<Check>),
 }
 
@@ -215,19 +215,9 @@ impl Check {
         &self.context
     }
 
-    /// The proposal.
-    pub fn proposal(&self) -> &Proposal {
-        &self.proposal
-    }
-
-    /// How long the proposal took.
-    pub fn compute(&self) -> Duration {
-        self.compute
-    }
-
     /// The longest the check may take: [`FINAL_DEADLINE`] when the turn waits for it
     /// ([`Check::can_change_text`]), otherwise [`SHADOW_LIMIT`].
-    pub fn limit(&self) -> Duration {
+    fn limit(&self) -> Duration {
         if self.can_change_text() {
             FINAL_DEADLINE
         } else {
@@ -248,7 +238,7 @@ impl Check {
     }
 
     /// The sentences to ask about: the heard text first, then the candidates to validate.
-    pub fn sentences(&self) -> Vec<String> {
+    pub(crate) fn sentences(&self) -> Vec<String> {
         std::iter::once(self.heard.clone())
             .chain(self.validated().iter().map(|c| c.text.clone()))
             .collect()
@@ -256,7 +246,7 @@ impl Check {
 
     /// The matcher request: one call for every sentence, for the speaker's HA device and in
     /// the pipeline's language.
-    pub fn request(&self, scope: WorkScope) -> RecognizeRequest {
+    fn request(&self, scope: WorkScope) -> RecognizeRequest {
         RecognizeRequest {
             scope,
             ha_device: self.context.ha_device.clone(),
@@ -277,7 +267,7 @@ impl Check {
     }
 
     /// The check did not finish within its limit: the heard text is sent.
-    pub fn timed_out(self, latency: Duration) -> Outcome {
+    fn timed_out(self, latency: Duration) -> Outcome {
         let mut record = self.base_record(Reason::Timeout, latency);
         record.deadline_met = Some(false);
         Outcome::heard(&self.heard, Some(record))
@@ -290,7 +280,7 @@ impl Check {
     /// its meaning and passed, no other interpretation came close, the context still holds,
     /// and, in `on` mode, the answer came within [`FINAL_DEADLINE`]. In shadow mode the
     /// heard text is always sent and the record says what `on` would have done.
-    pub fn finish(
+    pub(crate) fn finish(
         self,
         result: Result<Vec<Option<SentenceRecognition>>, HaError>,
         current: &FixContext,

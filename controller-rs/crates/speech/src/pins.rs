@@ -8,7 +8,7 @@
 //!   `linux/amd64` and `linux/arm64`;
 //! - the official ONNX Runtime 1.20.1 release `ort` loads at run time, for both architectures
 //!   (the version the BCResNet fixture was generated with);
-//! - the two DTLN models, which `controller/Dockerfile` pins only by upstream commit;
+//! - the two DTLN models at their pinned upstream commit;
 //! - the test WAV inside the hash-pinned Kroko archive, and what Kroko transcribes from it.
 //!
 //! Every digest here was computed from the downloaded file named next to it. The arm64 values
@@ -182,7 +182,7 @@ pub struct ModelPin {
     pub sha256: Sha256Digest,
 }
 
-/// DTLN stage one (magnitude mask), at the upstream commit `controller/Dockerfile` names.
+/// DTLN stage one (magnitude mask), at the pinned upstream commit below.
 pub const DTLN_MODEL_1: ModelPin = ModelPin {
     url: "https://raw.githubusercontent.com/breizhn/DTLN/1de1f15a8b5b7e1c44905618ff2ef70ca8277fbc/pretrained_model/model_1.onnx",
     size: 1_458_237,

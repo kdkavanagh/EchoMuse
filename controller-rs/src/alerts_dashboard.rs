@@ -24,11 +24,10 @@ use echomuse_alerts::{
 use echomuse_api::{AlarmCancel, AlarmReply, AlarmRequest, AlertControl, BoxFuture, ServiceError};
 use echomuse_core::types::DeviceId;
 use echomuse_db::{DbHandle, ReadQuery};
+use echomuse_protocol::alerts::MAX_LABEL_CHARS;
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 
-/// The longest alarm label the device accepts (§3.1.8).
-const MAX_LABEL_CHARS: usize = 120;
 /// How far back the panel lists finished operations.
 const OPERATIONS_WINDOW: Duration = Duration::from_secs(24 * 3600);
 /// The most operations the panel lists.
@@ -160,15 +159,11 @@ fn refused(refusal: &Refusal) -> AlarmReply {
 /// Whether an occurrence due at `due_local` (RFC 3339) rings at `time`; seconds count
 /// only when the request named them.
 fn same_time(due_local: &str, time: TimeOfDay, with_seconds: bool) -> bool {
-    let Some((_, clock)) = due_local.split_once('T') else {
-        return false;
-    };
-    let Some(due) = clock.get(..8).and_then(TimeOfDay::parse) else {
-        return false;
-    };
-    due.hour() == time.hour()
-        && due.minute() == time.minute()
-        && (!with_seconds || due.second() == time.second())
+    TimeOfDay::of_local_text(due_local).is_some_and(|due| {
+        due.hour() == time.hour()
+            && due.minute() == time.minute()
+            && (!with_seconds || due.second() == time.second())
+    })
 }
 
 impl DashboardAlerts {

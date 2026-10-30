@@ -153,7 +153,7 @@ pub enum Input {
     /// Answered with [`Effect::PreviewAnswer`] quoting `id`.
     Preview {
         id: PreviewId,
-        sound: echomuse_playback::AlertPreviewSound,
+        sound: echomuse_protocol::alerts::AlertSound,
     },
     /// Stop the preview playing, if any. Answered with [`Effect::PreviewAnswer`].
     StopPreview {
@@ -509,7 +509,7 @@ pub enum Effect {
         outcome: PreviewOutcome,
     },
     /// Audio, or the end, of the recording modes' subscription.
-    Diagnostic(crate::diagnostic::DiagnosticAudio),
+    Diagnostic(crate::DiagnosticAudio),
     /// Correct a turn's transcript (§4.7); answer with [`Input::Corrected`] quoting `call`.
     Correct {
         call: CallId,
@@ -528,7 +528,7 @@ pub enum Effect {
     ServerTranscribe {
         call: CallId,
         through: echomuse_turn::Sample,
-        request: crate::pause_server::ServerRequest,
+        request: crate::ServerRequest,
     },
 }
 

@@ -1,5 +1,5 @@
-//! The parts of `session.ready` that come from settings (spec §3.1.4): the speech assets
-//! and the detector policy, built with the protocol crate's own validating constructors.
+//! The `session.ready` grant (spec §3.1.4): the speech assets and the detector policy
+//! from settings, built with the protocol crate's own validating constructors.
 //!
 //! - `assets`: the runtime library's SHA-256, and the graph and sidecar of the device's
 //!   selected registry model.
@@ -69,28 +69,6 @@ impl From<PolicyError> for ComposeError {
     }
 }
 
-/// `session.ready`'s `assets` and `detector`.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ReadyParts {
-    /// `assets`.
-    pub assets: SpeechAssets,
-    /// `detector`.
-    pub detector: DetectorPolicy,
-}
-
-impl ReadyParts {
-    /// The full grant, with the session's capture permission and whether to ask for the
-    /// `afe` stream.
-    pub fn into_grant(self, capture_permitted: bool, afe_metadata: bool) -> ReadyGrant {
-        ReadyGrant {
-            capture_permitted,
-            assets: self.assets,
-            detector: self.detector,
-            afe_metadata,
-        }
-    }
-}
-
 fn open_rule(rule: &WakeRule) -> Result<OpenRule, PolicyError> {
     OpenRule::new(
         rule.profile,
@@ -100,13 +78,16 @@ fn open_rule(rule: &WakeRule) -> Result<OpenRule, PolicyError> {
     )
 }
 
-/// Compose `assets` and `detector` from a device's effective settings, the registry
-/// model they select and the runtime library's SHA-256.
+/// Compose the grant from a device's effective settings, the registry model they select
+/// and the runtime library's SHA-256, with the session's capture permission and whether
+/// to ask for the `afe` stream.
 pub fn compose_ready(
     settings: &DeviceSettings,
     model: &WakeModel,
     runtime_sha256: Sha256,
-) -> Result<ReadyParts, ComposeError> {
+    capture_permitted: bool,
+    afe_metadata: bool,
+) -> Result<ReadyGrant, ComposeError> {
     let selected = &settings.wakeword.wake_model.0;
     if model.graph_sha256() != selected {
         return Err(ComposeError::WrongModel {
@@ -164,12 +145,14 @@ pub fn compose_ready(
         open_rules,
         shadow_rules,
     )?;
-    Ok(ReadyParts {
+    Ok(ReadyGrant {
+        capture_permitted,
         assets: SpeechAssets {
             runtime_sha256,
             graph_sha256: model.graph_sha256().clone(),
             sidecar_sha256: model.sidecar_sha256().clone(),
         },
         detector,
+        afe_metadata,
     })
 }

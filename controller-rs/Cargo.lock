@@ -584,6 +584,7 @@ dependencies = [
  "tokio-tungstenite 0.30.0",
  "tokio-util",
  "tower-http 0.7.1",
+ "tracing",
  "url",
  "zip",
 ]
@@ -692,6 +693,7 @@ dependencies = [
  "mdns-sd",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -895,7 +897,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "uuid",
 ]
 
 [[package]]

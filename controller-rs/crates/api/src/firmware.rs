@@ -22,8 +22,6 @@
 //! `update_in_progress` and `update_error` from [`FirmwareControl::status`]. The
 //! provisioning routes are admin-only: the TLS answer holds a device's link token.
 
-use std::{future::Future, pin::Pin};
-
 use axum::{
     Json, Router,
     body::Body,
@@ -48,6 +46,7 @@ use crate::{
     body::JsonBody,
     error::{ApiError, ErrorCode},
     params::DevicePath,
+    services::BoxFuture,
     state::ApiState,
 };
 
@@ -126,153 +125,51 @@ pub trait FirmwareControl: Send + Sync + 'static {
 
     /// Starts installing the bundled firmware on a connected device; returns the
     /// version being installed.
-    fn update(
-        &self,
-        device: DeviceId,
-    ) -> impl Future<Output = Result<String, FirmwareRefusal>> + Send;
+    fn update(&self, device: DeviceId) -> BoxFuture<'_, Result<String, FirmwareRefusal>>;
 
     /// Starts switching a connected device back to its other slot.
-    fn rollback(
-        &self,
-        device: DeviceId,
-    ) -> impl Future<Output = Result<(), FirmwareRefusal>> + Send;
+    fn rollback(&self, device: DeviceId) -> BoxFuture<'_, Result<(), FirmwareRefusal>>;
 
     /// Queues an install for the device's next connection; returns its stored time in
     /// seconds since the Unix epoch.
-    fn queue_update(
-        &self,
-        device: DeviceId,
-    ) -> impl Future<Output = Result<i64, FirmwareRefusal>> + Send;
+    fn queue_update(&self, device: DeviceId) -> BoxFuture<'_, Result<i64, FirmwareRefusal>>;
 
     /// Cancels a queued install; returns whether one was queued.
     fn cancel_queued_update(
         &self,
         device: DeviceId,
-    ) -> impl Future<Output = Result<bool, FirmwareRefusal>> + Send;
+    ) -> BoxFuture<'_, Result<bool, FirmwareRefusal>>;
 
     /// Starts re-applying the debloat on a connected device.
-    fn debloat(&self, device: DeviceId)
-    -> impl Future<Output = Result<(), FirmwareRefusal>> + Send;
+    fn debloat(&self, device: DeviceId) -> BoxFuture<'_, Result<(), FirmwareRefusal>>;
 
     /// Installs link credentials on a connected device, which then redials over TLS.
-    fn secure_link(
-        &self,
-        device: DeviceId,
-    ) -> impl Future<Output = Result<(), FirmwareRefusal>> + Send;
+    fn secure_link(&self, device: DeviceId) -> BoxFuture<'_, Result<(), FirmwareRefusal>>;
 
     /// Starts an install on every connected, approved device not running the bundled
     /// firmware.
-    fn deploy(&self) -> impl Future<Output = DeployReport> + Send;
+    fn deploy(&self) -> BoxFuture<'_, DeployReport>;
 
     /// `start_server.sh`.
-    fn provision_start_script(
-        &self,
-    ) -> impl Future<Output = Result<StartScriptFile, ProvisionError>> + Send;
+    fn provision_start_script(&self) -> BoxFuture<'_, Result<StartScriptFile, ProvisionError>>;
 
     /// The Echo Show package lists.
-    fn provision_crown_lists(
-        &self,
-    ) -> impl Future<Output = Result<CrownLists, ProvisionError>> + Send;
+    fn provision_crown_lists(&self) -> BoxFuture<'_, Result<CrownLists, ProvisionError>>;
 
     /// The bundled firmware for the wizard to push.
-    fn provision_firmware(
-        &self,
-    ) -> impl Future<Output = Result<FirmwareDownload, ProvisionError>> + Send;
+    fn provision_firmware(&self) -> BoxFuture<'_, Result<FirmwareDownload, ProvisionError>>;
 
     /// The CA and the device's link token.
     fn provision_tls_credentials(
         &self,
         request: TlsCredentialsRequest,
-    ) -> impl Future<Output = Result<TlsCredentials, ProvisionError>> + Send;
+    ) -> BoxFuture<'_, Result<TlsCredentials, ProvisionError>>;
 
     /// The wizard's diagnostics with the controller's side added.
     fn provision_diagnostics(
         &self,
         upload: DiagnosticsUpload,
     ) -> Result<ProvisionDiagnostics, ProvisionError>;
-}
-
-type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
-
-/// [`FirmwareControl`] behind a pointer.
-pub(crate) trait Firmware: Send + Sync + 'static {
-    fn bundled(&self) -> FirmwareInfo;
-    fn status(&self, device: &DeviceId) -> UpdateStatus;
-    fn update(&self, device: DeviceId) -> BoxFuture<'_, Result<String, FirmwareRefusal>>;
-    fn rollback(&self, device: DeviceId) -> BoxFuture<'_, Result<(), FirmwareRefusal>>;
-    fn queue_update(&self, device: DeviceId) -> BoxFuture<'_, Result<i64, FirmwareRefusal>>;
-    fn cancel_queued_update(
-        &self,
-        device: DeviceId,
-    ) -> BoxFuture<'_, Result<bool, FirmwareRefusal>>;
-    fn debloat(&self, device: DeviceId) -> BoxFuture<'_, Result<(), FirmwareRefusal>>;
-    fn secure_link(&self, device: DeviceId) -> BoxFuture<'_, Result<(), FirmwareRefusal>>;
-    fn deploy(&self) -> BoxFuture<'_, DeployReport>;
-    fn provision_start_script(&self) -> BoxFuture<'_, Result<StartScriptFile, ProvisionError>>;
-    fn provision_crown_lists(&self) -> BoxFuture<'_, Result<CrownLists, ProvisionError>>;
-    fn provision_firmware(&self) -> BoxFuture<'_, Result<FirmwareDownload, ProvisionError>>;
-    fn provision_tls_credentials(
-        &self,
-        request: TlsCredentialsRequest,
-    ) -> BoxFuture<'_, Result<TlsCredentials, ProvisionError>>;
-    fn provision_diagnostics(
-        &self,
-        upload: DiagnosticsUpload,
-    ) -> Result<ProvisionDiagnostics, ProvisionError>;
-}
-
-impl<F: FirmwareControl> Firmware for F {
-    fn bundled(&self) -> FirmwareInfo {
-        FirmwareControl::bundled(self)
-    }
-    fn status(&self, device: &DeviceId) -> UpdateStatus {
-        FirmwareControl::status(self, device)
-    }
-    fn update(&self, device: DeviceId) -> BoxFuture<'_, Result<String, FirmwareRefusal>> {
-        Box::pin(FirmwareControl::update(self, device))
-    }
-    fn rollback(&self, device: DeviceId) -> BoxFuture<'_, Result<(), FirmwareRefusal>> {
-        Box::pin(FirmwareControl::rollback(self, device))
-    }
-    fn queue_update(&self, device: DeviceId) -> BoxFuture<'_, Result<i64, FirmwareRefusal>> {
-        Box::pin(FirmwareControl::queue_update(self, device))
-    }
-    fn cancel_queued_update(
-        &self,
-        device: DeviceId,
-    ) -> BoxFuture<'_, Result<bool, FirmwareRefusal>> {
-        Box::pin(FirmwareControl::cancel_queued_update(self, device))
-    }
-    fn debloat(&self, device: DeviceId) -> BoxFuture<'_, Result<(), FirmwareRefusal>> {
-        Box::pin(FirmwareControl::debloat(self, device))
-    }
-    fn secure_link(&self, device: DeviceId) -> BoxFuture<'_, Result<(), FirmwareRefusal>> {
-        Box::pin(FirmwareControl::secure_link(self, device))
-    }
-    fn deploy(&self) -> BoxFuture<'_, DeployReport> {
-        Box::pin(FirmwareControl::deploy(self))
-    }
-    fn provision_start_script(&self) -> BoxFuture<'_, Result<StartScriptFile, ProvisionError>> {
-        Box::pin(FirmwareControl::provision_start_script(self))
-    }
-    fn provision_crown_lists(&self) -> BoxFuture<'_, Result<CrownLists, ProvisionError>> {
-        Box::pin(FirmwareControl::provision_crown_lists(self))
-    }
-    fn provision_firmware(&self) -> BoxFuture<'_, Result<FirmwareDownload, ProvisionError>> {
-        Box::pin(FirmwareControl::provision_firmware(self))
-    }
-    fn provision_tls_credentials(
-        &self,
-        request: TlsCredentialsRequest,
-    ) -> BoxFuture<'_, Result<TlsCredentials, ProvisionError>> {
-        Box::pin(FirmwareControl::provision_tls_credentials(self, request))
-    }
-    fn provision_diagnostics(
-        &self,
-        upload: DiagnosticsUpload,
-    ) -> Result<ProvisionDiagnostics, ProvisionError> {
-        FirmwareControl::provision_diagnostics(self, upload)
-    }
 }
 
 pub(crate) fn routes() -> Router<ApiState> {
@@ -296,16 +193,8 @@ pub(crate) fn routes() -> Router<ApiState> {
 
 fn refused(refusal: FirmwareRefusal, doing: &'static str) -> ApiError {
     match refusal {
-        FirmwareRefusal::UnknownDevice => ApiError::new(
-            StatusCode::NOT_FOUND,
-            ErrorCode::NotFound,
-            "No device has this id",
-        ),
-        FirmwareRefusal::NotConnected => ApiError::new(
-            StatusCode::CONFLICT,
-            ErrorCode::NotConnected,
-            "The device is not connected",
-        ),
+        FirmwareRefusal::UnknownDevice => ApiError::unknown_device(),
+        FirmwareRefusal::NotConnected => ApiError::not_connected(),
         FirmwareRefusal::Busy => ApiError::new(
             StatusCode::CONFLICT,
             ErrorCode::Busy,
@@ -324,7 +213,7 @@ fn refused(refusal: FirmwareRefusal, doing: &'static str) -> ApiError {
         }
         FirmwareRefusal::Unavailable => ApiError::unavailable("Firmware delivery is shutting down"),
         FirmwareRefusal::Failed(reason) => {
-            eprintln!("api: {doing} failed: {reason}");
+            tracing::error!(%reason, "{doing} failed");
             ApiError::internal(format!("The controller could not {doing}: {reason}"))
         }
     }
@@ -336,7 +225,7 @@ fn provision_error(error: ProvisionError) -> ApiError {
         ProvisionError::InvalidRequest(_) => ErrorCode::BadRequest,
         ProvisionError::TlsUnavailable => ErrorCode::Unavailable,
         ProvisionError::Firmware(_) | ProvisionError::Payload(_) | ProvisionError::Store(_) => {
-            eprintln!("api: a provisioning request failed: {error}");
+            tracing::error!(%error, "a provisioning request failed");
             ErrorCode::Internal
         }
     };

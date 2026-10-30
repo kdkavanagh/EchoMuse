@@ -268,10 +268,10 @@ impl GrantShared {
     }
 
     /// Registers a recorder's queue so withdrawal and expiry can reach it. Refused once the
-    /// grant has been withdrawn.
+    /// grant has been withdrawn or its device forgotten.
     pub(crate) fn attach(&self, queue: &Arc<Queue>) -> Result<(), EndReason> {
         let mut state = lock(&self.state);
-        if state.withdrawal.is_some() {
+        if self.withdrawn.load(Ordering::Acquire) {
             return Err(EndReason::Withdrawn);
         }
         state.writers.retain(|w| w.strong_count() > 0);
@@ -333,28 +333,6 @@ impl GrantShared {
 #[derive(Debug)]
 pub struct GrantPass {
     pub(crate) shared: Arc<GrantShared>,
-}
-
-impl GrantPass {
-    /// The grant.
-    pub fn grant(&self) -> &GrantId {
-        &self.shared.id
-    }
-
-    /// The device it covers.
-    pub fn device(&self) -> &DeviceId {
-        &self.shared.device
-    }
-
-    /// What it allows.
-    pub fn streams(&self) -> StreamScope {
-        self.shared.streams
-    }
-
-    /// When it ends, on the monotonic clock.
-    pub fn ends(&self) -> MonoInstant {
-        self.shared.ends
-    }
 }
 
 /// Every device's grant. One book serves the whole controller: the dashboard API grants and

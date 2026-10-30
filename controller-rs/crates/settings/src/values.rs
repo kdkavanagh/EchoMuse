@@ -1402,11 +1402,6 @@ impl KioskPassword {
     pub fn expose(&self) -> &str {
         &self.0
     }
-
-    /// Whether one is set.
-    pub fn is_set(&self) -> bool {
-        !self.0.is_empty()
-    }
 }
 
 impl fmt::Debug for KioskPassword {
@@ -1507,15 +1502,10 @@ mod tests {
             )
             .is_err()
         );
-        let ok = parse::<PauseAsr>(
-            r#"{"engine": "wyoming", "host": "stt.local", "port": 10300, "model": "", "language": "en"}"#,
-        )
-        .unwrap();
+        let stored = r#"{"engine": "wyoming", "host": "stt.local", "port": 10300, "model": "", "language": "en"}"#;
+        let ok = parse::<PauseAsr>(stored).unwrap();
         assert_eq!(ok.host(), "stt.local");
-        assert_eq!(
-            PauseAsr::default().to_json().to_python_text(),
-            r#"{"engine": "kroko", "host": "", "port": 10300, "model": "", "language": "en"}"#
-        );
+        assert_eq!(ok.to_json().to_python_text(), stored);
     }
 
     #[test]

@@ -8,7 +8,8 @@
 //! one per [`REFILL`], a line longer than [`MAX_LINE_BYTES`] is cut, and the queue to the
 //! writer is bounded. Lines refused by any of these are counted per device and the count
 //! is written as one controller line once lines are accepted again, so the log says
-//! what it is missing.
+//! what it is missing. Each queued line keeps the device's records lifetime, so a line
+//! still queued when its device is deleted is refused, even after a re-approval.
 //!
 //! The dashboard reads the log with `GET /api/devices/{id}/logs`; it does not read
 //! live `device_log` events, so none are published.
@@ -21,7 +22,7 @@ use std::{
 
 use echomuse_core::types::DeviceId;
 use echomuse_records::{
-    DeviceLogEntry, RecordsService, UnixMillis,
+    DeviceLogEntry, RecordsLifetime, RecordsService, UnixMillis,
     vocab::{LogLevel, LogSource},
 };
 use serde_json::{Map, Value};
@@ -71,23 +72,28 @@ impl Bucket {
 /// Hands device log lines to the records service. Cheap to clone.
 #[derive(Clone)]
 pub struct LogSink {
-    queue: mpsc::Sender<DeviceLogEntry>,
+    records: RecordsService,
+    /// Each line with the device's records lifetime when it was queued, so a line queued
+    /// before the device was deleted is refused after it is approved again.
+    queue: mpsc::Sender<(DeviceLogEntry, RecordsLifetime)>,
     buckets: Arc<Mutex<HashMap<DeviceId, Bucket>>>,
 }
 
 impl LogSink {
     /// Starts the writer on the shared runtime.
     pub fn start(records: RecordsService, tasks: &TaskSupervisor) -> Self {
-        let (queue, mut lines) = mpsc::channel::<DeviceLogEntry>(QUEUE);
+        let (queue, mut lines) = mpsc::channel::<(DeviceLogEntry, RecordsLifetime)>(QUEUE);
+        let writer = records.clone();
         tasks.spawn("device logs", async move {
-            while let Some(line) = lines.recv().await {
+            while let Some((line, lifetime)) = lines.recv().await {
                 let device = line.device.clone();
-                if let Err(error) = records.log(line).await {
+                if let Err(error) = writer.log(line, lifetime).await {
                     tracing::warn!(%device, %error, "a device log line was not stored");
                 }
             }
         });
         Self {
+            records,
             queue,
             buckets: Arc::default(),
         }
@@ -129,6 +135,7 @@ impl LogSink {
             }
             std::mem::take(&mut bucket.refused)
         };
+        let lifetime = self.records.lifetime(device);
         if refused > 0 {
             let note = DeviceLogEntry {
                 device: device.clone(),
@@ -137,7 +144,7 @@ impl LogSink {
                 source: LogSource::Controller,
                 message: format!("{refused} device log lines were not stored (rate limit)"),
             };
-            let _ = self.queue.try_send(note);
+            let _ = self.queue.try_send((note, lifetime));
         }
         let entry = DeviceLogEntry {
             device: device.clone(),
@@ -146,7 +153,7 @@ impl LogSink {
             source,
             message,
         };
-        if self.queue.try_send(entry).is_err() {
+        if self.queue.try_send((entry, lifetime)).is_err() {
             let mut buckets = self.buckets.lock().expect("log buckets lock");
             if let Some(bucket) = buckets.get_mut(device) {
                 bucket.refused += 1;

@@ -93,31 +93,30 @@ impl WifiState {
 type ScanAnswer = Result<Vec<WifiNetwork>, String>;
 
 /// The Wi-Fi state of every device and the scans waiting for answers.
-#[derive(Default)]
 pub struct WifiService {
-    directory: OnceLock<watch::Receiver<Directory>>,
+    directory: watch::Receiver<Directory>,
     publisher: Arc<OnceLock<EventPublisher>>,
     states: Mutex<HashMap<DeviceId, WifiState>>,
     scans: Mutex<HashMap<DeviceId, Vec<oneshot::Sender<ScanAnswer>>>>,
 }
 
 impl WifiService {
-    pub fn new(publisher: Arc<OnceLock<EventPublisher>>) -> Self {
+    /// The service over the runtimes' `directory`.
+    pub fn new(
+        publisher: Arc<OnceLock<EventPublisher>>,
+        directory: watch::Receiver<Directory>,
+    ) -> Self {
         Self {
+            directory,
             publisher,
-            ..Self::default()
+            states: Mutex::default(),
+            scans: Mutex::default(),
         }
     }
 
-    /// The runtimes' directory, once the registry exists.
-    pub fn set_directory(&self, directory: watch::Receiver<Directory>) {
-        let _ = self.directory.set(directory);
-    }
-
     fn link(&self, device: &DeviceId) -> Result<SessionLink, ServiceError> {
-        self.directory
-            .get()
-            .and_then(|d| d.borrow().get(device).cloned())
+        let handle = self.directory.borrow().get(device).cloned();
+        handle
             .ok_or(ServiceError::UnknownDevice)?
             .snapshot()
             .session_link

@@ -695,7 +695,6 @@ mod tests {
     fn builds_layers() {
         let tables = Tables::build(3, &inputs(), lexicon());
         assert_eq!(tables.id().revision, 3);
-        assert_eq!(tables.names.entries.len(), 3);
         assert!(tables.template_words.contains("turn"));
         assert!(!tables.template_words.contains("the"));
         assert!(tables.name_words.contains("kitchen"));

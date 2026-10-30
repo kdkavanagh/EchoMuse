@@ -44,12 +44,6 @@ pub trait FirmwareStore: Send + Sync + 'static {
         at: UnixSeconds,
     ) -> impl Future<Output = Result<UnixSeconds, StoreError>> + Send;
 
-    /// Clears the device's queued install. Returns whether one was queued.
-    fn cancel_queued_update(
-        &self,
-        device: &DeviceId,
-    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
-
     /// Clears the device's queued install and returns when it was queued, in one step, so
     /// two connections cannot both start it.
     fn take_queued_update(
@@ -201,10 +195,6 @@ impl FirmwareStore for DbHandle {
         })
         .await
         .map_err(row_error)
-    }
-
-    async fn cancel_queued_update(&self, device: &DeviceId) -> Result<bool, StoreError> {
-        Ok(self.take_queued_update(device).await?.is_some())
     }
 
     async fn take_queued_update(

@@ -170,11 +170,6 @@ pub const UNKNOWN_CONTROLLER_VERSION: &str = "dev";
 /// The name of the TLS directory beside the database when `TLS_DIR` is unset.
 pub const TLS_DIR_NAME: &str = "tls";
 
-/// Home Assistant's WebSocket endpoint inside an add-on.
-pub const SUPERVISOR_WEBSOCKET_URL: &str = "ws://supervisor/core/websocket";
-/// Home Assistant's base URL inside an add-on; REST paths go under `/api`.
-pub const SUPERVISOR_BASE_URL: &str = "http://supervisor/core";
-
 /// A validated mDNS label: 1 to 63 ASCII letters, digits or hyphens, not
 /// starting or ending with a hyphen. It names both the service instance and the
 /// host (`{name}.local.`), so it must be a valid host label.
@@ -265,12 +260,6 @@ impl HaBaseUrl {
         let scheme = if self.secure { "https" } else { "http" };
         format!("{scheme}://{}", self.authority_and_path)
     }
-
-    /// The WebSocket API URL: the base with `ws`/`wss` and `/api/websocket`.
-    pub fn websocket_url(&self) -> String {
-        let scheme = if self.secure { "wss" } else { "ws" };
-        format!("{scheme}://{}/api/websocket", self.authority_and_path)
-    }
 }
 
 /// How the controller reaches Home Assistant.
@@ -291,29 +280,6 @@ pub enum HomeAssistantAccess {
 }
 
 impl HomeAssistantAccess {
-    /// The WebSocket API URL.
-    pub fn websocket_url(&self) -> String {
-        match self {
-            Self::Direct { base_url, .. } => base_url.websocket_url(),
-            Self::Supervisor { .. } => SUPERVISOR_WEBSOCKET_URL.to_owned(),
-        }
-    }
-
-    /// The base URL REST paths are appended to (`{base}/api/...`).
-    pub fn base_url(&self) -> String {
-        match self {
-            Self::Direct { base_url, .. } => base_url.as_http(),
-            Self::Supervisor { .. } => SUPERVISOR_BASE_URL.to_owned(),
-        }
-    }
-
-    /// The bearer token for both APIs.
-    pub fn token(&self) -> &str {
-        match self {
-            Self::Direct { token, .. } | Self::Supervisor { token } => token,
-        }
-    }
-
     /// The user-facing base URL configured with `HA_URL`; `None` in add-on
     /// mode, where the dashboard shares Home Assistant's origin.
     pub fn configured_url(&self) -> Option<String> {
@@ -1013,10 +979,12 @@ mod tests {
             None,
         )
         .unwrap();
+        let HomeAssistantAccess::Direct { base_url, token } = &config.home_assistant else {
+            panic!("HA_URL and HA_TOKEN give direct access");
+        };
+        assert_eq!(base_url.as_http(), "https://ha.example:8123");
+        assert_eq!(token, "abc");
         let ha = &config.home_assistant;
-        assert_eq!(ha.websocket_url(), "wss://ha.example:8123/api/websocket");
-        assert_eq!(ha.base_url(), "https://ha.example:8123");
-        assert_eq!(ha.token(), "abc");
         assert_eq!(
             ha.configured_url().as_deref(),
             Some("https://ha.example:8123")
@@ -1028,9 +996,7 @@ mod tests {
         let config =
             ControllerConfig::from_env(&env(&[("SUPERVISOR_TOKEN", "sup")]), None).unwrap();
         let ha = &config.home_assistant;
-        assert_eq!(ha.websocket_url(), "ws://supervisor/core/websocket");
-        assert_eq!(ha.base_url(), "http://supervisor/core");
-        assert_eq!(ha.token(), "sup");
+        assert!(matches!(ha, HomeAssistantAccess::Supervisor { token } if token == "sup"));
         assert_eq!(ha.configured_url(), None);
         assert!(!format!("{ha:?}").contains("sup\""));
     }
@@ -1071,10 +1037,9 @@ mod tests {
     }
 
     #[test]
-    fn plain_http_maps_to_plain_websocket() {
+    fn plain_http_base_urls_are_normalized() {
         let url = HaBaseUrl::parse("HTTP://10.0.0.2:8123//").unwrap();
         assert_eq!(url.as_http(), "http://10.0.0.2:8123");
-        assert_eq!(url.websocket_url(), "ws://10.0.0.2:8123/api/websocket");
     }
 
     #[test]

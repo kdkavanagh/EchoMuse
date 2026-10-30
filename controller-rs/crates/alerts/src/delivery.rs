@@ -192,12 +192,13 @@ impl Delivery {
             return self.snapshot(desired);
         }
         let sent = self.sent.as_ref().expect("checked above");
-        let mut changes: Vec<CacheObject> = Vec::new();
         let live: BTreeMap<Uuid, &OccurrenceObject> =
             desired.live.iter().map(|o| (o.occurrence_id, o)).collect();
-        for (id, object) in sent {
-            if !live.contains_key(id) {
-                changes.push(CacheObject::Tombstone(TombstoneObject {
+        let mut changes: Vec<CacheObject> = sent
+            .keys()
+            .filter(|id| !live.contains_key(id))
+            .map(|id| {
+                CacheObject::Tombstone(TombstoneObject {
                     occurrence_id: *id,
                     revision: 0,
                     tombstone: desired
@@ -205,10 +206,9 @@ impl Delivery {
                         .get(id)
                         .copied()
                         .unwrap_or(TombstoneReason::Deleted),
-                }));
-                let _ = object;
-            }
-        }
+                })
+            })
+            .collect();
         for (id, object) in &live {
             if sent.get(id).is_none_or(|old| !same_content(old, object)) {
                 changes.push(CacheObject::Occurrence((*object).clone()));
@@ -216,40 +216,8 @@ impl Delivery {
         }
         let mut outbox = Outbox::default();
         for chunk in changes.chunks(SNAPSHOT_PAGE_OBJECTS) {
-            self.sequence += 1;
-            let sequence = self.sequence;
-            let objects: Vec<CacheObject> = chunk
-                .iter()
-                .cloned()
-                .map(|object| match object {
-                    CacheObject::Occurrence(o) => CacheObject::Occurrence(OccurrenceObject {
-                        revision: sequence,
-                        ..o
-                    }),
-                    CacheObject::Tombstone(t) => CacheObject::Tombstone(TombstoneObject {
-                        revision: sequence,
-                        ..t
-                    }),
-                })
-                .collect();
-            let sent = self.sent.as_mut().expect("checked above");
-            for object in &objects {
-                match object {
-                    CacheObject::Occurrence(o) => {
-                        sent.insert(o.occurrence_id, o.clone());
-                    }
-                    CacheObject::Tombstone(t) => {
-                        sent.remove(&t.occurrence_id);
-                    }
-                }
-            }
-            let delta = AlertDelta {
-                delivery_epoch: self.epoch.clone(),
-                sequence,
-                objects,
-            };
-            self.unacked.push_back(delta.clone());
-            outbox.bodies.push(PostBody::Delta(delta));
+            let delta = self.next_delta(chunk.iter().cloned());
+            outbox.bodies.push(delta);
         }
         if !outbox.bodies.is_empty() {
             outbox.position = Some((self.sequence, self.acked));
@@ -261,24 +229,46 @@ impl Delivery {
     /// snooze child the device derived whose snooze was rejected), in one delta.
     pub fn retract(&mut self, removed: &[(Uuid, TombstoneReason)]) -> Outbox {
         let in_step = self.attached.as_ref().is_some_and(|a| !a.snapshot_owed);
-        let Some(sent) = self
-            .sent
-            .as_mut()
-            .filter(|_| in_step && !removed.is_empty())
-        else {
+        if !in_step || removed.is_empty() || self.sent.is_none() {
             return Outbox::default();
-        };
+        }
+        let delta = self.next_delta(removed.iter().map(|(id, reason)| {
+            CacheObject::Tombstone(TombstoneObject {
+                occurrence_id: *id,
+                revision: 0,
+                tombstone: *reason,
+            })
+        }));
+        Outbox {
+            bodies: vec![delta],
+            position: Some((self.sequence, self.acked)),
+        }
+    }
+
+    /// The next delta, carrying `objects` stamped with its sequence, which are applied to
+    /// what the device will hold. Only once this process has sent the epoch's state.
+    fn next_delta(&mut self, objects: impl IntoIterator<Item = CacheObject>) -> PostBody {
         self.sequence += 1;
         let sequence = self.sequence;
-        let objects = removed
-            .iter()
-            .map(|(id, reason)| {
-                sent.remove(id);
-                CacheObject::Tombstone(TombstoneObject {
-                    occurrence_id: *id,
-                    revision: sequence,
-                    tombstone: *reason,
-                })
+        let sent = self.sent.as_mut().expect("deltas follow a snapshot");
+        let objects = objects
+            .into_iter()
+            .map(|object| match object {
+                CacheObject::Occurrence(o) => {
+                    let o = OccurrenceObject {
+                        revision: sequence,
+                        ..o
+                    };
+                    sent.insert(o.occurrence_id, o.clone());
+                    CacheObject::Occurrence(o)
+                }
+                CacheObject::Tombstone(t) => {
+                    sent.remove(&t.occurrence_id);
+                    CacheObject::Tombstone(TombstoneObject {
+                        revision: sequence,
+                        ..t
+                    })
+                }
             })
             .collect();
         let delta = AlertDelta {
@@ -287,10 +277,7 @@ impl Delivery {
             objects,
         };
         self.unacked.push_back(delta.clone());
-        Outbox {
-            bodies: vec![PostBody::Delta(delta)],
-            position: Some((self.sequence, self.acked)),
-        }
+        PostBody::Delta(delta)
     }
 
     fn snapshot(&mut self, desired: &Desired) -> Result<Outbox, SnapshotError> {

@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::asr::{TextTracker, WakeCut};
+use crate::asr::{TextTracker, TrailingQuiet, WakeCut};
 use crate::classify::{AttributionPolicy, CellClass, CellClassifier, ReplyAttribution};
 use crate::completeness::{Completeness, RecognizerAnswer, RecognizerError, TextClass};
 use crate::evidence::{
@@ -87,7 +87,7 @@ pub struct EndpointPolicy {
 /// (cells at least 6 dB over the room) ended a median 136 ms *before* Kroko emitted it, and
 /// 90% ended no more than 56 ms after. This margin covers those, and keeps the median audio
 /// after the word's end near the cell bound's own 192 ms tail.
-pub const ASR_WORD_MARGIN_MS: u64 = 64;
+const ASR_WORD_MARGIN_MS: u64 = 64;
 
 impl Default for EndpointPolicy {
     fn default() -> Self {
@@ -493,9 +493,9 @@ pub struct TurnPolicy {
     classifier: CellClassifier,
     background: BackgroundLevel,
     foreground: ForegroundLevel,
-    /// Wake-word cells that may seed `F`, collected until the trigger.
-    seed: Vec<i16>,
-    seed_done: bool,
+    /// Wake-word cells that may seed `F`, collected until the trigger; `None` once the cells
+    /// have reached it.
+    seed: Option<Vec<i16>>,
     text: TextTracker,
     class: Option<TextClass>,
     grammar_class: Option<TextClass>,
@@ -577,8 +577,7 @@ impl TurnPolicy {
             classifier: CellClassifier::new(config.attribution, spec.trigger, reply),
             background: BackgroundLevel::new(config.attribution.non_speech_max),
             foreground: ForegroundLevel::new(),
-            seed: Vec::new(),
-            seed_done: false,
+            seed: Some(Vec::new()),
             text: TextTracker::new(spec.trigger, wake),
             class: None,
             grammar_class: None,
@@ -832,12 +831,16 @@ impl TurnPolicy {
         matches!(self.spec.kind, TurnKind::Reply(_))
     }
 
+    /// A reply to an HA-started conversation: route R, and no questions to HA's matcher.
+    fn is_ha_reply(&self) -> bool {
+        matches!(&self.spec.kind, TurnKind::Reply(r) if r.origin == ReplyOrigin::HaConversation)
+    }
+
     fn close(&mut self, reason: CloseReason, cause: CloseCause, out: &mut Vec<Decision>) {
         if self.finished {
             return;
         }
         self.finished = true;
-        self.trace.frontier = self.frontier;
         self.trace.endpoint.push(EndpointEvent::Close {
             reason,
             cause,
@@ -899,15 +902,12 @@ impl TurnPolicy {
             return;
         }
 
-        // F is seeded from the wake word once the cells reach the trigger.
+        // F is seeded from the wake word once the cells reach the trigger (only a wake turn
+        // collects seed cells).
         let after_trigger = end > self.spec.trigger;
-        if after_trigger && !self.seed_done {
-            self.seed_done = true;
-            if matches!(self.spec.kind, TurnKind::Wake(_)) {
-                self.foreground.seed(&self.seed);
-                self.trace.foreground_seeded = self.foreground.seeded();
-            }
-            self.seed = Vec::new();
+        if after_trigger && let Some(seed) = self.seed.take() {
+            self.foreground.seed(&seed);
+            self.trace.foreground_seeded = self.foreground.seeded();
         }
         let foreground = self.foreground.current_db();
         self.count_evidence(&cell.audio, background);
@@ -961,8 +961,9 @@ impl TurnPolicy {
                     energy_centi: Some(centi),
                     ..
                 } = cell.audio
+                && let Some(seed) = self.seed.as_mut()
             {
-                self.seed.push(centi);
+                seed.push(centi);
             }
             return;
         }
@@ -1124,13 +1125,9 @@ impl TurnPolicy {
         if changed {
             let prefix = self.text.prefix().to_owned();
             self.grammar_class = (!prefix.is_empty()).then(|| grammar.classify(&prefix));
-            let ha_reply = matches!(
-                &self.spec.kind,
-                TurnKind::Reply(r) if r.origin == ReplyOrigin::HaConversation
-            );
             ask = self.grammar_class == Some(TextClass::Unknown)
                 && self.config.recognizer_available
-                && !ha_reply
+                && !self.is_ha_reply()
                 && !self.asked.iter().any(|a| a.text == prefix);
             self.trace.text.push(TextChange {
                 text: prefix,
@@ -1259,8 +1256,7 @@ impl TurnPolicy {
             return;
         };
         let last_cmd_end = *self.command_ends.last().expect("command speech exists");
-        let ha_reply = reply.is_some_and(|r| r.origin == ReplyOrigin::HaConversation);
-        let set = if ha_reply {
+        let set = if self.is_ha_reply() {
             self.route_r(frontier, last_cmd_end)
         } else {
             self.route_a(frontier, through, last_cmd_end)
@@ -1354,8 +1350,7 @@ impl TurnPolicy {
             through,
             self.last_speech_positive_end.unwrap_or(self.spec.start),
         );
-        let blanks_min =
-            Samples(u64::from(p.trailing_blanks_min) * crate::asr::BLANK_FRAME_SAMPLES);
+        let blanks_min = TrailingQuiet::Blanks(p.trailing_blanks_min).samples();
         if trailing.samples() < blanks_min {
             return None;
         }
@@ -1485,7 +1480,6 @@ impl TurnPolicy {
             source,
         };
         self.finished = true;
-        self.trace.frontier = Some(frontier);
         self.trace.endpoint.push(EndpointEvent::Commit {
             route,
             boundary,

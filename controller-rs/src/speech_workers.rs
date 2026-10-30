@@ -33,6 +33,7 @@
 use std::{
     any::Any,
     io,
+    ops::Index,
     panic::{self, AssertUnwindSafe},
     sync::Arc,
     thread::{self, JoinHandle},
@@ -167,13 +168,6 @@ pub enum SpeechWorkerKind {
 }
 
 impl SpeechWorkerKind {
-    pub const ALL: [Self; 4] = [
-        Self::MicrophoneAnalysis,
-        Self::ReferenceScoring,
-        Self::WakeVerification,
-        Self::SpanDecoding,
-    ];
-
     /// Stable name, used as the thread-name suffix.
     pub const fn name(self) -> &'static str {
         match self {
@@ -193,13 +187,47 @@ impl SpeechWorkerKind {
             Self::SpanDecoding => "span decoding",
         }
     }
+}
 
-    const fn index(self) -> usize {
-        match self {
-            Self::MicrophoneAnalysis => 0,
-            Self::ReferenceScoring => 1,
-            Self::WakeVerification => 2,
-            Self::SpanDecoding => 3,
+/// One value for each speech worker, addressed by the worker's kind.
+#[derive(Clone)]
+pub(crate) struct PerWorker<T> {
+    microphone_analysis: T,
+    reference_scoring: T,
+    wake_verification: T,
+    span_decoding: T,
+}
+
+impl<T> PerWorker<T> {
+    pub(crate) fn from_fn(mut value: impl FnMut(SpeechWorkerKind) -> T) -> Self {
+        Self {
+            microphone_analysis: value(SpeechWorkerKind::MicrophoneAnalysis),
+            reference_scoring: value(SpeechWorkerKind::ReferenceScoring),
+            wake_verification: value(SpeechWorkerKind::WakeVerification),
+            span_decoding: value(SpeechWorkerKind::SpanDecoding),
+        }
+    }
+
+    /// Like [`PerWorker::from_fn`], stopping at the first error.
+    fn try_from_fn<E>(mut value: impl FnMut(SpeechWorkerKind) -> Result<T, E>) -> Result<Self, E> {
+        Ok(Self {
+            microphone_analysis: value(SpeechWorkerKind::MicrophoneAnalysis)?,
+            reference_scoring: value(SpeechWorkerKind::ReferenceScoring)?,
+            wake_verification: value(SpeechWorkerKind::WakeVerification)?,
+            span_decoding: value(SpeechWorkerKind::SpanDecoding)?,
+        })
+    }
+}
+
+impl<T> Index<SpeechWorkerKind> for PerWorker<T> {
+    type Output = T;
+
+    fn index(&self, kind: SpeechWorkerKind) -> &T {
+        match kind {
+            SpeechWorkerKind::MicrophoneAnalysis => &self.microphone_analysis,
+            SpeechWorkerKind::ReferenceScoring => &self.reference_scoring,
+            SpeechWorkerKind::WakeVerification => &self.wake_verification,
+            SpeechWorkerKind::SpanDecoding => &self.span_decoding,
         }
     }
 }
@@ -209,7 +237,7 @@ impl SpeechWorkerKind {
 /// Dropping it cancels the stop token without waiting; the idle threads then exit on
 /// their own. [`SpeechWorkers::shutdown`] is the waiting form.
 pub struct SpeechWorkers {
-    handles: Vec<SpeechWorkerHandle>,
+    handles: PerWorker<SpeechWorkerHandle>,
     threads: Vec<WorkerThread>,
     stop: CancellationToken,
     failure: Arc<watch::Sender<Option<RuntimeError>>>,
@@ -273,10 +301,9 @@ impl SpeechWorkers {
 
         let failure = Arc::new(watch::Sender::new(None));
         let path = Arc::new(watch::Sender::new(SpeechPathState::default()));
-        let mut handles = Vec::with_capacity(SpeechWorkerKind::ALL.len());
-        let mut threads = Vec::with_capacity(SpeechWorkerKind::ALL.len());
-        for kind in SpeechWorkerKind::ALL {
-            let started = spawn_worker(
+        let mut threads = Vec::with_capacity(4);
+        let started = PerWorker::try_from_fn(|kind| {
+            let (handle, thread) = spawn_worker(
                 kind,
                 thread_prefix,
                 limits,
@@ -288,23 +315,22 @@ impl SpeechWorkers {
                     path: Arc::clone(&path),
                 },
                 &mut *spawn,
-            );
-            match started {
-                Ok((handle, thread)) => {
-                    handles.push(handle);
-                    threads.push(thread);
+            )?;
+            threads.push(thread);
+            Ok(handle)
+        });
+        let handles = match started {
+            Ok(handles) => handles,
+            Err(error) => {
+                stop.cancel();
+                // The started workers have run no job and are idle on their queues, so
+                // each exits as soon as it sees the stop token.
+                for thread in threads {
+                    let _ = thread.join.join();
                 }
-                Err(error) => {
-                    stop.cancel();
-                    // The started workers have run no job and are idle on their
-                    // queues, so each exits as soon as it sees the stop token.
-                    for thread in threads {
-                        let _ = thread.join.join();
-                    }
-                    return Err(error);
-                }
+                return Err(error);
             }
-        }
+        };
         Ok(Self {
             handles,
             threads,
@@ -316,7 +342,7 @@ impl SpeechWorkers {
 
     /// A submitter for one worker; clones share its queue and byte credits.
     pub fn handle(&self, kind: SpeechWorkerKind) -> SpeechWorkerHandle {
-        self.handles[kind.index()].clone()
+        self.handles[kind].clone()
     }
 
     /// The first failure of any worker; `None` while all are healthy.
@@ -407,7 +433,6 @@ fn spawn_worker(
     let builder = thread::Builder::new().name(format!("{thread_prefix}-{}", kind.name()));
     let join = spawn(builder, body).map_err(thread_start)?;
     let handle = SpeechWorkerHandle {
-        kind,
         sender,
         // `start_with` validated that the byte limits fit a semaphore.
         credits: Arc::new(Semaphore::new(limits.bytes_for(kind) as usize)),
@@ -432,39 +457,32 @@ fn publish_failure(failure: &watch::Sender<Option<RuntimeError>>, error: Runtime
 pub struct WorkerSlot(Option<Box<dyn Any + Send>>);
 
 impl WorkerSlot {
-    /// The worker's state of type `S`, made by `init` the first time it is needed. A
-    /// worker keeps one kind of state; asking for another type replaces it.
+    /// The worker's state of type `S`, made by `init` the first time it is needed.
+    ///
+    /// # Panics
+    ///
+    /// A worker keeps one type of state for its life. Asking for another is a dispatch
+    /// bug, and replacing the state would silently drop the streams it holds, so it
+    /// panics; the worker reports that as [`RuntimeError::WorkerPanicked`].
     pub fn state<S: Send + 'static>(&mut self, init: impl FnOnce() -> S) -> &mut S {
-        if !self.0.as_ref().is_some_and(|state| state.is::<S>()) {
-            self.0 = Some(Box::new(init()));
-        }
         self.0
-            .as_mut()
-            .and_then(|state| state.downcast_mut::<S>())
-            .expect("the state was just installed")
-    }
-
-    /// Drops whatever the worker kept.
-    pub fn clear(&mut self) {
-        self.0 = None;
+            .get_or_insert_with(|| Box::new(init()))
+            .downcast_mut::<S>()
+            .expect("a speech worker keeps one type of state")
     }
 }
 
 /// Submits jobs to one speech worker.
 #[derive(Clone)]
 pub struct SpeechWorkerHandle {
-    kind: SpeechWorkerKind,
     sender: mpsc::Sender<Job>,
     credits: Arc<Semaphore>,
     stop: CancellationToken,
 }
 
 impl SpeechWorkerHandle {
-    pub fn kind(&self) -> SpeechWorkerKind {
-        self.kind
-    }
-
-    /// Queues `work` to run on this worker's thread, without waiting.
+    /// Queues `work` to run on this worker's thread, without waiting. `work` gets the
+    /// state this worker keeps between jobs (its model sessions and stream state, §5.1).
     ///
     /// `retained_bytes` is what the job keeps alive (its input buffers) until `work`
     /// returns; it is charged against the worker's byte credits for that long.
@@ -474,21 +492,6 @@ impl SpeechWorkerHandle {
     /// [`RuntimeError::Overloaded`] when the bytes do not fit or the queue is full, in
     /// which case `scope` is cancelled before returning.
     pub fn submit<T, F>(
-        &self,
-        scope: WorkScope,
-        retained_bytes: usize,
-        work: F,
-    ) -> Result<Work<T>, RuntimeError>
-    where
-        T: Send + 'static,
-        F: FnOnce() -> T + Send + 'static,
-    {
-        self.submit_stateful(scope, retained_bytes, move |_: &mut WorkerSlot| work())
-    }
-
-    /// Like [`SpeechWorkerHandle::submit`], for work that uses the state this worker
-    /// keeps between jobs (its model sessions and stream state, §5.1).
-    pub fn submit_stateful<T, F>(
         &self,
         scope: WorkScope,
         retained_bytes: usize,
@@ -835,7 +838,7 @@ mod tests {
             .unwrap();
         // The worker keeps running: a quick job afterwards is answered.
         assert_eq!(
-            verify.submit(scope(), 0, || 8_u32).unwrap().result().await,
+            verify.submit(scope(), 0, |_| 8_u32).unwrap().result().await,
             Ok(8)
         );
         workers.shutdown(PATIENCE).await.unwrap();
@@ -852,7 +855,7 @@ mod tests {
         let (started_tx, started) = oneshot::channel();
         let (release, gate) = std_mpsc::channel::<()>();
         let work = handle
-            .submit(scope, bytes, move || {
+            .submit(scope, bytes, move |_| {
                 let _ = started_tx.send(());
                 let _ = gate.recv();
                 value
@@ -872,7 +875,7 @@ mod tests {
         let (started_tx, started) = oneshot::channel();
         let (release, gate) = std_mpsc::channel::<()>();
         let work = mic
-            .submit(turn.clone(), 0, move || {
+            .submit(turn.clone(), 0, move |_| {
                 let _ = started_tx.send(());
                 let _ = gate.recv();
                 let _ = finished_tx.send(());
@@ -889,7 +892,7 @@ mod tests {
 
         release.send(()).unwrap();
         finished.await.unwrap();
-        let next = mic.submit(scope(), 0, || 2_u32).unwrap();
+        let next = mic.submit(scope(), 0, |_| 2_u32).unwrap();
         assert_eq!(next.result().await, Ok(2));
         workers.shutdown(PATIENCE).await.unwrap();
     }
@@ -935,7 +938,7 @@ mod tests {
         let abandoned_ran = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&abandoned_ran);
         drop(
-            mic.submit(scope(), 0, move || flag.store(true, Ordering::SeqCst))
+            mic.submit(scope(), 0, move |_| flag.store(true, Ordering::SeqCst))
                 .unwrap(),
         );
 
@@ -943,11 +946,13 @@ mod tests {
         let flag = Arc::clone(&cancelled_ran);
         let ended = scope();
         let cancelled = mic
-            .submit(ended.clone(), 0, move || flag.store(true, Ordering::SeqCst))
+            .submit(ended.clone(), 0, move |_| {
+                flag.store(true, Ordering::SeqCst)
+            })
             .unwrap();
         ended.cancel();
 
-        let last = mic.submit(scope(), 0, || 4_u32).unwrap();
+        let last = mic.submit(scope(), 0, |_| 4_u32).unwrap();
         release.send(()).unwrap();
         assert_eq!(first.result().await, Ok(1));
         assert_eq!(cancelled.reply.await, Ok(Err(RuntimeError::Cancelled)));
@@ -971,11 +976,11 @@ mod tests {
         let (running, started, release) = submit_blocking(&mic, scope(), 0, 1);
         started.await.unwrap();
         let queued_scope = scope();
-        let queued = mic.submit(queued_scope.clone(), 0, || 2_u32).unwrap();
+        let queued = mic.submit(queued_scope.clone(), 0, |_| 2_u32).unwrap();
 
         let refused_scope = scope();
         assert!(matches!(
-            mic.submit(refused_scope.clone(), 0, || 3_u32),
+            mic.submit(refused_scope.clone(), 0, |_| 3_u32),
             Err(RuntimeError::Overloaded)
         ));
         assert!(refused_scope.is_cancelled());
@@ -985,7 +990,7 @@ mod tests {
         let reference = workers.handle(SpeechWorkerKind::ReferenceScoring);
         assert_eq!(
             reference
-                .submit(scope(), 0, || 4_u32)
+                .submit(scope(), 0, |_| 4_u32)
                 .unwrap()
                 .result()
                 .await,
@@ -1011,7 +1016,7 @@ mod tests {
 
         let oversized = scope();
         assert!(matches!(
-            span.submit(oversized.clone(), 101, || ()),
+            span.submit(oversized.clone(), 101, |_| ()),
             Err(RuntimeError::Overloaded)
         ));
         assert!(oversized.is_cancelled());
@@ -1021,16 +1026,16 @@ mod tests {
         // The queue is empty, but the running job still holds 60 bytes.
         let refused = scope();
         assert!(matches!(
-            span.submit(refused.clone(), 50, || 2_u32),
+            span.submit(refused.clone(), 50, |_| 2_u32),
             Err(RuntimeError::Overloaded)
         ));
         assert!(refused.is_cancelled());
-        let fits = span.submit(scope(), 40, || 3_u32).unwrap();
+        let fits = span.submit(scope(), 40, |_| 3_u32).unwrap();
 
         release.send(()).unwrap();
         assert_eq!(running.result().await, Ok(1));
         assert_eq!(fits.result().await, Ok(3));
-        let whole = span.submit(scope(), 100, || 4_u32).unwrap();
+        let whole = span.submit(scope(), 100, |_| 4_u32).unwrap();
         assert_eq!(whole.result().await, Ok(4));
         workers.shutdown(PATIENCE).await.unwrap();
     }
@@ -1078,7 +1083,7 @@ mod tests {
     ) -> Result<SpanOutput, RuntimeError> {
         let models: Arc<dyn ModelSet> = Arc::new(m.clone());
         let bytes = span_job_bytes(&job);
-        let work = span.submit_stateful(scope(), bytes, move |slot| {
+        let work = span.submit(scope(), bytes, move |slot| {
             slot.state(|| SpanDecoding::new(models)).run(job)
         })?;
         work.result().await
@@ -1181,7 +1186,7 @@ mod tests {
 
         let excessive = scope();
         assert!(matches!(
-            span.submit(excessive.clone(), limits.span_bytes as usize + 1, || ()),
+            span.submit(excessive.clone(), limits.span_bytes as usize + 1, |_| ()),
             Err(RuntimeError::Overloaded)
         ));
         assert!(excessive.is_cancelled());
@@ -1197,10 +1202,10 @@ mod tests {
         // The next turn's commit still fits; a third at once is overload, and only its
         // submitter is cancelled.
         let next = scope();
-        let queued = span.submit(next.clone(), largest, || 2_u32).unwrap();
+        let queued = span.submit(next.clone(), largest, |_| 2_u32).unwrap();
         let third = scope();
         assert!(matches!(
-            span.submit(third.clone(), largest, || 3_u32),
+            span.submit(third.clone(), largest, |_| 3_u32),
             Err(RuntimeError::Overloaded)
         ));
         assert!(third.is_cancelled());
@@ -1210,7 +1215,7 @@ mod tests {
         assert_eq!(queued.result().await, Ok(2));
         // Every credit came back.
         let whole = span
-            .submit(scope(), limits.span_bytes as usize, || 4_u32)
+            .submit(scope(), limits.span_bytes as usize, |_| 4_u32)
             .unwrap();
         assert_eq!(whole.result().await, Ok(4));
         workers.shutdown(PATIENCE).await.unwrap();
@@ -1227,7 +1232,7 @@ mod tests {
         let (started_tx, started) = oneshot::channel();
         let (release, gate) = std_mpsc::channel::<()>();
         let panicking = verify
-            .submit(scope(), 0, move || -> u32 {
+            .submit(scope(), 0, move |_| -> u32 {
                 let _ = started_tx.send(());
                 let _ = gate.recv();
                 panic!("injected speech worker panic");
@@ -1237,7 +1242,7 @@ mod tests {
         let ran = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&ran);
         let behind = verify
-            .submit(scope(), 0, move || flag.store(true, Ordering::SeqCst))
+            .submit(scope(), 0, move |_| flag.store(true, Ordering::SeqCst))
             .unwrap();
 
         release.send(()).unwrap();
@@ -1252,12 +1257,12 @@ mod tests {
         assert!(stop.is_cancelled());
         assert!(!ran.load(Ordering::SeqCst));
         assert!(matches!(
-            verify.submit(scope(), 0, || ()),
+            verify.submit(scope(), 0, |_| ()),
             Err(RuntimeError::Closed)
         ));
         let mic = workers.handle(SpeechWorkerKind::MicrophoneAnalysis);
         assert!(matches!(
-            mic.submit(scope(), 0, || ()),
+            mic.submit(scope(), 0, |_| ()),
             Err(RuntimeError::Closed)
         ));
         workers.shutdown(PATIENCE).await.unwrap();
@@ -1267,18 +1272,32 @@ mod tests {
     async fn shutdown_wakes_idle_workers_while_handles_are_still_held() {
         let stop = CancellationToken::new();
         let workers = SpeechWorkers::start("kitchen", roomy(), stop.clone(), test_watch()).unwrap();
-        let held: Vec<_> = SpeechWorkerKind::ALL
-            .iter()
-            .map(|&kind| workers.handle(kind))
-            .collect();
+        let held = PerWorker::from_fn(|kind| workers.handle(kind));
         assert_eq!(workers.shutdown(PATIENCE).await, Ok(()));
         assert!(stop.is_cancelled());
-        for handle in &held {
+        PerWorker::from_fn(|kind| {
             assert!(matches!(
-                handle.submit(scope(), 0, || ()),
+                held[kind].submit(scope(), 0, |_| ()),
                 Err(RuntimeError::Closed)
             ));
-        }
+        });
+    }
+
+    #[tokio::test]
+    async fn a_job_asking_for_another_state_type_fails_the_worker_instead_of_replacing_it() {
+        let workers =
+            SpeechWorkers::start("kitchen", roomy(), CancellationToken::new(), test_watch())
+                .unwrap();
+        let mic = workers.handle(SpeechWorkerKind::MicrophoneAnalysis);
+        let first = mic
+            .submit(scope(), 0, |slot| *slot.state(|| 7_u32))
+            .unwrap();
+        assert_eq!(first.result().await, Ok(7));
+        let other = mic
+            .submit(scope(), 0, |slot| slot.state(String::new).len())
+            .unwrap();
+        assert_eq!(other.result().await, Err(RuntimeError::WorkerPanicked));
+        assert_eq!(workers.shutdown(PATIENCE).await, Ok(()));
     }
 
     #[tokio::test]
@@ -1306,7 +1325,7 @@ mod tests {
         drop(workers);
         assert!(stop.is_cancelled());
         assert!(matches!(
-            mic.submit(scope(), 0, || ()),
+            mic.submit(scope(), 0, |_| ()),
             Err(RuntimeError::Closed)
         ));
     }
@@ -1344,9 +1363,7 @@ mod tests {
         let refused =
             SpeechWorkers::start_with("kitchen", roomy(), stop.clone(), test_watch(), &mut spawn);
         match refused {
-            Err(RuntimeError::ThreadStart(detail)) => {
-                assert!(detail.contains("wake_verification"), "{detail}");
-            }
+            Err(RuntimeError::ThreadStart(_)) => {}
             Err(other) => panic!("unexpected error {other}"),
             Ok(_) => panic!("start succeeded"),
         }

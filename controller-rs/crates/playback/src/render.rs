@@ -12,9 +12,9 @@
 //! Each source class has its own generation counter, which only grows, so a
 //! playback never starts at a generation the device would call stale within a
 //! session. Starting a playback in a class with a live one cancels the old one
-//! first. Cancelling purges the playback's queued packets; a packet already
-//! being written has uncertain delivery, and [`CancelDelivery`] says so rather
-//! than claiming it was withdrawn.
+//! first. Cancelling cancels the playback's token, so the link drops its
+//! queued packets unwritten; a packet already being written may still reach
+//! the device.
 //!
 //! Dialog output may carry [`ResponseLimits`] (spec §4.8): its audio must start
 //! by a deadline (10 s after the answer is known), may go at most 2 s without
@@ -26,7 +26,6 @@
 //! [`RenderClient::poll`] next. Outcomes queue up as [`RenderEvent`]s.
 
 use std::collections::{HashMap, VecDeque};
-use std::ops::Range;
 use std::time::Duration;
 
 use echomuse_protocol::ema::{self, Flags};
@@ -34,11 +33,11 @@ use echomuse_protocol::{Capabilities, Capability, MessageId, Reported};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::link::{FramePurge, FrameRefused, LinkClosed, RenderFrame, RenderLink};
+use crate::link::{FrameRefused, LinkClosed, RenderFrame, RenderLink};
 use crate::wire::{
     AckFailure, AckOutcome, CancelReason, Command, Earcon, FORMAT_PCM16, FinishReason, LocalSource,
     NetworkClass, PlaybackId, ProgressEvent, RenderCancel, RenderEnd, RenderEpoch, RenderProgress,
-    RenderRejection, RenderReport, RenderStart, SourceClass,
+    RenderRejection, RenderReport, RenderStart, SourceClass, reported,
 };
 
 /// Frames per render packet, the most kind 3 allows.
@@ -108,11 +107,6 @@ impl PlaybackRef {
         &self.id
     }
 
-    /// Its source class.
-    pub fn class(&self) -> SourceClass {
-        self.class
-    }
-
     /// Its generation, which every envelope about it carries.
     pub fn generation(&self) -> u32 {
         self.generation
@@ -159,21 +153,6 @@ pub enum AudioRefused {
 #[error("no such live playback")]
 pub struct NotLive;
 
-/// What is known about a cancelled playback's audio.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CancelDelivery {
-    /// Frames handed to the link, from frame 0.
-    pub handed: u64,
-    /// Frames the device last reported complete.
-    pub completed: u64,
-    /// Frames known to have been dropped before they were written.
-    pub withdrawn: Option<Range<u64>>,
-    /// Frames that may or may not reach the device: the packet being written
-    /// when the playback was cancelled, or, when the link cannot tell, every
-    /// handed frame the device has not reported complete.
-    pub uncertain: Option<Range<u64>>,
-}
-
 /// How a playback ended. Every playback ends exactly once.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PlaybackEnd {
@@ -213,8 +192,6 @@ pub enum RenderEvent {
         playback: PlaybackRef,
         /// Why.
         reason: CancelReason,
-        /// What became of its audio; `None` for a local playback.
-        delivery: Option<CancelDelivery>,
     },
     /// A response limit was exceeded; the playback is cancelled.
     LimitExceeded {
@@ -257,9 +234,6 @@ struct Network {
     /// One past the last frame packetized.
     next_frame: u64,
     next_sequence: u64,
-    /// Frames and packets the link accepted.
-    handed_frames: u64,
-    handed_packets: u64,
     /// The device's latest `completed_frames`.
     completed: u64,
     source_done: bool,
@@ -370,8 +344,6 @@ impl RenderClient {
                 retry_at: None,
                 next_frame: 0,
                 next_sequence: 0,
-                handed_frames: 0,
-                handed_packets: 0,
                 completed: 0,
                 source_done: false,
                 end_sent: false,
@@ -425,7 +397,8 @@ impl RenderClient {
     /// the runtime leaves the decoder's output queued, which in turn holds
     /// back the decoder and the fetch.
     pub fn wants_audio(&self, playback: &PlaybackRef) -> bool {
-        self.entry(playback).is_some_and(|entry| {
+        self.index(playback).is_some_and(|index| {
+            let entry = &self.entries[index];
             entry.phase != Phase::Cancelling
                 && entry
                     .network
@@ -481,23 +454,6 @@ impl RenderClient {
         Ok(())
     }
 
-    /// Moves a spoken answer's start deadline, for example to 10 s after
-    /// `intent-end` once that arrives.
-    pub fn set_start_deadline(
-        &mut self,
-        playback: &PlaybackRef,
-        deadline: Instant,
-    ) -> Result<(), NotLive> {
-        let index = self.index(playback).ok_or(NotLive)?;
-        match self.entries[index].limits.as_mut() {
-            Some(limits) => {
-                limits.start_deadline = deadline;
-                Ok(())
-            }
-            None => Err(NotLive),
-        }
-    }
-
     /// Cancels a playback: purges its queued packets, sends `render.cancel`
     /// and reports [`RenderEvent::Cancelled`]. The playback ends when the
     /// device reports it finished.
@@ -543,10 +499,7 @@ impl RenderClient {
                 }
             }
             (CommandKind::Start, AckOutcome::Rejected { code }) => {
-                let code = code.map(|code| match RenderRejection::from_wire(&code) {
-                    Some(known) => Reported::Known(known),
-                    None => Reported::Unrecognized(code),
-                });
+                let code = code.map(|code| reported(&code, RenderRejection::from_wire));
                 self.end_at(index, PlaybackEnd::Rejected(code));
             }
             (CommandKind::Start, AckOutcome::Failed(AckFailure::TimedOut)) => {
@@ -644,7 +597,7 @@ impl RenderClient {
             let Some(index) = self.entries.iter().position(|e| e.playback.id == id) else {
                 continue;
             };
-            let entry = &mut self.entries[index];
+            let entry = &self.entries[index];
             if entry.phase == Phase::Cancelling {
                 continue;
             }
@@ -652,7 +605,6 @@ impl RenderClient {
                 continue;
             };
             if deadline <= now {
-                entry.limits = None;
                 self.events.push_back(RenderEvent::LimitExceeded {
                     playback: entry.playback.clone(),
                     limit,
@@ -695,15 +647,6 @@ impl RenderClient {
     /// The next queued event.
     pub fn next_event(&mut self) -> Option<RenderEvent> {
         self.events.pop_front()
-    }
-
-    /// The playbacks not yet ended.
-    pub fn live(&self) -> impl Iterator<Item = &PlaybackRef> {
-        self.entries.iter().map(|e| &e.playback)
-    }
-
-    fn entry(&self, playback: &PlaybackRef) -> Option<&Entry> {
-        self.index(playback).map(|index| &self.entries[index])
     }
 
     fn index(&self, playback: &PlaybackRef) -> Option<usize> {
@@ -750,19 +693,16 @@ impl RenderClient {
         let entry = &mut self.entries[index];
         entry.phase = Phase::Cancelling;
         entry.limits = None;
-        let delivery = entry.network.as_mut().map(|net| {
+        if let Some(net) = entry.network.as_mut() {
             net.token.cancel();
-            let purge = link.withdraw_frames(&net.token);
             net.pending.clear();
             net.blocked = None;
             net.retry_at = None;
-            delivery(net, purge)
-        });
+        }
         let playback = entry.playback.clone();
         self.events.push_back(RenderEvent::Cancelled {
             playback: playback.clone(),
             reason,
-            delivery,
         });
         let body = RenderCancel {
             playback_id: playback.id.clone(),
@@ -835,11 +775,8 @@ impl RenderClient {
                     frame
                 }
             };
-            let end = frame.frame_range().end;
             match link.queue_frame(frame) {
                 Ok(()) => {
-                    net.handed_frames = end;
-                    net.handed_packets += 1;
                     net.retry_at = None;
                 }
                 Err(FrameRefused::Full(frame)) => {
@@ -875,41 +812,6 @@ impl RenderClient {
         if closed {
             self.end_at(index, PlaybackEnd::LinkClosed);
         }
-    }
-}
-
-/// What a purge leaves known about a cancelled playback's packets. Every
-/// packet but the last carries [`PACKET_FRAMES`], so a packet's frames follow
-/// from its sequence number.
-fn delivery(net: &Network, purge: FramePurge) -> CancelDelivery {
-    let packet_range = |sequence: u64| {
-        let start = (sequence * PACKET_FRAMES as u64).min(net.handed_frames);
-        start..((sequence + 1) * PACKET_FRAMES as u64).min(net.handed_frames)
-    };
-    let nonempty = |range: Range<u64>| (!range.is_empty()).then_some(range);
-    let (withdrawn, uncertain) = match purge {
-        FramePurge::Exact {
-            withdrawn,
-            in_write,
-        } => {
-            let withdrawn = withdrawn.min(net.handed_packets);
-            let first = net.handed_packets - withdrawn;
-            let withdrawn = nonempty(packet_range(first).start..net.handed_frames);
-            (
-                withdrawn,
-                in_write.and_then(|seq| nonempty(packet_range(seq))),
-            )
-        }
-        FramePurge::Unknown => (
-            None,
-            nonempty(net.completed.min(net.handed_frames)..net.handed_frames),
-        ),
-    };
-    CancelDelivery {
-        handed: net.handed_frames,
-        completed: net.completed,
-        withdrawn,
-        uncertain,
     }
 }
 

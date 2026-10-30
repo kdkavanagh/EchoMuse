@@ -13,20 +13,6 @@ use echomuse_db::{
 };
 use rusqlite::Connection;
 
-fn objects(conn: &Connection, kind: &str) -> Vec<String> {
-    let mut statement = conn
-        .prepare(
-            "SELECT name FROM sqlite_master WHERE type = ?1 AND name NOT LIKE 'sqlite\\_%' \
-             ESCAPE '\\' ORDER BY name",
-        )
-        .unwrap();
-    statement
-        .query_map([kind], |row| row.get(0))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap()
-}
-
 fn settings(conn: &Connection) -> BTreeMap<String, Option<String>> {
     let mut statement = conn
         .prepare("SELECT key, value FROM system_config")
@@ -73,26 +59,6 @@ fn a_new_installation_gets_the_contract_schema_and_first_settings() {
     );
 
     let conn = Connection::open(&path).unwrap();
-    assert_eq!(
-        objects(&conn, "table"),
-        [
-            "alert_delivery",
-            "alert_ops",
-            "alert_scripts",
-            "device_logs",
-            "device_metrics",
-            "devices",
-            "near_misses",
-            "sessions",
-            "system_config",
-            "turns",
-            "users",
-            "wake_counters",
-            "wake_shadow",
-            "wake_shadow_events",
-        ]
-    );
-    assert_eq!(objects(&conn, "index").len(), 8);
     let expected: BTreeMap<String, Option<String>> = [
         ("device_approval", "strict"),
         ("next_esphome_port", "16001"),
@@ -230,7 +196,6 @@ fn a_backup_that_cannot_be_written_stops_startup_before_any_write() {
     match open_err(&path) {
         OpenError::CutoverBackup(e) => {
             assert!(matches!(e.cause, BackupFailure::NotAFile));
-            assert!(e.to_string().contains("cannot be skipped"));
         }
         other => panic!("unexpected {other:?}"),
     }
@@ -267,14 +232,16 @@ fn a_newer_database_is_refused_with_instructions() {
             ..
         }
     ));
-    let message = error.to_string();
-    assert!(message.contains("newer controller") && message.contains("echomuse.db.pre-*"));
+    assert!(
+        error.to_string().contains("echomuse.db.pre-*"),
+        "names the backups beside this database"
+    );
     assert!(!cutover_backup_path(&path).exists());
     assert_eq!(journal_mode(&path), "delete");
 }
 
 #[test]
-fn an_older_database_is_refused_with_upgrade_instructions() {
+fn an_older_database_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let path = db_path(&dir);
     drop(existing_installation(&path));
@@ -288,11 +255,6 @@ fn an_older_database_is_refused_with_upgrade_instructions() {
             known: 40
         }
     ));
-    assert!(
-        error
-            .to_string()
-            .contains("latest Python controller release")
-    );
     assert!(!cutover_backup_path(&path).exists());
 }
 

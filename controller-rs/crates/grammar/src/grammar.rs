@@ -149,13 +149,11 @@ impl Grammar {
         words
     }
 
-    /// Normalized words with skip words removed; `None` when nothing was said.
+    /// Normalized words with skip words removed; `None` when nothing is left.
     fn words(&self, text: &str) -> Option<Vec<String>> {
         let tokens = normalize(text).into_tokens();
-        if tokens.is_empty() {
-            return None;
-        }
-        Some(matcher::remove_skip_words(&self.program, &tokens))
+        let words = matcher::remove_skip_words(&self.program, &tokens);
+        (!words.is_empty()).then_some(words)
     }
 
     fn run(&self, words: Vec<String>, groups: &[Group]) -> RunResult<'_> {
@@ -322,7 +320,7 @@ impl Grammar {
     /// as any other reading, or the best reading stops part way through a known name.
     /// Transcript correction asks this; it is not completeness.
     pub fn reads_whole(&self, text: &str) -> bool {
-        let Some(words) = self.words(text).filter(|w| !w.is_empty()) else {
+        let Some(words) = self.words(text) else {
             return false;
         };
         let run = self.run(words, &[Group::Ha, Group::HaTimers, Group::Commands]);
@@ -381,9 +379,6 @@ impl Grammar {
     /// media takes `stop` and `pause`. The alert comes first, then the reply, then media.
     pub fn context_command(&self, text: &str, context: &CommandContext) -> Option<ContextCommand> {
         let words = self.words(text)?;
-        if words.is_empty() {
-            return None;
-        }
         let run = self.run(words, &[Group::Commands]);
         let mut bare: Option<String> = None;
         let mut stop_alert: Vec<Vec<Capture>> = Vec::new();
@@ -451,7 +446,7 @@ impl Grammar {
     /// names a timer by name or length goes to Home Assistant, whose timer intents match
     /// it.
     pub fn route(&self, text: &str) -> Route {
-        let Some(words) = self.words(text).filter(|w| !w.is_empty()) else {
+        let Some(words) = self.words(text) else {
             return Route::SendToHa;
         };
         // The timer cancels the deployed controller took itself begin with cancel, stop,
@@ -529,7 +524,7 @@ impl Grammar {
     /// The answer to "AM or PM?", if `text` is one (`pm`, `p m`, `in the morning`,
     /// `evening`, `at night`).
     pub fn meridiem(&self, text: &str) -> Option<Meridiem> {
-        let words = self.words(text).filter(|w| !w.is_empty())?;
+        let words = self.words(text)?;
         let run = self.run(words, &[Group::Replies]);
         run.accepts
             .iter()
@@ -557,7 +552,7 @@ impl Grammar {
     }
 
     fn which_reading(&self, text: &str) -> Option<(WhichReply, u16)> {
-        let words = self.words(text).filter(|w| !w.is_empty())?;
+        let words = self.words(text)?;
         let run = self.run(words, &[Group::Replies]);
         let mut readings: Vec<&Accepted> = run
             .accepts

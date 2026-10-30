@@ -130,42 +130,33 @@ mod tests {
         );
     }
 
+    /// Vectors from Python's `uuid.uuid5`, which the journal and the device share.
     #[test]
-    fn the_operation_formulas_hash_the_documented_strings() {
+    fn the_operation_formulas_match_python_uuid5() {
+        let text = |id: Uuid| id.to_string();
         assert_eq!(
-            OpId::voice_alarm("turn-1").uuid(),
-            Uuid::new_v5(&NAMESPACE_URL, b"turn-1")
+            text(OpId::voice_alarm("turn-1").uuid()),
+            "d44277be-3b12-5cfb-b366-521a156067cd"
         );
         assert_eq!(
-            OpId::local_action("t7", "dismiss"),
-            OpId::relay("t7|dismiss"),
-            "both hash the same URL-namespace string"
+            text(OpId::local_action("t7", "dismiss").uuid()),
+            "4f55f6f9-5ff2-54ca-b76c-78f087ea1d22"
         );
         let root = OpId::relay("ctx|cancel_alarm|{}");
+        assert_eq!(text(root.uuid()), "ee34985f-1d96-505a-9ca7-b8b91d683a76");
         let schedule = Uuid::from_u128(5);
         assert_eq!(
-            OpId::group_member(root, schedule).uuid(),
-            Uuid::new_v5(&root.uuid(), b"00000000-0000-0000-0000-000000000005")
+            text(OpId::group_member(root, schedule).uuid()),
+            "1f0900f8-40de-5cda-9914-0506a3b7854f"
         );
         assert_eq!(
-            new_schedule_id(root),
-            Uuid::new_v5(&root.uuid(), b"schedule")
+            text(new_schedule_id(root)),
+            "520c1611-284c-58a1-bebf-cb2eebf84dfa"
         );
         assert_eq!(
-            snooze_child_schedule_id(schedule),
-            Uuid::new_v5(
-                &NAMESPACE_URL,
-                b"echomuse-snooze:00000000-0000-0000-0000-000000000005"
-            )
-        );
-        assert_eq!(
-            OpId::missed(schedule).uuid(),
-            Uuid::new_v5(
-                &NAMESPACE_URL,
-                b"echomuse-missed:00000000-0000-0000-0000-000000000005"
-            )
+            text(OpId::missed(schedule).uuid()),
+            "49c2765e-a8b8-548c-84c8-d283a2ed3ab0"
         );
         assert_eq!(OpId::dashboard().uuid().get_version_num(), 4);
-        assert_eq!(OpId::relay("x").uuid().get_version_num(), 5);
     }
 }

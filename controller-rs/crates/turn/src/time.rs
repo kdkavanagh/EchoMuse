@@ -20,8 +20,6 @@ use serde::{Deserialize, Serialize};
 pub const SAMPLE_RATE: u64 = 16_000;
 /// Samples in one analysis cell: 32 ms, the VAD's input size and the device's loudness cell.
 pub const CELL_SAMPLES: u64 = 512;
-/// Samples in one capture block: 80 ms, the cadence at which the reducer is evaluated.
-pub const BLOCK_SAMPLES: u64 = 1_280;
 
 /// A capture epoch. Sample positions are only meaningful within one epoch, and the epoch
 /// identifier is never zero on the wire (§3.1.6).

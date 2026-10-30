@@ -5,12 +5,12 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use echomuse_api::{
-    ApiEvent, DeployReport, DeploySkip, DeploySkipReason, DeviceStatePatch, EventPublisher,
-    FirmwareControl, FirmwareRefusal, UpdateStatus,
+    ApiEvent, BoxFuture, DeployReport, DeploySkip, DeploySkipReason, DeviceStatePatch,
+    EventPublisher, FirmwareControl, FirmwareRefusal, UpdateStatus,
 };
 use echomuse_core::types::DeviceId;
 use echomuse_db::{DbHandle, devices::GetDevice};
@@ -24,7 +24,6 @@ use echomuse_firmware::{
     },
 };
 use echomuse_link::{SessionLink, ShellBroker};
-use echomuse_protocol::Platform;
 use serde_json::{Map, json};
 use tokio::sync::watch;
 
@@ -33,8 +32,9 @@ use crate::{app::Directory, supervision::TaskSupervisor};
 /// The firmware service as this controller builds it.
 pub type Firmware = FirmwareService<FirmwareAccess, DbHandle, FirmwareDashboard>;
 
-/// Every device's firmware operation state, published whole on each change.
-pub type UpdateStates = Arc<HashMap<DeviceId, UpdateStatus>>;
+/// Every device's latest update or rollback state, as the dashboard shows it. Which
+/// devices an operation holds is the firmware service's ([`FirmwareService::is_busy`]).
+pub type UpdateStates = Arc<Mutex<HashMap<DeviceId, UpdateStatus>>>;
 
 /// A device's live session, from its runtime's latest snapshot.
 fn live_link(directory: &watch::Receiver<Directory>, device: &DeviceId) -> Option<SessionLink> {
@@ -42,24 +42,15 @@ fn live_link(directory: &watch::Receiver<Directory>, device: &DeviceId) -> Optio
 }
 
 /// [`DeviceAccess`] over the runtimes' published sessions and the link server's shell
-/// broker. The broker exists only once the device listeners run; until then no device
-/// is connected anyway.
+/// broker.
 pub struct FirmwareAccess {
     directory: watch::Receiver<Directory>,
-    shells: Arc<OnceLock<ShellBroker>>,
+    shells: ShellBroker,
 }
 
 impl FirmwareAccess {
-    /// Access with the broker filled in later through the returned slot.
-    pub fn new(directory: watch::Receiver<Directory>) -> (Self, Arc<OnceLock<ShellBroker>>) {
-        let shells = Arc::new(OnceLock::new());
-        (
-            Self {
-                directory,
-                shells: Arc::clone(&shells),
-            },
-            shells,
-        )
+    pub fn new(directory: watch::Receiver<Directory>, shells: ShellBroker) -> Self {
+        Self { directory, shells }
     }
 }
 
@@ -68,8 +59,7 @@ impl DeviceAccess for FirmwareAccess {
 
     async fn open_shell(&self, device: &DeviceId) -> Result<LinkShell, ShellOpenError> {
         let link = live_link(&self.directory, device).ok_or(ShellOpenError::NotConnected)?;
-        let broker = self.shells.get().ok_or(ShellOpenError::NotConnected)?;
-        open_pipe_shell(broker, &link).await
+        open_pipe_shell(&self.shells, &link).await
     }
 
     fn disconnect(&self, device: &DeviceId) -> bool {
@@ -87,26 +77,22 @@ impl DeviceAccess for FirmwareAccess {
 /// live events dashboard.jsx reads.
 pub struct FirmwareDashboard {
     publisher: Arc<OnceLock<EventPublisher>>,
-    states: watch::Sender<UpdateStates>,
+    states: UpdateStates,
 }
 
 impl FirmwareDashboard {
     /// The events, the publisher filled in later through the returned slot (the API is
-    /// built after the firmware service), and the state receiver.
-    pub fn new() -> (
-        Self,
-        Arc<OnceLock<EventPublisher>>,
-        watch::Receiver<UpdateStates>,
-    ) {
+    /// built after the firmware service), and the states it keeps.
+    pub fn new() -> (Self, Arc<OnceLock<EventPublisher>>, UpdateStates) {
         let publisher = Arc::new(OnceLock::new());
-        let (states, receiver) = watch::channel(Arc::new(HashMap::new()));
+        let states = UpdateStates::default();
         (
             Self {
                 publisher: Arc::clone(&publisher),
-                states,
+                states: Arc::clone(&states),
             },
             publisher,
-            receiver,
+            states,
         )
     }
 
@@ -117,13 +103,12 @@ impl FirmwareDashboard {
     }
 
     fn set(&self, device: &DeviceId, status: UpdateStatus) {
-        let mut changed = false;
-        self.states.send_modify(|states| {
-            let entry = Arc::make_mut(states).entry(device.clone()).or_default();
-            changed = *entry != status;
-            *entry = status.clone();
-        });
-        if changed {
+        let previous = self
+            .states
+            .lock()
+            .expect("firmware states poisoned")
+            .insert(device.clone(), status.clone());
+        if previous.unwrap_or_default() != status {
             self.publish_event(ApiEvent::DeviceUpdate {
                 device_id: device.clone(),
                 state: DeviceStatePatch(Map::from_iter([
@@ -156,41 +141,30 @@ impl FirmwareEvents for FirmwareDashboard {
             }
             FirmwareEvent::UpdateFinished { device, outcome } => {
                 let (error, event) = match outcome {
-                    UpdateOutcome::Updated { from, to } => {
-                        tracing::info!(%device, from = ?from.as_ref().map(FirmwareVersion::as_str), to = to.as_str(), "firmware updated");
-                        (
-                            None,
-                            ApiEvent::DeviceUpdated {
-                                device_id: device.clone(),
-                            },
-                        )
-                    }
+                    UpdateOutcome::Updated { .. } => (
+                        None,
+                        ApiEvent::DeviceUpdated {
+                            device_id: device.clone(),
+                        },
+                    ),
                     UpdateOutcome::AutoRolledBack {
-                        attempted,
-                        running,
-                        supervisor_log,
-                    } => {
-                        tracing::warn!(%device, attempted = attempted.as_str(), running = running.as_str(), ?supervisor_log, "the new firmware failed to start; the device rolled back");
-                        (
-                            Some(format!(
-                                "{} failed to start; the device went back to {}",
-                                attempted.as_str(),
-                                running.as_str()
-                            )),
-                            ApiEvent::DeviceAutoRolledBack {
-                                device_id: device.clone(),
-                            },
-                        )
-                    }
-                    UpdateOutcome::Failed(failure) => {
-                        tracing::warn!(%device, %failure, "firmware update failed");
-                        (
-                            Some(failure.to_string()),
-                            ApiEvent::DeviceUpdateFailed {
-                                device_id: device.clone(),
-                            },
-                        )
-                    }
+                        attempted, running, ..
+                    } => (
+                        Some(format!(
+                            "{} failed to start; the device went back to {}",
+                            attempted.as_str(),
+                            running.as_str()
+                        )),
+                        ApiEvent::DeviceAutoRolledBack {
+                            device_id: device.clone(),
+                        },
+                    ),
+                    UpdateOutcome::Failed(failure) => (
+                        Some(failure.to_string()),
+                        ApiEvent::DeviceUpdateFailed {
+                            device_id: device.clone(),
+                        },
+                    ),
                 };
                 self.set(
                     &device,
@@ -242,18 +216,6 @@ impl FirmwareEvents for FirmwareDashboard {
             }
         }
     }
-}
-
-/// Runs a firmware job on the shared runtime under the task supervisor, so a panic in
-/// it never disappears with an unobserved join handle: it stops the process (§5.5).
-pub fn supervise<F>(tasks: &TaskSupervisor, what: &'static str, device: DeviceId, job: F)
-where
-    F: Future + Send + 'static,
-    F::Output: Send + 'static,
-{
-    tracing::debug!(%device, what, "firmware job started");
-    // The supervisor observes the task; nothing waits on its result.
-    drop(tasks.spawn(what, job));
 }
 
 /// The device's target for an operation: its live session's platform and version, and
@@ -309,7 +271,7 @@ pub struct ControllerFirmware {
     service: Firmware,
     directory: watch::Receiver<Directory>,
     db: DbHandle,
-    states: watch::Receiver<UpdateStates>,
+    states: UpdateStates,
     tasks: TaskSupervisor,
 }
 
@@ -318,7 +280,7 @@ impl ControllerFirmware {
         service: Firmware,
         directory: watch::Receiver<Directory>,
         db: DbHandle,
-        states: watch::Receiver<UpdateStates>,
+        states: UpdateStates,
         tasks: TaskSupervisor,
     ) -> Self {
         Self {
@@ -333,8 +295,8 @@ impl ControllerFirmware {
     async fn start_update(&self, target: DeviceTarget) -> Result<String, FirmwareRefusal> {
         let job = self.service.prepare_update(target).map_err(refusal)?;
         let version = job.version().as_str().to_owned();
-        let device = job.device().clone();
-        supervise(&self.tasks, "update", device, job.run());
+        // The supervisor observes the job (a panic stops the process); nothing waits on it.
+        drop(self.tasks.spawn("update", job.run()));
         Ok(version)
     }
 }
@@ -346,130 +308,134 @@ impl FirmwareControl for ControllerFirmware {
 
     fn status(&self, device: &DeviceId) -> UpdateStatus {
         self.states
-            .borrow()
+            .lock()
+            .expect("firmware states poisoned")
             .get(device)
             .cloned()
             .unwrap_or_default()
     }
 
-    async fn update(&self, device: DeviceId) -> Result<String, FirmwareRefusal> {
-        let target = device_target(&self.directory, &self.db, &device).await?;
-        self.start_update(target).await
+    fn update(&self, device: DeviceId) -> BoxFuture<'_, Result<String, FirmwareRefusal>> {
+        Box::pin(async move {
+            let target = device_target(&self.directory, &self.db, &device).await?;
+            self.start_update(target).await
+        })
     }
 
-    async fn rollback(&self, device: DeviceId) -> Result<(), FirmwareRefusal> {
-        let target = device_target(&self.directory, &self.db, &device).await?;
-        let job = self.service.prepare_rollback(target).map_err(refusal)?;
-        supervise(&self.tasks, "rollback", device, job.run());
-        Ok(())
+    fn rollback(&self, device: DeviceId) -> BoxFuture<'_, Result<(), FirmwareRefusal>> {
+        Box::pin(async move {
+            let target = device_target(&self.directory, &self.db, &device).await?;
+            let job = self.service.prepare_rollback(target).map_err(refusal)?;
+            drop(self.tasks.spawn("rollback", job.run()));
+            Ok(())
+        })
     }
 
-    async fn queue_update(&self, device: DeviceId) -> Result<i64, FirmwareRefusal> {
-        self.service
-            .queue_update(&device)
-            .await
-            .map(|at| at.0)
-            .map_err(refusal)
+    fn queue_update(&self, device: DeviceId) -> BoxFuture<'_, Result<i64, FirmwareRefusal>> {
+        Box::pin(async move {
+            self.service
+                .queue_update(&device)
+                .await
+                .map(|at| at.0)
+                .map_err(refusal)
+        })
     }
 
-    async fn cancel_queued_update(&self, device: DeviceId) -> Result<bool, FirmwareRefusal> {
-        self.service
-            .cancel_queued_update(&device)
-            .await
-            .map_err(refusal)
+    fn cancel_queued_update(
+        &self,
+        device: DeviceId,
+    ) -> BoxFuture<'_, Result<bool, FirmwareRefusal>> {
+        Box::pin(async move {
+            self.service
+                .cancel_queued_update(&device)
+                .await
+                .map_err(refusal)
+        })
     }
 
-    async fn debloat(&self, device: DeviceId) -> Result<(), FirmwareRefusal> {
-        let target = device_target(&self.directory, &self.db, &device).await?;
-        if target.platform == Platform::Lineage18Crown {
-            return Err(refusal(FirmwareFailure::NothingToDebloat));
-        }
-        if self.service.is_busy(&device) {
-            return Err(FirmwareRefusal::Busy);
-        }
-        let service = self.service.clone();
-        supervise(&self.tasks, "debloat", device.clone(), async move {
-            match service.debloat(&target).await {
-                Ok(report) => tracing::info!(%device, "debloat finished: {report}"),
-                Err(failure) => tracing::warn!(%device, %failure, "debloat failed"),
+    fn debloat(&self, device: DeviceId) -> BoxFuture<'_, Result<(), FirmwareRefusal>> {
+        Box::pin(async move {
+            let target = device_target(&self.directory, &self.db, &device).await?;
+            let job = self.service.prepare_debloat(target).map_err(refusal)?;
+            drop(self.tasks.spawn("debloat", job.run()));
+            Ok(())
+        })
+    }
+
+    fn secure_link(&self, device: DeviceId) -> BoxFuture<'_, Result<(), FirmwareRefusal>> {
+        Box::pin(async move {
+            if live_link(&self.directory, &device).is_none() {
+                return Err(FirmwareRefusal::NotConnected);
             }
-        });
-        Ok(())
+            self.service.secure_link(&device).await.map_err(refusal)
+        })
     }
 
-    async fn secure_link(&self, device: DeviceId) -> Result<(), FirmwareRefusal> {
-        if live_link(&self.directory, &device).is_none() {
-            return Err(FirmwareRefusal::NotConnected);
-        }
-        self.service.secure_link(&device).await.map_err(refusal)
-    }
-
-    async fn deploy(&self) -> DeployReport {
-        let bundled = self.service.bundled().version().clone();
-        let devices: Vec<DeviceId> = {
-            let directory = self.directory.borrow();
-            let mut devices: Vec<DeviceId> = directory.keys().cloned().collect();
-            devices.sort_by(|a, b| a.0.cmp(&b.0));
-            devices
-        };
-        let mut report = DeployReport {
-            version: bundled.as_str().to_owned(),
-            started: Vec::new(),
-            skipped: Vec::new(),
-        };
-        for device in devices {
-            let skip = |reason| DeploySkip {
-                device_id: device.clone(),
-                reason,
+    fn deploy(&self) -> BoxFuture<'_, DeployReport> {
+        Box::pin(async move {
+            let devices: Vec<DeviceId> = {
+                let directory = self.directory.borrow();
+                let mut devices: Vec<DeviceId> = directory.keys().cloned().collect();
+                devices.sort_by(|a, b| a.0.cmp(&b.0));
+                devices
             };
-            let target = match device_target(&self.directory, &self.db, &device).await {
-                Ok(target) => target,
-                Err(FirmwareRefusal::NotConnected) => {
-                    report.skipped.push(skip(DeploySkipReason::Offline));
-                    continue;
-                }
-                Err(error) => {
-                    tracing::warn!(%device, ?error, "deploy could not read the device");
-                    continue;
-                }
+            let mut report = DeployReport {
+                version: self.service.bundled().version().as_str().to_owned(),
+                started: Vec::new(),
+                skipped: Vec::new(),
             };
-            if target.running.as_ref() == Some(&bundled) {
-                report.skipped.push(skip(DeploySkipReason::AlreadyCurrent));
-                continue;
-            }
-            match self.start_update(target).await {
-                Ok(_) => report.started.push(device),
-                Err(FirmwareRefusal::Busy) => {
-                    report
-                        .skipped
-                        .push(skip(DeploySkipReason::UpdateInProgress));
+            for device in devices {
+                let skip = |reason| DeploySkip {
+                    device_id: device.clone(),
+                    reason,
+                };
+                let target = match device_target(&self.directory, &self.db, &device).await {
+                    Ok(target) => target,
+                    Err(FirmwareRefusal::NotConnected) => {
+                        report.skipped.push(skip(DeploySkipReason::Offline));
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%device, ?error, "deploy could not read the device");
+                        continue;
+                    }
+                };
+                match self.start_update(target).await {
+                    Ok(_) => report.started.push(device),
+                    Err(FirmwareRefusal::Busy) => {
+                        report
+                            .skipped
+                            .push(skip(DeploySkipReason::UpdateInProgress));
+                    }
+                    Err(FirmwareRefusal::AlreadyCurrent) => {
+                        report.skipped.push(skip(DeploySkipReason::AlreadyCurrent));
+                    }
+                    Err(error) => {
+                        tracing::warn!(%device, ?error, "deploy could not start the update");
+                    }
                 }
-                Err(FirmwareRefusal::AlreadyCurrent) => {
-                    report.skipped.push(skip(DeploySkipReason::AlreadyCurrent));
-                }
-                Err(error) => tracing::warn!(%device, ?error, "deploy could not start the update"),
             }
-        }
-        report
+            report
+        })
     }
 
-    async fn provision_start_script(&self) -> Result<StartScriptFile, ProvisionError> {
-        self.service.provision_start_script().await
+    fn provision_start_script(&self) -> BoxFuture<'_, Result<StartScriptFile, ProvisionError>> {
+        Box::pin(self.service.provision_start_script())
     }
 
-    async fn provision_crown_lists(&self) -> Result<CrownLists, ProvisionError> {
-        self.service.provision_crown_lists().await
+    fn provision_crown_lists(&self) -> BoxFuture<'_, Result<CrownLists, ProvisionError>> {
+        Box::pin(self.service.provision_crown_lists())
     }
 
-    async fn provision_firmware(&self) -> Result<FirmwareDownload, ProvisionError> {
-        self.service.provision_firmware().await
+    fn provision_firmware(&self) -> BoxFuture<'_, Result<FirmwareDownload, ProvisionError>> {
+        Box::pin(self.service.provision_firmware())
     }
 
-    async fn provision_tls_credentials(
+    fn provision_tls_credentials(
         &self,
         request: TlsCredentialsRequest,
-    ) -> Result<TlsCredentials, ProvisionError> {
-        self.service.provision_tls_credentials(request).await
+    ) -> BoxFuture<'_, Result<TlsCredentials, ProvisionError>> {
+        Box::pin(self.service.provision_tls_credentials(request))
     }
 
     fn provision_diagnostics(

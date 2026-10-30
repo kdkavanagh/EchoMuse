@@ -153,8 +153,13 @@ impl SettingsSnapshot {
     ) -> Result<ReadyGrant, ComposeError> {
         let settings = self.effective(device);
         let model = self.selected_model(device)?;
-        compose_ready(&settings, model, runtime_sha256)
-            .map(|parts| parts.into_grant(capture_permitted, afe_metadata))
+        compose_ready(
+            &settings,
+            model,
+            runtime_sha256,
+            capture_permitted,
+            afe_metadata,
+        )
     }
 }
 
@@ -255,11 +260,6 @@ impl SettingsHandle {
     /// The current snapshot.
     pub fn snapshot(&self) -> Arc<SettingsSnapshot> {
         self.snapshots.borrow().clone()
-    }
-
-    /// Every snapshot as it is published.
-    pub fn subscribe(&self) -> watch::Receiver<Arc<SettingsSnapshot>> {
-        self.snapshots.clone()
     }
 
     /// A device's current effective settings (the fleet's for a device without a row).
@@ -580,12 +580,7 @@ impl State {
         Ok(())
     }
 
-    fn outcome(
-        &self,
-        before: &SettingsSnapshot,
-        after: Arc<SettingsSnapshot>,
-        not_stored: Vec<SettingKey>,
-    ) -> EditOutcome {
+    fn outcome(&self, before: &SettingsSnapshot, after: Arc<SettingsSnapshot>) -> EditOutcome {
         let mut changed: Vec<(DeviceId, bool)> = after
             .devices
             .iter()
@@ -608,7 +603,6 @@ impl State {
                 .map(|c| c.0.clone())
                 .collect(),
             changed_devices: changed.into_iter().map(|c| c.0).collect(),
-            not_stored,
             snapshot: after,
         }
     }
@@ -624,7 +618,7 @@ impl State {
             .map_err(|_| EditError::StoredUnreadable)?;
         let before = self.current();
         let Some(text) = text else {
-            return Ok(self.outcome(&before, before.clone(), Vec::new()));
+            return Ok(self.outcome(&before, before.clone()));
         };
         let fleet = StoredConfig::parse(Some(&text));
         self.check_wake(patch.values(), &fleet_settings(&fleet))?;
@@ -634,7 +628,7 @@ impl State {
             .map_err(edit_db_error)?;
         self.fleet = fleet;
         let after = self.publish(publisher);
-        Ok(self.outcome(&before, after, Vec::new()))
+        Ok(self.outcome(&before, after))
     }
 
     async fn device_edit(
@@ -659,15 +653,15 @@ impl State {
             .unwrap_or_else(|| old_sections.clone());
         let fleet = fleet_settings(&self.fleet);
 
-        let mut store: Vec<SettingValue> = Vec::new();
-        let mut not_stored = Vec::new();
-        for value in edit.values.values() {
-            match value.key().scope() {
-                Scope::State => store.push(value.clone()),
-                Scope::Section(section) if sections.contains(&section) => store.push(value.clone()),
-                Scope::Section(_) => not_stored.push(value.key()),
-            }
-        }
+        let mut store: Vec<SettingValue> = edit
+            .values
+            .values()
+            .filter(|v| match v.key().scope() {
+                Scope::State => true,
+                Scope::Section(section) => sections.contains(&section),
+            })
+            .cloned()
+            .collect();
         // A section switched to the device starts from the fleet's current values.
         for section in sections.difference(&old_sections) {
             for key in section.keys() {
@@ -697,17 +691,12 @@ impl State {
         let sections_changed =
             sections != old_sections || use_global_config != stored.use_global_config;
         if text.is_none() && !sections_changed {
-            return Ok(self.outcome(&before, before.clone(), not_stored));
+            return Ok(self.outcome(&before, before.clone()));
         }
         let sections_text = if sections_changed {
             stored.sections.render(&sections)
         } else {
             stored.sections_text.clone()
-        };
-        let use_global_config = if sections_changed {
-            use_global_config
-        } else {
-            stored.use_global_config
         };
         self.db
             .write(WriteDeviceConfig {
@@ -728,7 +717,7 @@ impl State {
             },
         );
         let after = self.publish(publisher);
-        Ok(self.outcome(&before, after, not_stored))
+        Ok(self.outcome(&before, after))
     }
 
     async fn refresh(

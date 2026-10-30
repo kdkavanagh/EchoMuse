@@ -25,8 +25,7 @@ use echomuse_turn::{
     VerifierResult, WakeCandidate, WakeDecision, WakePolicy,
 };
 
-use crate::io::{Effect, Now};
-use crate::machine::Voice;
+use crate::io::Effect;
 
 /// One input a decider or policy took, as the recorder records it.
 #[derive(Clone, Debug)]
@@ -433,95 +432,5 @@ impl Pushes for Noting<'_> {
             });
         }
         Ok(())
-    }
-}
-
-impl Voice {
-    /// Queues one piece of evidence while a recording runs.
-    pub(crate) fn note(&mut self, now: Now, evidence: impl FnOnce() -> Evidence) {
-        if self.recording {
-            let at = self.mono(now.at);
-            self.link.effects.push(Effect::Evidence {
-                at,
-                evidence: Box::new(evidence()),
-            });
-        }
-    }
-
-    /// The live turn's assembler, noting accepted pushes while a recording runs.
-    pub(crate) fn turn_pushes(&mut self, now: Now) -> Option<Noting<'_>> {
-        let at = self.mono(now.at);
-        let recording = self.recording;
-        let turn = self.turn.as_mut()?;
-        let id = turn.evidence_id;
-        let assembler = turn.policy.as_mut()?.evidence_mut();
-        Some(Noting {
-            assembler,
-            notes: recording.then_some((&mut self.link.effects, id, at)),
-        })
-    }
-
-    /// The recorder's identity for the next turn policy.
-    pub(crate) fn next_evidence_id(&mut self) -> u64 {
-        self.evidence_turns += 1;
-        self.evidence_turns
-    }
-
-    /// Notes a turn policy that just opened.
-    pub(crate) fn note_opened(
-        &mut self,
-        id: u64,
-        cause: TurnCause,
-        config: TurnConfig,
-        spec: TurnSpec,
-        now: Now,
-    ) {
-        self.note(now, || Evidence::TurnOpened {
-            turn: id,
-            cause,
-            config,
-            spec,
-        });
-    }
-
-    /// Notes a control event the live turn's policy took, with the decisions it made.
-    pub(crate) fn note_control(&mut self, control: TurnControl, decisions: &[Decision], now: Now) {
-        if let Some(turn) = self.turn.as_ref().filter(|t| t.policy.is_some()) {
-            let id = turn.evidence_id;
-            let decisions = decisions.to_vec();
-            self.note(now, || Evidence::Control {
-                turn: id,
-                control,
-                decisions,
-            });
-        }
-    }
-
-    /// Opens a turn policy under the session's settings, and notes it with `cause`.
-    /// Returns the policy and the recorder's identity for it.
-    pub(crate) fn open_policy(
-        &mut self,
-        cause: TurnCause,
-        spec: TurnSpec,
-        now: Now,
-    ) -> Result<(echomuse_turn::TurnPolicy, u64), EvidenceError> {
-        let settings = std::sync::Arc::clone(&self.settings);
-        let config = self.turn_config(&settings, &spec.kind);
-        let policy = echomuse_turn::TurnPolicy::new(config, spec.clone(), self.mono(now.at))?;
-        let id = self.next_evidence_id();
-        self.note_opened(id, cause, config, spec, now);
-        Ok((policy, id))
-    }
-
-    /// A fresh policy's assembler, noting accepted pushes under turn `id`.
-    pub(crate) fn noting<'a>(
-        &'a mut self,
-        assembler: &'a mut EvidenceAssembler,
-        id: u64,
-        now: Now,
-    ) -> Noting<'a> {
-        let at = self.mono(now.at);
-        let notes = self.recording.then_some((&mut self.link.effects, id, at));
-        Noting { assembler, notes }
     }
 }

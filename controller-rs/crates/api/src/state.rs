@@ -11,11 +11,11 @@ use crate::{
     auth::{password::Passwords, throttle::Throttle, token::BootstrapToken},
     clock::WallClock,
     events::EventHub,
-    firmware::Firmware,
+    firmware::FirmwareControl,
     ingress::Ingress,
-    runtime::Runtimes,
+    runtime::DeviceRuntimes,
     system::HaStatus,
-    wake_models::Qualifier,
+    wake_models::ModelQualifier,
 };
 
 /// The server's shared state. Cheap to clone.
@@ -33,9 +33,9 @@ pub(crate) struct Inner {
     pub(crate) static_dir: Box<Path>,
     pub(crate) events: EventHub,
     pub(crate) settings: SettingsHandle,
-    pub(crate) runtimes: Box<dyn Runtimes>,
-    pub(crate) qualifier: Box<dyn Qualifier>,
-    pub(crate) firmware: Box<dyn Firmware>,
+    pub(crate) runtimes: Box<dyn DeviceRuntimes>,
+    pub(crate) qualifier: Box<dyn ModelQualifier>,
+    pub(crate) firmware: Box<dyn FirmwareControl>,
     pub(crate) records: RecordsService,
     pub(crate) services: crate::services::DeviceServices,
     pub(crate) capture: std::sync::Arc<dyn crate::capture::CaptureControl>,
@@ -90,15 +90,15 @@ impl ApiState {
         &self.0.settings
     }
 
-    pub(crate) fn runtimes(&self) -> &dyn Runtimes {
+    pub(crate) fn runtimes(&self) -> &dyn DeviceRuntimes {
         &*self.0.runtimes
     }
 
-    pub(crate) fn qualifier(&self) -> &dyn Qualifier {
+    pub(crate) fn qualifier(&self) -> &dyn ModelQualifier {
         &*self.0.qualifier
     }
 
-    pub(crate) fn firmware(&self) -> &dyn Firmware {
+    pub(crate) fn firmware(&self) -> &dyn FirmwareControl {
         &*self.0.firmware
     }
 

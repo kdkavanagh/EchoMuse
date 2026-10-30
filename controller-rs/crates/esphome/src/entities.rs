@@ -187,10 +187,6 @@ pub struct VoiceStates {
     pub voice_state: Option<VoiceState>,
 }
 
-fn encode<M: crate::api::ApiMessage>(message: &M) -> Result<Bytes, FrameTooLarge> {
-    frame::encode(message)
-}
-
 /// The voice satellite's entity list, in key order, ending with the
 /// end-of-list message.
 pub(crate) fn voice_entity_frames(
@@ -204,7 +200,7 @@ pub(crate) fn voice_entity_frames(
         purpose: purpose as i32,
         sample_bytes: 2,
     };
-    let mut frames = vec![encode(&ListEntitiesMediaPlayerResponse {
+    let mut frames = vec![frame::encode(&ListEntitiesMediaPlayerResponse {
         object_id: "media_player".to_owned(),
         key: MEDIA_PLAYER_KEY,
         name: label.to_owned(),
@@ -217,7 +213,7 @@ pub(crate) fn voice_entity_frames(
         ..Default::default()
     })?];
     if entities.action_button {
-        frames.push(encode(&ListEntitiesEventResponse {
+        frames.push(frame::encode(&ListEntitiesEventResponse {
             object_id: "action_button".to_owned(),
             key: ACTION_BUTTON_KEY,
             name: format!("{label} Action Button"),
@@ -230,7 +226,7 @@ pub(crate) fn voice_entity_frames(
         })?);
     }
     if entities.ambient_light {
-        frames.push(encode(&ListEntitiesSensorResponse {
+        frames.push(frame::encode(&ListEntitiesSensorResponse {
             object_id: "ambient_light".to_owned(),
             key: AMBIENT_LIGHT_KEY,
             name: format!("{label} Ambient Light"),
@@ -241,35 +237,35 @@ pub(crate) fn voice_entity_frames(
             ..Default::default()
         })?);
     }
-    frames.push(encode(&ListEntitiesBinarySensorResponse {
+    frames.push(frame::encode(&ListEntitiesBinarySensorResponse {
         object_id: "alert_ringing".to_owned(),
         key: ALERT_RINGING_KEY,
         name: format!("{label} Alert ringing"),
         device_class: "sound".to_owned(),
         ..Default::default()
     })?);
-    frames.push(encode(&ListEntitiesButtonResponse {
+    frames.push(frame::encode(&ListEntitiesButtonResponse {
         object_id: "stop_alert".to_owned(),
         key: STOP_ALERT_KEY,
         name: format!("{label} Stop alert"),
         device_class: "restart".to_owned(),
         ..Default::default()
     })?);
-    frames.push(encode(&ListEntitiesTextSensorResponse {
+    frames.push(frame::encode(&ListEntitiesTextSensorResponse {
         object_id: "voice_state".to_owned(),
         key: VOICE_STATE_KEY,
         name: format!("{label} Voice state"),
         icon: "mdi:account-voice".to_owned(),
         ..Default::default()
     })?);
-    frames.push(encode(&ListEntitiesDoneResponse {})?);
+    frames.push(frame::encode(&ListEntitiesDoneResponse {})?);
     Ok(frames)
 }
 
 /// The Bluetooth proxy's entity list.
 pub(crate) fn bluetooth_entity_frames(label: &str) -> Result<Vec<Bytes>, FrameTooLarge> {
     Ok(vec![
-        encode(&ListEntitiesSensorResponse {
+        frame::encode(&ListEntitiesSensorResponse {
             object_id: "ble_advertisements".to_owned(),
             key: BLE_ADVERTISEMENTS_KEY,
             name: format!("{label} BLE advertisements"),
@@ -279,7 +275,7 @@ pub(crate) fn bluetooth_entity_frames(label: &str) -> Result<Vec<Bytes>, FrameTo
             entity_category: EntityCategory::Diagnostic as i32,
             ..Default::default()
         })?,
-        encode(&ListEntitiesDoneResponse {})?,
+        frame::encode(&ListEntitiesDoneResponse {})?,
     ])
 }
 
@@ -294,7 +290,7 @@ pub(crate) fn media_frame(media: Option<MediaState>) -> Option<Bytes> {
         Playback::Paused => MediaPlayerState::Paused,
     };
     Some(
-        encode(&MediaPlayerStateResponse {
+        frame::encode(&MediaPlayerStateResponse {
             key: MEDIA_PLAYER_KEY,
             state: state as i32,
             volume: media.volume.to_home_assistant(),
@@ -308,7 +304,7 @@ pub(crate) fn media_frame(media: Option<MediaState>) -> Option<Bytes> {
 /// A sensor state, missing when `value` is `None` or not a number.
 pub(crate) fn sensor_frame(key: u32, value: Option<f32>) -> Bytes {
     let value = value.filter(|v| v.is_finite());
-    encode(&SensorStateResponse {
+    frame::encode(&SensorStateResponse {
         key,
         state: value.unwrap_or_default(),
         missing_state: value.is_none(),
@@ -318,7 +314,7 @@ pub(crate) fn sensor_frame(key: u32, value: Option<f32>) -> Bytes {
 }
 
 pub(crate) fn alert_ringing_frame(ringing: Option<bool>) -> Bytes {
-    encode(&BinarySensorStateResponse {
+    frame::encode(&BinarySensorStateResponse {
         key: ALERT_RINGING_KEY,
         state: ringing.unwrap_or_default(),
         missing_state: ringing.is_none(),
@@ -328,7 +324,7 @@ pub(crate) fn alert_ringing_frame(ringing: Option<bool>) -> Bytes {
 }
 
 pub(crate) fn voice_state_frame(state: Option<VoiceState>) -> Bytes {
-    encode(&TextSensorStateResponse {
+    frame::encode(&TextSensorStateResponse {
         key: VOICE_STATE_KEY,
         state: state.map(VoiceState::as_str).unwrap_or_default().to_owned(),
         missing_state: state.is_none(),
@@ -338,7 +334,7 @@ pub(crate) fn voice_state_frame(state: Option<VoiceState>) -> Bytes {
 }
 
 pub(crate) fn button_event_frame(event: ButtonEvent) -> Bytes {
-    encode(&EventResponse {
+    frame::encode(&EventResponse {
         key: ACTION_BUTTON_KEY,
         event_type: event.as_str().to_owned(),
         device_id: 0,

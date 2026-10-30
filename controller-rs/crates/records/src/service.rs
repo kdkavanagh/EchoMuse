@@ -7,8 +7,9 @@
 //! holding the gate shared; retention and deletion hold it alone. So retention never sees a
 //! half-published recording, and once [`RecordsService::delete_device`] has closed the gate
 //! no late writer of that device can add a row or a file: its write fails with
-//! [`RecordsError::Closed`] until [`RecordsService::reopen_device`]. A mark that finds its
-//! row gone removes the file it just wrote.
+//! [`RecordsError::Closed`] until [`RecordsService::reopen_device`]. A deletion also ends
+//! the device's records lifetime: a turn or continuation submitted before it is refused
+//! even after the reopen. A mark that finds its row gone removes the file it just wrote.
 //!
 //! # Publishing a recording
 //!
@@ -77,14 +78,14 @@ use crate::{
         GetRowState, MarkTurnFileSaved, NEAR_MISS_RECORDING_RETENTION, RecordingKind,
         RecordingsLayout, RetainedIds, RowState, TURN_RECORDING_RETENTION, UTTERANCE_RETENTION,
         WAKE_CLIP_RETENTION, file_safe, remove_if_present, samples_duration, scan, wav_bytes,
-        wav_samples, write_atomically, write_sample_clip,
+        wav_samples, write_atomically,
     },
     rollups::{RecordRtt, RecordStats, RecordWakeStats, RttSample, StatsReport, WakeStatsReport},
     turns::{
         ContinuationUpdate, InsertTurn, RecordContinuation, ResolveStaleContinuations,
         SetTurnWakeWindows, TRACE_RETENTION, TurnInsert, TurnKey, TurnRecord, TurnRowId,
     },
-    values::{AfeSeries, ClipWindows, Pcm16, SttFix, UnixMillis, WallSeconds},
+    values::{ClipWindows, Pcm16, SttFix, WallSeconds},
     vocab::{Continuation, ContinuationEnd, NearMissRecording, NearMissVerdict},
 };
 
@@ -146,7 +147,7 @@ pub enum RecordsError {
     Closed(DeviceId),
     /// The device id cannot name files.
     UnsafeDeviceId(DeviceId),
-    /// A blocking file task panicked.
+    /// A record task ended without reporting its outcome.
     TaskFailed,
 }
 
@@ -157,7 +158,7 @@ impl fmt::Display for RecordsError {
             Self::Io(e) => write!(f, "files: {e}"),
             Self::Closed(d) => write!(f, "records of device {d} are closed"),
             Self::UnsafeDeviceId(d) => write!(f, "device id {d:?} cannot name files"),
-            Self::TaskFailed => f.write_str("a file task panicked"),
+            Self::TaskFailed => f.write_str("a record task ended without reporting its outcome"),
         }
     }
 }
@@ -283,10 +284,19 @@ const TURN_NOTICES: usize = 64;
 
 type Gate = Arc<RwLock<bool>>;
 
+/// One lifetime of a device's records: a deletion ends it, and the reopen that follows
+/// starts the next. A write captures the lifetime it was submitted (or queued) in and is
+/// refused in any later one, so nothing from before a deletion lands in the next
+/// approval's records. Taken with [`RecordsService::lifetime`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecordsLifetime(u64);
+
 #[derive(Default)]
 struct Gates {
     closed_all: bool,
-    by_device: HashMap<DeviceId, Gate>,
+    /// Each device's gate and current lifetime. The lifetime changes only while its gate
+    /// is held alone, so a writer holding the gate shared reads it stably.
+    by_device: HashMap<DeviceId, (Gate, RecordsLifetime)>,
 }
 
 struct Inner {
@@ -332,6 +342,24 @@ impl fmt::Debug for RecordsService {
     }
 }
 
+/// The failure of a turn's row, said again for a reply end folded into it; `None` when the
+/// vocabulary cannot say it again (a refused command's own error). Nothing here claims the
+/// row is absent: an unknown outcome stays unknown.
+fn same_failure(error: &RecordsError) -> Option<RecordsError> {
+    Some(match error {
+        RecordsError::Closed(device) => RecordsError::Closed(device.clone()),
+        RecordsError::UnsafeDeviceId(device) => RecordsError::UnsafeDeviceId(device.clone()),
+        RecordsError::Db(ServiceError::Closed) => RecordsError::Db(ServiceError::Closed),
+        RecordsError::Db(ServiceError::Aborted) => RecordsError::Db(ServiceError::Aborted),
+        RecordsError::Db(ServiceError::Unknown) => RecordsError::Db(ServiceError::Unknown),
+        RecordsError::Io(error) => {
+            RecordsError::Io(io::Error::new(error.kind(), error.to_string()))
+        }
+        RecordsError::TaskFailed => RecordsError::TaskFailed,
+        RecordsError::Db(ServiceError::Failed(_)) => return None,
+    })
+}
+
 async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> io::Result<T> + Send + 'static,
 ) -> Result<T, RecordsError> {
@@ -375,19 +403,44 @@ impl RecordsService {
         self.inner.turns_stored.subscribe()
     }
 
-    fn gate(&self, device: &DeviceId) -> Gate {
+    /// The device's gate and its current lifetime.
+    fn gate(&self, device: &DeviceId) -> (Gate, RecordsLifetime) {
         let mut gates = self.inner.gates.lock().expect("records gates lock");
         let open = !gates.closed_all;
-        gates
+        let (gate, lifetime) = gates
             .by_device
             .entry(device.clone())
-            .or_insert_with(|| Arc::new(RwLock::new(open)))
-            .clone()
+            .or_insert_with(|| (Arc::new(RwLock::new(open)), RecordsLifetime(0)));
+        (Arc::clone(gate), *lifetime)
+    }
+
+    /// The device's current records lifetime, for a write queued before it reaches the
+    /// service ([`RecordsService::log`]).
+    pub fn lifetime(&self, device: &DeviceId) -> RecordsLifetime {
+        self.gate(device).1
+    }
+
+    /// Ends the device's current lifetime. Call it holding the gate alone.
+    fn end_lifetime(&self, device: &DeviceId) {
+        let mut gates = self.inner.gates.lock().expect("records gates lock");
+        if let Some((_, lifetime)) = gates.by_device.get_mut(device) {
+            lifetime.0 += 1;
+        }
     }
 
     async fn enter(&self, device: &DeviceId) -> Result<OwnedRwLockReadGuard<bool>, RecordsError> {
-        let guard = self.gate(device).read_owned().await;
-        if *guard {
+        let lifetime = self.gate(device).1;
+        self.enter_in(device, lifetime).await
+    }
+
+    /// Holds the device's gate shared for a write submitted in `lifetime`.
+    async fn enter_in(
+        &self,
+        device: &DeviceId,
+        lifetime: RecordsLifetime,
+    ) -> Result<OwnedRwLockReadGuard<bool>, RecordsError> {
+        let guard = self.gate(device).0.read_owned().await;
+        if *guard && self.gate(device).1 == lifetime {
             Ok(guard)
         } else {
             Err(RecordsError::Closed(device.clone()))
@@ -398,7 +451,7 @@ impl RecordsService {
         &self,
         device: &DeviceId,
     ) -> Result<OwnedRwLockWriteGuard<bool>, RecordsError> {
-        let guard = self.gate(device).write_owned().await;
+        let guard = self.gate(device).0.write_owned().await;
         if *guard {
             Ok(guard)
         } else {
@@ -491,7 +544,8 @@ impl RecordsService {
     /// is held until the transcript-correction record arrives (or its sender goes, or the
     /// shutdown drain stops waiting) and written with it. Continuations recorded for the
     /// turn meanwhile go into the held row. Registration happens before this returns, so a
-    /// continuation submitted afterwards is always applied to this row.
+    /// continuation submitted afterwards is always applied to this row. A deletion of the
+    /// device meanwhile refuses the row, even if the device is approved again first.
     pub fn submit_turn(
         &self,
         record: TurnRecord,
@@ -506,10 +560,13 @@ impl RecordsService {
         if let Some(key) = &key {
             self.held().entry(key.clone()).or_default();
         }
+        let lifetime = self.gate(&record.device).1;
         let service = self.clone();
         self.inner.tasks.spawn_on(
             async move {
-                let written = service.write_held_turn(key, record, audio, fix).await;
+                let written = service
+                    .write_held_turn(key, lifetime, record, audio, fix)
+                    .await;
                 // Nobody waiting is not an error.
                 drop(reply.send(written));
             },
@@ -525,6 +582,7 @@ impl RecordsService {
     async fn write_held_turn(
         &self,
         key: Option<(DeviceId, Uuid)>,
+        lifetime: RecordsLifetime,
         mut record: TurnRecord,
         audio: TurnAudio,
         fix: Option<FixFollows>,
@@ -541,7 +599,7 @@ impl RecordsService {
             }
         }
         let Some(key) = key else {
-            return self.write_turn(record, audio).await;
+            return self.write_turn(record, audio, lifetime).await;
         };
         // The ends that arrived while the row was held go into it: the first is final.
         let early = {
@@ -550,6 +608,7 @@ impl RecordsService {
             entry.writing = true;
             std::mem::take(&mut entry.ends)
         };
+        let mut folded = Vec::with_capacity(early.len());
         for (end, reply) in early {
             let update = match &record.continuation {
                 Some(Continuation::Pending) => {
@@ -559,9 +618,43 @@ impl RecordsService {
                 Some(Continuation::Resolved(first)) => ContinuationUpdate::AlreadyFinal(*first),
                 None => ContinuationUpdate::NotAsked,
             };
-            drop(reply.send(Ok(update)));
+            folded.push((end, reply, update));
         }
-        let written = self.write_turn(record, audio).await;
+        let device = record.device.clone();
+        let inserted = self.insert_turn(record, &audio, lifetime).await;
+        // A repeat publishes nothing, so its gate goes now: its ends enter the gate
+        // themselves.
+        let (gate, insert) = match inserted {
+            Ok((gate, insert)) if insert.inserted => (Some(gate), Ok(insert)),
+            Ok((_, insert)) => (None, Ok(insert)),
+            Err(error) => (None, Err(error)),
+        };
+        // A folded end is answered once its row's insert is settled: it was committed
+        // with the row, or shares the row's failure.
+        for (end, reply, update) in folded {
+            let outcome = match &insert {
+                Ok(insert) if insert.inserted => Ok(update),
+                // A repeated completion inserted nothing: the end applies to the row
+                // already stored.
+                Ok(_) => self.write_continuation(&key.0, key.1, end, lifetime).await,
+                Err(error) => match same_failure(error) {
+                    Some(error) => Err(error),
+                    // No answer: the reply ends without success.
+                    None => continue,
+                },
+            };
+            drop(reply.send(outcome));
+        }
+        let written = match (gate, insert) {
+            (Some(gate), Ok(insert)) => self.publish_turn(gate, &device, insert, audio).await,
+            (_, Ok(insert)) => Ok(PersistedTurn {
+                insert,
+                utterance: None,
+                wake_clip: None,
+                turn_recording: None,
+            }),
+            (_, Err(error)) => Err(error),
+        };
         // Ends that arrived while the row was written apply to it now, in order; the
         // entry goes only when none is left, so a later end cannot overtake them.
         loop {
@@ -578,7 +671,8 @@ impl RecordsService {
                 ends
             };
             for (end, reply) in late {
-                drop(reply.send(self.write_continuation(&key.0, key.1, end).await));
+                let update = self.write_continuation(&key.0, key.1, end, lifetime).await;
+                drop(reply.send(update));
             }
         }
         written
@@ -588,21 +682,46 @@ impl RecordsService {
         &self,
         record: TurnRecord,
         audio: TurnAudio,
+        lifetime: RecordsLifetime,
     ) -> Result<PersistedTurn, RecordsError> {
         let device = record.device.clone();
+        let (gate, insert) = self.insert_turn(record, &audio, lifetime).await?;
+        self.publish_turn(gate, &device, insert, audio).await
+    }
+
+    /// Step 1 of publishing a turn: commits its row (once per key) and keeps the device's
+    /// gate held for its recordings.
+    async fn insert_turn(
+        &self,
+        record: TurnRecord,
+        audio: &TurnAudio,
+        lifetime: RecordsLifetime,
+    ) -> Result<(OwnedRwLockReadGuard<bool>, TurnInsert), RecordsError> {
         let has_audio = audio.utterance.is_some()
             || audio.wake_clip.is_some()
             || audio.turn_recording.is_some();
         if has_audio {
-            Self::check_device(&device)?;
+            Self::check_device(&record.device)?;
         }
-        let gate = self.enter(&device).await?;
+        let gate = self.enter_in(&record.device, lifetime).await?;
         let insert = self
             .write(InsertTurn {
                 record,
                 trace_retention: self.inner.limits.turn_traces,
             })
             .await?;
+        Ok((gate, insert))
+    }
+
+    /// The rest of publishing a committed turn: its recordings, the notice to the
+    /// dashboard, then retention. A repeat publishes nothing.
+    async fn publish_turn(
+        &self,
+        gate: OwnedRwLockReadGuard<bool>,
+        device: &DeviceId,
+        insert: TurnInsert,
+        audio: TurnAudio,
+    ) -> Result<PersistedTurn, RecordsError> {
         let mut result = PersistedTurn {
             insert,
             utterance: None,
@@ -619,7 +738,7 @@ impl RecordsService {
         ];
         for (kind, pcm) in published {
             let Some(pcm) = pcm else { continue };
-            let outcome = Some(self.publish(kind, &device, insert.id.0, pcm).await?);
+            let outcome = Some(self.publish(kind, device, insert.id.0, pcm).await?);
             match kind {
                 RecordingKind::Utterance => result.utterance = outcome,
                 RecordingKind::WakeClip => result.wake_clip = outcome,
@@ -639,7 +758,7 @@ impl RecordsService {
             (RecordingKind::TurnRecording, &result.turn_recording),
         ] {
             if *outcome == Some(Publication::Saved) {
-                self.retain_after_write(&device, kind).await?;
+                self.retain_after_write(device, kind).await?;
             }
         }
         Ok(result)
@@ -698,7 +817,8 @@ impl RecordsService {
     }
 
     /// [`RecordsService::record_continuation`] on the service's own task, so it is applied
-    /// whatever becomes of the caller; the receiver hears the result.
+    /// whatever becomes of the caller; the receiver hears the result. Like a submitted
+    /// turn, it is refused once the device has been deleted.
     pub fn submit_continuation(
         &self,
         device: &DeviceId,
@@ -713,11 +833,15 @@ impl RecordsService {
                 return result;
             }
         }
+        let lifetime = self.gate(device).1;
         let service = self.clone();
         let device = device.clone();
         self.inner.tasks.spawn_on(
             async move {
-                drop(reply.send(service.write_continuation(&device, turn_uuid, end).await));
+                let update = service
+                    .write_continuation(&device, turn_uuid, end, lifetime)
+                    .await;
+                drop(reply.send(update));
             },
             &self.inner.runtime,
         );
@@ -729,8 +853,9 @@ impl RecordsService {
         device: &DeviceId,
         turn_uuid: Uuid,
         end: ContinuationEnd,
+        lifetime: RecordsLifetime,
     ) -> Result<ContinuationUpdate, RecordsError> {
-        let _gate = self.enter(device).await?;
+        let _gate = self.enter_in(device, lifetime).await?;
         self.write(RecordContinuation {
             device: device.clone(),
             turn_uuid,
@@ -797,9 +922,14 @@ impl RecordsService {
         Ok(update)
     }
 
-    /// Appends a device log line, keeping the device's newest lines.
-    pub async fn log(&self, entry: DeviceLogEntry) -> Result<i64, RecordsError> {
-        let _gate = self.enter(&entry.device).await?;
+    /// Appends a device log line queued in `lifetime` (see [`RecordsService::lifetime`]),
+    /// keeping the device's newest lines.
+    pub async fn log(
+        &self,
+        entry: DeviceLogEntry,
+        lifetime: RecordsLifetime,
+    ) -> Result<i64, RecordsError> {
+        let _gate = self.enter_in(&entry.device, lifetime).await?;
         self.write(InsertDeviceLog {
             entry,
             retention: self.inner.limits.device_logs,
@@ -853,30 +983,6 @@ impl RecordsService {
             device: device.clone(),
             at,
             report,
-        })
-        .await
-    }
-
-    /// Publishes a sample clip (`samples/<device>/<at>.wav`) with its optional AFE sidecar.
-    pub async fn publish_sample_clip(
-        &self,
-        device: &DeviceId,
-        at: UnixMillis,
-        pcm: Pcm16,
-        sidecar: Option<AfeSeries>,
-    ) -> Result<PathBuf, RecordsError> {
-        Self::check_device(device)?;
-        let _gate = self.enter(device).await?;
-        let layout = self.inner.layout.clone();
-        let device = device.clone();
-        blocking(move || {
-            write_sample_clip(
-                &layout,
-                &device,
-                at,
-                &pcm,
-                sidecar.as_ref().map(AfeSeries::as_str),
-            )
         })
         .await
     }
@@ -963,7 +1069,11 @@ impl RecordsService {
             let found = blocking(move || scan(&layout, kind, None)).await?;
             for entry in found {
                 match entry.name {
-                    EntryName::Unrecognized => report.unrecognized.push(entry.path),
+                    // Only a deletion of its device removes an earlier controller's
+                    // partial file.
+                    EntryName::Unrecognized | EntryName::LegacyPartial { .. } => {
+                        report.unrecognized.push(entry.path);
+                    }
                     EntryName::Temporary => {
                         let path = entry.path.clone();
                         blocking(move || remove_if_present(&path)).await?;
@@ -1043,12 +1153,14 @@ impl RecordsService {
         Ok(())
     }
 
-    /// Deletes every record of a device: closes its gate (so late writers fail), waits for
-    /// writes in progress, deletes its rows and then its recordings. The gate stays closed
-    /// until [`RecordsService::reopen_device`]. Delete the `devices` row afterwards.
+    /// Deletes every record of a device: closes its gate and ends its lifetime (so late
+    /// writers fail, even after a reopen), waits for writes in progress, deletes its rows
+    /// and then its recordings; its own wake-clip directory goes whole. The gate stays
+    /// closed until [`RecordsService::reopen_device`]. Delete the `devices` row afterwards.
     pub async fn delete_device(&self, device: &DeviceId) -> Result<DeletedRecords, RecordsError> {
-        let mut gate = self.gate(device).write_owned().await;
+        let mut gate = self.gate(device).0.write_owned().await;
         *gate = false;
+        self.end_lifetime(device);
         let rows = self.write(DeleteDeviceRecords(device.clone())).await?;
         let mut files = 0;
         if file_safe(device) {
@@ -1065,11 +1177,9 @@ impl RecordsService {
                         }
                     }
                 }
-                match std::fs::remove_dir(layout.directory(RecordingKind::WakeClip, &d)) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                    Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => {}
-                    Err(e) => return Err(e),
+                match std::fs::remove_dir_all(layout.directory(RecordingKind::WakeClip, &d)) {
+                    Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+                    _ => {}
                 }
                 Ok(removed)
             })
@@ -1079,15 +1189,24 @@ impl RecordsService {
         Ok(DeletedRecords { rows, files })
     }
 
-    /// Opens a deleted device's records again, when the device is approved anew.
+    /// Opens a deleted device's records again, before a runtime starts for it anew. A
+    /// closed gate it opens starts a new lifetime, so a write queued while the device was
+    /// deleted is refused too. Opening a gate that is open changes nothing.
     pub async fn reopen_device(&self, device: &DeviceId) {
-        let mut gate = self.gate(device).write_owned().await;
-        *gate = !self
+        let mut gate = self.gate(device).0.write_owned().await;
+        if *gate {
+            return;
+        }
+        let closed_all = self
             .inner
             .gates
             .lock()
             .expect("records gates lock")
             .closed_all;
+        if !closed_all {
+            self.end_lifetime(device);
+            *gate = true;
+        }
     }
 
     /// Drains the submitted writes ([`RecordsService::drain`] with [`DRAIN_WAIT`]), then
@@ -1097,7 +1216,11 @@ impl RecordsService {
         let gates: Vec<Gate> = {
             let mut gates = self.inner.gates.lock().expect("records gates lock");
             gates.closed_all = true;
-            gates.by_device.values().cloned().collect()
+            gates
+                .by_device
+                .values()
+                .map(|(gate, _)| Arc::clone(gate))
+                .collect()
         };
         for gate in gates {
             *gate.write_owned().await = false;

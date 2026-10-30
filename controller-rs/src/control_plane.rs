@@ -440,6 +440,21 @@ impl ControlPlane {
             .map_err(|error| StartupError::Settings(error.to_string()))?;
         let settings = settings_service.handle();
         partial.settings = Some(settings_service);
+        // Stored values the settings could not use are kept aside; say so once.
+        {
+            let snapshot = settings.snapshot();
+            for issue in snapshot.registry().issues() {
+                tracing::warn!(?issue, "a wake-model registry entry was set aside");
+            }
+            for issue in snapshot.fleet_issues() {
+                tracing::warn!(%issue, "the stored fleet settings hold a value that is not used");
+            }
+            for (device, entry) in snapshot.devices() {
+                for issue in entry.issues() {
+                    tracing::warn!(%device, %issue, "a device's stored settings hold a value that is not used");
+                }
+            }
+        }
 
         let endpoint = match &config.home_assistant {
             HomeAssistantAccess::Direct { base_url, token } => {
@@ -448,6 +463,9 @@ impl ControlPlane {
             HomeAssistantAccess::Supervisor { token } => HaEndpoint::supervisor(token),
         }
         .map_err(|error| StartupError::HomeAssistant(error.to_string()))?;
+        let ha_base = reqwest::Url::parse(endpoint.rest_base()).map_err(|error| {
+            StartupError::HomeAssistant(format!("{}: {error}", endpoint.rest_base()))
+        })?;
         let (ha, ha_task) = HaClient::start(endpoint, HaOptions::default())
             .map_err(|error| StartupError::HomeAssistant(error.to_string()))?;
         let ha_task = tasks.observe("Home Assistant session", ha_task);
@@ -494,11 +512,17 @@ impl ControlPlane {
         );
         let services_publisher: Arc<OnceLock<echomuse_api::EventPublisher>> =
             Arc::new(OnceLock::new());
-        let wifi = Arc::new(crate::wifi::WifiService::new(services_publisher.clone()));
+        // The runtimes' directory, which the device services follow from the start.
+        let directory_sender = watch::Sender::new(crate::app::Directory::default());
+        let wifi = Arc::new(crate::wifi::WifiService::new(
+            services_publisher.clone(),
+            directory_sender.subscribe(),
+        ));
         let recording = crate::recording_modes::RecordingHub::load(
             db.clone(),
             records.layout(),
             services_publisher.clone(),
+            directory_sender.subscribe(),
             tasks.clone(),
         )
         .await
@@ -515,6 +539,7 @@ impl ControlPlane {
         let capture = crate::capture::CaptureHub::new(
             logs.clone(),
             services_publisher.clone(),
+            directory_sender.subscribe(),
             tasks.clone(),
         )
         .map_err(|error| StartupError::Records(format!("capture: {error}")))?;
@@ -526,32 +551,26 @@ impl ControlPlane {
             capture: capture.clone(),
         };
         let (events, events_rx) = DeviceEvents::channel();
-        let mut controller = Controller::with_services(
-            options.runtime,
-            RuntimeServices {
-                esphome: Some(esphome),
-                events: Some(events.clone()),
-                voice: None,
-                supervision: Some(supervision),
-                taps: Some(device_taps.clone()),
-            },
-        )
-        .map_err(|error| StartupError::RuntimeLimits(error.to_string()))?;
+        // From here a failed start stops the runtimes through `partial`.
+        let controller = partial.controller.insert(
+            Controller::new(
+                options.runtime,
+                RuntimeServices {
+                    esphome: Some(esphome),
+                    events: Some(events.clone()),
+                    voice: None,
+                    supervision: Some(supervision),
+                    taps: Some(device_taps.clone()),
+                },
+                directory_sender,
+            )
+            .map_err(|error| StartupError::RuntimeLimits(error.to_string()))?,
+        );
         let approved = db
             .read(ApprovedDevices)
             .await
-            .map_err(|error| StartupError::DeviceList(error.to_string()));
-        let approved = match approved {
-            Ok(approved) => approved,
-            Err(error) => {
-                partial.controller = Some(controller);
-                return Err(error);
-            }
-        };
+            .map_err(|error| StartupError::DeviceList(error.to_string()))?;
         let directory = controller.directory();
-        wifi.set_directory(directory.clone());
-        recording.set_directory(directory.clone());
-        capture.set_directory(directory.clone());
 
         // Alerts: every approved device is an endpoint; the dispatcher registers them.
         let (alerts, alerts_task) = AlertService::start(
@@ -569,13 +588,11 @@ impl ControlPlane {
         // The voice path: records, speech models, the grammar and the decoder. Models
         // load (and qualify) in the background; until they are ready every device's
         // session refuses wakes and says why (§4.1).
-        match records.start_up().await {
-            Ok(report) => tracing::info!(?report, "records reconciled"),
-            Err(error) => {
-                partial.controller = Some(controller);
-                return Err(StartupError::Records(error.to_string()));
-            }
-        }
+        let reconciled = records
+            .start_up()
+            .await
+            .map_err(|error| StartupError::Records(error.to_string()))?;
+        tracing::info!(report = ?reconciled, "records reconciled");
         let speech = match options.speech {
             SpeechSource::Bundle => speech_models::start_loading(
                 SpeechPaths::from_config(&config.paths),
@@ -584,68 +601,41 @@ impl ControlPlane {
             ),
             SpeechSource::Provided(models) => speech_models::provided(models),
         };
-        let grammar = match blocking(Grammar::new).await {
-            Ok(grammar) => grammar,
-            Err(error) => {
-                partial.controller = Some(controller);
-                return Err(StartupError::Grammar(error.to_string()));
-            }
-        };
-        let ha_base = match &config.home_assistant {
-            HomeAssistantAccess::Direct { base_url, .. } => base_url.as_http(),
-            HomeAssistantAccess::Supervisor { .. } => "http://supervisor/core".to_owned(),
-        };
-        let ha_base = match reqwest::Url::parse(&ha_base) {
-            Ok(url) => url,
-            Err(error) => {
-                partial.controller = Some(controller);
-                return Err(StartupError::HomeAssistant(format!("{ha_base}: {error}")));
-            }
-        };
-        let decoder = match media_client() {
-            Ok(client) => Decoder::new(
-                tokio::runtime::Handle::current(),
-                client,
-                options.ffmpeg.clone(),
-            ),
-            Err(error) => {
-                partial.controller = Some(controller);
-                return Err(StartupError::HomeAssistant(error));
-            }
-        };
+        let grammar = blocking(Grammar::new)
+            .await
+            .map_err(|error| StartupError::Grammar(error.to_string()))?;
+        // The media decoder and the Kiosk Satellite routes share one client.
+        let http = media_client().map_err(StartupError::HomeAssistant)?;
+        let decoder = Decoder::new(
+            tokio::runtime::Handle::current(),
+            http.clone(),
+            options.ffmpeg.clone(),
+        );
         // Transcript correction's tables, built off every device thread (§4.7, §5.4).
-        let correction = match crate::correction::CorrectionTables::start(
+        let correction = crate::correction::CorrectionTables::start(
             ha.clone(),
             grammar.clone(),
             db.clone(),
             records.subscribe_turns(),
             &controller.tasks(),
-        ) {
-            Ok(correction) => correction,
-            Err(error) => {
-                partial.controller = Some(controller);
-                return Err(StartupError::Grammar(format!(
-                    "the correction table builder did not start: {error}"
-                )));
-            }
-        };
+        )
+        .map_err(|error| {
+            StartupError::Grammar(format!(
+                "the correction table builder did not start: {error}"
+            ))
+        })?;
         // The dashboard's correction tools and clip-window scoring (§4.7, §4.11).
-        let clip_scorer = match crate::clip_windows::ClipScorer::start(
+        let clip_scorer = crate::clip_windows::ClipScorer::start(
             db.clone(),
             records.clone(),
             settings.clone(),
             speech.clone(),
             watchdog,
             &tasks,
-        ) {
-            Ok(scorer) => scorer,
-            Err(error) => {
-                partial.controller = Some(controller);
-                return Err(StartupError::Records(format!(
-                    "the clip scoring thread did not start: {error}"
-                )));
-            }
-        };
+        )
+        .map_err(|error| {
+            StartupError::Records(format!("the clip scoring thread did not start: {error}"))
+        })?;
         let diagnostics = echomuse_api::Diagnostics {
             text_fix: Arc::new(crate::text_fix::DashboardTextFix {
                 ha: ha.clone(),
@@ -663,29 +653,26 @@ impl ControlPlane {
             records: records.clone(),
             settings: settings.clone(),
             grammar,
-            arbiter: controller.arbiter(),
+            arbiter: Arc::new(echomuse_voice::arbiter::WakeArbiter::default()),
             speech: speech.clone(),
             decoder,
             correction,
         }));
         for device in &approved {
-            if let Err(error) = controller.add_device(device.clone()).await {
-                partial.controller = Some(controller);
-                return Err(StartupError::DeviceRuntime {
+            controller
+                .add_device(device.clone())
+                .await
+                .map_err(|error| StartupError::DeviceRuntime {
                     device: device.0.clone(),
                     error: error.to_string(),
-                });
-            }
-        }
-        for device in &approved {
-            events.send(DeviceEvent::Registered(device.clone())).await;
+                })?;
         }
 
         // Firmware delivery.
-        let (access, shells_slot) = FirmwareAccess::new(directory.clone());
+        let shells = echomuse_link::ShellBroker::new();
+        let access = FirmwareAccess::new(directory.clone(), shells.clone());
         let (firmware_events, firmware_publisher, update_states) = FirmwareDashboard::new();
         let service_directory = directory.clone();
-        let service_updates = update_states.clone();
         let sound_service = {
             let sounds_dir = echomuse_presentation::sounds::SoundsDir::beside_database(&data_dir);
             let ffmpeg = options.ffmpeg.clone();
@@ -695,7 +682,6 @@ impl ControlPlane {
             .await
             .map_err(|error| StartupError::Records(format!("the sound catalog: {error}")))?
         };
-        let kiosk_http = media_client().map_err(StartupError::HomeAssistant)?;
         let controller_version = Some(config.controller_version.clone())
             .filter(|version| version != UNKNOWN_CONTROLLER_VERSION);
         let firmware = FirmwareService::new(
@@ -712,7 +698,11 @@ impl ControlPlane {
             },
         );
 
-        let (registry, registry_task, publisher_slot) = Registry::start(controller, db.clone());
+        let (registry, registry_task, publisher_slot) = Registry::start(
+            partial.controller.take().expect("started above"),
+            db.clone(),
+            records.clone(),
+        );
         partial.registry = Some((registry.clone(), registry_task));
         partial.dispatcher = Some(
             tasks.spawn(
@@ -729,6 +719,11 @@ impl ControlPlane {
                 .run(events_rx),
             ),
         );
+        // The dispatcher consumes the events now; each approved device's runtime is
+        // registered with it.
+        for device in &approved {
+            events.send(DeviceEvent::Registered(device.clone())).await;
+        }
 
         let qualifier = WakeModelQualifier::prepare(
             config.paths.onnxruntime_lib.clone(),
@@ -757,22 +752,22 @@ impl ControlPlane {
                 db: db.clone(),
                 bootstrap: setup_token,
                 settings: settings.clone(),
-                runtimes: ControllerRuntimes::new(
+                runtimes: Box::new(ControllerRuntimes::new(
                     registry.clone(),
                     db.clone(),
                     discovery.clone(),
-                    data_dir.clone(),
+                    records.clone(),
                     events,
                     device_taps,
-                ),
-                qualifier,
-                firmware: ControllerFirmware::new(
-                    firmware,
+                )),
+                qualifier: Box::new(qualifier),
+                firmware: Box::new(ControllerFirmware::new(
+                    firmware.clone(),
                     directory,
                     db.clone(),
                     update_states,
                     tasks.clone(),
-                ),
+                )),
                 records: records.clone(),
                 services: echomuse_api::DeviceServices {
                     wifi: Arc::new(crate::wifi::WifiRoutes(wifi)),
@@ -780,8 +775,8 @@ impl ControlPlane {
                     recorder: Arc::new(crate::recorder_link::RecorderRoutes(recorder)),
                     shell: Arc::new(crate::shell_bridge::ShellBridge {
                         directory: service_directory.clone(),
-                        shells: shells_slot.clone(),
-                        firmware: service_updates,
+                        shells: shells.clone(),
+                        firmware,
                         tasks: tasks.clone(),
                     }),
                     alerts: Arc::new(crate::alerts_dashboard::DashboardAlerts {
@@ -798,13 +793,13 @@ impl ControlPlane {
                         db: db.clone(),
                         settings: settings.clone(),
                         directory: service_directory,
-                        http: kiosk_http,
+                        http,
                     }),
                 },
                 capture,
                 diagnostics,
                 ha_status: ha_status_rx,
-                clock: SystemWallClock,
+                clock: Box::new(SystemWallClock),
             },
         );
         let publisher = api.publisher();
@@ -864,12 +859,10 @@ impl ControlPlane {
                 settings.clone(),
                 data_dir.join("sounds").join("assets"),
             ),
+            shells,
         )
         .await
         .map_err(|error| StartupError::Link(error.to_string()))?;
-
-        // The firmware service reaches device shells through the link server's broker.
-        let _ = shells_slot.set(link.shells());
 
         let (ha, ha_task) = partial.ha.take().expect("started above");
         let (discovery, discovery_task) = partial.discovery.take().expect("started above");

@@ -8,53 +8,43 @@
 //! and backgrounds alerts); answers carry the response limits; content plays through the
 //! equalizer. Announcements queue behind the device's own replies (the media player
 //! decides when each may start).
+//!
+//! [`Output`] owns the render client, the media player, the playbacks with their decodes
+//! and focus leases, the alert sound preview, earcons and announcements. It knows no turn:
+//! the conversation asks it to play or stop an answer by the turn's identity, and what a
+//! render event means for the conversation goes back as [`Notices`] carrying identities,
+//! which the machine hands on once this call has returned.
 
-use echomuse_esphome::voice::SatelliteRequest;
-use echomuse_grammar::Line;
+use echomuse_esphome::voice::{Announcement, MediaRequest};
 use echomuse_playback::{
     AckOutcome, AnnouncementKey, CancelReason, ContentEnd, ContentEndReason, DecodeEvent, Earcon,
-    EqSettings, FocusKind, FocusLease, FocusOwner, LocalSource, MediaEffect, NetworkClass,
-    NetworkStart, Opener, PlaybackEnd, PlaybackRef, RenderClient, RenderEvent, ResponseLimits,
-    SatelliteAnnouncement, StreamId as MediaStreamId,
+    EqSettings, FocusKind, FocusLease, FocusOwner, LocalSource, MediaEffect, MediaPlayer,
+    NetworkClass, NetworkStart, Opener, PlaybackEnd, PlaybackRef, RenderClient, RenderEvent,
+    RenderReport, ResponseLimits, SatelliteAnnouncement, StreamId as MediaStreamId,
     wire::{FinishReason, RenderRejection},
 };
-use echomuse_presentation::ring::Cue;
-use echomuse_protocol::{MessageId, Reported};
+use echomuse_protocol::{Capabilities, MessageId, Reported};
 use echomuse_records::vocab::PlaybackReason;
 use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::{
-    io::{
-        CallId, DecodeCommand, DecodeReport, Effect, HaRequest, Now, Outbound, SatelliteCommand,
-        VolumeSet,
-    },
-    link::EffectLink,
-    local::Expectation,
-    machine::Voice,
-    turn::{Call, Stage},
+    io::{CallId, DecodeCommand, DecodeReport, Effect, Now, Outbound, SatelliteCommand, VolumeSet},
+    session::OutputCx,
 };
-
-/// The last answer this device spoke, for "repeat" (§4.4). Kept in memory only.
-#[derive(Clone, Debug)]
-pub(crate) struct LastAnswer {
-    pub(crate) url: String,
-    pub(crate) ended_at: Instant,
-    pub(crate) follow_up: Option<Expectation>,
-}
 
 /// The alert sound preview playing, and the request that started it.
 #[derive(Debug)]
-pub(crate) struct Preview {
-    pub(crate) id: crate::io::PreviewId,
-    pub(crate) playback: PlaybackRef,
+struct Preview {
+    id: crate::io::PreviewId,
+    playback: PlaybackRef,
     /// Its start was answered (accepted, refused or unknown).
-    pub(crate) answered: bool,
+    answered: bool,
 }
 
 /// What a playback is for.
 #[derive(Clone, Debug)]
-pub(crate) enum Purpose {
+enum Purpose {
     /// A turn's spoken answer or line.
     Answer {
         turn: Uuid,
@@ -73,7 +63,7 @@ pub(crate) enum Purpose {
 }
 
 #[derive(Debug)]
-pub(crate) struct Playout {
+struct Playout {
     purpose: Purpose,
     /// The decode feeding a network playback.
     call: Option<CallId>,
@@ -91,128 +81,92 @@ pub(crate) struct Playout {
     cancelled: Option<CancelReason>,
 }
 
+impl Playout {
+    /// A playback the device plays from its own assets: nothing to fetch or decode.
+    fn local(purpose: Purpose, playback: PlaybackRef) -> Self {
+        Self {
+            purpose,
+            call: None,
+            url: None,
+            playback: Some(playback),
+            pulling: false,
+            waiting_room: false,
+            pushed: false,
+            source_done: true,
+            focus: None,
+            audible: false,
+            limit_passed: false,
+            cancelled: None,
+        }
+    }
+
+    fn cancel(&mut self, render: &mut RenderClient, cx: &mut OutputCx<'_>, reason: CancelReason) {
+        if self.cancelled.is_some() {
+            return;
+        }
+        self.cancelled = Some(reason);
+        if let Some(call) = self.call {
+            cx.link
+                .effects
+                .push(Effect::Decode(DecodeCommand::Cancel(call)));
+            self.pulling = false;
+        }
+        if let Some(playback) = &self.playback {
+            let _ = render.cancel(cx.link, playback, reason);
+        }
+    }
+}
+
+/// What output is doing, for a command's context and for arbitration.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OutputSummary {
+    /// An answer of this device's plays (and was not cancelled).
+    pub(crate) answer_playing: bool,
+    /// The media player plays.
+    pub(crate) media_playing: bool,
+}
+
+/// An answer became audible.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Audible {
+    pub(crate) turn: Uuid,
+    /// It was already cancelled when it became audible.
+    pub(crate) cancelled: bool,
+}
+
+/// An answer ended.
+#[derive(Clone, Debug)]
+pub(crate) struct AnswerEnded {
+    pub(crate) turn: Uuid,
+    pub(crate) reason: PlaybackReason,
+    /// The answer's URL when it played to its end.
+    pub(crate) completed_url: Option<String>,
+}
+
+/// What one render event means for the conversation, in the order it applies. Each
+/// names the turn it is about; the conversation checks it before acting.
 #[derive(Debug, Default)]
-pub(crate) struct Playouts {
-    list: Vec<Playout>,
-    /// Released leases waiting for their acknowledgement.
-    pub(crate) releasing: Vec<FocusLease>,
+pub(crate) struct Notices {
+    /// An answer's first frame played at this device time (`None` when the report's time
+    /// cannot place it).
+    pub(crate) first_frame: Option<(Uuid, Option<u64>)>,
+    pub(crate) audible: Option<Audible>,
+    pub(crate) ended: Option<AnswerEnded>,
+    /// A completed announcement asks for a conversation HA started.
+    pub(crate) ha_conversation: bool,
 }
 
-impl Playouts {
-    pub(crate) fn answer_playing(&self) -> bool {
-        self.list
-            .iter()
-            .any(|p| matches!(p.purpose, Purpose::Answer { .. }) && p.cancelled.is_none())
-    }
+/// Work a render event leaves for after its notices were handled: pulling the next chunk
+/// of a playback the device made room for.
+#[derive(Debug)]
+pub(crate) struct Refill(Option<PlaybackRef>);
 
-    /// Dialog output is audible (an answer or an announcement).
-    pub(crate) fn speaking(&self) -> bool {
-        self.list.iter().any(|p| {
-            p.audible
-                && p.cancelled.is_none()
-                && matches!(
-                    p.purpose,
-                    Purpose::Answer { .. } | Purpose::Announcement { .. }
-                )
-        })
-    }
-
-    pub(crate) fn focus_deadlines(&self) -> Vec<Option<Instant>> {
-        self.list
-            .iter()
-            .filter_map(|p| p.focus.as_ref())
-            .chain(self.releasing.iter())
-            .map(FocusLease::next_deadline)
-            .collect()
-    }
-
-    pub(crate) fn focus_ack(&mut self, id: &MessageId, outcome: &AckOutcome) -> bool {
-        for lease in self
-            .list
-            .iter_mut()
-            .filter_map(|p| p.focus.as_mut())
-            .chain(self.releasing.iter_mut())
-        {
-            if lease.on_ack(id, outcome.clone()).is_ok() {
-                return true;
-            }
-        }
-        false
-    }
-
-    pub(crate) fn poll_focus(&mut self, link: &mut EffectLink, now: Instant) {
-        for lease in self
-            .list
-            .iter_mut()
-            .filter_map(|p| p.focus.as_mut())
-            .chain(self.releasing.iter_mut())
-        {
-            let _ = lease.poll(link, now);
-        }
-        self.releasing.retain(FocusLease::is_held);
-    }
-
-    /// The device's own answer stops when a new turn begins.
-    pub(crate) fn interrupt_answers(
-        &mut self,
-        render: &mut RenderClient,
-        link: &mut EffectLink,
-        _now: Now,
-    ) {
-        for playout in &mut self.list {
-            if matches!(playout.purpose, Purpose::Answer { .. }) {
-                cancel(playout, render, link, CancelReason::Interrupted);
-            }
-        }
-    }
-
-    /// Stops what a turn still plays when it ends some other way.
-    pub(crate) fn end_answers_of(
-        &mut self,
-        turn: Uuid,
-        render: &mut RenderClient,
-        link: &mut EffectLink,
-        _now: Now,
-    ) {
-        for playout in &mut self.list {
-            if matches!(playout.purpose, Purpose::Answer { turn: t } if t == turn) {
-                cancel(playout, render, link, CancelReason::Interrupted);
-            }
-        }
-    }
-
-    pub(crate) fn session_lost(&mut self, link: &mut EffectLink, now: Now) {
-        for mut playout in self.list.drain(..) {
-            if let Some(call) = playout.call {
-                link.effects
-                    .push(Effect::Decode(DecodeCommand::Cancel(call)));
-            }
-            if let Some(mut lease) = playout.focus.take() {
-                let _ = lease.release(link, now.at);
-            }
-        }
-        self.releasing.clear();
-    }
-}
-
-fn cancel(
-    playout: &mut Playout,
-    render: &mut RenderClient,
-    link: &mut EffectLink,
-    reason: CancelReason,
-) {
-    if playout.cancelled.is_some() {
-        return;
-    }
-    playout.cancelled = Some(reason);
-    if let Some(call) = playout.call {
-        link.effects
-            .push(Effect::Decode(DecodeCommand::Cancel(call)));
-        playout.pulling = false;
-    }
-    if let Some(playback) = &playout.playback {
-        let _ = render.cancel(link, playback, reason);
-    }
+/// The device's output. See the module documentation.
+pub(crate) struct Output {
+    render: RenderClient,
+    media: MediaPlayer,
+    playouts: Vec<Playout>,
+    preview: Option<Preview>,
 }
 
 fn eq_settings(settings: &echomuse_settings::DeviceSettings) -> Option<EqSettings> {
@@ -222,9 +176,193 @@ fn eq_settings(settings: &echomuse_settings::DeviceSettings) -> Option<EqSetting
         .filter(|eq| !eq.is_flat())
 }
 
-impl Voice {
+impl Output {
+    pub(crate) fn new(
+        capabilities: &Capabilities,
+        volume: Option<echomuse_esphome::entities::DeviceVolume>,
+    ) -> Self {
+        Self {
+            render: RenderClient::new(capabilities),
+            media: MediaPlayer::new(capabilities, volume),
+            playouts: Vec::new(),
+            preview: None,
+        }
+    }
+
+    // ---- summaries ------------------------------------------------------------------
+
+    pub(crate) fn summary(&self) -> OutputSummary {
+        OutputSummary {
+            answer_playing: self
+                .playouts
+                .iter()
+                .any(|p| matches!(p.purpose, Purpose::Answer { .. }) && p.cancelled.is_none()),
+            media_playing: self.media.state().playback
+                == echomuse_esphome::entities::Playback::Playing,
+        }
+    }
+
+    /// Dialog output is audible (an answer or an announcement).
+    pub(crate) fn speaking(&self) -> bool {
+        self.playouts.iter().any(|p| {
+            p.audible
+                && p.cancelled.is_none()
+                && matches!(
+                    p.purpose,
+                    Purpose::Answer { .. } | Purpose::Announcement { .. }
+                )
+        })
+    }
+
+    /// When the render client or a playback's focus lease next needs polling.
+    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+        self.playouts
+            .iter()
+            .filter_map(|p| p.focus.as_ref())
+            .filter_map(FocusLease::next_deadline)
+            .chain(self.render.next_deadline())
+            .min()
+    }
+
+    // ---- what the conversation asks -------------------------------------------------
+
+    /// Plays turn `turn`'s answer from `url` (HA's TTS, or a line's).
+    pub(crate) fn play_answer(&mut self, cx: &mut OutputCx<'_>, turn: Uuid, url: String, now: Now) {
+        self.play_url(cx, url, Purpose::Answer { turn }, now);
+    }
+
+    /// The device's own answers stop when a new turn begins.
+    pub(crate) fn interrupt_answers(&mut self, cx: &mut OutputCx<'_>) {
+        for playout in &mut self.playouts {
+            if matches!(playout.purpose, Purpose::Answer { .. }) {
+                playout.cancel(&mut self.render, cx, CancelReason::Interrupted);
+            }
+        }
+    }
+
+    /// Stops what turn `turn` still plays when it ends some other way.
+    pub(crate) fn end_answers_of(&mut self, cx: &mut OutputCx<'_>, turn: Uuid) {
+        for playout in &mut self.playouts {
+            if matches!(playout.purpose, Purpose::Answer { turn: t } if t == turn) {
+                playout.cancel(&mut self.render, cx, CancelReason::Interrupted);
+            }
+        }
+    }
+
+    pub(crate) fn earcon(&mut self, cx: &mut OutputCx<'_>, earcon: Earcon) {
+        let source = LocalSource::Earcon(earcon);
+        if self.render.supports(&source).is_err() {
+            return;
+        }
+        if let Ok(playback) = self.render.start_local(cx.link, &source, 0.0, false) {
+            self.playouts
+                .push(Playout::local(Purpose::Earcon, playback));
+        }
+    }
+
+    /// A dialog began: the media player ducks or pauses as it decides.
+    pub(crate) fn dialog_started(&mut self) {
+        self.media.dialog_started();
+    }
+
+    /// The dialog ended: the media player applies what it held back.
+    pub(crate) fn dialog_ended(&mut self, cx: &mut OutputCx<'_>, now: Now) {
+        self.media.dialog_ended();
+        self.apply_media_effects(cx, now);
+    }
+
+    /// A media command spoken to this device (during the dialog the player records the
+    /// intent and applies it when the dialog ends, §4.9).
+    pub(crate) fn media_command(&mut self, cx: &mut OutputCx<'_>, request: MediaRequest, now: Now) {
+        let _ = self.media.command(request);
+        self.apply_media_effects(cx, now);
+    }
+
+    // ---- what the machine hands on --------------------------------------------------
+
+    /// A media request Home Assistant sent the satellite; its effects follow with
+    /// [`Self::apply_media_effects`].
+    pub(crate) fn satellite_media(&mut self, request: MediaRequest) {
+        let _ = self.media.command(request);
+    }
+
+    /// An announcement Home Assistant sent the satellite; it starts with
+    /// [`Self::apply_media_effects`] when the player allows.
+    pub(crate) fn announce(&mut self, announcement: Announcement) {
+        let _: AnnouncementKey = self
+            .media
+            .announce(SatelliteAnnouncement::from(announcement));
+    }
+
+    pub(crate) fn device_volume(
+        &mut self,
+        volume: Option<echomuse_esphome::entities::DeviceVolume>,
+    ) {
+        self.media.device_volume(volume);
+    }
+
+    pub(crate) fn render_report(
+        &mut self,
+        cx: &mut OutputCx<'_>,
+        generation: u32,
+        report: RenderReport,
+        now: Now,
+    ) {
+        self.render.on_report(cx.link, now.at, generation, report);
+    }
+
+    /// A `command.ack` for the render client; `false` when it is not one of its commands.
+    pub(crate) fn render_ack(
+        &mut self,
+        cx: &mut OutputCx<'_>,
+        id: &MessageId,
+        outcome: AckOutcome,
+        now: Now,
+    ) -> bool {
+        self.render.on_ack(cx.link, now.at, id, outcome)
+    }
+
+    /// A `command.ack` for a live playback's focus lease.
+    pub(crate) fn focus_ack(&mut self, id: &MessageId, outcome: &AckOutcome) -> bool {
+        for lease in self.playouts.iter_mut().filter_map(|p| p.focus.as_mut()) {
+            if lease.on_ack(id, outcome.clone()).is_ok() {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(crate) fn poll_render(&mut self, cx: &mut OutputCx<'_>, now: Now) {
+        self.render.poll(cx.link, now.at);
+    }
+
+    pub(crate) fn poll_focus(&mut self, cx: &mut OutputCx<'_>, now: Now) {
+        for lease in self.playouts.iter_mut().filter_map(|p| p.focus.as_mut()) {
+            let _ = lease.poll(cx.link, now.at);
+        }
+    }
+
+    /// The session ended: every decode stops, every lease is released, the player stops.
+    pub(crate) fn session_lost(&mut self, cx: &mut OutputCx<'_>, now: Now) {
+        for mut playout in self.playouts.drain(..) {
+            if let Some(call) = playout.call {
+                cx.link
+                    .effects
+                    .push(Effect::Decode(DecodeCommand::Cancel(call)));
+            }
+            if let Some(mut lease) = playout.focus.take() {
+                let _ = lease.release(cx.link, now.at);
+            }
+        }
+        self.render.session_ended();
+        self.media.session_lost();
+        self.apply_media_effects(cx, now);
+    }
+
+    // ---- playing --------------------------------------------------------------------
+
     /// Starts a network playback of `url` for `purpose`.
-    fn play_url(&mut self, url: String, purpose: Purpose, now: Now) {
+    fn play_url(&mut self, cx: &mut OutputCx<'_>, url: String, purpose: Purpose, now: Now) {
         let (class, limits, focus_owner, announcement, equalizer) = match &purpose {
             Purpose::Answer { turn } => (
                 NetworkClass::DialogOutput,
@@ -245,12 +383,12 @@ impl Voice {
                 None,
                 None,
                 false,
-                eq_settings(&self.settings),
+                eq_settings(cx.settings),
             ),
             Purpose::Earcon => return,
         };
         let Ok(playback) = self.render.start_network(
-            &mut self.link,
+            cx.link,
             NetworkStart {
                 class,
                 gain_db: 0.0,
@@ -262,7 +400,7 @@ impl Voice {
         };
         let focus = focus_owner.and_then(|owner| {
             FocusLease::acquire(
-                &mut self.link,
+                cx.link,
                 now.at,
                 FocusKind::DialogOutput,
                 FocusOwner::new(owner),
@@ -270,89 +408,24 @@ impl Voice {
             )
             .ok()
         });
-        let call = self.call_id();
-        self.link.effects.push(Effect::Decode(DecodeCommand::Start {
+        let call = cx.ids.call();
+        cx.link.effects.push(Effect::Decode(DecodeCommand::Start {
             call,
             url: url.clone(),
             skip_frames: 0,
             equalizer,
         }));
-        self.link
+        cx.link
             .effects
             .push(Effect::Decode(DecodeCommand::Pull(call)));
-        self.playouts.list.push(Playout {
-            purpose,
+        self.playouts.push(Playout {
             call: Some(call),
             url: Some(url),
-            playback: Some(playback),
             pulling: true,
-            waiting_room: false,
-            pushed: false,
             source_done: false,
             focus,
-            audible: false,
-            limit_passed: false,
-            cancelled: None,
+            ..Playout::local(purpose, playback)
         });
-    }
-
-    /// Plays the current turn's answer from `url` (HA's TTS, or a line's).
-    pub(crate) fn speak_answer(&mut self, url: String, now: Now) {
-        let Some(turn) = self.turn.as_mut() else {
-            return;
-        };
-        if turn.answering.playing {
-            // HA gives one TTS URL per run; a second is ignored.
-            return;
-        }
-        turn.answering.playing = true;
-        let uuid = turn.uuid;
-        self.play_url(url, Purpose::Answer { turn: uuid }, now);
-    }
-
-    /// Says one of the controller's own lines for the current turn (HA synthesises it).
-    pub(crate) fn say(&mut self, line: Line, now: Now) {
-        let text = self.line_text(&line, now);
-        let target = self.target();
-        let Some(turn) = self.turn.as_mut() else {
-            return;
-        };
-        if turn.stage != Stage::Speaking {
-            turn.stage = Stage::Thinking;
-        }
-        turn.facts.response_text = Some(text.clone());
-        turn.facts.intent_ended.get_or_insert(now.at);
-        if let Some(body) = self.view.final_answer(&text) {
-            self.link.send(Outbound::TurnView(body), 0);
-        }
-        let Some(turn) = self.turn.as_ref() else {
-            return;
-        };
-        let (uuid, scope) = (turn.uuid, turn.scope.clone());
-        match target {
-            Some(target) => {
-                let call = self.call_id();
-                self.calls.insert(call, Call::Tts { turn: uuid });
-                self.link.effects.push(Effect::Ha {
-                    call,
-                    scope,
-                    request: HaRequest::Tts { target, text },
-                });
-            }
-            None => {
-                // No pipeline to speak with (HA unreachable): the error cue answers.
-                self.cue(Cue::Error, now);
-                self.answer_done(None, now);
-            }
-        }
-    }
-
-    /// Asks a question: the line, then a reply window expecting `expectation`.
-    pub(crate) fn ask(&mut self, line: Line, expectation: Expectation, now: Now) {
-        if let Some(turn) = self.turn.as_mut() {
-            turn.answering.follow_up = Some(expectation);
-        }
-        self.say(line, now);
     }
 
     /// Plays an alert sound's preview (`alert_preview`, a local source the device holds):
@@ -360,23 +433,23 @@ impl Voice {
     /// playing is superseded by the render client (one live playback per class).
     pub(crate) fn preview(
         &mut self,
+        cx: &mut OutputCx<'_>,
         id: crate::io::PreviewId,
-        sound: echomuse_playback::AlertPreviewSound,
-        _now: Now,
+        sound: echomuse_protocol::alerts::AlertSound,
     ) {
         let source = LocalSource::AlertPreview(sound);
         if self.render.supports(&source).is_err() {
-            self.preview_answer(id, crate::io::PreviewOutcome::Unsupported);
+            preview_answer(cx, id, crate::io::PreviewOutcome::Unsupported);
             return;
         }
-        match self.render.start_local(&mut self.link, &source, 0.0, false) {
+        match self.render.start_local(cx.link, &source, 0.0, false) {
             Ok(playback) => {
                 if let Some(old) = self.preview.take()
                     && !old.answered
                 {
                     // Superseded before the device answered: what became of it is not
                     // known.
-                    self.preview_answer(old.id, crate::io::PreviewOutcome::Unknown);
+                    preview_answer(cx, old.id, crate::io::PreviewOutcome::Unknown);
                 }
                 self.preview = Some(Preview {
                     id,
@@ -384,36 +457,30 @@ impl Voice {
                     answered: false,
                 });
             }
-            Err(_) => self.preview_answer(id, crate::io::PreviewOutcome::SessionEnded),
+            Err(_) => preview_answer(cx, id, crate::io::PreviewOutcome::SessionEnded),
         }
     }
 
     /// Stops the preview playing, if any.
-    pub(crate) fn stop_preview(&mut self, id: crate::io::PreviewId, _now: Now) {
+    pub(crate) fn stop_preview(&mut self, cx: &mut OutputCx<'_>, id: crate::io::PreviewId) {
         let was_playing = match self.preview.take() {
             Some(preview) => {
                 if !preview.answered {
-                    self.preview_answer(preview.id, crate::io::PreviewOutcome::Unknown);
+                    preview_answer(cx, preview.id, crate::io::PreviewOutcome::Unknown);
                 }
-                let _ =
-                    self.render
-                        .cancel(&mut self.link, &preview.playback, CancelReason::Stopped);
+                let _ = self
+                    .render
+                    .cancel(cx.link, &preview.playback, CancelReason::Stopped);
                 true
             }
             None => false,
         };
-        self.preview_answer(id, crate::io::PreviewOutcome::Stopped { was_playing });
-    }
-
-    fn preview_answer(&mut self, id: crate::io::PreviewId, outcome: crate::io::PreviewOutcome) {
-        self.link
-            .effects
-            .push(Effect::PreviewAnswer { id, outcome });
+        preview_answer(cx, id, crate::io::PreviewOutcome::Stopped { was_playing });
     }
 
     /// A render event of the preview: its start is answered once, and it is forgotten
     /// when it ends.
-    fn preview_event(&mut self, event: &RenderEvent) {
+    fn preview_event(&mut self, cx: &mut OutputCx<'_>, event: &RenderEvent) {
         let Some(preview) = self.preview.as_mut() else {
             return;
         };
@@ -443,224 +510,205 @@ impl Voice {
             self.preview = None;
         }
         if let Some(answer) = answer.filter(|_| first) {
-            self.preview_answer(id, answer);
+            preview_answer(cx, id, answer);
         }
     }
 
-    pub(crate) fn earcon(&mut self, earcon: Earcon, _now: Now) {
-        let source = LocalSource::Earcon(earcon);
-        if self.render.supports(&source).is_err() {
-            return;
-        }
-        if let Ok(playback) = self.render.start_local(&mut self.link, &source, 0.0, false) {
-            self.playouts.list.push(Playout {
-                purpose: Purpose::Earcon,
-                call: None,
-                url: None,
-                playback: Some(playback),
-                pulling: false,
-                waiting_room: false,
-                pushed: false,
-                source_done: true,
-                focus: None,
-                audible: false,
-                limit_passed: false,
-                cancelled: None,
-            });
-        }
-    }
-
-    pub(crate) fn cue(&mut self, cue: Cue, now: Now) {
-        if let Some(command) = self.ring.cue(cue, now.at) {
-            self.link.send(Outbound::Led(command), 0);
-        }
-    }
-
-    fn playout_index_by_call(&self, call: CallId) -> Option<usize> {
-        self.playouts.list.iter().position(|p| p.call == Some(call))
-    }
-
-    fn pull(&mut self, index: usize) {
-        let playout = &mut self.playouts.list[index];
+    fn pull(&mut self, cx: &mut OutputCx<'_>, index: usize) {
+        let playout = &mut self.playouts[index];
         if playout.pulling || playout.source_done || playout.cancelled.is_some() {
             return;
         }
         if let Some(call) = playout.call {
             playout.pulling = true;
             playout.waiting_room = false;
-            self.link
+            cx.link
                 .effects
                 .push(Effect::Decode(DecodeCommand::Pull(call)));
         }
     }
 
-    pub(crate) fn decode_event(&mut self, call: CallId, event: DecodeReport, now: Now) {
-        let Some(index) = self.playout_index_by_call(call) else {
-            self.counters.stale_results += 1;
+    pub(crate) fn decode_event(
+        &mut self,
+        cx: &mut OutputCx<'_>,
+        call: CallId,
+        event: DecodeReport,
+        now: Now,
+    ) {
+        let Some(index) = self.playouts.iter().position(|p| p.call == Some(call)) else {
+            *cx.stale += 1;
             return;
         };
-        self.playouts.list[index].pulling = false;
-        let Some(playback) = self.playouts.list[index].playback.clone() else {
+        self.playouts[index].pulling = false;
+        let Some(playback) = self.playouts[index].playback.clone() else {
             return;
         };
         match event {
             DecodeReport::Event(DecodeEvent::Opened { seekable }) => {
-                if let Purpose::Content { stream } = self.playouts.list[index].purpose {
+                if let Purpose::Content { stream } = self.playouts[index].purpose {
                     self.media.content_opened(stream, seekable);
                 }
-                self.pull(index);
+                self.pull(cx, index);
             }
             DecodeReport::Event(DecodeEvent::Audio(pcm)) => {
-                self.playouts.list[index].pushed = true;
-                let _ = self
-                    .render
-                    .push_audio(&mut self.link, now.at, &playback, &pcm);
+                self.playouts[index].pushed = true;
+                let _ = self.render.push_audio(cx.link, now.at, &playback, &pcm);
                 if self.render.wants_audio(&playback) {
-                    self.pull(index);
+                    self.pull(cx, index);
                 } else {
-                    self.playouts.list[index].waiting_room = true;
+                    self.playouts[index].waiting_room = true;
                 }
             }
             DecodeReport::Event(DecodeEvent::Finished(Ok(_))) => {
-                self.playouts.list[index].source_done = true;
-                let _ = self.render.finish_audio(&mut self.link, now.at, &playback);
+                self.playouts[index].source_done = true;
+                let _ = self.render.finish_audio(cx.link, now.at, &playback);
             }
             DecodeReport::Event(DecodeEvent::Finished(Err(error))) => {
-                tracing::warn!(device = %self.device, %error, "a playback's audio could not be decoded");
-                self.source_failed(index, now);
+                tracing::warn!(device = %cx.device, %error, "a playback's audio could not be decoded");
+                self.source_failed(cx, index, now);
             }
-            DecodeReport::Closed => self.source_failed(index, now),
+            DecodeReport::Closed => self.source_failed(cx, index, now),
         }
     }
 
-    fn source_failed(&mut self, index: usize, now: Now) {
-        let playout = &mut self.playouts.list[index];
+    fn source_failed(&mut self, cx: &mut OutputCx<'_>, index: usize, now: Now) {
+        let playout = &mut self.playouts[index];
         playout.source_done = true;
         let Some(playback) = playout.playback.clone() else {
             return;
         };
         if playout.pushed {
             // Play what arrived.
-            let _ = self.render.finish_audio(&mut self.link, now.at, &playback);
+            let _ = self.render.finish_audio(cx.link, now.at, &playback);
         } else {
-            cancel(
-                playout,
-                &mut self.render,
-                &mut self.link,
-                CancelReason::SourceFailed,
-            );
+            playout.cancel(&mut self.render, cx, CancelReason::SourceFailed);
         }
     }
 
-    /// A render client event about one of the playbacks.
-    pub(crate) fn playout_event(&mut self, playback: &PlaybackRef, event: RenderEvent, now: Now) {
+    /// The render client's next event, if any.
+    pub(crate) fn next_render_event(&mut self) -> Option<RenderEvent> {
+        self.render.next_event()
+    }
+
+    /// A render client event about one of the playbacks. What it means for the
+    /// conversation is returned; [`Self::refill`] finishes it once that was handled.
+    pub(crate) fn render_event(
+        &mut self,
+        cx: &mut OutputCx<'_>,
+        event: RenderEvent,
+        now: Now,
+    ) -> (Notices, Refill) {
+        let mut notices = Notices::default();
+        let playback = match &event {
+            RenderEvent::Accepted(p) | RenderEvent::Started(p) => p,
+            RenderEvent::Progress { playback, .. }
+            | RenderEvent::Cancelled { playback, .. }
+            | RenderEvent::LimitExceeded { playback, .. }
+            | RenderEvent::Ended { playback, .. } => playback,
+        };
         if self
             .preview
             .as_ref()
             .is_some_and(|p| &p.playback == playback)
         {
-            self.preview_event(&event);
-            return;
+            self.preview_event(cx, &event);
+            return (notices, Refill(None));
         }
         let Some(index) = self
             .playouts
-            .list
             .iter()
             .position(|p| p.playback.as_ref() == Some(playback))
         else {
-            return;
+            return (notices, Refill(None));
         };
+        let mut refill = None;
         match event {
             RenderEvent::Accepted(_) | RenderEvent::Cancelled { .. } => {}
-            RenderEvent::Started(_) => {
-                self.playouts.list[index].audible = true;
-                if let Purpose::Answer { turn } = self.playouts.list[index].purpose
-                    && let Some(current) = self.turn.as_mut().filter(|t| t.uuid == turn)
-                {
-                    current.stage = Stage::Speaking;
-                    current.facts.audible_at.get_or_insert(now.at);
-                    if self.playouts.list[index].cancelled.is_none() {
-                        self.question_audible(turn, now);
-                    }
-                }
-            }
-            RenderEvent::Progress { progress, .. } => {
+            RenderEvent::Started(_) => notices.audible = self.audible(index),
+            RenderEvent::Progress { playback, progress } => {
                 // The answer's first frame played at the first progress reporting
                 // completed frames, at its device time less those frames.
                 if progress.completed_frames > 0
                     && let Ok(mono_ns) = u64::try_from(progress.mono_ns)
                     && mono_ns > 0
-                    && let Purpose::Answer { turn } = self.playouts.list[index].purpose
-                    && let Some(current) = self.turn.as_mut().filter(|t| t.uuid == turn)
-                    && current.facts.first_frame_mono_ns.is_none()
+                    && let Purpose::Answer { turn } = self.playouts[index].purpose
                 {
                     let played_ns = progress.completed_frames * 1_000_000_000
                         / u64::from(echomuse_playback::eq::RENDER_SAMPLE_RATE);
-                    current.facts.first_frame_mono_ns = mono_ns.checked_sub(played_ns);
+                    notices.first_frame = Some((turn, mono_ns.checked_sub(played_ns)));
                 }
-                if !self.playouts.list[index].audible && progress.completed_frames > 0 {
-                    self.playouts.list[index].audible = true;
-                    if let Purpose::Answer { turn } = self.playouts.list[index].purpose
-                        && let Some(current) = self.turn.as_mut().filter(|t| t.uuid == turn)
-                    {
-                        current.stage = Stage::Speaking;
-                        current.facts.audible_at.get_or_insert(now.at);
-                        if self.playouts.list[index].cancelled.is_none() {
-                            self.question_audible(turn, now);
-                        }
-                    }
+                if !self.playouts[index].audible && progress.completed_frames > 0 {
+                    notices.audible = self.audible(index);
                 }
-                if let Purpose::Content { stream } = self.playouts.list[index].purpose {
+                if let Purpose::Content { stream } = self.playouts[index].purpose {
                     self.media
                         .content_progress(stream, progress.completed_frames);
                 }
-                if self.playouts.list[index].waiting_room && self.render.wants_audio(playback) {
-                    self.pull(index);
-                }
+                refill = Some(playback);
             }
             RenderEvent::LimitExceeded { .. } => {
-                self.playouts.list[index].limit_passed = true;
+                self.playouts[index].limit_passed = true;
             }
             RenderEvent::Ended { end, .. } => {
-                let mut playout = self.playouts.list.remove(index);
+                let mut playout = self.playouts.remove(index);
                 if let Some(call) = playout.call.filter(|_| !playout.source_done) {
-                    self.link
+                    cx.link
                         .effects
                         .push(Effect::Decode(DecodeCommand::Cancel(call)));
                 }
-                if let Some(lease) = playout.focus.take() {
-                    self.release_focus(Some(lease), now);
-                }
+                cx.released.release(cx.link, playout.focus.take(), now);
                 let reason = playback_reason(&end, playout.limit_passed);
-                self.playout_ended(playout, reason, now);
+                self.ended(cx, playout, reason, &mut notices, now);
             }
+        }
+        (notices, Refill(refill))
+    }
+
+    /// Pulls the next chunk of a playback whose progress made room for it.
+    pub(crate) fn refill(&mut self, cx: &mut OutputCx<'_>, refill: Refill) {
+        let Refill(Some(playback)) = refill else {
+            return;
+        };
+        let Some(index) = self
+            .playouts
+            .iter()
+            .position(|p| p.playback.as_ref() == Some(&playback))
+        else {
+            return;
+        };
+        if self.playouts[index].waiting_room && self.render.wants_audio(&playback) {
+            self.pull(cx, index);
         }
     }
 
-    fn playout_ended(&mut self, playout: Playout, reason: PlaybackReason, now: Now) {
+    /// A playback became audible: for an answer, the conversation hears of it.
+    fn audible(&mut self, index: usize) -> Option<Audible> {
+        let playout = &mut self.playouts[index];
+        playout.audible = true;
+        match playout.purpose {
+            Purpose::Answer { turn } => Some(Audible {
+                turn,
+                cancelled: playout.cancelled.is_some(),
+            }),
+            _ => None,
+        }
+    }
+
+    fn ended(
+        &mut self,
+        cx: &mut OutputCx<'_>,
+        playout: Playout,
+        reason: PlaybackReason,
+        notices: &mut Notices,
+        now: Now,
+    ) {
         match playout.purpose {
             Purpose::Answer { turn } => {
-                if let Some(current) = self.turn.as_mut().filter(|t| t.uuid == turn) {
-                    current.facts.playback_ended = Some(now.at);
-                    if reason == PlaybackReason::Drained
-                        && let Some(url) = playout.url
-                    {
-                        self.last_answer = Some(LastAnswer {
-                            url,
-                            ended_at: now.at,
-                            follow_up: current.answering.follow_up.clone(),
-                        });
-                    }
-                    if reason != PlaybackReason::Drained && reason != PlaybackReason::Cancelled {
-                        current.facts.terminal.get_or_insert(match reason {
-                            PlaybackReason::ResponseTimeout => {
-                                echomuse_records::vocab::TerminalReason::ResponseTimeout
-                            }
-                            _ => echomuse_records::vocab::TerminalReason::Interrupted,
-                        });
-                    }
-                    self.answer_done(Some(reason), now);
-                }
+                notices.ended = Some(AnswerEnded {
+                    turn,
+                    reason,
+                    completed_url: playout.url.filter(|_| reason == PlaybackReason::Drained),
+                });
             }
             Purpose::Announcement {
                 key,
@@ -672,6 +720,7 @@ impl Voice {
                     Some(message) if played || reason == PlaybackReason::Failed => {
                         // The opener ended (a failed opener does not stop the message).
                         self.play_url(
+                            cx,
                             message,
                             Purpose::Announcement {
                                 key,
@@ -683,11 +732,8 @@ impl Voice {
                     }
                     _ => {
                         self.media.announcement_ended(key, played);
-                        let effects = self.media_effects();
-                        self.apply_media_effects(effects, now);
-                        if played && start_conversation {
-                            self.open_ha_conversation(now);
-                        }
+                        self.apply_media_effects(cx, now);
+                        notices.ha_conversation = played && start_conversation;
                     }
                 }
             }
@@ -704,8 +750,7 @@ impl Voice {
                         completed_frames: None,
                     },
                 );
-                let effects = self.media_effects();
-                self.apply_media_effects(effects, now);
+                self.apply_media_effects(cx, now);
             }
             Purpose::Earcon => {}
         }
@@ -713,15 +758,9 @@ impl Voice {
 
     // ---- media and announcements ----------------------------------------------------
 
-    pub(crate) fn media_playing(&self) -> bool {
-        self.media.state().playback == echomuse_esphome::entities::Playback::Playing
-    }
-
-    pub(crate) fn media_effects(&mut self) -> Vec<MediaEffect> {
-        std::iter::from_fn(|| self.media.next_effect()).collect()
-    }
-
-    pub(crate) fn apply_media_effects(&mut self, effects: Vec<MediaEffect>, now: Now) {
+    /// Carries out what the media player queued.
+    pub(crate) fn apply_media_effects(&mut self, cx: &mut OutputCx<'_>, now: Now) {
+        let effects: Vec<MediaEffect> = std::iter::from_fn(|| self.media.next_effect()).collect();
         for effect in effects {
             match effect {
                 MediaEffect::StartContent {
@@ -729,11 +768,11 @@ impl Voice {
                     url,
                     skip_frames,
                 } => {
-                    self.play_url(url, Purpose::Content { stream }, now);
+                    self.play_url(cx, url, Purpose::Content { stream }, now);
                     if skip_frames > 0
                         && let Some(Effect::Decode(DecodeCommand::Start {
                             skip_frames: skip, ..
-                        })) = self
+                        })) = cx
                             .link
                             .effects
                             .iter_mut()
@@ -744,20 +783,15 @@ impl Voice {
                     }
                 }
                 MediaEffect::StopContent { stream } => {
-                    for playout in &mut self.playouts.list {
+                    for playout in &mut self.playouts {
                         if matches!(playout.purpose, Purpose::Content { stream: s } if s == stream)
                         {
-                            cancel(
-                                playout,
-                                &mut self.render,
-                                &mut self.link,
-                                CancelReason::Stopped,
-                            );
+                            playout.cancel(&mut self.render, cx, CancelReason::Stopped);
                         }
                     }
                 }
                 MediaEffect::SetDeviceVolume(volume) => {
-                    self.link.send(
+                    cx.link.send(
                         Outbound::VolumeSet(VolumeSet {
                             level: volume.get(),
                         }),
@@ -769,30 +803,18 @@ impl Voice {
                     match plan.opener {
                         Opener::Chime => {
                             let source = LocalSource::Earcon(Earcon::AnnouncementChime);
-                            let started = self
-                                .render
-                                .start_local(&mut self.link, &source, 0.0, true)
-                                .ok();
+                            let started = self.render.start_local(cx.link, &source, 0.0, true).ok();
                             match started {
-                                Some(playback) => self.playouts.list.push(Playout {
-                                    purpose: Purpose::Announcement {
+                                Some(playback) => self.playouts.push(Playout::local(
+                                    Purpose::Announcement {
                                         key,
                                         then: Some(plan.media_url),
                                         start_conversation: plan.start_conversation,
                                     },
-                                    call: None,
-                                    url: None,
-                                    playback: Some(playback),
-                                    pulling: false,
-                                    waiting_room: false,
-                                    pushed: false,
-                                    source_done: true,
-                                    focus: None,
-                                    audible: false,
-                                    limit_passed: false,
-                                    cancelled: None,
-                                }),
+                                    playback,
+                                )),
                                 None => self.play_url(
+                                    cx,
                                     plan.media_url,
                                     Purpose::Announcement {
                                         key,
@@ -804,6 +826,7 @@ impl Voice {
                             }
                         }
                         Opener::Sound(url) => self.play_url(
+                            cx,
                             url,
                             Purpose::Announcement {
                                 key,
@@ -813,6 +836,7 @@ impl Voice {
                             now,
                         ),
                         Opener::None => self.play_url(
+                            cx,
                             plan.media_url,
                             Purpose::Announcement {
                                 key,
@@ -824,12 +848,15 @@ impl Voice {
                     }
                 }
                 MediaEffect::FinishAnnouncement { id, success } => {
-                    self.link.effects.push(Effect::Satellite(
-                        SatelliteCommand::FinishAnnouncement { id, success },
-                    ));
+                    cx.link
+                        .effects
+                        .push(Effect::Satellite(SatelliteCommand::FinishAnnouncement {
+                            id,
+                            success,
+                        }));
                 }
                 MediaEffect::ReportState(state) => {
-                    self.link
+                    cx.link
                         .effects
                         .push(Effect::Satellite(SatelliteCommand::Media(
                             state.media_state(),
@@ -838,26 +865,14 @@ impl Voice {
             }
         }
     }
+}
 
-    /// A request Home Assistant sent the satellite.
-    pub(crate) fn satellite(&mut self, request: SatelliteRequest, now: Now) {
-        match request {
-            SatelliteRequest::Media(request) => {
-                let _ = self.media.command(request);
-            }
-            SatelliteRequest::Announce(announcement) => {
-                let _: AnnouncementKey = self
-                    .media
-                    .announce(SatelliteAnnouncement::from(announcement));
-            }
-            SatelliteRequest::Run { run, event } => self.satellite_run_event(run, event, now),
-            // Timers and the stop button belong to the alert service; the runtime
-            // forwards them there.
-            SatelliteRequest::Timer(_) | SatelliteRequest::StopAlert => {}
-        }
-        let effects = self.media_effects();
-        self.apply_media_effects(effects, now);
-    }
+fn preview_answer(
+    cx: &mut OutputCx<'_>,
+    id: crate::io::PreviewId,
+    outcome: crate::io::PreviewOutcome,
+) {
+    cx.link.effects.push(Effect::PreviewAnswer { id, outcome });
 }
 
 fn playback_reason(end: &PlaybackEnd, limit_passed: bool) -> PlaybackReason {

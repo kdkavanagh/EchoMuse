@@ -5,8 +5,8 @@
 //! # How the runtime plugs in
 //!
 //! 1. Build a [`LinkConfig`] ([`LinkConfig::from_controller`]) and start
-//!    [`LinkServer::bind`] with the database handle, an [`Admission`] and an
-//!    [`AssetSource`].
+//!    [`LinkServer::bind`] with the database handle, an [`Admission`], an
+//!    [`AssetSource`] and the [`ShellBroker`] that shell dial-backs are routed into.
 //! 2. For every hello that passes the protocol, token and approval checks, the link
 //!    ends the device's previous session, then calls [`Admission::admit`] with an
 //!    [`AdmissionRequest`] and the new session's [`LinkSession`]. The integrator
@@ -91,6 +91,6 @@ pub use session::{
     SessionLink, SocketKind,
 };
 pub use shell::{
-    ShellBroker, ShellClose, ShellConnection, ShellError, ShellInput, ShellMode, ShellOpen,
-    ShellPending, ShellReader, ShellWriter,
+    ShellBroker, ShellConnection, ShellError, ShellInput, ShellMode, ShellOpen, ShellPending,
+    ShellReader, ShellWriter,
 };

@@ -12,10 +12,7 @@ use serde::Deserialize;
 use crate::program::{CompileError, Group, ListDef, Origin, TemplateSet, ValueDef};
 
 /// The vendored `en.json`.
-pub(crate) const EN_JSON: &str = include_str!("../data/home-assistant-intents/en.json");
-
-/// The release the data comes from.
-pub const INTENTS_VERSION: &str = "2026.7.30";
+const EN_JSON: &str = include_str!("../data/home-assistant-intents/en.json");
 
 /// Timer requests the deployed controller's timer family judges for completeness although
 /// Home Assistant's templates lack them, compiled with HA's own rules and lists: `(intent,
@@ -92,12 +89,8 @@ fn one() -> i64 {
 
 /// Reads the intent data into a template set.
 pub(crate) fn home_assistant() -> Result<TemplateSet, CompileError> {
-    parse(EN_JSON)
-}
-
-fn parse(json: &str) -> Result<TemplateSet, CompileError> {
     let file: IntentFile =
-        serde_json::from_str(json).map_err(|err| CompileError::Data(err.to_string()))?;
+        serde_json::from_str(EN_JSON).map_err(|err| CompileError::Data(err.to_string()))?;
     if file.language != "en" {
         return Err(CompileError::Data(format!(
             "language {:?}, expected \"en\"",

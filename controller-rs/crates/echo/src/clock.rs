@@ -150,11 +150,6 @@ impl Alignment {
     pub fn reference_to_mic(&self, r: f64) -> f64 {
         self.mic.position_at(self.reference.ns_at(r))
     }
-
-    /// The same alignment with another lag, for example the one a candidate comparison found.
-    pub fn with_lag(self, lag: Option<Lag>) -> Self {
-        Self { lag, ..self }
-    }
 }
 
 #[cfg(test)]

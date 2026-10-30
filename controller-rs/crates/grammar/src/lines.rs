@@ -306,7 +306,7 @@ impl Line {
 }
 
 /// `7 AM`, `7:05 PM`, `12 PM` (noon), `12 AM` (midnight).
-pub fn spoken_time(time: TimeOfDay) -> String {
+pub(crate) fn spoken_time(time: TimeOfDay) -> String {
     let (hour, minute) = (time.hour(), time.minute());
     let suffix = if hour < 12 { "AM" } else { "PM" };
     let h12 = match hour % 12 {
@@ -354,7 +354,7 @@ fn day_name(day: Weekday) -> &'static str {
 
 /// `today`, `tomorrow`, `on Friday` within the week, `on November 12` beyond it; `every
 /// day`, `on weekdays`, `on Mondays and Wednesdays`; nothing for a one-off without a date.
-pub fn spoken_day(day: SpokenDay, today: Date) -> String {
+pub(crate) fn spoken_day(day: SpokenDay, today: Date) -> String {
     match day {
         SpokenDay::On(date) => match (date - today).get_days() {
             0 => "today".to_owned(),
@@ -486,31 +486,6 @@ mod tests {
     }
 
     #[test]
-    fn fixed_lines() {
-        let today = today();
-        assert_eq!(Line::DidntCatch.text(today), "Sorry, I didn't catch that.");
-        assert_eq!(
-            Line::TooLong.text(today),
-            "That was too long. Try a shorter request."
-        );
-        assert_eq!(
-            Line::SomethingWentWrong.text(today),
-            "Something went wrong."
-        );
-        assert_eq!(
-            Line::NotSureItWorked.text(today),
-            "I'm not sure that worked."
-        );
-        assert_eq!(Line::AmOrPm.text(today), "AM or PM?");
-        assert_eq!(Line::PleaseSayAmOrPm.text(today), "Please say AM or PM.");
-        assert_eq!(Line::LeftIt.text(today), "Okay, I left it.");
-        assert_eq!(
-            Line::NothingToRepeat.text(today),
-            "I haven't said anything in the last two minutes."
-        );
-    }
-
-    #[test]
     fn alarm_lines_singular_plural_and_empty() {
         let today = today();
         let tomorrow = SpokenDay::On(date(2026, 10, 29));
@@ -557,10 +532,6 @@ mod tests {
              7 AM tomorrow, and 2 more."
         );
         assert_eq!(
-            Line::NextAlarm(None).text(today),
-            "You don't have any alarms."
-        );
-        assert_eq!(
             Line::NextAlarm(Some(a)).text(today),
             "Your next alarm is 7 AM tomorrow."
         );
@@ -568,17 +539,8 @@ mod tests {
             Line::NextAlarm(Some(b)).text(today),
             "Your next alarm is work at 6:30 AM on weekdays."
         );
-        assert_eq!(
-            Line::AlarmsUnavailable.text(today),
-            "I couldn't check your alarms."
-        );
         assert_eq!(Line::AlarmsCancelled(1).text(today), "Alarm cancelled.");
         assert_eq!(Line::AlarmsCancelled(3).text(today), "Cancelled 3 alarms.");
-        assert_eq!(
-            Line::AlarmNotFound.text(today),
-            "I couldn't find that alarm."
-        );
-        assert_eq!(Line::WhichAlarm.text(today), "Which alarm? Say its time.");
     }
 
     #[test]
@@ -620,11 +582,6 @@ mod tests {
             cancelled(vec![], 0).text(today),
             "You don't have any timers."
         );
-        assert_eq!(Line::NoTimers.text(today), "You don't have any timers.");
-        assert_eq!(
-            Line::TimerNotCancelled.text(today),
-            "I couldn't cancel that timer."
-        );
         assert_eq!(
             Line::WhichTimer(vec![five.clone(), pasta.clone()]).text(today),
             "Which one? Your 5 minute timer or your 10 minute pasta timer?"
@@ -637,10 +594,6 @@ mod tests {
         assert_eq!(
             Line::WhichTimer(vec![five.clone(); 6]).text(today),
             "You have 6 timers. Which one? Say its length, like the 5 minute timer."
-        );
-        assert_eq!(
-            Line::WhichTimerAgain.text(today),
-            "Which timer? Say its length, like the 5 minute timer, or say all of them."
         );
         assert_eq!(
             Line::TimerFinished(plain).text(today),

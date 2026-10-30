@@ -155,28 +155,9 @@ impl StoredConfig {
         self.text.as_deref()
     }
 
-    /// Whether the document could be read.
-    pub fn is_readable(&self) -> bool {
-        self.document.is_some()
-    }
-
-    /// The valid stored value of `key`.
-    pub fn value(&self, key: SettingKey) -> Option<&SettingValue> {
-        self.values.get(&key)
-    }
-
     /// Everything not taken as a setting.
     pub fn issues(&self) -> &[StoredIssue] {
         &self.issues
-    }
-
-    /// The document written back in its stored shape: Python's `json.dumps` text, keys
-    /// in their order. Unchanged from [`text`](Self::text) for a document read from the
-    /// previous controller's writes.
-    pub fn render(&self) -> Option<String> {
-        self.document
-            .as_ref()
-            .map(|d| Json::Object(d.clone()).to_python_text())
     }
 
     /// The text after setting `changes`, or `None` when no stored value would change. A
@@ -322,11 +303,13 @@ mod tests {
         let text =
             r#"{"duckDb": -35, "replyOnset": 3, "futureKey": [1], "nearMissThreshold": 0.9}"#;
         let config = StoredConfig::parse(Some(text));
+        let fleet = fleet_settings(&config);
+        assert_eq!(fleet.playback.duck_db, DuckDb::new(-35.0).unwrap());
+        // The invalid stored floor gives way to the default.
         assert_eq!(
-            config.value(SettingKey::DuckDb),
-            Some(&SettingValue::DuckDb(DuckDb::new(-35.0).unwrap()))
+            fleet.wakeword.near_miss_threshold,
+            DeviceSettings::default().wakeword.near_miss_threshold
         );
-        assert_eq!(config.value(SettingKey::NearMissThreshold), None);
         assert_eq!(config.issues().len(), 3);
         assert!(matches!(&config.issues()[0], StoredIssue::Removed { key } if key == "replyOnset"));
         assert!(
@@ -339,7 +322,6 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(config.render().as_deref(), Some(text));
         // An edit keeps every other key, recognised or not, as stored.
         let floor = SettingValue::NearMissThreshold(NearMissFloor::new(0.2).unwrap());
         assert_eq!(
@@ -354,10 +336,8 @@ mod tests {
     #[test]
     fn unreadable_documents_are_never_written_over() {
         let config = StoredConfig::parse(Some("{not json"));
-        assert!(!config.is_readable());
         let volume = SettingValue::StartupVolume(StartupVolume::new(10).unwrap());
         assert_eq!(config.with_changes([&volume]), Err(Unwritable));
-        assert_eq!(config.text(), Some("{not json"));
     }
 
     #[test]

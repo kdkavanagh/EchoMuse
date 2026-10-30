@@ -263,19 +263,12 @@ fn text_home_assistant_understands_is_never_changed() {
     assert_eq!(record.candidates, Some(Vec::new()));
 }
 
-/// A candidate refused before HA with `detail`, and never sent to the matcher.
-fn assert_refused(names: &[&str], phrases: &[&str], heard: &str, expected: &str, detail: &str) {
+/// A candidate refused before HA and never sent to the matcher.
+fn assert_refused(names: &[&str], phrases: &[&str], heard: &str, expected: &str) {
     let tables = tables(1, names, phrases);
     let s = settings(TranscriptFixMode::On, &[]);
     let snap = snapshot(&tables, &s);
     let check = check(prepare(&s, &turn(heard), Some(&snap), &ha()));
-    let refused = check
-        .proposal()
-        .rejected
-        .iter()
-        .find(|c| key(&c.text) == key(expected))
-        .unwrap_or_else(|| panic!("{expected:?} not proposed: {:?}", check.proposal()));
-    assert_eq!(refused.not_preserved, Some(detail));
     assert!(check.sentences().iter().all(|s| key(s) != key(expected)));
     // Even if HA would match it, it is not sent.
     let outcome = finish(check, |s| {
@@ -285,11 +278,11 @@ fn assert_refused(names: &[&str], phrases: &[&str], heard: &str, expected: &str,
     assert_eq!(outcome.send, heard);
     let record = outcome.record.unwrap();
     let listed = record.candidates.unwrap();
-    assert!(
-        listed
-            .iter()
-            .any(|c| key(&c.text) == key(expected) && c.status == Status::NotPreserved)
-    );
+    let refused = listed
+        .iter()
+        .find(|c| key(&c.text) == key(expected))
+        .unwrap_or_else(|| panic!("{expected:?} not recorded: {listed:?}"));
+    assert_eq!(refused.status, Status::NotPreserved);
 }
 
 #[test]
@@ -299,7 +292,6 @@ fn a_negation_flip_is_refused() {
         &["never turn on the heater"],
         "ever turn on the heater",
         "never turn on the heater",
-        "changes a negation",
     );
 }
 
@@ -310,7 +302,6 @@ fn a_number_change_is_refused() {
         &["set a timer for fifty minutes"],
         "set a timer for fifteen minutes",
         "set a timer for fifty minutes",
-        "changes a number",
     );
 }
 
@@ -321,7 +312,6 @@ fn a_unit_change_is_refused() {
         &["add two pints of milk"],
         "add two points of milk",
         "add two pints of milk",
-        "changes a unit",
     );
 }
 

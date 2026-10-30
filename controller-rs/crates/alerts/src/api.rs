@@ -467,3 +467,23 @@ pub enum AlertNotice {
         detail: String,
     },
 }
+
+impl AlertNotice {
+    /// The speaker the notice is about, when it is about one.
+    pub fn device(&self) -> Option<&DeviceId> {
+        match self {
+            AlertNotice::TimerFinishMissed { device, .. }
+            | AlertNotice::TimerRingUndeliverable { device, .. }
+            | AlertNotice::RingEnded { device, .. }
+            | AlertNotice::OperationRejected { device, .. }
+            | AlertNotice::MalformedEvent { device, .. }
+            | AlertNotice::CalendarProblem { device, .. }
+            | AlertNotice::TooManyOccurrences { device, .. }
+            | AlertNotice::MalformedMessage { device, .. } => Some(device),
+            AlertNotice::UnreadableJournalRow { .. }
+            | AlertNotice::DatabaseProblem(_)
+            | AlertNotice::Script { .. }
+            | AlertNotice::TimeZoneUnknown(_) => None,
+        }
+    }
+}

@@ -251,7 +251,7 @@ pub struct CaptureHub {
     started_ms: u64,
     http: reqwest::Client,
     logs: LogSink,
-    directory: OnceLock<watch::Receiver<Directory>>,
+    directory: watch::Receiver<Directory>,
     publisher: Arc<OnceLock<EventPublisher>>,
     tasks: TaskSupervisor,
 }
@@ -276,10 +276,11 @@ fn webhook_client() -> Result<reqwest::Client, String> {
 }
 
 impl CaptureHub {
-    /// The hub, with no device connected yet.
+    /// The hub over the runtimes' `directory`, with no device connected yet.
     pub fn new(
         logs: LogSink,
         publisher: Arc<OnceLock<EventPublisher>>,
+        directory: watch::Receiver<Directory>,
         tasks: TaskSupervisor,
     ) -> Result<Arc<Self>, String> {
         let http = webhook_client()?;
@@ -289,15 +290,10 @@ impl CaptureHub {
             started_ms: unix_ms(),
             http,
             logs,
-            directory: OnceLock::new(),
+            directory,
             publisher,
             tasks,
         }))
-    }
-
-    /// The device runtimes, for telling a runtime its recording changed.
-    pub fn set_directory(&self, directory: watch::Receiver<Directory>) {
-        let _ = self.directory.set(directory);
     }
 
     fn me(&self) -> Arc<Self> {
@@ -329,10 +325,7 @@ impl CaptureHub {
 
     /// Tells the device's runtime to arm or disarm its recording subscription.
     fn recording_changed(&self, device: &DeviceId) {
-        let handle = self
-            .directory
-            .get()
-            .and_then(|d| d.borrow().get(device).cloned());
+        let handle = self.directory.borrow().get(device).cloned();
         if let Some(handle) = handle
             && let Err(error) = handle.recording_changed()
         {
@@ -341,9 +334,7 @@ impl CaptureHub {
     }
 
     fn known(&self, device: &DeviceId) -> bool {
-        self.directory
-            .get()
-            .is_some_and(|d| d.borrow().contains_key(device))
+        self.directory.borrow().contains_key(device)
     }
 
     /// The device's live session, or why there is none.

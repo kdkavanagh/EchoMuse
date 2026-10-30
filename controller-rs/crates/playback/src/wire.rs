@@ -12,9 +12,10 @@
 use std::fmt;
 use std::num::NonZeroU64;
 
+use echomuse_protocol::alerts::AlertSound;
 use echomuse_protocol::session::CommandAck;
 use echomuse_protocol::vocab::AckStatus;
-use echomuse_protocol::{ControlBody, MessageType, Reported, Sha256};
+use echomuse_protocol::{ControlBody, MessageType, Reported};
 use serde::{Serialize, Serializer};
 use serde_json::{Map, Value};
 
@@ -79,11 +80,6 @@ vocabulary! {
 }
 
 impl SourceClass {
-    /// Whether the class is fed by kind-3 packets rather than a local asset.
-    pub const fn is_network(self) -> bool {
-        matches!(self, SourceClass::Content | SourceClass::DialogOutput)
-    }
-
     /// The class's slot, matching the firmware's mixer slots.
     pub(crate) const fn slot(self) -> usize {
         match self {
@@ -350,23 +346,14 @@ impl Earcon {
     }
 }
 
-/// The sound an `alert_preview` plays. A hash the device has not installed
-/// plays the fallback tone while the device fetches it.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub enum AlertPreviewSound {
-    /// `builtin:fallback`.
-    Fallback,
-    /// An uploaded alert sound, named by its SHA-256.
-    Sound(Sha256),
-}
-
 /// What a local playback plays.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum LocalSource {
     /// An `earcon`.
     Earcon(Earcon),
-    /// An `alert_preview`.
-    AlertPreview(AlertPreviewSound),
+    /// An `alert_preview`. A hash the device has not installed plays the fallback tone
+    /// while the device fetches it.
+    AlertPreview(AlertSound),
 }
 
 impl LocalSource {
@@ -382,8 +369,8 @@ impl LocalSource {
     pub fn asset(&self) -> String {
         match self {
             LocalSource::Earcon(earcon) => earcon.asset().to_owned(),
-            LocalSource::AlertPreview(AlertPreviewSound::Fallback) => "builtin:fallback".to_owned(),
-            LocalSource::AlertPreview(AlertPreviewSound::Sound(hash)) => hash.as_str().to_owned(),
+            LocalSource::AlertPreview(AlertSound::Fallback) => "builtin:fallback".to_owned(),
+            LocalSource::AlertPreview(AlertSound::Asset(hash)) => hash.as_str().to_owned(),
         }
     }
 }
@@ -629,11 +616,7 @@ impl<'a> Fields<'a> {
         field: &'static str,
         parse: fn(&str) -> Option<T>,
     ) -> Result<Reported<T>, BodyError> {
-        let text = self.string(field)?;
-        Ok(match parse(text) {
-            Some(value) => Reported::Known(value),
-            None => Reported::Unrecognized(text.to_owned()),
-        })
+        Ok(reported(self.string(field)?, parse))
     }
 
     fn decimal_u64(&self, field: &'static str) -> Result<u64, BodyError> {
@@ -695,6 +678,15 @@ fn parse_decimal_u64(text: &str) -> Option<u64> {
         return None;
     }
     text.parse().ok()
+}
+
+/// A device-reported vocabulary value: known when `parse` recognises it, otherwise kept
+/// as sent.
+pub(crate) fn reported<T>(text: &str, parse: fn(&str) -> Option<T>) -> Reported<T> {
+    match parse(text) {
+        Some(value) => Reported::Known(value),
+        None => Reported::Unrecognized(text.to_owned()),
+    }
 }
 
 /// `render.progress`: sent every 80 ms while a playback plays and on every

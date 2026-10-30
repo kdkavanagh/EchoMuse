@@ -59,7 +59,7 @@ use tokio::{
 use crate::{
     esphome_node::EsphomeNodes,
     speech_models::SpeechStatus,
-    speech_workers::{SpeechWorkerHandle, WorkerSlot},
+    speech_workers::{PerWorker, SpeechWorkerHandle, SpeechWorkerKind},
 };
 
 /// How long the device has to acknowledge a command before its outcome is unknown.
@@ -221,7 +221,7 @@ pub(crate) struct VoiceStart {
     pub(crate) capture_permitted: bool,
     /// The device row's Kiosk Satellite token; `None` while none is stored.
     pub(crate) kiosk_token: Option<String>,
-    pub(crate) workers: [SpeechWorkerHandle; 4],
+    pub(crate) workers: PerWorker<SpeechWorkerHandle>,
     pub(crate) messages: mpsc::Sender<VoiceMessage>,
 }
 
@@ -231,7 +231,7 @@ pub(crate) struct VoiceSession {
     voice: Voice,
     link: SessionLink,
     services: Arc<VoiceServices>,
-    workers: [SpeechWorkerHandle; 4],
+    workers: PerWorker<SpeechWorkerHandle>,
     session_scope: WorkScope,
     messages: mpsc::Sender<VoiceMessage>,
     decodes: HashMap<CallId, Decode>,
@@ -243,7 +243,7 @@ pub(crate) struct VoiceSession {
     /// the worker runs them. A task per job could deliver a later job's answer first
     /// (one already done when first polled overtakes one woken later), and the turn's
     /// evidence takes ASR results only in stream order.
-    answers: [mpsc::UnboundedSender<PendingAnswer>; 4],
+    answers: PerWorker<mpsc::UnboundedSender<PendingAnswer>>,
     /// Sound preview requests waiting for the machine's answer.
     previews: HashMap<PreviewId, oneshot::Sender<PreviewOutcome>>,
     next_preview: u64,
@@ -270,6 +270,41 @@ pub(crate) struct VoiceSession {
 
 /// A speech job's answer once its work returns; `None` when it was cancelled.
 type PendingAnswer = std::pin::Pin<Box<dyn Future<Output = Option<Input>> + Send>>;
+
+/// The state one speech worker keeps between a session's jobs: each worker runs exactly
+/// one of these, so a job is sent to the worker its state names.
+trait WorkerState: Send + 'static {
+    const WORKER: SpeechWorkerKind;
+    fn start(models: Arc<dyn ModelSet>) -> Self;
+}
+
+impl WorkerState for MicAnalysis {
+    const WORKER: SpeechWorkerKind = SpeechWorkerKind::MicrophoneAnalysis;
+    fn start(models: Arc<dyn ModelSet>) -> Self {
+        Self::new(models)
+    }
+}
+
+impl WorkerState for ReferenceScoring {
+    const WORKER: SpeechWorkerKind = SpeechWorkerKind::ReferenceScoring;
+    fn start(models: Arc<dyn ModelSet>) -> Self {
+        Self::new(models)
+    }
+}
+
+impl WorkerState for WakeVerification {
+    const WORKER: SpeechWorkerKind = SpeechWorkerKind::WakeVerification;
+    fn start(models: Arc<dyn ModelSet>) -> Self {
+        Self::new(models)
+    }
+}
+
+impl WorkerState for SpanDecoding {
+    const WORKER: SpeechWorkerKind = SpeechWorkerKind::SpanDecoding;
+    fn start(models: Arc<dyn ModelSet>) -> Self {
+        Self::new(models)
+    }
+}
 
 /// Posts one worker's answers to the runtime in the order they were queued. Ends when
 /// the session's machine is gone or the runtime stops listening.
@@ -357,8 +392,8 @@ macro_rules! each_body {
 }
 
 impl VoiceSession {
-    /// Starts a session's voice path; `None` when the device has no usable wake model in
-    /// the registry (the session then runs without one, which admission prevents).
+    /// Starts a session's voice path. A device with no usable wake model in the registry
+    /// runs without one (admission prevents that).
     pub(crate) fn start(start: VoiceStart, tasks: &mut JoinSet<crate::device::Internal>) -> Self {
         let VoiceStart {
             services,
@@ -429,7 +464,7 @@ impl VoiceSession {
             write_frames(writer, frames).await;
             crate::device::Internal::VoiceTask
         });
-        let answers = std::array::from_fn(|_| {
+        let answers = PerWorker::from_fn(|_| {
             let (sender, pending) = mpsc::unbounded_channel();
             tasks.spawn(forward_answers(session, pending, messages.clone()));
             sender
@@ -833,7 +868,7 @@ impl VoiceSession {
     /// Plays an alert sound's preview; `reply` gets the machine's answer.
     pub(crate) fn preview(
         &mut self,
-        sound: echomuse_playback::AlertPreviewSound,
+        sound: echomuse_protocol::alerts::AlertSound,
         reply: oneshot::Sender<PreviewOutcome>,
         nodes: &EsphomeNodes,
         tasks: &mut JoinSet<crate::device::Internal>,
@@ -933,24 +968,18 @@ impl VoiceSession {
                     let requested: Result<PendingAck, SendError> =
                         each_body!(&body, b => self.link.request(b, generation, ACK_TIMEOUT));
                     match requested {
-                        Ok(pending) => {
-                            let messages = self.messages.clone();
-                            let session = self.session;
-                            tasks.spawn(async move {
-                                let outcome = match pending.acknowledged().await {
-                                    Ok(ack) => AckOutcome::from_ack(&ack),
-                                    Err(CommandFailure::Timeout { .. }) => {
-                                        AckOutcome::Failed(AckFailure::TimedOut)
-                                    }
-                                    Err(CommandFailure::SessionEnded { .. }) => {
-                                        AckOutcome::Failed(AckFailure::SessionEnded)
-                                    }
-                                };
-                                let input = Input::Ack { id, outcome };
-                                let _ = messages.send(VoiceMessage::Input { session, input }).await;
-                                crate::device::Internal::VoiceTask
-                            });
-                        }
+                        Ok(pending) => self.answer_later(tasks, async move {
+                            let outcome = match pending.acknowledged().await {
+                                Ok(ack) => AckOutcome::from_ack(&ack),
+                                Err(CommandFailure::Timeout { .. }) => {
+                                    AckOutcome::Failed(AckFailure::TimedOut)
+                                }
+                                Err(CommandFailure::SessionEnded { .. }) => {
+                                    AckOutcome::Failed(AckFailure::SessionEnded)
+                                }
+                            };
+                            Input::Ack { id, outcome }
+                        }),
                         Err(_) => self.post(Input::Ack {
                             id,
                             outcome: AckOutcome::Failed(AckFailure::SessionEnded),
@@ -970,24 +999,19 @@ impl VoiceSession {
                     let candidate = job.candidate.clone();
                     let bytes = job.pcm.len() * 2;
                     self.submit(
-                        3,
                         scope,
                         bytes,
-                        {
-                            let candidate = candidate.clone();
-                            move |result| Input::Verify { candidate, result }
-                        },
-                        move |models, slot| slot.state(|| WakeVerification::new(models)).run(job),
+                        move |result| Input::Verify { candidate, result },
+                        move |verify: &mut WakeVerification| verify.run(job),
                     );
                 }
                 Effect::Span { scope, turn, job } => {
                     let bytes = crate::speech_workers::span_job_bytes(&job);
                     self.submit(
-                        4,
                         scope,
                         bytes,
                         move |result| Input::Span { turn, result },
-                        move |models, slot| slot.state(|| SpanDecoding::new(models)).run(job),
+                        move |span: &mut SpanDecoding| span.run(job),
                     );
                 }
                 Effect::Ha {
@@ -1084,11 +1108,10 @@ impl VoiceSession {
         let session = self.session;
         let notice_key = key.clone();
         self.submit(
-            1,
             scope,
             bytes,
             move |result| Input::Mic { key, result },
-            move |models, slot| {
+            move |mic: &mut MicAnalysis| {
                 let mut pause = |through| {
                     if let Some(key) = &notice_key {
                         let input = Input::PauseDecoding {
@@ -1100,8 +1123,7 @@ impl VoiceSession {
                         let _ = messages.try_send(VoiceMessage::Input { session, input });
                     }
                 };
-                slot.state(|| MicAnalysis::new(models))
-                    .run_noting_pauses(job, &mut pause)
+                mic.run_noting_pauses(job, &mut pause)
             },
         );
     }
@@ -1117,30 +1139,29 @@ impl VoiceSession {
             _ => 64,
         };
         self.submit(
-            2,
             scope,
             bytes,
             move |result| Input::Reference { key, result },
-            move |models, slot| slot.state(|| ReferenceScoring::new(models)).run(job),
+            move |reference: &mut ReferenceScoring| reference.run(job),
         );
     }
 
-    /// Runs a job on worker `which` (1 microphone analysis, 2 reference scoring, 3 wake
-    /// verification, 4 span decoding) and posts its answer behind the answers of the
-    /// worker's earlier jobs. A cancelled job's answer is dropped: what asked for it is
-    /// gone.
-    fn submit<T, A, W>(&mut self, which: usize, scope: WorkScope, bytes: usize, answer: A, work: W)
+    /// Runs a job on the worker that keeps state `S` and posts its answer behind the
+    /// answers of that worker's earlier jobs. A cancelled job's answer is dropped: what
+    /// asked for it is gone.
+    fn submit<S, T, A, W>(&mut self, scope: WorkScope, bytes: usize, answer: A, work: W)
     where
+        S: WorkerState,
         T: Send + 'static,
         A: FnOnce(Result<T, RuntimeError>) -> Input + Send + 'static,
-        W: FnOnce(Arc<dyn ModelSet>, &mut WorkerSlot) -> T + Send + 'static,
+        W: FnOnce(&mut S) -> T + Send + 'static,
     {
         let answer: PendingAnswer = match self.models.clone() {
             None => Box::pin(std::future::ready(Some(answer(Err(RuntimeError::Closed))))),
             Some(models) => {
-                match self.workers[which - 1]
-                    .submit_stateful(scope, bytes, move |slot| work(models, slot))
-                {
+                match self.workers[S::WORKER].submit(scope, bytes, move |slot| {
+                    work(slot.state(|| S::start(models)))
+                }) {
                     Ok(work) => Box::pin(async move {
                         match work.result().await {
                             Err(RuntimeError::Cancelled) => None,
@@ -1153,7 +1174,7 @@ impl VoiceSession {
             }
         };
         // The forwarder ends only with the session, when nothing waits for answers.
-        let _ = self.answers[which - 1].send(answer);
+        let _ = self.answers[S::WORKER].send(answer);
     }
 
     fn ha(
@@ -1332,9 +1353,7 @@ impl VoiceSession {
     ) {
         let alerts = self.services.alerts.clone();
         let device = self.device.clone();
-        let messages = self.messages.clone();
-        let session = self.session;
-        tasks.spawn(async move {
+        self.answer_later(tasks, async move {
             let reply = match request {
                 AlertRequest::Act(act) => AlertReply::Act(alerts.act(act).await),
                 AlertRequest::SetAlarm(set) => AlertReply::SetAlarm(alerts.set_alarm(set).await),
@@ -1345,9 +1364,7 @@ impl VoiceSession {
                     AlertReply::ListAlarms(alerts.list_alarms(device, ALARM_LIMIT).await)
                 }
             };
-            let input = Input::Alert { call, reply };
-            let _ = messages.send(VoiceMessage::Input { session, input }).await;
-            crate::device::Internal::VoiceTask
+            Input::Alert { call, reply }
         });
     }
 
@@ -1425,19 +1442,30 @@ impl VoiceSession {
             let call = *call;
             let (started, result) = oneshot::channel();
             nodes.satellite(command, Some(started));
-            let messages = self.messages.clone();
-            let session = self.session;
-            tasks.spawn(async move {
+            self.answer_later(tasks, async move {
                 let result = result
                     .await
                     .unwrap_or_else(|_| Err("the satellite stopped".to_owned()));
-                let input = Input::RunStarted { call, result };
-                let _ = messages.send(VoiceMessage::Input { session, input }).await;
-                crate::device::Internal::VoiceTask
+                Input::RunStarted { call, result }
             });
             return;
         }
         nodes.satellite(command, None);
+    }
+
+    /// Runs `answer` beside the runtime and posts the input it yields to the machine.
+    fn answer_later(
+        &self,
+        tasks: &mut JoinSet<crate::device::Internal>,
+        answer: impl Future<Output = Input> + Send + 'static,
+    ) {
+        let messages = self.messages.clone();
+        let session = self.session;
+        tasks.spawn(async move {
+            let input = answer.await;
+            let _ = messages.send(VoiceMessage::Input { session, input }).await;
+            crate::device::Internal::VoiceTask
+        });
     }
 
     /// The session ended: the machine revokes what is live and queues its final

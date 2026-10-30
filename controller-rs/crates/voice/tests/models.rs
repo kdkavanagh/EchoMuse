@@ -51,7 +51,7 @@ fn assets() -> SpeechAssets {
     let pin = |name: &str, d: Sha256Digest| PinnedFile::new(kroko.join(name), d);
     let dtln = asset("ECHOMUSE_DTLN_DIR");
     SpeechAssets {
-        native: NativeLibraries::pinned(asset("ECHOMUSE_ORT_LIB"), None).unwrap(),
+        native: NativeLibraries::pinned(asset("ECHOMUSE_ORT_LIB")).unwrap(),
         kroko: KrokoModelFiles {
             encoder: pin("encoder.onnx", manifest.asr.files.encoder.sha256),
             decoder: pin("decoder.onnx", manifest.asr.files.decoder.sha256),
@@ -154,8 +154,9 @@ fn mic_analysis_streams_the_test_wav() {
         .iter()
         .filter(|v| matches!(v, VadInput::Probability(p) if p.get() >= 0.5))
         .count();
-    assert_eq!(observations.len(), pcm.len() / 1_280);
     let last = observations.last().unwrap();
+    // The last packet may be shorter than 80 ms; its audio must still reach ASR.
+    assert_eq!(last.through, Sample(start + pcm.len() as u64));
     let text: String = last.tokens.iter().map(|t| t.text.as_str()).collect();
     let finalized: Vec<_> = observations
         .iter()

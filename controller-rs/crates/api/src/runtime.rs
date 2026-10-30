@@ -10,7 +10,7 @@
 //!
 //! [`live`]: DeviceRuntimes::live
 
-use std::{collections::BTreeMap, fmt, future::Future, net::IpAddr, pin::Pin, sync::Arc};
+use std::{collections::BTreeMap, fmt, net::IpAddr, sync::Arc};
 
 use echomuse_core::types::DeviceId;
 use echomuse_protocol::{Capabilities, Capability, Platform};
@@ -20,6 +20,7 @@ use crate::{
     devices::DeviceLabel,
     events::DeviceStatePatch,
     gaps::{GapReason, capability_gaps},
+    services::BoxFuture,
 };
 
 /// What a device's runtime last published: the part of the device object that only
@@ -248,65 +249,21 @@ pub trait DeviceRuntimes: Send + Sync + 'static {
         &self,
         device: DeviceId,
         label: DeviceLabel,
-    ) -> impl Future<Output = Result<(), RuntimeError>> + Send;
+    ) -> BoxFuture<'_, Result<(), RuntimeError>>;
 
     /// Delete a device (§5.7.6): revoke its admission and routing, stop its runtime and
     /// listeners, then delete its row and every record and file kept for it. Completes
     /// when it is gone.
-    fn delete(&self, device: DeviceId) -> impl Future<Output = Result<(), RuntimeError>> + Send;
+    fn delete(&self, device: DeviceId) -> BoxFuture<'_, Result<(), RuntimeError>>;
 
     /// Settings changed: send each changed, connected device its new configuration,
     /// and renegotiate the session of each in [`SettingsApplied::new_session`]. Returns
     /// the devices the change was sent to.
-    fn settings_applied(
-        &self,
-        change: SettingsApplied,
-    ) -> impl Future<Output = Vec<DeviceId>> + Send;
+    fn settings_applied(&self, change: SettingsApplied) -> BoxFuture<'_, Vec<DeviceId>>;
 
     /// A device's label was stored: services that name the device (its Home Assistant
     /// calendar, its ESPHome nodes) learn the new one.
-    fn relabeled(&self, device: DeviceId, label: String) -> impl Future<Output = ()> + Send;
-}
-
-type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
-
-/// [`DeviceRuntimes`] behind a pointer.
-pub(crate) trait Runtimes: Send + Sync + 'static {
-    fn live(&self, device: &DeviceId) -> Option<LiveDevice>;
-    fn approve(
-        &self,
-        device: DeviceId,
-        label: DeviceLabel,
-    ) -> BoxFuture<'_, Result<(), RuntimeError>>;
-    fn delete(&self, device: DeviceId) -> BoxFuture<'_, Result<(), RuntimeError>>;
-    fn settings_applied(&self, change: SettingsApplied) -> BoxFuture<'_, Vec<DeviceId>>;
     fn relabeled(&self, device: DeviceId, label: String) -> BoxFuture<'_, ()>;
-}
-
-impl<R: DeviceRuntimes> Runtimes for R {
-    fn live(&self, device: &DeviceId) -> Option<LiveDevice> {
-        DeviceRuntimes::live(self, device)
-    }
-
-    fn approve(
-        &self,
-        device: DeviceId,
-        label: DeviceLabel,
-    ) -> BoxFuture<'_, Result<(), RuntimeError>> {
-        Box::pin(DeviceRuntimes::approve(self, device, label))
-    }
-
-    fn delete(&self, device: DeviceId) -> BoxFuture<'_, Result<(), RuntimeError>> {
-        Box::pin(DeviceRuntimes::delete(self, device))
-    }
-
-    fn settings_applied(&self, change: SettingsApplied) -> BoxFuture<'_, Vec<DeviceId>> {
-        Box::pin(DeviceRuntimes::settings_applied(self, change))
-    }
-
-    fn relabeled(&self, device: DeviceId, label: String) -> BoxFuture<'_, ()> {
-        Box::pin(DeviceRuntimes::relabeled(self, device, label))
-    }
 }
 
 #[cfg(test)]

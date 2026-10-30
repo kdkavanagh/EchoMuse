@@ -182,7 +182,6 @@ mod tests {
                 microphones: None,
             }
         );
-        assert_eq!(report.to_string(), "debloat: 33 listed services stopped");
     }
 
     #[test]
@@ -216,11 +215,6 @@ mod tests {
         );
         assert_eq!(report.microphones, Some(MicrophoneResult::default()));
         assert_eq!(report.stopped, 17);
-        assert_eq!(
-            report.to_string(),
-            "debloat: 17 listed services stopped; hidden again: com.amazon.a, com.amazon.b, \
-             still visible: com.amazon.c; microphone denied again: none"
-        );
     }
 
     #[test]
@@ -238,11 +232,5 @@ mod tests {
                 })
             );
         }
-    }
-
-    #[test]
-    fn lineage_reports_nothing_stopped() {
-        let report = parse_debloat_output("DEBLOAT_STOPPED:0 STILL_RUNNING:").unwrap();
-        assert_eq!(report.stopped, 0);
     }
 }

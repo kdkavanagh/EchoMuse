@@ -1,9 +1,16 @@
 //! The client handle: starting the session, commands, subscriptions and REST calls.
 
-use std::{fmt, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    sync::{Arc, Weak},
+    time::Duration,
+};
 
 use echomuse_core::{
-    services::{COMMAND_TIMEOUT, HaConnectionGeneration, HaError, NotDispatched},
+    services::{
+        COMMAND_TIMEOUT, EffectOutcome, HaConnectionGeneration, HaError, NotDispatched,
+        UnknownCause,
+    },
     types::WorkScope,
 };
 use rustls::{ClientConfig, RootCertStore};
@@ -109,7 +116,7 @@ pub struct Subscription {
     /// The events in HA's order; ends with the connection or on falling behind.
     pub events: mpsc::Receiver<HaEvent>,
     id: u64,
-    link: std::sync::Weak<Link>,
+    link: Weak<Link>,
 }
 
 /// A REST call that did not produce a response.
@@ -232,6 +239,22 @@ impl HaClient {
         }
     }
 
+    /// Sends a state-changing command whose result carries nothing the caller reads.
+    /// Never resent once it may have been sent.
+    pub(crate) async fn apply(&self, body: Map<String, Value>) -> EffectOutcome<()> {
+        match self
+            .command(None, body, self.shared.options.command_timeout)
+            .await
+        {
+            Ok(_) => EffectOutcome::Applied(()),
+            Err(HaError::NotDispatched(reason)) => EffectOutcome::NotDispatched(reason),
+            Err(HaError::Rejected { code, message }) => EffectOutcome::Rejected { code, message },
+            Err(HaError::Timeout) => EffectOutcome::Unknown(UnknownCause::Timeout),
+            Err(HaError::ConnectionLost) => EffectOutcome::Unknown(UnknownCause::ConnectionLost),
+            Err(HaError::BadResponse(_)) => EffectOutcome::Unknown(UnknownCause::Inconclusive),
+        }
+    }
+
     /// Subscribes to HA's events of `event_type` on the current connection.
     pub async fn subscribe_events(&self, event_type: &str) -> Result<Subscription, HaError> {
         let link = self
@@ -270,14 +293,21 @@ impl HaClient {
     /// Ends `subscription`. Once its connection is gone HA has already forgotten it, and
     /// this only drops the local end.
     pub async fn unsubscribe(&self, subscription: Subscription) -> Result<(), HaError> {
-        let Some(link) = subscription.link.upgrade() else {
+        self.end_subscription(subscription.link, subscription.id)
+            .await
+    }
+
+    /// Ends the subscription `id` on `link`, an `unsubscribe_events` for both kinds of
+    /// subscription. A connection that is already gone needs nothing sent.
+    pub(crate) async fn end_subscription(&self, link: Weak<Link>, id: u64) -> Result<(), HaError> {
+        let Some(link) = link.upgrade() else {
             return Ok(());
         };
-        link.remove(subscription.id);
+        link.remove(id);
         if link.is_lost() {
             return Ok(());
         }
-        let body = object(json!({"type": "unsubscribe_events", "subscription": subscription.id}));
+        let body = object(json!({"type": "unsubscribe_events", "subscription": id}));
         match self
             .command(None, body, self.shared.options.command_timeout)
             .await
@@ -341,6 +371,55 @@ pub(crate) fn object(value: Value) -> Map<String, Value> {
         Value::Object(map) => map,
         _ => unreachable!("request bodies are object literals"),
     }
+}
+
+/// The outcome of a state-changing REST call: a 4xx is a refusal made before anything
+/// changed; any other failure after sending is unknown, as is a 2xx answer `read` cannot
+/// use.
+pub(crate) fn rest_effect<T>(
+    sent: Result<(u16, Vec<u8>), RestFailure>,
+    read: impl FnOnce(&[u8]) -> Option<T>,
+) -> EffectOutcome<T> {
+    match sent {
+        Err(RestFailure::NotSent) => EffectOutcome::NotDispatched(NotDispatched::Unavailable),
+        Err(RestFailure::TimedOut) => EffectOutcome::Unknown(UnknownCause::Timeout),
+        Err(RestFailure::Lost) => EffectOutcome::Unknown(UnknownCause::ConnectionLost),
+        Ok((status, body)) if (200..300).contains(&status) => read(&body).map_or(
+            EffectOutcome::Unknown(UnknownCause::Inconclusive),
+            EffectOutcome::Applied,
+        ),
+        Ok((status, body)) if (400..500).contains(&status) => EffectOutcome::Rejected {
+            code: status.to_string(),
+            message: rest_message(&body),
+        },
+        Ok(_) => EffectOutcome::Unknown(UnknownCause::Inconclusive),
+    }
+}
+
+/// A REST read: 2xx gives the body, anything else is a refusal.
+pub(crate) fn rest_read(sent: Result<(u16, Vec<u8>), RestFailure>) -> Result<Vec<u8>, HaError> {
+    let (status, body) = sent?;
+    if (200..300).contains(&status) {
+        Ok(body)
+    } else {
+        Err(HaError::Rejected {
+            code: status.to_string(),
+            message: rest_message(&body),
+        })
+    }
+}
+
+/// HA's JSON `message`, or the body as text.
+pub(crate) fn rest_message(body: &[u8]) -> String {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| String::from_utf8_lossy(body).into_owned())
 }
 
 /// Trust roots from the operating system's store, with the `ring` provider chosen

@@ -32,7 +32,7 @@ use std::{
     time::Duration,
 };
 
-use echomuse_api::{ModelCandidate, ModelQualifier, ModelRefused};
+use echomuse_api::{BoxFuture, ModelCandidate, ModelQualifier, ModelRefused};
 use echomuse_settings::registry::ProbeResult;
 use echomuse_speech::{
     BcresnetModelFiles, BcresnetScorer, NativeLibraries, OrtRuntime, PinnedFile, Sha256Digest,
@@ -175,8 +175,8 @@ impl WakeModelQualifier {
     /// `scratch` is where candidate files are written for the children.
     pub async fn prepare(onnxruntime_lib: PathBuf, program: PathBuf, scratch: PathBuf) -> Self {
         let checked = tokio::task::spawn_blocking(move || {
-            let native = NativeLibraries::pinned(onnxruntime_lib.clone(), None)
-                .map_err(|e| e.to_string())?;
+            let native =
+                NativeLibraries::pinned(onnxruntime_lib.clone()).map_err(|e| e.to_string())?;
             native
                 .onnxruntime
                 .verify()
@@ -211,24 +211,29 @@ impl WakeModelQualifier {
 }
 
 impl ModelQualifier for WakeModelQualifier {
-    async fn qualify(&self, candidate: ModelCandidate) -> Result<ProbeResult, ModelRefused> {
-        let (native, program, scratch) = match &*self.state {
-            State::Unavailable(reason) => return Err(ModelRefused(reason.clone())),
-            State::Ready {
-                native,
-                program,
-                scratch,
-            } => (native.clone(), program.clone(), scratch.clone()),
-        };
-        let dir = scratch.join(format!(
-            ".qualifying-{}-{}",
-            std::process::id(),
-            NEXT_SCRATCH.fetch_add(1, Ordering::Relaxed)
-        ));
-        let result = qualify_files(&native, &program, &dir, &candidate).await;
-        let cleanup = dir.clone();
-        let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(cleanup)).await;
-        result
+    fn qualify(
+        &self,
+        candidate: ModelCandidate,
+    ) -> BoxFuture<'_, Result<ProbeResult, ModelRefused>> {
+        Box::pin(async move {
+            let (native, program, scratch) = match &*self.state {
+                State::Unavailable(reason) => return Err(ModelRefused(reason.clone())),
+                State::Ready {
+                    native,
+                    program,
+                    scratch,
+                } => (native.clone(), program.clone(), scratch.clone()),
+            };
+            let dir = scratch.join(format!(
+                ".qualifying-{}-{}",
+                std::process::id(),
+                NEXT_SCRATCH.fetch_add(1, Ordering::Relaxed)
+            ));
+            let result = qualify_files(&native, &program, &dir, &candidate).await;
+            let cleanup = dir.clone();
+            let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(cleanup)).await;
+            result
+        })
     }
 }
 

@@ -1,14 +1,12 @@
 //! A simulated device link for tests: records every command and frame in
-//! order, models the audio writer's queue, and lets a test mark the packet
-//! being written.
+//! order and models the audio writer's queue.
 
 use std::collections::VecDeque;
 
 use echomuse_protocol::MessageId;
 use serde_json::{Map, Value, json};
-use tokio_util::sync::CancellationToken;
 
-use crate::link::{CommandLink, FramePurge, FrameRefused, LinkClosed, RenderFrame, RenderLink};
+use crate::link::{CommandLink, FrameRefused, LinkClosed, RenderFrame, RenderLink};
 use crate::wire::{AckOutcome, Command, RenderReport};
 
 /// One thing the client sent, in order.
@@ -26,12 +24,8 @@ pub struct SimLink {
     pub sent: Vec<Sent>,
     /// Frames queued and not yet written.
     pub queue: VecDeque<RenderFrame>,
-    /// The frame being written, whose delivery is uncertain.
-    pub writing: Option<RenderFrame>,
     pub capacity: usize,
     pub closed: bool,
-    /// Whether `withdraw_frames` reports exactly.
-    pub exact_purge: bool,
 }
 
 impl SimLink {
@@ -39,10 +33,8 @@ impl SimLink {
         Self {
             sent: Vec::new(),
             queue: VecDeque::new(),
-            writing: None,
             capacity: 1_000,
             closed: false,
-            exact_purge: true,
         }
     }
 
@@ -74,14 +66,8 @@ impl SimLink {
             .collect()
     }
 
-    /// The writer takes the head of the queue and starts writing it.
-    pub fn begin_write(&mut self) {
-        self.writing = self.queue.pop_front();
-    }
-
     /// The writer drains everything queued.
     pub fn write_all(&mut self) {
-        self.writing = None;
         self.queue.clear();
     }
 }
@@ -113,29 +99,6 @@ impl RenderLink for SimLink {
         self.queue.push_back(frame);
         Ok(())
     }
-
-    fn withdraw_frames(&mut self, playback: &CancellationToken) -> FramePurge {
-        let before = self.queue.len();
-        self.queue.retain(|frame| !frame.playback.is_cancelled());
-        let withdrawn = (before - self.queue.len()) as u64;
-        let in_write = self
-            .writing
-            .take_if(|frame| frame.playback.is_cancelled())
-            .map(|frame| frame.sequence);
-        let _ = playback;
-        if self.exact_purge {
-            FramePurge::Exact {
-                withdrawn,
-                in_write,
-            }
-        } else {
-            FramePurge::Unknown
-        }
-    }
-}
-
-pub fn accepted() -> AckOutcome {
-    AckOutcome::Accepted
 }
 
 pub fn rejected(code: &str) -> AckOutcome {

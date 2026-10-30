@@ -1,9 +1,9 @@
 //! The narrow view of the device link this crate needs.
 //!
 //! The device link crate owns the sockets, envelopes and acknowledgement
-//! correlation. Playback needs three things from it: queue a command the device
-//! acknowledges, queue a kind-3 render frame without waiting, and withdraw a
-//! cancelled playback's frames that are still queued. Reports travel the other
+//! correlation. Playback needs two things from it: queue a command the device
+//! acknowledges, and queue a kind-3 render frame without waiting, which the
+//! link's writer drops unwritten once its playback is cancelled. Reports travel the other
 //! way through the device runtime: it receives `command.ack`,
 //! `render.progress` and `render.finished` in ingress order and hands them to
 //! [`RenderClient`](crate::RenderClient) and [`FocusLease`](crate::FocusLease)
@@ -63,35 +63,8 @@ pub enum FrameRefused {
     Closed,
 }
 
-/// What withdrawing a cancelled playback's frames achieved.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FramePurge {
-    /// The link knows exactly: the newest `withdrawn` frames it had queued
-    /// for the playback were dropped unwritten, and `in_write` is the
-    /// sequence number of the packet that was being written, whose delivery
-    /// is uncertain.
-    Exact {
-        /// Packets dropped unwritten.
-        withdrawn: u64,
-        /// The packet being written at the moment of cancellation.
-        in_write: Option<u64>,
-    },
-    /// The link drops the playback's queued frames but cannot say which had
-    /// already been written.
-    Unknown,
-}
-
 /// Sends render frames as well as commands.
 pub trait RenderLink: CommandLink {
     /// Queues one frame without waiting.
     fn queue_frame(&mut self, frame: RenderFrame) -> Result<(), FrameRefused>;
-
-    /// Called after `playback` has been cancelled: drops that playback's
-    /// frames that are still queued and reports what happened. A link whose
-    /// writer already skips frames with a cancelled token, and cannot tell
-    /// which were written, keeps this default.
-    fn withdraw_frames(&mut self, playback: &CancellationToken) -> FramePurge {
-        debug_assert!(playback.is_cancelled());
-        FramePurge::Unknown
-    }
 }

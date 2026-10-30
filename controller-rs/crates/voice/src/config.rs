@@ -124,7 +124,9 @@ mod tests {
         assert_eq!(
             body(&config),
             serde_json::json!({
-                "startupVolume": 85, "duckDb": -18.0, "bleProxyEnabled": false,
+                "startupVolume": settings.state.startup_volume.get(),
+                "duckDb": settings.playback.duck_db.get(),
+                "bleProxyEnabled": settings.bluetooth.ble_proxy_enabled,
                 "wakeSound": true,
             })
         );
@@ -137,7 +139,10 @@ mod tests {
         let config = DeviceConfig::new(&capabilities(&[]), &settings, None);
         assert_eq!(
             body(&config),
-            serde_json::json!({"startupVolume": 85, "duckDb": -18.0})
+            serde_json::json!({
+                "startupVolume": settings.state.startup_volume.get(),
+                "duckDb": settings.playback.duck_db.get(),
+            })
         );
     }
 
@@ -156,10 +161,15 @@ mod tests {
         assert_eq!(
             body(&config),
             serde_json::json!({
-                "startupVolume": 85, "duckDb": -18.0, "wakeSound": false,
-                "screenWake": false, "screenWakeUrl": "http://127.0.0.1:2323",
-                "screenWakePassword": "", "kioskToken": "kiosk-secret", "kioskPort": 2324,
-                "turnViewLinger": 6.0,
+                "startupVolume": settings.state.startup_volume.get(),
+                "duckDb": settings.playback.duck_db.get(),
+                "wakeSound": settings.wakeword.wake_sound,
+                "screenWake": settings.screen.screen_wake,
+                "screenWakeUrl": settings.screen.screen_wake_url.as_str(),
+                "screenWakePassword": settings.screen.screen_wake_password.expose(),
+                "kioskToken": "kiosk-secret",
+                "kioskPort": settings.screen.kiosk_port.get(),
+                "turnViewLinger": settings.screen.turn_view_linger.get(),
             })
         );
         // The secrets never reach a log line.

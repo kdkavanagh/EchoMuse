@@ -107,7 +107,6 @@ impl ReferenceScoring {
             ReferenceJob::Pcm { ref key, .. }
             | ReferenceJob::Silence { ref key, .. }
             | ReferenceJob::Missing { ref key, .. }
-            | ReferenceJob::Ended { ref key }
             | ReferenceJob::Judge { ref key, .. } => key.clone(),
         };
         let Some(stream) = self.streams.get_mut(&key) else {
@@ -151,7 +150,6 @@ impl ReferenceScoring {
                 },
                 Some(s),
             ) => s.push_missing(reference_epoch, first, end),
-            (ReferenceJob::Ended { .. }, Some(s)) => s.reference_ended(),
             _ => {}
         }
         if let Some(s) = &mut stream.scorer {
@@ -322,19 +320,6 @@ mod tests {
         w.run(pcm(&k, 0, &silence(6_250)));
         let out = w.run(judge(&k, "c1"));
         assert_eq!(out.judgements[0].1.score, ReferenceScore::NoOverlap);
-    }
-
-    #[test]
-    fn a_reference_that_ends_answers_a_waiting_judgement() {
-        let mut w = ReferenceScoring::new(Arc::new(ToneModels::new(&["ophelia"])));
-        let k = key(1);
-        open(&mut w, &k, Some(graph()));
-        w.run(pcm(&k, 0, &silence(3_000)));
-        assert!(w.run(judge(&k, "c1")).judgements.is_empty());
-        let out = w.run(ReferenceJob::Ended { key: k.clone() });
-        let j = out.judgements[0].1;
-        assert_eq!(j.score, ReferenceScore::Unavailable);
-        assert_eq!(j.unavailable, Some(ReferenceUnavailable::Ended));
     }
 
     #[test]

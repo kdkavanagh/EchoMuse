@@ -130,7 +130,7 @@ fn load(paths: &SpeechPaths, program: &Path) -> Result<Arc<dyn ModelSet>, String
     let manifest_path = paths.bundle_dir.join("speech_bundle.json");
     let manifest = SpeechBundleManifest::load(&manifest_path)
         .map_err(|e| format!("speech bundle manifest {}: {e}", manifest_path.display()))?;
-    let native = NativeLibraries::pinned(paths.onnxruntime_lib.clone(), None)
+    let native = NativeLibraries::pinned(paths.onnxruntime_lib.clone())
         .map_err(|e| format!("ONNX Runtime {}: {e}", paths.onnxruntime_lib.display()))?;
     let test_wav = kroko_test_wav(&manifest, &paths.bundle_dir)?;
     let assets = SpeechAssets::new(

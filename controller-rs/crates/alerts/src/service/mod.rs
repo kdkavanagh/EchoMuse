@@ -33,7 +33,7 @@ use std::{
 };
 
 use echomuse_core::{
-    services::{HaConnectionGeneration, UnknownCause},
+    services::{HaConnectionGeneration, TimerEvent, TimerEventKind, UnknownCause},
     types::{DeviceId, SessionId},
 };
 use echomuse_db::DbHandle;
@@ -71,9 +71,9 @@ use crate::{
         RestoreGuard, SetDeliveryPosition, State, request_digest,
     },
     ports::{AlertClock, AlertHa, AlertLink, CommandOutcome, SessionRef},
-    relay::{self, CancelSelector, RelayCall, RelayRequest},
-    schedule::{HaTimeZone, local_text},
-    timers::{TimerEvent, TimerEventKind, Timers},
+    relay::{self, CancelSelector, RelayCall, RelayRequest, RelayShape},
+    schedule::{HaTimeZone, TimeOfDay, local_text},
+    timers::Timers,
     wire::{
         ActAction, ActSource, AlertAct, AlertInbound, AlertLocalOperation, AlertOpResult,
         AlertPrefetch, AlertRing, AlertState, CommandBody, LocalAction, LocalSource, OpResultState,
@@ -166,20 +166,6 @@ pub(crate) enum Deliver {
     Relay {
         request_id: String,
         shape: RelayShape,
-    },
-}
-
-/// How a relay answer is worded.
-#[derive(Clone, Debug)]
-pub(crate) enum RelayShape {
-    Set {
-        speaker: String,
-    },
-    Cancel,
-    Stop {
-        kind: RingKind,
-        name: String,
-        snooze: bool,
     },
 }
 
@@ -539,6 +525,11 @@ struct Endpoint {
     intent_waits: u32,
     applier: mpsc::UnboundedSender<ApplierJob>,
     feed: mpsc::UnboundedSender<FeedControl>,
+    /// Acts written to this speaker whose outcome no journal row records yet: the device
+    /// acknowledged one and has its local operation still to upload, or never answered.
+    /// A repeat under the same id waits instead of sending again; the entry lasts until
+    /// that operation is journaled, for as long as the speaker is registered.
+    unconfirmed_acts: HashMap<OpId, RingKind>,
     tasks: Vec<AbortHandle>,
 }
 
@@ -556,6 +547,35 @@ impl Endpoint {
             .is_some_and(|a| a.capabilities.contains(capability))
     }
 
+    /// The reason the restore guard tombstones an occurrence: an applied operation
+    /// already handled it.
+    fn guarded(&self, occurrence: &Occurrence) -> Option<TombstoneReason> {
+        if let Some(action) = self
+            .guard
+            .get(&(occurrence.schedule_id, occurrence.key.clone()))
+        {
+            return Some(tombstone_for(*action));
+        }
+        self.cancelled
+            .contains(&occurrence.schedule_id)
+            .then_some(TombstoneReason::Deleted)
+    }
+
+    /// The reason a pending operation that handles `occurrence` tombstones it.
+    fn pending_reason(&self, occurrence: &Occurrence) -> Option<TombstoneReason> {
+        self.pending.values().find_map(|effect| match effect {
+            PendingEffect::Occurrence {
+                schedule,
+                key,
+                reason,
+            } if *schedule == occurrence.schedule_id && *key == occurrence.key => Some(*reason),
+            PendingEffect::Schedule(schedule) if *schedule == occurrence.schedule_id => {
+                Some(TombstoneReason::Deleted)
+            }
+            _ => None,
+        })
+    }
+
     /// Why an occurrence is not live, or `None` when it is.
     fn exclusion(
         &self,
@@ -563,31 +583,11 @@ impl Endpoint {
         now: i64,
         catch_up: i64,
     ) -> Option<TombstoneReason> {
-        if let Some(action) = self
-            .guard
-            .get(&(occurrence.schedule_id, occurrence.key.clone()))
-        {
-            return Some(tombstone_for(*action));
-        }
-        if self.cancelled.contains(&occurrence.schedule_id) {
-            return Some(TombstoneReason::Deleted);
-        }
-        for effect in self.pending.values() {
-            match effect {
-                PendingEffect::Occurrence {
-                    schedule,
-                    key,
-                    reason,
-                } if *schedule == occurrence.schedule_id && *key == occurrence.key => {
-                    return Some(*reason);
-                }
-                PendingEffect::Schedule(schedule) if *schedule == occurrence.schedule_id => {
-                    return Some(TombstoneReason::Deleted);
-                }
-                _ => {}
-            }
-        }
-        (occurrence.due_utc_ms < now - catch_up).then_some(TombstoneReason::Expired)
+        self.guarded(occurrence)
+            .or_else(|| self.pending_reason(occurrence))
+            .or_else(|| {
+                (occurrence.due_utc_ms < now - catch_up).then_some(TombstoneReason::Expired)
+            })
     }
 
     fn live<'a>(&'a self, now: i64, catch_up: i64) -> impl Iterator<Item = &'a Occurrence> + 'a {
@@ -640,6 +640,7 @@ impl Wait {
 }
 
 struct ActFlight {
+    device: DeviceId,
     kind: RingKind,
     delivers: Vec<Deliver>,
 }
@@ -891,6 +892,7 @@ impl<H: AlertHa, L: AlertLink, C: AlertClock> Core<H, L, C> {
             intent_waits: 0,
             applier: applier_tx,
             feed: feed_tx,
+            unconfirmed_acts: HashMap::new(),
             tasks: vec![applier, feed],
         };
         for entry in guard_rows {
@@ -927,15 +929,8 @@ impl<H: AlertHa, L: AlertLink, C: AlertClock> Core<H, L, C> {
         endpoint.config = config;
         // A connected speaker installs a newly chosen timer sound now, not as the timer
         // finishes (alarm sounds the device fetches itself for the alarms it holds).
-        if timer_sound_changed
-            && endpoint.attached.is_some()
-            && endpoint.capable(Capability::AlertPrefetch)
-            && let AlertSound::Asset(sha) = &endpoint.config.timer_sound
-        {
-            let body = CommandBody::Prefetch(AlertPrefetch {
-                sounds: vec![sha.clone()],
-            });
-            self.command(&device, body, |_| None);
+        if timer_sound_changed {
+            self.prefetch_timer_sound(&device);
         }
         if sound_changed {
             self.rebuild_view(&device).await;
@@ -968,14 +963,7 @@ impl<H: AlertHa, L: AlertLink, C: AlertClock> Core<H, L, C> {
             let view = endpoint.timers.view(Instant::now());
             self.post(&device, PostBody::TimerView(view));
         }
-        if let AlertSound::Asset(sha) = &endpoint.config.timer_sound
-            && endpoint.capable(Capability::AlertPrefetch)
-        {
-            let body = CommandBody::Prefetch(AlertPrefetch {
-                sounds: vec![sha.clone()],
-            });
-            self.command(&device, body, |_| None);
-        }
+        self.prefetch_timer_sound(&device);
         self.publish_rings();
     }
 
@@ -992,6 +980,23 @@ impl<H: AlertHa, L: AlertLink, C: AlertClock> Core<H, L, C> {
             delivery.detach(session);
         }
         self.publish_rings();
+    }
+
+    /// Has a connected speaker that installs sounds ahead fetch its timer sound.
+    fn prefetch_timer_sound(&mut self, device: &DeviceId) {
+        let Some(sha) = self
+            .endpoints
+            .get(device)
+            .filter(|e| e.capable(Capability::AlertPrefetch))
+            .and_then(|e| match &e.config.timer_sound {
+                AlertSound::Asset(sha) => Some(sha.clone()),
+                _ => None,
+            })
+        else {
+            return;
+        };
+        let body = CommandBody::Prefetch(AlertPrefetch { sounds: vec![sha] });
+        self.command(device, body, |_| None);
     }
 
     fn publish_rings(&self) {
@@ -1276,13 +1281,9 @@ impl<H: AlertHa, L: AlertLink, C: AlertClock> Core<H, L, C> {
             endpoint
                 .known
                 .insert(occurrence.occurrence_id, occurrence.clone());
-            if endpoint
-                .guard
-                .contains_key(&(occurrence.schedule_id, occurrence.key.clone()))
-                || endpoint.cancelled.contains(&occurrence.schedule_id)
-            {
+            if endpoint.guarded(&occurrence).is_some() {
                 guard_delete(endpoint, &entity, &occurrence);
-            } else if !endpoint.pending_targets(&occurrence) {
+            } else if endpoint.pending_reason(&occurrence).is_none() {
                 missed.push(occurrence);
             }
         }
@@ -1325,14 +1326,10 @@ impl<H: AlertHa, L: AlertLink, C: AlertClock> Core<H, L, C> {
                     detail: detail.clone(),
                 });
             }
-            if endpoint
-                .guard
-                .contains_key(&(occurrence.schedule_id, occurrence.key.clone()))
-                || endpoint.cancelled.contains(&occurrence.schedule_id)
-            {
+            if endpoint.guarded(occurrence).is_some() {
                 guard_delete(endpoint, &entity, occurrence);
             } else if occurrence.due_utc_ms < now - catch_up
-                && !endpoint.pending_targets(occurrence)
+                && endpoint.pending_reason(occurrence).is_none()
             {
                 missed.push(occurrence.clone());
             }
@@ -1508,6 +1505,9 @@ impl<H: AlertHa, L: AlertLink, C: AlertClock> Core<H, L, C> {
             Ok(rows) => {
                 if let Some(row) = rows.into_iter().next() {
                     // Already journaled: answer once it has settled.
+                    if let Some(endpoint) = self.endpoints.get_mut(device) {
+                        endpoint.unconfirmed_acts.remove(&op_id);
+                    }
                     return self.post_op_result(device, &row);
                 }
             }
@@ -1605,7 +1605,11 @@ impl<H: AlertHa, L: AlertLink, C: AlertClock> Core<H, L, C> {
         if let Some(outcomes) = self.journal(device, vec![new]).await
             && let Some(Journaled::Inserted(row) | Journaled::Existing(row)) = outcomes.first()
         {
-            // An act waiting on this operation now has a row to follow.
+            // An act waiting on this operation now has a row to follow, which also answers
+            // any later repeat of it.
+            if let Some(endpoint) = self.endpoints.get_mut(device) {
+                endpoint.unconfirmed_acts.remove(&op_id);
+            }
             self.attach_row_to_waits(row.clone());
         }
         self.refresh(device).await;
@@ -1651,20 +1655,29 @@ impl<H: AlertHa, L: AlertLink, C: AlertClock> Core<H, L, C> {
         }
     }
 
+    /// The row a repeated request was journaled under, if any; a different request
+    /// under the same id is `op_id_conflict`.
+    async fn repeated(&self, op: OpId, request: &Value) -> Result<Option<OpRow>, Refusal> {
+        let row = self
+            .existing(op)
+            .await
+            .map_err(|()| Refusal::InvalidRequest("journal unavailable".to_owned()))?;
+        match row {
+            Some(row)
+                if request_digest(request).ok().as_deref() != Some(row.payload_sha256.as_str()) =>
+            {
+                Err(Refusal::OpIdConflict)
+            }
+            row => Ok(row),
+        }
+    }
+
     async fn set_alarm(&mut self, request: SetAlarm, deliver: Deliver) {
         let op = request.op_id;
         let body = ops::set_request(&request);
-        match self.existing(op).await {
-            Err(()) => {
-                return self.refuse(
-                    deliver,
-                    Refusal::InvalidRequest("journal unavailable".to_owned()),
-                );
-            }
+        match self.repeated(op, &body).await {
+            Err(refusal) => return self.refuse(deliver, refusal),
             Ok(Some(row)) => {
-                if request_digest(&body).ok().as_deref() != Some(row.payload_sha256.as_str()) {
-                    return self.refuse(deliver, Refusal::OpIdConflict);
-                }
                 return self.wait_rows(
                     vec![op],
                     vec![Some(row)],
@@ -1769,17 +1782,9 @@ impl<H: AlertHa, L: AlertLink, C: AlertClock> Core<H, L, C> {
     async fn cancel_alarms(&mut self, request: CancelAlarms, deliver: Deliver) {
         let root = request.op_id;
         let body = ops::cancel_request(&request.endpoint.0, &request.selector);
-        match self.existing(root).await {
-            Err(()) => {
-                return self.refuse(
-                    deliver,
-                    Refusal::InvalidRequest("journal unavailable".to_owned()),
-                );
-            }
+        match self.repeated(root, &body).await {
+            Err(refusal) => return self.refuse(deliver, refusal),
             Ok(Some(row)) => {
-                if request_digest(&body).ok().as_deref() != Some(row.payload_sha256.as_str()) {
-                    return self.refuse(deliver, Refusal::OpIdConflict);
-                }
                 return self.cancel_from_journal(row, deliver).await;
             }
             Ok(None) => {}
@@ -1798,7 +1803,7 @@ impl<H: AlertHa, L: AlertLink, C: AlertClock> Core<H, L, C> {
                             o.summary.trim().eq_ignore_ascii_case(label.trim())
                         }
                         CancelSelector::Time(time) => {
-                            endpoint_time(o, self.zone.as_ref()) == Some(*time)
+                            TimeOfDay::of_local_text(&o.due_local) == Some(*time)
                         }
                         CancelSelector::All => true,
                     })
@@ -1997,12 +2002,11 @@ impl<H: AlertHa, L: AlertLink, C: AlertClock> Core<H, L, C> {
         if let Some(flight) = self.acts.get_mut(&op) {
             return flight.delivers.push(deliver);
         }
-        if self.waits_for(op)
-            && let Some(id) = self
-                .wait_index
-                .get(&op)
-                .and_then(|ids| ids.first())
-                .copied()
+        if let Some(id) = self
+            .wait_index
+            .get(&op)
+            .and_then(|ids| ids.first())
+            .copied()
             && let Some(wait) = self.waits.get_mut(&id)
         {
             return wait.delivers.push(deliver);
@@ -2024,7 +2028,21 @@ impl<H: AlertHa, L: AlertLink, C: AlertClock> Core<H, L, C> {
                     vec![deliver],
                 );
             }
-            Ok(None) => {}
+            Ok(None) => {
+                if let Some(kind) = self
+                    .endpoints
+                    .get(&request.target.device)
+                    .and_then(|e| e.unconfirmed_acts.get(&op))
+                    .copied()
+                {
+                    return self.wait_rows(
+                        vec![op],
+                        vec![None],
+                        WaitKind::Act { kind },
+                        vec![deliver],
+                    );
+                }
+            }
         }
         let Some(endpoint) = self.endpoints.get(&request.target.device) else {
             return self.refuse(deliver, Refusal::UnknownEndpoint);
@@ -2050,6 +2068,7 @@ impl<H: AlertHa, L: AlertLink, C: AlertClock> Core<H, L, C> {
         self.acts.insert(
             op,
             ActFlight {
+                device: request.target.device.clone(),
                 kind: active.kind,
                 delivers: vec![deliver],
             },
@@ -2062,10 +2081,6 @@ impl<H: AlertHa, L: AlertLink, C: AlertClock> Core<H, L, C> {
                 self.refuse(deliver, Refusal::DeviceNotConnected);
             }
         }
-    }
-
-    fn waits_for(&self, op: OpId) -> bool {
-        self.wait_index.get(&op).is_some_and(|ids| !ids.is_empty())
     }
 
     async fn act_acked(&mut self, op: OpId, outcome: CommandOutcome) {
@@ -2111,6 +2126,13 @@ impl<H: AlertHa, L: AlertLink, C: AlertClock> Core<H, L, C> {
             // persisting (applied with an error): it uploads the operation next.
             CommandOutcome::Acked { .. } => None,
         };
+        let unconfirmed = match &finished {
+            Some((ActOutcome::Unknown { .. }, _)) | None => true,
+            Some(_) => false,
+        };
+        if unconfirmed && let Some(endpoint) = self.endpoints.get_mut(&flight.device) {
+            endpoint.unconfirmed_acts.insert(op, flight.kind);
+        }
         match finished {
             Some((outcome, remember)) => {
                 if remember {
@@ -2224,22 +2246,7 @@ impl<H: AlertHa, L: AlertLink, C: AlertClock> Core<H, L, C> {
                 let row = wait.rows.first().cloned().flatten();
                 let op = wait.ops[0];
                 let outcome = ops::outcome_of(row.as_ref(), op, |row| {
-                    let result = row.result.clone().unwrap_or(Value::Null);
-                    let text = |key: &str| {
-                        result
-                            .get(key)
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned()
-                    };
-                    let occurrence_id = Uuid::parse_str(&text("occurrence_id")).unwrap_or_default();
-                    AlarmSet {
-                        schedule_id: Uuid::parse_str(&text("schedule_id")).unwrap_or_default(),
-                        occurrence_id,
-                        first_due_local: text("due_local"),
-                        first_due_utc_ms: text("due_utc_ms").parse().unwrap_or_default(),
-                        armed_on_endpoint: self.armed(&endpoint, occurrence_id),
-                    }
+                    ops::alarm_set_of(row, |occurrence| self.armed(&endpoint, occurrence))
                 });
                 for deliver in wait.delivers {
                     match deliver {
@@ -2247,7 +2254,7 @@ impl<H: AlertHa, L: AlertLink, C: AlertClock> Core<H, L, C> {
                             let _ = reply.send(outcome.clone());
                         }
                         Deliver::Relay { request_id, shape } => {
-                            let json = relay_set(&outcome, &shape);
+                            let json = relay::set_result(&outcome, &shape);
                             self.relay_answer(request_id, json, true);
                         }
                         other => self.refuse(
@@ -2277,7 +2284,7 @@ impl<H: AlertHa, L: AlertLink, C: AlertClock> Core<H, L, C> {
                             let _ = reply.send(outcome.clone());
                         }
                         Deliver::Relay { request_id, .. } => {
-                            let json = relay_cancel(&outcome);
+                            let json = relay::cancel_result(&outcome);
                             self.relay_answer(request_id, json, true);
                         }
                         other => self.refuse(
@@ -2312,7 +2319,10 @@ impl<H: AlertHa, L: AlertLink, C: AlertClock> Core<H, L, C> {
                 let _ = reply.send(outcome);
             }
             Deliver::Relay { request_id, shape } => {
-                let json = relay_stop(&outcome, &shape, row);
+                let due = row
+                    .and_then(|r| r.result.as_ref())
+                    .and_then(|r| r.get("due_local"));
+                let json = relay::stop_result(&outcome, &shape, due);
                 self.relay_answer(request_id, json, true);
             }
             other => self.refuse(
@@ -2376,16 +2386,7 @@ impl<H: AlertHa, L: AlertLink, C: AlertClock> Core<H, L, C> {
             }
             RelayCall::ListAlarms { .. } => {
                 let result = match self.list(&device, 10) {
-                    Ok(entries) => json!({
-                        "ok": true,
-                        "speaker": label,
-                        "alarms": entries.iter().map(|e| json!({
-                            "label": e.label,
-                            "due": e.due_local,
-                            "repeats": e.rrule,
-                            "kind": e.kind.as_str(),
-                        })).collect::<Vec<_>>(),
-                    }),
+                    Ok(entries) => relay::list_result(&label, &entries),
                     Err(refusal) => relay::error_result(&refusal.to_string()),
                 };
                 self.relay_answer(request_id, result, true);
@@ -2485,13 +2486,7 @@ impl<H: AlertHa, L: AlertLink, C: AlertClock> Core<H, L, C> {
             return;
         }
         let op = OpId::relay(&request_id);
-        let interim = json!({
-            "ok": false,
-            "pending": true,
-            "op_id": op.to_string(),
-            "error": "the speaker has not confirmed yet",
-        });
-        self.relay_answer(request_id, interim, false);
+        self.relay_answer(request_id, relay::unconfirmed_result(op), false);
     }
 
     fn fire(&mut self, request_id: &str, result: &Value) {
@@ -2511,19 +2506,11 @@ impl<H: AlertHa, L: AlertLink, C: AlertClock> Core<H, L, C> {
         };
         endpoint.timers.apply(&event, now);
         let config = endpoint.config.clone();
-        let prefetch = endpoint.capable(Capability::AlertPrefetch);
         let view = endpoint
             .capable(Capability::TimerView)
             .then(|| endpoint.timers.view(now));
         match event.kind {
-            TimerEventKind::Started => {
-                if let (true, AlertSound::Asset(sha)) = (prefetch, &config.timer_sound) {
-                    let body = CommandBody::Prefetch(AlertPrefetch {
-                        sounds: vec![sha.clone()],
-                    });
-                    self.command(device, body, |_| None);
-                }
-            }
+            TimerEventKind::Started => self.prefetch_timer_sound(device),
             TimerEventKind::Finished => {
                 let body = CommandBody::Ring(AlertRing {
                     ring_id: event.timer_id.clone(),
@@ -2595,19 +2582,6 @@ impl<H: AlertHa, L: AlertLink, C: AlertClock> Core<H, L, C> {
     }
 }
 
-impl Endpoint {
-    /// Whether a pending operation already handles `occurrence`.
-    fn pending_targets(&self, occurrence: &Occurrence) -> bool {
-        self.pending.values().any(|effect| match effect {
-            PendingEffect::Occurrence { schedule, key, .. } => {
-                *schedule == occurrence.schedule_id && *key == occurrence.key
-            }
-            PendingEffect::Schedule(schedule) => *schedule == occurrence.schedule_id,
-            PendingEffect::Nothing => false,
-        })
-    }
-}
-
 /// Hands an occurrence an applied operation already handled to the applier for
 /// deleting again (the restore guard).
 fn guard_delete(endpoint: &mut Endpoint, entity: &str, occurrence: &Occurrence) {
@@ -2643,19 +2617,6 @@ fn pending_effect(row: &OpRow) -> PendingEffect {
     }
 }
 
-/// The local time of day an occurrence rings at.
-fn endpoint_time(
-    occurrence: &Occurrence,
-    zone: Option<&HaTimeZone>,
-) -> Option<crate::schedule::TimeOfDay> {
-    let zoned = zone?.at_ms(occurrence.due_utc_ms)?;
-    crate::schedule::TimeOfDay::new(
-        zoned.hour() as u8,
-        zoned.minute() as u8,
-        zoned.second() as u8,
-    )
-}
-
 /// The calendar event of a snooze child the device derived: due when the device said,
 /// carrying the snooze's operation id and the parent's ring settings.
 fn snooze_child_event(
@@ -2685,85 +2646,5 @@ fn snooze_child_event(
         dtend: end,
         description: Some(line.description(None)),
         rrule: None,
-    }
-}
-
-fn relay_set(outcome: &Outcome<AlarmSet>, shape: &RelayShape) -> Value {
-    let speaker = match shape {
-        RelayShape::Set { speaker } => speaker.clone(),
-        _ => String::new(),
-    };
-    match outcome {
-        Outcome::Applied { op_id, result } => json!({
-            "ok": true,
-            "stored_in_ha": true,
-            "armed_on_endpoint": result.armed_on_endpoint,
-            "delivery_pending": !result.armed_on_endpoint,
-            "speaker": speaker,
-            "first_due": result.first_due_local,
-            "op_id": op_id.to_string(),
-        }),
-        Outcome::Pending { op_id } => relay::pending_result(*op_id),
-        Outcome::Rejected { op_id, reason } => json!({
-            "ok": false, "error": reason.code, "detail": reason.detail, "op_id": op_id.to_string(),
-        }),
-        Outcome::Refused(refusal) => relay::error_result(&refusal.to_string()),
-    }
-}
-
-fn relay_cancel(outcome: &CancelOutcome) -> Value {
-    match outcome {
-        CancelOutcome::Refused(refusal) => relay::error_result(&refusal.to_string()),
-        CancelOutcome::Journaled { root, targets } => {
-            let state = |o: &Outcome<()>| match o {
-                Outcome::Applied { .. } => "cancelled",
-                Outcome::Pending { .. } => "pending",
-                Outcome::Rejected { .. } => "failed",
-                Outcome::Refused(_) => "refused",
-            };
-            json!({
-                "ok": targets.iter().all(|t| !matches!(t.outcome, Outcome::Rejected { .. } | Outcome::Refused(_))),
-                "stored_in_ha": targets.iter().all(|t| matches!(t.outcome, Outcome::Applied { .. })),
-                "cancelled": targets.iter().map(|t| json!({"label": t.label, "state": state(&t.outcome)})).collect::<Vec<_>>(),
-                "op_id": root.to_string(),
-            })
-        }
-    }
-}
-
-fn relay_stop(outcome: &ActOutcome, shape: &RelayShape, row: Option<&OpRow>) -> Value {
-    let (kind, name, snooze) = match shape {
-        RelayShape::Stop { kind, name, snooze } => (*kind, name.clone(), *snooze),
-        _ => (RingKind::Alarm, String::new(), false),
-    };
-    let what = json!({"kind": kind.as_str(), "name": name});
-    match outcome {
-        ActOutcome::Applied { op_id, .. } => {
-            let mut result = json!({"ok": true, "stored_in_ha": kind != RingKind::Timer, "op_id": op_id.to_string()});
-            if snooze {
-                result["snoozed"] = what;
-                if let Some(due) = row
-                    .and_then(|r| r.result.as_ref())
-                    .and_then(|r| r.get("due_local"))
-                {
-                    result["due"] = due.clone();
-                }
-            } else {
-                result["stopped"] = what;
-            }
-            result
-        }
-        ActOutcome::Pending { op_id } => {
-            let mut result = relay::pending_result(*op_id);
-            result[if snooze { "snoozed" } else { "stopped" }] = what;
-            result
-        }
-        ActOutcome::Rejected { op_id, reason } => json!({
-            "ok": false, "error": reason.code, "detail": reason.detail, "op_id": op_id.to_string(),
-        }),
-        ActOutcome::Unknown { op_id, .. } => json!({
-            "ok": false, "error": "the speaker did not confirm", "op_id": op_id.to_string(),
-        }),
-        ActOutcome::Refused(refusal) => relay::error_result(&refusal.to_string()),
     }
 }

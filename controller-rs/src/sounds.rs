@@ -12,7 +12,6 @@ use std::sync::Arc;
 
 use echomuse_api::{BoxFuture, ServiceError, SoundControl};
 use echomuse_core::types::DeviceId;
-use echomuse_playback::AlertPreviewSound;
 use echomuse_presentation::sounds::{
     DEFAULT_SOUND_ID, SoundId, UploadFormat,
     catalog::{CatalogSnapshot, DeleteError, SoundSummary, UploadError},
@@ -118,27 +117,22 @@ impl DashboardSounds {
     }
 
     /// What the dashboard's sound id plays: an empty id is the "Default" choice.
-    fn preview_sound(&self, id: &str) -> Result<AlertPreviewSound, ServiceError> {
+    fn preview_sound(&self, id: &str) -> Result<AlertSound, ServiceError> {
         let catalog = self.sounds.snapshot();
-        let resolved = if id.is_empty() {
-            catalog.resolve(&SoundChoice::Default).sound
-        } else {
-            let sound_id = SoundId::new(id)
-                .ok_or_else(|| ServiceError::NotFound("No sound has this id".to_owned()))?;
-            let summary = catalog
-                .get(&sound_id)
-                .ok_or_else(|| ServiceError::NotFound("No sound has this id".to_owned()))?;
-            let sha = summary.sha256().ok_or_else(|| {
-                ServiceError::Unsupported(
-                    "This sound could not be turned into an alert sound".to_owned(),
-                )
-            })?;
-            AlertSound::Asset(sha.clone())
-        };
-        Ok(match resolved {
-            AlertSound::Fallback => AlertPreviewSound::Fallback,
-            AlertSound::Asset(sha) => AlertPreviewSound::Sound(sha),
-        })
+        if id.is_empty() {
+            return Ok(catalog.resolve(&SoundChoice::Default).sound);
+        }
+        let sound_id = SoundId::new(id)
+            .ok_or_else(|| ServiceError::NotFound("No sound has this id".to_owned()))?;
+        let summary = catalog
+            .get(&sound_id)
+            .ok_or_else(|| ServiceError::NotFound("No sound has this id".to_owned()))?;
+        let sha = summary.sha256().ok_or_else(|| {
+            ServiceError::Unsupported(
+                "This sound could not be turned into an alert sound".to_owned(),
+            )
+        })?;
+        Ok(AlertSound::Asset(sha.clone()))
     }
 
     async fn upload_now(

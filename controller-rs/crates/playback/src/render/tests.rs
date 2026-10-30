@@ -5,8 +5,8 @@ use serde_json::json;
 use tokio::time::{self, Instant};
 
 use super::*;
-use crate::sim::{SimLink, accepted, finished, progress, rejected};
-use crate::wire::{AckFailure, AlertPreviewSound, Command, Earcon};
+use crate::sim::{SimLink, finished, progress, rejected};
+use crate::wire::{AckFailure, Command, Earcon};
 
 fn client() -> RenderClient {
     RenderClient::new(&Capabilities::default())
@@ -42,7 +42,7 @@ fn events(client: &mut RenderClient) -> Vec<RenderEvent> {
 fn running(client: &mut RenderClient, link: &mut SimLink, now: Instant) -> PlaybackRef {
     let playback = client.start_network(link, content()).unwrap();
     let (id, _, _) = link.last_command();
-    assert!(client.on_ack(link, now, &id, accepted()));
+    assert!(client.on_ack(link, now, &id, AckOutcome::Accepted));
     playback
 }
 
@@ -71,7 +71,7 @@ fn render_start_names_a_fresh_nonzero_epoch_and_no_frame_precedes_the_ack() {
     assert!(link.frames().is_empty(), "no frame before the ack");
     assert_eq!(link.commands().len(), 1, "no render.end before the ack");
 
-    assert!(client.on_ack(&mut link, now, &start_id, accepted()));
+    assert!(client.on_ack(&mut link, now, &start_id, AckOutcome::Accepted));
     assert_eq!(
         events(&mut client),
         [RenderEvent::Accepted(playback.clone())]
@@ -145,14 +145,18 @@ fn end_frame_is_the_frame_after_the_last_one_sent() {
     assert_eq!(
         ended,
         RenderEvent::Ended {
-            playback,
+            playback: playback.clone(),
             end: PlaybackEnd::Finished {
                 reason: Reported::Known(FinishReason::Drained),
                 last_completed_frame: 10_000,
             },
         }
     );
-    assert_eq!(client.live().count(), 0);
+    assert_eq!(
+        client.cancel(&mut link, &playback, CancelReason::Stopped),
+        Err(NotLive),
+        "an ended playback is no longer live"
+    );
 }
 
 #[test]
@@ -242,7 +246,7 @@ fn a_full_link_queue_is_retried_at_the_next_deadline() {
 }
 
 #[test]
-fn cancel_purges_queued_packets_and_reports_the_one_being_written_as_uncertain() {
+fn cancel_withdraws_every_handed_frame_and_sends_render_cancel() {
     let now = Instant::now();
     let mut link = SimLink::new();
     let mut client = client();
@@ -252,16 +256,17 @@ fn cancel_purges_queued_packets_and_reports_the_one_being_written_as_uncertain()
         .push_audio(&mut link, now, &playback, &tone(5 * 3_840 + 100))
         .unwrap();
     assert_eq!(link.frames().len(), 5);
-    // The writer has written packet 0 and is writing packet 1.
-    link.begin_write();
-    link.begin_write();
     assert!(client.on_report(&mut link, now, 1, progress(&id, "progress", 2_048)));
     events(&mut client);
 
     client
         .cancel(&mut link, &playback, CancelReason::Interrupted)
         .unwrap();
-    assert!(link.queue.is_empty(), "queued packets purged");
+    // The link's writer drops a frame whose playback is cancelled.
+    assert!(
+        link.frames().iter().all(|f| f.playback.is_cancelled()),
+        "every handed frame is withdrawn"
+    );
     let (_, command, generation) = link.last_command();
     assert_eq!(generation, 1);
     assert_eq!(command.body_json()["reason"], "interrupted");
@@ -271,12 +276,6 @@ fn cancel_purges_queued_packets_and_reports_the_one_being_written_as_uncertain()
         [RenderEvent::Cancelled {
             playback: playback.clone(),
             reason: CancelReason::Interrupted,
-            delivery: Some(CancelDelivery {
-                handed: 5 * 3_840,
-                completed: 2_048,
-                withdrawn: Some(2 * 3_840..5 * 3_840),
-                uncertain: Some(3_840..2 * 3_840),
-            }),
         }]
     );
     // Nothing more goes out for it, and audio is refused.
@@ -303,37 +302,6 @@ fn cancel_purges_queued_packets_and_reports_the_one_being_written_as_uncertain()
             ..
         }]
     ));
-}
-
-#[test]
-fn a_link_that_cannot_tell_leaves_every_unconfirmed_frame_uncertain() {
-    let now = Instant::now();
-    let mut link = SimLink::new();
-    link.exact_purge = false;
-    let mut client = client();
-    let playback = running(&mut client, &mut link, now);
-    let id = playback.id().as_str().to_owned();
-    client
-        .push_audio(&mut link, now, &playback, &tone(3 * 3_840))
-        .unwrap();
-    assert!(client.on_report(&mut link, now, 1, progress(&id, "start", 1_000)));
-    events(&mut client);
-    client
-        .cancel(&mut link, &playback, CancelReason::Stopped)
-        .unwrap();
-    let events: [RenderEvent; 1] = events(&mut client).try_into().unwrap();
-    let [RenderEvent::Cancelled { delivery, .. }] = events else {
-        panic!("one cancelled event");
-    };
-    assert_eq!(
-        delivery,
-        Some(CancelDelivery {
-            handed: 3 * 3_840,
-            completed: 1_000,
-            withdrawn: None,
-            uncertain: Some(1_000..3 * 3_840),
-        })
-    );
 }
 
 #[test]
@@ -495,7 +463,7 @@ fn earcons_are_gated_by_the_device_capabilities() {
     let hash = echomuse_protocol::Sha256::of(b"alarm");
     bare.start_local(
         &mut link,
-        &LocalSource::AlertPreview(AlertPreviewSound::Sound(hash.clone())),
+        &LocalSource::AlertPreview(echomuse_protocol::alerts::AlertSound::Asset(hash.clone())),
         0.0,
         false,
     )
@@ -519,7 +487,7 @@ fn a_local_playback_ends_with_the_device_report() {
         )
         .unwrap();
     let (start, _, _) = link.last_command();
-    assert!(client.on_ack(&mut link, now, &start, accepted()));
+    assert!(client.on_ack(&mut link, now, &start, AckOutcome::Accepted));
     assert!(!client.wants_audio(&chime));
     let id = chime.id().as_str().to_owned();
     assert!(client.on_report(&mut link, now, 1, finished(&id, "drained", 9_600)));
@@ -585,7 +553,7 @@ async fn answer_audio_must_start_within_ten_seconds() {
         )
         .unwrap();
     let (start, _, _) = link.last_command();
-    assert!(client.on_ack(&mut link, ready, &start, accepted()));
+    assert!(client.on_ack(&mut link, ready, &start, AckOutcome::Accepted));
     time::advance(Duration::from_secs(9)).await;
     client.poll(&mut link, Instant::now());
     assert!(limit_events(&mut client).is_empty());
@@ -616,25 +584,6 @@ async fn answer_audio_must_start_within_ten_seconds() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_moved_start_deadline_is_honoured() {
-    let ready = Instant::now();
-    let mut link = SimLink::new();
-    let mut client = client();
-    let playback = client
-        .start_network(
-            &mut link,
-            dialog(Some(ResponseLimits::from_answer_ready(ready))),
-        )
-        .unwrap();
-    client
-        .set_start_deadline(&playback, ready + Duration::from_secs(25))
-        .unwrap();
-    let fired = run_to_deadline(&mut client, &mut link).await;
-    assert_eq!(fired - ready, Duration::from_secs(25));
-    assert_eq!(limit_events(&mut client), [ResponseLimit::Start]);
-}
-
-#[tokio::test(start_paused = true)]
 async fn a_started_answer_may_not_stall_for_two_seconds() {
     let ready = Instant::now();
     let mut link = SimLink::new();
@@ -646,7 +595,7 @@ async fn a_started_answer_may_not_stall_for_two_seconds() {
         )
         .unwrap();
     let (start, _, _) = link.last_command();
-    assert!(client.on_ack(&mut link, ready, &start, accepted()));
+    assert!(client.on_ack(&mut link, ready, &start, AckOutcome::Accepted));
     let id = playback.id().as_str().to_owned();
     time::advance(Duration::from_secs(1)).await;
     assert!(client.on_report(&mut link, Instant::now(), 1, progress(&id, "start", 0)));
@@ -694,7 +643,7 @@ async fn one_spoken_answer_plays_at_most_120_seconds() {
         )
         .unwrap();
     let (start, _, _) = link.last_command();
-    assert!(client.on_ack(&mut link, ready, &start, accepted()));
+    assert!(client.on_ack(&mut link, ready, &start, AckOutcome::Accepted));
     let id = playback.id().as_str().to_owned();
     let started = Instant::now();
     assert!(client.on_report(&mut link, started, 1, progress(&id, "start", 0)));

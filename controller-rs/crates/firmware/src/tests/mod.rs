@@ -526,14 +526,6 @@ async fn an_update_whose_transfer_fails_changes_nothing() {
         fake_device::OLDER_BUILD
     );
     assert_eq!(h.row().await.firmware_previous, None, "never written");
-    assert!(outcome_message(&outcome).contains("arrived corrupted"));
-}
-
-fn outcome_message(outcome: &UpdateOutcome) -> String {
-    match outcome {
-        UpdateOutcome::Failed(failure) => failure.to_string(),
-        other => format!("{other:?}"),
-    }
 }
 
 #[tokio::test]
@@ -561,7 +553,7 @@ async fn updates_are_refused_while_busy_or_already_current() {
         Err(FirmwareFailure::Busy)
     ));
     assert!(matches!(
-        h.service.debloat(&h.target()).await,
+        h.service.prepare_debloat(h.target()),
         Err(FirmwareFailure::Busy)
     ));
     drop(job);
@@ -742,7 +734,13 @@ async fn debloat_syncs_the_script_and_parses_the_show_result() {
         MIC_REASSERTED: STILL_ALLOWED:com.amazon.y\n\
         DEBLOAT_STOPPED:17 STILL_RUNNING:\n"
         .into();
-    let report = h.service.debloat(&h.target()).await.unwrap();
+    let report = h
+        .service
+        .prepare_debloat(h.target())
+        .unwrap()
+        .run()
+        .await
+        .unwrap();
     assert_eq!(report.stopped, 17);
     assert_eq!(report.hide.unwrap().rehidden, ["com.amazon.x"]);
     assert_eq!(report.microphones.unwrap().still_allowed, ["com.amazon.y"]);
@@ -761,12 +759,12 @@ async fn debloat_reports_a_missing_result_and_refuses_lineage() {
     let h = Harness::start(Platform::FireOs6).await;
     h.device.state().debloat_output = "sh: oops\n".into();
     assert!(matches!(
-        h.service.debloat(&h.target()).await,
+        h.service.prepare_debloat(h.target()).unwrap().run().await,
         Err(FirmwareFailure::Debloat(_))
     ));
     let h = Harness::start(Platform::Lineage18Crown).await;
     assert!(matches!(
-        h.service.debloat(&h.target()).await,
+        h.service.prepare_debloat(h.target()),
         Err(FirmwareFailure::NothingToDebloat)
     ));
     assert!(h.device.state().commands.is_empty());

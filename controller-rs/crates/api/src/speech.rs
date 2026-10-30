@@ -38,7 +38,7 @@ use crate::{
 };
 
 /// How long a Wyoming server may take to describe itself.
-pub const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(5);
+const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// The runtime asset's name on the device.
 const RUNTIME_NAME: &str = "libonnxruntime.so";
 
@@ -65,20 +65,29 @@ async fn speech_assets(
     let session = state.runtimes().live(&device).and_then(|live| live.session);
     let connected = session.is_some();
     let installed = session.and_then(|session| session.installed_assets);
-    let has = |sha: &Option<Sha256>| -> Option<bool> {
-        let list = installed.as_ref()?;
-        Some(sha.as_ref().is_some_and(|sha| list.contains(sha)))
+    let asset = |kind, name: Option<String>, sha256: Option<Sha256>| Asset {
+        kind,
+        name,
+        installed: installed
+            .as_ref()
+            .map(|list| sha256.as_ref().is_some_and(|sha| list.contains(sha))),
+        sha256,
     };
     let snapshot = state.settings().snapshot();
     let selected = snapshot.selected_model(&device);
     let runtime = state.diagnostics().runtime_asset.clone();
     let (graph, sidecar, wake_model, error) = match &selected {
         Ok(model) => (
-            Some((model.graph_file().to_owned(), model.graph_sha256().clone())),
-            Some((
-                model.sidecar_file().to_owned(),
-                model.sidecar_sha256().clone(),
-            )),
+            asset(
+                "graph",
+                Some(model.graph_file().to_owned()),
+                Some(model.graph_sha256().clone()),
+            ),
+            asset(
+                "sidecar",
+                Some(model.sidecar_file().to_owned()),
+                Some(model.sidecar_sha256().clone()),
+            ),
             json!({
                 "graph_sha256": model.graph_sha256(),
                 "wake_phrase": model.wake_phrase().as_str(),
@@ -87,30 +96,17 @@ async fn speech_assets(
                 .is_none()
                 .then(|| "The runtime asset's SHA-256 is not known".to_owned()),
         ),
-        Err(error) => (None, None, Value::Null, Some(error.to_string())),
+        Err(error) => (
+            asset("graph", None, None),
+            asset("sidecar", None, None),
+            Value::Null,
+            Some(error.to_string()),
+        ),
     };
-    let runtime_sha = runtime;
-    let graph_sha = graph.as_ref().map(|(_, sha)| sha.clone());
-    let sidecar_sha = sidecar.as_ref().map(|(_, sha)| sha.clone());
-    let assets = vec![
-        Asset {
-            kind: "runtime",
-            name: Some(RUNTIME_NAME.to_owned()),
-            installed: has(&runtime_sha),
-            sha256: runtime_sha,
-        },
-        Asset {
-            kind: "graph",
-            name: graph.map(|(name, _)| name),
-            installed: has(&graph_sha),
-            sha256: graph_sha,
-        },
-        Asset {
-            kind: "sidecar",
-            name: sidecar.map(|(name, _)| name),
-            installed: has(&sidecar_sha),
-            sha256: sidecar_sha,
-        },
+    let assets = [
+        asset("runtime", Some(RUNTIME_NAME.to_owned()), runtime),
+        graph,
+        sidecar,
     ];
     Ok(Json(json!({
         "device_id": device,

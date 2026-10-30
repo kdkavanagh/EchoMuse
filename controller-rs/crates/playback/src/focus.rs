@@ -24,7 +24,7 @@ use tokio::time::Instant;
 use crate::link::{CommandLink, LinkClosed};
 use crate::wire::{
     AckFailure, AckOutcome, Command, FocusAcquire, FocusKind, FocusOwner, FocusRejection,
-    FocusRelease, FocusRenew, LeaseId,
+    FocusRelease, FocusRenew, LeaseId, reported,
 };
 
 /// A lease's time to live on the device.
@@ -83,8 +83,6 @@ enum Op {
 #[derive(Debug)]
 pub struct FocusLease {
     id: LeaseId,
-    kind: FocusKind,
-    owner: FocusOwner,
     generation: u32,
     state: State,
     next_renewal: Instant,
@@ -105,15 +103,13 @@ impl FocusLease {
         let id = LeaseId::generate();
         let body = FocusAcquire {
             lease_id: id.clone(),
-            owner: owner.clone(),
+            owner,
             focus: kind,
             ttl_ms: FOCUS_TTL.as_millis() as u64,
         };
         let message = link.request(&Command::FocusAcquire(body), generation)?;
         Ok(Self {
             id,
-            kind,
-            owner,
             generation,
             state: State::Held,
             next_renewal: now + FOCUS_RENEW_INTERVAL,
@@ -122,26 +118,6 @@ impl FocusLease {
             held_until: now + FOCUS_TTL,
             pending: vec![(message, Op::Keep, now)],
         })
-    }
-
-    /// The lease's id.
-    pub fn id(&self) -> &LeaseId {
-        &self.id
-    }
-
-    /// Its class.
-    pub fn kind(&self) -> FocusKind {
-        self.kind
-    }
-
-    /// Its owner.
-    pub fn owner(&self) -> &FocusOwner {
-        &self.owner
-    }
-
-    /// The owner generation its messages carry.
-    pub fn generation(&self) -> u32 {
-        self.generation
     }
 
     /// Whether the lease is still held: not released, expired or refused.
@@ -261,12 +237,9 @@ impl FocusLease {
             }
             (_, AckOutcome::Rejected { code }) => {
                 self.state = State::Ended;
-                Some(FocusEvent::Rejected(code.map(
-                    |code| match FocusRejection::from_wire(&code) {
-                        Some(known) => Reported::Known(known),
-                        None => Reported::Unrecognized(code),
-                    },
-                )))
+                Some(FocusEvent::Rejected(
+                    code.map(|code| reported(&code, FocusRejection::from_wire)),
+                ))
             }
             (_, AckOutcome::Failed(AckFailure::SessionEnded)) => {
                 self.state = State::Ended;
@@ -302,7 +275,7 @@ mod tests {
     use tokio::time;
 
     use super::*;
-    use crate::sim::{SimLink, accepted, rejected};
+    use crate::sim::{SimLink, rejected};
 
     fn owner() -> FocusOwner {
         FocusOwner::new("6f9619ff-8b86-d011-b42d-00cf4fc964ff")
@@ -327,7 +300,8 @@ mod tests {
         assert_eq!(body["focus"], "dialog_output");
         assert_eq!(body["ttl_ms"], 3_000);
         assert_eq!(body["owner"], owner().as_str());
-        assert_eq!(lease.on_ack(&id, accepted()), Ok(None));
+        let lease_id = body["lease_id"].clone();
+        assert_eq!(lease.on_ack(&id, AckOutcome::Accepted), Ok(None));
 
         let mut renewals = Vec::new();
         for _ in 0..10 {
@@ -335,10 +309,10 @@ mod tests {
             assert_eq!(event, None);
             let (id, command, generation) = link.last_command();
             assert!(matches!(command, Command::FocusRenew(_)));
-            assert_eq!(command.body_json()["lease_id"], lease.id().as_str());
+            assert_eq!(command.body_json()["lease_id"], lease_id);
             assert_eq!(generation, 4);
             renewals.push(now - start);
-            assert_eq!(lease.on_ack(&id, accepted()), Ok(None));
+            assert_eq!(lease.on_ack(&id, AckOutcome::Accepted), Ok(None));
         }
         let expected: Vec<Duration> = (1..=10).map(Duration::from_secs).collect();
         assert_eq!(renewals, expected);
@@ -352,11 +326,11 @@ mod tests {
         let mut lease =
             FocusLease::acquire(&mut link, start, FocusKind::DialogInput, owner(), 1).unwrap();
         let (id, _, _) = link.last_command();
-        lease.on_ack(&id, accepted()).unwrap();
+        lease.on_ack(&id, AckOutcome::Accepted).unwrap();
         // The renewal at 1 s is acknowledged; later ones never are.
         let (_, _) = step(&mut lease, &mut link).await;
         let (renewed, _, _) = link.last_command();
-        lease.on_ack(&renewed, accepted()).unwrap();
+        lease.on_ack(&renewed, AckOutcome::Accepted).unwrap();
         let mut event = None;
         let mut fired = start;
         while event.is_none() {
@@ -413,11 +387,11 @@ mod tests {
         assert!(matches!(command, Command::FocusRelease(_)));
         assert_eq!(generation, 3);
         assert_eq!(
-            lease.on_ack(&release, accepted()),
+            lease.on_ack(&release, AckOutcome::Accepted),
             Ok(Some(FocusEvent::Released))
         );
         assert_eq!(
-            lease.on_ack(&MessageId::generate(), accepted()),
+            lease.on_ack(&MessageId::generate(), AckOutcome::Accepted),
             Err(NotThisLease)
         );
 

@@ -7,12 +7,8 @@
 use echomuse_turn::AttributionPolicy;
 use serde::{Deserialize, Serialize};
 
-/// Microphone and reference samples per second.
-pub const SAMPLE_RATE: u32 = 16_000;
 /// Samples in one analysis cell (32 ms), the grid of the device's loudness cells and the VAD.
 pub const CELL_SAMPLES: usize = 512;
-/// The wake model's window: 1.4 s (firmware `WindowSamples`).
-pub const WAKE_WINDOW_SAMPLES: usize = 22_400;
 /// The wake scorer's hop: two 80 ms capture blocks, 160 ms (firmware `HopSamples`).
 pub const WAKE_HOP_SAMPLES: u64 = 2_560;
 

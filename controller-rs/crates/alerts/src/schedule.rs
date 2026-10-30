@@ -149,6 +149,13 @@ impl TimeOfDay {
         Self::new(hour, minute, second)
     }
 
+    /// The time of day of a [`local_text`] instant: `2026-09-23T06:30:00-05:00` is
+    /// 06:30:00.
+    pub fn of_local_text(text: &str) -> Option<Self> {
+        let (_, clock) = text.split_once('T')?;
+        Self::parse(clock.get(..8)?)
+    }
+
     /// `HH:MM:SS`.
     pub fn text(self) -> String {
         format!("{:02}:{:02}:{:02}", self.hour, self.minute, self.second)

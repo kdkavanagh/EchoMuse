@@ -70,15 +70,6 @@ impl RecordedItem {
             Self::Marker(_) => None,
         }
     }
-
-    /// When it happened, for events and frames.
-    pub fn time(&self) -> Option<RelTime> {
-        match self {
-            Self::Event(e) => Some(e.t),
-            Self::Frame(f) => Some(f.t),
-            Self::Marker(_) => None,
-        }
-    }
 }
 
 /// How the file ends.
@@ -362,9 +353,6 @@ impl Recording {
                     break;
                 }
             }
-        }
-        if end.is_none() && tail == Tail::Ended {
-            tail = Tail::Unended;
         }
         let tally = match &end {
             Some(e) => e.tally,

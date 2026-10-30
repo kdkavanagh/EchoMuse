@@ -26,7 +26,7 @@ use echomuse_turn::{
 
 use crate::format::{RecordType, write_frame, write_json, write_preamble};
 use crate::grant::{GrantPass, GrantShared, StreamScope, UnixMillis};
-use crate::queue::{Body, Item, Purge, Pushed, Queue, QueueStatus};
+use crate::queue::{Body, Item, Purge, Pushed, Queue};
 use crate::record::{
     AnalyzerId, AppliedAnswer, AsrRecord, CancelTarget, DecisionRecord, DisconnectReason,
     EchoCellRecord, EchoStep, End, EndReason, Entry, Event, ExchangeId, GrammarAnswer, GrantRecord,
@@ -84,17 +84,6 @@ pub enum RecorderState {
     Deleted,
     /// Writing failed; the file is left as it was, cut short.
     Failed(String),
-}
-
-impl From<QueueStatus> for RecorderState {
-    fn from(s: QueueStatus) -> Self {
-        match s {
-            QueueStatus::Open { incomplete } => Self::Recording { incomplete },
-            QueueStatus::Ended { reason, written } => Self::Ended { reason, written },
-            QueueStatus::Deleted => Self::Deleted,
-            QueueStatus::Failed(e) => Self::Failed(e),
-        }
-    }
 }
 
 /// What happened to a frame handed to [`SessionRecorder::frame`].
@@ -194,7 +183,7 @@ impl Finishing {
         if let Some(h) = self.writer.take() {
             let _ = h.join();
         }
-        self.queue.status().into()
+        self.queue.status()
     }
 }
 
@@ -238,7 +227,7 @@ impl SessionRecorder {
             revisions,
             privacy,
         };
-        let (part, done) = store.paths(&session.device.0, &id);
+        let (part, done) = store.paths(&session.device, &id);
         store.register(&id, &session.device.0, &queue);
         let writer = {
             let queue = Arc::clone(&queue);
@@ -282,25 +271,9 @@ impl SessionRecorder {
         &self.id
     }
 
-    /// What the grant allows.
-    pub fn scope(&self) -> StreamScope {
-        self.streams
-    }
-
     /// The recording's state.
     pub fn state(&self) -> RecorderState {
-        self.queue.status().into()
-    }
-
-    /// Whether audio would be kept now: the recording is open and the device is neither muted
-    /// nor barred from capture.
-    pub fn audio_permitted(&self) -> bool {
-        self.queue.is_open() && self.privacy.audio_allowed()
-    }
-
-    /// When the grant ends; call [`SessionRecorder::poll`] then.
-    pub fn next_deadline(&self) -> Option<MonoInstant> {
-        self.queue.is_open().then_some(self.grant.ends)
+        self.queue.status()
     }
 
     /// Ends the recording if the grant has ended by `now`.

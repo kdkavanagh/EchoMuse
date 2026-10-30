@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use bytes::{BufMut, Bytes, BytesMut};
 use echomuse_core::types::DeviceId;
 use echomuse_protocol::{ControlBody, MessageType};
-use futures_util::{Sink, SinkExt, Stream, StreamExt};
+use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use tokio::sync::oneshot;
 use tokio_tungstenite::tungstenite::Message;
@@ -36,14 +36,6 @@ pub struct ShellOpen {
 
 impl ControlBody for ShellOpen {
     const MESSAGE_TYPE: MessageType = MessageType::ShellOpen;
-}
-
-/// `shell_close`: asks the device to end its shell.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
-pub struct ShellClose {}
-
-impl ControlBody for ShellClose {
-    const MESSAGE_TYPE: MessageType = MessageType::ShellClose;
 }
 
 /// How the device attached its shell.
@@ -121,14 +113,16 @@ struct Slot {
     live: Option<CancellationToken>,
 }
 
-/// The per-device shell routing table. Cheap to clone.
+/// The per-device shell routing table. Cheap to clone. The controller creates one and
+/// hands it to [`LinkServer::bind`](crate::LinkServer::bind), which routes dial-backs
+/// into it and closes its live shells when the server stops.
 ///
 /// Like the session registry, this is routing for HTTP upgrades that must be answered
 /// before upgrading; the lock is held only for map operations.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct ShellBroker {
     slots: Arc<Mutex<HashMap<DeviceId, Slot>>>,
-    shutdown: CancellationToken,
+    stop: CancellationToken,
 }
 
 impl fmt::Debug for ShellBroker {
@@ -138,11 +132,14 @@ impl fmt::Debug for ShellBroker {
 }
 
 impl ShellBroker {
-    pub(crate) fn new(shutdown: CancellationToken) -> Self {
-        Self {
-            slots: Arc::default(),
-            shutdown,
-        }
+    /// An empty broker.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Closes every live shell and every shell delivered later: the server stopped.
+    pub(crate) fn close_all(&self) {
+        self.stop.cancel();
     }
 
     fn lock(&self) -> MutexGuard<'_, HashMap<DeviceId, Slot>> {
@@ -170,7 +167,7 @@ impl ShellBroker {
     /// Hands an upgraded dial-back to whoever expects it, closing the device's previous
     /// shell.
     pub(crate) fn deliver(&self, device: &DeviceId, ws: Ws, mode: ShellMode) {
-        let stop = self.shutdown.child_token();
+        let stop = self.stop.child_token();
         let deliver = {
             let mut slots = self.lock();
             let slot = slots.entry(device.clone()).or_default();
@@ -232,52 +229,9 @@ impl ShellConnection {
         self.mode
     }
 
-    /// Sends one input.
-    pub async fn send(&mut self, input: ShellInput) -> Result<(), ShellError> {
-        self.writer.send(input).await
-    }
-
-    /// The next piece of shell output; `None` once the shell has closed.
-    pub async fn recv(&mut self) -> Option<Bytes> {
-        self.reader.recv().await
-    }
-
     /// Splits into independently usable halves.
     pub fn split(self) -> (ShellWriter, ShellReader) {
         (self.writer, self.reader)
-    }
-
-    /// Bridges the shell to a caller's byte stream, such as a dashboard terminal:
-    /// inputs from `input` go to the device and its output goes to `output`, until
-    /// either side ends. The shell's socket is closed on return.
-    pub async fn bridge<I, O>(self, mut input: I, mut output: O) -> Result<(), ShellError>
-    where
-        I: Stream<Item = ShellInput> + Unpin,
-        O: Sink<Bytes> + Unpin,
-    {
-        let (mut writer, mut reader) = self.split();
-        let result = loop {
-            tokio::select! {
-                next = input.next() => match next {
-                    Some(item) => {
-                        if let Err(error) = writer.send(item).await {
-                            break Err(error);
-                        }
-                    }
-                    None => break Ok(()),
-                },
-                out = reader.recv() => match out {
-                    Some(bytes) => {
-                        if output.send(bytes).await.is_err() {
-                            break Ok(());
-                        }
-                    }
-                    None => break Ok(()),
-                },
-            }
-        };
-        writer.close().await;
-        result
     }
 }
 

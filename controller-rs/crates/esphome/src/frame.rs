@@ -71,14 +71,7 @@ pub struct FrameTooLarge(pub usize);
 
 /// Encodes `message` as one frame.
 pub fn encode<M: ApiMessage>(message: &M) -> Result<Bytes, FrameTooLarge> {
-    let len = message.encoded_len();
-    if len > MAX_FRAME_LEN {
-        return Err(FrameTooLarge(len));
-    }
-    let mut out = BytesMut::with_capacity(1 + 3 + 3 + len);
-    out.put_u8(PLAINTEXT_INDICATOR);
-    prost::encoding::encode_varint(len as u64, &mut out);
-    prost::encoding::encode_varint(u64::from(M::ID), &mut out);
+    let mut out = header(M::ID, message.encoded_len())?;
     message
         .encode(&mut out)
         .expect("BytesMut grows to fit the message");
@@ -87,15 +80,21 @@ pub fn encode<M: ApiMessage>(message: &M) -> Result<Bytes, FrameTooLarge> {
 
 /// Encodes a frame from a message type and an already encoded payload.
 pub fn encode_raw(message_type: u16, payload: &[u8]) -> Result<Bytes, FrameTooLarge> {
-    if payload.len() > MAX_FRAME_LEN {
-        return Err(FrameTooLarge(payload.len()));
-    }
-    let mut out = BytesMut::with_capacity(1 + 3 + 3 + payload.len());
-    out.put_u8(PLAINTEXT_INDICATOR);
-    prost::encoding::encode_varint(payload.len() as u64, &mut out);
-    prost::encoding::encode_varint(u64::from(message_type), &mut out);
+    let mut out = header(message_type, payload.len())?;
     out.put_slice(payload);
     Ok(out.freeze())
+}
+
+/// A frame's header for a `len`-byte payload, with room for the payload.
+fn header(message_type: u16, len: usize) -> Result<BytesMut, FrameTooLarge> {
+    if len > MAX_FRAME_LEN {
+        return Err(FrameTooLarge(len));
+    }
+    let mut out = BytesMut::with_capacity(1 + 3 + 3 + len);
+    out.put_u8(PLAINTEXT_INDICATOR);
+    prost::encoding::encode_varint(len as u64, &mut out);
+    prost::encoding::encode_varint(u64::from(message_type), &mut out);
+    Ok(out)
 }
 
 /// Reassembles frames from a byte stream. Feed it whatever the socket
@@ -139,11 +138,6 @@ impl FrameDecoder {
     /// [`FrameDecoder::next_frame`].
     pub fn buffer_mut(&mut self) -> &mut BytesMut {
         &mut self.buffer
-    }
-
-    /// Appends received bytes.
-    pub fn extend(&mut self, data: &[u8]) {
-        self.buffer.extend_from_slice(data);
     }
 
     /// Takes the next complete frame, `Ok(None)` if more bytes are needed.
@@ -205,7 +199,7 @@ mod tests {
         let mut decoder = FrameDecoder::new();
         let mut frames = Vec::new();
         for byte in wire {
-            decoder.extend(&[byte]);
+            decoder.buffer_mut().extend_from_slice(&[byte]);
             while let Some(frame) = decoder.next_frame().unwrap() {
                 frames.push(frame);
             }
@@ -220,7 +214,9 @@ mod tests {
     #[test]
     fn a_noise_hello_is_a_bad_indicator() {
         let mut decoder = FrameDecoder::new();
-        decoder.extend(&[0x01, 0x00, 0x01, 0x00]);
+        decoder
+            .buffer_mut()
+            .extend_from_slice(&[0x01, 0x00, 0x01, 0x00]);
         assert_eq!(decoder.next_frame(), Err(FrameError::BadIndicator(0x01)));
     }
 
@@ -228,23 +224,31 @@ mod tests {
     fn the_length_limit_is_checked_from_the_header_alone() {
         let mut decoder = FrameDecoder::new();
         // 65 535 is allowed: the header parses and the decoder waits for the payload.
-        decoder.extend(&[0x00, 0xff, 0xff, 0x03, 0x07]);
+        decoder
+            .buffer_mut()
+            .extend_from_slice(&[0x00, 0xff, 0xff, 0x03, 0x07]);
         assert_eq!(decoder.next_frame(), Ok(None));
 
         let mut decoder = FrameDecoder::new();
         // 65 536 is not.
-        decoder.extend(&[0x00, 0x80, 0x80, 0x04, 0x07]);
+        decoder
+            .buffer_mut()
+            .extend_from_slice(&[0x00, 0x80, 0x80, 0x04, 0x07]);
         assert_eq!(decoder.next_frame(), Err(FrameError::TooLarge(65_536)));
     }
 
     #[test]
     fn overlong_varints_and_types_are_errors() {
         let mut decoder = FrameDecoder::new();
-        decoder.extend(&[0x00, 0x80, 0x80, 0x80, 0x80, 0x80]);
+        decoder
+            .buffer_mut()
+            .extend_from_slice(&[0x00, 0x80, 0x80, 0x80, 0x80, 0x80]);
         assert_eq!(decoder.next_frame(), Err(FrameError::VarintTooLong));
 
         let mut decoder = FrameDecoder::new();
-        decoder.extend(&[0x00, 0x00, 0x80, 0x80, 0x04]);
+        decoder
+            .buffer_mut()
+            .extend_from_slice(&[0x00, 0x00, 0x80, 0x80, 0x04]);
         assert_eq!(
             decoder.next_frame(),
             Err(FrameError::TypeOutOfRange(65_536))

@@ -155,10 +155,6 @@ fn parse<T: DeserializeOwned>(data: Value) -> Result<T, String> {
     serde_json::from_value(data).map_err(|err| err.to_string())
 }
 
-fn parse_event(event: Value) -> Result<PipelineEvent, String> {
-    parse(event)
-}
-
 fn speech_of(speech: Option<Speech>) -> String {
     let Some(speech) = speech else {
         return String::new();
@@ -238,7 +234,7 @@ impl IntentRoute {
         if self.scope.is_cancelled() {
             return true;
         }
-        let event = match parse_event(event).and_then(|event| self.translate(event)) {
+        let event = match parse::<PipelineEvent>(event).and_then(|event| self.translate(event)) {
             Ok(Some(event)) => event,
             Ok(None) => return false,
             Err(_) => return true,
@@ -436,6 +432,7 @@ impl HaClient {
         };
         let _route = RouteGuard::new(link, id);
         let transport = || SttFailure::Transport { dispatched: true };
+        let unreadable = |detail: String| SttFailure::Final(bad(detail));
         let attempt = async {
             loop {
                 let event = match received.recv().await {
@@ -445,13 +442,12 @@ impl HaClient {
                         return Err(SttFailure::Final(refusal.into()));
                     }
                     Some(RunItem::Event(event)) => {
-                        parse_event(event).map_err(|err| SttFailure::Final(bad(err)))?
+                        parse::<PipelineEvent>(event).map_err(unreadable)?
                     }
                 };
                 match event.kind {
                     EventKind::RunStart => {
-                        let data: RunStartData =
-                            parse(event.data).map_err(|err| SttFailure::Final(bad(err)))?;
+                        let data: RunStartData = parse(event.data).map_err(unreadable)?;
                         let handler = data
                             .runner_data
                             .and_then(|runner| runner.stt_binary_handler_id)
@@ -465,15 +461,13 @@ impl HaClient {
                         }
                     }
                     EventKind::SttEnd => {
-                        let data: SttEndData =
-                            parse(event.data).map_err(|err| SttFailure::Final(bad(err)))?;
+                        let data: SttEndData = parse(event.data).map_err(unreadable)?;
                         return Ok(Transcript {
                             text: data.stt_output.text.trim().to_owned(),
                         });
                     }
                     EventKind::Error => {
-                        let data: ErrorData =
-                            parse(event.data).map_err(|err| SttFailure::Final(bad(err)))?;
+                        let data: ErrorData = parse(event.data).map_err(unreadable)?;
                         return Err(SttFailure::Final(HaError::Rejected {
                             code: data.code,
                             message: data.message,
@@ -518,7 +512,7 @@ impl HaClient {
                     None | Some(RunItem::Lost) => return Err(HaError::ConnectionLost),
                     Some(RunItem::Started) => continue,
                     Some(RunItem::Refused(refusal)) => return Err(refusal.into()),
-                    Some(RunItem::Event(event)) => parse_event(event).map_err(bad)?,
+                    Some(RunItem::Event(event)) => parse::<PipelineEvent>(event).map_err(bad)?,
                 };
                 match event.kind {
                     EventKind::TtsEnd => {

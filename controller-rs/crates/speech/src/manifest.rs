@@ -153,22 +153,20 @@ mod tests {
     #[test]
     fn parses_the_repository_manifest() {
         let m = SpeechBundleManifest::parse(&repo_manifest()).unwrap();
-        let files = m.kroko_files(Path::new("/b"));
-        assert_eq!(files.encoder.path, Path::new("/b/kroko/encoder.onnx"));
-        assert_eq!(
-            files.encoder.sha256.to_hex(),
-            "d4881c57449d581e0770fd53fa66c2fdc6cd167d92ece7c715e603defc96d9d4"
-        );
-        let vad = m.vad_file(Path::new("/b"));
-        assert_eq!(vad.path, Path::new("/b/silero_vad_v5.onnx"));
-        assert_eq!(
-            vad.sha256.to_hex(),
-            "6b99cbfd39246b6706f98ec13c7c50c6b299181f2474fa05cbc8046acc274396"
-        );
-        assert_eq!(
-            m.asr.test_wav_member,
-            "sherpa-onnx-streaming-zipformer-en-kroko-2025-08-06/test_wavs/0.wav"
-        );
+        let bundle = Path::new("/b");
+        let files = m.kroko_files(bundle);
+        for (pinned, listed) in [
+            (&files.encoder, &m.asr.files.encoder),
+            (&files.decoder, &m.asr.files.decoder),
+            (&files.joiner, &m.asr.files.joiner),
+            (&files.tokens, &m.asr.files.tokens),
+        ] {
+            assert_eq!(pinned.path, bundle.join(&listed.path));
+            assert_eq!(pinned.sha256, listed.sha256);
+        }
+        let vad = m.vad_file(bundle);
+        assert_eq!(vad.path, bundle.join(&m.vad.path));
+        assert_eq!(vad.sha256, m.vad.sha256);
     }
 
     #[test]

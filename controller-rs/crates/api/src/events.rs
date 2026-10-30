@@ -76,23 +76,6 @@ impl DeviceView {
 #[serde(transparent)]
 pub struct DeviceStatePatch(pub Map<String, Value>);
 
-/// What `GET /api/releases/controller` reports and `controller_update` repeats: whether
-/// a newer controller release exists. The dashboard shows a notice when `available` and
-/// `version` are both set.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct ControllerRelease {
-    /// A newer release than the running one exists.
-    pub available: bool,
-    /// That release's version; `None` when unknown.
-    pub version: Option<String>,
-    /// The running controller's version; `None` when unknown.
-    pub current: Option<String>,
-    /// The release notes; `None` when there are none.
-    pub notes: Option<String>,
-    /// The release's web page; `None` when unknown.
-    pub release_url: Option<String>,
-}
-
 /// One Home Assistant timer as the alert panel lists it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct TimerDisplay {
@@ -204,8 +187,6 @@ pub enum ApiEvent {
         /// `update_queued_at`); `None` when the queue was cleared.
         queued_at: Option<i64>,
     },
-    /// What is known about a newer controller release.
-    ControllerUpdate(ControllerRelease),
     /// A turn was stored, or a near miss's verdict changed; Activity views and the
     /// response-latency panel re-read their lists.
     TurnComplete {
@@ -277,7 +258,7 @@ impl EventPublisher {
         match serde_json::to_string(event) {
             // No open socket is not an error.
             Ok(text) => drop(self.events.send(Utf8Bytes::from(text))),
-            Err(error) => eprintln!("api: an event could not be serialized: {error}"),
+            Err(error) => tracing::error!(%error, "an event could not be serialized"),
         }
     }
 
@@ -416,7 +397,7 @@ impl EventSocket {
         let snapshot = match serde_json::to_string(&ApiEvent::Snapshot { devices }) {
             Ok(text) => text,
             Err(error) => {
-                eprintln!("api: the device snapshot could not be serialized: {error}");
+                tracing::error!(%error, "the device snapshot could not be serialized");
                 return Some(Closing::NoSnapshot);
             }
         };
@@ -506,17 +487,6 @@ mod tests {
                 queued_at: None
             }),
             json!({"type": "device_update_queue", "device_id": "G0SYNTHETIC00001", "queued_at": null})
-        );
-        assert_eq!(
-            wire(&ApiEvent::ControllerUpdate(ControllerRelease {
-                available: true,
-                version: Some("v0.0.0-test".to_owned()),
-                current: None,
-                notes: None,
-                release_url: None,
-            })),
-            json!({"type": "controller_update", "available": true, "version": "v0.0.0-test",
-                   "current": null, "notes": null, "release_url": null})
         );
         assert_eq!(
             wire(&ApiEvent::Alerts {

@@ -20,20 +20,13 @@ use realfft::num_complex::Complex;
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 use serde::{Deserialize, Serialize};
 
-use crate::policy::{CELL_SAMPLES, EchoPolicy, SAMPLE_RATE};
+use crate::policy::{CELL_SAMPLES, EchoPolicy};
 
 /// An acoustic lag in samples: microphone sample `m` hears what the device played at reference
 /// sample `mic_to_reference(m) − lag`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Lag(pub u32);
-
-impl Lag {
-    /// The lag in milliseconds.
-    pub fn as_ms(self) -> f64 {
-        f64::from(self.0) * 1_000.0 / f64::from(SAMPLE_RATE)
-    }
-}
 
 /// An accepted lag and how clearly it was found.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -474,7 +467,7 @@ mod tests {
     }
 
     #[test]
-    fn a_chirp_is_found_and_plans_are_reused() {
+    fn a_chirp_is_found_on_every_call() {
         let policy = EchoPolicy::default();
         let n = policy.lag_window as usize;
         let lag_max = policy.lag_max as usize;
@@ -490,6 +483,5 @@ mod tests {
                 Some(Lag(2_500))
             );
         }
-        assert_eq!(est.size, fft_size(n + lag_max));
     }
 }

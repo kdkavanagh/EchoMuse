@@ -36,9 +36,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::eq::{Equalizer, RENDER_SAMPLE_RATE};
+use crate::render::PACKET_FRAMES;
 
 /// The most frames one decoded chunk carries: one render packet.
-pub const DECODE_CHUNK_FRAMES: usize = 3_840;
+pub const DECODE_CHUNK_FRAMES: usize = PACKET_FRAMES;
 
 /// How many decoded chunks wait for the reader before decoding pauses:
 /// about 0.6 s of audio.
@@ -48,7 +49,7 @@ pub const DECODE_QUEUE_CHUNKS: usize = 8;
 const STDERR_TAIL_BYTES: usize = 2_048;
 
 /// How long the server may take to answer before the fetch fails.
-pub const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Whether a later decode can resume the resource from a bookmark.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -153,11 +154,23 @@ pub struct DecodeRequest {
 }
 
 /// Resolves a URL Home Assistant gave, which may be a path such as
-/// `/api/tts_proxy/…`, against its base URL.
+/// `/api/tts_proxy/…`, against its base URL. A path is under the base's own
+/// path, as Home Assistant's REST API is: through the Supervisor the base is
+/// `http://supervisor/core`, and `/api/…` means `http://supervisor/core/api/…`.
 pub fn resolve_media_url(base: &Url, reference: &str) -> Result<Url, FetchError> {
-    let url = base
-        .join(reference)
-        .map_err(|err| FetchError::Request(format!("invalid URL {reference:?}: {err}")))?;
+    let joined = match reference.strip_prefix('/') {
+        // `//host/…` names another host, which `join` resolves.
+        Some(path) if !path.starts_with('/') => {
+            let mut dir = base.clone();
+            if !dir.path().ends_with('/') {
+                dir.set_path(&format!("{}/", dir.path()));
+            }
+            dir.join(path)
+        }
+        _ => base.join(reference),
+    };
+    let url =
+        joined.map_err(|err| FetchError::Request(format!("invalid URL {reference:?}: {err}")))?;
     match url.scheme() {
         "http" | "https" => Ok(url),
         other => Err(FetchError::Scheme(other.to_owned())),
@@ -170,7 +183,6 @@ pub struct Decoder {
     runtime: Handle,
     http: reqwest::Client,
     ffmpeg: PathBuf,
-    response_timeout: Duration,
 }
 
 impl Decoder {
@@ -182,14 +194,7 @@ impl Decoder {
             runtime,
             http,
             ffmpeg,
-            response_timeout: DEFAULT_RESPONSE_TIMEOUT,
         }
-    }
-
-    /// Changes how long the server may take to answer.
-    pub fn with_response_timeout(mut self, timeout: Duration) -> Self {
-        self.response_timeout = timeout;
-        self
     }
 
     /// Starts decoding `request`. The returned stream yields its events.
@@ -200,7 +205,6 @@ impl Decoder {
         let job = Job {
             http: self.http.clone(),
             ffmpeg: self.ffmpeg.clone(),
-            response_timeout: self.response_timeout,
             request,
             events,
             cancel: cancel.clone(),
@@ -230,11 +234,6 @@ impl DecodeStream {
     /// been taken, or after cancellation.
     pub async fn recv(&mut self) -> Option<DecodeEvent> {
         self.events.recv().await
-    }
-
-    /// The next event if one is waiting.
-    pub fn try_recv(&mut self) -> Option<DecodeEvent> {
-        self.events.try_recv().ok()
     }
 
     /// Stops the decode: the child is killed and reaped.
@@ -275,7 +274,6 @@ impl Drop for DecodeStream {
 struct Job {
     http: reqwest::Client,
     ffmpeg: PathBuf,
-    response_timeout: Duration,
     request: DecodeRequest,
     events: mpsc::Sender<DecodeEvent>,
     cancel: CancellationToken,
@@ -316,7 +314,7 @@ impl Job {
         let response = tokio::select! {
             biased;
             _ = self.cancel.cancelled() => return DecodeEnd::Cancelled,
-            response = tokio::time::timeout(self.response_timeout, self.http.get(url.clone()).send()) => response,
+            response = tokio::time::timeout(RESPONSE_TIMEOUT, self.http.get(url.clone()).send()) => response,
         };
         let response = match response {
             Err(_) => return DecodeEnd::Failed(FetchError::TimedOut.into()),
@@ -355,23 +353,19 @@ impl Job {
             _ = self.cancel.cancelled() => None,
             result = async { tokio::try_join!(feed(response, stdin), self.read(stdout)) } => Some(result),
         };
+        let pumped = match pumped {
+            Some(Ok(((), summary))) => Ok(summary),
+            None | Some(Err(PumpError::Abandoned)) => Err(DecodeEnd::Cancelled),
+            Some(Err(PumpError::Fetch(error))) => Err(DecodeEnd::Failed(error.into())),
+            Some(Err(PumpError::Pipe(detail))) => Err(DecodeEnd::Failed(DecodeError::Pipe(detail))),
+        };
         let summary = match pumped {
-            None | Some(Err(PumpError::Abandoned)) => {
+            Ok(summary) => summary,
+            Err(end) => {
                 reap(&mut child).await;
                 stderr.abort();
-                return DecodeEnd::Cancelled;
+                return end;
             }
-            Some(Err(PumpError::Fetch(error))) => {
-                reap(&mut child).await;
-                stderr.abort();
-                return DecodeEnd::Failed(error.into());
-            }
-            Some(Err(PumpError::Pipe(detail))) => {
-                reap(&mut child).await;
-                stderr.abort();
-                return DecodeEnd::Failed(DecodeError::Pipe(detail));
-            }
-            Some(Ok(((), summary))) => summary,
         };
         let status = tokio::select! {
             biased;

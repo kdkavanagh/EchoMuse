@@ -23,9 +23,8 @@
 //! magenta frame for a recording mode, no outcome cues, and a dark frame when idle.
 //!
 //! The mute ring, the volume arc, ringing alerts and the link state are the device's own
-//! layers; [`overlay`] models them for a still preview.
+//! layers, which it paints above this one without the controller.
 
-pub mod overlay;
 pub mod scene;
 pub mod wire;
 
@@ -258,11 +257,6 @@ impl LedProjector {
         self.emit(now, renew_due)
     }
 
-    /// The update last sent, if the session has had one.
-    pub fn current(&self) -> Option<&LedCommand> {
-        self.sent.as_ref().map(|s| &s.command)
-    }
-
     fn emit(&mut self, now: Instant, force: bool) -> Option<LedCommand> {
         let (command, renew) = self.desired()?;
         let changed = self.sent.as_ref().is_none_or(|s| s.command != command);
@@ -395,16 +389,14 @@ impl LedProjector {
         if lit == 0 {
             return None;
         }
-        let mut frame = [Rgb::OFF; RING_LEDS];
-        for (i, slot) in frame.iter_mut().enumerate().take(lit) {
-            *slot = self.palette.listening_at(i);
-        }
+        let mut frame = palette_frame(&self.palette.listening);
+        frame[lit..].fill(Rgb::OFF);
         Some(frame)
     }
 }
 
 /// `ceil(12 × remaining ÷ total)`, at most 12; at least 1 while any time remains.
-pub fn timer_leds(remaining_ms: u64, total_ms: u64) -> usize {
+fn timer_leds(remaining_ms: u64, total_ms: u64) -> usize {
     if remaining_ms == 0 {
         return 0;
     }

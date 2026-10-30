@@ -73,17 +73,6 @@ impl LedsBody {
             .collect();
         Self { leds }
     }
-
-    /// The frame this body paints; LEDs it does not name stay dark.
-    pub fn frame(&self) -> Frame {
-        let mut frame = [Rgb::OFF; RING_LEDS];
-        for led in &self.leds {
-            if let Some(slot) = frame.get_mut(usize::from(led.id)) {
-                *slot = Rgb(led.r, led.g, led.b);
-            }
-        }
-        frame
-    }
 }
 
 impl ControlBody for LedsBody {
@@ -196,15 +185,6 @@ impl LedCommand {
         };
         encoded.expect("LED bodies always serialize")
     }
-
-    /// One still picture of what the controller layer shows: a frame as sent, an
-    /// animation's palette at full brightness at its first step, dark for `off`.
-    pub fn still_frame(&self) -> Frame {
-        match self {
-            Self::Frame(body) => body.frame(),
-            Self::Anim(body) => anim_still(&body.anim),
-        }
-    }
 }
 
 /// How the firmware maps a palette onto the ring (`paletteFrame`): one colour fills it,
@@ -220,27 +200,4 @@ pub fn palette_frame(colors: &[Rgb]) -> Frame {
         }
     }
     frame
-}
-
-fn anim_still(spec: &AnimSpec) -> Frame {
-    match spec.pattern {
-        AnimPattern::Off => [Rgb::OFF; RING_LEDS],
-        AnimPattern::Spin => {
-            // The firmware's frame 0: head on LED 0, trail on LED 11.
-            let mut frame = [Rgb::OFF; RING_LEDS];
-            frame[0] = spec.colors.first().copied().unwrap_or_default();
-            frame[RING_LEDS - 1] = spec.colors.get(1).copied().unwrap_or_default();
-            frame
-        }
-        AnimPattern::Rotate => {
-            let mut frame = [Rgb::OFF; RING_LEDS];
-            if !spec.colors.is_empty() {
-                for (i, slot) in frame.iter_mut().enumerate() {
-                    *slot = spec.colors[i % spec.colors.len()];
-                }
-            }
-            frame
-        }
-        AnimPattern::Solid | AnimPattern::Pulse | AnimPattern::Meter => palette_frame(&spec.colors),
-    }
 }

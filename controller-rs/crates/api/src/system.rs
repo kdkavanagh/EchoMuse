@@ -32,7 +32,7 @@ use serde_json::{Map, Value};
 
 use crate::{
     auth::{
-        AdminUser, AuthenticatedUser,
+        AdminUser, AuthenticatedUser, Role,
         store::{MAX_SESSION_DAYS, SESSION_EXPIRY_KEY, session_days},
     },
     body::JsonBody,
@@ -73,15 +73,21 @@ async fn fleet(
     user: AuthenticatedUser,
 ) -> Result<Json<Map<String, Value>>, ApiError> {
     let snapshot = state.settings().snapshot();
-    let Value::Object(mut config) = serde_json::to_value(&**snapshot.fleet())
-        .map_err(|_| ApiError::internal("The fleet configuration could not be shown"))?
-    else {
+    Ok(Json(fleet_view(snapshot.fleet(), user.role())?))
+}
+
+/// The fleet's value of every setting, as `viewer` may see it.
+pub(crate) fn fleet_view(
+    fleet: &echomuse_settings::settings::DeviceSettings,
+    viewer: Role,
+) -> Result<Map<String, Value>, ApiError> {
+    let Ok(Value::Object(mut config)) = serde_json::to_value(fleet) else {
         return Err(ApiError::internal(
             "The fleet configuration could not be shown",
         ));
     };
-    hide_secrets(&mut config, user.role());
-    Ok(Json(config))
+    hide_secrets(&mut config, viewer);
+    Ok(config)
 }
 
 #[derive(Serialize)]

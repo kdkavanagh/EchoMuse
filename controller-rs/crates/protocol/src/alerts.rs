@@ -51,7 +51,7 @@ wire_enum! {
 }
 
 /// The sound an occurrence rings.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum AlertSound {
     /// The firmware's built-in sound, `builtin:fallback`.
     Fallback,

@@ -96,6 +96,12 @@ impl HaEndpoint {
         &self.websocket_url
     }
 
+    /// The base the REST API's `/api` paths and HA's media paths are relative to, with no
+    /// trailing slash.
+    pub fn rest_base(&self) -> &str {
+        &self.rest_base
+    }
+
     /// The REST API's URL for `path`, which starts with `/` and is relative to `/api`.
     pub fn rest_url(&self, path: &str) -> String {
         format!("{}/api{path}", self.rest_base)

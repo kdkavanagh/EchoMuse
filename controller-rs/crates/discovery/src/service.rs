@@ -27,7 +27,7 @@ pub const REANNOUNCE_INTERVAL: Duration = Duration::from_secs(120);
 
 /// How long shutdown may take when every handle is dropped without an
 /// explicit [`DiscoveryHandle::shutdown`].
-pub const IMPLICIT_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(2);
+const IMPLICIT_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(2);
 
 /// How many messages may wait for the service task.
 const COMMAND_CAPACITY: usize = 64;
@@ -137,26 +137,13 @@ enum Command {
         EsphomeNodeKind,
         oneshot::Sender<Result<Withdrawn, DiscoveryError>>,
     ),
-    UpdateController(
-        ControllerAdvertisement,
-        oneshot::Sender<Result<(), DiscoveryError>>,
-    ),
     Shutdown(Duration, oneshot::Sender<Result<(), DiscoveryError>>),
-}
-
-/// The state the service task reports after each re-announcement.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct DiscoveryHealth {
-    /// The error from the most recent re-announcement of the controller
-    /// record; `None` after a success or before the first one.
-    pub last_reannounce_error: Option<DiscoveryError>,
 }
 
 /// A cheap, cloneable way to send the discovery service messages.
 #[derive(Clone, Debug)]
 pub struct DiscoveryHandle {
     commands: mpsc::Sender<Command>,
-    health: tokio::sync::watch::Receiver<DiscoveryHealth>,
 }
 
 impl DiscoveryHandle {
@@ -192,26 +179,11 @@ impl DiscoveryHandle {
             .await
     }
 
-    /// Replaces the controller record, for example when the TLS listener
-    /// starts or stops. ESPHome records move to the new address.
-    pub async fn update_controller(
-        &self,
-        controller: ControllerAdvertisement,
-    ) -> Result<(), DiscoveryError> {
-        self.request(|reply| Command::UpdateController(controller, reply))
-            .await
-    }
-
     /// Withdraws every record and stops the responder. The service finishes
     /// within `deadline` whether or not the responder confirms.
     pub async fn shutdown(&self, deadline: Duration) -> Result<(), DiscoveryError> {
         self.request(|reply| Command::Shutdown(deadline, reply))
             .await
-    }
-
-    /// The service's latest health report.
-    pub fn health(&self) -> tokio::sync::watch::Receiver<DiscoveryHealth> {
-        self.health.clone()
     }
 }
 
@@ -233,22 +205,19 @@ pub(crate) fn spawn<R: Responder>(
     responder.serve_address(controller.address)?;
     responder.announce(&controller.record())?;
     let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
-    let (health_sender, health) = tokio::sync::watch::channel(DiscoveryHealth::default());
     let service = Service {
         responder,
         controller,
         esphome: HashMap::new(),
-        health: health_sender,
     };
     let task = tokio::spawn(service.run(receiver, reannounce_interval));
-    Ok((DiscoveryHandle { commands, health }, task))
+    Ok((DiscoveryHandle { commands }, task))
 }
 
 struct Service<R> {
     responder: R,
     controller: ControllerAdvertisement,
     esphome: HashMap<(DeviceId, EsphomeNodeKind), EsphomeAdvertisement>,
-    health: tokio::sync::watch::Sender<DiscoveryHealth>,
 }
 
 impl<R: Responder> Service<R> {
@@ -265,9 +234,6 @@ impl<R: Responder> Service<R> {
                     Some(Command::Unregister(device, kind, reply)) => {
                         let _ = reply.send(self.unregister(device, kind).await);
                     }
-                    Some(Command::UpdateController(controller, reply)) => {
-                        let _ = reply.send(self.update_controller(controller).await);
-                    }
                     Some(Command::Shutdown(deadline, reply)) => {
                         let _ = reply.send(self.shutdown(deadline).await);
                         return;
@@ -278,8 +244,9 @@ impl<R: Responder> Service<R> {
                     }
                 },
                 _ = reannounce.tick() => {
-                    let last_reannounce_error = self.responder.announce(&self.controller.record()).err();
-                    self.health.send_replace(DiscoveryHealth { last_reannounce_error });
+                    if let Err(error) = self.responder.announce(&self.controller.record()) {
+                        tracing::warn!(%error, "re-announcing the controller's mDNS record failed");
+                    }
                 }
             }
         }
@@ -305,30 +272,6 @@ impl<R: Responder> Service<R> {
         };
         let fullname = advertisement.record(self.controller.address).fullname();
         self.responder.withdraw(&fullname)?.await
-    }
-
-    async fn update_controller(
-        &mut self,
-        controller: ControllerAdvertisement,
-    ) -> Result<(), DiscoveryError> {
-        let old = self.controller.record();
-        let new = controller.record();
-        if old.fullname() != new.fullname() {
-            self.responder.withdraw(&old.fullname())?.await?;
-        }
-        let address_changed = self.controller.address != controller.address;
-        if address_changed {
-            self.responder.serve_address(controller.address)?;
-        }
-        self.responder.announce(&new)?;
-        self.controller = controller;
-        if address_changed {
-            for advertisement in self.esphome.values() {
-                self.responder
-                    .announce(&advertisement.record(self.controller.address))?;
-            }
-        }
-        Ok(())
     }
 
     async fn shutdown(&mut self, deadline: Duration) -> Result<(), DiscoveryError> {
@@ -393,7 +336,6 @@ mod tests {
     #[derive(Clone, Default)]
     struct Simulated {
         calls: Arc<Mutex<Vec<Call>>>,
-        served: Arc<Mutex<Vec<Ipv4Addr>>>,
         hang_on_stop: bool,
     }
 
@@ -404,8 +346,7 @@ mod tests {
     }
 
     impl Responder for Simulated {
-        fn serve_address(&mut self, address: Ipv4Addr) -> Result<(), DiscoveryError> {
-            self.served.lock().unwrap().push(address);
+        fn serve_address(&mut self, _address: Ipv4Addr) -> Result<(), DiscoveryError> {
             Ok(())
         }
 
@@ -493,7 +434,6 @@ mod tests {
         tokio::time::sleep(REANNOUNCE_INTERVAL).await;
         tokio::task::yield_now().await;
         assert_eq!(announced(&responder.calls()).len(), 3);
-        assert_eq!(handle.health().borrow().last_reannounce_error, None);
 
         handle.shutdown(Duration::from_secs(1)).await.unwrap();
         task.await.unwrap();
@@ -540,97 +480,6 @@ mod tests {
         );
         assert_eq!(responder.calls().len(), before);
 
-        handle.shutdown(Duration::from_secs(1)).await.unwrap();
-        task.await.unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn turning_tls_on_and_off_republishes_the_controller_record() {
-        let responder = Simulated::default();
-        let (handle, task) =
-            spawn(responder.clone(), controller(None), REANNOUNCE_INTERVAL).unwrap();
-        handle
-            .update_controller(controller(Some(8770)))
-            .await
-            .unwrap();
-        handle.update_controller(controller(None)).await.unwrap();
-        let tls_ports: Vec<Option<String>> = responder
-            .calls()
-            .iter()
-            .filter_map(|call| match call {
-                Call::Announce(record) => Some(record.txt_value("tls_port").map(str::to_owned)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(tls_ports, [None, Some("8770".to_owned()), None]);
-        // The same instance name is updated in place, never withdrawn.
-        assert!(
-            !responder
-                .calls()
-                .iter()
-                .any(|call| matches!(call, Call::Withdraw(_)))
-        );
-        handle.shutdown(Duration::from_secs(1)).await.unwrap();
-        task.await.unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_new_address_moves_every_record() {
-        let responder = Simulated::default();
-        let (handle, task) =
-            spawn(responder.clone(), controller(None), REANNOUNCE_INTERVAL).unwrap();
-        handle
-            .register_esphome(voice("AAAAAAAAAAAA", 16001))
-            .await
-            .unwrap();
-        let mut moved = controller(None);
-        moved.address = Ipv4Addr::new(10, 0, 0, 7);
-        handle.update_controller(moved).await.unwrap();
-        let calls = responder.calls();
-        let last_two: Vec<(String, Ipv4Addr)> = calls[calls.len() - 2..]
-            .iter()
-            .map(|call| match call {
-                Call::Announce(record) => (record.fullname(), record.address),
-                other => panic!("unexpected {other:?}"),
-            })
-            .collect();
-        assert_eq!(
-            last_two,
-            [
-                (
-                    "echomuse._emcontroller._tcp.local.".to_owned(),
-                    Ipv4Addr::new(10, 0, 0, 7)
-                ),
-                (
-                    "echomuse-aaaaaaaaaaaa._esphomelib._tcp.local.".to_owned(),
-                    Ipv4Addr::new(10, 0, 0, 7)
-                ),
-            ]
-        );
-        assert_eq!(
-            *responder.served.lock().unwrap(),
-            [Ipv4Addr::new(192, 168, 1, 20), Ipv4Addr::new(10, 0, 0, 7)]
-        );
-        handle.shutdown(Duration::from_secs(1)).await.unwrap();
-        task.await.unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn renaming_the_controller_withdraws_the_old_instance() {
-        let responder = Simulated::default();
-        let (handle, task) =
-            spawn(responder.clone(), controller(None), REANNOUNCE_INTERVAL).unwrap();
-        let mut renamed = controller(None);
-        renamed.name = MdnsName::new("den").unwrap();
-        handle.update_controller(renamed).await.unwrap();
-        let calls = responder.calls();
-        assert_eq!(
-            calls[1],
-            Call::Withdraw("echomuse._emcontroller._tcp.local.".to_owned())
-        );
-        assert!(
-            matches!(&calls[2], Call::Announce(record) if record.fullname() == "den._emcontroller._tcp.local.")
-        );
         handle.shutdown(Duration::from_secs(1)).await.unwrap();
         task.await.unwrap();
     }

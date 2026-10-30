@@ -16,9 +16,9 @@ use serde::{Deserialize, Serialize};
 use crate::time::{CellIndex, Epoch, Sample, SampleSpan};
 
 /// The device's loudness record of a silent or missing cell, in hundredths of a dB.
-pub const CELL_E_MIN: i16 = -12_000;
+const CELL_E_MIN: i16 = -12_000;
 /// The loudest possible cell, in hundredths of a dB.
-pub const CELL_E_MAX: i16 = 0;
+const CELL_E_MAX: i16 = 0;
 const FLAG_GAP: u8 = 1;
 const FLAG_MUTED: u8 = 2;
 /// The final-mix sources a cell's mask may name: content, alert, dialog, earcon.
@@ -371,6 +371,34 @@ pub enum CellAudio {
 }
 
 impl CellAudio {
+    /// What a cell holds, from the inputs that arrived for it, by the rule the evidence
+    /// assembler releases cells with: a gap or muted device record is a gap (muted as the
+    /// device said), a marked missing range is a gap, and otherwise the cell is present with
+    /// every absent input unknown ([`VadInput::Unknown`], [`EchoCell::MISSING`]).
+    pub fn from_inputs(
+        device: Option<DeviceInput>,
+        gap: bool,
+        vad: Option<VadInput>,
+        echo: Option<EchoCell>,
+    ) -> Self {
+        let device = match device {
+            Some(DeviceInput::Cell(d)) if d.gap || d.muted => {
+                return Self::Gap { muted: d.muted };
+            }
+            Some(DeviceInput::Cell(d)) => Some(d),
+            _ => None,
+        };
+        if gap {
+            return Self::Gap { muted: false };
+        }
+        Self::Present {
+            energy_centi: device.map(|d| d.e_centi),
+            source_mask: device.map(|d| d.source_mask),
+            vad: vad.unwrap_or(VadInput::Unknown),
+            echo: echo.unwrap_or(EchoCell::MISSING),
+        }
+    }
+
     /// The cell's loudness in dB, when known.
     pub fn energy_db(&self) -> Option<f64> {
         match self {
@@ -460,11 +488,6 @@ impl EvidenceAssembler {
     /// The plan.
     pub fn plan(&self) -> &EvidencePlan {
         &self.plan
-    }
-
-    /// The next cell that will be released.
-    pub fn next_cell(&self) -> CellIndex {
-        self.next
     }
 
     /// The covered-through sample of the newest ASR result accepted so far.
@@ -644,39 +667,14 @@ impl EvidenceAssembler {
             let slot = self.slots.pop_front().expect("front exists");
             let cell = self.next;
             self.next = cell.next();
-            let audio = cell_audio(slot, cell, &self.plan);
+            // Inputs the plan does not require for the cell were refused on arrival, so they
+            // are absent here and read as unknown.
+            let audio = CellAudio::from_inputs(slot.device, slot.gap, slot.vad, slot.echo);
             if cell >= self.plan.analysis_from && matches!(audio, CellAudio::Gap { .. }) {
                 self.asr_closed = true;
             }
             out.push(Released::Cell(CellEvidence { cell, audio }));
         }
-    }
-}
-
-fn cell_audio(slot: Slot, cell: CellIndex, plan: &EvidencePlan) -> CellAudio {
-    let device = match slot.device {
-        Some(DeviceInput::Cell(d)) if d.gap || d.muted => {
-            return CellAudio::Gap { muted: d.muted };
-        }
-        Some(DeviceInput::Cell(d)) => Some(d),
-        _ => None,
-    };
-    if slot.gap {
-        return CellAudio::Gap { muted: false };
-    }
-    CellAudio::Present {
-        energy_centi: device.map(|d| d.e_centi),
-        source_mask: device.map(|d| d.source_mask),
-        vad: if cell < plan.vad_from {
-            VadInput::Unknown
-        } else {
-            slot.vad.unwrap_or(VadInput::Unknown)
-        },
-        echo: if cell < plan.analysis_from {
-            EchoCell::MISSING
-        } else {
-            slot.echo.unwrap_or(EchoCell::MISSING)
-        },
     }
 }
 

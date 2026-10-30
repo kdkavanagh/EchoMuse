@@ -70,7 +70,7 @@ pub struct MacAddress(pub [u8; 6]);
 
 impl MacAddress {
     /// The form of the ESPHome `mac` TXT property: 12 lowercase hex digits.
-    pub fn txt_form(&self) -> String {
+    fn txt_form(&self) -> String {
         self.0.iter().map(|octet| format!("{octet:02x}")).collect()
     }
 }
@@ -144,7 +144,7 @@ pub struct EsphomeAdvertisement {
 
 impl EsphomeAdvertisement {
     /// The node name for this device and kind.
-    pub fn node_name(&self) -> NodeName {
+    fn node_name(&self) -> NodeName {
         match self.kind {
             EsphomeNodeKind::VoiceSatellite => voice_node_name(&self.device),
             EsphomeNodeKind::BluetoothProxy => bluetooth_proxy_node_name(&self.device),
@@ -152,7 +152,7 @@ impl EsphomeAdvertisement {
     }
 
     /// The MAC address for this device and kind.
-    pub fn mac(&self) -> MacAddress {
+    fn mac(&self) -> MacAddress {
         match self.kind {
             EsphomeNodeKind::VoiceSatellite => voice_mac(&self.device),
             EsphomeNodeKind::BluetoothProxy => bluetooth_proxy_mac(&self.device),

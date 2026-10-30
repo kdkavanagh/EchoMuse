@@ -55,8 +55,8 @@ use axum::{
 use echomuse_core::types::DeviceId;
 use echomuse_db::ReadQuery;
 use echomuse_records::{
-    ArchiveClip, ClipWindows, ConfirmedWakeClips, GetNearMiss, GetTurn, ListScope, NearMissRowId,
-    RecordingKind, RecordingsLayout, SavedNearMissRecordings, TurnRowId, WakeClipRows,
+    ArchiveClip, ClipWindows, ConfirmedWakeClips, ListScope, RecordingKind, RecordingsLayout,
+    SavedNearMissRecordings, WakeClipRows,
     vocab::{NearMissRecording, NearMissVerdict},
 };
 use rusqlite::Connection;
@@ -64,14 +64,14 @@ use serde::Deserialize;
 use tokio_util::io::ReaderStream;
 
 use crate::{
-    activity::{RowPath, known_device, no_such, recording_path},
+    activity::{RowPath, known_device, near_miss_of_device, recording_path, turn_of_device},
     auth::AuthenticatedUser,
     device_services::service_error,
     diagnostics::{ClipKind, ClipRef},
     error::{ApiError, ErrorCode},
     params::{DevicePath, QueryParams},
     state::ApiState,
-    zip_writer::{DosTime, SampleSpan, ZipEntry, ZipPart, ZipPlan, stream_zip_parts, unique_name},
+    zip_writer::{DosTime, SampleSpan, ZipEntry, ZipPart, ZipPlan, unique_name, zip_download},
 };
 
 pub(crate) fn routes() -> Router<ApiState> {
@@ -96,7 +96,7 @@ pub(crate) fn routes() -> Router<ApiState> {
 }
 
 fn not_kept() -> ApiError {
-    no_such("This recording is not kept")
+    ApiError::no_such("This recording is not kept")
 }
 
 /// A device's name in file names, by the dashboard's rule (dashboard.jsx, `fileSlug`): the
@@ -145,7 +145,7 @@ async fn serve_wav(path: Option<std::path::PathBuf>) -> Result<Response, ApiErro
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(not_kept()),
         Err(e) => {
-            eprintln!("api: recording {} could not be opened: {e}", path.display());
+            tracing::error!(error = %e, "recording {} could not be opened", path.display());
             return Err(ApiError::internal("The recording could not be read"));
         }
     };
@@ -170,12 +170,7 @@ enum TurnClip {
 }
 
 async fn turn_clip(state: &ApiState, path: RowPath, clip: TurnClip) -> Result<Response, ApiError> {
-    let turn = state
-        .db()
-        .read(GetTurn(TurnRowId(path.row)))
-        .await?
-        .filter(|t| t.device_id == path.device.0)
-        .ok_or_else(|| no_such("No turn of this device has this id"))?;
+    let turn = turn_of_device(state, &path).await?;
     // The utterance and the wake clip are saved exactly when their column is set; the turn
     // recording has no column and is saved exactly when its file exists.
     let (kind, saved) = match clip {
@@ -219,12 +214,7 @@ async fn near_miss_recording(
     _user: AuthenticatedUser,
     path: RowPath,
 ) -> Result<Response, ApiError> {
-    let near_miss = state
-        .db()
-        .read(GetNearMiss(NearMissRowId(path.row)))
-        .await?
-        .filter(|n| n.device_id == path.device.0)
-        .ok_or_else(|| no_such("No near miss of this device has this id"))?;
+    let near_miss = near_miss_of_device(&state, &path).await?;
     if near_miss.recording.known() != Some(&NearMissRecording::Saved) {
         return Err(not_kept());
     }
@@ -325,7 +315,7 @@ async fn archive(
     .await
     .map_err(|_| ApiError::internal("Listing the clips failed"))?;
     if parts.is_empty() {
-        return Err(no_such(none));
+        return Err(ApiError::no_such(none));
     }
     if !plan.fits() {
         return Err(ApiError::new(
@@ -334,16 +324,7 @@ async fn archive(
             "These clips are more than one ZIP archive can hold (4 GiB); narrow the range",
         ));
     }
-    let mut response = stream_zip_parts(parts).into_response();
-    let headers = response.headers_mut();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/zip"),
-    );
-    if let Ok(value) = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")) {
-        headers.insert(header::CONTENT_DISPOSITION, value);
-    }
-    Ok(response)
+    Ok(zip_download(parts, &filename))
 }
 
 // ─── Crops ──────────────────────────────────────────────────────────────────────
@@ -526,17 +507,15 @@ async fn crops_for(
         .collect();
     if crops.is_empty() {
         return Err(match (windows.is_empty(), cut) {
-            (false, Cut::Every { min, .. }) => no_such_owned(format!(
+            (false, Cut::Every { min, .. }) => ApiError::no_such(format!(
                 "No window of the matching clips scored {min:.2} or more; lower the window score"
             )),
-            _ => no_such("None of the matching clips could be scored, so none can be cropped"),
+            _ => ApiError::no_such(
+                "None of the matching clips could be scored, so none can be cropped",
+            ),
         });
     }
     Ok(crops)
-}
-
-fn no_such_owned(message: String) -> ApiError {
-    ApiError::new(StatusCode::NOT_FOUND, ErrorCode::NotFound, message)
 }
 
 /// `DELETE …/wakeclips`: refused. The records service has no command that deletes a

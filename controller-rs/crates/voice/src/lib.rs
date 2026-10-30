@@ -13,7 +13,6 @@
 //! [`arbiter`].
 
 pub mod arbiter;
-pub mod config;
 pub mod evidence;
 pub mod speech;
 pub mod wire;
@@ -25,27 +24,21 @@ mod tests;
 
 mod afe;
 mod analysis;
-mod button;
-mod candidate;
-mod diagnostic;
-mod early;
+mod config;
+mod conversation;
 mod io;
-mod linger;
 mod link;
-mod local;
 mod machine;
 mod output;
-mod pause_server;
-mod record;
-mod reply;
-mod turn;
+mod rows;
+mod session;
+mod wake;
 
-pub use diagnostic::DiagnosticAudio;
+pub use conversation::pause_server::ServerRequest;
 pub use io::{
     AlertReply, AlertRequest, CallId, Correction, CorrectionRequest, DecodeCommand, DecodeReport,
     Effect, HaReply, HaRequest, Input, Now, Outbound, PersistReply, PersistRequest, PreviewId,
-    PreviewOutcome, RECOGNIZER_PROBE, SatelliteCommand, VolumeSet, recognizer_sentences,
+    PreviewOutcome, SatelliteCommand, VolumeSet, recognizer_sentences,
 };
+pub use machine::diagnostic::DiagnosticAudio;
 pub use machine::{Voice, VoiceConfig, VoiceCounters, VoiceStatus, WakeModelInfo};
-pub use pause_server::{PAUSE_SERVER_LIMIT, SPAN_SERVER_LIMIT, ServerRequest};
-pub use record::POLICY;

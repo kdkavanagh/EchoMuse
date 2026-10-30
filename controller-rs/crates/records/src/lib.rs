@@ -59,8 +59,8 @@ pub use rollups::{
 };
 pub use service::{
     DRAIN_WAIT, DeletedRecords, FixFollows, NearMissAudio, PersistedNearMiss, PersistedTurn,
-    Publication, ReconcileReport, RecordsError, RecordsService, RetentionLimits, TurnAudio,
-    TurnStored,
+    Publication, ReconcileReport, RecordsError, RecordsLifetime, RecordsService, RetentionLimits,
+    TurnAudio, TurnStored,
 };
 pub use trace::{DecisionTrace, TraceDetails, TraceParts, VerificationTiming};
 pub use turns::{

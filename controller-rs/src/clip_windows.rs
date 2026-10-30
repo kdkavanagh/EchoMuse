@@ -57,16 +57,16 @@ use crate::{
 };
 
 /// Samples between window starts (160 ms).
-pub const HOP: usize = 2_560;
+const HOP: usize = 2_560;
 /// How long the scorer waits between scans when nothing new arrives.
-pub const RESCAN: Duration = Duration::from_secs(60);
+const RESCAN: Duration = Duration::from_secs(60);
 /// Clips scored before the next scan, so new clips are not kept waiting behind a backlog.
 const BATCH: usize = 32;
 /// The capture rate every clip is recorded at.
 const RATE: u32 = 16_000;
 
 /// Each window's start sample in a clip of `samples`.
-pub fn window_starts(samples: usize) -> Vec<usize> {
+fn window_starts(samples: usize) -> Vec<usize> {
     if samples <= WAKE_WINDOW_SAMPLES {
         return vec![0];
     }
@@ -83,7 +83,7 @@ fn rounded(score: f64) -> f64 {
 }
 
 /// Scores every window of `pcm`.
-pub fn score_clip(
+fn score_clip(
     scorer: &mut BoxedWakeScorer,
     pcm: &[i16],
 ) -> Result<Vec<(u64, f64)>, echomuse_speech::SpeechError> {
@@ -270,7 +270,6 @@ impl ReadQuery for UnscoredAmong {
 struct Inner {
     db: DbHandle,
     records: RecordsService,
-    layout: RecordingsLayout,
     settings: SettingsHandle,
     speech: watch::Receiver<SpeechStatus>,
     jobs: Mutex<std_mpsc::Sender<Job>>,
@@ -325,7 +324,6 @@ impl ClipScorer {
             .spawn(move || run_jobs(receiver, watched))?;
         let scorer = Self {
             inner: Arc::new(Inner {
-                layout: records.layout().clone(),
                 db,
                 records,
                 settings,
@@ -401,7 +399,7 @@ impl ClipScorer {
     /// Scores and stores one clip; `false` when it cannot be scored (it is then not
     /// tried again until restart).
     async fn score_one(&self, models: &Arc<dyn ModelSet>, clip: Unscored) -> bool {
-        let Some(path) = path_of(&self.inner.layout, &clip.clip) else {
+        let Some(path) = path_of(self.inner.records.layout(), &clip.clip) else {
             return self.unscorable(clip.clip, "its device id cannot name files");
         };
         let Some((graph, files)) = self.graph_for(&clip) else {
@@ -446,11 +444,12 @@ impl ClipScorer {
                     .await
             }
         };
+        // A clip whose windows cannot be stored is set aside like one that cannot be
+        // scored; otherwise every scan would score it again.
         match stored {
             Ok(_) => true,
             Err(error) => {
-                tracing::warn!(%device, id = clip.clip.id, %error, "clip windows were not stored");
-                false
+                self.unscorable(clip.clip, &format!("its windows were not stored: {error}"))
             }
         }
     }
@@ -479,7 +478,7 @@ impl ClipScorer {
             .lock()
             .expect("unscorable lock")
             .clone();
-        let layout = self.inner.layout.clone();
+        let layout = self.inner.records.layout().clone();
         tokio::task::spawn_blocking(move || {
             all.into_iter()
                 .filter(|clip| !skip.contains(&clip.clip))

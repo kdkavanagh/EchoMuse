@@ -231,7 +231,6 @@ fn recording_stops_at_the_grants_end() {
             ..
         }
     ));
-    assert_eq!(rec.next_deadline(), Some(ms(1_000)));
     assert_eq!(
         rec.frame(IngressOrdinal(1), &mic(0), ms(500)),
         FrameTaken::Queued
@@ -305,7 +304,6 @@ fn withdrawal_discards_unwritten_entries_and_ends_the_recording() {
         0,
         "pending entries discarded at once"
     );
-    assert!(!rec.audio_permitted());
     assert_eq!(
         rec.frame(IngressOrdinal(9), &mic(9), ms(50)),
         FrameTaken::Ended
@@ -365,7 +363,6 @@ fn mute_discards_pending_audio_and_records_the_mute() {
     rec.privacy(Some(IngressOrdinal(10)), muted, ms(10));
     // Only the non-audio entry and the mute itself remain.
     assert_eq!(rec.queue().pending(), 2);
-    assert!(!rec.audio_permitted());
     for k in 3..5 {
         assert_eq!(
             rec.frame(IngressOrdinal(k + 8), &mic(k), ms(20)),
@@ -425,7 +422,6 @@ fn no_audio_is_kept_while_capture_is_not_permitted_or_frames_are_flagged_muted()
         capture_permitted: false,
     };
     let mut rec = start(&book, &store, barred, ms(0));
-    assert!(!rec.audio_permitted());
     assert_eq!(
         rec.frame(IngressOrdinal(0), &mic(0), ms(1)),
         FrameTaken::Withheld

@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use echomuse_echo::WakeWindowScorer;
+use echomuse_speech::bcresnet::{RMS_FLOOR as WAKE_RMS_FLOOR, WAKE_WINDOW_SAMPLES as WAKE_WINDOW};
 use echomuse_speech::{AsrResult, BcresnetModelFiles, SpeechError, WindowScore};
 
 use super::Pcm16Le;
@@ -40,9 +41,6 @@ const BURST_FRAMES: u32 = 3;
 const END_FRAMES: u32 = 3;
 /// How long after a burst's last frame its word is stamped.
 const EMIT_DELAY_SECONDS: f64 = 0.12;
-/// The wake scorer's RMS floor, the real scorer's.
-const WAKE_RMS_FLOOR: f64 = 1e-4;
-const WAKE_WINDOW: usize = 22_400;
 /// Wake tone a window needs to score high: 300 ms.
 const WAKE_TONE_SAMPLES: usize = 4_800;
 

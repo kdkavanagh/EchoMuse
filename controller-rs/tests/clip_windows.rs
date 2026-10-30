@@ -7,7 +7,7 @@ use std::{path::Path, sync::Arc, time::Duration};
 
 use echomuse_api::{ClipKind, ClipRef, ClipScoring};
 use echomuse_controller::{
-    clip_windows::{ClipScorer, window_starts},
+    clip_windows::ClipScorer,
     speech_models,
     supervision::{Supervision, SupervisionOptions},
 };
@@ -135,12 +135,12 @@ async fn kept_clips_are_scored_in_the_background_and_on_demand() {
     assert_eq!(windows.graph_sha256, graph);
     assert_eq!(windows.samples, wake_clip().len() as u64);
     assert_eq!(windows.window, 22_400);
+    // 75,200 samples: a window every 160 ms from 0 through 51,200, then one ending at the
+    // clip's end.
     let starts: Vec<u64> = windows.scores.iter().map(|(start, _)| *start).collect();
-    let expected: Vec<u64> = window_starts(wake_clip().len())
-        .into_iter()
-        .map(|s| s as u64)
-        .collect();
-    assert_eq!(starts, expected);
+    assert_eq!(starts.len(), 22, "{starts:?}");
+    assert_eq!(starts[..2], [0, 2_560]);
+    assert_eq!(starts[20..], [51_200, 52_800]);
     // Windows holding enough of the tone hear the wake word; silent windows are below the
     // RMS floor and stored as 0, as the deployed rows store them.
     let (tone_start, tone_end) = (32_000_u64, 32_000 + 11_200);

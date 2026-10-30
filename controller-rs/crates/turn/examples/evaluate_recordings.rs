@@ -555,7 +555,7 @@ fn ms(samples: i64) -> i64 {
 fn main() {
     let args = args();
     let manifest = SpeechBundleManifest::load(&args.manifest).unwrap();
-    let native = NativeLibraries::pinned(&args.ort_lib, None).unwrap();
+    let native = NativeLibraries::pinned(&args.ort_lib).unwrap();
     let ort = OrtRuntime::load(&native.onnxruntime).unwrap();
     let sherpa = SherpaRuntime::verify(&native.sherpa).unwrap();
     let pin = |name: &str, d| PinnedFile::new(args.kroko.join(name), d);

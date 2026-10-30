@@ -45,10 +45,6 @@ pub(crate) fn load_session(
     Ok(session)
 }
 
-fn describe(ty: &ValueType) -> String {
-    format!("{ty:?}")
-}
-
 fn check_one(
     model: &'static str,
     role: &str,
@@ -66,9 +62,8 @@ fn check_one(
     }
     let ValueType::Tensor { ty, shape, .. } = actual else {
         return fail(format!(
-            "{role} {:?} is {}, expected a tensor",
-            spec.name,
-            describe(actual)
+            "{role} {:?} is {actual:?}, expected a tensor",
+            spec.name
         ));
     };
     if *ty != spec.ty {

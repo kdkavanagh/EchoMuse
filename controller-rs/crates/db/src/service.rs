@@ -339,7 +339,7 @@ impl DatabaseService {
             return Err(StartError::InvalidConfig);
         }
         let readers = (0..config.read_connections)
-            .map(|_| open_reader(database.path()))
+            .map(|_| open_reader(&database.path))
             .collect::<Result<Vec<_>, _>>()
             .map_err(StartError::OpenReader)?;
 

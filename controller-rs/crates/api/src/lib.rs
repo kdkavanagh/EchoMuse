@@ -105,8 +105,8 @@ pub use diagnostics::{
 };
 pub use error::{ApiError, ErrorCode};
 pub use events::{
-    AlertNotice, ApiEvent, ControllerRelease, DeviceStatePatch, DeviceView, EventPublisher,
-    EventsConfig, FeatureStatus, TimerDisplay,
+    AlertNotice, ApiEvent, DeviceStatePatch, DeviceView, EventPublisher, EventsConfig,
+    FeatureStatus, TimerDisplay,
 };
 pub use firmware::{
     DeployReport, DeploySkip, DeploySkipReason, FirmwareControl, FirmwareRefusal, UpdateStatus,
@@ -170,7 +170,7 @@ impl ApiConfig {
 }
 
 /// The services the API uses.
-pub struct ApiDeps<R, Q, F, C = SystemWallClock> {
+pub struct ApiDeps {
     /// The database service.
     pub db: DbHandle,
     /// The setup token printed at startup, or `None` when a user already exists.
@@ -179,11 +179,11 @@ pub struct ApiDeps<R, Q, F, C = SystemWallClock> {
     /// registry.
     pub settings: SettingsHandle,
     /// The device runtimes: live device state and device commands.
-    pub runtimes: R,
+    pub runtimes: Box<dyn DeviceRuntimes>,
     /// Runs uploaded wake models before they are accepted.
-    pub qualifier: Q,
+    pub qualifier: Box<dyn ModelQualifier>,
     /// Firmware delivery and the setup wizard's files.
-    pub firmware: F,
+    pub firmware: Box<dyn FirmwareControl>,
     /// The voice records: the turn and near-miss rows the activity routes read, the
     /// recordings beside the database, and near-miss verdicts.
     pub records: RecordsService,
@@ -198,7 +198,7 @@ pub struct ApiDeps<R, Q, F, C = SystemWallClock> {
     /// dashboards as `ha_status`.
     pub ha_status: watch::Receiver<HaStatus>,
     /// Wall time for session timestamps.
-    pub clock: C,
+    pub clock: Box<dyn WallClock>,
 }
 
 /// The HTTP API, ready to serve.
@@ -211,17 +211,14 @@ pub struct ApiServer {
 
 impl ApiServer {
     /// Build the routes over these services.
-    pub fn new<R: DeviceRuntimes, Q: ModelQualifier, F: FirmwareControl, C: WallClock>(
-        config: ApiConfig,
-        deps: ApiDeps<R, Q, F, C>,
-    ) -> Self {
+    pub fn new(config: ApiConfig, deps: ApiDeps) -> Self {
         let shutdown = CancellationToken::new();
         let events = EventHub::new(config.events, shutdown.clone());
         let publisher = events.publisher();
         let ha_status = deps.ha_status.clone();
         let state = ApiState::new(Inner {
             db: deps.db,
-            clock: Box::new(deps.clock),
+            clock: deps.clock,
             passwords: Passwords::new(config.bcrypt_cost),
             throttle: Throttle::new(config.login_throttle),
             bootstrap: Mutex::new(deps.bootstrap),
@@ -229,9 +226,9 @@ impl ApiServer {
             static_dir: config.static_dir.clone().into_boxed_path(),
             events,
             settings: deps.settings,
-            runtimes: Box::new(deps.runtimes),
-            qualifier: Box::new(deps.qualifier),
-            firmware: Box::new(deps.firmware),
+            runtimes: deps.runtimes,
+            qualifier: deps.qualifier,
+            firmware: deps.firmware,
             records: deps.records,
             services: deps.services,
             capture: deps.capture,

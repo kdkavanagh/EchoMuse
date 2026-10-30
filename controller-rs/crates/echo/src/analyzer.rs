@@ -159,6 +159,21 @@ pub struct CandidateComparison {
     pub speech_positive_cells: u32,
 }
 
+impl CandidateComparison {
+    /// An unknown comparison that compared no cells.
+    fn unknown(coverage: ReferenceCoverage, undecided: Undecided, lag: Option<LagOutcome>) -> Self {
+        Self {
+            echo: CandidateEcho::Unknown,
+            coverage,
+            lag,
+            undecided: Some(undecided),
+            cells: 0,
+            valid_cells: 0,
+            speech_positive_cells: 0,
+        }
+    }
+}
+
 /// The per-cell inputs held for one cell.
 #[derive(Clone, Copy, Debug, Default)]
 struct CellSlot {
@@ -298,11 +313,6 @@ impl EchoAnalyzer {
             sample_valid: Vec::new(),
             contexts: Vec::new(),
         }
-    }
-
-    /// The policy.
-    pub fn policy(&self) -> &EchoPolicy {
-        &self.policy
     }
 
     /// The open plan.
@@ -612,28 +622,9 @@ impl EchoAnalyzer {
             if !ready {
                 return;
             }
-            let audio = if slot.device_gap() {
-                CellAudio::Gap {
-                    muted: matches!(slot.device, Some(DeviceInput::Cell(d)) if d.is_muted()),
-                }
-            } else if slot.gap {
-                CellAudio::Gap { muted: false }
-            } else {
-                let device = match slot.device {
-                    Some(DeviceInput::Cell(d)) => Some(d),
-                    _ => None,
-                };
-                CellAudio::Present {
-                    energy_centi: device.map(|d| d.e_centi()),
-                    source_mask: device.map(|d| d.source_mask()),
-                    vad: if c < plan.vad_from {
-                        VadInput::Unknown
-                    } else {
-                        slot.vad.unwrap_or(VadInput::Unknown)
-                    },
-                    echo: EchoCell::MISSING,
-                }
-            };
+            // The cell as the evidence assembler releases it, so `B` here is the reducer's `B`.
+            let vad = if c < plan.vad_from { None } else { slot.vad };
+            let audio = CellAudio::from_inputs(slot.device, slot.gap, vad, None);
             let b = self.background.current_db();
             self.background.push(&audio);
             if let Ok(Some(s)) = self.slot_mut(c) {
@@ -654,6 +645,25 @@ impl EchoAnalyzer {
         let sp =
             matches!(vad, VadInput::Probability(p) if p.get() >= self.policy.speech_positive_vad);
         Some((sp, b))
+    }
+
+    /// Fills `contexts` with the context of each of `cells` cells from `first`; `false` while
+    /// one of them is not known yet.
+    fn fill_contexts(
+        &self,
+        plan: &EchoPlan,
+        first: CellIndex,
+        cells: usize,
+        contexts: &mut Vec<(bool, Option<f64>)>,
+    ) -> bool {
+        contexts.clear();
+        for i in 0..cells {
+            match self.cell_context(plan, CellIndex(first.0 + i as u64)) {
+                Some(ctx) => contexts.push(ctx),
+                None => return false,
+            }
+        }
+        true
     }
 
     /// The reference position heard at microphone sample `m` with no lag, rounded.
@@ -786,15 +796,11 @@ impl EchoAnalyzer {
         }
 
         let mut contexts = std::mem::take(&mut self.contexts);
-        contexts.clear();
-        for i in 0..cells {
-            let Some(ctx) = self.cell_context(&plan, CellIndex(k0.0 + i as u64)) else {
-                self.contexts = contexts;
-                return None;
-            };
-            contexts.push(ctx);
-        }
-        let labelled = self.label_window(k0, cells, lag, &contexts);
+        let labelled = if self.fill_contexts(&plan, k0, cells, &mut contexts) {
+            self.label_window(k0, cells, lag, &contexts)
+        } else {
+            None
+        };
         self.contexts = contexts;
         let (echo, used_lag, undecided) = labelled?;
         if let Some(state) = &mut self.labels {
@@ -947,17 +953,8 @@ impl EchoAnalyzer {
     pub fn compare_candidate(&mut self, support: SampleSpan) -> Option<CandidateComparison> {
         let plan = self.plan?;
         self.advance_background();
-        let unknown = |coverage, undecided, lag| CandidateComparison {
-            echo: CandidateEcho::Unknown,
-            coverage,
-            lag,
-            undecided: Some(undecided),
-            cells: 0,
-            valid_cells: 0,
-            speech_positive_cells: 0,
-        };
         if support.is_empty() {
-            return Some(unknown(
+            return Some(CandidateComparison::unknown(
                 ReferenceCoverage::Missing,
                 Undecided::TooFewValid,
                 None,
@@ -966,7 +963,7 @@ impl EchoAnalyzer {
         let first = support.start.cell().max(plan.vad_from);
         let last = Sample(support.end.0 - 1).cell();
         if last < first {
-            return Some(unknown(
+            return Some(CandidateComparison::unknown(
                 ReferenceCoverage::Missing,
                 Undecided::TooFewValid,
                 None,
@@ -977,15 +974,11 @@ impl EchoAnalyzer {
         }
         let cells = (last.0 - first.0 + 1) as usize;
         let mut contexts = std::mem::take(&mut self.contexts);
-        contexts.clear();
-        for i in 0..cells {
-            let Some(ctx) = self.cell_context(&plan, CellIndex(first.0 + i as u64)) else {
-                self.contexts = contexts;
-                return None;
-            };
-            contexts.push(ctx);
-        }
-        let result = self.compare_cells(first, &contexts);
+        let result = if self.fill_contexts(&plan, first, cells, &mut contexts) {
+            self.compare_cells(first, &contexts)
+        } else {
+            None
+        };
         self.contexts = contexts;
         result
     }
@@ -997,22 +990,13 @@ impl EchoAnalyzer {
         first: CellIndex,
         contexts: &[(bool, Option<f64>)],
     ) -> Option<CandidateComparison> {
-        let unknown = |coverage, undecided, lag| CandidateComparison {
-            echo: CandidateEcho::Unknown,
-            coverage,
-            lag,
-            undecided: Some(undecided),
-            cells: 0,
-            valid_cells: 0,
-            speech_positive_cells: 0,
-        };
         let cells = contexts.len();
         let n = cells * CELL_SAMPLES;
         let lag_max = i64::from(self.policy.lag_max);
         let Some(r_s) = self.mic_to_reference(first.start().0) else {
             return match self.reference_unplaced() {
                 Read::Pending => None,
-                _ => Some(unknown(
+                _ => Some(CandidateComparison::unknown(
                     ReferenceCoverage::Missing,
                     Undecided::ReferenceMissing,
                     None,
@@ -1022,7 +1006,7 @@ impl EchoAnalyzer {
         let tags = match self.reference_read(r_s - lag_max, r_s + n as i64) {
             Read::Pending => return None,
             Read::Missing => {
-                return Some(unknown(
+                return Some(CandidateComparison::unknown(
                     ReferenceCoverage::Missing,
                     Undecided::ReferenceMissing,
                     None,
@@ -1035,7 +1019,7 @@ impl EchoAnalyzer {
             .store
             .copy_to(r_s - lag_max, &mut self.ref_buf);
         if all_silent(&self.ref_buf, self.policy.silence_mean_square()) {
-            return Some(unknown(
+            return Some(CandidateComparison::unknown(
                 ReferenceCoverage::Silent,
                 Undecided::NoLag,
                 Some(LagOutcome::Unknown(LagUnknown::ReferenceSilent)),
@@ -1043,7 +1027,11 @@ impl EchoAnalyzer {
         }
         let coverage = tag_coverage(tags);
         if coverage == ReferenceCoverage::Partial {
-            return Some(unknown(coverage, Undecided::PartialCoverage, None));
+            return Some(CandidateComparison::unknown(
+                coverage,
+                Undecided::PartialCoverage,
+                None,
+            ));
         }
         self.read_mic_cells(first, cells);
         self.sample_valid.clear();

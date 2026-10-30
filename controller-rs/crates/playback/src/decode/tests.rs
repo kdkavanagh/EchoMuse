@@ -315,7 +315,7 @@ async fn dropping_the_stream_reaps_ffmpeg_too() {
 
 #[test]
 fn relative_media_urls_resolve_against_home_assistant() {
-    let base = Url::parse("http://homeassistant.local:8123/").unwrap();
+    let base = Url::parse("http://homeassistant.local:8123").unwrap();
     assert_eq!(
         resolve_media_url(&base, "/api/tts_proxy/abc.mp3")
             .unwrap()
@@ -332,4 +332,23 @@ fn relative_media_urls_resolve_against_home_assistant() {
         resolve_media_url(&base, "media-source://x"),
         Err(FetchError::Scheme("media-source".into()))
     );
+}
+
+#[test]
+fn a_media_path_stays_under_a_prefixed_base() {
+    for base in ["http://supervisor/core", "http://supervisor/core/"] {
+        let base = Url::parse(base).unwrap();
+        assert_eq!(
+            resolve_media_url(&base, "/api/tts_proxy/abc.mp3?token=x")
+                .unwrap()
+                .as_str(),
+            "http://supervisor/core/api/tts_proxy/abc.mp3?token=x"
+        );
+        assert_eq!(
+            resolve_media_url(&base, "http://other:8123/api/x.mp3")
+                .unwrap()
+                .as_str(),
+            "http://other:8123/api/x.mp3"
+        );
+    }
 }

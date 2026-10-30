@@ -54,11 +54,11 @@ async fn page(state: &ApiState, headers: &HeaderMap, name: &str) -> Result<Respo
     let html = match tokio::fs::read_to_string(&path).await {
         Ok(html) => html,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("api: the dashboard page {} is missing", path.display());
+            tracing::warn!("the dashboard page {} is missing", path.display());
             return Err(ApiError::not_found());
         }
         Err(error) => {
-            eprintln!("api: cannot read {}: {error}", path.display());
+            tracing::error!(%error, "cannot read {}", path.display());
             return Err(ApiError::internal("The dashboard page could not be read"));
         }
     };

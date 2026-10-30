@@ -20,7 +20,7 @@ use std::{
 
 use bytes::Bytes;
 use echomuse_api::{
-    ApiConfig, ApiDeps, ApiServer, BcryptCost, BootstrapToken, DeployReport, DeploySkip,
+    ApiConfig, ApiDeps, ApiServer, BcryptCost, BootstrapToken, BoxFuture, DeployReport, DeploySkip,
     DeploySkipReason, DeviceLabel, DeviceRuntimes, EventPublisher, EventsConfig, FirmwareControl,
     FirmwareRefusal, HaStatus, Ingress, LiveDevice, ModelCandidate, ModelQualifier, ModelRefused,
     RuntimeError, SettingsApplied, ThrottleConfig, UpdateStatus, WallClock,
@@ -145,54 +145,66 @@ impl DeviceRuntimes for FakeRuntimes {
         self.live.lock().unwrap().get(device).cloned()
     }
 
-    async fn approve(&self, device: DeviceId, label: DeviceLabel) -> Result<(), RuntimeError> {
-        self.calls.lock().unwrap().push(RuntimeCall::Approve(
-            device.clone(),
-            label.as_str().to_owned(),
-        ));
-        self.failure()?;
-        self.sqlite()
-            .execute(
-                "UPDATE devices SET approved = 1, label = ?2 WHERE device_id = ?1",
-                [&device.0, label.as_str()],
-            )
-            .unwrap();
-        Ok(())
+    fn approve(
+        &self,
+        device: DeviceId,
+        label: DeviceLabel,
+    ) -> BoxFuture<'_, Result<(), RuntimeError>> {
+        Box::pin(async move {
+            self.calls.lock().unwrap().push(RuntimeCall::Approve(
+                device.clone(),
+                label.as_str().to_owned(),
+            ));
+            self.failure()?;
+            self.sqlite()
+                .execute(
+                    "UPDATE devices SET approved = 1, label = ?2 WHERE device_id = ?1",
+                    [&device.0, label.as_str()],
+                )
+                .unwrap();
+            Ok(())
+        })
     }
 
-    async fn delete(&self, device: DeviceId) -> Result<(), RuntimeError> {
-        self.calls
-            .lock()
-            .unwrap()
-            .push(RuntimeCall::Delete(device.clone()));
-        self.failure()?;
-        let conn = self.sqlite();
-        conn.execute("DELETE FROM device_logs WHERE device_id = ?1", [&device.0])
-            .unwrap();
-        conn.execute("DELETE FROM devices WHERE device_id = ?1", [&device.0])
-            .unwrap();
-        self.live.lock().unwrap().remove(&device);
-        Ok(())
+    fn delete(&self, device: DeviceId) -> BoxFuture<'_, Result<(), RuntimeError>> {
+        Box::pin(async move {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(RuntimeCall::Delete(device.clone()));
+            self.failure()?;
+            let conn = self.sqlite();
+            conn.execute("DELETE FROM device_logs WHERE device_id = ?1", [&device.0])
+                .unwrap();
+            conn.execute("DELETE FROM devices WHERE device_id = ?1", [&device.0])
+                .unwrap();
+            self.live.lock().unwrap().remove(&device);
+            Ok(())
+        })
     }
 
-    async fn settings_applied(&self, change: SettingsApplied) -> Vec<DeviceId> {
-        self.calls
-            .lock()
-            .unwrap()
-            .push(RuntimeCall::SettingsApplied(change.clone()));
-        let live = self.live.lock().unwrap();
-        change
-            .changed
-            .into_iter()
-            .filter(|device| live.get(device).is_some_and(LiveDevice::connected))
-            .collect()
+    fn settings_applied(&self, change: SettingsApplied) -> BoxFuture<'_, Vec<DeviceId>> {
+        Box::pin(async move {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(RuntimeCall::SettingsApplied(change.clone()));
+            let live = self.live.lock().unwrap();
+            change
+                .changed
+                .into_iter()
+                .filter(|device| live.get(device).is_some_and(LiveDevice::connected))
+                .collect()
+        })
     }
 
-    async fn relabeled(&self, device: DeviceId, label: String) {
-        self.calls
-            .lock()
-            .unwrap()
-            .push(RuntimeCall::Relabeled(device, label));
+    fn relabeled(&self, device: DeviceId, label: String) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(RuntimeCall::Relabeled(device, label));
+        })
     }
 }
 
@@ -219,9 +231,14 @@ impl FakeQualifier {
 }
 
 impl ModelQualifier for FakeQualifier {
-    async fn qualify(&self, candidate: ModelCandidate) -> Result<ProbeResult, ModelRefused> {
-        self.runs.lock().unwrap().push(candidate);
-        self.result.lock().unwrap().clone()
+    fn qualify(
+        &self,
+        candidate: ModelCandidate,
+    ) -> BoxFuture<'_, Result<ProbeResult, ModelRefused>> {
+        Box::pin(async move {
+            self.runs.lock().unwrap().push(candidate);
+            self.result.lock().unwrap().clone()
+        })
     }
 }
 
@@ -296,89 +313,108 @@ impl FirmwareControl for FakeFirmware {
             .unwrap_or_default()
     }
 
-    async fn update(&self, device: DeviceId) -> Result<String, FirmwareRefusal> {
-        self.record(FirmwareCall::Update(device))?;
-        Ok(BUNDLED_VERSION.to_owned())
-    }
-
-    async fn rollback(&self, device: DeviceId) -> Result<(), FirmwareRefusal> {
-        self.record(FirmwareCall::Rollback(device))
-    }
-
-    async fn queue_update(&self, device: DeviceId) -> Result<i64, FirmwareRefusal> {
-        self.record(FirmwareCall::Queue(device.clone()))?;
-        Ok(*self.queued.lock().unwrap().entry(device).or_insert(START))
-    }
-
-    async fn cancel_queued_update(&self, device: DeviceId) -> Result<bool, FirmwareRefusal> {
-        self.record(FirmwareCall::CancelQueue(device.clone()))?;
-        Ok(self.queued.lock().unwrap().remove(&device).is_some())
-    }
-
-    async fn debloat(&self, device: DeviceId) -> Result<(), FirmwareRefusal> {
-        self.record(FirmwareCall::Debloat(device))
-    }
-
-    async fn secure_link(&self, device: DeviceId) -> Result<(), FirmwareRefusal> {
-        self.record(FirmwareCall::SecureLink(device))
-    }
-
-    async fn deploy(&self) -> DeployReport {
-        let _ = self.record(FirmwareCall::Deploy);
-        DeployReport {
-            version: BUNDLED_VERSION.to_owned(),
-            started: vec![DeviceId("G0SYNTHETIC00001".to_owned())],
-            skipped: vec![DeploySkip {
-                device_id: DeviceId("G0SYNTHETIC00002".to_owned()),
-                reason: DeploySkipReason::Offline,
-            }],
-        }
-    }
-
-    async fn provision_start_script(&self) -> Result<StartScriptFile, ProvisionError> {
-        Ok(StartScriptFile {
-            bytes: Bytes::from_static(b"#!/system/bin/sh\n# synthetic\n"),
+    fn update(&self, device: DeviceId) -> BoxFuture<'_, Result<String, FirmwareRefusal>> {
+        Box::pin(async move {
+            self.record(FirmwareCall::Update(device))?;
+            Ok(BUNDLED_VERSION.to_owned())
         })
     }
 
-    async fn provision_crown_lists(&self) -> Result<CrownLists, ProvisionError> {
-        let list = |file: &'static str| PackageList {
-            file,
-            text: "com.example.synthetic\n".to_owned(),
-            packages: vec!["com.example.synthetic".to_owned()],
-        };
-        Ok(CrownLists {
-            dir: "/data/local/etc/echomuse",
-            tiers_file: "crown_tiers",
-            hide: vec![HideList {
-                tier: "1",
-                list: list("crown_hide_packages.txt"),
-            }],
-            mic_deny: list("crown_mic_deny_packages.txt"),
+    fn rollback(&self, device: DeviceId) -> BoxFuture<'_, Result<(), FirmwareRefusal>> {
+        Box::pin(async move { self.record(FirmwareCall::Rollback(device)) })
+    }
+
+    fn queue_update(&self, device: DeviceId) -> BoxFuture<'_, Result<i64, FirmwareRefusal>> {
+        Box::pin(async move {
+            self.record(FirmwareCall::Queue(device.clone()))?;
+            Ok(*self.queued.lock().unwrap().entry(device).or_insert(START))
         })
     }
 
-    async fn provision_firmware(&self) -> Result<FirmwareDownload, ProvisionError> {
-        Ok(FirmwareDownload {
-            bytes: Bytes::from_static(BUNDLED_BYTES),
-            info: Self::info(),
+    fn cancel_queued_update(
+        &self,
+        device: DeviceId,
+    ) -> BoxFuture<'_, Result<bool, FirmwareRefusal>> {
+        Box::pin(async move {
+            self.record(FirmwareCall::CancelQueue(device.clone()))?;
+            Ok(self.queued.lock().unwrap().remove(&device).is_some())
         })
     }
 
-    async fn provision_tls_credentials(
+    fn debloat(&self, device: DeviceId) -> BoxFuture<'_, Result<(), FirmwareRefusal>> {
+        Box::pin(async move { self.record(FirmwareCall::Debloat(device)) })
+    }
+
+    fn secure_link(&self, device: DeviceId) -> BoxFuture<'_, Result<(), FirmwareRefusal>> {
+        Box::pin(async move { self.record(FirmwareCall::SecureLink(device)) })
+    }
+
+    fn deploy(&self) -> BoxFuture<'_, DeployReport> {
+        Box::pin(async move {
+            let _ = self.record(FirmwareCall::Deploy);
+            DeployReport {
+                version: BUNDLED_VERSION.to_owned(),
+                started: vec![DeviceId("G0SYNTHETIC00001".to_owned())],
+                skipped: vec![DeploySkip {
+                    device_id: DeviceId("G0SYNTHETIC00002".to_owned()),
+                    reason: DeploySkipReason::Offline,
+                }],
+            }
+        })
+    }
+
+    fn provision_start_script(&self) -> BoxFuture<'_, Result<StartScriptFile, ProvisionError>> {
+        Box::pin(async {
+            Ok(StartScriptFile {
+                bytes: Bytes::from_static(b"#!/system/bin/sh\n# synthetic\n"),
+            })
+        })
+    }
+
+    fn provision_crown_lists(&self) -> BoxFuture<'_, Result<CrownLists, ProvisionError>> {
+        Box::pin(async {
+            let list = |file: &'static str| PackageList {
+                file,
+                text: "com.example.synthetic\n".to_owned(),
+                packages: vec!["com.example.synthetic".to_owned()],
+            };
+            Ok(CrownLists {
+                dir: "/data/local/etc/echomuse",
+                tiers_file: "crown_tiers",
+                hide: vec![HideList {
+                    tier: "1",
+                    list: list("crown_hide_packages.txt"),
+                }],
+                mic_deny: list("crown_mic_deny_packages.txt"),
+            })
+        })
+    }
+
+    fn provision_firmware(&self) -> BoxFuture<'_, Result<FirmwareDownload, ProvisionError>> {
+        Box::pin(async {
+            Ok(FirmwareDownload {
+                bytes: Bytes::from_static(BUNDLED_BYTES),
+                info: Self::info(),
+            })
+        })
+    }
+
+    fn provision_tls_credentials(
         &self,
         request: TlsCredentialsRequest,
-    ) -> Result<TlsCredentials, ProvisionError> {
-        let _ = self.record(FirmwareCall::TlsCredentials(request.device_id.clone()));
-        if request.device_id.is_empty() {
-            return Err(ProvisionError::InvalidRequest(
-                "device_id is empty".to_owned(),
-            ));
-        }
-        Ok(TlsCredentials {
-            ca_pem: "-----BEGIN CERTIFICATE-----\nsynthetic\n".to_owned(),
-            token: LinkToken::new("synthetic-token".to_owned()),
-            dir: "/data/local/etc/echomuse",
+    ) -> BoxFuture<'_, Result<TlsCredentials, ProvisionError>> {
+        Box::pin(async move {
+            let _ = self.record(FirmwareCall::TlsCredentials(request.device_id.clone()));
+            if request.device_id.is_empty() {
+                return Err(ProvisionError::InvalidRequest(
+                    "device_id is empty".to_owned(),
+                ));
+            }
+            Ok(TlsCredentials {
+                ca_pem: "-----BEGIN CERTIFICATE-----\nsynthetic\n".to_owned(),
+                token: LinkToken::new("synthetic-token".to_owned()),
+                dir: "/data/local/etc/echomuse",
+            })
         })
     }
 
@@ -514,9 +550,9 @@ impl TestServer {
                 db: db.clone(),
                 bootstrap,
                 settings: settings.clone(),
-                runtimes: runtimes.clone(),
-                qualifier: qualifier.clone(),
-                firmware: firmware.clone(),
+                runtimes: Box::new(runtimes.clone()),
+                qualifier: Box::new(qualifier.clone()),
+                firmware: Box::new(firmware.clone()),
                 records: records.clone(),
                 services: services::refusing(),
                 capture: services::refusing_capture(),
@@ -524,7 +560,7 @@ impl TestServer {
                     .diagnostics
                     .unwrap_or_else(services::refusing_diagnostics),
                 ha_status: ha_status_receiver,
-                clock: clock.clone(),
+                clock: Box::new(clock.clone()),
             },
         );
         let publisher = server.publisher();

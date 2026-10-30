@@ -122,12 +122,14 @@ impl std::fmt::Debug for LinkServer {
 }
 
 impl LinkServer {
-    /// Binds both listeners and starts accepting. Must run inside a Tokio runtime.
+    /// Binds both listeners and starts accepting, routing shell dial-backs into
+    /// `shells`. Must run inside a Tokio runtime.
     pub async fn bind<A: Admission, S: AssetSource>(
         config: LinkConfig,
         db: DbHandle,
         admission: A,
         assets: S,
+        shells: ShellBroker,
     ) -> Result<Self, LinkError> {
         config.validate().map_err(LinkError::Config)?;
         let plain = TcpListener::bind((config.host.as_str(), config.plain_port))
@@ -161,7 +163,7 @@ impl LinkServer {
                 })?)
             }
         };
-        let shared = Arc::new(Shared::new(config, db, admission, assets));
+        let shared = Arc::new(Shared::new(config, db, admission, assets, shells));
         shared
             .tracker
             .spawn(accept_plain(Arc::clone(&shared), plain));
@@ -193,17 +195,11 @@ impl LinkServer {
         self.shared.server_boot_id
     }
 
-    /// The shell dial-back routing table.
-    pub fn shells(&self) -> ShellBroker {
-        self.shared.shells.clone()
-    }
-
     /// Stops accepting, ends every session with
-    /// [`CloseReason::Shutdown`](crate::CloseReason::Shutdown), and waits for every
-    /// task to finish.
+    /// [`CloseReason::Shutdown`](crate::CloseReason::Shutdown), closes every shell, and
+    /// waits for every task to finish.
     pub async fn shutdown(self) {
-        self.shared.shutdown.cancel();
-        self.shared.tracker.close();
+        self.shared.stop();
         self.shared.tracker.wait().await;
     }
 
@@ -222,8 +218,7 @@ impl LinkServer {
 
 impl Drop for LinkServer {
     fn drop(&mut self) {
-        self.shared.shutdown.cancel();
-        self.shared.tracker.close();
+        self.shared.stop();
     }
 }
 
@@ -233,20 +228,26 @@ impl Shared {
         db: DbHandle,
         admission: A,
         assets: S,
+        shells: ShellBroker,
     ) -> Self {
-        let shutdown = CancellationToken::new();
         Self {
             config,
             db,
             admission: Box::new(admission),
             assets: Arc::new(assets),
             registry: Registry::default(),
-            shells: ShellBroker::new(shutdown.clone()),
+            shells,
             tracker: TaskTracker::new(),
-            shutdown,
+            shutdown: CancellationToken::new(),
             mono_epoch: Instant::now(),
             server_boot_id: Uuid::new_v4(),
         }
+    }
+
+    fn stop(&self) {
+        self.shutdown.cancel();
+        self.shells.close_all();
+        self.tracker.close();
     }
 }
 
@@ -429,14 +430,13 @@ async fn route(
                 Ok(core) => core,
                 Err(code) => return status(code),
             };
-            let Ok(deliver) = shared.registry.take_audio(&core) else {
+            let Some(deliver) = shared.registry.take_audio(&core) else {
                 tracing::info!(device = %core.device, "refusing a second audio socket");
                 return status(StatusCode::FORBIDDEN);
             };
             upgrade(&shared, &mut request, &key, move |ws| async move {
-                if let Err(ws) = deliver.send(ws) {
-                    drop(ws);
-                }
+                // A session that ended meanwhile drops the socket.
+                let _ = deliver.send(ws);
             })
         }
         Endpoint::Assets => {

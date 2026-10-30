@@ -446,17 +446,7 @@ impl<H: AlertHa, C: AlertClock> Applier<H, C> {
             self.advance(row, 1).await;
         }
         let view = self.fresh_view().await;
-        let child_result = |v: &CalendarView| {
-            v.created_by(op).map(|c| {
-                serde_json::json!({
-                    "ok": true,
-                    "child_schedule_id": c.schedule_id.to_string(),
-                    "child_occurrence_id": c.occurrence_id.to_string(),
-                    "due_local": c.due_local,
-                    "due_utc_ms": c.due_utc_ms.to_string(),
-                })
-            })
-        };
+        let child_result = |v: &CalendarView| v.created_by(op).map(ops::snoozed_result);
         let Some(parent) = view.find(schedule, &key) else {
             return self.applied(child_result(&view).unwrap_or_else(|| ops::deleted_result(false)));
         };

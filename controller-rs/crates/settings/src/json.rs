@@ -157,25 +157,7 @@ impl Json {
         out
     }
 
-    /// The equivalent `serde_json` value (its objects may reorder keys).
-    pub fn to_value(&self) -> serde_json::Value {
-        match self {
-            Self::Null => serde_json::Value::Null,
-            Self::Bool(b) => serde_json::Value::Bool(*b),
-            Self::Number(n) => serde_json::Value::Number(n.clone()),
-            Self::String(s) => serde_json::Value::String(s.clone()),
-            Self::Array(items) => {
-                serde_json::Value::Array(items.iter().map(Self::to_value).collect())
-            }
-            Self::Object(o) => serde_json::Value::Object(
-                o.iter()
-                    .map(|(k, v)| (k.to_owned(), v.to_value()))
-                    .collect(),
-            ),
-        }
-    }
-
-    /// The same value from a `serde_json` one.
+    /// A `serde_json` value, its object keys in that value's order.
     pub fn from_value(value: &serde_json::Value) -> Self {
         match value {
             serde_json::Value::Null => Self::Null,

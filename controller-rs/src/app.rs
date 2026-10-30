@@ -20,6 +20,7 @@ use echomuse_db::{
     DbHandle, ReadQuery, ServiceError,
     devices::{ApproveDevice, DeviceError},
 };
+use echomuse_records::RecordsService;
 use rusqlite::Connection;
 use tokio::{
     sync::{mpsc, oneshot, watch},
@@ -28,8 +29,6 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use echomuse_core::types::{DeviceId, RuntimeError};
-
-use echomuse_voice::arbiter::WakeArbiter;
 
 use crate::{
     dashboard,
@@ -47,7 +46,6 @@ pub type Directory = Arc<HashMap<DeviceId, DeviceHandle>>;
 pub struct Controller {
     devices: HashMap<DeviceId, Supervised>,
     config: DeviceRuntimeConfig,
-    arbiter: Arc<WakeArbiter>,
     services: RuntimeServices,
     supervision: Supervision,
     /// Shared with the supervisors, which put a rebuilt runtime's handle in place.
@@ -63,17 +61,13 @@ struct Supervised {
 }
 
 impl Controller {
-    /// A registry whose runtimes run no ESPHome nodes and report no events, with the
-    /// production failure handling.
-    pub fn new(config: DeviceRuntimeConfig) -> Result<Self, RuntimeError> {
-        Self::with_services(config, RuntimeServices::default())
-    }
-
-    /// A registry whose runtimes serve their devices with `services`. Without
+    /// A registry whose runtimes serve their devices with `services` and are listed on
+    /// `directory`, whose receivers the device services already hold. Without
     /// `services.supervision` the production failure handling is started.
-    pub fn with_services(
+    pub fn new(
         config: DeviceRuntimeConfig,
         mut services: RuntimeServices,
+        directory: watch::Sender<Directory>,
     ) -> Result<Self, RuntimeError> {
         config.ingress.validate()?;
         config.workers.validate()?;
@@ -89,10 +83,9 @@ impl Controller {
         Ok(Self {
             devices: HashMap::new(),
             config,
-            arbiter: Arc::new(WakeArbiter::default()),
             services,
             supervision,
-            directory: Arc::new(watch::Sender::new(Arc::new(HashMap::new()))),
+            directory: Arc::new(directory),
         })
     }
 
@@ -101,19 +94,13 @@ impl Controller {
         self.services.events.clone()
     }
 
-    pub fn arbiter(&self) -> Arc<WakeArbiter> {
-        Arc::clone(&self.arbiter)
-    }
-
     /// Spawns the shared services' tasks; a panic in one stops the process.
     pub fn tasks(&self) -> TaskSupervisor {
         self.supervision.tasks.clone()
     }
 
-    /// Gives every runtime started from now on the voice path's services. Its arbiter
-    /// becomes the registry's.
+    /// Gives every runtime started from now on the voice path's services.
     pub fn set_voice_services(&mut self, voice: Arc<crate::voice_session::VoiceServices>) {
-        self.arbiter = Arc::clone(&voice.arbiter);
         self.services.voice = Some(voice);
     }
 
@@ -128,8 +115,7 @@ impl Controller {
         if self.devices.contains_key(&id) {
             return Err(RuntimeError::DuplicateDevice);
         }
-        let runtime =
-            DeviceRuntime::start_with(id.clone(), self.config, self.services.clone()).await?;
+        let runtime = DeviceRuntime::start(id.clone(), self.config, self.services.clone()).await?;
         let handle = runtime.handle();
         self.directory.send_modify(|directory| {
             Arc::make_mut(directory).insert(id.clone(), handle.clone());
@@ -155,17 +141,6 @@ impl Controller {
     /// The device's current runtime.
     pub fn device(&self, id: &DeviceId) -> Option<DeviceHandle> {
         self.directory.borrow().get(id).cloned()
-    }
-
-    pub fn snapshots(&self) -> Vec<DeviceSnapshot> {
-        let mut snapshots: Vec<_> = self
-            .directory
-            .borrow()
-            .values()
-            .map(DeviceHandle::snapshot)
-            .collect();
-        snapshots.sort_by(|left, right| left.device.0.cmp(&right.device.0));
-        snapshots
     }
 
     /// Removes the device's runtime from the directory, then stops it and its
@@ -368,10 +343,12 @@ impl Registry {
     /// Starts the service. It serves commands once it is given the dashboard's event
     /// publisher through the returned sender (the API is built with this registry, so
     /// the publisher exists only afterwards); from then on every runtime, already held
-    /// or added later, has its state changes published.
+    /// or added later, has its state changes published. A device's records are reopened
+    /// before a runtime is created for it here (a deletion leaves them closed).
     pub fn start(
         controller: Controller,
         db: DbHandle,
+        records: RecordsService,
     ) -> (Self, JoinHandle<()>, oneshot::Sender<EventPublisher>) {
         let directory = controller.directory();
         let (commands, receiver) = mpsc::channel(64);
@@ -380,7 +357,7 @@ impl Registry {
         let tasks = controller.tasks();
         let task = tasks.spawn(
             "device registry",
-            serve(controller, receiver, retiring_tx, publisher),
+            serve(controller, records, receiver, retiring_tx, publisher),
         );
         (
             Self {
@@ -515,6 +492,7 @@ impl std::error::Error for ApproveError {}
 
 async fn serve(
     mut controller: Controller,
+    records: RecordsService,
     mut commands: mpsc::Receiver<RegistryCommand>,
     retiring: watch::Sender<Retiring>,
     publisher: oneshot::Receiver<EventPublisher>,
@@ -547,6 +525,8 @@ async fn serve(
                 } else if let Some(handle) = controller.device(&device) {
                     Ok(handle)
                 } else {
+                    // A device deleted earlier must not find its records closed.
+                    records.reopen_device(&device).await;
                     let added = controller.add_device(device.clone()).await;
                     if let Ok(handle) = &added {
                         tasks.spawn(

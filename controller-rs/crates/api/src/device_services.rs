@@ -34,13 +34,11 @@
 //! scripts. A grant is bounded (at most 8 hours) and names what may be kept; withdrawing
 //! it discards everything not yet written.
 
-use std::path::PathBuf;
-
 use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::{
-        DefaultBodyLimit, Multipart, State, WebSocketUpgrade,
+        DefaultBodyLimit, Multipart, Path, State, WebSocketUpgrade,
         ws::{Message, WebSocket, rejection::WebSocketUpgradeRejection},
     },
     http::{HeaderValue, StatusCode, header},
@@ -57,7 +55,7 @@ use crate::{
     auth::{AdminUser, AuthenticatedUser},
     body::JsonBody,
     error::{ApiError, ErrorCode},
-    gaps::capability_gaps,
+    gaps::{GapReason, capability_gaps},
     params::{DevicePath, TextPath},
     runtime::LiveSession,
     services::{
@@ -65,7 +63,7 @@ use crate::{
         ServiceError, ShellFrame, WifiCredentials,
     },
     state::ApiState,
-    zip_writer::{DosTime, ZipEntry, stream_zip},
+    zip_writer::{DosTime, ZipEntry, ZipPart, zip_download},
 };
 
 /// The largest sound upload accepted, with room for the multipart framing.
@@ -126,20 +124,14 @@ pub(crate) fn routes() -> Router<ApiState> {
 pub(crate) fn service_error(error: ServiceError) -> ApiError {
     let message = error.to_string();
     match error {
-        ServiceError::UnknownDevice => {
-            ApiError::new(StatusCode::NOT_FOUND, ErrorCode::NotFound, message)
-        }
-        ServiceError::NotConnected => {
-            ApiError::new(StatusCode::CONFLICT, ErrorCode::NotConnected, message)
-        }
+        ServiceError::UnknownDevice => ApiError::unknown_device(),
+        ServiceError::NotConnected => ApiError::not_connected(),
         ServiceError::Unsupported(_) => {
             ApiError::new(StatusCode::CONFLICT, ErrorCode::NotApplicable, message)
         }
         ServiceError::Busy(_) => ApiError::new(StatusCode::CONFLICT, ErrorCode::Busy, message),
         ServiceError::Invalid(_) => ApiError::bad_request(message),
-        ServiceError::NotFound(_) => {
-            ApiError::new(StatusCode::NOT_FOUND, ErrorCode::NotFound, message)
-        }
+        ServiceError::NotFound(_) => ApiError::no_such(message),
         ServiceError::InUse(_) => ApiError::new(StatusCode::CONFLICT, ErrorCode::InUse, message),
         ServiceError::Upstream(_) => {
             ApiError::new(StatusCode::BAD_GATEWAY, ErrorCode::Unavailable, message)
@@ -149,35 +141,41 @@ pub(crate) fn service_error(error: ServiceError) -> ApiError {
         }
         ServiceError::Unavailable(_) => ApiError::unavailable(message),
         ServiceError::Failed(reason) => {
-            eprintln!("api: a device service failed: {reason}");
+            tracing::error!(%reason, "a device service failed");
             ApiError::internal("The controller could not do that")
         }
     }
 }
 
-fn unknown_device() -> ApiError {
-    service_error(ServiceError::UnknownDevice)
+/// The device's live session: 404 for a device without a runtime, 409 while it is not
+/// connected.
+pub(crate) fn connected(state: &ApiState, device: &DeviceId) -> Result<LiveSession, ApiError> {
+    state
+        .runtimes()
+        .live(device)
+        .ok_or_else(ApiError::unknown_device)?
+        .session
+        .ok_or_else(ApiError::not_connected)
 }
 
-/// The device's live session, when it is connected and announces `capability`. A device
-/// that lacks it is refused with the reason the dashboard shows beside the control.
-fn require(
-    state: &ApiState,
-    device: &DeviceId,
-    capability: Capability,
-) -> Result<LiveSession, ApiError> {
-    let live = state.runtimes().live(device).ok_or_else(unknown_device)?;
-    let session = live
-        .session
-        .ok_or_else(|| service_error(ServiceError::NotConnected))?;
-    if !session.capabilities.contains(capability) {
-        let reason = capability_gaps(session.platform, &session.capabilities)
-            .get(&capability)
-            .map(|gap| gap.text().to_owned())
-            .unwrap_or_else(|| format!("the device does not announce {}", capability.as_str()));
-        return Err(service_error(ServiceError::Unsupported(reason)));
+/// The refusal for a device that lacks `capability`, with the reason the dashboard shows
+/// beside the control.
+fn unsupported(capability: Capability, gap: Option<GapReason>) -> ApiError {
+    let reason = gap.map_or_else(
+        || format!("the device does not announce {}", capability.as_str()),
+        |gap| gap.text().to_owned(),
+    );
+    service_error(ServiceError::Unsupported(reason))
+}
+
+/// The device is connected and announces `capability`.
+fn require(state: &ApiState, device: &DeviceId, capability: Capability) -> Result<(), ApiError> {
+    let session = connected(state, device)?;
+    if session.capabilities.contains(capability) {
+        return Ok(());
     }
-    Ok(session)
+    let gap = capability_gaps(session.platform, &session.capabilities).remove(&capability);
+    Err(unsupported(capability, gap))
 }
 
 /// The device has a runtime (it is approved).
@@ -186,17 +184,22 @@ fn known(state: &ApiState, device: &DeviceId) -> Result<(), ApiError> {
         .runtimes()
         .live(device)
         .map(drop)
-        .ok_or_else(unknown_device)
+        .ok_or_else(ApiError::unknown_device)
 }
 
-async fn send_file(path: PathBuf, content_type: &'static str) -> Result<Response, ApiError> {
-    let file = match tokio::fs::File::open(&path).await {
+/// Streams the file at `path` as `content_type`, or 404 when it is not there. Its
+/// `Content-Length` is sent when its size can be read.
+async fn send_file(
+    path: &std::path::Path,
+    content_type: &'static str,
+) -> Result<Response, ApiError> {
+    let file = match tokio::fs::File::open(path).await {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(ApiError::not_found());
         }
         Err(error) => {
-            eprintln!("api: could not open {}: {error}", path.display());
+            tracing::error!(%error, "could not open {}", path.display());
             return Err(ApiError::internal("The file could not be read"));
         }
     };
@@ -338,13 +341,13 @@ fn clip_name(text: &str) -> Result<ClipName, ApiError> {
 
 async fn clip(
     state: &ApiState,
-    device: DeviceId,
+    ClipPath { id, name }: ClipPath,
     mode: RecordingMode,
-    name: &str,
     part: ClipPart,
 ) -> Result<Response, ApiError> {
+    let device = DeviceId(id);
     known(state, &device)?;
-    let name = clip_name(name)?;
+    let name = clip_name(&name)?;
     let path = state
         .services()
         .recording
@@ -355,7 +358,7 @@ async fn clip(
         ClipPart::Audio => "audio/wav",
         ClipPart::Afe => "application/json",
     };
-    send_file(path, content_type).await
+    send_file(&path, content_type).await
 }
 
 async fn delete_clips(
@@ -382,76 +385,52 @@ struct ClipPath {
     name: String,
 }
 
-fn clip_path(path: axum::extract::Path<ClipPath>) -> (DeviceId, String) {
-    (DeviceId(path.0.id), path.0.name)
-}
-
 async fn sample_audio(
     State(state): State<ApiState>,
     AdminUser(_): AdminUser,
-    path: axum::extract::Path<ClipPath>,
+    Path(path): Path<ClipPath>,
 ) -> Result<Response, ApiError> {
-    let (device, name) = clip_path(path);
-    clip(
-        &state,
-        device,
-        RecordingMode::Samples,
-        &name,
-        ClipPart::Audio,
-    )
-    .await
+    clip(&state, path, RecordingMode::Samples, ClipPart::Audio).await
 }
 
 async fn sample_afe(
     State(state): State<ApiState>,
     AdminUser(_): AdminUser,
-    path: axum::extract::Path<ClipPath>,
+    Path(path): Path<ClipPath>,
 ) -> Result<Response, ApiError> {
-    let (device, name) = clip_path(path);
-    clip(&state, device, RecordingMode::Samples, &name, ClipPart::Afe).await
+    clip(&state, path, RecordingMode::Samples, ClipPart::Afe).await
 }
 
 async fn ambient_audio(
     State(state): State<ApiState>,
     AdminUser(_): AdminUser,
-    path: axum::extract::Path<ClipPath>,
+    Path(path): Path<ClipPath>,
 ) -> Result<Response, ApiError> {
-    let (device, name) = clip_path(path);
-    clip(
-        &state,
-        device,
-        RecordingMode::Ambient,
-        &name,
-        ClipPart::Audio,
-    )
-    .await
+    clip(&state, path, RecordingMode::Ambient, ClipPart::Audio).await
 }
 
 async fn ambient_afe(
     State(state): State<ApiState>,
     AdminUser(_): AdminUser,
-    path: axum::extract::Path<ClipPath>,
+    Path(path): Path<ClipPath>,
 ) -> Result<Response, ApiError> {
-    let (device, name) = clip_path(path);
-    clip(&state, device, RecordingMode::Ambient, &name, ClipPart::Afe).await
+    clip(&state, path, RecordingMode::Ambient, ClipPart::Afe).await
 }
 
 async fn sample_delete(
     State(state): State<ApiState>,
     AdminUser(_): AdminUser,
-    path: axum::extract::Path<ClipPath>,
+    Path(ClipPath { id, name }): Path<ClipPath>,
 ) -> Result<Json<Value>, ApiError> {
-    let (device, name) = clip_path(path);
-    delete_clips(&state, device, RecordingMode::Samples, Some(&name)).await
+    delete_clips(&state, DeviceId(id), RecordingMode::Samples, Some(&name)).await
 }
 
 async fn ambient_delete(
     State(state): State<ApiState>,
     AdminUser(_): AdminUser,
-    path: axum::extract::Path<ClipPath>,
+    Path(ClipPath { id, name }): Path<ClipPath>,
 ) -> Result<Json<Value>, ApiError> {
-    let (device, name) = clip_path(path);
-    delete_clips(&state, device, RecordingMode::Ambient, Some(&name)).await
+    delete_clips(&state, DeviceId(id), RecordingMode::Ambient, Some(&name)).await
 }
 
 async fn samples_delete_all(
@@ -482,29 +461,18 @@ async fn samples_zip(
         .archive_files(device.clone(), RecordingMode::Samples)
         .await
         .map_err(service_error)?;
-    let entries = files
+    let parts = files
         .into_iter()
-        .map(|file| ZipEntry {
-            name: file.name,
-            path: file.path,
-            time: DosTime::from_unix(file.unix_secs),
+        .map(|file| ZipPart {
+            entry: ZipEntry {
+                name: file.name,
+                path: file.path,
+                time: DosTime::from_unix(file.unix_secs),
+            },
+            span: None,
         })
         .collect();
-    let disposition = format!("attachment; filename=\"{}-samples.zip\"", device.0);
-    let mut response = (
-        [(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/zip"),
-        )],
-        stream_zip(entries),
-    )
-        .into_response();
-    if let Ok(value) = HeaderValue::from_str(&disposition) {
-        response
-            .headers_mut()
-            .insert(header::CONTENT_DISPOSITION, value);
-    }
-    Ok(response)
+    Ok(zip_download(parts, &format!("{}-samples.zip", device.0)))
 }
 
 // ─── Session recorder ───────────────────────────────────────────────────────────────
@@ -603,7 +571,7 @@ struct RecordingPath {
 async fn recorder_file(
     State(state): State<ApiState>,
     AdminUser(_): AdminUser,
-    axum::extract::Path(path): axum::extract::Path<RecordingPath>,
+    Path(path): Path<RecordingPath>,
 ) -> Result<Response, ApiError> {
     let device = DeviceId(path.id);
     known(&state, &device)?;
@@ -613,13 +581,13 @@ async fn recorder_file(
         .file(device, path.recording)
         .await
         .map_err(service_error)?;
-    send_file(file, "application/octet-stream").await
+    send_file(&file, "application/octet-stream").await
 }
 
 async fn recorder_delete(
     State(state): State<ApiState>,
     AdminUser(_): AdminUser,
-    axum::extract::Path(path): axum::extract::Path<RecordingPath>,
+    Path(path): Path<RecordingPath>,
 ) -> Result<Json<Value>, ApiError> {
     let device = DeviceId(path.id);
     known(&state, &device)?;
@@ -933,18 +901,12 @@ async fn kiosk_login(
     if body.password.is_empty() {
         return Err(ApiError::bad_request("Enter the Kiosk Satellite password"));
     }
-    match require(&state, &device, Capability::KioskPlugin) {
-        Ok(_) => {}
-        Err(refusal) => {
-            let live = state.runtimes().live(&device).and_then(|l| l.session);
-            let update_pending = live.is_some_and(|session| {
-                capability_gaps(session.platform, &session.capabilities)
-                    .get(&Capability::KioskPlugin)
-                    == Some(&crate::gaps::GapReason::FirmwareUpdate)
-            });
-            if !update_pending {
-                return Err(refusal);
-            }
+    let session = connected(&state, &device)?;
+    if !session.capabilities.contains(Capability::KioskPlugin) {
+        let gap = capability_gaps(session.platform, &session.capabilities)
+            .remove(&Capability::KioskPlugin);
+        if gap != Some(GapReason::FirmwareUpdate) {
+            return Err(unsupported(Capability::KioskPlugin, gap));
         }
     }
     state

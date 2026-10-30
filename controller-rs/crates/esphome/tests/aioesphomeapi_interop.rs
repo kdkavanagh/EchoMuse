@@ -13,13 +13,13 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use bytes::Bytes;
-use echomuse_core::types::DeviceId;
+use echomuse_core::{services::TimerEventKind, types::DeviceId};
 use echomuse_esphome::bluetooth::{
     BleAddressType, BleAdvertisement, BluetoothProxyConfig, start_bluetooth_proxy,
 };
 use echomuse_esphome::entities::{DeviceVolume, MediaState, Playback, VoiceEntities, VoiceState};
 use echomuse_esphome::voice::{
-    MediaRequest, RunClosed, RunEvent, SatelliteRequest, TimerEventKind, VoiceSatelliteConfig,
+    MediaRequest, RunClosed, RunEvent, SatelliteRequest, VoiceSatelliteConfig,
     start_voice_satellite,
 };
 use echomuse_protocol::Platform;

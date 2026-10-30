@@ -24,13 +24,13 @@ use crate::native::OrtRuntime;
 use crate::onnx::{Dim, TensorSpec, check_io, extract_f32, load_session};
 
 /// The only sample rate the graph accepts.
-pub const WAKE_SAMPLE_RATE: u32 = 16_000;
+const WAKE_SAMPLE_RATE: u32 = 16_000;
 /// Samples in one window: 1.4 s at 16 kHz.
 pub const WAKE_WINDOW_SAMPLES: usize = 22_400;
 /// A window whose RMS (of `pcm / 32768`) is below this is not scored.
 pub const RMS_FLOOR: f64 = 1e-4;
 /// A window whose peak is at or below this is not rescaled.
-pub const PEAK_GUARD: f32 = 1e-4;
+const PEAK_GUARD: f32 = 1e-4;
 
 const MODEL: &str = "bcresnet";
 
@@ -144,7 +144,7 @@ pub fn prepare_window(dst: &mut [f32], pcm: &[i16], norm_peak: f64) -> Result<bo
 
 /// `softmax(logits − max(logits))[wake_index]`, or `None` when a logit is not finite or the
 /// index is out of range.
-pub fn wake_probability(logits: &[f32], wake_index: usize) -> Option<f64> {
+fn wake_probability(logits: &[f32], wake_index: usize) -> Option<f64> {
     if wake_index >= logits.len() || logits.iter().any(|v| !v.is_finite()) {
         return None;
     }
@@ -297,16 +297,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_the_deployed_sidecar() {
-        let s = WakeSidecar::parse(&repo_sidecar()).unwrap();
-        assert_eq!(s.labels, vec!["noise", "ohphelia", "unknown"]);
-        assert_eq!(s.wake_index, 1);
-        assert_eq!(s.norm_peak, 0.8);
-    }
-
-    #[test]
     fn sidecar_load_rules() {
         let good: serde_json::Value = serde_json::from_slice(&repo_sidecar()).unwrap();
+        WakeSidecar::parse(&repo_sidecar()).unwrap();
         let with = |key: &str, v: serde_json::Value| {
             let mut j = good.clone();
             j[key] = v;

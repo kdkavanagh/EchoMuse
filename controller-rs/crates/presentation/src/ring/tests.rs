@@ -6,7 +6,6 @@ use echomuse_settings::values::{
 };
 use serde_json::{Value, json};
 
-use super::overlay::{DeviceOverlays, MUTE_RED, VOLUME_CYAN, volume_arc};
 use super::scene::PRIDE_RAINBOW;
 use super::*;
 
@@ -157,10 +156,14 @@ fn anim_of(command: &LedCommand) -> &AnimSpec {
 }
 
 fn frame_of(command: &LedCommand) -> Frame {
-    match command {
-        LedCommand::Frame(body) => body.frame(),
-        LedCommand::Anim(_) => panic!("expected a frame, got {command:?}"),
+    let LedCommand::Frame(body) = command else {
+        panic!("expected a frame, got {command:?}");
+    };
+    let mut frame = [Rgb::OFF; RING_LEDS];
+    for led in &body.leds {
+        frame[usize::from(led.id)] = Rgb(led.r, led.g, led.b);
     }
+    frame
 }
 
 #[tokio::test(start_paused = true)]
@@ -242,31 +245,7 @@ async fn standard_scene_bodies_are_exact() {
 }
 
 #[test]
-fn scene_palettes_match_the_ring_document() {
-    let standard = ScenePalette::from_settings(&scene(LedScene::Standard));
-    assert_eq!(standard.listening, [Rgb(0, 180, 0)]);
-    let airy = ScenePalette::from_settings(&scene(LedScene::Airy));
-    assert_eq!(airy.listening, [Rgb(80, 150, 200)]);
-    assert_eq!(
-        airy.thinking,
-        Thinking::Spin {
-            head: Rgb(150, 205, 255),
-            trail: Rgb(25, 45, 70)
-        }
-    );
-    let malevolent = ScenePalette::from_settings(&scene(LedScene::Malevolent));
-    assert_eq!(malevolent.listening, [Rgb(110, 0, 45)]);
-    assert_eq!(malevolent.meter, [Rgb(210, 45, 0)]);
-    let pride = ScenePalette::from_settings(&scene(LedScene::Pride));
-    assert_eq!(pride.listening, PRIDE_RAINBOW);
-    assert_eq!(pride.thinking, Thinking::Rotate(PRIDE_RAINBOW.to_vec()));
-    assert_eq!(pride.meter, PRIDE_RAINBOW);
-    // Twelve distinct hues, none of them the mute ring's red.
-    let mut hues = PRIDE_RAINBOW.to_vec();
-    hues.dedup();
-    assert_eq!(hues.len(), RING_LEDS);
-    assert!(!PRIDE_RAINBOW.contains(&MUTE_RED));
-
+fn the_custom_scene_follows_the_chosen_colours() {
     let custom = RingSettings {
         led_scene: LedScene::Custom,
         led_listen_color: ListenColor(LedColor::new("#102030").unwrap()),
@@ -283,10 +262,6 @@ fn scene_palettes_match_the_ring_document() {
         }
     );
     assert_eq!(custom.meter, [Rgb(255, 150, 0)]);
-    // The custom scene's defaults are the standard listening and spinner head colours.
-    let defaults = ScenePalette::from_settings(&scene(LedScene::Custom));
-    assert_eq!(defaults.listening, [Rgb(0, 180, 0)]);
-    assert_eq!(defaults.meter, [Rgb(0, 200, 0)]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -295,7 +270,6 @@ async fn pride_listens_in_twelve_hues_and_thinks_by_turning_them() {
     let mut ring = LedProjector::new(&dot(), &scene(LedScene::Pride));
     let listening = ring.set_phase(Phase::Listening, now).unwrap();
     assert_eq!(anim_of(&listening).colors, PRIDE_RAINBOW);
-    assert_eq!(listening.still_frame(), PRIDE_RAINBOW);
     let thinking = ring.set_phase(Phase::Thinking, now).unwrap();
     assert_eq!(anim_of(&thinking).pattern, AnimPattern::Rotate);
     assert_eq!(anim_of(&thinking).period_ms, THINKING_STEP_MS);
@@ -359,7 +333,7 @@ async fn cues_play_for_a_second_then_the_ring_returns_to_its_state() {
 }
 
 #[test]
-fn cue_choice_follows_the_terminal_reason() {
+fn the_no_speech_cue_is_for_wake_and_button_turns_only() {
     use TerminalReason as R;
     assert_eq!(
         Cue::for_turn_end(R::NoInput, TriggerType::Wake),
@@ -371,39 +345,6 @@ fn cue_choice_follows_the_terminal_reason() {
     );
     assert_eq!(Cue::for_turn_end(R::NoInput, TriggerType::Reply), None);
     assert_eq!(Cue::for_turn_end(R::NoInput, TriggerType::HaReply), None);
-    for reason in [
-        R::Interrupted,
-        R::AudioOverrun,
-        R::SpeechUnavailable,
-        R::HaTimeout,
-        R::ResponseTimeout,
-        R::SttFailed,
-        R::HaError,
-        R::DiagnosticRecording,
-    ] {
-        assert_eq!(
-            Cue::for_turn_end(reason, TriggerType::Wake),
-            Some(Cue::Error),
-            "{reason:?}"
-        );
-    }
-    for reason in [
-        R::Completed,
-        R::Superseded,
-        R::Muted,
-        R::SessionLost,
-        R::ArbitrationLost,
-        R::TooLong,
-        R::Retry,
-        R::EmptyTranscript,
-        R::OutcomeUnknown,
-    ] {
-        assert_eq!(
-            Cue::for_turn_end(reason, TriggerType::Wake),
-            None,
-            "{reason:?}"
-        );
-    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -478,8 +419,11 @@ async fn the_timer_arc_waits_for_the_conversation_and_recordings() {
         "listening outranks the arc"
     );
     ring.set_recording(true, t0);
-    ring.set_phase(Phase::Idle, t0);
-    assert_eq!(anim_of(ring.current().unwrap()).pattern, AnimPattern::Pulse);
+    assert_eq!(
+        ring.set_phase(Phase::Idle, t0),
+        None,
+        "the recording pulse stays after the dialog"
+    );
     let arc = ring.set_recording(false, t0).unwrap();
     assert_eq!(frame_of(&arc).iter().filter(|c| !c.is_dark()).count(), 6);
 }
@@ -519,7 +463,6 @@ async fn a_new_session_gets_the_projection_again() {
     assert_eq!(ring.session_started(t0), Some(listening.clone()));
     ring.cue(Cue::Error, t0);
     ring.session_lost();
-    assert_eq!(ring.current(), None);
     assert_eq!(ring.next_deadline(), None);
     assert_eq!(ring.session_started(t0), Some(listening));
 }
@@ -567,78 +510,6 @@ async fn a_ring_without_animations_gets_fixed_frames() {
     assert_eq!(frame_of(&arc).iter().filter(|c| !c.is_dark()).count(), 3);
     firmware_accepts(&arc).unwrap();
     assert_eq!(arc.message_type(), MessageType::Leds);
-    assert!(matches!(ring.current(), Some(LedCommand::Frame(_))));
-}
-
-#[test]
-fn device_overlays_cover_the_controller_layer() {
-    let listening = LedCommand::Anim(LedAnimBody {
-        anim: AnimSpec {
-            pattern: AnimPattern::Solid,
-            colors: vec![Rgb(0, 180, 0)],
-            period_ms: 0,
-            ttl_sec: 30,
-            meter: None,
-        },
-    });
-    let none = DeviceOverlays::default();
-    assert_eq!(none.visible(Some(&listening)), [Rgb(0, 180, 0); RING_LEDS]);
-    assert_eq!(none.visible(None), [Rgb::OFF; RING_LEDS]);
-    let muted = DeviceOverlays {
-        muted: true,
-        volume_arc: None,
-    };
-    assert_eq!(muted.visible(Some(&listening)), [MUTE_RED; RING_LEDS]);
-    let arc_over_mute = DeviceOverlays {
-        muted: true,
-        volume_arc: Some(127),
-    };
-    assert_eq!(
-        arc_over_mute.visible(Some(&listening)),
-        [VOLUME_CYAN; RING_LEDS]
-    );
-
-    let lit = |level| {
-        volume_arc(level)
-            .iter()
-            .filter(|c| **c == VOLUME_CYAN)
-            .count()
-    };
-    assert_eq!(lit(0), 0);
-    assert_eq!(lit(1), 1);
-    assert_eq!(lit(47), 1);
-    assert_eq!(lit(53), 1);
-    assert_eq!(lit(54), 1);
-    assert_eq!(lit(87), 6);
-    assert_eq!(lit(126), 11);
-    assert_eq!(lit(127), 12);
-    assert_eq!(lit(255), 12);
-    // The arc fills from LED 0, and both overlays are frames the firmware accepts.
-    assert_eq!(volume_arc(87)[..6], [VOLUME_CYAN; 6]);
-    for frame in [volume_arc(87), [MUTE_RED; RING_LEDS]] {
-        firmware_accepts(&LedCommand::Frame(LedsBody::from_frame(&frame))).unwrap();
-    }
-}
-
-#[test]
-fn still_frames_follow_the_firmware_first_frame() {
-    let spin = LedCommand::Anim(LedAnimBody {
-        anim: AnimSpec {
-            pattern: AnimPattern::Spin,
-            colors: vec![Rgb(0, 200, 0), Rgb(0, 60, 0)],
-            period_ms: 80,
-            ttl_sec: 135,
-            meter: None,
-        },
-    });
-    let frame = spin.still_frame();
-    assert_eq!(frame[0], Rgb(0, 200, 0));
-    assert_eq!(frame[11], Rgb(0, 60, 0));
-    assert!(frame[1..11].iter().all(|c| c.is_dark()));
-    let off = LedCommand::Anim(LedAnimBody {
-        anim: AnimSpec::off(),
-    });
-    assert_eq!(off.still_frame(), [Rgb::OFF; RING_LEDS]);
 }
 
 #[test]

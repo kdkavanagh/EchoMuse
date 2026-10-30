@@ -10,7 +10,8 @@ use echomuse_core::types::{DeviceId, WorkScope};
 use echomuse_protocol::ema::{self, HEADER_BYTES, Kind};
 use echomuse_protocol::session::ProtocolErrorReport;
 use echomuse_protocol::{
-    ControlBody, EncodeError, LinkSessionId, MessageId, ProtocolError, encode_envelope,
+    ControlBody, EncodeError, EncodedEnvelope, LinkSessionId, MessageId, ProtocolError,
+    encode_envelope,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::time::Instant;
@@ -182,6 +183,15 @@ impl SessionCore {
 
     pub(crate) fn ended_reason(&self) -> CloseReason {
         self.reason().unwrap_or(CloseReason::Shutdown)
+    }
+
+    /// `body` in an envelope carrying this session's id and device.
+    pub(crate) fn encode<B: ControlBody>(
+        &self,
+        body: &B,
+        generation: u32,
+    ) -> Result<EncodedEnvelope, EncodeError> {
+        encode_envelope(body, Some(&self.session_id), &self.device, generation)
     }
 
     pub(crate) fn revoke_capture(&self) {
@@ -412,13 +422,10 @@ impl SessionLink {
     /// control writer queue is full the session is closed as overloaded rather than the
     /// message dropped. Never waits.
     pub fn send<B: ControlBody>(&self, body: &B, generation: u32) -> Result<MessageId, SendError> {
-        let encoded = encode_envelope(
-            body,
-            Some(&self.core.session_id),
-            &self.core.device,
-            generation,
-        )
-        .map_err(SendError::Encode)?;
+        let encoded = self
+            .core
+            .encode(body, generation)
+            .map_err(SendError::Encode)?;
         self.control.push(&self.core, encoded.text, None)?;
         Ok(encoded.message_id)
     }
@@ -433,13 +440,10 @@ impl SessionLink {
         generation: u32,
         timeout: Duration,
     ) -> Result<PendingAck, SendError> {
-        let encoded = encode_envelope(
-            body,
-            Some(&self.core.session_id),
-            &self.core.device,
-            generation,
-        )
-        .map_err(SendError::Encode)?;
+        let encoded = self
+            .core
+            .encode(body, generation)
+            .map_err(SendError::Encode)?;
         if let Some(reason) = self.core.reason() {
             return Err(SendError::SessionEnded(reason));
         }

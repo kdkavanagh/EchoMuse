@@ -29,15 +29,9 @@ pub const SUBSCRIPTION_TTL: Duration = Duration::from_secs(3);
 /// dialog focus leases (post-AFE architecture §4.4).
 pub const RENEW_INTERVAL: Duration = Duration::from_secs(1);
 
-/// How long the device waits for the controller's `command.ack` of a
-/// `wake.candidate` before ending the candidate subscription with `ttl`
-/// (`uplink.CandidateAckWait`). Informational: the controller acknowledges at
-/// once.
-pub const CANDIDATE_ACK_WAIT: Duration = Duration::from_secs(1);
-
 /// The wire's `"live"` start: from the stream's position when the device
 /// applies the command.
-pub const START_LIVE: &str = "live";
+const START_LIVE: &str = "live";
 
 macro_rules! vocabulary {
     (

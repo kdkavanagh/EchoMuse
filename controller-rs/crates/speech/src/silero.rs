@@ -20,11 +20,11 @@ use crate::onnx::{Dim, TensorSpec, check_finite, check_io, extract_f32, load_ses
 /// Samples in one VAD cell: 32 ms at 16 kHz.
 pub const SILERO_CELL_SAMPLES: usize = 512;
 /// Samples of the previous cell carried in front of each cell.
-pub const SILERO_CONTEXT_SAMPLES: usize = 64;
+const SILERO_CONTEXT_SAMPLES: usize = 64;
 /// Floats in the recurrent state, `2 × 1 × 128`.
-pub const SILERO_STATE_LEN: usize = 256;
+const SILERO_STATE_LEN: usize = 256;
 /// The sample rate the model is run at.
-pub const SILERO_SAMPLE_RATE: i64 = 16_000;
+const SILERO_SAMPLE_RATE: i64 = 16_000;
 
 const MODEL: &str = "silero_vad_v5";
 const INPUT_LEN: usize = SILERO_CONTEXT_SAMPLES + SILERO_CELL_SAMPLES;
@@ -42,30 +42,6 @@ impl SileroState {
         recurrent: [0.0; SILERO_STATE_LEN],
         context: [0.0; SILERO_CONTEXT_SAMPLES],
     };
-
-    /// The recurrent state, `[2, 1, 128]` in row-major order.
-    pub fn recurrent(&self) -> &[f32; SILERO_STATE_LEN] {
-        &self.recurrent
-    }
-
-    /// The last 64 samples of the previous cell.
-    pub fn context(&self) -> &[f32; SILERO_CONTEXT_SAMPLES] {
-        &self.context
-    }
-
-    /// Rebuilds a state from its parts, for example one persisted with a turn. Non-finite
-    /// values are rejected.
-    pub fn from_parts(
-        recurrent: [f32; SILERO_STATE_LEN],
-        context: [f32; SILERO_CONTEXT_SAMPLES],
-    ) -> Result<Self, SpeechError> {
-        if recurrent.iter().chain(&context).any(|v| !v.is_finite()) {
-            return Err(SpeechError::InvalidInput(
-                "Silero state is not finite".into(),
-            ));
-        }
-        Ok(Self { recurrent, context })
-    }
 }
 
 impl Default for SileroState {
@@ -182,24 +158,5 @@ impl SileroVad {
     /// Returns to the stream-start state.
     pub fn reset(&mut self) {
         self.state = SileroState::INITIAL;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn state_parts_round_trip_and_reject_non_finite() {
-        let mut r = [0.0f32; SILERO_STATE_LEN];
-        r[3] = 0.25;
-        let c = [0.5f32; SILERO_CONTEXT_SAMPLES];
-        let s = SileroState::from_parts(r, c).unwrap();
-        assert_eq!(s.recurrent()[3], 0.25);
-        assert_eq!(s.context()[0], 0.5);
-        assert_ne!(s, SileroState::INITIAL);
-        r[0] = f32::NAN;
-        assert!(SileroState::from_parts(r, c).is_err());
-        assert_eq!(SileroState::default(), SileroState::INITIAL);
     }
 }

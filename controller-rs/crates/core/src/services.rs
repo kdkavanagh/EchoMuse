@@ -1,15 +1,13 @@
 //! Typed boundaries between a device runtime and the shared services it calls (§5.4).
 //!
 //! This module holds the Home Assistant contract and the outcome vocabulary shared by
-//! every service. The alert service and turn persistence contracts are designed with
-//! those services, from §3.1.8, §3.3.4, §4.9, the firmware's alert package and the
-//! schema contract (`crates/db/schema/v40.sql`); they are not defined here yet.
+//! services. Alert and turn-persistence contracts live in the crates that own them.
 //!
-//! Every trait method returns a `Send` future and takes an owned request, so a device
-//! runtime can await it on its own thread while the implementation runs on the shared
-//! runtime. The traits use return-position `impl Future`, which costs no allocation per
-//! call but is not object safe: hold implementations by generic parameter, or add a boxing
-//! adapter where a trait object is genuinely needed.
+//! Home Assistant methods return `Send` futures and take owned requests, so a device
+//! runtime can await them on its own executor. The implementation decides where its
+//! work runs; the shared connection does not move every caller's future to that runtime.
+//! Return-position `impl Future` avoids boxing these calls. API ports that genuinely
+//! need trait objects expose boxed futures directly rather than duplicate their traits.
 //!
 //! # Freshness, dispatch and outcomes
 //!
@@ -352,6 +350,37 @@ pub struct TimerStatus {
     pub timers: Vec<HaTimer>,
     /// HA's `response_type` as sent (`action_done`).
     pub response_type: String,
+}
+
+/// What happened to one of a satellite's Home Assistant timers.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum TimerEventKind {
+    /// The timer was set.
+    Started,
+    /// It was changed or paused.
+    Updated,
+    /// It was cancelled.
+    Cancelled,
+    /// It ran out.
+    Finished,
+}
+
+/// A timer event from Home Assistant, which owns the satellite's timers. Home Assistant
+/// sends these to the satellite over the ESPHome API.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimerEvent {
+    /// What happened.
+    pub kind: TimerEventKind,
+    /// Home Assistant's timer ID.
+    pub timer_id: String,
+    /// The timer's name, if it has one.
+    pub name: Option<String>,
+    /// The timer's full length in seconds.
+    pub total_seconds: u32,
+    /// Seconds left.
+    pub seconds_left: u32,
+    /// Whether it is counting down (not paused).
+    pub is_active: bool,
 }
 
 /// The Home Assistant session as a device runtime uses it. One implementation multiplexes

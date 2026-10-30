@@ -17,10 +17,12 @@ use echomuse_alerts::{
     ids,
     relay::CancelSelector,
     schedule::{AlarmWhen, Repeat, TimeOfDay, Weekdays, parse_instant},
-    timers::{TimerEvent, TimerEventKind},
     wire::{ActAction, ActSource, AlertInbound, CommandBody, PostBody},
 };
-use echomuse_core::types::SessionId;
+use echomuse_core::{
+    services::{TimerEvent, TimerEventKind},
+    types::SessionId,
+};
 use echomuse_protocol::{
     Capabilities, MessageType,
     alerts::{AlertSound, CacheObject, TombstoneReason, snapshot_digest},
@@ -689,6 +691,123 @@ async fn a_ring_on_another_speaker_is_checked_again_and_acted_on_through_its_dev
         within(w.handle.act(snooze)).await.unwrap(),
         ActOutcome::Refused(Refusal::NotSnoozable)
     );
+}
+
+#[tokio::test]
+async fn a_repeated_act_the_device_has_not_confirmed_is_never_sent_again() {
+    // Remember a single outcome, so later acts push earlier ones out of that memory.
+    let short = echomuse_alerts::AlertConfig {
+        settle_wait: Duration::from_millis(300),
+        remembered: 1,
+        ..test_config()
+    };
+    let mut w = World::with(short);
+    w.kitchen().await;
+    let created = within(w.handle.set_alarm(set(
+        KITCHEN,
+        OpId::voice_alarm("k1"),
+        once((8, 1)),
+        "Wake up",
+    )))
+    .await
+    .unwrap();
+    let Outcome::Applied { result, .. } = created else {
+        panic!("{created:?}");
+    };
+    let occurrence = result.occurrence_id;
+    w.attach(KITCHEN, 3, Some(hello(None, 0)), &[]);
+    w.ringing(KITCHEN, 3, &occurrence.to_string(), "alarm");
+    eventually("the alarm rings", || {
+        w.handle
+            .rings()
+            .borrow()
+            .devices
+            .get(KITCHEN)
+            .is_some_and(|d| d.active.is_some())
+    })
+    .await;
+
+    let op = OpId::local_action("turn-r", "dismiss");
+    let act = Act {
+        op_id: op,
+        target: RingRef {
+            device: device(KITCHEN),
+            ring_id: occurrence.to_string(),
+        },
+        action: ActAction::Dismiss,
+        source: ActSource::Voice,
+    };
+    let call = tokio::spawn({
+        let handle = w.handle.clone();
+        let act = act.clone();
+        async move { handle.act(act).await }
+    });
+    // The device journals the act but has not uploaded its operation by the settle wait.
+    w.probe.act().await.ack(AckStatus::Durable, None);
+    assert_eq!(
+        within(call).await.unwrap().unwrap(),
+        ActOutcome::Pending { op_id: op }
+    );
+
+    // The alarm still shows ringing; the repeat waits again and sends nothing.
+    assert_eq!(
+        within(w.handle.act(act.clone())).await.unwrap(),
+        ActOutcome::Pending { op_id: op }
+    );
+    assert!(w.probe.acts.try_recv().is_err(), "the act was sent again");
+
+    // Acts the device never answered are remembered as unknown; once later acts push them
+    // out of that bounded memory, a repeat still waits instead of sending them again.
+    let unanswered = |turn: &str| Act {
+        op_id: OpId::local_action(turn, "dismiss"),
+        ..act.clone()
+    };
+    for turn in ["turn-u1", "turn-u2"] {
+        let call = tokio::spawn({
+            let handle = w.handle.clone();
+            let act = unanswered(turn);
+            async move { handle.act(act).await }
+        });
+        w.probe.act().await.lose();
+        let outcome = within(call).await.unwrap().unwrap();
+        assert!(matches!(outcome, ActOutcome::Unknown { .. }), "{outcome:?}");
+    }
+    let forgotten = unanswered("turn-u1");
+    assert_eq!(
+        within(w.handle.act(forgotten.clone())).await.unwrap(),
+        ActOutcome::Pending {
+            op_id: forgotten.op_id
+        }
+    );
+    assert!(
+        w.probe.acts.try_recv().is_err(),
+        "an unanswered act was sent again"
+    );
+
+    // The operation arrives under the same id and answers the next repeat.
+    let schedule = ids::new_schedule_id(OpId::voice_alarm("k1"));
+    w.send(
+        KITCHEN,
+        3,
+        inbound(
+            MessageType::AlertLocalOperation,
+            json!({
+        "op_id": op.to_string(), "action": "dismiss", "occurrence_id": occurrence.to_string(),
+        "schedule_id": schedule.to_string(), "revision": 1, "reason": null, "source": "voice"}),
+        ),
+    );
+    eventually("the device's operation applied", || {
+        op_state(&w.db, op).as_deref() == Some("applied")
+    })
+    .await;
+    assert_eq!(
+        within(w.handle.act(act)).await.unwrap(),
+        ActOutcome::Applied {
+            op_id: op,
+            kind: echomuse_alerts::wire::RingKind::Alarm
+        }
+    );
+    assert!(w.probe.acts.try_recv().is_err());
 }
 
 #[tokio::test]

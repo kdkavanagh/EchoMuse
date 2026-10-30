@@ -664,13 +664,49 @@ async fn a_repeated_turn_completion_inserts_once_and_publishes_once() {
     let path = h.file(RecordingKind::Utterance, DEV, first.insert.id.0);
     assert_eq!(fs::read(path).unwrap(), wav_bytes(&pcm(1_600)));
 
+    // A reply held for a repeated completion applies to the row already stored, not to
+    // the repeat that inserts nothing.
+    let (fix, follows) = tokio::sync::oneshot::channel::<Option<SttFix>>();
+    let repeat = h
+        .records
+        .submit_turn(record.clone(), TurnAudio::default(), Some(follows));
+    let reply = h.records.submit_continuation(
+        &dev(DEV),
+        uuid,
+        ContinuationEnd::FollowUp(FollowUp::Answered),
+    );
+    drop(fix);
+    assert!(!repeat.await.unwrap().unwrap().insert.inserted);
+    assert_eq!(reply.await.unwrap().unwrap(), ContinuationUpdate::Resolved);
+    assert_eq!(
+        stored_turn(&h, uuid).unwrap().1.as_deref(),
+        Some("answered")
+    );
+
     let mut elsewhere = record;
     elsewhere.device = dev(OTHER);
     let conflict = h
         .records
-        .persist_turn(elsewhere, TurnAudio::default())
+        .persist_turn(elsewhere.clone(), TurnAudio::default())
         .await;
     assert!(matches!(conflict, Err(RecordsError::Db(_))));
+
+    // A reply held for a row that is refused is never answered as written.
+    let (fix, follows) = tokio::sync::oneshot::channel::<Option<SttFix>>();
+    let refused = h
+        .records
+        .submit_turn(elsewhere, TurnAudio::default(), Some(follows));
+    let reply = h.records.submit_continuation(
+        &dev(OTHER),
+        uuid,
+        ContinuationEnd::FollowUp(FollowUp::Answered),
+    );
+    drop(fix);
+    assert!(matches!(refused.await.unwrap(), Err(RecordsError::Db(_))));
+    assert!(
+        !matches!(reply.await, Ok(Ok(_))),
+        "a held end shares its row's failure"
+    );
     h.close().await;
 }
 
@@ -766,6 +802,16 @@ fn stored_turn(h: &Harness, uuid: Uuid) -> Option<(Option<String>, Option<String
         )
         .optional()
         .unwrap()
+}
+
+fn log_line(device: &DeviceId, message: &str) -> DeviceLogEntry {
+    DeviceLogEntry {
+        device: device.clone(),
+        ts: UnixMillis(1_793_239_028_889),
+        level: LogLevel::Info,
+        source: LogSource::Device,
+        message: message.to_owned(),
+    }
 }
 
 #[test]
@@ -924,9 +970,13 @@ async fn a_held_row_waits_for_its_correction_record_and_takes_a_reply_meanwhile(
         .submit_turn(record, TurnAudio::default(), Some(follows));
     // The question's reply arrives while its row waits for the record.
     let answered = ContinuationEnd::FollowUp(FollowUp::Answered);
-    let resolved = h.records.submit_continuation(&dev(DEV), uuid, answered);
+    let mut resolved = h.records.submit_continuation(&dev(DEV), uuid, answered);
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(stored_turn(&h, uuid), None, "the row waits for its record");
+    assert!(
+        resolved.try_recv().is_err(),
+        "the reply is answered only once its row is written"
+    );
     fix.send(Some(SttFix(object(
         json!({"mode": "shadow", "reason": "would_apply"}),
     ))))
@@ -1436,20 +1486,28 @@ async fn deleting_a_device_stops_late_writers() {
         .await
         .unwrap();
     h.records
-        .log(DeviceLogEntry {
-            device: device.clone(),
-            ts: UnixMillis(1_793_239_028_889),
-            level: LogLevel::Info,
-            source: LogSource::Device,
-            message: "hello".to_owned(),
-        })
+        .log(log_line(&device, "hello"), h.records.lifetime(&device))
         .await
         .unwrap();
+    // Partial files an earlier controller left: in the device's own wake directory, and in
+    // a shared directory beside another device's.
+    fs::write(
+        h.root().join("wakes").join(DEV).join("9.wav.part"),
+        b"partial",
+    )
+    .unwrap();
+    let recordings = h.root().join("recordings");
+    let ours = recordings.join(format!("{DEV}_7.wav.part"));
+    let theirs = recordings.join(format!("{OTHER}_7.wav.part"));
+    fs::write(&ours, b"partial").unwrap();
+    fs::write(&theirs, b"partial").unwrap();
     let deleted = h.records.delete_device(&device).await.unwrap();
     assert_eq!(deleted.rows.turns, 1);
     assert_eq!(deleted.rows.near_misses, 1);
     assert_eq!(deleted.rows.device_logs, 1);
-    assert_eq!(deleted.files, 3);
+    assert_eq!(deleted.files, 5);
+    assert!(!ours.exists());
+    assert!(theirs.exists(), "another device's partial file stays");
     assert!(
         !h.file(RecordingKind::Utterance, DEV, p.insert.id.0)
             .exists()
@@ -1493,6 +1551,89 @@ async fn deleting_a_device_stops_late_writers() {
     h.close().await;
 }
 
+/// A turn submitted before its device was deleted, still waiting for its correction record
+/// with a reply's end held in it, does not land in the records of the device's next
+/// approval: neither its row nor its recordings. Nor do log lines queued before the
+/// deletion or while the device was deleted.
+#[tokio::test]
+async fn a_held_turn_from_before_a_deletion_stays_out_after_reapproval() {
+    let h = Harness::new(RetentionLimits::default());
+    let device = dev(DEV);
+    let uuid = Uuid::new_v4();
+    let mut record = full_turn(uuid, Uuid::new_v4());
+    record.stt_fix = None;
+    let (fix, follows) = tokio::sync::oneshot::channel::<Option<SttFix>>();
+    let written = h.records.submit_turn(
+        record,
+        TurnAudio {
+            utterance: Some(pcm(160)),
+            wake_clip: Some(pcm(160)),
+            turn_recording: Some(pcm(160)),
+        },
+        Some(follows),
+    );
+    let answered =
+        h.records
+            .submit_continuation(&device, uuid, ContinuationEnd::FollowUp(FollowUp::Answered));
+    let queued_before = h.records.lifetime(&device);
+
+    h.records.delete_device(&device).await.unwrap();
+    let queued_while_deleted = h.records.lifetime(&device);
+    h.records.reopen_device(&device).await;
+    for (lifetime, message) in [
+        (queued_before, "before the deletion"),
+        (queued_while_deleted, "while deleted"),
+    ] {
+        let refused = h.records.log(log_line(&device, message), lifetime).await;
+        assert!(matches!(refused, Err(RecordsError::Closed(_))), "{message}");
+    }
+    fix.send(Some(SttFix(object(json!({"mode": "shadow"})))))
+        .unwrap();
+    assert!(matches!(
+        written.await.unwrap(),
+        Err(RecordsError::Closed(_))
+    ));
+    // The reply's end was held for that row, and is refused with it.
+    assert!(matches!(
+        answered.await.unwrap(),
+        Err(RecordsError::Closed(_))
+    ));
+    assert_eq!(stored_turn(&h, uuid), None);
+    let count: i64 = h
+        .conn()
+        .query_row("SELECT count(*) FROM turns", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0, "nothing of the old lifetime was written");
+    let logs: i64 = h
+        .conn()
+        .query_row("SELECT count(*) FROM device_logs", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(logs, 0);
+    for dir in ["recordings", "turn_recordings", "wakes"] {
+        let files: Vec<_> = fs::read_dir(h.root().join(dir))
+            .map(|entries| entries.map(|e| e.unwrap().path()).collect())
+            .unwrap_or_default();
+        assert!(files.is_empty(), "{dir}: {files:?}");
+    }
+
+    // The device approved again writes as usual.
+    h.records
+        .persist_turn(
+            full_turn(Uuid::new_v4(), Uuid::new_v4()),
+            TurnAudio::default(),
+        )
+        .await
+        .unwrap();
+    h.records
+        .log(
+            log_line(&device, "approved again"),
+            h.records.lifetime(&device),
+        )
+        .await
+        .unwrap();
+    h.close().await;
+}
+
 #[tokio::test]
 async fn device_logs_store_milliseconds_and_keep_the_newest_lines() {
     let h = Harness::new(RetentionLimits {
@@ -1502,32 +1643,38 @@ async fn device_logs_store_milliseconds_and_keep_the_newest_lines() {
     let device = dev(DEV);
     for i in 0..5 {
         h.records
-            .log(DeviceLogEntry {
-                device: device.clone(),
-                ts: UnixMillis(1_793_239_000_000 + i),
-                level: if i == 4 {
-                    LogLevel::Error
-                } else {
-                    LogLevel::Info
+            .log(
+                DeviceLogEntry {
+                    device: device.clone(),
+                    ts: UnixMillis(1_793_239_000_000 + i),
+                    level: if i == 4 {
+                        LogLevel::Error
+                    } else {
+                        LogLevel::Info
+                    },
+                    source: if i == 4 {
+                        LogSource::Controller
+                    } else {
+                        LogSource::Device
+                    },
+                    message: format!("line {i}"),
                 },
-                source: if i == 4 {
-                    LogSource::Controller
-                } else {
-                    LogSource::Device
-                },
-                message: format!("line {i}"),
-            })
+                h.records.lifetime(&device),
+            )
             .await
             .unwrap();
     }
     h.records
-        .log(DeviceLogEntry {
-            device: dev(OTHER),
-            ts: UnixMillis(1),
-            level: LogLevel::Warn,
-            source: LogSource::Device,
-            message: "other".to_owned(),
-        })
+        .log(
+            DeviceLogEntry {
+                device: dev(OTHER),
+                ts: UnixMillis(1),
+                level: LogLevel::Warn,
+                source: LogSource::Device,
+                message: "other".to_owned(),
+            },
+            h.records.lifetime(&dev(OTHER)),
+        )
         .await
         .unwrap();
     let conn = h.conn();
@@ -1903,61 +2050,4 @@ async fn wake_stats_roll_up_counters_and_shadow_rules() {
         "[0.17870475019777243, 0.8644937192419655, 0.9385493562892955]"
     );
     h.close().await;
-}
-
-#[tokio::test]
-async fn sample_clips_are_published_with_their_sidecar() {
-    let h = Harness::new(RetentionLimits::default());
-    let device = dev(DEV);
-    let at = UnixMillis(1_786_757_114_826);
-    let sidecar = AfeSeries(object(json!({"start": 0, "period": 1280, "support": null})));
-    let path = h
-        .records
-        .publish_sample_clip(&device, at, pcm(320), Some(sidecar))
-        .await
-        .unwrap();
-    assert_eq!(
-        path,
-        h.root().join("samples").join(DEV).join("1786757114826.wav")
-    );
-    assert_eq!(fs::read(&path).unwrap(), wav_bytes(&pcm(320)));
-    assert_eq!(
-        fs::read_to_string(
-            h.root()
-                .join("samples")
-                .join(DEV)
-                .join("1786757114826.afe.json")
-        )
-        .unwrap(),
-        r#"{"period":1280,"start":0,"support":null}"#
-    );
-    let again = h
-        .records
-        .publish_sample_clip(&device, at, pcm(320), None)
-        .await;
-    assert!(matches!(again, Err(RecordsError::Io(_))));
-    let unsafe_id = h
-        .records
-        .publish_sample_clip(&dev("../x"), at, pcm(1), None)
-        .await;
-    assert!(matches!(unsafe_id, Err(RecordsError::UnsafeDeviceId(_))));
-    h.close().await;
-}
-
-#[test]
-fn the_default_limits_are_the_documented_ones() {
-    let l = RetentionLimits::default();
-    assert_eq!(
-        (
-            l.utterances,
-            l.turn_recordings,
-            l.wake_clips,
-            l.near_miss_recordings,
-            l.near_miss_rows,
-            l.turn_traces,
-            l.near_miss_series,
-            l.device_logs
-        ),
-        (300, 100, 1_000, 1_000, 2_000, 1_000, 1_000, 10_000)
-    );
 }

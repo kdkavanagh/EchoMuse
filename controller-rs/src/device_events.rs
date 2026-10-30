@@ -8,8 +8,10 @@
 //! alert messages. A runtime never waits on the channel: when it is full, an event the
 //! session needs closes that session instead of being dropped (§5.2).
 
-use echomuse_core::types::{DeviceId, SessionId};
-use echomuse_esphome::voice::TimerEvent;
+use echomuse_core::{
+    services::TimerEvent,
+    types::{DeviceId, SessionId},
+};
 use echomuse_link::SessionLink;
 use echomuse_protocol::{Capabilities, MessageType, Platform, session::HelloAlerts};
 use serde_json::{Map, Value};

@@ -43,17 +43,7 @@ impl SettingsPatch {
         self.values.values()
     }
 
-    /// Whether it sets nothing.
-    pub fn is_empty(&self) -> bool {
-        self.values.is_empty()
-    }
-
     /// Parse a JSON object of setting keys, as the dashboard sends the fleet config.
-    pub fn from_json_text(text: &str) -> Result<Self, EditError> {
-        Self::from_json(&Json::parse(text).map_err(|e| EditError::NotAnObject(e.to_string()))?)
-    }
-
-    /// The same from a `serde_json` value.
     pub fn from_value(value: &serde_json::Value) -> Result<Self, EditError> {
         Self::from_json(&Json::from_value(value))
     }
@@ -84,10 +74,10 @@ fn parse_entry(key: &str, value: &Json) -> Result<SettingValue, EditError> {
 
 /// A device edit: the sections it overrides from now on, and values.
 ///
-/// A value whose section stays on the fleet is not stored and is reported back in
-/// [`EditOutcome::not_stored`]: the dashboard sends the whole effective config with
-/// every save. Sections newly overridden start from the fleet's current values unless
-/// the edit sets them. `startupVolume` is device state and always stored.
+/// A value whose section stays on the fleet is not stored: the dashboard sends the whole
+/// effective config with every save. Sections newly overridden start from the fleet's
+/// current values unless the edit sets them. `startupVolume` is device state and always
+/// stored.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DeviceEdit {
     /// The overridden sections after the edit; `None` keeps them.
@@ -99,11 +89,6 @@ pub struct DeviceEdit {
 impl DeviceEdit {
     /// Parse the dashboard's device config body: setting keys plus `config_sections`,
     /// a list of section ids.
-    pub fn from_json_text(text: &str) -> Result<Self, EditError> {
-        Self::from_json(&Json::parse(text).map_err(|e| EditError::NotAnObject(e.to_string()))?)
-    }
-
-    /// The same from a `serde_json` value.
     pub fn from_value(value: &serde_json::Value) -> Result<Self, EditError> {
         Self::from_json(&Json::from_value(value))
     }
@@ -224,26 +209,25 @@ pub struct EditOutcome {
     /// Of those, the ones whose wake graph, rules or near-miss floor changed: they take
     /// effect only through a new `session.ready` (spec §3.1.4).
     pub new_session_needed: Vec<DeviceId>,
-    /// Values the edit carried that were not stored because their section follows the
-    /// fleet on this device.
-    pub not_stored: Vec<SettingKey>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use serde_json::json;
+
     #[test]
     fn unknown_removed_and_invalid_keys_are_refused_by_name() {
         assert!(matches!(
-            SettingsPatch::from_json_text(r#"{"wakeSound": true, "colour": 1}"#),
+            SettingsPatch::from_value(&json!({"wakeSound": true, "colour": 1})),
             Err(EditError::UnknownKey(k)) if k == "colour"
         ));
         assert!(matches!(
-            SettingsPatch::from_json_text(r#"{"replyOnset": 3}"#),
+            SettingsPatch::from_value(&json!({"replyOnset": 3})),
             Err(EditError::RemovedKey(k)) if k == "replyOnset"
         ));
-        let err = SettingsPatch::from_json_text(r#"{"duckDb": -41}"#).unwrap_err();
+        let err = SettingsPatch::from_value(&json!({"duckDb": -41})).unwrap_err();
         assert!(matches!(
             err,
             EditError::InvalidValue {
@@ -253,11 +237,11 @@ mod tests {
         ));
         assert_eq!(err.to_string(), "duckDb: -41 is outside -40 to 0");
         assert!(matches!(
-            DeviceEdit::from_json_text(r#"{"config_sections": ["ring", "lights"]}"#),
+            DeviceEdit::from_value(&json!({"config_sections": ["ring", "lights"]})),
             Err(EditError::UnknownSection(s)) if s == "lights"
         ));
-        let edit = DeviceEdit::from_json_text(
-            r#"{"config_sections": ["timers"], "timerRingSeconds": 600}"#,
+        let edit = DeviceEdit::from_value(
+            &json!({"config_sections": ["timers"], "timerRingSeconds": 600}),
         )
         .unwrap();
         assert_eq!(edit.sections, Some(SectionSet::from([Section::Timers])));

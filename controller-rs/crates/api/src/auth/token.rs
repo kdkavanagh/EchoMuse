@@ -50,7 +50,7 @@ impl SessionToken {
         random_hex::<SESSION_TOKEN_BYTES>()
             .map(Self)
             .map_err(|error| {
-                eprintln!("api: no randomness for a session token: {error}");
+                tracing::error!(%error, "no randomness for a session token");
                 ApiError::internal("The controller could not create a session")
             })
     }
@@ -104,7 +104,7 @@ impl BootstrapToken {
         random_hex::<SETUP_TOKEN_BYTES>()
             .map(Self)
             .map_err(|error| {
-                eprintln!("api: no randomness for the setup token: {error}");
+                tracing::error!(%error, "no randomness for the setup token");
                 ApiError::internal("The controller could not create a setup token")
             })
     }

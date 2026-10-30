@@ -61,12 +61,6 @@ impl Phase {
     }
 }
 
-/// The `voice_state` value for a runtime state; `None` (the sensor's missing state) while
-/// the state is unknown, such as before the device's session is attached.
-pub fn voice_state(state: Option<ActorState>) -> Option<VoiceState> {
-    state.map(|s| s.phase().voice_state())
-}
-
 /// Follows the runtime's state and reports each change of the sensor's value once.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct VoiceStateProjection {
@@ -74,9 +68,10 @@ pub struct VoiceStateProjection {
 }
 
 impl VoiceStateProjection {
-    /// The new sensor value when `state` changes it, else `None`.
+    /// The new sensor value when `state` changes it, else `None`. An unknown state (no
+    /// session attached) is the sensor's missing value.
     pub fn update(&mut self, state: Option<ActorState>) -> Option<Option<VoiceState>> {
-        let value = voice_state(state);
+        let value = state.map(|s| s.phase().voice_state());
         if self.shown == Some(value) {
             return None;
         }
@@ -88,24 +83,6 @@ impl VoiceStateProjection {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn every_state_maps_to_its_phase() {
-        let expected = [
-            (ActorState::Idle, VoiceState::Idle),
-            (ActorState::Armed, VoiceState::Listening),
-            (ActorState::Listening, VoiceState::Listening),
-            (ActorState::EndPending, VoiceState::Listening),
-            (ActorState::Committed, VoiceState::Thinking),
-            (ActorState::Thinking, VoiceState::Thinking),
-            (ActorState::Speaking, VoiceState::Speaking),
-            (ActorState::Closing, VoiceState::Idle),
-        ];
-        for (state, value) in expected {
-            assert_eq!(voice_state(Some(state)), Some(value), "{state:?}");
-        }
-        assert_eq!(voice_state(None), None);
-    }
 
     #[test]
     fn a_turn_reports_each_change_once() {

@@ -16,13 +16,14 @@
 //! pending, and its answer is cancelled), and the reply turn opens on the watch's
 //! subscription with no opening guard: its utterance starts 300 ms before the answer's
 //! onset, its trigger is the onset, and it gets a fresh decode and echo labels from its
-//! start, with the loudness and VAD already heard. When the question plays to its end
+//! start, with the loudness and VAD already heard. The question's playback ending later
+//! names the asking turn, so it cannot end the reply. When the question plays to its end
 //! instead, the watch closes and the reply window opens as usual.
 //!
 //! Only the controller's own questions are watched. A question Home Assistant asks
 //! (`continue_conversation`) is HA's answer; its reply window opens at the drain.
 
-use echomuse_core::types::{TurnId, WorkScope};
+use echomuse_core::types::WorkScope;
 use echomuse_turn::{
     EarlyAnswerPolicy, EarlyAnswerWatch, Epoch, EvidenceAssembler, EvidenceError, EvidencePlan,
     Released, Sample, Samples,
@@ -30,39 +31,43 @@ use echomuse_turn::{
 use echomuse_uplink::{CloseReason, Owner as SubOwner, SubscriptionId};
 use uuid::Uuid;
 
-use crate::{
-    analysis::{Analysis, Owner, StreamNews},
-    io::Now,
+use super::{
+    Conversation,
     local::Expectation,
-    machine::Voice,
-    reply::ReplyWindow,
-    speech::{MicJob, ReferenceJob, StreamKey},
+    reply::{ReplyWindow, reply_history},
+};
+use crate::{
+    analysis::{Analysis, StreamNews, mic_job},
+    io::Now,
+    output::Output,
+    session::ConversationCx,
+    speech::{MicJob, StreamKey},
 };
 
 /// The pre-roll before an early answer's onset that its utterance keeps (post-AFE §16.6).
 const PRE_ROLL: Samples = Samples(4_800);
 
 /// The watch over one question.
-pub(crate) struct QuestionWatch {
+pub(super) struct QuestionWatch {
     /// The asking turn.
-    pub(crate) question: Uuid,
-    pub(crate) subscription: SubscriptionId,
-    pub(crate) analysis: Analysis,
+    pub(super) question: Uuid,
+    pub(super) subscription: SubscriptionId,
+    pub(super) analysis: Analysis,
     /// The reply turn's scope, should the answer come early.
-    pub(crate) scope: WorkScope,
+    pub(super) scope: WorkScope,
     /// Where the subscription's loudness history starts.
-    pub(crate) cells_from: Sample,
+    cells_from: Sample,
     /// Releases the cells in order once the first live mic sample is known.
-    pub(crate) assembler: Option<EvidenceAssembler>,
+    assembler: Option<EvidenceAssembler>,
     /// The first cell the watch judges (where its live mic starts).
-    pub(crate) start: Option<Sample>,
-    pub(crate) watch: EarlyAnswerWatch,
+    start: Option<Sample>,
+    watch: EarlyAnswerWatch,
     /// The evidence could not be put in order: the watch stops judging.
-    pub(crate) broken: bool,
+    broken: bool,
 }
 
 /// Whether the controller asked this itself (and so watches for an early answer).
-pub(crate) fn own_question(expectation: &Expectation) -> bool {
+fn own_question(expectation: &Expectation) -> bool {
     match expectation {
         Expectation::Retry
         | Expectation::Meridiem { .. }
@@ -73,11 +78,16 @@ pub(crate) fn own_question(expectation: &Expectation) -> bool {
     }
 }
 
-impl Voice {
+impl Conversation {
     /// The current turn's answer became audible: when it asks the controller's own
     /// question, watch for an answer that starts before it ends.
-    pub(crate) fn question_audible(&mut self, question: Uuid, now: Now) {
-        if self.question_watch.is_some() {
+    pub(super) fn question_audible(
+        &mut self,
+        cx: &mut ConversationCx<'_>,
+        question: Uuid,
+        now: Now,
+    ) {
+        if self.watch.is_some() {
             return;
         }
         let Some(turn) = self.turn.as_ref().filter(|t| t.uuid == question) else {
@@ -89,39 +99,39 @@ impl Voice {
         if !watched {
             return;
         }
-        let (Some(capture), Some(epoch)) =
-            (self.capture.clone(), self.uplink.timeline().capture_epoch())
-        else {
+        let (Some(capture), Some(epoch)) = (
+            cx.facts.capture.clone(),
+            cx.audio.timeline().capture_epoch(),
+        ) else {
             return;
         };
         let Some(turn_epoch) = Epoch::new(epoch.get()) else {
             return;
         };
-        // Ten seconds of loudness before the question, for the room's background level;
-        // the device clips the request to what its ring still holds.
-        let heard = self.mic_end(epoch).unwrap_or(Sample(0));
-        let cells_from = (heard - Samples(160_000)).round_down(512);
+        // Ten seconds of loudness before the question, for the room's background level.
+        let (heard, cells_from) = reply_history(cx.audio, epoch);
         let owner = SubOwner::new(format!("early-{question}")).expect("not empty");
-        let opened = match self.uplink.open_reply(owner, cells_from, self.mono(now.at)) {
-            Ok(opened) => opened,
+        let subscription = match cx
+            .audio
+            .open_reply(owner, cells_from, cx.facts.mono(now.at))
+        {
+            Ok(subscription) => subscription,
             Err(error) => {
-                tracing::info!(device = %self.device, %error, "the early-answer watch could not open");
+                tracing::info!(device = %cx.facts.device, %error, "the early-answer watch could not open");
                 return;
             }
         };
-        self.apply_grants(&opened.grants);
-        self.next_turn += 1;
-        let scope = capture.for_turn(TurnId(self.next_turn));
+        let scope = cx.ids.turn_scope(&capture);
         let key = StreamKey {
-            session: self.session,
-            subscription: opened.subscription_id.clone(),
+            session: cx.facts.session,
+            subscription: subscription.clone(),
             epoch: turn_epoch,
         };
         let mut analysis = Analysis::new(key.clone(), epoch);
         analysis.cells_from = Some(cells_from.cell());
-        self.question_watch = Some(QuestionWatch {
+        let watch = self.watch.insert(QuestionWatch {
             question,
-            subscription: opened.subscription_id,
+            subscription,
             analysis,
             scope,
             cells_from,
@@ -130,57 +140,58 @@ impl Voice {
             watch: EarlyAnswerWatch::new(EarlyAnswerPolicy::default()),
             broken: false,
         });
-        self.mic_job(
-            Owner::Watch,
-            MicJob::Open {
-                key: key.clone(),
-                plan: echomuse_echo::EchoPlan {
-                    epoch: turn_epoch,
-                    cells_from: cells_from.cell(),
-                    vad_from: heard.cell(),
-                },
+        cx.audio.open_analysis(
+            cx.link,
+            &watch.scope,
+            key,
+            echomuse_echo::EchoPlan {
+                epoch: turn_epoch,
+                cells_from: cells_from.cell(),
+                vad_from: heard.cell(),
             },
-        );
-        self.reference_job(
-            Owner::Watch,
-            ReferenceJob::Open {
-                key,
-                graph: self.wake.files.clone(),
-            },
+            cx.facts.wake.files.clone(),
         );
     }
 
     /// Ends the watch without an early answer: the question played out, or its turn ended.
-    pub(crate) fn close_question_watch(&mut self, now: Now) {
-        if let Some(watch) = self.question_watch.take() {
-            let _ = self
-                .uplink
-                .close(&watch.subscription, CloseReason::Closed, self.mono(now.at));
-            self.close_analysis(watch.analysis.key);
+    pub(super) fn close_question_watch(&mut self, cx: &mut ConversationCx<'_>, now: Now) {
+        if let Some(watch) = self.watch.take() {
+            cx.audio.close(
+                &watch.subscription,
+                CloseReason::Closed,
+                cx.facts.mono(now.at),
+            );
+            cx.audio.close_analysis(cx.link, watch.analysis.key);
         }
     }
 
-    pub(crate) fn watch_news(&mut self, news: StreamNews, now: Now) {
+    pub(super) fn watch_news(
+        &mut self,
+        cx: &mut ConversationCx<'_>,
+        out: &mut Output,
+        news: StreamNews,
+        now: Now,
+    ) {
         match news {
             StreamNews::Ended(_) => {
                 // The device ended the subscription (mute, a new capture epoch): the
                 // question plays on unwatched.
-                if let Some(watch) = self.question_watch.take() {
-                    self.close_analysis(watch.analysis.key);
+                if let Some(watch) = self.watch.take() {
+                    cx.audio.close_analysis(cx.link, watch.analysis.key);
                 }
             }
             StreamNews::Mic => {
-                self.start_watching();
-                self.watch_evidence(now);
+                self.start_watching(cx);
+                self.watch_evidence(cx, out, now);
             }
-            StreamNews::Other => self.watch_evidence(now),
+            StreamNews::Other => self.watch_evidence(cx, out, now),
         }
     }
 
     /// Once the first live mic sample is known: the judged cells start at the first
     /// whole cell from there, with echo labels and a decode from that cell.
-    fn start_watching(&mut self) {
-        let Some(watch) = self.question_watch.as_mut() else {
+    fn start_watching(&mut self, cx: &mut ConversationCx<'_>) {
+        let Some(watch) = self.watch.as_mut() else {
             return;
         };
         if watch.assembler.is_some() || watch.broken {
@@ -209,31 +220,41 @@ impl Voice {
         watch.assembler = Some(assembler);
         watch.start = Some(start);
         let key = watch.analysis.key.clone();
-        self.mic_job(Owner::Watch, MicJob::StartUtterance { key, from: start });
+        mic_job(
+            cx.link,
+            &watch.scope,
+            MicJob::StartUtterance { key, from: start },
+        );
     }
 
     /// Hands evidence to the watch's assembler, if it has one.
-    pub(crate) fn watch_assembler(
+    pub(super) fn watch_assembler(
         &mut self,
+        cx: &ConversationCx<'_>,
         push: impl FnOnce(&mut EvidenceAssembler) -> Result<(), EvidenceError>,
     ) {
-        if let Some(watch) = self.question_watch.as_mut()
+        if let Some(watch) = self.watch.as_mut()
             && let Some(assembler) = watch.assembler.as_mut()
             && let Err(error) = push(assembler)
         {
-            tracing::debug!(device = %self.device, ?error, "early-answer evidence refused");
+            tracing::debug!(device = %cx.facts.device, ?error, "early-answer evidence refused");
             watch.broken = true;
         }
     }
 
     /// Judges the cells released so far.
-    pub(crate) fn watch_evidence(&mut self, now: Now) {
-        let Some(watch) = self.question_watch.as_mut() else {
+    pub(super) fn watch_evidence(
+        &mut self,
+        cx: &mut ConversationCx<'_>,
+        out: &mut Output,
+        now: Now,
+    ) {
+        let Some(watch) = self.watch.as_mut() else {
             return;
         };
         if watch.broken {
             // Evidence out of order can prove nothing: the question plays on.
-            self.close_question_watch(now);
+            self.close_question_watch(cx, now);
             return;
         }
         let Some(assembler) = watch.assembler.as_mut() else {
@@ -246,18 +267,21 @@ impl Voice {
             Released::Block(_) => None,
         });
         if let Some(onset) = onset {
-            self.early_answer(onset, now);
+            self.early_answer(cx, out, onset, now);
         }
     }
 
-    pub(crate) fn watch_failed(&mut self, now: Now) {
-        self.close_question_watch(now);
-    }
-
-    /// The answer began at `onset` while the question still played: the question is cut
-    /// off and the reply turn opens on the watch's subscription.
-    fn early_answer(&mut self, onset: Sample, now: Now) {
-        let Some(watch) = self.question_watch.take() else {
+    /// The answer began at `onset` while the question still played: in one step the
+    /// asking turn ends with its expectation and chain kept, its answer stops, and the
+    /// reply turn opens on the watch's subscription with the watch's analysis and scope.
+    fn early_answer(
+        &mut self,
+        cx: &mut ConversationCx<'_>,
+        out: &mut Output,
+        onset: Sample,
+        now: Now,
+    ) {
+        let Some(watch) = self.watch.take() else {
             return;
         };
         let asking = self
@@ -265,26 +289,28 @@ impl Voice {
             .as_mut()
             .filter(|t| t.uuid == watch.question && t.answering.follow_up.is_some());
         let Some(asking) = asking else {
-            let _ = self
-                .uplink
-                .close(&watch.subscription, CloseReason::Closed, self.mono(now.at));
-            self.close_analysis(watch.analysis.key);
+            cx.audio.close(
+                &watch.subscription,
+                CloseReason::Closed,
+                cx.facts.mono(now.at),
+            );
+            cx.audio.close_analysis(cx.link, watch.analysis.key);
             return;
         };
-        tracing::info!(device = %self.device, turn = %asking.uuid, onset = onset.0, "an early answer cut the question off");
+        tracing::info!(device = %cx.facts.device, turn = %asking.uuid, onset = onset.0, "an early answer cut the question off");
         asking.answering.early_answer = true;
         asking.facts.playback_reason = Some(echomuse_records::vocab::PlaybackReason::Cancelled);
         let expectation = asking.answering.follow_up.clone().expect("checked above");
         let (question, chain, origin) = (asking.uuid, asking.chain, asking.origin);
         // The asking turn keeps its own ending ("didn't catch that" stays an empty
         // transcript); its row records the continuation as pending.
-        self.finish_turn(now);
+        self.finish_turn(cx, out, now);
         let earliest = watch.start.unwrap_or(onset);
         let start = (onset - PRE_ROLL).round_down(512).max(earliest);
         let reply = echomuse_turn::ReplySpec::at_early_answer(
             origin,
             onset,
-            self.mono(now.at),
+            cx.facts.mono(now.at),
             &echomuse_turn::EndpointPolicy::default(),
         );
         let window = ReplyWindow {
@@ -298,6 +324,6 @@ impl Voice {
             opened_at: now.at,
             cells_from: watch.cells_from,
         };
-        self.begin_reply_turn(window, start, onset, reply, now);
+        self.begin_reply_turn(cx, out, window, start, onset, reply, now);
     }
 }

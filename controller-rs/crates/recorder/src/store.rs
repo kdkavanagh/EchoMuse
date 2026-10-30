@@ -28,11 +28,11 @@ use crate::reader::read_header;
 use crate::record::{Header, RecordingId};
 
 /// A finished recording's file extension.
-pub const EXTENSION: &str = "emrec";
+const EXTENSION: &str = "emrec";
 /// The extension of a recording still being written, or cut short.
-pub const PART_EXTENSION: &str = "emrec.part";
+const PART_EXTENSION: &str = "emrec.part";
 /// How long recordings are kept unless configured otherwise.
-pub const DEFAULT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const DEFAULT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// The recorder's configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,8 +64,8 @@ struct Active {
 }
 
 #[derive(Debug)]
-pub(crate) struct StoreShared {
-    pub(crate) config: RecorderConfig,
+struct StoreShared {
+    config: RecorderConfig,
     active: Mutex<HashMap<RecordingId, Active>>,
 }
 
@@ -88,7 +88,7 @@ pub struct StoredRecording {
 /// The recordings directory. Cheap to clone; every clone is the same store.
 #[derive(Clone, Debug)]
 pub struct RecordingStore {
-    pub(crate) shared: Arc<StoreShared>,
+    shared: Arc<StoreShared>,
 }
 
 /// Creates `dir` as `0700`, or tightens an existing one.
@@ -146,8 +146,8 @@ impl RecordingStore {
             .join(device_dir_name(&device.0))
     }
 
-    pub(crate) fn paths(&self, device: &str, id: &RecordingId) -> (PathBuf, PathBuf) {
-        let dir = self.shared.config.directory.join(device_dir_name(device));
+    pub(crate) fn paths(&self, device: &DeviceId, id: &RecordingId) -> (PathBuf, PathBuf) {
+        let dir = self.device_dir(device);
         (
             dir.join(format!("{}.{PART_EXTENSION}", id.as_str())),
             dir.join(format!("{}.{EXTENSION}", id.as_str())),

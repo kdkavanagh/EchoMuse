@@ -96,6 +96,59 @@ async fn a_mute_while_the_response_lingers_writes_the_row_without_the_responses_
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_new_turn_while_the_last_response_lingers_keeps_each_row_its_own() {
+    let mut rig = afe_rig(true);
+    answered_turn(&mut rig);
+    assert!(
+        rig.turn_rows().is_empty(),
+        "the answered turn's row lingers"
+    );
+    // A tap starts the next turn at once, while that row still waits.
+    let tap = rig.device.tap(rig.device.captured(), 1);
+    rig.control(echomuse_protocol::MessageType::ButtonAction, tap, 0);
+    assert_eq!(
+        rig.voice.status().state,
+        echomuse_presentation::phase::ActorState::Listening
+    );
+    rig.silence(1_200);
+    // The lingering row closes on its own deadline, with its own recording, while the
+    // new turn listens on.
+    let rows = rig.turn_rows();
+    let [answered] = rows.as_slice() else {
+        panic!("only the answered turn's row: {} rows", rows.len());
+    };
+    assert_eq!(answered.trigger, echomuse_records::vocab::TriggerType::Wake);
+    assert_eq!(
+        answered.terminal_reason,
+        echomuse_records::vocab::TerminalReason::Completed
+    );
+    let series: Value =
+        serde_json::from_str(answered.afe_series.as_ref().expect("a chart").as_str()).unwrap();
+    assert!(series["recording"].is_array(), "{series}");
+    let answered_key = answered.key.clone();
+    assert!(
+        rig.persisted.iter().any(|request| matches!(request,
+            PersistRequest::Turn { record, audio, .. }
+                if record.key == answered_key && audio.turn_recording.is_some())),
+        "the answered turn keeps its recording"
+    );
+    assert_ne!(
+        rig.voice.status().state,
+        echomuse_presentation::phase::ActorState::Idle,
+        "the new turn is still open"
+    );
+    // The new turn's row is its own.
+    rig.handle(crate::Input::SessionLost);
+    let rows = rig.turn_rows();
+    let [first, second] = rows.as_slice() else {
+        panic!("two rows: {}", rows.len());
+    };
+    assert_eq!(first.key, answered_key);
+    assert_eq!(second.trigger, echomuse_records::vocab::TriggerType::Button);
+    assert_ne!(second.key, answered_key);
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_committed_turn_keeps_its_chart_through_the_answer_and_its_recording() {
     let mut rig = afe_rig(true);
     answered_turn(&mut rig);

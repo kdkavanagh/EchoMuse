@@ -15,6 +15,4 @@ pub use esphome::{
 pub use records::{
     CONTROLLER_SERVICE_TYPE, ControllerAdvertisement, ESPHOME_SERVICE_TYPE, ServiceRecord,
 };
-pub use service::{
-    DiscoveryError, DiscoveryHandle, DiscoveryHealth, REANNOUNCE_INTERVAL, Withdrawn, start,
-};
+pub use service::{DiscoveryError, DiscoveryHandle, REANNOUNCE_INTERVAL, Withdrawn, start};

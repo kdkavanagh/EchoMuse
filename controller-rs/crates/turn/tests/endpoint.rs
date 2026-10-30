@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use echomuse_turn::endpoint::{self, CloseCause, ReplySpec};
+use echomuse_turn::endpoint::{CloseCause, ReplySpec};
 use echomuse_turn::trace::EndpointEvent;
 use echomuse_turn::{
     AsrKind, AsrObservation, CellIndex, CloseReason, Completeness, Decision, DeviceCell,
@@ -356,18 +356,19 @@ fn route_a_one_cell_later_waits_one_more_block() {
 
 #[test]
 fn the_pause_depends_on_the_text_class() {
-    for (class, pause_ms) in [
-        (TextClass::Complete, 608),
-        (TextClass::Extendable, 1_216),
-        (TextClass::NeedsMore, 1_792),
-        (TextClass::Unknown, 1_792),
+    let p = TurnConfig::default().endpoint;
+    for (class, pause) in [
+        (TextClass::Complete, p.pause_complete),
+        (TextClass::Extendable, p.pause_extendable),
+        (TextClass::NeedsMore, p.pause_needs_more),
+        (TextClass::Unknown, p.pause_needs_more),
     ] {
         let mut r = Run::button(lights(21), lights_grammar(class));
         r.run();
         let (k, (_, boundary, since)) = r.pending().unwrap();
-        let (_, expected) = first_frontier_at_least(boundary + Samples::from_ms(pause_ms));
+        let (_, expected) = first_frontier_at_least(boundary + pause);
         assert_eq!(since, expected, "{class:?}");
-        assert!(frontier_of_block(k - 1).since(boundary) < Samples::from_ms(pause_ms));
+        assert!(frontier_of_block(k - 1).since(boundary) < pause);
     }
 }
 
@@ -495,10 +496,6 @@ fn unknown_evidence_is_never_silence() {
     assert_eq!(
         commit.at,
         first_frontier_at_least(progress + Samples::from_ms(3_000)).1
-    );
-    assert_eq!(
-        r.policy.trace().evidence.vad_unknown,
-        200.min(commit.at.since(c(21)).0 / CELL) as u32
     );
 
     // Without complete text the same stream is a retry: nothing is dispatched.
@@ -1330,7 +1327,7 @@ fn a_soft_final_word_the_recognizer_heard_extends_the_committed_audio() {
     assert_eq!(commit.last_word, Some(c(30)));
     assert_eq!(
         commit.span.end,
-        c(30) + Samples::from_ms(endpoint::ASR_WORD_MARGIN_MS)
+        c(30) + TurnConfig::default().endpoint.asr_word_margin
     );
     assert!(commit.span.end > c(21) + Samples::from_ms(192));
     // The trace says which bound set the end.

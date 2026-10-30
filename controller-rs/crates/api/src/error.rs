@@ -129,6 +129,25 @@ impl ApiError {
         Self::new(StatusCode::NOT_FOUND, ErrorCode::NotFound, "Not found")
     }
 
+    /// 404 saying what is missing.
+    pub(crate) fn no_such(message: impl Into<Cow<'static, str>>) -> Self {
+        Self::new(StatusCode::NOT_FOUND, ErrorCode::NotFound, message)
+    }
+
+    /// 404: no device has this id.
+    pub(crate) fn unknown_device() -> Self {
+        Self::no_such("No device has this id")
+    }
+
+    /// 409: the device has no live session.
+    pub(crate) fn not_connected() -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            ErrorCode::NotConnected,
+            "The device is not connected",
+        )
+    }
+
     /// 503: a service this needs is stopping or stopped.
     pub fn unavailable(message: impl Into<Cow<'static, str>>) -> Self {
         Self::new(
@@ -217,15 +236,15 @@ impl<E: fmt::Display> From<ServiceError<E>> for ApiError {
                 "The database is not accepting requests",
             ),
             ServiceError::Failed(error) => {
-                eprintln!("api: database command failed: {error}");
+                tracing::error!(%error, "database command failed");
                 Self::internal("A database command failed")
             }
             ServiceError::Aborted => {
-                eprintln!("api: database command panicked and was rolled back");
+                tracing::error!("database command panicked and was rolled back");
                 Self::internal("A database command failed")
             }
             ServiceError::Unknown => {
-                eprintln!("api: database thread stopped before reporting a result");
+                tracing::error!("database thread stopped before reporting a result");
                 Self::internal("The database stopped before reporting a result")
             }
         }

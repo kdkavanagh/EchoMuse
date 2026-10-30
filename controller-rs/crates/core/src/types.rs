@@ -111,8 +111,6 @@ pub enum RuntimeError {
     Expired,
     /// A speech worker's call ran past its deadline; its late result was rejected.
     Overdue,
-    StaleSession,
-    Muted,
     DuplicateDevice,
     UnknownDevice,
     WorkerPanicked,
@@ -129,8 +127,6 @@ impl fmt::Display for RuntimeError {
             Self::Overloaded => f.write_str("queue capacity was exceeded"),
             Self::Expired => f.write_str("queued operation expired"),
             Self::Overdue => f.write_str("the call ran past its deadline; its result was rejected"),
-            Self::StaleSession => f.write_str("session is no longer current"),
-            Self::Muted => f.write_str("capture is muted"),
             Self::DuplicateDevice => f.write_str("device already has a runtime"),
             Self::UnknownDevice => f.write_str("device runtime does not exist"),
             Self::WorkerPanicked => f.write_str("worker thread panicked"),

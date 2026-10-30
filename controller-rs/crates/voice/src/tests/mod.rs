@@ -8,18 +8,17 @@ mod diagnostic;
 mod early;
 mod evidence;
 mod features;
+mod handoffs;
 mod latency;
 mod pause_server;
 pub(crate) mod rig;
 mod timers;
 
-use std::time::Duration;
-
 use echomuse_core::services::{
     ConversationId, IntentEnd, MediaUrl, PipelineId, RunEvent, Transcript,
 };
 use echomuse_playback::Command;
-use echomuse_protocol::{MessageType, vocab::AckStatus};
+use echomuse_protocol::vocab::AckStatus;
 use echomuse_records::vocab::{TerminalReason, TriggerType, TurnOutcome};
 use echomuse_uplink::UplinkCommand;
 
@@ -177,8 +176,6 @@ async fn a_wake_while_muted_is_refused_and_recorded() {
     let rows = rig.turn_rows();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].terminal_reason, TerminalReason::Muted);
-    let _ = MessageType::WakeCandidate;
-    let _ = Duration::ZERO;
 }
 
 #[tokio::test(start_paused = true)]

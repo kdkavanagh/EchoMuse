@@ -19,12 +19,13 @@
 
 use std::collections::VecDeque;
 
+use echomuse_speech::bcresnet::WAKE_WINDOW_SAMPLES;
 use echomuse_speech::{BcresnetScorer, SpeechError, WindowScore};
 use echomuse_turn::{Epoch, ReferenceScore, SampleSpan};
 use serde::{Deserialize, Serialize};
 
 use crate::clock::Alignment;
-use crate::policy::{EchoPolicy, ReferenceWakePolicy, WAKE_HOP_SAMPLES, WAKE_WINDOW_SAMPLES};
+use crate::policy::{EchoPolicy, ReferenceWakePolicy, WAKE_HOP_SAMPLES};
 use crate::store::{Read, SampleStore};
 
 /// Reference kept for scoring: 10 s, so a whole candidate backfill (2.5 s of reference before
@@ -144,7 +145,6 @@ pub struct ReferenceWakeScorer<S> {
     scores: VecDeque<(u64, f64)>,
     unscored: u32,
     below: u32,
-    open: bool,
     candidates: VecDeque<ReferenceCandidate>,
     hops: VecDeque<ReferenceHop>,
     window: Vec<i16>,
@@ -185,7 +185,6 @@ impl<S: WakeWindowScorer> ReferenceWakeScorer<S> {
             scores: VecDeque::with_capacity(3),
             unscored: 0,
             below: 0,
-            open: false,
             candidates: VecDeque::with_capacity(MAX_CANDIDATES),
             hops: VecDeque::with_capacity(MAX_HOPS),
             window: vec![0; WAKE_WINDOW_SAMPLES],
@@ -205,7 +204,6 @@ impl<S: WakeWindowScorer> ReferenceWakeScorer<S> {
         self.first_end = None;
         self.next_end = None;
         self.clear_history();
-        self.open = false;
         self.candidates.clear();
         self.hops.clear();
     }
@@ -289,12 +287,14 @@ impl<S: WakeWindowScorer> ReferenceWakeScorer<S> {
     }
 
     fn close(&mut self, end: u64) {
-        if self.open {
-            self.open = false;
-            if let Some(c) = self.candidates.back_mut() {
-                c.closed_at = Some(end);
-            }
+        if let Some(c) = self.open_candidate() {
+            c.closed_at = Some(end);
         }
+    }
+
+    /// The newest candidate while it is still open.
+    fn open_candidate(&mut self) -> Option<&mut ReferenceCandidate> {
+        self.candidates.back_mut().filter(|c| c.closed_at.is_none())
     }
 
     /// Scores every hop whose window has fully arrived, in order. Returns how many hops it
@@ -359,17 +359,15 @@ impl<S: WakeWindowScorer> ReferenceWakeScorer<S> {
         let smoothed = self.scores.iter().map(|s| s.1).sum::<f64>() / self.scores.len() as f64;
         self.record(end, HopOutcome::Scored { raw, smoothed });
         let threshold = self.policy.threshold;
-        if self.open {
-            let c = self
-                .candidates
-                .back_mut()
-                .expect("an open candidate exists");
+        let extend_at = threshold * self.policy.extend_fraction;
+        let close_after_below = self.policy.close_after_below;
+        if let Some(c) = self.open_candidate() {
             c.peak = c.peak.max(smoothed);
-            if smoothed >= threshold * self.policy.extend_fraction {
+            if smoothed >= extend_at {
                 self.below = 0;
             } else {
                 self.below += 1;
-                if self.below >= self.policy.close_after_below {
+                if self.below >= close_after_below {
                     self.close(end);
                 }
             }
@@ -396,7 +394,6 @@ impl<S: WakeWindowScorer> ReferenceWakeScorer<S> {
                 closed_at: None,
                 peak: smoothed,
             });
-            self.open = true;
             self.below = 0;
         }
     }

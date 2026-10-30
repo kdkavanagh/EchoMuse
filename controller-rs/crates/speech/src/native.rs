@@ -46,18 +46,12 @@ pub struct SherpaLibraries {
     pub c_api_sha256: Sha256Digest,
     /// Digest of the mapped `libonnxruntime.so` beside it.
     pub onnxruntime_sha256: Sha256Digest,
-    /// When set, the mapped libraries must be the files in this directory. When unset, they
-    /// may be anywhere the loader found them, as long as their digests match.
-    pub directory: Option<PathBuf>,
 }
 
 impl NativeLibraries {
     /// The pinned libraries for the architecture this crate was compiled for: the official
     /// ONNX Runtime 1.20.1 library at `onnxruntime_path`, and the sherpa-onnx 1.13.8 shared build.
-    pub fn pinned(
-        onnxruntime_path: impl Into<PathBuf>,
-        sherpa_directory: Option<PathBuf>,
-    ) -> Result<Self, SpeechError> {
+    pub fn pinned(onnxruntime_path: impl Into<PathBuf>) -> Result<Self, SpeechError> {
         let arch = Arch::current().ok_or_else(|| {
             SpeechError::NativeLibrary("no pinned native libraries for this architecture".into())
         })?;
@@ -69,7 +63,6 @@ impl NativeLibraries {
                 version: SHERPA_ONNX_VERSION.to_owned(),
                 c_api_sha256: sherpa.c_api_sha256,
                 onnxruntime_sha256: sherpa.onnxruntime_sha256,
-                directory: sherpa_directory,
             },
         })
     }
@@ -159,7 +152,6 @@ impl OrtRuntime {
 
 /// Asks the already-mapped ONNX Runtime at `path` for its version string.
 fn ort_library_version(path: &Path) -> Result<String, SpeechError> {
-    use std::os::unix::ffi::OsStrExt;
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|_| SpeechError::NativeLibrary("library path contains a NUL byte".into()))?;
     // SAFETY: `c_path` is a valid NUL-terminated string. RTLD_NOLOAD only looks up an object
@@ -237,19 +229,6 @@ impl SherpaRuntime {
                 SpeechError::NativeLibrary("sherpa-onnx library has no directory".into())
             })?
             .to_path_buf();
-        if let Some(dir) = &config.directory {
-            let want = dir.canonicalize().map_err(|source| SpeechError::Io {
-                path: dir.clone(),
-                source,
-            })?;
-            if want != c_api_dir {
-                return Err(SpeechError::NativeLibrary(format!(
-                    "sherpa-onnx was loaded from {}, expected {}",
-                    c_api_dir.display(),
-                    want.display()
-                )));
-            }
-        }
         PinnedFile::new(&c_api_path, config.c_api_sha256).verify()?;
 
         // sherpa-onnx's ONNX Runtime is the `libonnxruntime.so` beside the C API library (its
@@ -374,38 +353,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pinned_libraries_follow_the_architecture() {
-        let libs = NativeLibraries::pinned("/x/libonnxruntime.so.1.20.1", None).unwrap();
-        let arch = Arch::current().unwrap();
-        assert_eq!(
-            libs.onnxruntime.sha256,
-            OrtPins::for_arch(arch).library_sha256
-        );
-        assert_eq!(
-            libs.sherpa.c_api_sha256,
-            SherpaPins::for_arch(arch).c_api_sha256
-        );
-        assert_eq!(libs.sherpa.version, "1.13.8");
-        let json = serde_json::to_string(&libs).unwrap();
-        assert_eq!(
-            serde_json::from_str::<NativeLibraries>(&json).unwrap(),
-            libs
-        );
-    }
-
-    #[test]
     fn linked_sherpa_is_the_pinned_build() {
-        let arch = Arch::current().unwrap();
-        let pins = SherpaPins::for_arch(arch);
-        let config = SherpaLibraries {
-            version: SHERPA_ONNX_VERSION.into(),
-            c_api_sha256: pins.c_api_sha256,
-            onnxruntime_sha256: pins.onnxruntime_sha256,
-            directory: None,
-        };
+        let config = NativeLibraries::pinned("/x/libonnxruntime.so.1.20.1")
+            .unwrap()
+            .sherpa;
         let rt = SherpaRuntime::verify(&config).unwrap();
         assert!(rt.c_api().path.ends_with("libsherpa-onnx-c-api.so"));
-        assert_eq!(rt.c_api().version, "1.13.8");
         assert!(!rt.onnxruntime().version.is_empty());
 
         let wrong_version = SherpaLibraries {
@@ -418,19 +371,11 @@ mod tests {
         ));
         let wrong_hash = SherpaLibraries {
             c_api_sha256: Sha256Digest::of_bytes(b"not the library"),
-            ..config.clone()
+            ..config
         };
         assert!(matches!(
             SherpaRuntime::verify(&wrong_hash),
             Err(SpeechError::HashMismatch { .. })
-        ));
-        let wrong_dir = SherpaLibraries {
-            directory: Some(std::env::temp_dir()),
-            ..config
-        };
-        assert!(matches!(
-            SherpaRuntime::verify(&wrong_dir),
-            Err(SpeechError::NativeLibrary(_))
         ));
     }
 

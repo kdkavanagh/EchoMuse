@@ -116,8 +116,14 @@ pub(crate) struct Rig {
     /// after that a request waits for the test), and every transcription asked of it.
     pub(crate) server_answers: VecDeque<Result<String, echomuse_turn::ServerFailure>>,
     pub(crate) server_requests: Vec<(CallId, Sample, crate::ServerRequest)>,
+    /// Commit re-decodes sent to the span worker.
+    pub(crate) redecodes: usize,
     /// Every effect in order, as text, for diagnosing a failing test.
     pub(crate) log: Vec<String>,
+    /// Microphone worker results are held back (as a busy worker's queue would) until
+    /// [`Rig::release_mic_results`].
+    pub(crate) hold_mic_results: bool,
+    held: Vec<Input>,
 }
 
 impl Rig {
@@ -204,10 +210,13 @@ impl Rig {
             corrections: Vec::new(),
             violations: Vec::new(),
             unacked: Vec::new(),
+            hold_mic_results: false,
+            held: Vec::new(),
             auto_ack: true,
             auto_correct: true,
             server_answers: VecDeque::new(),
             server_requests: Vec::new(),
+            redecodes: 0,
             log: Vec::new(),
         };
         rig.process();
@@ -307,10 +316,15 @@ impl Rig {
                             });
                         }
                     }
-                    self.pending.push_back(Input::Mic {
+                    let result = Input::Mic {
                         key,
                         result: Ok(output),
-                    });
+                    };
+                    if self.hold_mic_results {
+                        self.held.push(result);
+                    } else {
+                        self.pending.push_back(result);
+                    }
                 }
             }
             Effect::Reference { scope, key, job } => {
@@ -333,6 +347,9 @@ impl Rig {
                 }
             }
             Effect::Span { scope, turn, job } => {
+                if matches!(job, crate::speech::SpanJob::Redecode { .. }) {
+                    self.redecodes += 1;
+                }
                 if !scope.is_cancelled() {
                     let output = self.span.run(job);
                     self.pending.push_back(Input::Span {
@@ -426,6 +443,14 @@ impl Rig {
         }
     }
 
+    /// Hands the held microphone worker results to the machine, in the order they were
+    /// produced, and stops holding them.
+    pub(crate) fn release_mic_results(&mut self) {
+        self.hold_mic_results = false;
+        self.pending.extend(self.held.drain(..));
+        self.process();
+    }
+
     /// Advances the controller's clock, firing the machine's timers on the way.
     pub(crate) fn advance(&mut self, by: Duration) {
         let end = self.now.at + by;
@@ -492,7 +517,7 @@ impl Rig {
                 if ack.status == echomuse_protocol::vocab::AckStatus::Accepted)
         });
         if accepted {
-            let afe = self.voice.uplink.terms().afe_metadata;
+            let afe = self.device.serves_afe();
             let starts = CandidateStarts::new(Sample(support_start), afe);
             let mut packets = self.device.backfill("mic", starts.mic.0);
             packets.extend(self.device.backfill("reference", starts.reference.0));

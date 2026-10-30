@@ -95,8 +95,8 @@ impl fmt::Display for OpenError {
             Self::OlderSchema { found, known } => write!(
                 f,
                 "the database is at schema_version {found}, and this controller opens only \
-                 version {known}. Upgrade it first: start the latest Python controller release \
-                 on this database once, then start this controller."
+                 version {known}. Upgrade a private copy with an explicit schema migration \
+                 procedure or restore a compatible backup before starting this controller."
             ),
             Self::SchemaMismatch(differences) => {
                 f.write_str(
@@ -137,7 +137,7 @@ fn sqlite(action: &'static str) -> impl FnOnce(rusqlite::Error) -> OpenError {
 /// cutover backup.
 pub struct OpenedDatabase {
     pub(crate) connection: Connection,
-    path: PathBuf,
+    pub(crate) path: PathBuf,
     startup: Startup,
 }
 
@@ -201,11 +201,6 @@ impl OpenedDatabase {
             path,
             startup,
         })
-    }
-
-    /// The database file.
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 
     /// What opening found and did.

@@ -32,15 +32,6 @@ pub enum CutoverBackup {
     AlreadyPresent(PathBuf),
 }
 
-impl CutoverBackup {
-    /// Where the backup is.
-    pub fn path(&self) -> &Path {
-        match self {
-            Self::Written(path) | Self::AlreadyPresent(path) => path,
-        }
-    }
-}
-
 /// Why the cutover backup could not be written. Startup stops: this backup cannot be
 /// skipped.
 #[derive(Debug)]

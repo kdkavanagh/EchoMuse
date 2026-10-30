@@ -20,13 +20,15 @@
 
 use std::{collections::VecDeque, sync::Weak};
 
-use echomuse_core::services::{EffectOutcome, HaConnectionGeneration, HaError, NotDispatched};
+use echomuse_core::services::{
+    EffectOutcome, HaConnectionGeneration, HaError, NotDispatched, UnknownCause,
+};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 
 use crate::{
-    client::{HaClient, RestFailure, object},
+    client::{HaClient, object, rest_effect, rest_read},
     connection::{Link, Route, RouteGuard, RunItem},
 };
 
@@ -238,62 +240,6 @@ fn parse_api_items(body: &[u8]) -> Result<Vec<CalendarItem>, HaError> {
         .collect()
 }
 
-/// The outcome of a state-changing WebSocket command.
-pub(crate) fn effect(result: Result<Value, HaError>) -> EffectOutcome<Value> {
-    use echomuse_core::services::UnknownCause;
-    match result {
-        Ok(value) => EffectOutcome::Applied(value),
-        Err(HaError::NotDispatched(reason)) => EffectOutcome::NotDispatched(reason),
-        Err(HaError::Rejected { code, message }) => EffectOutcome::Rejected { code, message },
-        Err(HaError::Timeout) => EffectOutcome::Unknown(UnknownCause::Timeout),
-        Err(HaError::ConnectionLost) => EffectOutcome::Unknown(UnknownCause::ConnectionLost),
-        Err(HaError::BadResponse(_)) => EffectOutcome::Unknown(UnknownCause::Inconclusive),
-    }
-}
-
-/// The outcome of a state-changing REST call: a 4xx is a refusal made before anything
-/// changed, any other failure after sending is unknown.
-pub(crate) fn rest_effect(sent: Result<(u16, Vec<u8>), RestFailure>) -> EffectOutcome<Vec<u8>> {
-    use echomuse_core::services::UnknownCause;
-    match sent {
-        Err(RestFailure::NotSent) => EffectOutcome::NotDispatched(NotDispatched::Unavailable),
-        Err(RestFailure::TimedOut) => EffectOutcome::Unknown(UnknownCause::Timeout),
-        Err(RestFailure::Lost) => EffectOutcome::Unknown(UnknownCause::ConnectionLost),
-        Ok((status, body)) if (200..300).contains(&status) => EffectOutcome::Applied(body),
-        Ok((status, body)) if (400..500).contains(&status) => EffectOutcome::Rejected {
-            code: status.to_string(),
-            message: rest_message(&body),
-        },
-        Ok(_) => EffectOutcome::Unknown(UnknownCause::Inconclusive),
-    }
-}
-
-/// HA's JSON `message`, or the body as text.
-pub(crate) fn rest_message(body: &[u8]) -> String {
-    serde_json::from_slice::<Value>(body)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("message")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| String::from_utf8_lossy(body).into_owned())
-}
-
-/// A REST read: 2xx gives the body, anything else is an error.
-fn rest_read(sent: Result<(u16, Vec<u8>), RestFailure>) -> Result<Vec<u8>, HaError> {
-    let (status, body) = sent?;
-    if (200..300).contains(&status) {
-        Ok(body)
-    } else {
-        Err(HaError::Rejected {
-            code: status.to_string(),
-            message: rest_message(&body),
-        })
-    }
-}
-
 fn query_value(text: &str) -> String {
     url::form_urlencoded::byte_serialize(text.as_bytes()).collect()
 }
@@ -332,13 +278,7 @@ impl HaClient {
             "entity_id": entity_id,
             "event": event.to_json(),
         }));
-        match effect(
-            self.command(None, body, self.options().command_timeout)
-                .await,
-        ) {
-            EffectOutcome::Applied(_) => EffectOutcome::Applied(()),
-            other => other.map_applied(),
-        }
+        self.apply(body).await
     }
 
     /// Deletes an event, a series, or one instance of a series (`calendar/event/delete`).
@@ -358,13 +298,7 @@ impl HaClient {
                 Value::from(recurrence_id.clone()),
             );
         }
-        match effect(
-            self.command(None, body, self.options().command_timeout)
-                .await,
-        ) {
-            EffectOutcome::Applied(_) => EffectOutcome::Applied(()),
-            other => other.map_applied(),
-        }
+        self.apply(body).await
     }
 
     /// Subscribes to the events of `entity_id` between `start` and `end` (RFC 3339).
@@ -423,23 +357,8 @@ impl HaClient {
         &self,
         subscription: CalendarSubscription,
     ) -> Result<(), HaError> {
-        let Some(link) = subscription.link.upgrade() else {
-            return Ok(());
-        };
-        link.remove(subscription.id);
-        if link.is_lost() {
-            return Ok(());
-        }
-        let body = object(json!({"type": "unsubscribe_events", "subscription": subscription.id}));
-        match self
-            .command(None, body, self.options().command_timeout)
+        self.end_subscription(subscription.link, subscription.id)
             .await
-        {
-            Err(HaError::ConnectionLost | HaError::NotDispatched(NotDispatched::Unavailable)) => {
-                Ok(())
-            }
-            other => other.map(drop),
-        }
     }
 
     /// The items of `entity_id` between `start` and `end` (RFC 3339) through REST, which
@@ -515,14 +434,16 @@ impl HaClient {
     /// Creates an empty Local Calendar named `name` through the stock config flow. A
     /// flow HA aborts (a calendar with that storage key exists) is a refusal.
     pub async fn create_local_calendar(&self, name: &str) -> EffectOutcome<ConfigEntry> {
+        let read_flow = |body: &[u8]| serde_json::from_slice::<WireFlow>(body).ok();
         let started = rest_effect(
             self.rest_post(
                 "/config/config_entries/flow",
                 &json!({"handler": "local_calendar", "show_advanced_options": false}),
             )
             .await,
+            read_flow,
         );
-        let flow = match read_flow(started) {
+        let flow = match applied(started) {
             Ok(flow) => flow,
             Err(outcome) => return outcome,
         };
@@ -535,8 +456,9 @@ impl HaClient {
                 &json!({"calendar_name": name, "import": "create_empty"}),
             )
             .await,
+            read_flow,
         );
-        let flow = match read_flow(finished) {
+        let flow = match applied(finished) {
             Ok(flow) => flow,
             Err(outcome) => return outcome,
         };
@@ -545,20 +467,19 @@ impl HaClient {
                 entry_id: entry.entry_id,
                 title: entry.title,
             }),
-            ("create_entry", None) => {
-                EffectOutcome::Unknown(echomuse_core::services::UnknownCause::Inconclusive)
-            }
+            ("create_entry", None) => EffectOutcome::Unknown(UnknownCause::Inconclusive),
             (kind, _) => refused_flow(kind, flow.reason),
         }
     }
 }
 
-fn read_flow(outcome: EffectOutcome<Vec<u8>>) -> Result<WireFlow, EffectOutcome<ConfigEntry>> {
+/// The applied value, or the same outcome for a caller that returns another type.
+fn applied<T, U>(outcome: EffectOutcome<T>) -> Result<T, EffectOutcome<U>> {
     match outcome {
-        EffectOutcome::Applied(body) => serde_json::from_slice(&body).map_err(|_| {
-            EffectOutcome::Unknown(echomuse_core::services::UnknownCause::Inconclusive)
-        }),
-        other => Err(other.map_applied()),
+        EffectOutcome::Applied(value) => Ok(value),
+        EffectOutcome::NotDispatched(reason) => Err(EffectOutcome::NotDispatched(reason)),
+        EffectOutcome::Rejected { code, message } => Err(EffectOutcome::Rejected { code, message }),
+        EffectOutcome::Unknown(cause) => Err(EffectOutcome::Unknown(cause)),
     }
 }
 
@@ -566,25 +487,6 @@ fn refused_flow(kind: &str, reason: Option<String>) -> EffectOutcome<ConfigEntry
     EffectOutcome::Rejected {
         code: kind.to_owned(),
         message: reason.unwrap_or_default(),
-    }
-}
-
-/// Re-types an outcome that did not apply.
-pub(crate) trait NotApplied<T> {
-    /// The same outcome for another result type; must not be [`EffectOutcome::Applied`].
-    fn map_applied<U>(self) -> EffectOutcome<U>;
-}
-
-impl<T> NotApplied<T> for EffectOutcome<T> {
-    fn map_applied<U>(self) -> EffectOutcome<U> {
-        match self {
-            EffectOutcome::NotDispatched(reason) => EffectOutcome::NotDispatched(reason),
-            EffectOutcome::Rejected { code, message } => EffectOutcome::Rejected { code, message },
-            EffectOutcome::Unknown(cause) => EffectOutcome::Unknown(cause),
-            EffectOutcome::Applied(_) => {
-                unreachable!("an applied outcome is handled by the caller")
-            }
-        }
     }
 }
 

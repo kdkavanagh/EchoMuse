@@ -59,6 +59,7 @@ use serde_json::{Map, Value};
 use crate::{
     auth::AdminUser,
     body::JsonBody,
+    device_services::connected,
     error::{ApiError, ErrorCode},
     params::{DevicePath, QueryParams},
     services::BoxFuture,
@@ -446,7 +447,7 @@ impl From<CaptureError> for ApiError {
             CaptureError::StaleWindow => (StatusCode::CONFLICT, ErrorCode::Conflict),
             CaptureError::Unavailable(why) => return ApiError::unavailable(why),
             CaptureError::Failed(reason) => {
-                eprintln!("api: capture failed: {reason}");
+                tracing::error!(%reason, "capture failed");
                 return ApiError::internal("The controller could not do that");
             }
         };
@@ -501,16 +502,6 @@ pub(crate) fn routes() -> Router<ApiState> {
         .route("/api/devices/{id}/capture/window", post(open_window))
         .route("/api/devices/{id}/capture/window/stop", post(stop_window))
         .route("/api/devices/{id}/capture/recording", get(recording))
-}
-
-/// The device has a live session.
-fn connected(state: &ApiState, device: &DeviceId) -> Result<(), ApiError> {
-    let live = state
-        .runtimes()
-        .live(device)
-        .ok_or(CaptureError::UnknownDevice)?;
-    live.session.ok_or(CaptureError::NotConnected)?;
-    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -620,28 +611,15 @@ async fn recording(
         HeaderValue::from(recording.wav.len()),
     );
     for (name, value) in recording.headers() {
-        if let Ok(value) = HeaderValue::from_str(&value) {
-            headers.insert(HeaderName::from_static(lower(name)), value);
+        // `from_bytes` lower-cases the name, which `from_static` would refuse.
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(&value),
+        ) {
+            headers.insert(name, value);
         }
     }
     Ok(response)
-}
-
-/// A header name in the lower case `HeaderName::from_static` needs.
-fn lower(name: &'static str) -> &'static str {
-    match name {
-        "X-EM-Device" => "x-em-device",
-        "X-EM-Session" => "x-em-session",
-        "X-EM-Tag" => "x-em-tag",
-        "X-EM-Ms" => "x-em-ms",
-        "X-EM-Peak-Db" => "x-em-peak-db",
-        "X-EM-Floor-Db" => "x-em-floor-db",
-        "X-EM-Frames" => "x-em-frames",
-        "X-EM-Dropped" => "x-em-dropped",
-        "X-EM-Truncated" => "x-em-truncated",
-        "X-EM-Opened-Ms" => "x-em-opened-ms",
-        other => unreachable!("not a capture header: {other}"),
-    }
 }
 
 #[cfg(test)]
@@ -714,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn every_header_has_its_lower_case_name() {
+    fn header_values_are_formatted_for_the_driver() {
         let recording = CaptureRecording {
             device: DeviceId("D".into()),
             session: WindowId("s".into()),
@@ -728,9 +706,6 @@ mod tests {
             opened_ms: 5,
             wav: Bytes::new(),
         };
-        for (name, _) in recording.headers() {
-            assert_eq!(lower(name), name.to_ascii_lowercase());
-        }
         assert_eq!(recording.headers()[4].1, "-3.0");
         assert_eq!(recording.headers()[8].1, "false");
     }

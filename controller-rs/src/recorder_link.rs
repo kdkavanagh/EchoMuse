@@ -115,16 +115,14 @@ impl RecorderHub {
         }
     }
 
-    /// Forgets a deleted device: its grant is withdrawn and its recordings deleted.
-    pub async fn forget(&self, device: &DeviceId) {
+    /// Deletes what is kept for a deleted device: its grant is withdrawn and its
+    /// recordings deleted.
+    pub async fn delete_device(&self, device: &DeviceId) -> std::io::Result<()> {
         self.book.forget(device, self.now());
         let store = self.store.clone();
         let device = device.clone();
         match tokio::task::spawn_blocking(move || store.delete_device(&device)).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "a deleted device's session recordings remain")
-            }
+            Ok(result) => result.map(drop),
             Err(error) => std::panic::resume_unwind(error.into_panic()),
         }
     }

@@ -20,21 +20,21 @@ use std::f64::consts::{PI, SQRT_2};
 pub const RENDER_SAMPLE_RATE: u32 = 48_000;
 
 /// The band centre frequencies in Hz.
-pub const EQ_BAND_HZ: [f64; 8] = [
+const EQ_BAND_HZ: [f64; 8] = [
     125.0, 250.0, 500.0, 1_000.0, 2_000.0, 3_500.0, 5_500.0, 8_000.0,
 ];
 
 /// The peaking bands' Q.
-pub const EQ_Q: f64 = 1.4;
+const EQ_Q: f64 = 1.4;
 
 /// The largest cut or boost of one band, in dB.
-pub const EQ_GAIN_LIMIT_DB: i8 = 12;
+const EQ_GAIN_LIMIT_DB: i8 = 12;
 
 /// The speech boost's centre frequency in Hz.
-pub const SPEECH_BOOST_HZ: f64 = 2_500.0;
+const SPEECH_BOOST_HZ: f64 = 2_500.0;
 
 /// The speech boost's gain in dB.
-pub const SPEECH_BOOST_DB: f64 = 5.0;
+const SPEECH_BOOST_DB: f64 = 5.0;
 
 /// A band gain outside −12 to +12 dB.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -46,7 +46,8 @@ pub struct EqSettingsError {
     pub gain: i8,
 }
 
-/// The `eqBands` and `eqLoudness` settings.
+/// The `eqBands` and `eqLoudness` settings; the default is flat, without the speech
+/// boost.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct EqSettings {
     bands: [i8; 8],
@@ -54,12 +55,6 @@ pub struct EqSettings {
 }
 
 impl EqSettings {
-    /// Flat, without the speech boost: the default.
-    pub const FLAT: Self = Self {
-        bands: [0; 8],
-        loudness: false,
-    };
-
     /// Checks every band is within ±12 dB.
     pub fn new(bands: [i8; 8], loudness: bool) -> Result<Self, EqSettingsError> {
         if let Some((band, &gain)) = bands
@@ -70,16 +65,6 @@ impl EqSettings {
             return Err(EqSettingsError { band, gain });
         }
         Ok(Self { bands, loudness })
-    }
-
-    /// The band gains in dB.
-    pub fn bands(&self) -> [i8; 8] {
-        self.bands
-    }
-
-    /// Whether the speech boost is on.
-    pub fn loudness(&self) -> bool {
-        self.loudness
     }
 
     /// Whether the settings change nothing.
@@ -165,25 +150,12 @@ impl Biquad {
         self.z2 = self.b2 * x - self.a2 * y;
         y
     }
-
-    /// |H(e^jw)| at `hz`.
-    fn magnitude(&self, hz: f64, sample_rate: f64) -> f64 {
-        let w = 2.0 * PI * hz / sample_rate;
-        let (s1, c1) = w.sin_cos();
-        let (s2, c2) = (2.0 * w).sin_cos();
-        let num_re = self.b0 + self.b1 * c1 + self.b2 * c2;
-        let num_im = -(self.b1 * s1 + self.b2 * s2);
-        let den_re = 1.0 + self.a1 * c1 + self.a2 * c2;
-        let den_im = -(self.a1 * s1 + self.a2 * s2);
-        ((num_re * num_re + num_im * num_im) / (den_re * den_re + den_im * den_im)).sqrt()
-    }
 }
 
 /// A stateful equalizer for one playback's audio. Its state carries across
 /// calls, so a stream can be processed in chunks of any size.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Equalizer {
-    sample_rate: f64,
     stages: Vec<Biquad>,
 }
 
@@ -214,15 +186,7 @@ impl Equalizer {
                 rate,
             ));
         }
-        Self {
-            sample_rate: rate,
-            stages,
-        }
-    }
-
-    /// Whether the chain has no stage and passes audio through unchanged.
-    pub fn is_bypass(&self) -> bool {
-        self.stages.is_empty()
+        Self { stages }
     }
 
     /// Filters `pcm` in place, saturating to the PCM16 range.
@@ -239,29 +203,29 @@ impl Equalizer {
             *sample = x.round().clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16;
         }
     }
-
-    /// Clears the filter state, as at the start of a new stream.
-    pub fn reset(&mut self) {
-        for stage in &mut self.stages {
-            stage.z1 = 0.0;
-            stage.z2 = 0.0;
-        }
-    }
-
-    /// The chain's gain at `hz`, in dB.
-    pub fn response_db(&self, hz: f64) -> f64 {
-        let magnitude: f64 = self
-            .stages
-            .iter()
-            .map(|stage| stage.magnitude(hz, self.sample_rate))
-            .product();
-        20.0 * magnitude.log10()
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// |H(e^jw)| of one section at `hz`.
+    fn magnitude(stage: &Biquad, hz: f64) -> f64 {
+        let w = 2.0 * PI * hz / f64::from(RENDER_SAMPLE_RATE);
+        let (s1, c1) = w.sin_cos();
+        let (s2, c2) = (2.0 * w).sin_cos();
+        let num_re = stage.b0 + stage.b1 * c1 + stage.b2 * c2;
+        let num_im = -(stage.b1 * s1 + stage.b2 * s2);
+        let den_re = 1.0 + stage.a1 * c1 + stage.a2 * c2;
+        let den_im = -(stage.a1 * s1 + stage.a2 * s2);
+        ((num_re * num_re + num_im * num_im) / (den_re * den_re + den_im * den_im)).sqrt()
+    }
+
+    /// The designed gain of a chain built at [`RENDER_SAMPLE_RATE`], at `hz`, in dB.
+    fn response_db(eq: &Equalizer, hz: f64) -> f64 {
+        let magnitude: f64 = eq.stages.iter().map(|s| magnitude(s, hz)).product();
+        20.0 * magnitude.log10()
+    }
 
     fn single(band: usize, gain: i8) -> Equalizer {
         let mut bands = [0; 8];
@@ -269,16 +233,16 @@ mod tests {
         Equalizer::new(&EqSettings::new(bands, false).unwrap(), RENDER_SAMPLE_RATE)
     }
 
-    /// The gain a steady sine at `hz` gets through `eq`, measured from the
-    /// processed samples once the filters have settled.
-    fn measured_db(eq: &mut Equalizer, hz: f64) -> f64 {
+    /// The gain a steady sine at `hz` gets through a fresh copy of `eq`, measured from
+    /// the processed samples once the filters have settled.
+    fn measured_db(eq: &Equalizer, hz: f64) -> f64 {
         let amplitude = 2_000.0;
         let rate = f64::from(RENDER_SAMPLE_RATE);
         let mut pcm: Vec<i16> = (0..2 * RENDER_SAMPLE_RATE as usize)
             .map(|n| (amplitude * (2.0 * PI * hz * n as f64 / rate).sin()).round() as i16)
             .collect();
         let input: Vec<f64> = pcm.iter().map(|&s| f64::from(s)).collect();
-        eq.reset();
+        let mut eq = eq.clone();
         // Uneven chunks: state must carry across calls.
         for chunk in pcm.chunks_mut(1_234) {
             eq.process(chunk);
@@ -304,13 +268,13 @@ mod tests {
             EqSettings::new([0, 0, 0, 0, 0, 0, 0, -13], false),
             Err(EqSettingsError { band: 7, gain: -13 })
         );
-        assert!(EqSettings::FLAT.is_flat());
-        assert!(Equalizer::new(&EqSettings::FLAT, RENDER_SAMPLE_RATE).is_bypass());
+        assert!(EqSettings::default().is_flat());
+        assert!(!EqSettings::new([0; 8], true).unwrap().is_flat());
     }
 
     #[test]
     fn flat_settings_leave_audio_bit_exact() {
-        let mut eq = Equalizer::new(&EqSettings::FLAT, RENDER_SAMPLE_RATE);
+        let mut eq = Equalizer::new(&EqSettings::default(), RENDER_SAMPLE_RATE);
         let original: Vec<i16> = (0..4_800)
             .map(|n| ((n * 37) % 65_536 - 32_768) as i16)
             .collect();
@@ -324,14 +288,14 @@ mod tests {
         for (band, &centre) in EQ_BAND_HZ.iter().enumerate().take(7).skip(1) {
             for gain in [-12, -5, 3, 12] {
                 let eq = single(band, gain);
-                let at_centre = eq.response_db(centre);
+                let at_centre = response_db(&eq, centre);
                 assert!(
                     (at_centre - f64::from(gain)).abs() < 1e-9,
                     "band {band} gain {gain}: {at_centre}"
                 );
                 // A peak is the extreme of its own response.
                 for factor in [0.8, 1.25] {
-                    assert!(eq.response_db(centre * factor).abs() < f64::from(gain).abs());
+                    assert!(response_db(&eq, centre * factor).abs() < f64::from(gain).abs());
                 }
             }
         }
@@ -342,30 +306,30 @@ mod tests {
         for gain in [-12, 6, 12] {
             let half = f64::from(gain) / 2.0;
             let low = single(0, gain);
-            assert!((low.response_db(125.0) - half).abs() < 1e-9);
-            assert!((low.response_db(1.0) - f64::from(gain)).abs() < 0.01);
-            assert!(low.response_db(8_000.0).abs() < 0.01);
+            assert!((response_db(&low, 125.0) - half).abs() < 1e-9);
+            assert!((response_db(&low, 1.0) - f64::from(gain)).abs() < 0.01);
+            assert!(response_db(&low, 8_000.0).abs() < 0.01);
             let high = single(7, gain);
-            assert!((high.response_db(8_000.0) - half).abs() < 1e-9);
-            assert!((high.response_db(23_999.0) - f64::from(gain)).abs() < 0.05);
-            assert!(high.response_db(125.0).abs() < 0.01);
+            assert!((response_db(&high, 8_000.0) - half).abs() < 1e-9);
+            assert!((response_db(&high, 23_999.0) - f64::from(gain)).abs() < 0.05);
+            assert!(response_db(&high, 125.0).abs() < 0.01);
         }
     }
 
     #[test]
     fn speech_boost_adds_five_db_at_two_and_a_half_kilohertz() {
         let eq = Equalizer::new(&EqSettings::new([0; 8], true).unwrap(), RENDER_SAMPLE_RATE);
-        assert!((eq.response_db(SPEECH_BOOST_HZ) - SPEECH_BOOST_DB).abs() < 1e-9);
+        assert!((response_db(&eq, SPEECH_BOOST_HZ) - SPEECH_BOOST_DB).abs() < 1e-9);
     }
 
     #[test]
     fn processed_audio_matches_the_designed_response_at_every_band_centre() {
         // The dashboard's Clarity preset with a warm low end and the boost.
         let settings = EqSettings::new([4, 3, 2, 0, -2, 7, 4, 2], true).unwrap();
-        let mut eq = Equalizer::new(&settings, RENDER_SAMPLE_RATE);
+        let eq = Equalizer::new(&settings, RENDER_SAMPLE_RATE);
         for hz in EQ_BAND_HZ.into_iter().chain([SPEECH_BOOST_HZ]) {
-            let designed = eq.response_db(hz);
-            let measured = measured_db(&mut eq, hz);
+            let designed = response_db(&eq, hz);
+            let measured = measured_db(&eq, hz);
             assert!(
                 (measured - designed).abs() < 0.05,
                 "{hz} Hz: measured {measured:.4} dB, designed {designed:.4} dB"

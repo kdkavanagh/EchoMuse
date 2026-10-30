@@ -83,7 +83,7 @@ impl BackgroundLevel {
 /// The command speaker's level `F`: the 80th percentile of `E` over the utterance's command
 /// speech, available once 10 cells count.
 #[derive(Debug, Default)]
-pub struct ForegroundLevel {
+pub(crate) struct ForegroundLevel {
     sorted: Vec<i16>,
     seeded: bool,
 }

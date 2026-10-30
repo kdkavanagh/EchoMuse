@@ -7,9 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use echomuse_core::types::DeviceId;
-use echomuse_db::{DatabaseService, DbHandle, OpenedDatabase, ServiceConfig};
-use echomuse_protocol::session::SessionReady;
-use echomuse_protocol::{Capabilities, LinkSessionId, Sha256};
+use echomuse_db::{DatabaseService, OpenedDatabase, ServiceConfig};
+use echomuse_protocol::Sha256;
 use echomuse_settings::edit::{DeviceEdit, EditError, SettingsPatch};
 use echomuse_settings::registry::{
     AddOutcome, ModelThresholds, NewModel, ProbeResult, SeedModel, SpokenForm, WakeRegistry,
@@ -187,10 +186,6 @@ fn set(key: SettingKey, json: serde_json::Value) -> SettingValue {
     SettingValue::parse(key, &echomuse_settings::json::Json::from_value(&json)).unwrap()
 }
 
-fn handle_db(fixture: &Fixture) -> DbHandle {
-    fixture.db.handle()
-}
-
 #[tokio::test]
 async fn a_fresh_installation_uses_the_defaults() {
     let f = fixture(false).await;
@@ -204,7 +199,7 @@ async fn a_fresh_installation_uses_the_defaults() {
     assert_eq!(f.fleet_text(), None);
     // The first fleet edit creates the row with just what it set.
     f.handle
-        .apply_fleet_edit(SettingsPatch::from_json_text(r#"{"duckDb": -24}"#).unwrap())
+        .apply_fleet_edit(SettingsPatch::from_value(&json!({"duckDb": -24})).unwrap())
         .await
         .unwrap();
     assert_eq!(f.fleet_text().as_deref(), Some(r#"{"duckDb": -24}"#));
@@ -261,7 +256,7 @@ async fn stored_documents_round_trip_unchanged() {
     let f = fixture(true).await;
     let generation = f.handle.snapshot().generation();
     // Saving the fleet's own values (what the dashboard sends) changes nothing.
-    let same = f.handle.snapshot().fleet().to_json().to_value();
+    let same = serde_json::to_value(&**f.handle.snapshot().fleet()).unwrap();
     let mut same = same.as_object().unwrap().clone();
     same.remove("nearMissThreshold");
     let outcome = f
@@ -273,7 +268,7 @@ async fn stored_documents_round_trip_unchanged() {
     assert_eq!(f.handle.snapshot().generation(), generation);
     assert_eq!(f.fleet_text(), Some(fleet_doc()));
     // So does a device save of its own effective config with its sections unchanged.
-    let effective = f.handle.effective(&id(OVERRIDER)).to_json().to_value();
+    let effective = serde_json::to_value(&*f.handle.effective(&id(OVERRIDER))).unwrap();
     let mut body = effective.as_object().unwrap().clone();
     body.insert("config_sections".to_owned(), json!(["ring", "timers"]));
     let outcome = f
@@ -285,13 +280,12 @@ async fn stored_documents_round_trip_unchanged() {
         .await
         .unwrap();
     assert!(outcome.changed_devices.is_empty());
+    // Nothing was written: not even the fleet-following Wake word values the body
+    // carried, which differ from the stored copy (`wakeArbitrationMs` 650, stored 0).
     assert_eq!(
         f.device_columns(OVERRIDER),
         (overrider_doc(), r#"["ring", "timers"]"#.to_owned(), 0)
     );
-    // Values for sections following the fleet were reported, not stored.
-    assert!(outcome.not_stored.contains(&SettingKey::WakeModel));
-    assert!(!outcome.not_stored.contains(&SettingKey::LedScene));
 
     // One change rewrites only that key, in place, keeping the unknown key.
     let mut patch = SettingsPatch::new();
@@ -327,7 +321,7 @@ async fn switching_sections_starts_from_the_fleet_and_back() {
     let f = fixture(true).await;
     // The follower's copy has a stale nearMissThreshold 0.2; switching Wake word to
     // the device starts it from the fleet's value instead.
-    let edit = DeviceEdit::from_json_text(r#"{"config_sections": ["wakeword"]}"#).unwrap();
+    let edit = DeviceEdit::from_value(&json!({"config_sections": ["wakeword"]})).unwrap();
     let outcome = f
         .handle
         .apply_device_edit(id(FOLLOWER), edit)
@@ -338,7 +332,7 @@ async fn switching_sections_starts_from_the_fleet_and_back() {
     assert!(config.contains(r#""nearMissThreshold": 0.17"#));
     assert_eq!((sections.as_str(), use_global), (r#"["wakeword"]"#, 0));
     // Now its own value takes effect, and needs a new session.ready.
-    let edit = DeviceEdit::from_json_text(r#"{"nearMissThreshold": 0.25}"#).unwrap();
+    let edit = DeviceEdit::from_value(&json!({"nearMissThreshold": 0.25})).unwrap();
     let outcome = f
         .handle
         .apply_device_edit(id(FOLLOWER), edit)
@@ -347,7 +341,7 @@ async fn switching_sections_starts_from_the_fleet_and_back() {
     assert_eq!(outcome.changed_devices, [id(FOLLOWER)]);
     assert_eq!(outcome.new_session_needed, [id(FOLLOWER)]);
     // Back to the fleet: the stored copy stays, the fleet's value applies again.
-    let edit = DeviceEdit::from_json_text(r#"{"config_sections": []}"#).unwrap();
+    let edit = DeviceEdit::from_value(&json!({"config_sections": []})).unwrap();
     f.handle
         .apply_device_edit(id(FOLLOWER), edit)
         .await
@@ -370,16 +364,22 @@ async fn switching_sections_starts_from_the_fleet_and_back() {
 async fn edits_are_refused_by_key_and_change_nothing() {
     let f = fixture(true).await;
     for (body, expected) in [
-        (r#"{"owwModel": "x"}"#, "owwModel: this setting was removed"),
-        (r#"{"wakeColour": 1}"#, "wakeColour: not a setting"),
-        (r#"{"kioskPort": 0}"#, "kioskPort: 0 is outside 1 to 65535"),
         (
-            r#"{"nearMissThreshold": 0.123}"#,
+            json!({"owwModel": "x"}),
+            "owwModel: this setting was removed",
+        ),
+        (json!({"wakeColour": 1}), "wakeColour: not a setting"),
+        (
+            json!({"kioskPort": 0}),
+            "kioskPort: 0 is outside 1 to 65535",
+        ),
+        (
+            json!({"nearMissThreshold": 0.123}),
             "nearMissThreshold: 0.123 has more than two decimals",
         ),
     ] {
         assert_eq!(
-            SettingsPatch::from_json_text(body).unwrap_err().to_string(),
+            SettingsPatch::from_value(&body).unwrap_err().to_string(),
             expected
         );
     }
@@ -408,31 +408,28 @@ async fn edits_are_refused_by_key_and_change_nothing() {
 #[tokio::test]
 async fn snapshots_are_published_only_after_the_commit() {
     let f = fixture(true).await;
-    let mut snapshots = f.handle.subscribe();
-    snapshots.borrow_and_update();
+    let mut follower = f.handle.watch_device(id(FOLLOWER));
     let path = f.path.clone();
+    // When the follower's settings change, the database already holds the edit.
     let watcher = tokio::spawn(async move {
-        snapshots.changed().await.unwrap();
-        let generation = snapshots.borrow().generation();
-        let stored: String = Connection::open(&path)
+        follower.changed().await.unwrap();
+        Connection::open(&path)
             .unwrap()
             .query_row(
                 "SELECT value FROM system_config WHERE key = 'global_device_config'",
                 [],
-                |row| row.get(0),
+                |row| row.get::<_, String>(0),
             )
-            .unwrap();
-        (generation, stored)
+            .unwrap()
     });
     let before = f.handle.snapshot().generation();
     let outcome = f
         .handle
-        .apply_fleet_edit(SettingsPatch::from_json_text(r#"{"wakeArbitrationMs": 800}"#).unwrap())
+        .apply_fleet_edit(SettingsPatch::from_value(&json!({"wakeArbitrationMs": 800})).unwrap())
         .await
         .unwrap();
-    let (generation, stored) = watcher.await.unwrap();
-    assert_eq!(generation, before + 1);
-    assert_eq!(outcome.snapshot.generation(), generation);
+    let stored = watcher.await.unwrap();
+    assert_eq!(outcome.snapshot.generation(), before + 1);
     assert!(stored.contains(r#""wakeArbitrationMs": 800"#));
     // The follower changed; the overrider's Wake word follows the fleet too.
     assert_eq!(outcome.changed_devices, [id(FOLLOWER), id(OVERRIDER)]);
@@ -448,7 +445,7 @@ async fn snapshots_are_published_only_after_the_commit() {
         .handle
         .apply_device_edit(
             id(OVERRIDER),
-            DeviceEdit::from_json_text(r#"{"timerRingSeconds": 60}"#).unwrap(),
+            DeviceEdit::from_value(&json!({"timerRingSeconds": 60})).unwrap(),
         )
         .await
         .unwrap_err();
@@ -457,7 +454,6 @@ async fn snapshots_are_published_only_after_the_commit() {
     // Refreshing drops the deleted device.
     let snapshot = f.handle.refresh_device(&id(OVERRIDER)).await.unwrap();
     assert!(snapshot.device(&id(OVERRIDER)).is_none());
-    let _ = handle_db(&f);
     f.stop().await;
 }
 
@@ -469,7 +465,7 @@ async fn a_device_watch_wakes_only_for_its_device() {
     let first = follower.current();
     // Ring is overridden by the overrider, so a fleet Ring change reaches the follower only.
     f.handle
-        .apply_fleet_edit(SettingsPatch::from_json_text(r#"{"ledScene": "airy"}"#).unwrap())
+        .apply_fleet_edit(SettingsPatch::from_value(&json!({"ledScene": "airy"})).unwrap())
         .await
         .unwrap();
     let next = follower.changed().await.unwrap();
@@ -534,7 +530,7 @@ async fn models_are_added_selected_and_deleted_only_when_unused() {
     );
 
     // Once nothing selects it, it goes, files and all; nothing else is renamed or removed.
-    let edit = DeviceEdit::from_json_text(r#"{"config_sections": ["ring", "timers"]}"#).unwrap();
+    let edit = DeviceEdit::from_value(&json!({"config_sections": ["ring", "timers"]})).unwrap();
     f.handle
         .apply_device_edit(id(OVERRIDER), edit)
         .await
@@ -602,29 +598,6 @@ async fn ready_grant_carries_the_settings_detector() {
                 {"profile": "playback", "windows": 2, "combine": "mean", "threshold": 0.6}
             ]
         })
-    );
-    // A device without open_rules_v1 gets neither list; the protocol crate strips them.
-    let ready = SessionReady::new(
-        &grant,
-        &Capabilities::default(),
-        LinkSessionId::generate(),
-        uuid::Uuid::nil(),
-        0,
-    );
-    let wire = serde_json::to_value(&ready).unwrap();
-    assert!(wire["detector"].get("open_rules").is_none());
-    let with_rules = Capabilities::from_names(["open_rules_v1"]);
-    let ready = SessionReady::new(
-        &grant,
-        &with_rules,
-        LinkSessionId::generate(),
-        uuid::Uuid::nil(),
-        0,
-    );
-    let wire = serde_json::to_value(&ready).unwrap();
-    assert_eq!(
-        wire["detector"]["open_rules"].as_array().map(Vec::len),
-        Some(3)
     );
     f.stop().await;
 }

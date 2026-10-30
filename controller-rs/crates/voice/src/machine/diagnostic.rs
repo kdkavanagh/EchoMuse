@@ -15,10 +15,8 @@ use std::num::NonZeroU64;
 
 use echomuse_uplink::{CloseReason, Delivery, EndCause, Owner, SubscriptionId};
 
-use crate::{
-    io::{Effect, Now, Outbound},
-    machine::Voice,
-};
+use super::Voice;
+use crate::io::{Effect, Now, Outbound};
 
 /// The owner the diagnostic subscription is opened under.
 const OWNER: &str = "diagnostic";
@@ -35,7 +33,7 @@ pub enum DiagnosticAudio {
 
 /// The machine's recording-mode state.
 #[derive(Debug, Default)]
-pub(crate) struct Diagnostic {
+pub(super) struct Diagnostic {
     /// A mode is armed.
     armed: bool,
     /// The open subscription.
@@ -46,16 +44,15 @@ pub(crate) struct Diagnostic {
 
 impl Voice {
     /// Arms or disarms the recording modes' subscription ([`crate::Input::Diagnostic`]).
-    pub(crate) fn set_diagnostic(&mut self, armed: bool, now: Now) {
+    pub(super) fn set_diagnostic(&mut self, armed: bool, now: Now) {
         self.diagnostic.armed = armed;
         if armed {
             self.diagnostic.refused_epoch = None;
             self.reconcile_diagnostic(now);
         } else if let Some(id) = self.diagnostic.subscription.clone() {
             // Its end arrives as a delivery, which tells the recorder to finish.
-            let _ = self
-                .uplink
-                .close(&id, CloseReason::Closed, self.mono(now.at));
+            self.audio
+                .close(&id, CloseReason::Closed, self.facts.mono(now.at));
         }
     }
 
@@ -67,17 +64,21 @@ impl Voice {
     /// Whether a recording mode runs: one is armed, or its subscription is still open
     /// (a disarmed mode's subscription stays until its end arrives). Turns that would
     /// take the microphone from it are refused meanwhile (§4.11).
-    pub(crate) fn recording_mode_runs(&self) -> bool {
+    pub(super) fn recording_mode_runs(&self) -> bool {
         self.diagnostic.armed || self.diagnostic_active()
     }
 
     /// Opens the subscription when a mode is armed and none is open, and capture allows.
-    pub(crate) fn reconcile_diagnostic(&mut self, now: Now) {
+    pub(super) fn reconcile_diagnostic(&mut self, now: Now) {
         let state = &self.diagnostic;
-        if !state.armed || state.subscription.is_some() || self.muted || self.capture.is_none() {
+        if !state.armed
+            || state.subscription.is_some()
+            || self.facts.muted
+            || self.facts.capture.is_none()
+        {
             return;
         }
-        let epoch = self.uplink.timeline().capture_epoch();
+        let epoch = self.audio.timeline().capture_epoch();
         if epoch.is_none()
             || state
                 .refused_epoch
@@ -86,25 +87,24 @@ impl Voice {
             return;
         }
         let owner = Owner::new(OWNER).expect("the owner is not empty");
-        match self.uplink.open_diagnostic(owner, self.mono(now.at)) {
-            Ok(opened) => {
-                self.apply_grants(&opened.grants);
-                self.diagnostic.subscription = Some(opened.subscription_id);
+        match self.audio.open_diagnostic(owner, self.facts.mono(now.at)) {
+            Ok(subscription) => {
+                self.diagnostic.subscription = Some(subscription);
                 self.diagnostic_ring(now);
             }
             Err(error) => {
-                tracing::debug!(device = %self.device, ?error, "the recording subscription cannot open yet");
+                tracing::debug!(device = %self.facts.device, ?error, "the recording subscription cannot open yet");
             }
         }
     }
 
     /// Whether `subscription` is the recording modes'.
-    pub(crate) fn is_diagnostic(&self, subscription: &SubscriptionId) -> bool {
+    pub(super) fn is_diagnostic(&self, subscription: &SubscriptionId) -> bool {
         self.diagnostic.subscription.as_ref() == Some(subscription)
     }
 
     /// Passes one of the subscription's deliveries to the runtime.
-    pub(crate) fn diagnostic_delivery(&mut self, delivery: Delivery, now: Now) {
+    pub(super) fn diagnostic_delivery(&mut self, delivery: Delivery, now: Now) {
         match delivery {
             Delivery::Chunk(chunk) => self
                 .link
@@ -113,7 +113,7 @@ impl Voice {
             Delivery::Ended(ended) => {
                 self.diagnostic.subscription = None;
                 if matches!(ended.cause, EndCause::Rejected { .. }) {
-                    self.diagnostic.refused_epoch = self.uplink.timeline().capture_epoch();
+                    self.diagnostic.refused_epoch = self.audio.timeline().capture_epoch();
                 }
                 self.link
                     .effects
@@ -125,7 +125,7 @@ impl Voice {
 
     fn diagnostic_ring(&mut self, now: Now) {
         let on = self.diagnostic.subscription.is_some();
-        if let Some(command) = self.ring.set_recording(on, now.at) {
+        if let Some(command) = self.presenter.ring.set_recording(on, now.at) {
             self.link.send(Outbound::Led(command), 0);
         }
     }

@@ -21,15 +21,15 @@
 //! 3. Build a [`FirmwareService`]. For every session the link admits, call
 //!    [`FirmwareService::observe_hello`], then
 //!    [`FirmwareService::queued_update_on_connect`] and spawn any job it returns.
-//! 4. Routes call [`FirmwareService::prepare_update`] / [`prepare_rollback`]
-//!    (answering at once, spawning the job's `run` under supervision),
-//!    [`queue_update`] / [`cancel_queued_update`], [`debloat`], [`secure_link`], and
+//! 4. Routes call [`FirmwareService::prepare_update`] / [`prepare_rollback`] /
+//!    [`prepare_debloat`] (answering at once, spawning the job's `run` under
+//!    supervision), [`queue_update`] / [`cancel_queued_update`], [`secure_link`], and
 //!    the `provision_*` responders in [`provision`].
 //!
 //! [`prepare_rollback`]: FirmwareService::prepare_rollback
+//! [`prepare_debloat`]: FirmwareService::prepare_debloat
 //! [`queue_update`]: FirmwareService::queue_update
 //! [`cancel_queued_update`]: FirmwareService::cancel_queued_update
-//! [`debloat`]: FirmwareService::debloat
 //! [`secure_link`]: FirmwareService::secure_link
 //!
 //! # The update, step by step
@@ -73,15 +73,13 @@ pub use debloat::{DebloatReport, HideResult, MicrophoneResult, parse_debloat_out
 pub use hub::DeviceHello;
 pub use payloads::{DevicePayloads, Payload, PayloadError, START_SCRIPT_FILE, list_packages};
 pub use service::{
-    DeviceAccess, DeviceTarget, FirmwareEvent, FirmwareEvents, FirmwareFailure, FirmwareService,
-    FirmwareServiceConfig, FirmwareTimings, Operation, RollbackJob, RollbackOutcome,
-    SUPERVISOR_LOG_TAIL_BYTES, Stage, SupervisorLog, UpdateJob, UpdateOutcome,
+    DebloatJob, DeviceAccess, DeviceTarget, FirmwareEvent, FirmwareEvents, FirmwareFailure,
+    FirmwareService, FirmwareServiceConfig, FirmwareTimings, Operation, RollbackJob,
+    RollbackOutcome, SUPERVISOR_LOG_TAIL_BYTES, Stage, SupervisorLog, UpdateJob, UpdateOutcome,
 };
 pub use shell::{
     CommandLimits, CommandOutput, DeviceShell, Ending, LinkShell, ShellClosed, ShellFailure,
     ShellIo, ShellOpenError, open_pipe_shell,
 };
-pub use store::{
-    FirmwareRowError, FirmwareStore, QueueUpdate, SetFirmwarePrevious, StoreError, TakeQueuedUpdate,
-};
+pub use store::{FirmwareStore, StoreError};
 pub use types::{FirmwareVersion, LinkToken, Md5};

@@ -283,11 +283,6 @@ impl Sidecar {
             clip_seconds,
         })
     }
-
-    /// The wake word's label.
-    pub fn wake_label(&self) -> &str {
-        &self.labels[self.wake_index]
-    }
 }
 
 /// A model's thresholds `{idle, playback, reference}`, each in (0, 1] with
@@ -521,21 +516,6 @@ impl WakeModel {
         self.probe
     }
 
-    /// The parsed sidecar, when its file verified and parsed.
-    pub fn sidecar(&self) -> Option<&Sidecar> {
-        self.sidecar.as_ref()
-    }
-
-    /// Whether the graph file verified.
-    pub fn graph_status(&self) -> &FileStatus {
-        &self.graph_status
-    }
-
-    /// Whether the sidecar file verified.
-    pub fn sidecar_status(&self) -> &FileStatus {
-        &self.sidecar_status
-    }
-
     /// Whether both files verified and the sidecar parsed, so the model can be served
     /// and selected.
     pub fn is_usable(&self) -> bool {
@@ -732,27 +712,32 @@ impl WakeRegistry {
         let mut entries = Vec::with_capacity(raw_entries.len());
         let mut issues = Vec::new();
         for (index, raw) in raw_entries.into_iter().enumerate() {
-            match parse_entry(&raw) {
-                Ok(mut model) => {
-                    verify_files(&dir, &mut model);
-                    let duplicate = entries.iter().any(
-                        |e| matches!(e, Entry::Model(m) if m.graph_sha256 == model.graph_sha256),
-                    );
-                    if duplicate {
-                        issues.push(RegistryIssue::DuplicateGraph(model.graph_sha256.clone()));
-                        entries.push(Entry::Unreadable(raw));
-                        continue;
-                    }
-                    if let Some(issue) = file_issue(&dir, &model) {
-                        issues.push(issue);
-                    }
-                    entries.push(Entry::Model(Box::new(model)));
-                }
+            let mut model = match parse_entry(&raw) {
+                Ok(model) => model,
                 Err(reason) => {
                     issues.push(RegistryIssue::UnreadableEntry { index, reason });
                     entries.push(Entry::Unreadable(raw));
+                    continue;
                 }
+            };
+            let duplicate = entries
+                .iter()
+                .any(|e| matches!(e, Entry::Model(m) if m.graph_sha256 == model.graph_sha256));
+            if duplicate {
+                issues.push(RegistryIssue::DuplicateGraph(model.graph_sha256.clone()));
+                entries.push(Entry::Unreadable(raw));
+                continue;
             }
+            let sidecar_error = verify_files(&dir, &mut model);
+            if !model.is_usable() {
+                issues.push(RegistryIssue::UnusableFiles {
+                    graph_sha256: model.graph_sha256.clone(),
+                    graph: model.graph_status.clone(),
+                    sidecar: model.sidecar_status.clone(),
+                    sidecar_error,
+                });
+            }
+            entries.push(Entry::Model(Box::new(model)));
         }
         Ok(Self {
             dir,
@@ -1045,27 +1030,19 @@ fn parse_entry(raw: &Json) -> Result<WakeModel, String> {
     })
 }
 
-fn verify_files(dir: &Path, model: &mut WakeModel) {
+/// Check the model's files against their hashes and parse its sidecar. Returns why the
+/// sidecar did not parse, when its file verified but did not.
+fn verify_files(dir: &Path, model: &mut WakeModel) -> Option<SidecarError> {
     model.graph_status = file_status(dir, &model.graph_file, &model.graph_sha256).0;
     let (status, bytes) = file_status(dir, &model.sidecar_file, &model.sidecar_sha256);
     model.sidecar_status = status;
-    model.sidecar = bytes.and_then(|b| Sidecar::parse(&b).ok());
-}
-
-fn file_issue(dir: &Path, model: &WakeModel) -> Option<RegistryIssue> {
-    if model.is_usable() {
-        return None;
+    match Sidecar::parse(&bytes?) {
+        Ok(sidecar) => {
+            model.sidecar = Some(sidecar);
+            None
+        }
+        Err(error) => Some(error),
     }
-    let sidecar_error = (model.sidecar_status == FileStatus::Verified)
-        .then(|| fs::read(dir.join(&model.sidecar_file)).ok())
-        .flatten()
-        .and_then(|b| Sidecar::parse(&b).err());
-    Some(RegistryIssue::UnusableFiles {
-        graph_sha256: model.graph_sha256.clone(),
-        graph: model.graph_status.clone(),
-        sidecar: model.sidecar_status.clone(),
-        sidecar_error,
-    })
 }
 
 /// The file's status, and its bytes when it verified.
@@ -1138,11 +1115,11 @@ fn sync_dir(dir: &Path) -> Result<(), RegistryError> {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
 
     /// The repository's deployed graph and sidecar.
-    pub(crate) fn repo_model() -> (PathBuf, PathBuf) {
+    fn repo_model() -> (PathBuf, PathBuf) {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         (
             root.join("bcresnet_audio.onnx"),
@@ -1150,21 +1127,21 @@ pub(crate) mod tests {
         )
     }
 
-    pub(crate) fn seeded(dir: &Path) -> WakeRegistry {
+    fn seeded(dir: &Path) -> WakeRegistry {
         let (graph, sidecar) = repo_model();
         WakeRegistry::open_or_seed(dir.join("oww_models"), &SeedModel::deployed(graph, sidecar))
             .unwrap()
     }
 
     /// A sidecar the firmware accepts, different from the deployed one.
-    pub(crate) fn synthetic_sidecar(label: &str) -> Vec<u8> {
+    fn synthetic_sidecar(label: &str) -> Vec<u8> {
         format!(
             r#"{{"type": "bcresnet", "sampleRate": 16000, "window": 22400, "labels": ["noise", "{label}", "unknown"], "wakeIndex": 1, "nMels": 40, "clipSeconds": 1.4, "normPeak": 0.8}}"#
         )
         .into_bytes()
     }
 
-    pub(crate) fn new_model(graph: &[u8], label: &str) -> NewModel {
+    fn new_model(graph: &[u8], label: &str) -> NewModel {
         NewModel {
             graph: graph.to_vec(),
             sidecar: synthetic_sidecar(label),
@@ -1199,8 +1176,6 @@ pub(crate) mod tests {
         );
         let model = registry.models().next().unwrap();
         assert!(model.is_usable());
-        assert_eq!(model.thresholds(), ModelThresholds::DEPLOYED);
-        assert_eq!(model.sidecar().unwrap().wake_label(), "ohphelia");
         assert_eq!(
             fs::read_to_string(dir.join(REGISTRY_FILE)).unwrap(),
             format!(

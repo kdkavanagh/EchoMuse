@@ -100,9 +100,6 @@ pub enum MicJob {
     /// `from` on is fed at once), echo labels from `from`, and a fresh pause finalizer.
     /// Replaces an utterance already under way on the stream.
     StartUtterance { key: StreamKey, from: Sample },
-    /// Ends the stream's utterance: no further ASR observations or echo labels. VAD and
-    /// the stream stay open (a reply window can start another utterance later).
-    EndUtterance { key: StreamKey },
     /// Mic audio, `first` on the capture timeline. `discontinuity`: the device flagged a
     /// discontinuity before it, so VAD state and any utterance's ASR restart.
     Mic {
@@ -140,9 +137,6 @@ pub enum MicJob {
         first: u64,
         end: u64,
     },
-    /// The subscription's reference ended (or it never had one): cells still waiting on
-    /// reference become unknown.
-    ReferenceEnded { key: StreamKey },
     /// The device's loudness cells (the cells stream), for the echo analyzer's
     /// background level.
     DeviceCells {
@@ -214,11 +208,8 @@ pub enum ReferenceJob {
         first: u64,
         end: u64,
     },
-    Ended {
-        key: StreamKey,
-    },
     /// Judges a mic candidate's support against the reference candidates. Answered once
-    /// the windows it needs are scored (or the reference ended).
+    /// the windows it needs are scored.
     Judge {
         key: StreamKey,
         candidate: String,

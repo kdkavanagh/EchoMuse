@@ -669,7 +669,7 @@ fn main() {
     }
     let get = |k: &str| PathBuf::from(map.get(k).unwrap_or_else(|| panic!("--{k}")));
     let manifest = SpeechBundleManifest::load(&get("manifest")).unwrap();
-    let native = NativeLibraries::pinned(get("ort-lib"), None).unwrap();
+    let native = NativeLibraries::pinned(get("ort-lib")).unwrap();
     let ort = OrtRuntime::load(&native.onnxruntime).unwrap();
     let sherpa = SherpaRuntime::verify(&native.sherpa).unwrap();
     let kroko_dir = get("kroko");

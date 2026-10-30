@@ -590,13 +590,15 @@ pub struct RecordingHub {
     db: DbHandle,
     root: PathBuf,
     modes: Mutex<HashMap<DeviceId, Modes>>,
+    /// Held through a mode edit and while a deleted device's modes are dropped.
+    edits: tokio::sync::Mutex<()>,
     live: Mutex<HashMap<DeviceId, LiveState>>,
     /// Recorders still running, per device (a recorder outlives its sender while it
     /// saves what it holds).
     running: Mutex<HashMap<DeviceId, usize>>,
-    /// Wakes [`RecordingHub::forget`] when a recorder stops.
+    /// Wakes [`RecordingHub::delete_device`] when a recorder stops.
     recorder_stopped: tokio::sync::Notify,
-    directory: OnceLock<watch::Receiver<Directory>>,
+    directory: watch::Receiver<Directory>,
     publisher: Arc<OnceLock<EventPublisher>>,
     tasks: TaskSupervisor,
 }
@@ -633,11 +635,13 @@ impl Drop for RunningRecorder {
 }
 
 impl RecordingHub {
-    /// The hub over the stored modes of every approved device.
+    /// The hub over the stored modes of every approved device and the runtimes'
+    /// `directory`.
     pub async fn load(
         db: DbHandle,
         layout: &RecordingsLayout,
         publisher: Arc<OnceLock<EventPublisher>>,
+        directory: watch::Receiver<Directory>,
         tasks: TaskSupervisor,
     ) -> Result<Arc<Self>, String> {
         let modes = db
@@ -648,17 +652,14 @@ impl RecordingHub {
             db,
             root: layout.root().to_path_buf(),
             modes: Mutex::new(modes.into_iter().collect()),
+            edits: tokio::sync::Mutex::new(()),
             live: Mutex::default(),
             running: Mutex::default(),
             recorder_stopped: tokio::sync::Notify::new(),
-            directory: OnceLock::new(),
+            directory,
             publisher,
             tasks,
         }))
-    }
-
-    pub fn set_directory(&self, directory: watch::Receiver<Directory>) {
-        let _ = self.directory.set(directory);
     }
 
     /// A device's armed modes.
@@ -754,10 +755,7 @@ impl RecordingHub {
 
     /// Tells the device's runtime to arm or disarm according to the stored modes.
     fn recording_changed(&self, device: &DeviceId) {
-        let handle = self
-            .directory
-            .get()
-            .and_then(|d| d.borrow().get(device).cloned());
+        let handle = self.directory.borrow().get(device).cloned();
         if let Some(handle) = handle
             && let Err(error) = handle.recording_changed()
         {
@@ -776,6 +774,9 @@ impl RecordingHub {
                 "This device's id cannot name files".to_owned(),
             ));
         }
+        // One edit at a time: the two modes exclude each other, so the check, the stored
+        // row and the hub's copy must not interleave with another edit.
+        let _edit = self.edits.lock().await;
         let mut modes = self.modes(&device);
         match mode {
             RecordingMode::Samples => {
@@ -829,11 +830,13 @@ impl RecordingHub {
         Ok(mode_dir(&self.root, mode, device))
     }
 
-    /// Forgets a deleted device, once its runtime has stopped: waits (at most
-    /// [`FORGET_WAIT`]) for its recorders to save or discard what they hold, so no file
-    /// is written after the device's files are deleted, then drops its modes and
-    /// counters.
-    pub async fn forget(&self, device: &DeviceId) {
+    /// Deletes a deleted device's recording modes, once its runtime has stopped: waits (at
+    /// most [`FORGET_WAIT`]) for its recorders to save or discard what they hold, so no file
+    /// is written after its files go, drops its modes and counters, then removes its
+    /// sample and ambient directories. Mode edits wait until the returned hold is dropped:
+    /// keep it until the device's row is deleted, so an edit queued meanwhile finds no
+    /// device instead of arming modes again.
+    pub async fn delete_device(&self, device: &DeviceId) -> io::Result<ModeEditsHeld<'_>> {
         let deadline = tokio::time::Instant::now() + FORGET_WAIT;
         loop {
             let stopped = self.recorder_stopped.notified();
@@ -852,9 +855,37 @@ impl RecordingHub {
                 break;
             }
         }
+        let held = ModeEditsHeld {
+            _edits: self.edits.lock().await,
+        };
         self.modes.lock().expect("modes lock").remove(device);
         self.live.lock().expect("live lock").remove(device);
+        if !file_safe(device) {
+            // Its id cannot name a directory, so no recorder ever wrote one.
+            return Ok(held);
+        }
+        let dirs = [RecordingMode::Samples, RecordingMode::Ambient]
+            .map(|mode| mode_dir(&self.root, mode, device));
+        tokio::task::spawn_blocking(move || {
+            for dir in dirs {
+                match fs::remove_dir_all(dir) {
+                    Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+                    _ => {}
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(io::Error::other)??;
+        Ok(held)
     }
+}
+
+/// Recording-mode edits held back while a device's deletion finishes; dropping it lets
+/// them run again.
+#[must_use = "mode edits resume as soon as this is dropped"]
+pub struct ModeEditsHeld<'a> {
+    _edits: tokio::sync::MutexGuard<'a, ()>,
 }
 
 async fn blocking<T: Send + 'static>(

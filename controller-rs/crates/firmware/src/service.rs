@@ -483,6 +483,21 @@ impl<D, S, E> fmt::Debug for RollbackJob<D, S, E> {
     }
 }
 
+/// A debloat ready to run. Spawn [`run`](Self::run) under supervision.
+pub struct DebloatJob<D, S, E> {
+    inner: Arc<Inner<D, S, E>>,
+    target: DeviceTarget,
+    _claim: Claim,
+}
+
+impl<D, S, E> fmt::Debug for DebloatJob<D, S, E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DebloatJob")
+            .field("target", &self.target)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<D: DeviceAccess, S: FirmwareStore, E: FirmwareEvents> FirmwareService<D, S, E> {
     /// The service.
     pub fn new(access: D, store: S, events: E, config: FirmwareServiceConfig) -> Self {
@@ -583,7 +598,7 @@ impl<D: DeviceAccess, S: FirmwareStore, E: FirmwareEvents> FirmwareService<D, S,
 
     /// Cancels the device's queued install. Returns whether one was queued.
     pub async fn cancel_queued_update(&self, device: &DeviceId) -> Result<bool, FirmwareFailure> {
-        let cancelled = self.inner.store.cancel_queued_update(device).await?;
+        let cancelled = self.inner.store.take_queued_update(device).await?.is_some();
         if cancelled {
             self.inner.events.publish(FirmwareEvent::QueueChanged {
                 device: device.clone(),
@@ -619,24 +634,21 @@ impl<D: DeviceAccess, S: FirmwareStore, E: FirmwareEvents> FirmwareService<D, S,
         Ok(job)
     }
 
-    /// Syncs `start_server.sh` (and on a Fire OS Echo Show its package lists), then runs
-    /// `start_server.sh debloat` and reads its result.
-    pub async fn debloat(&self, target: &DeviceTarget) -> Result<DebloatReport, FirmwareFailure> {
+    /// Reserves the device for a debloat. Refused on a LineageOS Echo Show, which runs
+    /// nothing of Amazon's, and while another operation runs on the device.
+    pub fn prepare_debloat(
+        &self,
+        target: DeviceTarget,
+    ) -> Result<DebloatJob<D, S, E>, FirmwareFailure> {
         if target.platform == Platform::Lineage18Crown {
             return Err(FirmwareFailure::NothingToDebloat);
         }
-        let _claim = self.claim(&target.device)?;
-        let payloads = self.inner.load_payloads(target.platform).await?;
-        let mut shell = self
-            .inner
-            .open_shell(&target.device, Operation::Debloat)
-            .await?;
-        let result = self.inner.debloat_on(&mut shell, target, &payloads).await;
-        shell.close().await;
-        if let Ok(report) = &result {
-            tracing::info!(device = %target.device, "{report}");
-        }
-        result
+        let claim = self.claim(&target.device)?;
+        Ok(DebloatJob {
+            inner: Arc::clone(&self.inner),
+            target,
+            _claim: claim,
+        })
     }
 
     /// Writes the controller's CA (`ca.pem`, 0644) and the device's link token (`token`,
@@ -1009,28 +1021,30 @@ impl<D: DeviceAccess, S: FirmwareStore, E: FirmwareEvents> Inner<D, S, E> {
         })
     }
 
-    async fn debloat_on(
-        &self,
-        shell: &mut DeviceShell<D::Shell>,
-        target: &DeviceTarget,
-        payloads: &Payloads,
-    ) -> Result<DebloatReport, FirmwareFailure> {
+    async fn debloat(&self, target: &DeviceTarget) -> Result<DebloatReport, FirmwareFailure> {
         let device = &target.device;
         let op = Operation::Debloat;
-        let tools = self.tools(shell, device, op).await?;
-        self.sync_payloads(shell, &tools, device, op, payloads)
-            .await?;
-        self.progress(device, op, Stage::RunningDebloat);
-        let out = shell
-            .run(
-                &format!("/system/bin/sh {START_SCRIPT} debloat 2>&1"),
-                CommandLimits {
-                    idle: self.config.timings.debloat_idle,
-                    total: self.config.timings.debloat_total,
-                },
-            )
-            .await?;
-        parse_debloat_output(&out.text).map_err(FirmwareFailure::Debloat)
+        let payloads = self.load_payloads(target.platform).await?;
+        let mut shell = self.open_shell(device, op).await?;
+        let result = async {
+            let tools = self.tools(&mut shell, device, op).await?;
+            self.sync_payloads(&mut shell, &tools, device, op, &payloads)
+                .await?;
+            self.progress(device, op, Stage::RunningDebloat);
+            let out = shell
+                .run(
+                    &format!("/system/bin/sh {START_SCRIPT} debloat 2>&1"),
+                    CommandLimits {
+                        idle: self.config.timings.debloat_idle,
+                        total: self.config.timings.debloat_total,
+                    },
+                )
+                .await?;
+            parse_debloat_output(&out.text).map_err(FirmwareFailure::Debloat)
+        }
+        .await;
+        shell.close().await;
+        result
     }
 }
 
@@ -1059,9 +1073,11 @@ impl<D: DeviceAccess, S: FirmwareStore, E: FirmwareEvents> UpdateJob<D, S, E> {
                 tracing::info!(%device, from = ?from.as_ref().map(FirmwareVersion::as_str), %to, "firmware updated");
             }
             UpdateOutcome::AutoRolledBack {
-                attempted, running, ..
+                attempted,
+                running,
+                supervisor_log,
             } => {
-                tracing::warn!(%device, %attempted, %running, "the device rolled the firmware update back");
+                tracing::warn!(%device, %attempted, %running, ?supervisor_log, "the new firmware failed to start; the device rolled back");
             }
             UpdateOutcome::Failed(failure) => {
                 tracing::warn!(%device, %failure, "firmware update failed");
@@ -1105,5 +1121,19 @@ impl<D: DeviceAccess, S: FirmwareStore, E: FirmwareEvents> RollbackJob<D, S, E> 
             outcome: outcome.clone(),
         });
         outcome
+    }
+}
+
+impl<D: DeviceAccess, S: FirmwareStore, E: FirmwareEvents> DebloatJob<D, S, E> {
+    /// Syncs `start_server.sh` (and on a Fire OS Echo Show its package lists), then runs
+    /// `start_server.sh debloat` and reads its result.
+    pub async fn run(self) -> Result<DebloatReport, FirmwareFailure> {
+        let result = self.inner.debloat(&self.target).await;
+        let device = &self.target.device;
+        match &result {
+            Ok(report) => tracing::info!(%device, "{report}"),
+            Err(failure) => tracing::warn!(%device, %failure, "debloat failed"),
+        }
+        result
     }
 }

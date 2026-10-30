@@ -1,7 +1,7 @@
 //! The device `config` push, the timer arc, and the alert sound preview.
 
-use echomuse_playback::{AlertPreviewSound, Command};
-use echomuse_protocol::MessageType;
+use echomuse_playback::Command;
+use echomuse_protocol::alerts::AlertSound;
 
 use super::rig::{Options, Rig, capabilities};
 use crate::{Input, Outbound, PreviewId, PreviewOutcome};
@@ -46,7 +46,6 @@ async fn a_new_kiosk_token_reaches_a_kiosk_plugin_device() {
     assert!(configs(&rig)[0].get("kioskToken").is_none());
     rig.handle(Input::KioskToken(Some("token-1".to_owned())));
     assert_eq!(configs(&rig).last().unwrap()["kioskToken"], "token-1");
-    let _ = MessageType::Config;
 }
 
 #[tokio::test(start_paused = true)]
@@ -76,7 +75,7 @@ async fn a_preview_starts_once_the_device_accepts_it_and_stops_on_request() {
     let sha = echomuse_protocol::Sha256::parse(&"ab".repeat(32)).unwrap();
     rig.handle(Input::Preview {
         id: PreviewId(1),
-        sound: AlertPreviewSound::Sound(sha.clone()),
+        sound: AlertSound::Asset(sha.clone()),
     });
     let start = rig
         .requests

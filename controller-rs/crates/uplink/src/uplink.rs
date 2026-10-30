@@ -52,8 +52,8 @@ use crate::chunk::{
 };
 use crate::config::{SessionTerms, UplinkConfig};
 use crate::starts::{
-    CandidateStarts, NEAR_MISS_AFE_LEAD, NEAR_MISS_GRACE, NEAR_MISS_TAIL, device_grid_start,
-    device_history, record_samples,
+    CandidateStarts, NEAR_MISS_AFE_LEAD, NEAR_MISS_GRACE, NEAR_MISS_TAIL, device_grid,
+    device_grid_start, device_history,
 };
 use crate::timeline::{Attribution, Claim, Path, SubKey, Timeline};
 use crate::wire::{
@@ -288,7 +288,7 @@ impl Cursor {
                 self.mode = Mode::Ordered;
             }
             (Attribution::Run { start }, _) => {
-                self.pos = Some(start.next_multiple_of(anchor_grid(stream)));
+                self.pos = Some(start.next_multiple_of(device_grid(stream)));
                 self.mode = Mode::Ordered;
             }
             (Attribution::NoRun, StartSpec::At(_)) => self.mode = Mode::Ordered,
@@ -299,7 +299,7 @@ impl Cursor {
     fn on_packet(&mut self, path: Path, first: u64, own: SubKey, stream: StreamId) {
         match self.mode {
             Mode::AwaitLive if path == Path::Advance => {
-                self.pos = Some(first.next_multiple_of(anchor_grid(stream)));
+                self.pos = Some(first.next_multiple_of(device_grid(stream)));
                 self.mode = Mode::Ordered;
             }
             Mode::Ordered if path == Path::Advance || path == Path::Run(Some(own)) => {
@@ -322,16 +322,6 @@ impl Cursor {
             None => true,
             Some(target) => self.pos.is_some_and(|pos| pos >= target),
         }
-    }
-}
-
-/// Where a subscription's position may start on a stream: the grids the
-/// device rounds every start to.
-fn anchor_grid(stream: StreamId) -> u64 {
-    match stream {
-        StreamId::Mic | StreamId::Cells => 512,
-        StreamId::Afe => 1_280,
-        StreamId::Reference => 2_560,
     }
 }
 
@@ -498,6 +488,15 @@ impl Outbox {
             }
         }
     }
+
+    /// Drops the queued chunks of one subscription.
+    fn discard_chunks_of(&mut self, id: &SubscriptionId) {
+        self.queue
+            .retain(|d| d.subscription() != id || matches!(d, Delivery::Ended(_)));
+        if let Some(account) = self.accounts.get_mut(id) {
+            account.backlog = Backlog::default();
+        }
+    }
 }
 
 /// What a release reads from.
@@ -512,7 +511,7 @@ struct Source<'a> {
 impl Source<'_> {
     /// Below this the device's ring can no longer hold anything.
     fn overwritten_below(&self) -> Option<u64> {
-        let unit = record_samples(self.stream);
+        let unit = self.stream.kind().samples_per_frame();
         let gone = self.live_end?.checked_sub(device_history(self.stream))?;
         Some(gone - gone % unit)
     }
@@ -881,12 +880,7 @@ impl Uplink {
         match report.reason {
             UplinkEndedReason::Mute => {
                 let id = self.subs[at].id.clone();
-                self.outbox
-                    .queue
-                    .retain(|d| d.subscription() != &id || matches!(d, Delivery::Ended(_)));
-                if let Some(account) = self.outbox.accounts.get_mut(&id) {
-                    account.backlog = Backlog::default();
-                }
+                self.outbox.discard_chunks_of(&id);
                 self.end_sub(at, EndCause::Device(report.clone()), Leaves::Gone, now);
             }
             UplinkEndedReason::Epoch | UplinkEndedReason::Session => {
@@ -897,11 +891,8 @@ impl Uplink {
                 for want in &mut sub.wants {
                     let last = report.last_sample.get(&want.stream).copied().flatten();
                     let clipped = report.clipped_start.get(&want.stream).copied().flatten();
-                    let newest = want.cursors.len().saturating_sub(1);
-                    for (i, cursor) in want.cursors.iter_mut().enumerate() {
-                        if i != newest {
-                            continue;
-                        }
+                    // Only the newest epoch's cursor is the one the report describes.
+                    if let Some(cursor) = want.cursors.last_mut() {
                         cursor.target = last.map(|l| l.saturating_add(1));
                         if let Some(clipped) = clipped {
                             match cursor.pos {
@@ -971,14 +962,7 @@ impl Uplink {
             return Err(OpenError::DuplicateId);
         }
         let starts = CandidateStarts::new(candidate.support_start, self.terms.afe_metadata);
-        let mut streams = BTreeMap::from([
-            (StreamId::Mic, StreamStart::At(starts.mic)),
-            (StreamId::Cells, StreamStart::At(starts.cells)),
-            (StreamId::Reference, StreamStart::At(starts.reference)),
-        ]);
-        if let Some(afe) = starts.afe {
-            streams.insert(StreamId::Afe, StreamStart::At(afe));
-        }
+        let streams = candidate_streams(&starts);
         let owner = Owner::of_subscription(&candidate.subscription_id);
         let grants = self.activate(
             candidate.subscription_id,
@@ -1039,14 +1023,7 @@ impl Uplink {
         now: MonoInstant,
     ) -> Result<Opened, OpenError> {
         let starts = CandidateStarts::new(press, self.terms.afe_metadata);
-        let mut streams = BTreeMap::from([
-            (StreamId::Mic, StreamStart::At(starts.mic)),
-            (StreamId::Cells, StreamStart::At(starts.cells)),
-            (StreamId::Reference, StreamStart::At(starts.reference)),
-        ]);
-        if let Some(afe) = starts.afe {
-            streams.insert(StreamId::Afe, StreamStart::At(afe));
-        }
+        let streams = candidate_streams(&starts);
         self.open(OpenReason::Turn, turn, streams, now)
     }
 
@@ -1339,10 +1316,10 @@ impl Uplink {
                 stream,
                 cursors: Vec::new(),
             };
-            let spec = match (start, device_grid_start(stream, sample_of(start))) {
-                (StreamStart::Live, _) => StartSpec::Live,
-                (StreamStart::At(_), Some(at)) => StartSpec::At(at.0),
-                (StreamStart::At(_), None) => StartSpec::Mapped,
+            let spec = match start {
+                StreamStart::Live => StartSpec::Live,
+                StreamStart::At(at) => device_grid_start(stream, at)
+                    .map_or(StartSpec::Mapped, |at| StartSpec::At(at.0)),
             };
             let epoch = match stream {
                 StreamId::Reference => self.timeline.reference_epoch(),
@@ -1544,11 +1521,18 @@ enum Leaves {
     Gone,
 }
 
-fn sample_of(start: StreamStart) -> Sample {
-    match start {
-        StreamStart::At(sample) => sample,
-        StreamStart::Live => Sample(0),
+/// The streams a candidate subscription wants, from the candidate starts:
+/// mic, cells and reference, and AFE records in an `afe_metadata` session.
+fn candidate_streams(starts: &CandidateStarts) -> BTreeMap<StreamId, StreamStart> {
+    let mut streams = BTreeMap::from([
+        (StreamId::Mic, StreamStart::At(starts.mic)),
+        (StreamId::Cells, StreamStart::At(starts.cells)),
+        (StreamId::Reference, StreamStart::At(starts.reference)),
+    ]);
+    if let Some(afe) = starts.afe {
+        streams.insert(StreamId::Afe, StreamStart::At(afe));
     }
+    streams
 }
 
 #[cfg(test)]

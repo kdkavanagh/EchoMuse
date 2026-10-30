@@ -34,7 +34,8 @@ use tokio_tungstenite::tungstenite::{self, Message};
 
 use crate::{
     Admission, AdmissionDecision, AdmissionRequest, AssetSource, CloseReason, LinkConfig,
-    LinkLimits, LinkServer, LinkSession, LinkTimings, SessionLink, Transport, WallClock,
+    LinkLimits, LinkServer, LinkSession, LinkTimings, SessionLink, ShellBroker, Transport,
+    WallClock,
 };
 
 /// The fixed wall time of every test: 2023-11-14T22:13:20Z.
@@ -156,6 +157,7 @@ pub(super) struct Harness {
     _service: DatabaseService,
     pub(super) db: DbHandle,
     pub(super) server: LinkServer,
+    pub(super) shells: ShellBroker,
     pub(super) admitted: mpsc::UnboundedReceiver<Admitted>,
     pub(super) decide: Arc<Mutex<Decide>>,
 }
@@ -190,7 +192,8 @@ impl Harness {
             decide: Arc::clone(&decide),
             earlier: Mutex::new(Vec::new()),
         };
-        let server = LinkServer::bind(config, db.clone(), admission, assets)
+        let shells = ShellBroker::new();
+        let server = LinkServer::bind(config, db.clone(), admission, assets, shells.clone())
             .await
             .unwrap();
         Self {
@@ -198,6 +201,7 @@ impl Harness {
             _service: service,
             db,
             server,
+            shells,
             admitted,
             decide,
         }

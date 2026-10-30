@@ -317,11 +317,6 @@ impl TelemetryKind {
             _ => return None,
         })
     }
-
-    /// Whether only the latest message of this kind matters.
-    pub fn is_replaceable(self) -> bool {
-        !matches!(self, Self::Log | Self::BleAdverts)
-    }
 }
 
 /// One telemetry message.

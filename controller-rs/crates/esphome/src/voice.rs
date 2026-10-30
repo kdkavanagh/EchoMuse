@@ -13,7 +13,10 @@ use std::fmt;
 use std::net::SocketAddr;
 
 use bytes::{BufMut, Bytes, BytesMut};
-use echomuse_core::types::DeviceId;
+use echomuse_core::{
+    services::{TimerEvent, TimerEventKind},
+    types::DeviceId,
+};
 use echomuse_protocol::Platform;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -128,36 +131,6 @@ pub struct Announcement {
     /// Whether to start a conversation once the announcement ends, as a
     /// controller-started run.
     pub start_conversation: bool,
-}
-
-/// What happened to one of the satellite's Home Assistant timers.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum TimerEventKind {
-    /// The timer was set.
-    Started,
-    /// It was changed or paused.
-    Updated,
-    /// It was cancelled.
-    Cancelled,
-    /// It ran out.
-    Finished,
-}
-
-/// A timer event from Home Assistant, which owns the satellite's timers.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TimerEvent {
-    /// What happened.
-    pub kind: TimerEventKind,
-    /// Home Assistant's timer ID.
-    pub timer_id: String,
-    /// The timer's name, if it has one.
-    pub name: Option<String>,
-    /// The timer's full length in seconds.
-    pub total_seconds: u32,
-    /// Seconds left.
-    pub seconds_left: u32,
-    /// Whether it is counting down (not paused).
-    pub is_active: bool,
 }
 
 /// How a controller-started run ended. Each run gets exactly one of these
@@ -950,9 +923,7 @@ impl Actor {
         let id = run.id;
         if response.error {
             self.run = None;
-            if self.response_owner.is_some_and(|(owner, _)| owner == id) {
-                self.response_owner = None;
-            }
+            self.forget_response(id);
             self.deliver_run(id, RunEvent::Closed(RunClosed::Refused), Some(conn));
             return;
         }
@@ -1004,9 +975,7 @@ impl Actor {
                 if let Some(active) = self.run.take_if(|active| active.id == run) {
                     self.core.send(active.conn, stop_frame());
                 }
-                if self.response_owner.is_some_and(|(owner, _)| owner == run) {
-                    self.response_owner = None;
-                }
+                self.forget_response(run);
             }
             Command::FinishRunResponse {
                 run,
@@ -1029,6 +998,14 @@ impl Actor {
                 };
                 let _ = reply.send(result);
             }
+        }
+    }
+
+    /// Home Assistant will not wait on `run`'s spoken reply: the run ended before it
+    /// could have one.
+    fn forget_response(&mut self, run: RunId) {
+        if self.response_owner.is_some_and(|(owner, _)| owner == run) {
+            self.response_owner = None;
         }
     }
 
@@ -1130,9 +1107,7 @@ impl Actor {
         if active.pending_bytes > MAX_PENDING_RUN_AUDIO {
             self.run = None;
             self.core.send(conn, stop_frame());
-            if self.response_owner.is_some_and(|(owner, _)| owner == id) {
-                self.response_owner = None;
-            }
+            self.forget_response(id);
             self.deliver_run(id, RunEvent::Closed(RunClosed::AudioBacklog), None);
         }
     }

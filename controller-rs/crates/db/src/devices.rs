@@ -21,9 +21,9 @@ use crate::{
 };
 
 /// The first ESPHome voice satellite port (§3.3.1).
-pub const ESPHOME_FIRST_PORT: u16 = 16001;
+pub(crate) const ESPHOME_FIRST_PORT: u16 = 16001;
 /// A device's Bluetooth proxy listens on its voice port plus this (§3.3.2).
-pub const BLE_PROXY_PORT_OFFSET: u16 = 1000;
+const BLE_PROXY_PORT_OFFSET: u16 = 1000;
 /// Random bytes in a link token; URL-safe base64 without padding makes 43 characters,
 /// the length of the tokens already stored.
 const TOKEN_BYTES: usize = 32;
@@ -451,7 +451,7 @@ impl WriteCommand for EnsureEsphomePort {
     }
 }
 
-/// The device's Bluetooth proxy port, its voice port plus [`BLE_PROXY_PORT_OFFSET`],
+/// The device's Bluetooth proxy port, its voice port plus 1000,
 /// stored on first use (§3.3.2). None while the device has no voice port.
 #[derive(Clone, Debug)]
 pub struct EnsureBleProxyPort {

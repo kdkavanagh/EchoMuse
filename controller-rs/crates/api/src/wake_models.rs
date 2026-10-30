@@ -15,7 +15,7 @@
 //! registered is returned unchanged without running it again. A new model is not
 //! selected anywhere.
 
-use std::{fmt, future::Future, pin::Pin, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use axum::{
     Json, Router,
@@ -38,6 +38,7 @@ use crate::{
     auth::{AdminUser, AuthenticatedUser},
     error::{ApiError, ErrorCode},
     params::TextPath,
+    services::BoxFuture,
     state::ApiState,
 };
 
@@ -91,21 +92,7 @@ pub trait ModelQualifier: Send + Sync + 'static {
     fn qualify(
         &self,
         candidate: ModelCandidate,
-    ) -> impl Future<Output = Result<ProbeResult, ModelRefused>> + Send;
-}
-
-type QualifyFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<ProbeResult, ModelRefused>> + Send + 'a>>;
-
-/// [`ModelQualifier`] behind a pointer.
-pub(crate) trait Qualifier: Send + Sync + 'static {
-    fn qualify(&self, candidate: ModelCandidate) -> QualifyFuture<'_>;
-}
-
-impl<Q: ModelQualifier> Qualifier for Q {
-    fn qualify(&self, candidate: ModelCandidate) -> QualifyFuture<'_> {
-        Box::pin(ModelQualifier::qualify(self, candidate))
-    }
+    ) -> BoxFuture<'_, Result<ProbeResult, ModelRefused>>;
 }
 
 pub(crate) fn routes() -> Router<ApiState> {
@@ -355,7 +342,7 @@ fn model_error(error: ModelError) -> ApiError {
         }
         ModelError::Closed => ApiError::unavailable("The settings service has stopped"),
         error @ (ModelError::Registry(_) | ModelError::Interrupted) => {
-            eprintln!("api: a wake-model registry change failed: {error}");
+            tracing::error!(%error, "a wake-model registry change failed");
             ApiError::internal("The wake-model registry could not be changed")
         }
     }

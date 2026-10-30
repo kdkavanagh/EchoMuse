@@ -369,7 +369,7 @@ impl SoundCatalog {
 fn recorded_state(dir: &SoundsDir, id: &SoundId, format: UploadFormat) -> ExportState {
     let current = || -> Option<ExportState> {
         let stamp = upload_stamp(&dir.upload_path(id, format)).ok()?;
-        let text = fs::read_to_string(dir.root().join(SoundsDir::record_name(id))).ok()?;
+        let text = fs::read_to_string(dir.record_path(id)).ok()?;
         let record = ExportRecord::parse(&text)?;
         if record.stamp != stamp {
             return None;
@@ -420,7 +420,7 @@ fn store_asset(
 ) -> Result<ExportState, ExportError> {
     let asset = export::finish(export::decode(ffmpeg, path, dir.root(), stop)?)?;
     if !dir.asset_path(&asset.sha256).is_file() {
-        let name = format!("{}.wav", asset.sha256);
+        let name = SoundsDir::asset_name(&asset.sha256);
         write_atomic(&dir.assets(), &name, &asset.wav, PRIVATE_MODE)
             .map_err(|e| ExportError::Io(e.to_string()))?;
     }

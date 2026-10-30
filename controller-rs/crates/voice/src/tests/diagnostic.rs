@@ -151,7 +151,10 @@ async fn a_button_turn_is_refused_while_a_recording_mode_runs() {
     let tap = rig.device.tap(rig.device.captured(), 1);
     rig.control(echomuse_protocol::MessageType::ButtonAction, tap, 0);
     assert_eq!(turn_opens(&rig), 0, "no button turn while recording");
-    assert!(rig.voice.turn.is_none());
+    assert_eq!(
+        rig.voice.status().state,
+        echomuse_presentation::phase::ActorState::Idle
+    );
 }
 
 fn echomuse_link_ack() -> echomuse_playback::AckOutcome {

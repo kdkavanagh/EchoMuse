@@ -54,7 +54,7 @@ fn repo() -> PathBuf {
 }
 
 fn native() -> NativeLibraries {
-    NativeLibraries::pinned(asset("ECHOMUSE_ORT_LIB"), None).unwrap()
+    NativeLibraries::pinned(asset("ECHOMUSE_ORT_LIB")).unwrap()
 }
 
 fn ort() -> OrtRuntime {

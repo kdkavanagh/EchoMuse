@@ -17,7 +17,7 @@ use echomuse_db::devices::{
 };
 use echomuse_protocol::envelope::{ControlFrame, HelloRefused, HelloRequest};
 use echomuse_protocol::session::{SessionReady, SessionRejected, check_admission};
-use echomuse_protocol::{RejectReason, encode_envelope, parse_hello};
+use echomuse_protocol::{Platform, RejectReason, encode_envelope, parse_hello};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::oneshot;
 use tokio::time::{Instant, timeout, timeout_at};
@@ -28,11 +28,11 @@ use crate::auth::{PresentedToken, Transport, authorize};
 use crate::config::utc_ms;
 use crate::control::{Ws, WsSink, WsStream, new_session};
 use crate::server::Shared;
-use crate::session::{CloseReason, SessionCore};
+use crate::session::{CloseReason, LinkSession, SessionCore, SocketKind};
 
 /// What the checks before admission decided.
 enum Verdict {
-    Admit(Box<(HelloRequest, DeviceRow)>),
+    Admit(Box<(HelloRequest, Platform, DeviceRow)>),
     Reject {
         device: DeviceId,
         reason: RejectReason,
@@ -83,8 +83,11 @@ pub(crate) async fn serve_control(
             close(&mut sink, &shared).await;
         }
         Verdict::Admit(admitted) => {
-            let (hello, row) = *admitted;
-            admit(&shared, hello, row, transport, peer, deadline, sink, stream).await;
+            let (hello, platform, row) = *admitted;
+            admit(
+                &shared, hello, platform, row, transport, peer, deadline, sink, stream,
+            )
+            .await;
         }
     }
 }
@@ -146,13 +149,16 @@ async fn check_hello(
     else {
         return Verdict::Close;
     };
-    if let Err(refusal) = check_admission(hello) {
-        tracing::info!(%device, %refusal, "refusing a hello");
-        return Verdict::Reject {
-            device,
-            reason: refusal.reason(),
-        };
-    }
+    let platform = match check_admission(hello) {
+        Ok(platform) => platform,
+        Err(refusal) => {
+            tracing::info!(%device, %refusal, "refusing a hello");
+            return Verdict::Reject {
+                device,
+                reason: refusal.reason(),
+            };
+        }
+    };
     let require_tls = shared.config.require_device_tls;
     if let Err(refusal) = authorize(token, row.token.as_ref(), transport, require_tls) {
         tracing::info!(%device, %transport, %refusal, "refusing an unauthorized hello");
@@ -175,7 +181,7 @@ async fn check_hello(
             Approval::Failed => return Verdict::Close,
         }
     };
-    Verdict::Admit(Box::new((request, row)))
+    Verdict::Admit(Box::new((request, platform, row)))
 }
 
 /// Records one connection attempt; `None` (logged) when the database refused it.
@@ -262,10 +268,13 @@ impl Drop for ReleaseGuard<'_> {
     }
 }
 
+/// Admits a checked hello: ends the device's previous session, asks the integrator for
+/// the grant, writes `session.ready` and runs the session.
 #[allow(clippy::too_many_arguments)]
 async fn admit(
     shared: &Shared,
     request: HelloRequest,
+    platform: Platform,
     row: DeviceRow,
     transport: Transport,
     peer: SocketAddr,
@@ -275,10 +284,6 @@ async fn admit(
 ) {
     let HelloRequest { header, hello } = request;
     let device = header.device_id;
-    let platform = match check_admission(&hello) {
-        Ok(platform) => platform,
-        Err(_) => unreachable!("check_hello admitted the hello"),
-    };
     let (session, runner) = new_session(
         device.clone(),
         transport,
@@ -294,7 +299,6 @@ async fn admit(
     if let Some(old) = shared.registry.claim(Arc::clone(&core)) {
         old.end(CloseReason::Replaced);
     }
-    let capabilities = hello.capabilities.clone();
     let request = AdmissionRequest {
         device: device.clone(),
         session_id: core.session_id.clone(),
@@ -304,47 +308,10 @@ async fn admit(
         platform,
         device_row: row,
     };
-    let decision = tokio::select! {
-        _ = core.stop.cancelled() => None,
-        decision = timeout_at(deadline, shared.admission.admit(request, session)) => Some(decision),
-    };
-    let grant = match decision {
-        None => {
-            close(&mut sink, shared).await;
-            return;
-        }
-        Some(Ok(AdmissionDecision::Ready(grant))) => grant,
-        Some(Ok(AdmissionDecision::Decline(detail))) => {
-            core.end(CloseReason::Declined(detail));
-            close(&mut sink, shared).await;
-            return;
-        }
-        Some(Err(_)) => {
-            core.end(CloseReason::Declined(
-                "admission did not answer before the ready deadline".to_owned(),
-            ));
-            close(&mut sink, shared).await;
-            return;
-        }
-    };
-    let Some(utc_ms) = utc_ms(shared.config.wall_clock.as_ref()) else {
-        core.end(CloseReason::Declined(
-            "the wall clock reads before 1970".to_owned(),
-        ));
-        close(&mut sink, shared).await;
-        return;
-    };
-    let ready = SessionReady::new(
-        &grant,
-        &capabilities,
-        core.session_id.clone(),
-        shared.server_boot_id,
-        utc_ms,
-    );
-    let encoded = match encode_envelope(&ready, Some(&core.session_id), &device, 0) {
-        Ok(encoded) => encoded,
-        Err(error) => {
-            core.end(CloseReason::Declined(format!("session.ready: {error}")));
+    let ready = match session_ready(shared, &core, request, session, deadline).await {
+        Ok(ready) => ready,
+        Err(reason) => {
+            core.end(reason);
             close(&mut sink, shared).await;
             return;
         }
@@ -354,29 +321,61 @@ async fn admit(
     let (audio_tx, audio_rx) = oneshot::channel();
     if !shared.registry.activate(&core, audio_tx) {
         core.end(CloseReason::Replaced);
-        close(&mut sink, shared).await;
-        return;
     }
     if core.stop.is_cancelled() {
+        core.end(core.ended_reason());
         close(&mut sink, shared).await;
         return;
     }
-    let written = timeout(
-        shared.config.timings.write,
-        sink.send(Message::text(encoded.text)),
-    )
-    .await;
+    let written = timeout(shared.config.timings.write, sink.send(Message::text(ready))).await;
     if let Some(detail) = match written {
         Ok(Ok(())) => None,
         Ok(Err(error)) => Some(error.to_string()),
         Err(_) => Some("session.ready stalled past the write deadline".to_owned()),
     } {
         core.end(CloseReason::SocketClosed {
-            socket: crate::session::SocketKind::Control,
+            socket: SocketKind::Control,
             detail,
         });
         return;
     }
     tracing::info!(%device, session = %core.session_id, %transport, %peer, "device session ready");
     runner.run(shared, sink, stream, audio_rx).await;
+}
+
+/// Asks the integrator for the grant within `deadline` and encodes `session.ready`;
+/// otherwise why the session ends without it.
+async fn session_ready(
+    shared: &Shared,
+    core: &SessionCore,
+    request: AdmissionRequest,
+    session: LinkSession,
+    deadline: Instant,
+) -> Result<String, CloseReason> {
+    let capabilities = request.hello.capabilities.clone();
+    let decision = tokio::select! {
+        _ = core.stop.cancelled() => return Err(core.ended_reason()),
+        decision = timeout_at(deadline, shared.admission.admit(request, session)) => decision,
+    };
+    let grant = match decision {
+        Ok(AdmissionDecision::Ready(grant)) => grant,
+        Ok(AdmissionDecision::Decline(detail)) => return Err(CloseReason::Declined(detail)),
+        Err(_) => {
+            return Err(CloseReason::Declined(
+                "admission did not answer before the ready deadline".to_owned(),
+            ));
+        }
+    };
+    let utc_ms = utc_ms(shared.config.wall_clock.as_ref())
+        .ok_or_else(|| CloseReason::Declined("the wall clock reads before 1970".to_owned()))?;
+    let ready = SessionReady::new(
+        &grant,
+        &capabilities,
+        core.session_id.clone(),
+        shared.server_boot_id,
+        utc_ms,
+    );
+    core.encode(&ready, 0)
+        .map(|encoded| encoded.text)
+        .map_err(|error| CloseReason::Declined(format!("session.ready: {error}")))
 }

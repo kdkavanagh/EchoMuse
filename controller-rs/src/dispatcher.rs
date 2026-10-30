@@ -22,14 +22,12 @@
 use std::{collections::HashMap, num::NonZeroU64, sync::Arc};
 
 use echomuse_alerts::{
-    Act, AlertHandle, AlertNotice, DeviceAttach, EndpointConfig, OpId, RingRef,
-    timers::{TimerEvent, TimerEventKind},
+    Act, AlertHandle, DeviceAttach, EndpointConfig, OpId, RingRef,
     wire::{ActAction, ActSource, AlertInbound},
 };
 use echomuse_api::{AlertNotice as DashboardNotice, ApiEvent, EventPublisher};
 use echomuse_core::types::DeviceId;
 use echomuse_db::{DbHandle, devices::GetDevice};
-use echomuse_esphome::voice::{TimerEvent as SatelliteTimer, TimerEventKind as SatelliteKind};
 use echomuse_firmware::{DeviceHello, FirmwareVersion};
 use echomuse_presentation::sounds::{catalog::CatalogSnapshot, service::SoundHandle};
 use echomuse_settings::service::SettingsHandle;
@@ -38,7 +36,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use crate::{
     app::Directory,
     device_events::{DeviceEvent, ReadySession},
-    firmware_control::{Firmware, device_target, supervise},
+    firmware_control::{Firmware, device_target},
     supervision::TaskSupervisor,
 };
 
@@ -89,22 +87,6 @@ async fn endpoint(
         timer_loop_gap_ms: gap_ms,
         timer_max_ring_ms: NonZeroU64::new(max_ring_ms)?,
     })
-}
-
-fn timer_event(event: SatelliteTimer) -> TimerEvent {
-    TimerEvent {
-        kind: match event.kind {
-            SatelliteKind::Started => TimerEventKind::Started,
-            SatelliteKind::Updated => TimerEventKind::Updated,
-            SatelliteKind::Cancelled => TimerEventKind::Cancelled,
-            SatelliteKind::Finished => TimerEventKind::Finished,
-        },
-        timer_id: event.timer_id,
-        name: event.name,
-        total_seconds: event.total_seconds,
-        seconds_left: event.seconds_left,
-        is_active: event.is_active,
-    }
 }
 
 impl Dispatcher {
@@ -229,7 +211,7 @@ impl Dispatcher {
                 None => {}
             },
             DeviceEvent::Timer { device, event } => {
-                self.alerts.timer_event(device, timer_event(event))?;
+                self.alerts.timer_event(device, event)?;
             }
             DeviceEvent::StopAlert { device } => self.stop_alert(device),
         }
@@ -251,7 +233,7 @@ impl Dispatcher {
                 }
             };
             match firmware.queued_update_on_connect(target).await {
-                Ok(Some(job)) => supervise(&tasks, "queued update", device, job.run()),
+                Ok(Some(job)) => drop(tasks.spawn("queued update", job.run())),
                 Ok(None) => {}
                 Err(failure) => {
                     tracing::warn!(%device, %failure, "the queued install did not start")
@@ -291,24 +273,6 @@ impl Dispatcher {
     }
 }
 
-/// The device a notice is about, when it is about one.
-fn notice_device(notice: &AlertNotice) -> Option<&DeviceId> {
-    match notice {
-        AlertNotice::TimerFinishMissed { device, .. }
-        | AlertNotice::TimerRingUndeliverable { device, .. }
-        | AlertNotice::RingEnded { device, .. }
-        | AlertNotice::OperationRejected { device, .. }
-        | AlertNotice::MalformedEvent { device, .. }
-        | AlertNotice::CalendarProblem { device, .. }
-        | AlertNotice::TooManyOccurrences { device, .. }
-        | AlertNotice::MalformedMessage { device, .. } => Some(device),
-        AlertNotice::UnreadableJournalRow { .. }
-        | AlertNotice::DatabaseProblem(_)
-        | AlertNotice::Script { .. }
-        | AlertNotice::TimeZoneUnknown(_) => None,
-    }
-}
-
 /// Logs the alert service's notices and tells the dashboard which speakers' alerts
 /// changed (`alerts` with kind `changed`: its alert panel reads them again). A change
 /// of what rings on a speaker is one too.
@@ -321,7 +285,7 @@ pub async fn publish_alert_notices(alerts: AlertHandle, publisher: EventPublishe
             notice = notices.recv() => match notice {
                 Ok(notice) => {
                     tracing::info!(?notice, "alert notice");
-                    if let Some(device) = notice_device(&notice) {
+                    if let Some(device) = notice.device() {
                         publisher.publish(&ApiEvent::Alerts {
                             device_id: device.clone(),
                             notice: DashboardNotice::Changed,

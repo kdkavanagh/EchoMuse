@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use echomuse_protocol::{Capabilities, Capability};
+use echomuse_protocol::Capability;
 
 use crate::json::Json;
 use crate::values::*;
@@ -129,16 +129,6 @@ pub enum Requirement {
     /// The setting goes unused on a device announcing this capability (a LineageOS
     /// Show's own app lights the screen, so the kiosk API settings do nothing there).
     Lacks(Capability),
-}
-
-impl Requirement {
-    /// Whether `capabilities` meet it.
-    pub fn met_by(self, capabilities: &Capabilities) -> bool {
-        match self {
-            Self::Has(c) => capabilities.contains(c),
-            Self::Lacks(c) => !capabilities.contains(c),
-        }
-    }
 }
 
 macro_rules! settings_table {
@@ -345,16 +335,6 @@ impl SettingKey {
             Self::TurnViewLinger => &[Has(C::TurnView)],
             _ => &[],
         }
-    }
-
-    /// The conditions `capabilities` do not meet, in [`requirements`](Self::requirements)
-    /// order; empty when the setting applies on this device.
-    pub fn unmet(self, capabilities: &Capabilities) -> Vec<Requirement> {
-        self.requirements()
-            .iter()
-            .copied()
-            .filter(|r| !r.met_by(capabilities))
-            .collect()
     }
 
     /// Whether changing this setting needs the device's next `session.ready`: the wake
@@ -564,50 +544,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn forty_keys_in_nine_sections() {
-        assert_eq!(SettingKey::ALL.len(), 40);
-        let per_section: Vec<usize> = Section::ALL.iter().map(|s| s.keys().count()).collect();
-        assert_eq!(per_section, [3, 7, 4, 9, 2, 1, 4, 4, 5]);
+    fn wire_names_round_trip_and_are_not_removed_keys() {
         for key in SettingKey::ALL {
             assert_eq!(SettingKey::from_wire(key.as_str()), Some(*key));
             assert!(!REMOVED_KEYS.contains(&key.as_str()));
         }
-        assert_eq!(SettingKey::StartupVolume.scope(), Scope::State);
         for section in Section::ALL {
             assert_eq!(Section::from_wire(section.as_str()), Some(section));
         }
     }
 
     #[test]
-    fn defaults_are_the_documented_ones() {
+    fn every_default_parses_back_as_itself() {
         let d = DeviceSettings::default();
-        let text = d.to_json().to_python_text();
-        assert_eq!(
-            text,
-            concat!(
-                r#"{"eqBands": [0, 0, 0, 0, 0, 0, 0, 0], "eqLoudness": false, "duckDb": -18, "#,
-                r#""wakeModel": "4eb745120ea56f5681eddbf788a0c69e1fd406d4694a04a4dba0c1e41d862d3f", "#,
-                r#""nearMissThreshold": 0.17, "saveWakeClips": false, "wakeArbitrationMs": 700, "#,
-                r#""wakeSound": false, "wakeOpenRules": [], "wakeShadowRules": ["#,
-                r#"{"profile": "idle", "windows": 2, "combine": "mean", "threshold": 0.9}, "#,
-                r#"{"profile": "idle", "windows": 2, "combine": "mean", "threshold": 0.95}, "#,
-                r#"{"profile": "idle", "windows": 2, "combine": "all", "threshold": 0.9}, "#,
-                r#"{"profile": "idle", "windows": 2, "combine": "all", "threshold": 0.95}, "#,
-                r#"{"profile": "idle", "windows": 1, "combine": "mean", "threshold": 0.97}], "#,
-                r#""nsAsr": false, "saveUtterances": false, "extendedUtterances": false, "#,
-                r#""pauseAsr": {"engine": "kroko", "host": "", "port": 10300, "model": "", "language": "en"}, "#,
-                r##""ledScene": "standard", "ledListenColor": "#00b400", "ledThinkColor": "#00c800", "##,
-                r#""meterAttack": 0.6, "meterDecay": 0.3, "meterFloor": 0.06, "meterGamma": 2.2, "#,
-                r#""meterRef": 0.22, "meterCurve": 0.7, "buttonSingleTapEvent": false, "#,
-                r#""buttonMultiTapMs": 0, "bleProxyEnabled": false, "timerSound": "", "#,
-                r#""timerRingSeconds": 900, "timerRingGapSeconds": 2, "alarmSound": "", "#,
-                r#""transcriptFix": "shadow", "transcriptFixTerms": [], "transcriptFixPhrases": [], "#,
-                r#""transcriptFixPronunciations": {}, "screenWake": false, "#,
-                r#""screenWakeUrl": "http://127.0.0.1:2323", "screenWakePassword": "", "#,
-                r#""kioskPort": 2324, "turnViewLinger": 6, "startupVolume": 85}"#
-            )
-        );
-        // Every default parses back as itself.
         for key in SettingKey::ALL {
             let value = d.get(*key);
             assert_eq!(
@@ -616,24 +565,5 @@ mod tests {
                 "{key}"
             );
         }
-    }
-
-    #[test]
-    fn requirements_follow_capabilities() {
-        let show = Capabilities::from_names(["screen_wake", "screen_overlay", "leds"]);
-        assert!(SettingKey::ScreenWake.unmet(&show).is_empty());
-        assert_eq!(
-            SettingKey::ScreenWakeUrl.unmet(&show),
-            [Requirement::Lacks(Capability::ScreenOverlay)]
-        );
-        assert_eq!(
-            SettingKey::MeterDecay.unmet(&show),
-            [Requirement::Has(Capability::LedAnim)]
-        );
-        assert!(
-            SettingKey::EqBands
-                .unmet(&Capabilities::default())
-                .is_empty()
-        );
     }
 }

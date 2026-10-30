@@ -5,7 +5,7 @@ use std::{io, path::PathBuf};
 
 use bytes::Bytes;
 use echomuse_link::{Admission, AdmissionDecision, AdmissionRequest, AssetSource, LinkSession};
-use echomuse_protocol::{Capability, Sha256};
+use echomuse_protocol::{Capability, Sha256, session::ReadyGrant};
 use echomuse_settings::service::SettingsHandle;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -50,16 +50,14 @@ impl ControllerAdmission {
         }
     }
 
-    async fn decide(
+    /// The grant for an admitted session, or why it is declined.
+    async fn grant(
         &self,
         request: AdmissionRequest,
         session: LinkSession,
-    ) -> Result<AdmissionDecision, String> {
+    ) -> Result<ReadyGrant, String> {
         if self.closing.is_cancelled() {
             return Err("the controller is shutting down".to_owned());
-        }
-        if !request.device_row.approved {
-            return Err("the device is not approved".to_owned());
         }
         if self.registry.is_retiring(&request.device) {
             return Err("the device is being deleted".to_owned());
@@ -118,7 +116,7 @@ impl ControllerAdmission {
                 platform: request.platform,
                 peer: request.peer.ip(),
                 label: request.device_row.label,
-                afe_metadata: grant.afe_metadata && afe_capable,
+                afe_metadata: grant.afe_metadata,
                 bluetooth_proxy,
                 capture_permitted,
                 capture_refusal,
@@ -126,15 +124,15 @@ impl ControllerAdmission {
             })
             .await
             .map_err(|error| format!("the device runtime did not attach the session: {error}"))?;
-        Ok(AdmissionDecision::Ready(grant))
+        Ok(grant)
     }
 }
 
 impl Admission for ControllerAdmission {
     async fn admit(&self, request: AdmissionRequest, session: LinkSession) -> AdmissionDecision {
         let device = request.device.clone();
-        match self.decide(request, session).await {
-            Ok(decision) => decision,
+        match self.grant(request, session).await {
+            Ok(grant) => AdmissionDecision::Ready(grant),
             Err(reason) => {
                 tracing::warn!(%device, %reason, "device session declined");
                 AdmissionDecision::Decline(reason)

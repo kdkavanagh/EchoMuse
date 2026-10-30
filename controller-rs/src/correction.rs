@@ -15,19 +15,17 @@
 //!
 //! Each device session compiles its speaker's own preferences (terms, phrases,
 //! pronunciations) against the published tables on the same builder thread
-//! ([`CorrectionTables::compile`]), and uses the pair as its [`Snapshot`] per turn.
+//! ([`CorrectionTables::snapshot`]), and uses the pair as its [`Snapshot`] per turn.
 
 use std::{sync::Arc, time::Duration};
 
-use echomuse_correction::{
-    KnownPhrase, PhraseSource, Preferences, Snapshot, TableBuilder, TableInputs, Tables,
-};
+use echomuse_correction::{KnownPhrase, PhraseSource, Snapshot, TableBuilder, TableInputs, Tables};
 use echomuse_db::DbHandle;
 use echomuse_grammar::{Grammar, Vocabulary};
 use echomuse_ha::{AUTOMATIONS_EVENT, HaClient, VOCABULARY_EVENTS};
 use echomuse_records::{AnsweredRequests, TurnStored};
 use echomuse_settings::settings::TranscriptSettings;
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::supervision::TaskSupervisor;
 
@@ -38,9 +36,9 @@ const RETRY: Duration = Duration::from_secs(10);
 /// The least time between rebuilds for new turn rows.
 const HISTORY_SETTLE: Duration = Duration::from_secs(60);
 /// The most sentences one trigger template may say to be taken as known phrases.
-pub const TRIGGER_SENTENCES: usize = 256;
+const TRIGGER_SENTENCES: usize = 256;
 /// The most earlier requests taken as known phrases.
-pub const HISTORY_REQUESTS: u32 = 5_000;
+const HISTORY_REQUESTS: u32 = 5_000;
 
 /// The published correction tables and the builder that compiles preferences against
 /// them. Cheap to clone.
@@ -77,23 +75,18 @@ impl CorrectionTables {
         self.tables.clone()
     }
 
-    /// Compiles a speaker's preferences against `tables` on the builder thread; the
-    /// receiver yields nothing if the thread stopped.
-    pub fn compile(
-        &self,
-        tables: Arc<Tables>,
-        settings: TranscriptSettings,
-    ) -> oneshot::Receiver<Arc<Preferences>> {
-        self.builder.compile_preferences(tables, settings)
-    }
-
-    /// A speaker's snapshot: `tables` and its preferences compiled against them.
+    /// A speaker's snapshot: `tables` and its preferences compiled against them on the
+    /// builder thread; `None` if the thread stopped.
     pub async fn snapshot(
         &self,
         tables: Arc<Tables>,
         settings: TranscriptSettings,
     ) -> Option<Snapshot> {
-        let preferences = self.compile(Arc::clone(&tables), settings).await.ok()?;
+        let preferences = self
+            .builder
+            .compile_preferences(Arc::clone(&tables), settings)
+            .await
+            .ok()?;
         Some(Snapshot {
             tables,
             preferences,
@@ -111,7 +104,7 @@ struct Sources {
 
 /// The known phrases of conversation-trigger `templates`: each template's sentences, a
 /// template saying more than [`TRIGGER_SENTENCES`] (or that does not parse) left out.
-pub fn trigger_phrases(templates: &[String]) -> Vec<KnownPhrase> {
+fn trigger_phrases(templates: &[String]) -> Vec<KnownPhrase> {
     let mut phrases = Vec::new();
     for template in templates {
         match echomuse_grammar::expand_template(template, TRIGGER_SENTENCES) {

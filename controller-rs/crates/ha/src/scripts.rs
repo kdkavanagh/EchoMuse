@@ -12,10 +12,7 @@
 use echomuse_core::services::{EffectOutcome, HaError};
 use serde_json::{Value, json};
 
-use crate::{
-    calendar::{NotApplied, effect, rest_effect, rest_message},
-    client::{HaClient, object},
-};
+use crate::client::{HaClient, object, rest_effect, rest_message};
 
 impl HaClient {
     /// The stored configuration of script `object_id`; `None` when HA has none.
@@ -41,55 +38,36 @@ impl HaClient {
         let sent = self
             .rest_post(&format!("/config/script/config/{object_id}"), config)
             .await;
-        match rest_effect(sent) {
-            EffectOutcome::Applied(_) => EffectOutcome::Applied(()),
-            other => other.map_applied(),
-        }
+        rest_effect(sent, |_| Some(()))
     }
 
     /// Reloads HA's scripts (`script.reload`).
     pub async fn reload_scripts(&self) -> EffectOutcome<()> {
-        let body = object(json!({"type": "call_service", "domain": "script", "service": "reload"}));
-        match effect(
-            self.command(None, body, self.options().command_timeout)
-                .await,
-        ) {
-            EffectOutcome::Applied(_) => EffectOutcome::Applied(()),
-            other => other.map_applied(),
-        }
+        self.apply(object(
+            json!({"type": "call_service", "domain": "script", "service": "reload"}),
+        ))
+        .await
     }
 
     /// Exposes `entity_ids` to the conversation assistant
     /// (`homeassistant/expose_entity`).
     pub async fn expose_to_conversation(&self, entity_ids: &[String]) -> EffectOutcome<()> {
-        let body = object(json!({
+        self.apply(object(json!({
             "type": "homeassistant/expose_entity",
             "assistants": ["conversation"],
             "entity_ids": entity_ids,
             "should_expose": true,
-        }));
-        match effect(
-            self.command(None, body, self.options().command_timeout)
-                .await,
-        ) {
-            EffectOutcome::Applied(_) => EffectOutcome::Applied(()),
-            other => other.map_applied(),
-        }
+        })))
+        .await
     }
 
     /// Fires `event_type` on HA's event bus with `data` (`fire_event`).
     pub async fn fire_event(&self, event_type: &str, data: Value) -> EffectOutcome<()> {
-        let body = object(json!({
+        self.apply(object(json!({
             "type": "fire_event",
             "event_type": event_type,
             "event_data": data,
-        }));
-        match effect(
-            self.command(None, body, self.options().command_timeout)
-                .await,
-        ) {
-            EffectOutcome::Applied(_) => EffectOutcome::Applied(()),
-            other => other.map_applied(),
-        }
+        })))
+        .await
     }
 }

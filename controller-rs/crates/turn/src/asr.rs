@@ -24,7 +24,7 @@ use crate::text::{TimedTranscript, cut_streaming, locate_in_streaming, normalize
 use crate::time::{CellIndex, Sample, Samples};
 
 /// Samples in one decoder blank frame (40 ms).
-pub const BLANK_FRAME_SAMPLES: u64 = 640;
+const BLANK_FRAME_SAMPLES: u64 = 640;
 /// The finalize runs once VAD has analysed this many cells past the last speech-positive one.
 const FINALIZE_AFTER_CELLS: u64 = 10;
 
@@ -295,11 +295,6 @@ impl PauseFinalizer {
         }
         false
     }
-
-    /// The end of the last speech-positive cell, if any.
-    pub fn last_speech_end(&self) -> Option<Sample> {
-        self.last_speech_end
-    }
 }
 
 #[cfg(test)]
@@ -490,6 +485,5 @@ mod tests {
         assert!(!f.due());
         f.observe_cell(CellIndex(22), Some(0.0));
         assert!(f.due(), "re-armed by later speech");
-        assert_eq!(f.last_speech_end(), Some(CellIndex(12).end()));
     }
 }

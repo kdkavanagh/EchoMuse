@@ -2,7 +2,7 @@
 //!
 //! Every HA request and reply passes through [`redact()`] inside the recorder before it is
 //! queued, so no credential reaches the write queue, let alone the disk. A value is replaced by
-//! [`REDACTED`] when:
+//! `[redacted]` when:
 //!
 //! - its key names a credential: any key that, lowercased with `_`, `-`, `.` and spaces
 //!   removed, contains `token`, `password`, `passwd`, `secret`, `cookie`, `authorization`,
@@ -17,10 +17,10 @@
 use serde_json::Value;
 
 /// What a redacted value is replaced with.
-pub const REDACTED: &str = "[redacted]";
+pub(crate) const REDACTED: &str = "[redacted]";
 
 /// Whether a key names a credential.
-pub fn is_credential_key(key: &str) -> bool {
+fn is_credential_key(key: &str) -> bool {
     let k: String = key
         .chars()
         .filter(|c| !matches!(c, '_' | '-' | '.' | ' '))
@@ -97,7 +97,7 @@ fn redact_str(s: &str) -> (Option<String>, u32) {
 
 /// Removes every credential from `value`, returning the cleaned copy and how many values were
 /// replaced.
-pub fn redact(value: &Value) -> (Value, u32) {
+pub(crate) fn redact(value: &Value) -> (Value, u32) {
     let mut out = value.clone();
     let n = redact_in_place(&mut out);
     (out, n)

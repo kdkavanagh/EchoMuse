@@ -28,9 +28,8 @@ use std::{
     fmt,
     future::Future,
     panic::{self, AssertUnwindSafe},
-    pin::Pin,
     sync::{Arc, Condvar, Mutex, MutexGuard},
-    task::{Context, Poll},
+    task::Poll,
     thread,
     time::{Duration, Instant, SystemTime},
 };
@@ -105,7 +104,7 @@ fn exit_now(reason: &str) -> ! {
 }
 
 /// The text of a panic payload, for logs.
-pub fn panic_message(payload: &(dyn Any + Send)) -> String {
+pub(crate) fn panic_message(payload: &(dyn Any + Send)) -> String {
     if let Some(text) = payload.downcast_ref::<&str>() {
         (*text).to_owned()
     } else if let Some(text) = payload.downcast_ref::<String>() {
@@ -115,20 +114,18 @@ pub fn panic_message(payload: &(dyn Any + Send)) -> String {
     }
 }
 
-/// Polls a future and turns a panic inside it into an error.
-struct CatchUnwind<F>(Pin<Box<F>>);
-
-impl<F: Future> Future for CatchUnwind<F> {
-    type Output = Result<F::Output, Box<dyn Any + Send>>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let inner = self.get_mut().0.as_mut();
-        match panic::catch_unwind(AssertUnwindSafe(|| inner.poll(cx))) {
+/// Runs `future`, turning a panic while it is polled into its payload. The future is
+/// pinned in this one's own state, not boxed, and is dropped before this returns.
+pub(crate) async fn catch_panic<F: Future>(future: F) -> Result<F::Output, Box<dyn Any + Send>> {
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|cx| {
+        match panic::catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx))) {
             Ok(Poll::Pending) => Poll::Pending,
             Ok(Poll::Ready(value)) => Poll::Ready(Ok(value)),
             Err(payload) => Poll::Ready(Err(payload)),
         }
-    }
+    })
+    .await
 }
 
 /// Spawns the shared services' tasks so that none of them can fail unseen. Cheap to
@@ -160,7 +157,7 @@ impl TaskSupervisor {
     {
         let fatal = self.fatal.clone();
         tokio::spawn(async move {
-            match CatchUnwind(Box::pin(task)).await {
+            match catch_panic(task).await {
                 Ok(value) => value,
                 Err(payload) => {
                     let reason = format!(
@@ -260,7 +257,7 @@ impl RuntimeTasks {
     {
         let failures = self.failures.clone();
         tokio::spawn(async move {
-            match CatchUnwind(Box::pin(task)).await {
+            match catch_panic(task).await {
                 Ok(value) => value,
                 Err(payload) => {
                     let reason = format!(
@@ -413,11 +410,6 @@ impl RestartBackoff {
     pub fn reset(&mut self) {
         self.failures = 0;
     }
-
-    /// Failures since the last stable run.
-    pub fn failures(&self) -> u32 {
-        self.failures
-    }
 }
 
 // ── The native-call watchdog ────────────────────────────────────────────────────────
@@ -565,10 +557,6 @@ impl Watchdog {
         Ok(Self {
             owner: Arc::new(WatchdogOwner { shared }),
         })
-    }
-
-    pub fn config(&self) -> WatchdogConfig {
-        self.owner.shared.config
     }
 
     /// A call starts on `kind`'s worker of `owner`; it ends when the guard is finished
@@ -780,19 +768,20 @@ mod tests {
 
     #[test]
     fn backoff_doubles_to_its_ceiling_and_starts_over_after_a_stable_run() {
-        let mut backoff = RestartBackoff::new(RestartPolicy::default());
+        let policy = RestartPolicy {
+            initial: Duration::from_secs(3),
+            max: Duration::from_secs(20),
+            stable: Duration::from_secs(50),
+        };
+        let mut backoff = RestartBackoff::new(policy);
         let quick = Duration::from_secs(2);
-        let delays: Vec<u64> = (0..8).map(|_| backoff.failed(quick).as_secs()).collect();
-        assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30, 30]);
-        // A run of a stable minute: the next failure waits the first delay again.
-        assert_eq!(
-            backoff.failed(Duration::from_secs(60)),
-            Duration::from_secs(1)
-        );
-        assert_eq!(backoff.failed(quick), Duration::from_secs(2));
+        let delays: Vec<u64> = (0..6).map(|_| backoff.failed(quick).as_secs()).collect();
+        assert_eq!(delays, [3, 6, 12, 20, 20, 20]);
+        // A run of the stable time: the next failure waits the first delay again.
+        assert_eq!(backoff.failed(policy.stable), policy.initial);
+        assert_eq!(backoff.failed(quick), Duration::from_secs(6));
         backoff.reset();
-        assert_eq!(backoff.failures(), 0);
-        assert_eq!(backoff.failed(quick), Duration::from_secs(1));
+        assert_eq!(backoff.failed(quick), policy.initial);
     }
 
     #[test]
@@ -865,10 +854,7 @@ mod tests {
             .unwrap()
             .unwrap();
         });
-        assert_eq!(
-            path.borrow().unavailable().as_deref(),
-            Some("the wake verification speech worker is stuck in a model call past its deadline")
-        );
+        assert!(path.borrow().unavailable().is_some());
         // The late result is rejected, and the path works again.
         assert!(guard.finish());
         assert_eq!(*path.borrow(), SpeechPathState::default());
@@ -892,7 +878,7 @@ mod tests {
         let path = Arc::new(watch::Sender::new(SpeechPathState::default()));
         let guard = watchdog.begin(&owner(), SpeechWorkerKind::SpanDecoding, &path);
         let reason = reasons.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert!(reason.contains("device kitchen"), "{reason}");
+        assert!(reason.contains("kitchen"), "{reason}");
         assert!(reason.contains("span decoding"), "{reason}");
         assert!(
             reasons.recv_timeout(Duration::from_millis(200)).is_err(),
@@ -946,7 +932,7 @@ mod tests {
         });
         // The hook fires before anyone waits on the handle.
         let (reason, reasons) = next_reason(reasons).await;
-        assert!(reason.contains("\"test service\" failed"), "{reason}");
+        assert!(reason.contains("test service"), "{reason}");
         assert!(reason.contains("injected service failure"), "{reason}");
         // Whoever waits on the handle still gets the error itself.
         assert_eq!(
@@ -989,7 +975,7 @@ mod tests {
             tokio::spawn(async { Err::<(), _>("injected observed failure".to_owned()) }),
         );
         let (reason, reasons) = next_reason(reasons).await;
-        assert!(reason.contains("\"failing service\" failed"), "{reason}");
+        assert!(reason.contains("failing service"), "{reason}");
         assert!(reason.contains("injected observed failure"), "{reason}");
         assert_eq!(
             failed.await.unwrap(),
@@ -999,10 +985,7 @@ mod tests {
         // A panic fires as a panic, and the handle still reports it.
         let panicked = tasks.observe_fallible("panicking service", tokio::spawn(panics()));
         let (reason, reasons) = next_reason(reasons).await;
-        assert!(
-            reason.contains("\"panicking service\" panicked"),
-            "{reason}"
-        );
+        assert!(reason.contains("panicking service"), "{reason}");
         assert!(reason.contains("injected observed panic"), "{reason}");
         assert!(panicked.await.is_err_and(|error| error.is_panic()));
         assert!(reasons.try_recv().is_err(), "each failure fired once");

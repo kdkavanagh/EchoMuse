@@ -13,9 +13,6 @@
 //! file is first written as `.<name>.<nonce>.tmp` in its final directory, synced, renamed
 //! into place, and the directory synced; only then is its row marked saved.
 //!
-//! Sample clips (`samples/<device>/<unix ms>.wav`, with an optional `<unix ms>.afe.json`
-//! sidecar) have no row; they are published the same way, sidecar first.
-//!
 //! # Retention (spec §4.11, configuration.md "Save utterances" and "Save wake clips")
 //!
 //! Per device: the newest 300 utterance recordings, 100 turn recordings, 1,000 wake clips and
@@ -36,10 +33,7 @@ use echomuse_core::types::DeviceId;
 use echomuse_db::{ReadQuery, WriteCommand};
 use rusqlite::{Connection, Transaction, params};
 
-use crate::{
-    error::RecordError,
-    values::{SAMPLE_RATE_HZ, UnixMillis},
-};
+use crate::{error::RecordError, values::SAMPLE_RATE_HZ};
 
 /// Utterance recordings kept per device.
 pub const UTTERANCE_RETENTION: u32 = 300;
@@ -150,11 +144,6 @@ impl RecordingsLayout {
         self.directory(kind, device)
             .join(Self::file_name(kind, device, id))
     }
-
-    /// A device's sample-clip directory.
-    pub fn samples_directory(&self, device: &DeviceId) -> PathBuf {
-        self.root.join("samples").join(&device.0)
-    }
 }
 
 /// What a directory entry is.
@@ -164,6 +153,9 @@ pub enum EntryName {
     Recording { device: DeviceId, id: i64 },
     /// A temporary file this crate writes before a rename.
     Temporary,
+    /// A recording an earlier controller was still writing (`<name>.wav.part`): left
+    /// alone at startup, deleted with its device.
+    LegacyPartial { device: DeviceId },
     /// Anything else, which is never touched.
     Unrecognized,
 }
@@ -174,8 +166,12 @@ pub fn parse_entry(kind: RecordingKind, name: &str, dir_device: Option<&DeviceId
     if name.starts_with('.') && name.ends_with(".tmp") && name.contains(".wav.") {
         return EntryName::Temporary;
     }
-    let Some(stem) = name.strip_suffix(".wav") else {
-        return EntryName::Unrecognized;
+    let (stem, partial) = match name.strip_suffix(".wav.part") {
+        Some(stem) => (stem, true),
+        None => match name.strip_suffix(".wav") {
+            Some(stem) => (stem, false),
+            None => return EntryName::Unrecognized,
+        },
     };
     let (device, id) = match (kind.per_device_directory(), dir_device) {
         (true, Some(device)) => (device.clone(), stem),
@@ -187,6 +183,7 @@ pub fn parse_entry(kind: RecordingKind, name: &str, dir_device: Option<&DeviceId
     };
     let numeric = !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit());
     match id.parse::<i64>() {
+        Ok(_) if partial && numeric && file_safe(&device) => EntryName::LegacyPartial { device },
         Ok(id) if numeric && id > 0 && file_safe(&device) => EntryName::Recording { device, id },
         _ => EntryName::Unrecognized,
     }
@@ -314,7 +311,10 @@ pub(crate) fn scan(
             let name = parse_entry(kind, text, dir_device);
             let mine = match (&name, only) {
                 (_, None) => true,
-                (EntryName::Recording { device, .. }, Some(d)) => device == d,
+                (
+                    EntryName::Recording { device, .. } | EntryName::LegacyPartial { device },
+                    Some(d),
+                ) => device == d,
                 (EntryName::Temporary, Some(d)) => {
                     dir_device.is_some() || text.starts_with(&format!(".{}_", d.0))
                 }
@@ -356,29 +356,6 @@ pub(crate) fn scan(
         list(&layout.root().join(kind.directory()), None)?;
     }
     Ok(found)
-}
-
-/// Writes a sample clip: the sidecar (if any) and then the WAV, each atomically. Refuses a
-/// name already taken. Blocking.
-pub fn write_sample_clip(
-    layout: &RecordingsLayout,
-    device: &DeviceId,
-    at: UnixMillis,
-    pcm: &[i16],
-    sidecar: Option<&str>,
-) -> io::Result<PathBuf> {
-    let dir = layout.samples_directory(device);
-    let wav = format!("{}.wav", at.0);
-    if dir.join(&wav).exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!("sample clip {wav} already exists"),
-        ));
-    }
-    if let Some(sidecar) = sidecar {
-        write_atomically(&dir, &format!("{}.afe.json", at.0), sidecar.as_bytes())?;
-    }
-    write_atomically(&dir, &wav, &wav_bytes(pcm))
 }
 
 /// Records a turn file as saved: `audio_file` or `wake_file`. False when the row is gone.
@@ -693,12 +670,18 @@ mod tests {
             parse_entry(RecordingKind::Utterance, ".G0A_12.wav.7-1.tmp", None),
             EntryName::Temporary
         );
+        assert_eq!(
+            parse_entry(RecordingKind::NearMiss, "G0A_12.wav.part", None),
+            EntryName::LegacyPartial { device: d.clone() }
+        );
         for odd in [
             "G0A_12.mp3",
             "G0A_x.wav",
             "12.wav",
             "G0A_+1.wav",
             "G0A_0.wav",
+            "G0A_x.wav.part",
+            "G0A_12.part",
         ] {
             assert_eq!(
                 parse_entry(RecordingKind::NearMiss, odd, None),

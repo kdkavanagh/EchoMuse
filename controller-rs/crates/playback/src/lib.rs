@@ -24,8 +24,8 @@
 //! The device link implements [`RenderLink`] (and so [`CommandLink`]):
 //! `request` sends a [`Command`] at a generation and returns the message id
 //! whose `command.ack` the runtime later hands back as an [`AckOutcome`];
-//! `queue_frame` queues a render frame without waiting; `withdraw_frames`
-//! drops a cancelled playback's queued frames. The runtime parses
+//! `queue_frame` queues a render frame without waiting, and the link's writer
+//! drops it unwritten once its playback is cancelled. The runtime parses
 //! `render.progress` and `render.finished` bodies with
 //! [`RenderReport::parse`] and hands them, with the envelope's generation, to
 //! [`RenderClient::on_report`].
@@ -59,16 +59,16 @@ pub use decode::{
 };
 pub use eq::{EqSettings, EqSettingsError, Equalizer};
 pub use focus::{FocusEvent, FocusLease, GenerationError, NotThisLease};
-pub use link::{CommandLink, FramePurge, FrameRefused, LinkClosed, RenderFrame, RenderLink};
+pub use link::{CommandLink, FrameRefused, LinkClosed, RenderFrame, RenderLink};
 pub use media::{
     AnnouncementKey, AnnouncementPlan, CommandOutcome, ContentEnd, ContentEndReason, MediaEffect,
     MediaPlayer, Opener, PlayerState, SatelliteAnnouncement, StreamId, Unavailable,
 };
 pub use render::{
-    AudioRefused, CancelDelivery, LocalStartError, NetworkStart, NotLive, PlaybackEnd, PlaybackRef,
-    RenderClient, RenderEvent, ResponseLimit, ResponseLimits,
+    AudioRefused, LocalStartError, NetworkStart, NotLive, PlaybackEnd, PlaybackRef, RenderClient,
+    RenderEvent, ResponseLimit, ResponseLimits,
 };
 pub use wire::{
-    AckFailure, AckOutcome, AlertPreviewSound, CancelReason, Command, Earcon, FocusKind,
-    FocusOwner, LocalSource, NetworkClass, PlaybackId, RenderReport, SourceClass,
+    AckFailure, AckOutcome, CancelReason, Command, Earcon, FocusKind, FocusOwner, LocalSource,
+    NetworkClass, PlaybackId, RenderReport, SourceClass,
 };

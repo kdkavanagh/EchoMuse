@@ -201,7 +201,7 @@ impl TurnView {
 
 /// `answer` cut to [`MAX_ANSWER_BYTES`]: a longer one is cut at the last word that fits
 /// and ends in "…".
-pub fn bounded_answer(answer: &str) -> String {
+fn bounded_answer(answer: &str) -> String {
     if answer.len() <= MAX_ANSWER_BYTES {
         return answer.to_owned();
     }

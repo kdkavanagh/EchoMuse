@@ -76,12 +76,4 @@ impl ScenePalette {
             meter: vec![head],
         }
     }
-
-    /// The listening colour of LED `index`.
-    pub fn listening_at(&self, index: usize) -> Rgb {
-        match self.listening.as_slice() {
-            [one] => *one,
-            many => many.get(index).copied().unwrap_or_default(),
-        }
-    }
 }

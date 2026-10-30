@@ -350,18 +350,15 @@ impl ButtonPolicy {
             return ButtonDecision::Act(out);
         }
         let events = self.tap_events();
-        match context.activity {
-            TurnActivity::Turn => {
-                self.flush(&mut out);
-                out.push(ButtonOutput::CancelTurn);
-                return ButtonDecision::Act(out);
-            }
-            TurnActivity::ReplyWindow if events => {
-                self.flush(&mut out);
-                out.push(ButtonOutput::CancelTurn);
-                return ButtonDecision::Act(out);
-            }
-            TurnActivity::ReplyWindow | TurnActivity::Idle => {}
+        let cancels = match context.activity {
+            TurnActivity::Turn => true,
+            TurnActivity::ReplyWindow => events,
+            TurnActivity::Idle => false,
+        };
+        if cancels {
+            self.flush(&mut out);
+            out.push(ButtonOutput::CancelTurn);
+            return ButtonDecision::Act(out);
         }
         if events {
             self.tap(action.mono_ns, now, &mut out);

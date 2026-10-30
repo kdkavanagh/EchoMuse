@@ -4,8 +4,8 @@
 //! The actor on that thread is the only code that changes the device's state. It
 //! serializes session admission, installs each session's privacy state before capture
 //! is allowed, and publishes an immutable [`DeviceSnapshot`] whenever something changes.
-//! Other threads talk to it through bounded command queues (ordinary and urgent),
-//! cancellation tokens and that snapshot.
+//! Other threads talk to it through a bounded command queue, cancellation tokens and
+//! that snapshot.
 //!
 //! A device link session handed over with [`DeviceHandle::attach_link`] is read here,
 //! urgent events first: privacy changes and the session's end, then the ordered ingress
@@ -41,7 +41,7 @@ use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
     task::JoinSet,
 };
-use tokio_util::sync::{CancellationToken, DropGuard};
+use tokio_util::sync::CancellationToken;
 
 use echomuse_core::types::{
     DeviceId, QueueLimits, RuntimeError, RuntimeId, SessionId, WorkIdentity, WorkScope,
@@ -53,17 +53,15 @@ use crate::esphome_node::{
 };
 use crate::speech_models::SpeechStatus;
 use crate::speech_workers::{
-    SpeechWorkerHandle, SpeechWorkerKind, SpeechWorkers, Work, WorkerLimits, WorkerWatch,
+    PerWorker, SpeechWorkerHandle, SpeechWorkers, WorkerLimits, WorkerWatch,
 };
 use crate::supervision::{
     Availability, DeviceHealth, RuntimeTasks, SpeechPathState, Supervision, SupervisionOptions,
-    WorkerOwner,
+    WorkerOwner, catch_panic, panic_message,
 };
-use crate::voice_session::{
-    VoiceMessage, VoiceServices, VoiceSession, VoiceStart, VoiceWatch, WatchChange,
-};
+use crate::voice_session::{VoiceMessage, VoiceServices, VoiceSession, VoiceStart, WatchChange};
 use echomuse_esphome::entities::DeviceVolume;
-pub use echomuse_playback::AlertPreviewSound;
+use echomuse_protocol::alerts::AlertSound;
 use echomuse_voice::{Input, PreviewOutcome};
 
 /// Device messages the voice path handles (besides the stream messages).
@@ -231,16 +229,11 @@ pub struct LinkAttach {
     pub kiosk_token: Option<String>,
 }
 
-#[derive(Clone)]
+/// Whether the session's device reports its privacy mute on, and the session's capture
+/// scope (cancelled while muted).
 struct CapturePermission {
     muted: bool,
     scope: WorkScope,
-}
-
-struct SessionState {
-    id: SessionId,
-    stop: CancellationToken,
-    capture: watch::Receiver<CapturePermission>,
 }
 
 /// A link session's receivers and voice path, owned by the actor.
@@ -268,8 +261,8 @@ struct LinkBinding {
 }
 
 /// The shared services a runtime serves its device with. A runtime without them runs
-/// sessions, capture and speech workers only.
-#[derive(Clone, Default)]
+/// its speech workers only and attaches no session.
+#[derive(Clone)]
 pub struct RuntimeServices {
     /// Port assignment, binding and advertising of the device's ESPHome nodes.
     pub esphome: Option<Arc<EsphomeServices>>,
@@ -286,34 +279,17 @@ pub struct RuntimeServices {
 
 // Only run_actor owns and mutates this state. Handles receive snapshots and tokens.
 struct ActiveSession {
-    state: Arc<SessionState>,
-    capture: watch::Sender<CapturePermission>,
-    link: Option<LinkBinding>,
-}
-
-struct SessionGrant {
-    state: Arc<SessionState>,
-    // Cancels the session if its attach reply or last transport handle is dropped.
-    lease: Arc<DropGuard>,
+    id: SessionId,
+    /// Cancelled when the session ends; every scope of the session derives from it.
+    stop: CancellationToken,
+    capture: CapturePermission,
+    link: LinkBinding,
 }
 
 enum Command {
-    Attach {
-        muted: bool,
-        reply: oneshot::Sender<Result<SessionGrant, RuntimeError>>,
-    },
     AttachLink {
         attach: Box<LinkAttach>,
         reply: oneshot::Sender<Result<SessionId, RuntimeError>>,
-    },
-    Privacy {
-        session: SessionId,
-        muted: bool,
-        reply: oneshot::Sender<Result<(), RuntimeError>>,
-    },
-    Detach {
-        session: SessionId,
-        reply: oneshot::Sender<Result<(), RuntimeError>>,
     },
     Renegotiate {
         reply: oneshot::Sender<Result<bool, RuntimeError>>,
@@ -327,7 +303,7 @@ enum Command {
 /// What the dashboard asks of a device's voice path.
 enum VoiceCommand {
     Preview {
-        sound: AlertPreviewSound,
+        sound: AlertSound,
         reply: oneshot::Sender<PreviewOutcome>,
     },
     StopPreview {
@@ -423,10 +399,8 @@ impl CommandQueue {
 pub struct DeviceHandle {
     device: DeviceId,
     runtime: RuntimeId,
-    ordinary: CommandQueue,
-    urgent: CommandQueue,
+    commands: CommandQueue,
     stop: CancellationToken,
-    workers: [SpeechWorkerHandle; 4],
     snapshot: watch::Receiver<DeviceSnapshot>,
 }
 
@@ -457,21 +431,6 @@ impl DeviceHandle {
         self.stop.cancel();
     }
 
-    /// The actor serializes admission, revokes the old session, then installs the new one.
-    pub async fn attach(&self, muted: bool) -> Result<SessionHandle, RuntimeError> {
-        let (reply, received) = oneshot::channel();
-        self.send(Command::Attach { muted, reply }, false)?;
-        let grant = self.wait(received).await?;
-        if grant.state.stop.is_cancelled() {
-            return Err(RuntimeError::StaleSession);
-        }
-        Ok(SessionHandle {
-            device: self.clone(),
-            state: grant.state,
-            _lease: grant.lease,
-        })
-    }
-
     /// Attaches an admitted device link session. The runtime ends the previous session,
     /// installs the hello's privacy state, publishes the capture scope to the link and
     /// then owns the session: it ends when the link reports its end, when the runtime
@@ -479,13 +438,10 @@ impl DeviceHandle {
     /// privacy mute is off attaches muted, so capture needs a positive report.
     pub async fn attach_link(&self, attach: LinkAttach) -> Result<SessionId, RuntimeError> {
         let (reply, received) = oneshot::channel();
-        self.send(
-            Command::AttachLink {
-                attach: Box::new(attach),
-                reply,
-            },
-            false,
-        )?;
+        self.send(Command::AttachLink {
+            attach: Box::new(attach),
+            reply,
+        })?;
         self.wait(received).await
     }
 
@@ -495,16 +451,15 @@ impl DeviceHandle {
     /// was attached.
     pub async fn renegotiate(&self) -> Result<bool, RuntimeError> {
         let (reply, received) = oneshot::channel();
-        self.send(Command::Renegotiate { reply }, false)?;
+        self.send(Command::Renegotiate { reply })?;
         self.wait(received).await
     }
 
-    fn send(&self, command: Command, urgent: bool) -> Result<(), RuntimeError> {
+    fn send(&self, command: Command) -> Result<(), RuntimeError> {
         if self.stop.is_cancelled() {
             return Err(RuntimeError::Closed);
         }
-        let queue = if urgent { &self.urgent } else { &self.ordinary };
-        queue.send(command).inspect_err(|error| {
+        self.commands.send(command).inspect_err(|error| {
             // Required lifecycle events are never silently discarded.
             eprintln!("device {} command queue failed: {error}", self.device);
             self.stop.cancel();
@@ -525,7 +480,7 @@ impl DeviceHandle {
     /// Plays an alert sound's preview on the attached device (`render.start`
     /// `alert_preview`, a local source naming the sound's SHA-256 or the built-in
     /// fallback). Resolves once the device accepted or refused it.
-    pub async fn preview_sound(&self, sound: AlertPreviewSound) -> Result<(), PreviewError> {
+    pub async fn preview_sound(&self, sound: AlertSound) -> Result<(), PreviewError> {
         let (reply, answer) = oneshot::channel();
         self.voice_command(VoiceCommand::Preview { sound, reply })?;
         let outcome = self.voice_answer(answer).await?;
@@ -546,7 +501,7 @@ impl DeviceHandle {
         if self.stop.is_cancelled() {
             return Err(RuntimeError::Closed);
         }
-        self.ordinary
+        self.commands
             .send(Command::Voice(VoiceCommand::KioskToken(token)))
     }
 
@@ -556,7 +511,7 @@ impl DeviceHandle {
         if self.stop.is_cancelled() {
             return Err(RuntimeError::Closed);
         }
-        self.ordinary.send(Command::RecordingChanged)
+        self.commands.send(Command::RecordingChanged)
     }
 
     /// Queues a dashboard request. A full queue refuses it without stopping the runtime:
@@ -565,7 +520,7 @@ impl DeviceHandle {
         if self.stop.is_cancelled() {
             return Err(PreviewError::Runtime(RuntimeError::Closed));
         }
-        self.ordinary
+        self.commands
             .send(Command::Voice(command))
             .map_err(PreviewError::Runtime)
     }
@@ -583,116 +538,6 @@ impl DeviceHandle {
     }
 }
 
-/// A transport holds this session-specific handle. An old handle cannot affect a replacement.
-/// Dropping the final clone ends the session, even if no explicit detach is sent.
-#[derive(Clone)]
-pub struct SessionHandle {
-    device: DeviceHandle,
-    state: Arc<SessionState>,
-    _lease: Arc<DropGuard>,
-}
-
-impl SessionHandle {
-    pub fn id(&self) -> SessionId {
-        self.state.id
-    }
-
-    /// Unmute publishes a new capture scope; it never revives an old scope.
-    pub fn scope(&self) -> Result<WorkScope, RuntimeError> {
-        if self.state.stop.is_cancelled() {
-            return Err(RuntimeError::StaleSession);
-        }
-        let permission = self.state.capture.borrow();
-        if permission.muted {
-            return Err(RuntimeError::Muted);
-        }
-        if permission.scope.is_cancelled() {
-            return Err(RuntimeError::Cancelled);
-        }
-        Ok(permission.scope.clone())
-    }
-
-    pub fn submit<T, F>(
-        &self,
-        kind: SpeechWorkerKind,
-        retained_bytes: usize,
-        work: F,
-    ) -> Result<Work<T>, RuntimeError>
-    where
-        T: Send + 'static,
-        F: FnOnce() -> T + Send + 'static,
-    {
-        self.submit_scoped(self.scope()?, kind, retained_bytes, work)
-    }
-
-    /// A turn can derive its own cancellable scope with WorkScope::for_turn.
-    pub fn submit_scoped<T, F>(
-        &self,
-        scope: WorkScope,
-        kind: SpeechWorkerKind,
-        retained_bytes: usize,
-        work: F,
-    ) -> Result<Work<T>, RuntimeError>
-    where
-        T: Send + 'static,
-        F: FnOnce() -> T + Send + 'static,
-    {
-        self.scope()?;
-        let identity = scope.identity();
-        if identity.device != self.device.device
-            || identity.runtime != self.device.runtime
-            || identity.session != self.state.id
-        {
-            return Err(RuntimeError::StaleSession);
-        }
-        let index = SpeechWorkerKind::ALL
-            .iter()
-            .position(|entry| *entry == kind)
-            .expect("all speech worker kinds are listed");
-        let result = self.device.workers[index].submit(scope, retained_bytes, work);
-        if matches!(result, Err(RuntimeError::Overloaded)) {
-            self.state.stop.cancel();
-        }
-        result
-    }
-
-    pub async fn set_muted(&self, muted: bool) -> Result<(), RuntimeError> {
-        if self.state.stop.is_cancelled() {
-            return Err(RuntimeError::StaleSession);
-        }
-        // Revocation may bypass ordinary work. Only the actor can grant fresh permission.
-        if muted {
-            self.state.capture.borrow().scope.cancel();
-        }
-        let (reply, received) = oneshot::channel();
-        self.device.send(
-            Command::Privacy {
-                session: self.id(),
-                muted,
-                reply,
-            },
-            true,
-        )?;
-        self.device.wait(received).await
-    }
-
-    pub async fn detach(&self) -> Result<(), RuntimeError> {
-        if self.state.stop.is_cancelled() {
-            return Err(RuntimeError::StaleSession);
-        }
-        self.state.stop.cancel();
-        let (reply, received) = oneshot::channel();
-        self.device.send(
-            Command::Detach {
-                session: self.id(),
-                reply,
-            },
-            true,
-        )?;
-        self.device.wait(received).await
-    }
-}
-
 /// One device runtime: its thread, and the handle that commands it.
 pub struct DeviceRuntime {
     handle: DeviceHandle,
@@ -706,17 +551,9 @@ pub struct DeviceRuntime {
 }
 
 impl DeviceRuntime {
-    /// A runtime without ESPHome nodes: sessions, capture and speech workers only.
-    pub async fn start(
-        device: DeviceId,
-        config: DeviceRuntimeConfig,
-    ) -> Result<Self, RuntimeError> {
-        Self::start_with(device, config, RuntimeServices::default()).await
-    }
-
     /// A runtime with the shared services it serves its device with: the device's
     /// ESPHome nodes while a link session is attached, and the device event channel.
-    pub async fn start_with(
+    pub async fn start(
         device: DeviceId,
         config: DeviceRuntimeConfig,
         services: RuntimeServices,
@@ -763,8 +600,7 @@ impl DeviceRuntime {
         );
         let stop = CancellationToken::new();
         let startup_guard = stop.clone().drop_guard();
-        let (ordinary, ordinary_rx) = CommandQueue::new(config.ingress);
-        let (urgent, urgent_rx) = CommandQueue::new(config.ingress);
+        let (commands, commands_rx) = CommandQueue::new(config.ingress);
         snapshots.send_modify(|state| {
             state.runtime = runtime;
             state.lifecycle = Lifecycle::Starting;
@@ -806,15 +642,13 @@ impl DeviceRuntime {
                                 },
                             },
                         )?;
-                        let handles = std::array::from_fn(|index| {
-                            workers.handle(SpeechWorkerKind::ALL[index])
-                        });
+                        let handles = PerWorker::from_fn(|kind| workers.handle(kind));
                         snapshot_tx.send_modify(|state| {
                             state.lifecycle = Lifecycle::Ready;
                             state.workers_ready = true;
                             state.failure = None;
                         });
-                        if ready_tx.send(handles).is_err() {
+                        if ready_tx.send(()).is_err() {
                             child_stop.cancel();
                         }
                         let (voice_tx, voice_rx) =
@@ -834,14 +668,11 @@ impl DeviceRuntime {
                             device: child_device.clone(),
                             runtime,
                             current: None,
-                            next_session: 0,
                             nodes: EsphomeNodes::new(child_device, services.esphome, node_tasks),
                             events: services.events,
                             tasks: JoinSet::new(),
                             counters_due: None,
-                            workers: std::array::from_fn(|index| {
-                                workers.handle(SpeechWorkerKind::ALL[index])
-                            }),
+                            workers: handles,
                             voice_services,
                             taps: services.taps,
                             voice_tx,
@@ -851,7 +682,31 @@ impl DeviceRuntime {
                             speech,
                             task_failures,
                         };
-                        let result = actor.run(ordinary_rx, urgent_rx).await;
+                        // An actor that panics leaves the device's state unknown while
+                        // its speech workers may still be inside native calls, so it
+                        // ends through the same drain as any other stop: no
+                        // replacement starts beside them, and nothing it held is used
+                        // again (§5.5). The actor, its tasks and its session are dropped
+                        // when the catch returns, before the drain.
+                        let result =
+                            catch_panic(actor.run(commands_rx))
+                                .await
+                                .unwrap_or_else(|payload| {
+                                    tracing::error!(
+                                        runtime = runtime.0,
+                                        reason = %panic_message(payload.as_ref()),
+                                        "the device runtime's actor panicked"
+                                    );
+                                    Err(RuntimeError::WorkerPanicked)
+                                });
+                        if result.is_err() {
+                            // Revoke the session's work and close its link now, not
+                            // after the drain; the end is reported below.
+                            child_stop.cancel();
+                            if let Some(link) = &snapshot_tx.borrow().session_link {
+                                link.close();
+                            }
+                        }
                         snapshot_tx.send_modify(|state| state.lifecycle = Lifecycle::Draining);
                         let failure = workers.failure();
                         let shutdown = workers.shutdown(config.shutdown_timeout).await;
@@ -905,22 +760,17 @@ impl DeviceRuntime {
                 let _ = exit_tx.send(outcome);
             })
             .map_err(|error| RuntimeError::ThreadStart(error.to_string()))?;
-        let workers = match ready_rx.await {
-            Ok(workers) => workers,
-            Err(_) => {
-                stop.cancel();
-                let result = exited.await.unwrap_or(Err(RuntimeError::WorkerPanicked));
-                let _ = thread.join();
-                return Err(result.err().unwrap_or(RuntimeError::Closed));
-            }
-        };
+        if ready_rx.await.is_err() {
+            stop.cancel();
+            let result = exited.await.unwrap_or(Err(RuntimeError::WorkerPanicked));
+            let _ = thread.join();
+            return Err(result.err().unwrap_or(RuntimeError::Closed));
+        }
         let handle = DeviceHandle {
             device,
             runtime,
-            ordinary,
-            urgent,
+            commands,
             stop,
-            workers,
             snapshot,
         };
         let _ = startup_guard.disarm();
@@ -1049,7 +899,6 @@ pub(crate) enum Internal {
 enum Event {
     Command(Envelope),
     LinkUrgent(Option<UrgentEvent>),
-    SessionStopped,
     LinkStatus(Option<bool>),
     Ingress(Option<IngressItem>),
     Telemetry(Option<Telemetry>),
@@ -1074,14 +923,13 @@ struct Actor<'a> {
     device: DeviceId,
     runtime: RuntimeId,
     current: Option<ActiveSession>,
-    next_session: u64,
     nodes: EsphomeNodes,
     tasks: JoinSet<Internal>,
     /// Where readiness, alert messages and Home Assistant requests go.
     events: Option<DeviceEvents>,
     /// Counters changed and are published at this time.
     counters_due: Option<tokio::time::Instant>,
-    workers: [SpeechWorkerHandle; 4],
+    workers: PerWorker<SpeechWorkerHandle>,
     voice_services: Option<Arc<VoiceServices>>,
     /// The device services' taps; `None` for a runtime without them.
     taps: Option<crate::taps::DeviceTaps>,
@@ -1118,66 +966,20 @@ async fn recv_status(receiver: Option<&mut watch::Receiver<LinkStatus>>) -> Opti
     }
 }
 
-async fn recv_urgent(receiver: Option<&mut UrgentReceiver>) -> Option<UrgentEvent> {
-    match receiver {
-        Some(receiver) => receiver.recv().await,
-        None => std::future::pending().await,
-    }
-}
-
-async fn recv_ingress(receiver: Option<&mut IngressReceiver>) -> Option<IngressItem> {
-    match receiver {
-        Some(receiver) => receiver.recv().await,
-        None => std::future::pending().await,
-    }
-}
-
-async fn recv_telemetry(receiver: Option<&mut TelemetryReceiver>) -> Option<Telemetry> {
-    match receiver {
-        Some(receiver) => receiver.recv().await,
-        None => std::future::pending().await,
-    }
-}
-
-async fn recv_satellite(
-    receiver: Option<&mut mpsc::Receiver<SatelliteRequest>>,
-) -> Option<SatelliteRequest> {
-    match receiver {
-        Some(receiver) => receiver.recv().await,
-        None => std::future::pending().await,
-    }
-}
-
-async fn sleep_until(due: Option<tokio::time::Instant>) {
-    match due {
-        Some(due) => tokio::time::sleep_until(due).await,
-        None => std::future::pending().await,
-    }
-}
-
-async fn watch_change(watch: Option<&mut VoiceWatch>) -> WatchChange {
-    match watch {
-        Some(watch) => watch.changed().await,
+/// Waits for `future`, or forever when there is none (a receiver of a session that is
+/// not attached, a deadline that is not set).
+async fn or_pending<F: Future>(future: Option<F>) -> F::Output {
+    match future {
+        Some(future) => future.await,
         None => std::future::pending().await,
     }
 }
 
 impl Actor<'_> {
-    async fn run(
-        mut self,
-        mut ordinary: mpsc::Receiver<Envelope>,
-        mut urgent: mpsc::Receiver<Envelope>,
-    ) -> Result<(), RuntimeError> {
-        let never = CancellationToken::new();
+    async fn run(mut self, mut commands: mpsc::Receiver<Envelope>) -> Result<(), RuntimeError> {
         let result = loop {
-            let attached = self.current.is_some();
-            let current_stop = self
-                .current
-                .as_ref()
-                .map(|session| session.state.stop.clone())
-                .unwrap_or_else(|| never.clone());
             let (link_urgent, link_ingress, link_telemetry, link_status, voice_watch, voice_due) =
-                match self.current.as_mut().and_then(|s| s.link.as_mut()) {
+                match self.current.as_mut().map(|s| &mut s.link) {
                     Some(LinkBinding {
                         urgent,
                         ingress,
@@ -1206,25 +1008,20 @@ impl Actor<'_> {
                 Some(reason) = self.task_failures.recv() => Event::TaskPanicked(reason),
                 state = path_changed(&mut self.speech_path) => Event::SpeechPath(state),
                 status = speech_changed(self.speech.as_mut()) => Event::Speech(status),
-                message = urgent.recv() => match message {
-                    Some(message) => Event::Command(message),
-                    None => break Ok(()),
-                },
-                event = recv_urgent(link_urgent) => Event::LinkUrgent(event),
-                _ = current_stop.cancelled(), if attached => Event::SessionStopped,
+                event = or_pending(link_urgent.map(|r| r.recv())) => Event::LinkUrgent(event),
                 changed = recv_status(link_status) => Event::LinkStatus(changed),
-                message = ordinary.recv() => match message {
+                message = commands.recv() => match message {
                     Some(message) => Event::Command(message),
                     None => break Ok(()),
                 },
-                item = recv_ingress(link_ingress) => Event::Ingress(item),
-                report = recv_telemetry(link_telemetry) => Event::Telemetry(report),
-                request = recv_satellite(satellite) => Event::Satellite(request),
+                item = or_pending(link_ingress.map(|r| r.recv())) => Event::Ingress(item),
+                report = or_pending(link_telemetry.map(|r| r.recv())) => Event::Telemetry(report),
+                request = or_pending(satellite.map(|r| r.recv())) => Event::Satellite(request),
                 Some(done) = self.tasks.join_next(), if has_tasks => Event::Task(done),
-                _ = sleep_until(self.counters_due) => Event::PublishCounters,
+                () = or_pending(self.counters_due.map(tokio::time::sleep_until)) => Event::PublishCounters,
                 Some(message) = self.voice_rx.recv() => Event::Voice(message),
-                _ = sleep_until(voice_due) => Event::VoiceTimer,
-                change = watch_change(voice_watch) => Event::VoiceChange(change),
+                () = or_pending(voice_due.map(tokio::time::sleep_until)) => Event::VoiceTimer,
+                change = or_pending(voice_watch.map(|w| w.changed())) => Event::VoiceChange(change),
             };
             if let Err(error) = self.handle(event) {
                 break Err(error);
@@ -1249,13 +1046,9 @@ impl Actor<'_> {
                 // was slow (a loaded host), not that the runtime is broken: failing it
                 // would rebuild the runtime and drop the device's session for nothing.
                 // A late attach is refused, so admission declines and the device dials
-                // again; everything else, revocations above all, is still applied.
+                // again; everything else is still applied.
                 let late = envelope.queued.elapsed() > self.max_age;
                 match envelope.command {
-                    Command::Attach { reply, .. } if late => {
-                        tracing::warn!(device = %self.device, "a late attach was refused");
-                        let _ = reply.send(Err(RuntimeError::Expired));
-                    }
                     Command::AttachLink { reply, .. } if late => {
                         // Dropping the session here ends it; the device dials again.
                         tracing::warn!(device = %self.device, "a late session attach was refused");
@@ -1289,13 +1082,12 @@ impl Actor<'_> {
                 }
             }
             Event::LinkStatus(None) => {
-                if let Some(binding) = self.current.as_mut().and_then(|s| s.link.as_mut()) {
-                    binding.status = None;
+                if let Some(active) = self.current.as_mut() {
+                    active.link.status = None;
                 }
             }
             Event::LinkUrgent(Some(UrgentEvent::Privacy { change, .. })) => {
-                let binding = self.current.as_mut().and_then(|s| s.link.as_mut());
-                let Some(binding) = binding else {
+                let Some(binding) = self.current.as_mut().map(|s| &mut s.link) else {
                     return Ok(());
                 };
                 // Button and mute events share one number that only rises (§3.1.5).
@@ -1306,12 +1098,7 @@ impl Actor<'_> {
                     binding.physical_seq = Some(seq);
                 }
                 self.apply_privacy(change.muted);
-                if let Some(taps) = self
-                    .current
-                    .as_mut()
-                    .and_then(|s| s.link.as_mut())
-                    .and_then(|b| b.taps.as_mut())
-                {
+                if let Some(taps) = self.current.as_mut().and_then(|s| s.link.taps.as_mut()) {
                     taps.privacy(change.muted);
                 }
                 self.voice_privacy(change.muted, change.physical_seq);
@@ -1321,17 +1108,16 @@ impl Actor<'_> {
                 self.end_session("the device session ended");
             }
             Event::LinkUrgent(None) => self.end_session("the device session ended"),
-            Event::SessionStopped => self.end_session("the session was revoked"),
             Event::Ingress(Some(item)) => self.ingress(item),
             Event::Ingress(None) => {
-                if let Some(binding) = self.current.as_mut().and_then(|s| s.link.as_mut()) {
-                    binding.ingress = None;
+                if let Some(active) = self.current.as_mut() {
+                    active.link.ingress = None;
                 }
             }
             Event::Telemetry(Some(report)) => self.telemetry(report),
             Event::Telemetry(None) => {
-                if let Some(binding) = self.current.as_mut().and_then(|s| s.link.as_mut()) {
-                    binding.telemetry = None;
+                if let Some(active) = self.current.as_mut() {
+                    active.link.telemetry = None;
                 }
             }
             Event::Satellite(Some(request)) => self.satellite_request(request),
@@ -1340,11 +1126,7 @@ impl Actor<'_> {
                     .send_modify(|state| self.nodes.voice_ended(&mut state.esphome));
             }
             Event::Task(Ok(Internal::Esphome(prepared))) => {
-                let attached = self
-                    .current
-                    .as_ref()
-                    .filter(|s| s.link.is_some())
-                    .map(|s| s.state.id);
+                let attached = self.current.as_ref().map(|s| s.id);
                 self.snapshots.send_modify(|state| {
                     self.nodes.install(*prepared, attached, &mut state.esphome);
                 });
@@ -1367,8 +1149,8 @@ impl Actor<'_> {
                 let binding = self
                     .current
                     .as_mut()
-                    .filter(|active| active.state.id == session)
-                    .and_then(|active| active.link.as_mut());
+                    .filter(|active| active.id == session)
+                    .map(|active| &mut active.link);
                 match binding {
                     Some(binding) => binding.voice.message(message, &self.nodes, &mut self.tasks),
                     // A late answer for a session that ended: what asked for it is gone.
@@ -1381,7 +1163,7 @@ impl Actor<'_> {
                 self.publish_voice();
             }
             Event::VoiceTimer => {
-                if let Some(binding) = self.current.as_mut().and_then(|s| s.link.as_mut()) {
+                if let Some(binding) = self.current.as_mut().map(|s| &mut s.link) {
                     binding
                         .voice
                         .handle(Input::Timer, &self.nodes, &mut self.tasks);
@@ -1389,7 +1171,7 @@ impl Actor<'_> {
                 self.publish_voice();
             }
             Event::VoiceChange(change) => {
-                if let Some(binding) = self.current.as_mut().and_then(|s| s.link.as_mut()) {
+                if let Some(binding) = self.current.as_mut().map(|s| &mut s.link) {
                     binding.voice.changed(change, &self.nodes, &mut self.tasks);
                 }
                 self.publish_voice();
@@ -1400,17 +1182,6 @@ impl Actor<'_> {
 
     fn command(&mut self, command: Command) -> Result<(), RuntimeError> {
         match command {
-            Command::Attach { muted, reply } => {
-                if reply.is_closed() {
-                    return Ok(());
-                }
-                let state = self.install(Some(muted), None)?;
-                let grant = SessionGrant {
-                    state: Arc::clone(&state),
-                    lease: Arc::new(state.stop.clone().drop_guard()),
-                };
-                let _ = reply.send(Ok(grant));
-            }
             Command::AttachLink { attach, reply } => {
                 if reply.is_closed() {
                     // Admission gave up; dropping the session ends it.
@@ -1427,9 +1198,7 @@ impl Actor<'_> {
                     bluetooth_proxy: attach.bluetooth_proxy
                         && attach.hello.capabilities.contains(Capability::BleProxy),
                 };
-                let muted = attach.hello.privacy.as_ref().and_then(|p| p.muted);
-                let state = self.install(muted, Some(attach))?;
-                let id = state.id;
+                let id = self.install(attach)?;
                 let _ = reply.send(Ok(id));
                 let mut preparation = None;
                 self.snapshots.send_modify(|snapshot| {
@@ -1440,35 +1209,8 @@ impl Actor<'_> {
                         .spawn(async move { Internal::Esphome(Box::new(preparation.await)) });
                 }
             }
-            Command::Privacy {
-                session,
-                muted,
-                reply,
-            } => {
-                let live = self
-                    .current
-                    .as_ref()
-                    .is_some_and(|s| s.state.id == session && !s.state.stop.is_cancelled());
-                if !live {
-                    let _ = reply.send(Err(RuntimeError::StaleSession));
-                    return Ok(());
-                }
-                self.apply_privacy(muted);
-                let _ = reply.send(Ok(()));
-            }
-            Command::Detach { session, reply } => {
-                if self.current.as_ref().map(|active| active.state.id) == Some(session) {
-                    self.end_session("the session detached");
-                }
-                let result = if session.0 == self.next_session {
-                    Ok(())
-                } else {
-                    Err(RuntimeError::StaleSession)
-                };
-                let _ = reply.send(result);
-            }
             Command::Renegotiate { reply } => {
-                let attached = self.current.as_ref().is_some_and(|s| s.link.is_some());
+                let attached = self.current.is_some();
                 if attached {
                     self.end_session("the session is renegotiated");
                 }
@@ -1483,7 +1225,7 @@ impl Actor<'_> {
     /// Arms or disarms the attached session's recording-mode subscription to match the
     /// stored modes.
     fn refresh_recording(&mut self) {
-        let Some(binding) = self.current.as_mut().and_then(|s| s.link.as_mut()) else {
+        let Some(binding) = self.current.as_mut().map(|s| &mut s.link) else {
             return;
         };
         let Some(taps) = binding.taps.as_mut() else {
@@ -1509,7 +1251,7 @@ impl Actor<'_> {
         let binding = self
             .current
             .as_mut()
-            .and_then(|s| s.link.as_mut())
+            .map(|s| &mut s.link)
             .filter(|binding| !binding.voice.is_lost());
         let Some(binding) = binding else {
             match command {
@@ -1544,22 +1286,34 @@ impl Actor<'_> {
         self.publish_voice();
     }
 
-    /// Ends the current session, then installs a new one with `muted` as reported.
-    fn install(
-        &mut self,
-        muted: Option<bool>,
-        attach: Option<LinkAttach>,
-    ) -> Result<Arc<SessionState>, RuntimeError> {
+    /// Ends the current session, then installs the link session `attach`, with the
+    /// privacy mute its hello reports.
+    fn install(&mut self, attach: LinkAttach) -> Result<SessionId, RuntimeError> {
+        let Some(services) = self.voice_services.clone() else {
+            tracing::warn!(device = %self.device, "a runtime without voice services cannot attach a device link");
+            return Err(RuntimeError::Closed);
+        };
         if let Some(old) = self.current.take() {
-            old.state.stop.cancel();
-            if let Some(binding) = old.link {
-                self.retire_link(old.state.id, binding);
-            }
+            self.retire(old);
         }
-        self.next_session = NEXT_SESSION
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-            .map_err(|_| RuntimeError::Closed)?;
-        let id = SessionId(self.next_session);
+        let id = SessionId(
+            NEXT_SESSION
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .map_err(|_| RuntimeError::Closed)?,
+        );
+        let LinkAttach {
+            session,
+            hello,
+            platform,
+            peer,
+            label: _,
+            afe_metadata,
+            bluetooth_proxy: _,
+            capture_permitted,
+            capture_refusal,
+            kiosk_token,
+        } = attach;
+        let muted = hello.privacy.as_ref().and_then(|p| p.muted);
         let session_stop = self.stop.child_token();
         let scope = WorkScope::new(
             WorkIdentity {
@@ -1575,139 +1329,106 @@ impl Actor<'_> {
         if capture_muted {
             scope.cancel();
         }
-        let link = match attach {
-            None => None,
-            Some(attach) => {
-                let Some(services) = self.voice_services.clone() else {
-                    tracing::warn!(device = %self.device, "a runtime without voice services cannot attach a device link");
-                    return Err(RuntimeError::Closed);
-                };
-                let LinkAttach {
-                    session,
-                    hello,
-                    platform,
-                    peer,
-                    label: _,
-                    afe_metadata,
-                    bluetooth_proxy: _,
-                    capture_permitted,
-                    capture_refusal,
-                    kiosk_token,
-                } = attach;
-                // The link cancels this scope itself on a mute report and at the end.
-                session.link.publish_capture_scope(scope.clone());
-                let volume =
-                    hello
-                        .volume
-                        .and_then(|volume| volume.level)
-                        .map(|level| match level {
-                            VolumeLevel::Level(level) => Volume::Level(level),
-                            VolumeLevel::Unavailable => Volume::Unavailable,
-                        });
-                let status = session.link.watch_status();
-                let voice = VoiceSession::start(
-                    VoiceStart {
-                        services,
-                        device: self.device.clone(),
-                        session: id,
-                        link: session.link.clone(),
-                        capabilities: hello.capabilities.clone(),
-                        afe_metadata,
-                        muted: capture_muted,
-                        volume: match volume {
-                            Some(Volume::Level(level)) => DeviceVolume::new(level),
-                            _ => None,
-                        },
-                        session_scope: WorkScope::new(
-                            scope.identity().clone(),
-                            session_stop.child_token(),
-                        ),
-                        capture: (!capture_muted).then(|| scope.clone()),
-                        capture_permitted,
-                        kiosk_token: {
-                            self.kiosk_token = kiosk_token;
-                            self.kiosk_token.clone()
-                        },
-                        workers: self.workers.clone(),
-                        messages: self.voice_tx.clone(),
-                    },
-                    &mut self.tasks,
-                );
-                let taps = self.taps.as_ref().map(|taps| {
-                    taps.session(crate::taps::SessionStart {
-                        device: &self.device,
-                        runtime: self.runtime,
-                        session: id,
-                        link: &session.link,
-                        firmware: hello.firmware_version.clone(),
-                        afe_metadata,
-                        muted: capture_muted,
-                        capture_permitted,
-                    })
-                });
-                Some(LinkBinding {
-                    state: LinkState {
-                        session_id: session.link.session_id().clone(),
-                        transport: session.link.transport(),
-                        ip: peer,
-                        platform,
-                        capabilities: hello.capabilities,
-                        firmware_version: hello.firmware_version,
-                        os_version: hello.os_version,
-                        volume,
-                        ambient_lux: None,
-                        stats: None,
-                        audio_accepted: BTreeMap::new(),
-                        capture_permitted,
-                        capture_refusal,
-                        voice: Some(voice.status()),
-                        unhandled: BTreeMap::new(),
-                        telemetry_dropped: 0,
-                        malformed: BTreeMap::new(),
-                        installed_assets: hello.assets,
-                    },
-                    link: session.link,
-                    urgent: session.urgent,
-                    ingress: Some(session.ingress),
-                    telemetry: Some(session.telemetry),
-                    voice,
-                    physical_seq: None,
-                    status: Some(status),
-                    announced: false,
-                    hello_alerts: hello.alerts,
-                    taps,
-                })
-            }
-        };
-        let capture_scope = scope.clone();
-        let permission = CapturePermission {
-            muted: capture_muted,
-            scope,
-        };
-        let (capture, capture_rx) = watch::channel(permission);
-        let state = Arc::new(SessionState {
-            id,
-            stop: session_stop,
-            capture: capture_rx,
+        // The link cancels this scope itself on a mute report and at the end.
+        session.link.publish_capture_scope(scope.clone());
+        let volume = hello
+            .volume
+            .and_then(|volume| volume.level)
+            .map(|level| match level {
+                VolumeLevel::Level(level) => Volume::Level(level),
+                VolumeLevel::Unavailable => Volume::Unavailable,
+            });
+        let status = session.link.watch_status();
+        self.kiosk_token = kiosk_token;
+        let voice = VoiceSession::start(
+            VoiceStart {
+                services,
+                device: self.device.clone(),
+                session: id,
+                link: session.link.clone(),
+                capabilities: hello.capabilities.clone(),
+                afe_metadata,
+                muted: capture_muted,
+                volume: match volume {
+                    Some(Volume::Level(level)) => DeviceVolume::new(level),
+                    _ => None,
+                },
+                session_scope: WorkScope::new(scope.identity().clone(), session_stop.child_token()),
+                capture: (!capture_muted).then(|| scope.clone()),
+                capture_permitted,
+                kiosk_token: self.kiosk_token.clone(),
+                workers: self.workers.clone(),
+                messages: self.voice_tx.clone(),
+            },
+            &mut self.tasks,
+        );
+        let taps = self.taps.as_ref().map(|taps| {
+            taps.session(crate::taps::SessionStart {
+                device: &self.device,
+                runtime: self.runtime,
+                session: id,
+                link: &session.link,
+                firmware: hello.firmware_version.clone(),
+                afe_metadata,
+                muted: capture_muted,
+                capture_permitted,
+            })
         });
-        let link_state = link.as_ref().map(|binding| Arc::new(binding.state.clone()));
-        let session_link = link.as_ref().map(|binding| binding.link.clone());
+        let link = LinkBinding {
+            state: LinkState {
+                session_id: session.link.session_id().clone(),
+                transport: session.link.transport(),
+                ip: peer,
+                platform,
+                capabilities: hello.capabilities,
+                firmware_version: hello.firmware_version,
+                os_version: hello.os_version,
+                volume,
+                ambient_lux: None,
+                stats: None,
+                audio_accepted: BTreeMap::new(),
+                capture_permitted,
+                capture_refusal,
+                voice: Some(voice.status()),
+                unhandled: BTreeMap::new(),
+                telemetry_dropped: 0,
+                malformed: BTreeMap::new(),
+                installed_assets: hello.assets,
+            },
+            link: session.link,
+            urgent: session.urgent,
+            ingress: Some(session.ingress),
+            telemetry: Some(session.telemetry),
+            voice,
+            physical_seq: None,
+            status: Some(status),
+            announced: false,
+            hello_alerts: hello.alerts,
+            taps,
+        };
+        let link_state = Arc::new(link.state.clone());
+        let session_link = link.link.clone();
+        let capture_scope = scope.clone();
         self.snapshots.send_modify(|snapshot| {
             snapshot.lifecycle = Lifecycle::Attached;
             snapshot.session = Some(id);
             snapshot.muted = muted;
             snapshot.capture = Some(capture_scope);
-            snapshot.link = link_state;
-            snapshot.session_link = session_link;
+            snapshot.link = Some(link_state);
+            snapshot.session_link = Some(session_link);
         });
         self.counters_due = None;
         self.current = Some(ActiveSession {
-            state: Arc::clone(&state),
-            capture,
+            id,
+            stop: session_stop,
+            capture: CapturePermission {
+                muted: capture_muted,
+                scope,
+            },
             link,
         });
         self.refresh_recording();
-        Ok(state)
+        Ok(id)
     }
 
     /// Ends the current session, if any: its work is revoked, its link closed and its
@@ -1716,11 +1437,8 @@ impl Actor<'_> {
         let Some(active) = self.current.take() else {
             return;
         };
-        active.state.stop.cancel();
-        if let Some(binding) = active.link {
-            tracing::debug!(device = %self.device, why, "detaching the device session");
-            self.retire_link(active.state.id, binding);
-        }
+        tracing::debug!(device = %self.device, why, "detaching the device session");
+        self.retire(active);
         self.counters_due = None;
         self.snapshots.send_modify(|state| {
             state.lifecycle = Lifecycle::Ready;
@@ -1733,22 +1451,26 @@ impl Actor<'_> {
         });
     }
 
-    /// Ends a session's voice path (its final records are still written), closes its
-    /// link and, when it was reported ready, reports its end.
-    fn retire_link(&mut self, session: SessionId, mut binding: LinkBinding) {
-        binding.voice.end(&self.nodes, &mut self.tasks);
-        if let Some(mut taps) = binding.taps.take() {
+    /// Revokes a session's work, ends its voice path (its final records are still
+    /// written), closes its link and, when it was reported ready, reports its end.
+    fn retire(&mut self, active: ActiveSession) {
+        let ActiveSession {
+            id, stop, mut link, ..
+        } = active;
+        stop.cancel();
+        link.voice.end(&self.nodes, &mut self.tasks);
+        if let Some(mut taps) = link.taps.take() {
             // The session's last decisions go into its recording before it ends.
-            let (origin, evidence) = binding.voice.take_evidence();
+            let (origin, evidence) = link.voice.take_evidence();
             taps.evidence(origin, evidence);
             taps.ended(echomuse_recorder::DisconnectReason::LinkLost);
         }
-        binding.link.close();
-        if binding.announced
+        link.link.close();
+        if link.announced
             && let Some(events) = &self.events
             && !events.try_send(DeviceEvent::SessionEnded {
                 device: self.device.clone(),
-                session,
+                session: id,
             })
         {
             // The link is closed either way; the services learn of the end from the
@@ -1760,7 +1482,7 @@ impl Actor<'_> {
     /// Hands the voice path's decision evidence to the session recorder, and tells the
     /// voice path whether one is recording (only then does it queue evidence).
     fn flush_evidence(&mut self) {
-        let Some(binding) = self.current.as_mut().and_then(|s| s.link.as_mut()) else {
+        let Some(binding) = self.current.as_mut().map(|s| &mut s.link) else {
             return;
         };
         let Some(taps) = binding.taps.as_mut() else {
@@ -1778,10 +1500,8 @@ impl Actor<'_> {
         let Some(active) = self.current.as_mut() else {
             return;
         };
-        let session = active.state.id;
-        let Some(binding) = active.link.as_mut() else {
-            return;
-        };
+        let session = active.id;
+        let binding = &mut active.link;
         if binding.announced {
             return;
         }
@@ -1809,30 +1529,20 @@ impl Actor<'_> {
     /// Installs a privacy change: a mute revokes capture at once and leaves it revoked;
     /// an unmute grants a fresh scope. Only this actor grants capture.
     fn apply_privacy(&mut self, muted: bool) {
-        let Some(active) = self.current.as_ref() else {
+        let Some(active) = self.current.as_mut() else {
             return;
         };
-        let previous = active.capture.borrow().clone();
+        let capture = &mut active.capture;
         if muted {
-            previous.scope.cancel();
-            if !previous.muted {
-                active.capture.send_replace(CapturePermission {
-                    muted,
-                    scope: previous.scope,
-                });
-            }
-        } else if previous.muted || previous.scope.is_cancelled() {
-            let scope = WorkScope::new(
-                previous.scope.identity().clone(),
-                active.state.stop.child_token(),
-            );
-            if let Some(binding) = &active.link {
-                binding.link.publish_capture_scope(scope.clone());
-            }
-            active.capture.send_replace(CapturePermission {
-                muted,
+            capture.scope.cancel();
+            capture.muted = true;
+        } else if capture.muted || capture.scope.is_cancelled() {
+            let scope = WorkScope::new(capture.scope.identity().clone(), active.stop.child_token());
+            active.link.link.publish_capture_scope(scope.clone());
+            *capture = CapturePermission {
+                muted: false,
                 scope: scope.clone(),
-            });
+            };
             self.snapshots
                 .send_modify(|state| state.capture = Some(scope));
         }
@@ -1844,10 +1554,8 @@ impl Actor<'_> {
         let Some(active) = self.current.as_mut() else {
             return;
         };
-        let session = active.state.id;
-        let Some(binding) = active.link.as_mut() else {
-            return;
-        };
+        let session = active.id;
+        let binding = &mut active.link;
         if binding.voice.is_lost() {
             // The session broke the stream rules and is closing.
             return;
@@ -1912,10 +1620,10 @@ impl Actor<'_> {
         let Some(active) = self.current.as_mut() else {
             return;
         };
-        let permission = active.capture.borrow().clone();
-        let Some(binding) = active.link.as_mut() else {
-            return;
-        };
+        let permission = &active.capture;
+        let scope = (!permission.muted && !permission.scope.is_cancelled())
+            .then(|| permission.scope.clone());
+        let binding = &mut active.link;
         binding.voice.handle(
             Input::Privacy {
                 muted,
@@ -1924,8 +1632,6 @@ impl Actor<'_> {
             &self.nodes,
             &mut self.tasks,
         );
-        let scope =
-            (!permission.muted && !permission.scope.is_cancelled()).then_some(permission.scope);
         binding
             .voice
             .handle(Input::Capture(scope), &self.nodes, &mut self.tasks);
@@ -1962,7 +1668,7 @@ impl Actor<'_> {
 
     /// Publishes the voice path's state with the link's.
     fn publish_voice(&mut self) {
-        if let Some(binding) = self.current.as_mut().and_then(|s| s.link.as_mut()) {
+        if let Some(binding) = self.current.as_mut().map(|s| &mut s.link) {
             binding.state.voice = Some(binding.voice.status());
         }
         self.counters_changed();
@@ -1981,7 +1687,7 @@ impl Actor<'_> {
         let still_current = self
             .current
             .as_ref()
-            .is_some_and(|s| s.state.id == session && s.link.as_ref().is_some_and(|b| b.announced));
+            .is_some_and(|s| s.id == session && s.link.announced);
         let Some(events) = self.events.as_ref().filter(|_| still_current) else {
             return;
         };
@@ -1999,7 +1705,7 @@ impl Actor<'_> {
     }
 
     fn telemetry(&mut self, report: Telemetry) {
-        let Some(binding) = self.current.as_mut().and_then(|s| s.link.as_mut()) else {
+        let Some(binding) = self.current.as_mut().map(|s| &mut s.link) else {
             return;
         };
         let state = &mut binding.state;
@@ -2084,7 +1790,7 @@ impl Actor<'_> {
                 .ok_or("stop_alert"),
             (None, SatelliteRequest::StopAlert) => Err("stop_alert"),
             (None, SatelliteRequest::Timer(_)) => Err("timer"),
-            (_, request) => match self.current.as_mut().and_then(|s| s.link.as_mut()) {
+            (_, request) => match self.current.as_mut().map(|s| &mut s.link) {
                 Some(binding) => {
                     binding
                         .voice
@@ -2118,7 +1824,7 @@ impl Actor<'_> {
 
     fn publish_link(&mut self) {
         self.counters_due = None;
-        let Some(binding) = self.current.as_ref().and_then(|s| s.link.as_ref()) else {
+        let Some(binding) = self.current.as_ref().map(|s| &s.link) else {
             return;
         };
         let state = Arc::new(binding.state.clone());

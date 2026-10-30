@@ -6,7 +6,10 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use bytes::Bytes;
-use echomuse_core::types::DeviceId;
+use echomuse_core::{
+    services::{TimerEvent, TimerEventKind},
+    types::DeviceId,
+};
 use echomuse_esphome::api::{self, ApiMessage};
 use echomuse_esphome::bluetooth::{
     BleAddressType, BleAdvertisement, BluetoothProxy, BluetoothProxyConfig, start_bluetooth_proxy,
@@ -17,7 +20,7 @@ use echomuse_esphome::entities::{
 use echomuse_esphome::frame::{self, BAD_INDICATOR_REPLY, Frame, FrameDecoder};
 use echomuse_esphome::voice::{
     Announcement, FinishError, MediaRequest, RunClosed, RunEvent, SatelliteRequest, StartRunError,
-    TimerEvent, TimerEventKind, VoiceSatellite, VoiceSatelliteConfig, start_voice_satellite,
+    VoiceSatellite, VoiceSatelliteConfig, start_voice_satellite,
 };
 use echomuse_esphome::{CloseReason, ServerStatus};
 use echomuse_protocol::Platform;

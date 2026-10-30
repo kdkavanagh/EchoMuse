@@ -1,5 +1,6 @@
-//! Audio of the analysed subscriptions (a wake candidate's, a turn's, a reply window's):
-//! where each delivery goes, and how the workers' evidence reaches the turn policy.
+//! Audio of the analysed subscriptions (a wake candidate's, a turn's, a reply window's,
+//! the early-answer watch's): what each delivery becomes, and how the workers' evidence
+//! reaches the turn policy.
 //!
 //! Every chunk of an analysed subscription goes to the microphone analysis worker (mic,
 //! reference and loudness cells: VAD, streaming ASR and echo attribution) and its
@@ -9,23 +10,26 @@
 //! verified, a reply window before its utterance opens) that evidence is kept in
 //! [`Evidence`], and the policy takes it when it is built: the policy's assembler
 //! releases cells in sample order whatever order its inputs came in.
+//!
+//! The helpers here act on the [`Analysis`] its owner (the wake handling or the
+//! conversation) hands them; they never look for it themselves.
 
 use std::num::NonZeroU64;
 
-use echomuse_core::types::RuntimeError;
+use echomuse_core::types::WorkScope;
 use echomuse_echo::OutputCoverage;
 use echomuse_protocol::StreamId;
 use echomuse_turn::{
     AsrObservation, CellIndex, DeviceCell, DeviceInput, EchoCell, Epoch, EvidenceError, Sample,
     SampleSpan, VadInput,
 };
-use echomuse_uplink::{ChunkBody, ChunkData, Delivery, Ended, SubscriptionId};
+use echomuse_uplink::{Chunk, ChunkBody, ChunkData, Ended};
 
 use crate::{
     evidence::Pushes,
-    io::{Effect, Now},
-    machine::Voice,
-    speech::{MicJob, MicOutput, Pcm16Le, ReferenceJob, ReferenceOutput, StreamKey},
+    io::Effect,
+    link::EffectLink,
+    speech::{MicJob, Pcm16Le, ReferenceJob, StreamKey},
 };
 
 /// Evidence for a stream that no turn policy holds yet, in arrival order.
@@ -225,14 +229,38 @@ impl Analysis {
     }
 }
 
-/// Which owner a stream belongs to.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Owner {
-    Candidate,
-    Turn,
-    Window,
-    /// The early-answer watch while the controller's own question plays.
-    Watch,
+/// Evidence a chunk brought that its owner's policy takes at once: nothing while the
+/// analysis keeps its evidence for a policy still to come.
+pub(crate) enum Fresh {
+    Nothing,
+    Cells(CellIndex, Vec<DeviceInput>),
+    Gap(SampleSpan),
+}
+
+impl Fresh {
+    /// Hands the evidence to a policy's assembler.
+    pub(crate) fn push(
+        self,
+        epoch: Epoch,
+        assembler: &mut impl Pushes,
+    ) -> Result<(), EvidenceError> {
+        match self {
+            Self::Nothing => Ok(()),
+            Self::Cells(first, cells) => push_cells(assembler, epoch, first, &cells),
+            Self::Gap(span) => assembler.mark_gap(epoch, span),
+        }
+    }
+
+    pub(crate) fn is_nothing(&self) -> bool {
+        matches!(self, Self::Nothing)
+    }
+}
+
+/// The worker's VAD, echo labels and ASR for an owner whose policy takes them now.
+pub(crate) struct WorkerEvidence {
+    pub(crate) vad: Option<(CellIndex, Vec<VadInput>)>,
+    pub(crate) echo: Option<(CellIndex, Vec<EchoCell>)>,
+    pub(crate) asr: Vec<AsrObservation>,
 }
 
 /// What became of an analysed subscription's chunk, for the owner to act on.
@@ -244,562 +272,321 @@ pub(crate) enum StreamNews {
     Other,
 }
 
-impl Voice {
-    pub(crate) fn owner_of(&self, subscription: &SubscriptionId) -> Option<Owner> {
-        if self
-            .candidate
-            .as_ref()
-            .is_some_and(|c| &c.message.subscription == subscription)
-        {
-            return Some(Owner::Candidate);
-        }
-        if self
-            .turn
-            .as_ref()
-            .is_some_and(|t| t.subscription.as_ref() == Some(subscription))
-        {
-            return Some(Owner::Turn);
-        }
-        if self
-            .window
-            .as_ref()
-            .is_some_and(|w| &w.subscription == subscription)
-        {
-            return Some(Owner::Window);
-        }
-        if self
-            .question_watch
-            .as_ref()
-            .is_some_and(|w| &w.subscription == subscription)
-        {
-            return Some(Owner::Watch);
-        }
-        None
-    }
-
-    fn owner_by_key(&self, key: &StreamKey) -> Option<Owner> {
-        if self
-            .candidate
-            .as_ref()
-            .is_some_and(|c| &c.analysis.key == key)
-        {
-            return Some(Owner::Candidate);
-        }
-        if self
-            .turn
-            .as_ref()
-            .and_then(|t| t.analysis.as_ref())
-            .is_some_and(|a| &a.key == key)
-        {
-            return Some(Owner::Turn);
-        }
-        if self.window.as_ref().is_some_and(|w| w.analysis.key == *key) {
-            return Some(Owner::Window);
-        }
-        if self
-            .question_watch
-            .as_ref()
-            .is_some_and(|w| w.analysis.key == *key)
-        {
-            return Some(Owner::Watch);
-        }
-        None
-    }
-
-    fn analysis_mut(&mut self, owner: Owner) -> Option<&mut Analysis> {
-        match owner {
-            Owner::Candidate => self.candidate.as_mut().map(|c| &mut c.analysis),
-            Owner::Turn => self.turn.as_mut().and_then(|t| t.analysis.as_mut()),
-            Owner::Window => self.window.as_mut().map(|w| &mut w.analysis),
-            Owner::Watch => self.question_watch.as_mut().map(|w| &mut w.analysis),
-        }
-    }
-
-    /// The scope a stream's jobs run under: the turn's own for a turn, capture for the
-    /// rest. `None` once capture is revoked.
-    fn job_scope(&self, owner: Owner) -> Option<echomuse_core::types::WorkScope> {
-        let scope = match owner {
-            Owner::Turn => self.turn.as_ref().map(|t| t.scope.clone()),
-            Owner::Candidate => self.candidate.as_ref().map(|c| c.scope.clone()),
-            Owner::Window => self.window.as_ref().map(|w| w.scope.clone()),
-            Owner::Watch => self.question_watch.as_ref().map(|w| w.scope.clone()),
-        }?;
-        (!scope.is_cancelled()).then_some(scope)
-    }
-
-    pub(crate) fn mic_job(&mut self, owner: Owner, job: MicJob) {
-        let Some(scope) = self.job_scope(owner) else {
-            return;
-        };
-        let key = match &job {
-            MicJob::Reset => None,
-            MicJob::Open { key, .. }
-            | MicJob::StartUtterance { key, .. }
-            | MicJob::EndUtterance { key }
-            | MicJob::Mic { key, .. }
-            | MicJob::MicMissing { key, .. }
-            | MicJob::Reference { key, .. }
-            | MicJob::ReferenceSilence { key, .. }
-            | MicJob::ReferenceMissing { key, .. }
-            | MicJob::ReferenceEnded { key }
-            | MicJob::DeviceCells { key, .. }
-            | MicJob::CompareCandidate { key, .. }
-            | MicJob::Close { key } => Some(key.clone()),
-        };
-        // Loudness cells that arrive in a run (a subscription's history comes as the many
-        // small packets it was sent in, two cells each) go to the worker as one job, so
-        // ten seconds of history do not overflow its queue.
-        if let MicJob::DeviceCells { key, first, cells } = &job
-            && let Some(Effect::Mic {
-                job:
-                    MicJob::DeviceCells {
-                        key: last_key,
-                        first: last_first,
-                        cells: last_cells,
+impl Analysis {
+    /// Routes one chunk of the subscription: its worker jobs under `scope` (none once
+    /// that is cancelled), and what the analysis records of it. `None` when the chunk
+    /// gives the owner nothing to act on.
+    pub(crate) fn chunk(
+        &mut self,
+        link: &mut EffectLink,
+        scope: &WorkScope,
+        chunk: Chunk,
+    ) -> Option<(StreamNews, Fresh)> {
+        let key = self.key.clone();
+        let span = SampleSpan::new(Sample(chunk.span.start), Sample(chunk.span.end));
+        let routed = match (chunk.stream, chunk.body) {
+            (
+                StreamId::Mic,
+                ChunkBody::Data {
+                    meta,
+                    discontinuity,
+                    data: ChunkData::Pcm(pcm),
+                },
+            ) => {
+                self.note_mic(span);
+                self.note_clock(span.start.0, meta.mono_ns);
+                mic_job(
+                    link,
+                    scope,
+                    MicJob::Mic {
+                        key,
+                        first: span.start,
+                        mono_ns: meta.mono_ns,
+                        discontinuity,
+                        pcm: Pcm16Le::new(pcm.as_bytes().clone()),
                     },
-                ..
-            }) = self.link.effects.last_mut()
-            && last_key == key
-            && last_first.0 + last_cells.len() as u64 == first.0
-        {
-            last_cells.extend_from_slice(cells);
-            return;
-        }
-        self.link.effects.push(Effect::Mic { scope, key, job });
-    }
-
-    pub(crate) fn reference_job(&mut self, owner: Owner, job: ReferenceJob) {
-        let Some(scope) = self.job_scope(owner) else {
-            return;
-        };
-        let key = match &job {
-            ReferenceJob::Reset => None,
-            ReferenceJob::Open { key, .. }
-            | ReferenceJob::Pcm { key, .. }
-            | ReferenceJob::Silence { key, .. }
-            | ReferenceJob::Missing { key, .. }
-            | ReferenceJob::Ended { key }
-            | ReferenceJob::Judge { key, .. }
-            | ReferenceJob::Close { key } => Some(key.clone()),
-        };
-        self.link
-            .effects
-            .push(Effect::Reference { scope, key, job });
-    }
-
-    /// Closes a stream on both workers. Uses the session scope: the stream's own may
-    /// already be cancelled, and the workers must still forget its audio.
-    pub(crate) fn close_analysis(&mut self, key: StreamKey) {
-        if self.session_scope.is_cancelled() {
-            return;
-        }
-        self.link.effects.push(Effect::Mic {
-            scope: self.session_scope.clone(),
-            key: Some(key.clone()),
-            job: MicJob::Close { key: key.clone() },
-        });
-        self.link.effects.push(Effect::Reference {
-            scope: self.session_scope.clone(),
-            key: Some(key.clone()),
-            job: ReferenceJob::Close { key },
-        });
-    }
-
-    /// Routes one chunk (or the end) of an analysed subscription.
-    pub(crate) fn analysed_delivery(&mut self, delivery: Delivery, now: Now) {
-        let Some(owner) = self.owner_of(delivery.subscription()) else {
-            return;
-        };
-        let news = match delivery {
-            Delivery::Ended(ended) => StreamNews::Ended(ended),
-            Delivery::Chunk(chunk) => {
-                let Some(key) = self.analysis_mut(owner).map(|a| a.key.clone()) else {
-                    return;
-                };
-                let span = SampleSpan::new(Sample(chunk.span.start), Sample(chunk.span.end));
-                match (chunk.stream, chunk.body) {
-                    (
-                        StreamId::Mic,
-                        ChunkBody::Data {
-                            meta,
-                            discontinuity,
-                            data: ChunkData::Pcm(pcm),
-                        },
-                    ) => {
-                        self.note_mic(owner, span);
-                        if let Some(analysis) = self.analysis_mut(owner) {
-                            analysis.note_clock(span.start.0, meta.mono_ns);
-                        }
-                        self.mic_job(
-                            owner,
-                            MicJob::Mic {
-                                key,
-                                first: span.start,
-                                mono_ns: meta.mono_ns,
-                                discontinuity,
-                                pcm: Pcm16Le::new(pcm.as_bytes().clone()),
-                            },
-                        );
-                        StreamNews::Mic
-                    }
-                    (StreamId::Mic, ChunkBody::Missing(_)) => {
-                        self.note_mic(owner, span);
-                        self.mic_job(
-                            owner,
-                            MicJob::MicMissing {
+                );
+                (StreamNews::Mic, Fresh::Nothing)
+            }
+            (StreamId::Mic, ChunkBody::Missing(_)) => {
+                self.note_mic(span);
+                mic_job(link, scope, MicJob::MicMissing { key, span });
+                (StreamNews::Mic, self.gap(span))
+            }
+            (StreamId::Reference, body) => {
+                let reference_epoch = Epoch::new(chunk.epoch.get())?;
+                let first = chunk.span.start;
+                match body {
+                    ChunkBody::Data {
+                        meta,
+                        data: ChunkData::Pcm(pcm),
+                        ..
+                    } => {
+                        let pcm = Pcm16Le::new(pcm.as_bytes().clone());
+                        mic_job(
+                            link,
+                            scope,
+                            MicJob::Reference {
                                 key: key.clone(),
-                                span,
+                                reference_epoch,
+                                first,
+                                mono_ns: meta.mono_ns,
+                                coverage: OutputCoverage::Full,
+                                pcm: pcm.clone(),
                             },
                         );
-                        self.evidence_gap(owner, &key, span, now);
-                        StreamNews::Mic
+                        reference_job(
+                            link,
+                            scope,
+                            ReferenceJob::Pcm {
+                                key,
+                                reference_epoch,
+                                first,
+                                pcm,
+                            },
+                        );
                     }
-                    (StreamId::Reference, body) => {
-                        let Some(reference_epoch) = Epoch::new(chunk.epoch.get()) else {
-                            return;
-                        };
-                        let first = chunk.span.start;
-                        match body {
-                            ChunkBody::Data {
-                                meta,
-                                data: ChunkData::Pcm(pcm),
-                                ..
-                            } => {
-                                let pcm = Pcm16Le::new(pcm.as_bytes().clone());
-                                self.mic_job(
-                                    owner,
-                                    MicJob::Reference {
-                                        key: key.clone(),
-                                        reference_epoch,
-                                        first,
-                                        mono_ns: meta.mono_ns,
-                                        coverage: OutputCoverage::Full,
-                                        pcm: pcm.clone(),
-                                    },
-                                );
-                                self.reference_job(
-                                    owner,
-                                    ReferenceJob::Pcm {
-                                        key,
-                                        reference_epoch,
-                                        first,
-                                        pcm,
-                                    },
-                                );
-                            }
-                            ChunkBody::Data {
-                                meta,
-                                data: ChunkData::DigitalSilence { frames },
-                                ..
-                            } => {
-                                self.mic_job(
-                                    owner,
-                                    MicJob::ReferenceSilence {
-                                        key: key.clone(),
-                                        reference_epoch,
-                                        first,
-                                        frames,
-                                        mono_ns: meta.mono_ns,
-                                        coverage: OutputCoverage::Full,
-                                    },
-                                );
-                                self.reference_job(
-                                    owner,
-                                    ReferenceJob::Silence {
-                                        key,
-                                        reference_epoch,
-                                        first,
-                                        frames,
-                                    },
-                                );
-                            }
-                            ChunkBody::Missing(_) => {
-                                self.mic_job(
-                                    owner,
-                                    MicJob::ReferenceMissing {
-                                        key: key.clone(),
-                                        reference_epoch,
-                                        first,
-                                        end: chunk.span.end,
-                                    },
-                                );
-                                self.reference_job(
-                                    owner,
-                                    ReferenceJob::Missing {
-                                        key,
-                                        reference_epoch,
-                                        first,
-                                        end: chunk.span.end,
-                                    },
-                                );
-                            }
-                            ChunkBody::Data { .. } => {}
-                        }
-                        StreamNews::Other
+                    ChunkBody::Data {
+                        meta,
+                        data: ChunkData::DigitalSilence { frames },
+                        ..
+                    } => {
+                        mic_job(
+                            link,
+                            scope,
+                            MicJob::ReferenceSilence {
+                                key: key.clone(),
+                                reference_epoch,
+                                first,
+                                frames,
+                                mono_ns: meta.mono_ns,
+                                coverage: OutputCoverage::Full,
+                            },
+                        );
+                        reference_job(
+                            link,
+                            scope,
+                            ReferenceJob::Silence {
+                                key,
+                                reference_epoch,
+                                first,
+                                frames,
+                            },
+                        );
                     }
-                    (StreamId::Cells, body) => {
-                        let first = CellIndex(chunk.span.start / echomuse_turn::time::CELL_SAMPLES);
-                        let cells: Vec<DeviceInput> = match body {
-                            ChunkBody::Data {
-                                data: ChunkData::Cells(cells),
-                                ..
-                            } => cells
-                                .iter()
-                                .map(|cell| {
-                                    DeviceCell::from_wire(
-                                        cell.e_centi,
-                                        cell.flags.bits(),
-                                        cell.mask.bits(),
-                                    )
-                                    .map_or(DeviceInput::Unknown, DeviceInput::Cell)
-                                })
-                                .collect(),
-                            // Loudness that never arrives is unknown, not silence and
-                            // not a gap in the audio.
-                            ChunkBody::Missing(_) => {
-                                let count = chunk.span.end.div_ceil(512) - chunk.span.start / 512;
-                                vec![DeviceInput::Unknown; count as usize]
-                            }
-                            ChunkBody::Data { .. } => Vec::new(),
-                        };
-                        if !cells.is_empty() {
-                            self.mic_job(
-                                owner,
-                                MicJob::DeviceCells {
-                                    key: key.clone(),
-                                    first,
-                                    cells: cells.clone(),
-                                },
-                            );
-                            self.evidence_cells(owner, &key, first, cells, now);
-                        }
-                        StreamNews::Other
+                    ChunkBody::Missing(_) => {
+                        mic_job(
+                            link,
+                            scope,
+                            MicJob::ReferenceMissing {
+                                key: key.clone(),
+                                reference_epoch,
+                                first,
+                                end: chunk.span.end,
+                            },
+                        );
+                        reference_job(
+                            link,
+                            scope,
+                            ReferenceJob::Missing {
+                                key,
+                                reference_epoch,
+                                first,
+                                end: chunk.span.end,
+                            },
+                        );
                     }
-                    (
-                        StreamId::Afe,
-                        ChunkBody::Data {
-                            data: ChunkData::Afe(records),
-                            ..
+                    ChunkBody::Data { .. } => {}
+                }
+                (StreamNews::Other, Fresh::Nothing)
+            }
+            (StreamId::Cells, body) => {
+                let first = CellIndex(chunk.span.start / echomuse_turn::time::CELL_SAMPLES);
+                let cells: Vec<DeviceInput> = match body {
+                    ChunkBody::Data {
+                        data: ChunkData::Cells(cells),
+                        ..
+                    } => cells
+                        .iter()
+                        .map(|cell| {
+                            DeviceCell::from_wire(cell.e_centi, cell.flags.bits(), cell.mask.bits())
+                                .map_or(DeviceInput::Unknown, DeviceInput::Cell)
+                        })
+                        .collect(),
+                    // Loudness that never arrives is unknown, not silence and not a gap
+                    // in the audio.
+                    ChunkBody::Missing(_) => {
+                        let count = chunk.span.end.div_ceil(512) - chunk.span.start / 512;
+                        vec![DeviceInput::Unknown; count as usize]
+                    }
+                    ChunkBody::Data { .. } => Vec::new(),
+                };
+                let fresh = if cells.is_empty() {
+                    Fresh::Nothing
+                } else {
+                    mic_job(
+                        link,
+                        scope,
+                        MicJob::DeviceCells {
+                            key,
+                            first,
+                            cells: cells.clone(),
                         },
-                    ) => {
-                        if let Some(analysis) = self.analysis_mut(owner) {
-                            store_afe(&mut analysis.afe, chunk.span.start, records);
-                        }
-                        StreamNews::Other
-                    }
-                    _ => StreamNews::Other,
-                }
+                    );
+                    self.cells(first, cells)
+                };
+                (StreamNews::Other, fresh)
             }
+            (
+                StreamId::Afe,
+                ChunkBody::Data {
+                    data: ChunkData::Afe(records),
+                    ..
+                },
+            ) => {
+                store_afe(&mut self.afe, chunk.span.start, records);
+                (StreamNews::Other, Fresh::Nothing)
+            }
+            _ => (StreamNews::Other, Fresh::Nothing),
         };
-        match owner {
-            Owner::Candidate => self.candidate_news(news, now),
-            Owner::Turn => self.turn_news(news, now),
-            Owner::Window => self.window_news(news, now),
-            Owner::Watch => self.watch_news(news, now),
+        Some(routed)
+    }
+
+    fn note_mic(&mut self, span: SampleSpan) {
+        self.mic_start.get_or_insert(span.start);
+        if self.mic_end.is_none_or(|end| span.end > end) {
+            self.mic_end = Some(span.end);
         }
     }
 
-    fn note_mic(&mut self, owner: Owner, span: SampleSpan) {
-        if let Some(analysis) = self.analysis_mut(owner) {
-            analysis.mic_start.get_or_insert(span.start);
-            if analysis.mic_end.is_none_or(|end| span.end > end) {
-                analysis.mic_end = Some(span.end);
-            }
-        }
-    }
-
-    /// Loudness cells for the owner's policy, or kept until it has one.
-    fn evidence_cells(
-        &mut self,
-        owner: Owner,
-        key: &StreamKey,
-        first: CellIndex,
-        cells: Vec<DeviceInput>,
-        now: Now,
-    ) {
-        if let Some(analysis) = self.analysis_mut(owner) {
-            analysis.log.cells.push((first, cells.clone()));
-            if let Some(pending) = analysis.pending.as_mut() {
+    /// Loudness cells: kept until a policy takes the stream, or fresh for it.
+    fn cells(&mut self, first: CellIndex, cells: Vec<DeviceInput>) -> Fresh {
+        self.log.cells.push((first, cells.clone()));
+        match self.pending.as_mut() {
+            Some(pending) => {
                 pending.cells.push((first, cells));
-                return;
+                Fresh::Nothing
             }
-        }
-        if owner == Owner::Turn {
-            let result = self
-                .turn_pushes(now)
-                .map(|mut pushes| push_cells(&mut pushes, key.epoch, first, &cells));
-            if let Some(Err(error)) = result {
-                self.evidence_failed(error);
-            }
-        }
-        if owner == Owner::Watch {
-            self.watch_assembler(|assembler| push_cells(assembler, key.epoch, first, &cells));
+            None => Fresh::Cells(first, cells),
         }
     }
 
-    fn evidence_gap(&mut self, owner: Owner, key: &StreamKey, span: SampleSpan, now: Now) {
-        if let Some(analysis) = self.analysis_mut(owner) {
-            analysis.log.gaps.push(span);
-            if let Some(pending) = analysis.pending.as_mut() {
+    fn gap(&mut self, span: SampleSpan) -> Fresh {
+        self.log.gaps.push(span);
+        match self.pending.as_mut() {
+            Some(pending) => {
                 pending.gaps.push(span);
-                return;
+                Fresh::Nothing
             }
-        }
-        if owner == Owner::Turn {
-            let result = self
-                .turn_pushes(now)
-                .map(|mut pushes| pushes.mark_gap(key.epoch, span));
-            if let Some(Err(error)) = result {
-                self.evidence_failed(error);
-            }
-        }
-        if owner == Owner::Watch {
-            self.watch_assembler(|assembler| assembler.mark_gap(key.epoch, span));
+            None => Fresh::Gap(span),
         }
     }
 
-    /// The microphone worker's answer.
-    pub(crate) fn mic_result(
+    /// The worker's VAD, echo labels and ASR: the VAD joins the stream's log; all of it
+    /// is kept until a policy takes the stream, or returned for the policy that has it.
+    pub(crate) fn worker_evidence(
         &mut self,
-        key: Option<crate::speech::StreamKey>,
-        result: Result<MicOutput, RuntimeError>,
-        now: Now,
-    ) {
-        let Some(key) = key else {
-            return;
-        };
-        let Some(owner) = self.owner_by_key(&key) else {
-            self.counters.stale_results += 1;
-            return;
-        };
-        let output = match result {
-            Ok(output) => output,
-            Err(error) => {
-                self.worker_failed(&error);
-                self.stream_failed(owner, now);
-                return;
-            }
-        };
-        if let Some(failure) = &output.failure {
-            tracing::warn!(device = %self.device, failure, "microphone analysis failed");
+        vad: Option<(CellIndex, Vec<VadInput>)>,
+        echo: Option<(CellIndex, Vec<EchoCell>)>,
+        asr: Vec<AsrObservation>,
+    ) -> Option<WorkerEvidence> {
+        if let Some(vad) = &vad {
+            self.log.vad.push(vad.clone());
         }
-        if let Some(alignment) = output.alignment
-            && owner == Owner::Candidate
-        {
-            self.candidate_alignment(alignment, now);
-        }
-        for (candidate, comparison) in output.comparisons.iter().cloned() {
-            self.candidate_comparison(&candidate, comparison, now);
-        }
-        let failed = output.failure.is_some();
-        if let (Some(vad), Some(analysis)) = (&output.vad, self.analysis_mut(owner)) {
-            analysis.log.vad.push(vad.clone());
-        }
-        // Evidence for the owner's policy, or kept until it has one.
-        if let Some(pending) = self.analysis_mut(owner).and_then(|a| a.pending.as_mut()) {
-            if let Some(vad) = output.vad {
-                pending.vad.push(vad);
-            }
-            if let Some(echo) = output.echo {
-                pending.echo.push(echo);
-            }
-            pending.asr.extend(output.asr);
-        } else if owner == Owner::Turn {
-            let epoch = key.epoch;
-            if let Some(turn) = self.turn.as_mut() {
-                turn.note_tokens(&output.asr);
-            }
-            // The pause server is asked when the worker starts a pause decode; should that
-            // notice have been lost, the pause decode's own result asks.
-            for observation in &output.asr {
-                if observation.kind == echomuse_turn::AsrKind::Finalized {
-                    self.ask_pause_server(observation.through, now);
+        match self.pending.as_mut() {
+            Some(pending) => {
+                if let Some(vad) = vad {
+                    pending.vad.push(vad);
                 }
-            }
-            let result = self
-                .turn_pushes(now)
-                .map(|mut pushes| push_worker_evidence(&mut pushes, epoch, output));
-            if let Some(Err(error)) = result {
-                self.evidence_failed(error);
-            }
-        } else if owner == Owner::Watch {
-            let epoch = key.epoch;
-            self.watch_assembler(|assembler| push_worker_evidence(assembler, epoch, output));
-        }
-        if failed {
-            self.stream_failed(owner, now);
-            return;
-        }
-        match owner {
-            Owner::Turn => self.turn_evidence(now),
-            Owner::Window => self.window_evidence(now),
-            Owner::Candidate => {}
-            Owner::Watch => self.watch_evidence(now),
-        }
-    }
-
-    /// A worker could not analyse the stream: its evidence is unknown from here.
-    fn stream_failed(&mut self, owner: Owner, now: Now) {
-        match owner {
-            Owner::Turn => self.turn_worker_error(now),
-            Owner::Candidate => self.candidate_evidence_failed(now),
-            Owner::Window => self.window_failed(now),
-            Owner::Watch => self.watch_failed(now),
-        }
-    }
-
-    /// The assembler refused evidence (it conflicts or is out of order): the turn's
-    /// evidence can no longer be trusted, so it closes as a worker error.
-    fn evidence_failed(&mut self, error: EvidenceError) {
-        tracing::warn!(device = %self.device, ?error, "turn evidence refused");
-        if let Some(turn) = self.turn.as_mut() {
-            turn.evidence_broken = true;
-        }
-    }
-
-    pub(crate) fn reference_result(
-        &mut self,
-        key: Option<StreamKey>,
-        result: Result<ReferenceOutput, RuntimeError>,
-        now: Now,
-    ) {
-        let Some(key) = key else {
-            return;
-        };
-        if self.owner_by_key(&key).is_none() {
-            self.counters.stale_results += 1;
-            return;
-        }
-        match result {
-            Ok(output) => {
-                if let Some(failure) = &output.failure {
-                    tracing::warn!(device = %self.device, failure, "reference scoring failed");
+                if let Some(echo) = echo {
+                    pending.echo.push(echo);
                 }
-                for (candidate, judgement) in output.judgements {
-                    self.candidate_judgement(&candidate, judgement, now);
-                }
+                pending.asr.extend(asr);
+                None
             }
-            Err(error) => {
-                self.worker_failed(&error);
-                self.candidate_reference_failed(now);
-            }
+            None => Some(WorkerEvidence { vad, echo, asr }),
         }
     }
 }
 
-/// Pushes one worker output into an assembler.
-fn push_worker_evidence(
+/// Queues a microphone worker job under `scope`, unless that is cancelled.
+pub(crate) fn mic_job(link: &mut EffectLink, scope: &WorkScope, job: MicJob) {
+    if scope.is_cancelled() {
+        return;
+    }
+    let key = match &job {
+        MicJob::Reset => None,
+        MicJob::Open { key, .. }
+        | MicJob::StartUtterance { key, .. }
+        | MicJob::Mic { key, .. }
+        | MicJob::MicMissing { key, .. }
+        | MicJob::Reference { key, .. }
+        | MicJob::ReferenceSilence { key, .. }
+        | MicJob::ReferenceMissing { key, .. }
+        | MicJob::DeviceCells { key, .. }
+        | MicJob::CompareCandidate { key, .. }
+        | MicJob::Close { key } => Some(key.clone()),
+    };
+    // Loudness cells that arrive in a run (a subscription's history comes as the many
+    // small packets it was sent in, two cells each) go to the worker as one job, so ten
+    // seconds of history do not overflow its queue.
+    if let MicJob::DeviceCells { key, first, cells } = &job
+        && let Some(Effect::Mic {
+            job:
+                MicJob::DeviceCells {
+                    key: last_key,
+                    first: last_first,
+                    cells: last_cells,
+                },
+            ..
+        }) = link.effects.last_mut()
+        && last_key == key
+        && last_first.0 + last_cells.len() as u64 == first.0
+    {
+        last_cells.extend_from_slice(cells);
+        return;
+    }
+    link.effects.push(Effect::Mic {
+        scope: scope.clone(),
+        key,
+        job,
+    });
+}
+
+/// Queues a reference scoring job under `scope`, unless that is cancelled.
+pub(crate) fn reference_job(link: &mut EffectLink, scope: &WorkScope, job: ReferenceJob) {
+    if scope.is_cancelled() {
+        return;
+    }
+    let key = match &job {
+        ReferenceJob::Reset => None,
+        ReferenceJob::Open { key, .. }
+        | ReferenceJob::Pcm { key, .. }
+        | ReferenceJob::Silence { key, .. }
+        | ReferenceJob::Missing { key, .. }
+        | ReferenceJob::Judge { key, .. }
+        | ReferenceJob::Close { key } => Some(key.clone()),
+    };
+    link.effects.push(Effect::Reference {
+        scope: scope.clone(),
+        key,
+        job,
+    });
+}
+
+/// Pushes the worker's evidence into an assembler.
+pub(crate) fn push_worker_evidence(
     assembler: &mut impl Pushes,
     epoch: Epoch,
-    output: MicOutput,
+    evidence: WorkerEvidence,
 ) -> Result<(), EvidenceError> {
-    if let Some((first, vad)) = output.vad {
+    if let Some((first, vad)) = evidence.vad {
         skip_outside(assembler.push_vad(epoch, first, &vad))?;
     }
-    if let Some((first, echo)) = output.echo {
+    if let Some((first, echo)) = evidence.echo {
         skip_outside(assembler.push_echo(epoch, first, &echo))?;
     }
-    for observation in output.asr {
+    for observation in evidence.asr {
         assembler.push_asr(epoch, observation)?;
     }
     Ok(())

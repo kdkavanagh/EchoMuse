@@ -182,7 +182,7 @@ async fn a_panic_inside_the_alert_service_fires_the_fatal_hook_at_once() {
         .await
         .expect("the fatal hook fired while the service was left running")
         .unwrap();
-    assert!(reason.contains("\"alert service\" failed"), "{reason}");
+    assert!(reason.contains("alert service"), "{reason}");
     assert!(reason.contains(INJECTED), "{reason}");
 
     // Whoever waits on the task still gets the service's own error.

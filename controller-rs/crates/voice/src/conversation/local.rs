@@ -24,15 +24,19 @@ use echomuse_grammar::{
 use echomuse_records::vocab::{TerminalReason, TurnOutcome};
 use uuid::Uuid;
 
-use crate::{
-    io::{AlertReply, AlertRequest, Effect, HaRequest, Now},
-    machine::Voice,
+use super::{
+    Conversation,
     turn::{Call, Stage},
+};
+use crate::{
+    io::{AlertReply, AlertRequest, CallId, Effect, HaRequest, Now},
+    output::Output,
+    session::{ConversationCx, ConversationFacts},
 };
 
 /// What a reply window expects: the question it answers.
 #[derive(Clone, Debug)]
-pub(crate) enum Expectation {
+pub(super) enum Expectation {
     /// HA's `continue_conversation`: the reply goes to HA with its conversation id.
     Conversation {
         conversation: Option<ConversationId>,
@@ -68,7 +72,7 @@ pub(crate) enum Expectation {
 }
 
 impl Expectation {
-    pub(crate) fn reply_kind(&self) -> Option<ReplyKind> {
+    pub(super) fn reply_kind(&self) -> Option<ReplyKind> {
         match self {
             Self::Meridiem { .. } | Self::CancelMeridiem { .. } => Some(ReplyKind::Meridiem),
             Self::WhichTimer { .. } | Self::WhichAlarm { .. } => Some(ReplyKind::Which),
@@ -76,7 +80,7 @@ impl Expectation {
         }
     }
 
-    pub(crate) fn conversation(&self) -> Option<ConversationId> {
+    pub(super) fn conversation(&self) -> Option<ConversationId> {
         match self {
             Self::Conversation { conversation } => conversation.clone(),
             _ => None,
@@ -86,7 +90,7 @@ impl Expectation {
 
 /// An alert operation a turn waits on, and what to say about its outcome.
 #[derive(Clone, Debug)]
-pub(crate) enum AlertWait {
+pub(super) enum AlertWait {
     /// Stopping or snoozing a ring: nothing is said unless the outcome is unknown.
     Act,
     Set {
@@ -102,7 +106,7 @@ pub(crate) enum AlertWait {
 
 /// A timer request waiting on HA's timer list (`HassTimerStatus`).
 #[derive(Clone, Debug)]
-pub(crate) enum TimerRequest {
+pub(super) enum TimerRequest {
     /// "Cancel the timer" or "cancel all timers", and the text as routed: when HA cannot
     /// list its timers, the text goes to HA's own intent handling instead.
     Cancel { cancel: TimerCancel, text: String },
@@ -110,35 +114,55 @@ pub(crate) enum TimerRequest {
     Chosen(ChosenTimers),
 }
 
-impl Voice {
-    fn today(&self, now: Now) -> jiff::civil::Date {
-        self.local_now(now)
-            .map(|zoned| zoned.date())
-            .unwrap_or_else(|| {
-                jiff::Timestamp::from_millisecond(now.wall_ms)
-                    .map(|t| t.to_zoned(jiff::tz::TimeZone::UTC).date())
-                    .unwrap_or_default()
-            })
-    }
+fn today(facts: &ConversationFacts<'_>, now: Now) -> jiff::civil::Date {
+    local_now(facts, now)
+        .map(|zoned| zoned.date())
+        .unwrap_or_else(|| {
+            jiff::Timestamp::from_millisecond(now.wall_ms)
+                .map(|t| t.to_zoned(jiff::tz::TimeZone::UTC).date())
+                .unwrap_or_default()
+        })
+}
 
-    /// The local time in Home Assistant's zone; `None` while the zone is unknown.
-    fn local_now(&self, now: Now) -> Option<jiff::Zoned> {
-        self.time_zone.as_ref()?.at_ms(now.wall_ms)
-    }
+/// The local time in Home Assistant's zone; `None` while the zone is unknown.
+fn local_now(facts: &ConversationFacts<'_>, now: Now) -> Option<jiff::Zoned> {
+    facts.time_zone.as_ref()?.at_ms(now.wall_ms)
+}
 
-    pub(crate) fn line_text(&self, line: &Line, now: Now) -> String {
-        line.text(self.today(now))
-    }
+pub(super) fn line_text(facts: &ConversationFacts<'_>, line: &Line, now: Now) -> String {
+    line.text(today(facts, now))
+}
 
-    fn alert_call(&mut self, request: AlertRequest, wait: AlertWait) {
+/// When `request` would first ring, as local RFC 3339 text in HA's zone.
+fn first_due_text(
+    facts: &ConversationFacts<'_>,
+    request: &AlarmRequest,
+    now: Now,
+) -> Option<String> {
+    let zone = facts.time_zone.as_ref()?;
+    let local = zone.at_ms(now.wall_ms)?;
+    let when = request.when(local.datetime()).ok()?;
+    let instant = jiff::Timestamp::from_millisecond(now.wall_ms).ok()?;
+    let due = when.first_due(instant, zone).ok()?;
+    Some(echomuse_alerts::schedule::local_text(&due))
+}
+
+fn list(
+    result: Result<Result<Vec<AlarmEntry>, Refusal>, echomuse_alerts::ServiceStopped>,
+) -> Option<Vec<AlarmEntry>> {
+    result.ok()?.ok()
+}
+
+impl Conversation {
+    fn alert_call(&mut self, cx: &mut ConversationCx<'_>, request: AlertRequest, wait: AlertWait) {
         let Some(turn) = self.turn.as_mut() else {
             return;
         };
         turn.alert_wait = Some(wait);
         let uuid = turn.uuid;
-        let call = self.call_id();
+        let call = cx.ids.call();
         self.calls.insert(call, Call::Alert { turn: uuid });
-        self.link.effects.push(Effect::Alert { call, request });
+        cx.link.effects.push(Effect::Alert { call, request });
     }
 
     fn set_outcome(&mut self, outcome: TurnOutcome) {
@@ -149,24 +173,31 @@ impl Voice {
 
     /// A failure with nothing more useful to say: the turn ends `ha_error` (error cue) with
     /// "Something went wrong."
-    fn went_wrong(&mut self, now: Now) {
+    fn went_wrong(&mut self, cx: &mut ConversationCx<'_>, out: &mut Output, now: Now) {
         if let Some(turn) = self.turn.as_mut() {
             turn.facts.terminal = Some(TerminalReason::HaError);
         }
-        self.say(Line::SomethingWentWrong, now);
+        self.say(cx, out, Line::SomethingWentWrong, now);
     }
 
     /// An operation that may or may not have happened: the turn ends `outcome_unknown`
     /// with "I'm not sure that worked."
-    fn not_sure(&mut self, now: Now) {
+    fn not_sure(&mut self, cx: &mut ConversationCx<'_>, out: &mut Output, now: Now) {
         if let Some(turn) = self.turn.as_mut() {
             turn.facts.terminal = Some(TerminalReason::OutcomeUnknown);
         }
-        self.say(Line::NotSureItWorked, now);
+        self.say(cx, out, Line::NotSureItWorked, now);
     }
 
     /// A command acting on what is going on, before STT (§4.4).
-    pub(crate) fn context_command(&mut self, command: ContextCommand, text: String, now: Now) {
+    pub(super) fn context_command(
+        &mut self,
+        cx: &mut ConversationCx<'_>,
+        out: &mut Output,
+        command: ContextCommand,
+        text: String,
+        now: Now,
+    ) {
         let Some(turn) = self.turn.as_mut() else {
             return;
         };
@@ -179,7 +210,7 @@ impl Voice {
         match command {
             ContextCommand::DismissAlert | ContextCommand::SnoozeAlert => {
                 let (Some((device, ring_id)), Some(_)) = (ring, alert) else {
-                    self.finish_turn(now);
+                    self.finish_turn(cx, out, now);
                     return;
                 };
                 let action = if command == ContextCommand::SnoozeAlert {
@@ -193,11 +224,11 @@ impl Voice {
                     action,
                     source: ActSource::Voice,
                 };
-                self.alert_call(AlertRequest::Act(act), AlertWait::Act);
+                self.alert_call(cx, AlertRequest::Act(act), AlertWait::Act);
             }
             ContextCommand::StopReply => {
                 // The reply stopped when this turn began; nothing more to do or say.
-                self.finish_turn(now);
+                self.finish_turn(cx, out, now);
             }
             ContextCommand::StopMedia | ContextCommand::PauseMedia => {
                 let request = if command == ContextCommand::StopMedia {
@@ -207,31 +238,37 @@ impl Voice {
                 };
                 // During the dialog the player records the intent and applies it when
                 // the turn ends (§4.9).
-                let _ = self.media.command(request);
-                let effects = self.media_effects();
-                self.apply_media_effects(effects, now);
-                self.finish_turn(now);
+                out.media_command(&mut cx.output(), request, now);
+                self.finish_turn(cx, out, now);
             }
         }
     }
 
     /// Routes a final transcript (wake phrase removed).
-    pub(crate) fn route(&mut self, text: String, now: Now) {
+    pub(super) fn route(
+        &mut self,
+        cx: &mut ConversationCx<'_>,
+        out: &mut Output,
+        text: String,
+        now: Now,
+    ) {
         let expectation = self.turn.as_ref().and_then(|t| t.expectation.clone());
         if let Some(expectation) = expectation
-            && self.answer_question(&expectation, &text, now)
+            && self.answer_question(cx, out, &expectation, &text, now)
         {
             return;
         }
-        match self.grammar.route(&text) {
-            Route::Repeat => self.repeat(now),
-            Route::SetAlarm(request) => self.set_alarm(request, None, now),
+        match cx.facts.grammar.route(&text) {
+            Route::Repeat => self.repeat(cx, out, now),
+            Route::SetAlarm(request) => self.set_alarm(cx, out, request, None, now),
             Route::AskMeridiem(pending) => {
                 self.set_outcome(TurnOutcome::Clarification);
                 let origin = self.turn_uuid();
                 self.ask(
+                    cx,
+                    out,
                     Line::AmOrPm,
-                    crate::local::Expectation::Meridiem {
+                    Expectation::Meridiem {
                         pending,
                         origin,
                         asked_again: false,
@@ -243,25 +280,26 @@ impl Voice {
                 self.set_outcome(TurnOutcome::Alarm);
                 let origin = self.turn_uuid();
                 self.alert_call(
+                    cx,
                     AlertRequest::ListAlarms,
                     AlertWait::ListForCancel { cancel, origin },
                 );
             }
             Route::AlarmQuery(query) => {
                 self.set_outcome(TurnOutcome::AlarmQuery);
-                self.alert_call(AlertRequest::ListAlarms, AlertWait::Query(query));
+                self.alert_call(cx, AlertRequest::ListAlarms, AlertWait::Query(query));
             }
             Route::CancelTimers(cancel) => {
                 self.set_outcome(TurnOutcome::Timer);
-                if self.ha_device.is_none() {
+                if cx.facts.ha_device.is_none() {
                     // Without this satellite's HA device, HA's timers cannot be told apart
                     // by speaker: refusing is better than cancelling another speaker's.
-                    self.say(Line::TimerNotCancelled, now);
+                    self.say(cx, out, Line::TimerNotCancelled, now);
                     return;
                 }
-                self.request_timers(TimerRequest::Cancel { cancel, text }, now);
+                self.request_timers(cx, TimerRequest::Cancel { cancel, text }, now);
             }
-            Route::SendToHa => self.dispatch_to_ha(text, now),
+            Route::SendToHa => self.dispatch_to_ha(cx, out, text, now),
         }
     }
 
@@ -271,18 +309,29 @@ impl Voice {
 
     /// Answers the question the turn replies to; `false` when the text is not an answer
     /// to it (it is then routed as a request of its own).
-    fn answer_question(&mut self, expectation: &Expectation, text: &str, now: Now) -> bool {
+    fn answer_question(
+        &mut self,
+        cx: &mut ConversationCx<'_>,
+        out: &mut Output,
+        expectation: &Expectation,
+        text: &str,
+        now: Now,
+    ) -> bool {
+        let facts = cx.facts;
+        let grammar = &facts.grammar;
         match expectation {
             Expectation::Meridiem {
                 pending,
                 origin,
                 asked_again,
             } => {
-                match self.grammar.meridiem(text) {
+                match grammar.meridiem(text) {
                     Some(meridiem) => {
-                        self.set_alarm(pending.with_meridiem(meridiem), Some(*origin), now)
+                        self.set_alarm(cx, out, pending.with_meridiem(meridiem), Some(*origin), now)
                     }
                     None => self.ask_again(
+                        cx,
+                        out,
                         Expectation::Meridiem {
                             pending: pending.clone(),
                             origin: *origin,
@@ -301,7 +350,7 @@ impl Voice {
                 origin,
                 asked_again,
             } => {
-                match self.grammar.meridiem(text) {
+                match grammar.meridiem(text) {
                     Some(meridiem) => {
                         let time = SaidTime::Ambiguous {
                             hour: *hour,
@@ -310,6 +359,7 @@ impl Voice {
                         .with_meridiem(meridiem);
                         self.set_outcome(TurnOutcome::Alarm);
                         self.alert_call(
+                            cx,
                             AlertRequest::ListAlarms,
                             AlertWait::ListForCancel {
                                 cancel: AlarmCancel::At(SaidTime::Exact(time)),
@@ -318,6 +368,8 @@ impl Voice {
                         );
                     }
                     None => self.ask_again(
+                        cx,
+                        out,
                         Expectation::CancelMeridiem {
                             hour: *hour,
                             minute: *minute,
@@ -335,24 +387,25 @@ impl Voice {
                 timers,
                 asked_again,
             } => {
-                let pick = self
-                    .grammar
+                let pick = grammar
                     .which(text)
                     .map_or(TimerPick::NoMatch, |reply| reply.choose_timer(timers));
                 match pick {
                     TimerPick::Chosen(chosen) => {
                         self.set_outcome(TurnOutcome::Timer);
-                        if self.ha_device.is_none() {
-                            self.went_wrong(now);
+                        if cx.facts.ha_device.is_none() {
+                            self.went_wrong(cx, out, now);
                         } else {
-                            self.request_timers(TimerRequest::Chosen(chosen), now);
+                            self.request_timers(cx, TimerRequest::Chosen(chosen), now);
                         }
                     }
                     TimerPick::Declined => {
                         self.set_outcome(TurnOutcome::Clarification);
-                        self.say(Line::LeftIt, now);
+                        self.say(cx, out, Line::LeftIt, now);
                     }
                     TimerPick::NoMatch => self.ask_again(
+                        cx,
+                        out,
                         Expectation::WhichTimer {
                             timers: timers.clone(),
                             asked_again: true,
@@ -369,21 +422,20 @@ impl Voice {
                 origin,
                 asked_again,
             } => {
-                let choice = self
-                    .grammar
-                    .which(text)
-                    .map(|reply| reply.choose_alarms(alarms));
+                let choice = grammar.which(text).map(|reply| reply.choose_alarms(alarms));
                 match choice {
                     Some(Choice::Chosen(chosen)) => {
                         self.set_outcome(TurnOutcome::Alarm);
                         let plan = AlarmCancelPlan::Cancel(chosen);
-                        self.cancel_alarms(plan, *origin, now);
+                        self.cancel_alarms(cx, out, plan, *origin, now);
                     }
                     Some(Choice::Declined) => {
                         self.set_outcome(TurnOutcome::Clarification);
-                        self.say(Line::LeftIt, now);
+                        self.say(cx, out, Line::LeftIt, now);
                     }
                     Some(Choice::NoMatch) | None => self.ask_again(
+                        cx,
+                        out,
                         Expectation::WhichAlarm {
                             alarms: alarms.clone(),
                             origin: *origin,
@@ -403,16 +455,25 @@ impl Voice {
     }
 
     /// An unclear answer: ask once more, then give up (§4.4 "Okay, I left it.").
-    fn ask_again(&mut self, again: Expectation, asked_again: bool, line: Line, now: Now) {
+    fn ask_again(
+        &mut self,
+        cx: &mut ConversationCx<'_>,
+        out: &mut Output,
+        again: Expectation,
+        asked_again: bool,
+        line: Line,
+        now: Now,
+    ) {
         self.set_outcome(TurnOutcome::Clarification);
         if asked_again {
-            self.say(Line::LeftIt, now);
+            self.say(cx, out, Line::LeftIt, now);
         } else {
-            self.ask(line, again, now);
+            self.ask(cx, out, line, again, now);
         }
     }
 
-    fn repeat(&mut self, now: Now) {
+    /// "Repeat": the last answer again, with the question it asked, within two minutes.
+    fn repeat(&mut self, cx: &mut ConversationCx<'_>, out: &mut Output, now: Now) {
         self.set_outcome(TurnOutcome::Repeat);
         let recent = self
             .last_answer
@@ -424,44 +485,65 @@ impl Voice {
                 if let Some(turn) = self.turn.as_mut() {
                     turn.answering.follow_up = last.follow_up.clone();
                 }
-                self.speak_answer(last.url, now);
+                self.speak_answer(cx, out, last.url, now);
             }
-            None => self.say(Line::NothingToRepeat, now),
+            None => self.say(cx, out, Line::NothingToRepeat, now),
         }
     }
 
-    fn set_alarm(&mut self, request: AlarmRequest, origin: Option<Uuid>, now: Now) {
+    fn set_alarm(
+        &mut self,
+        cx: &mut ConversationCx<'_>,
+        out: &mut Output,
+        request: AlarmRequest,
+        origin: Option<Uuid>,
+        now: Now,
+    ) {
         self.set_outcome(TurnOutcome::Alarm);
-        let Some(local) = self.local_now(now) else {
+        let Some(local) = local_now(&cx.facts, now) else {
             // Without HA's time zone no alarm time can be placed: report failure.
-            self.went_wrong(now);
+            self.went_wrong(cx, out, now);
             return;
         };
         let origin = origin.unwrap_or_else(|| self.turn_uuid());
         let op_id = OpId::voice_alarm(&origin.to_string());
-        match request.set_alarm(op_id, self.device.clone(), local.datetime()) {
-            Ok(set) => self.alert_call(AlertRequest::SetAlarm(set), AlertWait::Set { request }),
-            Err(_) => self.say(Line::NoSuchDate, now),
+        match request.set_alarm(op_id, cx.facts.device.clone(), local.datetime()) {
+            Ok(set) => self.alert_call(cx, AlertRequest::SetAlarm(set), AlertWait::Set { request }),
+            Err(_) => self.say(cx, out, Line::NoSuchDate, now),
         }
     }
 
-    fn cancel_alarms(&mut self, plan: AlarmCancelPlan, origin: Uuid, now: Now) {
+    fn cancel_alarms(
+        &mut self,
+        cx: &mut ConversationCx<'_>,
+        out: &mut Output,
+        plan: AlarmCancelPlan,
+        origin: Uuid,
+        now: Now,
+    ) {
         let op_id = OpId::voice_alarm(&origin.to_string());
-        match plan.request(op_id, self.device.clone()) {
+        match plan.request(op_id, cx.facts.device.clone()) {
             Some(request) => {
-                self.alert_call(AlertRequest::CancelAlarms(request), AlertWait::Cancel)
+                self.alert_call(cx, AlertRequest::CancelAlarms(request), AlertWait::Cancel)
             }
-            None => self.went_wrong(now),
+            None => self.went_wrong(cx, out, now),
         }
     }
 
-    pub(crate) fn alert_reply(&mut self, call: crate::io::CallId, reply: AlertReply, now: Now) {
+    pub(crate) fn alert_reply(
+        &mut self,
+        cx: &mut ConversationCx<'_>,
+        out: &mut Output,
+        call: CallId,
+        reply: AlertReply,
+        now: Now,
+    ) {
         let Some(Call::Alert { turn }) = self.calls.remove(&call) else {
-            self.counters.stale_results += 1;
+            cx.counters.stale_results += 1;
             return;
         };
-        if self.turn.as_ref().map(|t| t.uuid) != Some(turn) {
-            self.counters.stale_results += 1;
+        if !self.is_current(&turn) {
+            cx.counters.stale_results += 1;
             return;
         }
         let Some(wait) = self.turn.as_mut().and_then(|t| t.alert_wait.take()) else {
@@ -479,36 +561,44 @@ impl Voice {
                     | ActOutcome::Pending { .. }
                     | ActOutcome::Refused(_)
                     | ActOutcome::Rejected { .. },
-                ) => self.finish_turn(now),
-                Ok(ActOutcome::Unknown { .. }) | Err(_) => self.not_sure(now),
+                ) => self.finish_turn(cx, out, now),
+                Ok(ActOutcome::Unknown { .. }) | Err(_) => self.not_sure(cx, out, now),
             },
             (AlertWait::Set { request }, AlertReply::SetAlarm(result)) => match result {
                 Ok(Outcome::Applied { result, .. }) => self.say(
+                    cx,
+                    out,
                     Line::AlarmSet(SpokenAlarm::from_request(&request, &result.first_due_local)),
                     now,
                 ),
                 Ok(Outcome::Pending { .. }) => {
                     // Journaled but not yet confirmed: never said to be stored. The time
                     // said is when it would first ring, computed here.
-                    let due = self.first_due_text(&request, now).unwrap_or_default();
+                    let due = first_due_text(&cx.facts, &request, now).unwrap_or_default();
                     self.say(
+                        cx,
+                        out,
                         Line::AlarmSaving(SpokenAlarm::from_request(&request, &due)),
                         now,
                     );
                 }
-                Ok(Outcome::Refused(_) | Outcome::Rejected { .. }) | Err(_) => self.went_wrong(now),
+                Ok(Outcome::Refused(_) | Outcome::Rejected { .. }) | Err(_) => {
+                    self.went_wrong(cx, out, now)
+                }
             },
             (AlertWait::ListForCancel { cancel, origin }, AlertReply::ListAlarms(result)) => {
                 let Some(entries) = list(result) else {
-                    self.went_wrong(now);
+                    self.went_wrong(cx, out, now);
                     return;
                 };
                 let choices = AlarmChoice::from_entries(&entries);
                 match cancel.plan(&choices) {
                     AlarmCancelPlan::NoAlarms | AlarmCancelPlan::NotFound => {
-                        self.say(Line::AlarmNotFound, now)
+                        self.say(cx, out, Line::AlarmNotFound, now)
                     }
                     AlarmCancelPlan::WhichOne(alarms) => self.ask(
+                        cx,
+                        out,
                         Line::WhichAlarm,
                         Expectation::WhichAlarm {
                             alarms,
@@ -519,11 +609,13 @@ impl Voice {
                     ),
                     AlarmCancelPlan::AskMeridiem => {
                         let AlarmCancel::At(SaidTime::Ambiguous { hour, minute }) = cancel else {
-                            self.went_wrong(now);
+                            self.went_wrong(cx, out, now);
                             return;
                         };
                         self.set_outcome(TurnOutcome::Clarification);
                         self.ask(
+                            cx,
+                            out,
                             Line::AmOrPm,
                             Expectation::CancelMeridiem {
                                 hour,
@@ -535,7 +627,7 @@ impl Voice {
                         );
                     }
                     plan @ (AlarmCancelPlan::Cancel(_) | AlarmCancelPlan::CancelAll(_)) => {
-                        self.cancel_alarms(plan, origin, now)
+                        self.cancel_alarms(cx, out, plan, origin, now)
                     }
                 }
             }
@@ -549,17 +641,17 @@ impl Voice {
                         .iter()
                         .any(|t| matches!(t.outcome, Outcome::Pending { .. }))
                     {
-                        self.not_sure(now);
+                        self.not_sure(cx, out, now);
                     } else if applied == 0 {
-                        self.went_wrong(now);
+                        self.went_wrong(cx, out, now);
                     } else {
-                        self.say(Line::AlarmsCancelled(applied), now);
+                        self.say(cx, out, Line::AlarmsCancelled(applied), now);
                     }
                 }
                 Ok(CancelOutcome::Refused(Refusal::NothingToCancel)) => {
-                    self.say(Line::AlarmNotFound, now)
+                    self.say(cx, out, Line::AlarmNotFound, now)
                 }
-                Ok(CancelOutcome::Refused(_)) | Err(_) => self.went_wrong(now),
+                Ok(CancelOutcome::Refused(_)) | Err(_) => self.went_wrong(cx, out, now),
             },
             (AlertWait::Query(query), AlertReply::ListAlarms(result)) => match list(result) {
                 Some(entries) => {
@@ -570,11 +662,11 @@ impl Voice {
                         AlarmQuery::List => Line::Alarms(spoken),
                         AlarmQuery::Next => Line::NextAlarm(spoken.into_iter().next()),
                     };
-                    self.say(line, now);
+                    self.say(cx, out, line, now);
                 }
-                None => self.say(Line::AlarmsUnavailable, now),
+                None => self.say(cx, out, Line::AlarmsUnavailable, now),
             },
-            _ => self.counters.stale_results += 1,
+            _ => cx.counters.stale_results += 1,
         }
     }
 
@@ -582,7 +674,7 @@ impl Voice {
 
     /// Asks HA for its timers (`HassTimerStatus`, which changes nothing); the request's
     /// time is the turn's `intent_ms`.
-    fn request_timers(&mut self, request: TimerRequest, now: Now) {
+    fn request_timers(&mut self, cx: &mut ConversationCx<'_>, request: TimerRequest, now: Now) {
         let Some(turn) = self.turn.as_mut() else {
             return;
         };
@@ -590,27 +682,33 @@ impl Voice {
         turn.timer_request = Some(request);
         let uuid = turn.uuid;
         let scope = turn.scope.clone();
-        let call = self.call_id();
+        let call = cx.ids.call();
         self.calls.insert(call, Call::TimerStatus { turn: uuid });
-        self.link.effects.push(Effect::Ha {
+        cx.link.effects.push(Effect::Ha {
             call,
             scope,
             request: HaRequest::TimerStatus {
-                ha_device: self.ha_device.clone(),
+                ha_device: cx.facts.ha_device.clone(),
             },
         });
     }
 
     /// HA listed its timers, or could not.
-    pub(crate) fn timer_status(&mut self, result: Result<TimerStatus, HaError>, now: Now) {
+    pub(super) fn timer_status(
+        &mut self,
+        cx: &mut ConversationCx<'_>,
+        out: &mut Output,
+        result: Result<TimerStatus, HaError>,
+        now: Now,
+    ) {
         let Some(request) = self.turn.as_mut().and_then(|t| t.timer_request.take()) else {
-            self.counters.stale_results += 1;
+            cx.counters.stale_results += 1;
             return;
         };
-        let listed = match (result, self.ha_device.clone()) {
+        let listed = match (result, cx.facts.ha_device.clone()) {
             (Ok(status), Some(device)) => Some((status, device)),
             (Err(error), _) => {
-                tracing::warn!(device = %self.device, %error, "HA's timer list failed");
+                tracing::warn!(device = %cx.facts.device, %error, "HA's timer list failed");
                 None
             }
             (Ok(_), None) => None,
@@ -618,8 +716,8 @@ impl Voice {
         let Some((status, device)) = listed else {
             match request {
                 // HA could not say which timers run: the request is HA's after all.
-                TimerRequest::Cancel { text, .. } => self.dispatch_to_ha(text, now),
-                TimerRequest::Chosen(_) => self.went_wrong(now),
+                TimerRequest::Cancel { text, .. } => self.dispatch_to_ha(cx, out, text, now),
+                TimerRequest::Chosen(_) => self.went_wrong(cx, out, now),
             }
             return;
         };
@@ -634,11 +732,13 @@ impl Voice {
             TimerRequest::Chosen(chosen) => timers.plan_chosen(chosen),
         };
         match plan {
-            TimerCancelPlan::NoTimers => self.say(Line::NoTimers, now),
+            TimerCancelPlan::NoTimers => self.say(cx, out, Line::NoTimers, now),
             TimerCancelPlan::WhichOne(timers) => {
                 self.set_outcome(TurnOutcome::Clarification);
                 let spoken = timers.iter().map(SpokenTimer::from_timer).collect();
                 self.ask(
+                    cx,
+                    out,
                     Line::WhichTimer(spoken),
                     Expectation::WhichTimer {
                         timers,
@@ -647,10 +747,15 @@ impl Voice {
                     now,
                 );
             }
-            TimerCancelPlan::AlreadyFinished(timer) => {
-                self.say(Line::TimerFinished(SpokenTimer::from_timer(&timer)), now)
-            }
+            TimerCancelPlan::AlreadyFinished(timer) => self.say(
+                cx,
+                out,
+                Line::TimerFinished(SpokenTimer::from_timer(&timer)),
+                now,
+            ),
             TimerCancelPlan::Indistinct { timer, count } => self.say(
+                cx,
+                out,
                 Line::TimersIndistinct {
                     timer: SpokenTimer::from_timer(&timer),
                     count,
@@ -661,13 +766,13 @@ impl Voice {
                 if let Some(turn) = self.turn.as_mut() {
                     turn.timers_cancelling = Some(run);
                 }
-                self.next_timer_cancel(now);
+                self.next_timer_cancel(cx, out, now);
             }
         }
     }
 
     /// Sends the next cancel, or says what was cancelled once none is left.
-    fn next_timer_cancel(&mut self, now: Now) {
+    fn next_timer_cancel(&mut self, cx: &mut ConversationCx<'_>, out: &mut Output, now: Now) {
         let Some(turn) = self.turn.as_mut() else {
             return;
         };
@@ -684,71 +789,59 @@ impl Voice {
                     .collect(),
                 total: run.total(),
             };
-            self.say(line, now);
+            self.say(cx, out, line, now);
             return;
         };
         let uuid = turn.uuid;
         let scope = turn.scope.clone();
-        let call = self.call_id();
+        let call = cx.ids.call();
         self.calls.insert(call, Call::CancelTimers { turn: uuid });
-        self.link.effects.push(Effect::Ha {
+        cx.link.effects.push(Effect::Ha {
             call,
             scope,
             request: HaRequest::CallIntent {
                 intent,
-                ha_device: self.ha_device.clone(),
+                ha_device: cx.facts.ha_device.clone(),
             },
         });
     }
 
     /// HA answered one cancel. A refused or unsent cancel leaves that timer running and
     /// the rest go on; one whose outcome is unknown stops the run, never re-sent (§3.3.3).
-    pub(crate) fn timer_cancelled(&mut self, outcome: EffectOutcome<()>, now: Now) {
+    pub(super) fn timer_cancelled(
+        &mut self,
+        cx: &mut ConversationCx<'_>,
+        out: &mut Output,
+        outcome: EffectOutcome<()>,
+        now: Now,
+    ) {
         let Some(run) = self
             .turn
             .as_mut()
             .and_then(|t| t.timers_cancelling.as_mut())
         else {
-            self.counters.stale_results += 1;
+            cx.counters.stale_results += 1;
             return;
         };
         match outcome {
             EffectOutcome::Applied(()) => run.answered(true),
             EffectOutcome::Rejected { code, message } => {
-                tracing::warn!(device = %self.device, code, message, "HA refused a timer cancel");
+                tracing::warn!(device = %cx.facts.device, code, message, "HA refused a timer cancel");
                 run.answered(false);
             }
             EffectOutcome::NotDispatched(reason) => {
-                tracing::warn!(device = %self.device, ?reason, "a timer cancel was not sent");
+                tracing::warn!(device = %cx.facts.device, ?reason, "a timer cancel was not sent");
                 run.answered(false);
             }
             EffectOutcome::Unknown(cause) => {
-                tracing::warn!(device = %self.device, ?cause, "a timer cancel's outcome is unknown");
+                tracing::warn!(device = %cx.facts.device, ?cause, "a timer cancel's outcome is unknown");
                 if let Some(turn) = self.turn.as_mut() {
                     turn.timers_cancelling = None;
                 }
-                self.not_sure(now);
+                self.not_sure(cx, out, now);
                 return;
             }
         }
-        self.next_timer_cancel(now);
-    }
-}
-
-fn list(
-    result: Result<Result<Vec<AlarmEntry>, Refusal>, echomuse_alerts::ServiceStopped>,
-) -> Option<Vec<AlarmEntry>> {
-    result.ok()?.ok()
-}
-
-impl Voice {
-    /// When `request` would first ring, as local RFC 3339 text in HA's zone.
-    fn first_due_text(&self, request: &AlarmRequest, now: Now) -> Option<String> {
-        let zone = self.time_zone.as_ref()?;
-        let local = zone.at_ms(now.wall_ms)?;
-        let when = request.when(local.datetime()).ok()?;
-        let instant = jiff::Timestamp::from_millisecond(now.wall_ms).ok()?;
-        let due = when.first_due(instant, zone).ok()?;
-        Some(echomuse_alerts::schedule::local_text(&due))
+        self.next_timer_cancel(cx, out, now);
     }
 }

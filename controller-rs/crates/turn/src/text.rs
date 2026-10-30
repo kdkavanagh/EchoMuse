@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::time::Sample;
 
 /// A window of 1–3 words matches the wake phrase when its distance is at most this (§16.6).
-pub const PHRASE_MATCH_MAX: f64 = 0.45;
+const PHRASE_MATCH_MAX: f64 = 0.45;
 /// The verifier passes a transcript whose best substring is at most this far from the
 /// registry's `verify_core` (§16.6 "Wake verification").
 pub const VERIFY_PASS_MAX: f64 = 0.40;

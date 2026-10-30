@@ -146,9 +146,8 @@ async fn a_pty_shell_frames_input_and_resizes_and_returns_output() {
     let mut h = Harness::start().await;
     let device = h.approved("G0SHELL001").await;
     let (mut control, admitted) = device.connect(&mut h, &Route::Tcp).await;
-    let shells = h.server.shells();
 
-    let pending = shells.expect(DeviceId(device.id.clone()));
+    let pending = h.shells.expect(DeviceId(device.id.clone()));
     admitted
         .session
         .link
@@ -165,13 +164,14 @@ async fn a_pty_shell_frames_input_and_resizes_and_returns_output() {
         .dial(&Route::Tcp, &path, &[("X-EM-Token", &token)])
         .await
         .unwrap();
-    let mut shell = tokio::time::timeout(Duration::from_secs(5), pending.connected())
+    let shell = tokio::time::timeout(Duration::from_secs(5), pending.connected())
         .await
         .unwrap()
         .unwrap();
     assert_eq!(shell.mode(), ShellMode::Pty);
+    let (mut writer, mut reader) = shell.split();
 
-    shell
+    writer
         .send(ShellInput::Data(Bytes::from_static(b"ls\n")))
         .await
         .unwrap();
@@ -179,7 +179,7 @@ async fn a_pty_shell_frames_input_and_resizes_and_returns_output() {
         next_binary(&mut remote).await.unwrap(),
         Bytes::from_static(b"\x00ls\n")
     );
-    shell
+    writer
         .send(ShellInput::Resize {
             cols: 300,
             rows: 40,
@@ -194,42 +194,41 @@ async fn a_pty_shell_frames_input_and_resizes_and_returns_output() {
         .send(Message::Binary(Bytes::from_static(b"$ ")))
         .await
         .unwrap();
-    assert_eq!(shell.recv().await.unwrap(), Bytes::from_static(b"$ "));
+    assert_eq!(reader.recv().await.unwrap(), Bytes::from_static(b"$ "));
 
     // A new dial-back replaces the old shell.
-    let next = shells.expect(DeviceId(device.id.clone()));
+    let next = h.shells.expect(DeviceId(device.id.clone()));
     let _replacement = h
         .dial(&Route::Tcp, &path, &[("X-EM-Token", &token)])
         .await
         .unwrap();
     next.connected().await.unwrap();
-    assert_eq!(shell.recv().await, None);
+    assert_eq!(reader.recv().await, None);
 }
 
 #[tokio::test]
-async fn a_pipe_shell_carries_raw_bytes_and_bridges() {
+async fn a_pipe_shell_carries_raw_bytes_until_the_server_stops() {
     let h = Harness::start().await;
     let device = h.approved("G0SHELL002").await;
-    let shells = h.server.shells();
-    let pending = shells.expect(DeviceId(device.id.clone()));
+    let pending = h.shells.expect(DeviceId(device.id.clone()));
     let path = format!("{}{}", crate::PATH_SHELL_PREFIX, device.id);
     let token = device.token.clone().unwrap();
     let mut remote = h
         .dial(&Route::Tcp, &path, &[("X-EM-Token", &token)])
         .await
         .unwrap();
-    let mut shell = pending.connected().await.unwrap();
+    let shell = pending.connected().await.unwrap();
     assert_eq!(shell.mode(), ShellMode::Pipe);
+    let (mut writer, mut reader) = shell.split();
     assert_eq!(
-        shell.send(ShellInput::Resize { cols: 1, rows: 1 }).await,
+        writer.send(ShellInput::Resize { cols: 1, rows: 1 }).await,
         Err(crate::ShellError::ResizeInPipeMode)
     );
 
-    let input = futures_util::stream::iter([ShellInput::Data(Bytes::from_static(b"id\n"))])
-        .chain(futures_util::stream::pending());
-    let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(8);
-    let output = tokio_util::sync::PollSender::new(output_tx);
-    let bridge = tokio::spawn(shell.bridge(input, output));
+    writer
+        .send(ShellInput::Data(Bytes::from_static(b"id\n")))
+        .await
+        .unwrap();
     assert_eq!(
         next_binary(&mut remote).await.unwrap(),
         Bytes::from_static(b"id\n")
@@ -239,12 +238,19 @@ async fn a_pipe_shell_carries_raw_bytes_and_bridges() {
         .await
         .unwrap();
     assert_eq!(
-        output_rx.recv().await.unwrap(),
+        reader.recv().await.unwrap(),
         Bytes::from_static(b"uid=0(root)\n")
     );
-    // The device's shell exiting ends the bridge.
-    drop(remote);
-    bridge.await.unwrap().unwrap();
+
+    // Stopping the server closes the shell it delivered.
+    h.server.shutdown().await;
+    assert_eq!(reader.recv().await, None);
+    assert_eq!(
+        writer
+            .send(ShellInput::Data(Bytes::from_static(b"id\n")))
+            .await,
+        Err(crate::ShellError::Superseded)
+    );
 }
 
 #[tokio::test]
@@ -256,7 +262,7 @@ async fn a_shell_nobody_asked_for_or_with_a_bad_token_is_refused() {
     let refused = h.dial(&Route::Tcp, &path, &[("X-EM-Token", &token)]).await;
     assert_eq!(refused_status(refused), 403);
 
-    let _pending = h.server.shells().expect(DeviceId(device.id.clone()));
+    let _pending = h.shells.expect(DeviceId(device.id.clone()));
     let refused = h
         .dial(&Route::Tcp, &path, &[("X-EM-Token", "forged")])
         .await;

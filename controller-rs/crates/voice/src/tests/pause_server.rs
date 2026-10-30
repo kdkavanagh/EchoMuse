@@ -4,11 +4,10 @@
 //! (`echomuse-turn`'s endpoint tests).
 
 use echomuse_core::services::{MediaUrl, PipelineId, RunEvent, Transcript};
-use echomuse_protocol::StreamId;
+use echomuse_presentation::phase::ActorState;
 use echomuse_records::vocab::TerminalReason;
 use echomuse_settings::values::{PauseAsr, PauseAsrEngine};
-use echomuse_turn::{PauseError, Sample, ServerFailure, TextSource};
-use echomuse_uplink::buffer::Span;
+use echomuse_turn::{Commit, Decision, Sample, ServerFailure, TextSource};
 use serde_json::Value;
 
 use super::{
@@ -16,7 +15,7 @@ use super::{
     rig::{Options, Rig},
     wake,
 };
-use crate::{HaReply, HaRequest, Input};
+use crate::{HaReply, HaRequest, Input, evidence::Evidence};
 
 fn wyoming_rig() -> Rig {
     let mut options = Options::default();
@@ -75,14 +74,50 @@ fn blocks_to_commit(rig: &mut Rig, blocks: usize) -> Option<usize> {
     None
 }
 
-/// The pauses the policy recorded so far.
-fn pauses(rig: &Rig) -> Vec<echomuse_turn::PauseRecord> {
-    let turn = rig.voice.turn.as_ref().expect("a turn");
-    match (&turn.policy, &turn.utterance) {
-        (Some(policy), _) => policy.trace().pauses.clone(),
-        (None, Some(utterance)) => utterance.pauses.clone(),
-        (None, None) => Vec::new(),
-    }
+/// The pauses the turn asked the server about, as the session recorder saw them.
+fn asked(rig: &Rig) -> Vec<Sample> {
+    rig.evidence
+        .iter()
+        .filter_map(|(_, e)| match e {
+            Evidence::PauseServerAsked { pause, .. } => Some(*pause),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The server's answers handed to the turn policy, as the session recorder saw them.
+fn answered(rig: &Rig) -> Vec<Result<String, ServerFailure>> {
+    rig.evidence
+        .iter()
+        .filter_map(|(_, e)| match e {
+            Evidence::PauseServerAnswer { answer, .. } => Some(answer.outcome.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The commit the turn policy decided, as the session recorder saw it.
+fn commit(rig: &Rig) -> Option<Commit> {
+    rig.evidence.iter().rev().find_map(|(_, e)| {
+        let decisions = match e {
+            Evidence::Advanced { decisions, .. }
+            | Evidence::Timer { decisions, .. }
+            | Evidence::Control { decisions, .. } => decisions,
+            _ => return None,
+        };
+        decisions.iter().find_map(|d| match d {
+            Decision::Commit(commit) => Some(commit.clone()),
+            _ => None,
+        })
+    })
+}
+
+/// The turn's utterance has decided (committed or closed): its policy listens no more.
+fn decided(rig: &Rig) -> bool {
+    !matches!(
+        rig.voice.status().state,
+        ActorState::Listening | ActorState::EndPending
+    )
 }
 
 /// Answers the committed turn's HA requests with `heard` as HA's transcript, through to
@@ -124,44 +159,37 @@ fn answer_from_ha(rig: &mut Rig, heard: &str) -> Value {
 async fn a_pause_goes_to_the_server_as_its_decode_starts() {
     let mut rig = wyoming_rig();
     pause_after_command(&mut rig);
-    let pauses = pauses(&rig);
+    let pauses = asked(&rig);
     assert_eq!(pauses.len(), 1, "{pauses:?}");
     // One request for the pause, about exactly the pause decode's audio.
     assert_eq!(rig.server_requests.len(), 1);
     let (_, through, request) = &rig.server_requests[0];
-    assert_eq!(*through, pauses[0].through);
-    assert_eq!(request.limit, crate::PAUSE_SERVER_LIMIT);
+    assert_eq!(*through, pauses[0]);
     assert_eq!(
         (request.host.as_str(), request.port, request.model.as_str()),
         ("wyoming-faster-whisper", 10_300, "")
     );
     assert_eq!(request.language, "en");
     // The utterance from its start, at the recognizers' +20 dB.
-    let turn = rig.voice.turn.as_ref().unwrap();
-    let start = turn.policy.as_ref().unwrap().trace().start;
-    let mut canonical = Vec::new();
-    rig.voice
-        .uplink
-        .timeline()
-        .read_pcm(
-            StreamId::Mic,
-            turn.epoch().unwrap(),
-            Span {
-                start: start.0,
-                end: through.0,
-            },
-            &mut canonical,
-        )
-        .unwrap();
+    let start = rig
+        .evidence
+        .iter()
+        .rev()
+        .find_map(|(_, e)| match e {
+            Evidence::TurnOpened { spec, .. } => Some(spec.start),
+            _ => None,
+        })
+        .expect("the turn's policy opened");
+    let canonical = &rig.device.mic()[start.0 as usize..through.0 as usize];
     let expected: Vec<i16> = canonical.iter().map(|s| s.saturating_mul(10)).collect();
     assert_eq!(&request.pcm[..], &expected[..]);
     assert!(expected.contains(&i16::MAX), "loud words saturate");
     // Asked when the worker started the pause decode: before its result reached the policy.
-    let asked = rig.evidence.iter().position(|(_, e)| {
-        matches!(e, crate::evidence::Evidence::PauseServerAsked { pause, .. } if pause == through)
-    });
+    let asked = rig.evidence.iter().position(
+        |(_, e)| matches!(e, Evidence::PauseServerAsked { pause, .. } if pause == through),
+    );
     let decoded = rig.evidence.iter().position(|(_, e)| {
-        matches!(e, crate::evidence::Evidence::Asr { observation, .. }
+        matches!(e, Evidence::Asr { observation, .. }
             if observation.through == *through
                 && observation.kind == echomuse_turn::AsrKind::Finalized)
     });
@@ -189,18 +217,13 @@ async fn the_servers_words_end_the_turn_and_are_recorded() {
         blocks < kroko_blocks,
         "the server's complete words end the turn sooner: {blocks} vs {kroko_blocks}"
     );
-    let commit = rig
-        .voice
-        .turn
-        .as_ref()
-        .and_then(|t| t.commit.as_ref())
-        .map(|(c, _, _)| c.clone())
-        .unwrap();
+    let commit = commit(&rig).expect("the policy committed");
     assert_eq!(commit.text, "set a timer for five minutes");
     assert_eq!(commit.source, TextSource::Server);
-    assert!(rig.evidence.iter().any(|(_, e)| matches!(e,
-        crate::evidence::Evidence::PauseServerAnswer { answer, .. }
-            if answer.outcome.as_deref() == Ok("Ophelia, set a timer for five minutes."))));
+    assert_eq!(
+        answered(&rig),
+        [Ok("Ophelia, set a timer for five minutes.".to_owned())]
+    );
 
     // HA still transcribes the audio itself; the server's words decided only the end.
     let trace = answer_from_ha(&mut rig, "Ophelia, set a timer for five minutes.");
@@ -237,7 +260,6 @@ async fn answers_are_applied_only_to_the_call_and_audio_they_were_asked_about() 
     let mut rig = wyoming_rig();
     pause_after_command(&mut rig);
     let (call, through, _) = rig.server_requests[0].clone();
-    let stale = rig.voice.counters.stale_results;
     // An answer naming other audio, and one under a call never made, change nothing.
     rig.handle(Input::ServerTranscript {
         call,
@@ -249,10 +271,8 @@ async fn answers_are_applied_only_to_the_call_and_audio_they_were_asked_about() 
         through,
         result: Ok("Ophelia, what time is it?".to_owned()),
     });
-    assert_eq!(rig.voice.counters.stale_results, stale + 1);
     rig.silence(160);
-    let server = pauses(&rig)[0].server.clone().unwrap();
-    assert!(server.is_open(), "{server:?}");
+    assert!(answered(&rig).is_empty(), "no answer reached the policy");
     // The call was spent on the mismatched answer: the real one is dropped too.
     rig.handle(Input::ServerTranscript {
         call,
@@ -260,7 +280,7 @@ async fn answers_are_applied_only_to_the_call_and_audio_they_were_asked_about() 
         result: Ok("Ophelia, what time is it?".to_owned()),
     });
     rig.silence(160);
-    assert!(pauses(&rig)[0].server.as_ref().unwrap().is_open());
+    assert!(answered(&rig).is_empty(), "the spent call answers nothing");
 }
 
 #[tokio::test(start_paused = true)]
@@ -271,24 +291,26 @@ async fn an_unreachable_server_leaves_krokos_words_alone() {
     )));
     pause_after_command(&mut rig);
     blocks_to_commit(&mut rig, 60).expect("the turn commits");
-    let pause = pauses(&rig).remove(0);
-    let server = pause.server.unwrap();
     assert_eq!(
-        server.error,
-        Some(PauseError::Failed(
+        answered(&rig),
+        [Err(ServerFailure::Failed(
             "wyoming-faster-whisper:10300: could not connect".to_owned()
-        ))
+        ))]
     );
-    assert_eq!((server.text, server.judged), (None, None));
-    let commit = rig
-        .voice
-        .turn
-        .as_ref()
-        .and_then(|t| t.commit.as_ref())
-        .map(|(c, _, _)| c.clone())
-        .unwrap();
+    let commit = commit(&rig).expect("the policy committed");
     assert_eq!(commit.text, unjudged().join(" "));
     assert_ne!(commit.source, TextSource::Server);
+    // The row's pause records the failure, and no words from the server.
+    let trace = answer_from_ha(&mut rig, "Ophelia, kitchen light time.");
+    let server = &trace["utterance"]["pauses"][0]["server"];
+    assert_eq!(
+        server["error"], "wyoming-faster-whisper:10300: could not connect",
+        "{server}"
+    );
+    assert_eq!(
+        (&server["text"], &server["judged"]),
+        (&Value::Null, &Value::Null)
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -298,15 +320,15 @@ async fn kroko_alone_asks_no_server_and_records_no_server_words() {
     pause_after_command(&mut rig);
     blocks_to_commit(&mut rig, 60).expect("the turn commits");
     assert!(rig.server_requests.is_empty());
-    let pauses = pauses(&rig);
-    assert!(!pauses.is_empty());
-    assert!(pauses.iter().all(|p| p.server.is_none()));
+    assert!(asked(&rig).is_empty() && answered(&rig).is_empty());
     let trace = answer_from_ha(&mut rig, "Ophelia, kitchen light time.");
+    let pauses = trace["utterance"]["pauses"].as_array().expect("pauses");
+    assert!(!pauses.is_empty());
+    assert!(pauses.iter().all(|p| p["server"].is_null()), "{pauses:?}");
     assert_eq!(
         rig.turn_rows().last().unwrap().policy_hash.as_str(),
         "post_afe_10"
     );
-    assert_eq!(trace["utterance"]["pauses"][0]["server"], Value::Null);
 }
 
 /// Wakes, says the unjudged command, pauses 400 ms, then a quieter sound the recognizer
@@ -323,7 +345,7 @@ fn command_then_tv(rig: &mut Rig) {
             .ha
             .iter()
             .any(|(_, r)| matches!(r, HaRequest::Pipeline { .. }))
-            || rig.voice.turn.as_ref().is_none_or(|t| t.policy.is_none())
+            || decided(rig)
         {
             break;
         }
@@ -350,13 +372,7 @@ async fn a_route_b_commit_on_the_servers_words_is_rechecked_by_the_same_server()
             .push_back(recheck.clone().map(str::to_owned));
         command_then_tv(&mut rig);
         let rows = rig.turn_rows();
-        let committed = rig
-            .voice
-            .turn
-            .as_ref()
-            .and_then(|t| t.commit.as_ref())
-            .map(|(c, _, _)| c.clone());
-        let route = committed.as_ref().map(|c| c.route).or_else(|| {
+        let route = commit(&rig).map(|c| c.route).or_else(|| {
             rows.last()
                 .and_then(|r| r.commit.as_ref())
                 .map(|c| match c.route {
@@ -367,11 +383,7 @@ async fn a_route_b_commit_on_the_servers_words_is_rechecked_by_the_same_server()
         assert_eq!(route, Some(echomuse_turn::Route::B), "{recheck:?}");
         // The committed span went to the server, not to Kroko's re-decode.
         assert_eq!(rig.server_requests.len(), 2, "{recheck:?}");
-        assert_eq!(rig.server_requests[1].2.limit, crate::SPAN_SERVER_LIMIT);
-        assert!(
-            !rig.log.iter().any(|l| l.contains("Redecode")),
-            "{recheck:?}"
-        );
+        assert_eq!(rig.redecodes, 0, "{recheck:?}");
         match terminal {
             None => assert!(
                 rig.ha

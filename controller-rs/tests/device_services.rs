@@ -2451,7 +2451,8 @@ async fn kiosk_login_stores_the_token_and_sends_it_to_the_show() {
 
 /// Deleting a device clears what the device services keep for it: its Wi-Fi state, its
 /// recording modes and files, its session recordings and grant, and its sound choices.
-/// When it comes back and is approved again it starts clean.
+/// When it comes back and is approved again it starts clean, and what it sends is stored
+/// again.
 #[tokio::test(flavor = "multi_thread")]
 async fn deleting_a_device_clears_its_wifi_recordings_and_sound_choices() {
     let fixture = Fixture::new(&[
@@ -2524,6 +2525,12 @@ async fn deleting_a_device_clears_its_wifi_recordings_and_sound_choices() {
         .await;
     assert_eq!(deleted.status, 409, "the kitchen chose it");
 
+    // A partial recording an earlier controller left for each speaker.
+    let partials = fixture.data().join("recordings");
+    std::fs::create_dir_all(&partials).unwrap();
+    for device in [KITCHEN, HALL] {
+        std::fs::write(partials.join(format!("{device}_5.wav.part")), b"partial").unwrap();
+    }
     let (status, body) = dashboard
         .call("DELETE", &format!("/api/devices/{KITCHEN}"), None)
         .await;
@@ -2531,6 +2538,8 @@ async fn deleting_a_device_clears_its_wifi_recordings_and_sound_choices() {
     assert!(!fixture.data().join("ambient").join(KITCHEN).exists());
     assert!(session_recordings(fixture.data(), KITCHEN).is_empty());
     assert_eq!(ambient_files(fixture.data(), HALL).0.len(), 1);
+    assert!(!partials.join(format!("{KITCHEN}_5.wav.part")).exists());
+    assert!(partials.join(format!("{HALL}_5.wav.part")).exists());
     // The deleted device's choice no longer holds the sound.
     let deleted = dashboard
         .send("DELETE", "/api/sounds/bell", "", Vec::new())
@@ -2581,6 +2590,24 @@ async fn deleting_a_device_clears_its_wifi_recordings_and_sound_choices() {
     assert_eq!(status, 200, "{recorder}");
     assert_eq!(recorder["recordings"], json!([]));
     assert_eq!(recorder["status"]["state"], "off", "{recorder}");
+    let speaker = Speaker::connect(
+        plane.device_address(),
+        Hello::dot(KITCHEN, &["wifi_control"]),
+    )
+    .await;
+    speaker.send("log", json!({"level": "info", "message": "back again"}));
+    speaker.sync().await;
+    dashboard
+        .until(
+            "the returned device's log line",
+            &format!("/api/devices/{KITCHEN}/logs"),
+            |_, body| {
+                let entries = body.as_array()?;
+                (entries.len() == 1 && entries[0]["message"] == "back again").then_some(())
+            },
+        )
+        .await;
+    drop(speaker);
     drop(other);
     shut_down(plane).await;
 }

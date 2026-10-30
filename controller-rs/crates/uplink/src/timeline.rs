@@ -19,7 +19,6 @@ use echomuse_protocol::ema::{AfeRecord, Cell};
 
 use crate::buffer::{EpochBuffer, Segment, SegmentKind, Span};
 use crate::config::UplinkConfig;
-use crate::starts::record_samples;
 
 /// An internal subscription identity, unique within the session even when a
 /// device reuses a subscription ID.
@@ -461,7 +460,7 @@ impl Timeline {
 }
 
 fn check_grid(stream: StreamId, span: Span) -> Result<(), ReadError> {
-    let unit = record_samples(stream);
+    let unit = stream.kind().samples_per_frame();
     if !span.start.is_multiple_of(unit) || !span.end.is_multiple_of(unit) {
         return Err(ReadError::Misaligned);
     }

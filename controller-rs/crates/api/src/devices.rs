@@ -13,13 +13,13 @@
 //! | `GET /api/devices/{id}/logs?limit=` | signed in | the newest log entries first |
 //!
 //! A device object joins the `devices` row, the device's settings and what its runtime
-//! last published ([`LiveDevice`]). Its keys are the ones dashboard.jsx reads; a value
-//! nobody knows is `null`, never a stand-in such as `0` or `false`. `config` holds the
-//! device's own values: those of the sections it overrides, plus `startupVolume`, which
-//! is always its own (dashboard.jsx, `effectiveConfig`). The kiosk password is a setting
-//! the dashboard edits, so administrators see it; anyone else reads `null`. The link and
-//! Kiosk Satellite tokens never leave the controller (`kioskTokenSet` says whether one
-//! is held).
+//! last published ([`LiveDevice`](crate::LiveDevice)). Its keys are the ones dashboard.jsx
+//! reads; a value nobody knows is `null`, never a stand-in such as `0` or `false`.
+//! `config` holds the device's own values: those of the sections it overrides, plus
+//! `startupVolume`, which is always its own (dashboard.jsx, `effectiveConfig`). The kiosk
+//! password is a setting the dashboard edits, so administrators see it; anyone else reads
+//! `null`. The link and Kiosk Satellite tokens never leave the controller (`kioskTokenSet`
+//! says whether one is held).
 
 use axum::{
     Json, Router,
@@ -42,9 +42,8 @@ use crate::{
     body::JsonBody,
     error::{ApiError, ErrorCode},
     events::{ApiEvent, DeviceStatePatch, DeviceView},
-    firmware::UpdateStatus,
     params::{DevicePath, QueryParams},
-    runtime::{LiveDevice, RuntimeError, SettingsApplied},
+    runtime::{RuntimeError, SettingsApplied},
     state::ApiState,
 };
 
@@ -237,13 +236,16 @@ fn config_fields(entry: Option<&DeviceEntry>, viewer: Role) -> Map<String, Value
     fields
 }
 
+/// The device object: its row, settings and runtime, then what the device services and
+/// capture decide.
 fn view(
+    state: &ApiState,
     record: &DeviceRecord,
     settings: &SettingsSnapshot,
-    live: Option<LiveDevice>,
-    update: &UpdateStatus,
     viewer: Role,
 ) -> DeviceView {
+    let device = &record.device_id;
+    let update = state.firmware().status(device);
     let mut fields = Map::new();
     fields.extend([
         ("device_id".into(), json!(record.device_id)),
@@ -263,9 +265,12 @@ fn view(
         ("update_in_progress".into(), json!(update.in_progress)),
         ("update_error".into(), json!(update.error)),
     ]);
-    fields.extend(config_fields(settings.device(&record.device_id), viewer));
+    fields.extend(config_fields(settings.device(device), viewer));
     // A device without a runtime (pending) is not connected.
-    fields.extend(live.unwrap_or_default().fields());
+    fields.extend(state.runtimes().live(device).unwrap_or_default().fields());
+    // Wi-Fi state and live recording counters, from the device services.
+    fields.extend(state.services().device_fields(device));
+    fields.extend(state.capture().fields(device));
     DeviceView::from_fields(fields)
 }
 
@@ -274,17 +279,7 @@ async fn views(state: &ApiState, which: Which, viewer: Role) -> Result<Vec<Devic
     let settings = state.settings().snapshot();
     Ok(records
         .iter()
-        .map(|record| {
-            let live = state.runtimes().live(&record.device_id);
-            let update = state.firmware().status(&record.device_id);
-            let mut fields = view(record, &settings, live, &update, viewer)
-                .fields()
-                .clone();
-            // Wi-Fi state and live recording counters, from the device services.
-            fields.extend(state.services().device_fields(&record.device_id));
-            fields.extend(state.capture().fields(&record.device_id));
-            DeviceView::from_fields(fields)
-        })
+        .map(|record| view(state, record, &settings, viewer))
         .collect())
 }
 
@@ -301,23 +296,15 @@ async fn one_view(
     views(state, Which::One(device.clone()), viewer)
         .await?
         .pop()
-        .ok_or_else(unknown_device)
-}
-
-fn unknown_device() -> ApiError {
-    ApiError::new(
-        axum::http::StatusCode::NOT_FOUND,
-        ErrorCode::NotFound,
-        "No device has this id",
-    )
+        .ok_or_else(ApiError::unknown_device)
 }
 
 fn runtime_error(error: RuntimeError, doing: &'static str) -> ApiError {
     match error {
-        RuntimeError::UnknownDevice => unknown_device(),
+        RuntimeError::UnknownDevice => ApiError::unknown_device(),
         RuntimeError::Unavailable => ApiError::unavailable("The device runtimes are shutting down"),
         RuntimeError::Failed(reason) => {
-            eprintln!("api: {doing} failed: {reason}");
+            tracing::error!(%reason, "{doing} failed");
             ApiError::internal(format!("The controller could not {doing} the device"))
         }
     }
@@ -378,7 +365,7 @@ async fn relabel(
         })
         .await?;
     if !found {
-        return Err(unknown_device());
+        return Err(ApiError::unknown_device());
     }
     state
         .runtimes()
@@ -404,7 +391,7 @@ async fn approve(
         .await?
         .is_empty()
     {
-        return Err(unknown_device());
+        return Err(ApiError::unknown_device());
     }
     state
         .runtimes()
@@ -436,7 +423,7 @@ async fn delete(
         .await?
         .is_empty()
     {
-        return Err(unknown_device());
+        return Err(ApiError::unknown_device());
     }
     state
         .runtimes()
@@ -451,7 +438,7 @@ async fn delete(
         });
     // The settings drop the device once they read that its row is gone.
     if let Err(error) = state.settings().refresh_device(&device).await {
-        eprintln!("api: the settings did not drop deleted device {device}: {error}");
+        tracing::error!(%error, "the settings did not drop deleted device {device}");
     }
     Ok(Json(Deleted { deleted: device }))
 }
@@ -478,12 +465,12 @@ pub(crate) fn edit_error(error: EditError) -> ApiError {
         | EditError::OpenRuleIsBaseline { .. } => {
             ApiError::new(StatusCode::BAD_REQUEST, ErrorCode::InvalidSetting, message)
         }
-        EditError::UnknownDevice(_) => unknown_device(),
+        EditError::UnknownDevice(_) => ApiError::unknown_device(),
         EditError::StoredUnreadable => {
             ApiError::new(StatusCode::CONFLICT, ErrorCode::StoredUnreadable, message)
         }
         EditError::Database(reason) => {
-            eprintln!("api: a configuration edit was not stored: {reason}");
+            tracing::error!(%reason, "a configuration edit was not stored");
             ApiError::internal("The configuration was not stored")
         }
         EditError::Closed => ApiError::unavailable("The settings service has stopped"),
@@ -496,7 +483,9 @@ async fn config(
     DevicePath(device): DevicePath,
 ) -> Result<Json<Map<String, Value>>, ApiError> {
     let settings = state.settings().snapshot();
-    let entry = settings.device(&device).ok_or_else(unknown_device)?;
+    let entry = settings
+        .device(&device)
+        .ok_or_else(ApiError::unknown_device)?;
     Ok(Json(config_fields(Some(entry), user.role())))
 }
 
@@ -525,7 +514,7 @@ async fn edit_config(
     let entry = outcome
         .snapshot
         .device(&device)
-        .ok_or_else(unknown_device)?;
+        .ok_or_else(ApiError::unknown_device)?;
     Ok(Json(config_fields(Some(entry), user.role())))
 }
 
@@ -605,7 +594,7 @@ async fn logs(
         .read(ReadLogs { device, limit })
         .await?
         .map(Json)
-        .ok_or_else(unknown_device)
+        .ok_or_else(ApiError::unknown_device)
 }
 
 #[cfg(test)]

@@ -294,7 +294,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_local_route_has_the_dashboards_word() {
+    fn local_routes_are_named_and_requests_for_ha_are_not() {
         let grammar = Grammar::new().unwrap();
         assert_eq!(
             local_route(&grammar.route("say that again")),
@@ -303,14 +303,6 @@ mod tests {
         assert_eq!(
             local_route(&grammar.route("turn on the kitchen light")),
             None
-        );
-        assert_eq!(
-            serde_json::to_value(LocalRoute::AlarmQuery).unwrap(),
-            "alarm_query"
-        );
-        assert_eq!(
-            serde_json::to_value(LocalRoute::TimerCancel).unwrap(),
-            "timer_cancel"
         );
     }
 }

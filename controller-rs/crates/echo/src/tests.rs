@@ -716,8 +716,9 @@ fn reference_wake_feeds_the_wake_decision() {
     let j = s.judge(mic_support(100_000, 124_000), &a, &echo).unwrap();
     assert_eq!(j.score, ReferenceScore::NoOverlap, "{j:?}");
     // Without an established lag the whole 0–500 ms is allowed: still overlapping.
+    let unlagged = Alignment { lag: None, ..a };
     let j = s
-        .judge(mic_support(64_000, 82_000), &a.with_lag(None), &echo)
+        .judge(mic_support(64_000, 82_000), &unlagged, &echo)
         .unwrap();
     assert_eq!(j.score, ReferenceScore::Overlap);
 

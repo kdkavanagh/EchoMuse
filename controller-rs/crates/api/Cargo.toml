@@ -25,6 +25,7 @@ subtle = "2.6.1"
 tokio.workspace = true
 tokio-util = { workspace = true, features = ["io"] }
 tower-http = { version = "0.7.1", features = ["fs"] }
+tracing = "0.1.44"
 url = "2.5.8"
 
 [dev-dependencies]

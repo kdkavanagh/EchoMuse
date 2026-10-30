@@ -35,9 +35,9 @@ use crate::{
 };
 
 /// Days shown when the query names none.
-pub const DEFAULT_DAYS: u32 = 7;
+const DEFAULT_DAYS: u32 = 7;
 /// The most days one request covers.
-pub const MAX_DAYS: u32 = 90;
+const MAX_DAYS: u32 = 90;
 
 pub(crate) fn routes() -> Router<ApiState> {
     Router::new().route("/api/devices/{id}/activity", get(activity))

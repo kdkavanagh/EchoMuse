@@ -78,11 +78,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn assets_follow_the_manifest_and_pins() {
+    fn every_shared_model_is_qualified() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let manifest =
             SpeechBundleManifest::load(&root.join("controller/speech_bundle.json")).unwrap();
-        let native = NativeLibraries::pinned("/opt/ort/libonnxruntime.so.1.20.1", None).unwrap();
+        let native = NativeLibraries::pinned("/opt/ort/libonnxruntime.so.1.20.1").unwrap();
         let assets = SpeechAssets::new(
             native,
             &manifest,
@@ -90,20 +90,20 @@ mod tests {
             Path::new("/speech/0.wav"),
             Path::new("/dtln"),
         );
-        assert_eq!(
-            assets.kroko.joiner.path,
-            Path::new("/speech/kroko/joiner.onnx")
-        );
-        assert_eq!(assets.vad.sha256, manifest.vad.sha256);
-        assert_eq!(assets.dtln.model_2.path, Path::new("/dtln/model_2.onnx"));
         let requests = assets.qualification_requests();
-        assert!(matches!(requests[0].model, ModelUnderTest::Kroko { .. }));
+        assert!(requests.iter().all(|r| r.native == assets.native));
         assert!(matches!(
-            requests[1].model,
-            ModelUnderTest::SileroVad { .. }
+            &requests[0].model,
+            ModelUnderTest::Kroko { files, test_wav, .. }
+                if *files == assets.kroko && *test_wav == assets.kroko_test_wav
         ));
-        assert!(matches!(requests[2].model, ModelUnderTest::Dtln { .. }));
-        let json = serde_json::to_string(&assets).unwrap();
-        assert_eq!(serde_json::from_str::<SpeechAssets>(&json).unwrap(), assets);
+        assert!(matches!(
+            &requests[1].model,
+            ModelUnderTest::SileroVad { model } if *model == assets.vad
+        ));
+        assert!(matches!(
+            &requests[2].model,
+            ModelUnderTest::Dtln { files } if *files == assets.dtln
+        ));
     }
 }

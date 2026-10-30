@@ -15,7 +15,7 @@
 use echomuse_core::services::HaError;
 use serde_json::Value;
 
-use crate::{calendar::rest_message, client::HaClient};
+use crate::client::{HaClient, rest_message, rest_read};
 
 /// The event Home Assistant fires when its automations change.
 pub const AUTOMATIONS_EVENT: &str = "automation_reloaded";
@@ -53,13 +53,7 @@ pub fn conversation_commands(config: &Value) -> Vec<String> {
 impl HaClient {
     /// The conversation-trigger templates of every enabled automation, as written.
     pub async fn automation_sentences(&self) -> Result<Vec<String>, HaError> {
-        let (status, body) = self.rest_get("/states").await?;
-        if !(200..=299).contains(&status) {
-            return Err(HaError::Rejected {
-                code: status.to_string(),
-                message: rest_message(&body),
-            });
-        }
+        let body = rest_read(self.rest_get("/states").await)?;
         let states: Value = serde_json::from_slice(&body)
             .map_err(|error| HaError::BadResponse(format!("states: {error}")))?;
         let ids: Vec<String> = states

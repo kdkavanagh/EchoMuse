@@ -20,7 +20,6 @@ use echomuse_protocol::StreamId;
 use echomuse_protocol::ema::{AfeRecord, Cell, CellFlags, Content, Flags, Packet, SourceMask};
 
 use crate::chunk::{ChunkData, Pcm};
-use crate::starts::record_samples;
 
 /// Device monotonic nanoseconds per 16 kHz sample.
 const SAMPLE_NS: u64 = 62_500;
@@ -357,7 +356,7 @@ impl EpochBuffer {
     /// (rounded down to whole records, at least one) in at most `max_blocks`
     /// runs of distinct metadata.
     pub(crate) fn new(stream: StreamId, retention: u64, max_blocks: usize) -> Self {
-        let unit = record_samples(stream);
+        let unit = stream.kind().samples_per_frame();
         let records = match stream {
             StreamId::Mic | StreamId::Reference => Records::Pcm(Vec::new()),
             StreamId::Cells => Records::Cells(Vec::new()),

@@ -475,7 +475,7 @@ async fn the_service_exports_on_its_own_thread_and_publishes_snapshots() {
     handle.delete(id("bell"), Vec::new()).await.unwrap();
     assert!(handle.snapshot().get(&id("bell")).is_none());
 
-    service.stop();
+    drop(service);
     assert_eq!(
         handle.delete(id("waiting"), Vec::new()).await,
         Err(ServiceError::Stopped)

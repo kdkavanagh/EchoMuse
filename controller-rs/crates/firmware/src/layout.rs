@@ -107,10 +107,7 @@ impl Slot {
 
     /// The slot's full path.
     pub fn path(self) -> DevicePath {
-        DevicePath::fixed(match self {
-            Self::A => "/data/local/bin/server_a",
-            Self::B => "/data/local/bin/server_b",
-        })
+        DevicePath(format!("{BIN_DIR}/{}", self.name()))
     }
 
     /// The other slot.
@@ -123,11 +120,9 @@ impl Slot {
 
     /// The slot a `readlink` of the symlink names, if it is one of the two.
     pub fn from_link(target: &str) -> Option<Self> {
-        match target {
-            "server_a" => Some(Self::A),
-            "server_b" => Some(Self::B),
-            _ => None,
-        }
+        [Self::A, Self::B]
+            .into_iter()
+            .find(|slot| slot.name() == target)
     }
 }
 
@@ -163,11 +158,7 @@ impl CrownList {
 
     /// Where the list goes on the device.
     pub fn device_path(self) -> DevicePath {
-        DevicePath::fixed(match self {
-            Self::Hide => "/data/local/etc/echomuse/crown_hide_packages.txt",
-            Self::HideTier2 => "/data/local/etc/echomuse/crown_hide_packages_tier2.txt",
-            Self::MicDeny => "/data/local/etc/echomuse/crown_mic_deny_packages.txt",
-        })
+        DevicePath(format!("{ETC_DIR}/{}", self.file_name()))
     }
 
     /// The hide tier this list belongs to (`"1"` or `"2"`, as `crown_tiers` names
@@ -212,6 +203,10 @@ mod tests {
         assert_eq!(Slot::from_link("server_b"), Some(Slot::B));
         assert_eq!(Slot::from_link("/data/local/bin/server_b"), None);
         assert_eq!(Slot::B.path().as_str(), "/data/local/bin/server_b");
+        assert_eq!(
+            CrownList::MicDeny.device_path().as_str(),
+            "/data/local/etc/echomuse/crown_mic_deny_packages.txt"
+        );
         assert_eq!(FileMode::PRIVATE.to_string(), "600");
         assert_eq!(FileMode::EXECUTABLE.to_string(), "755");
     }

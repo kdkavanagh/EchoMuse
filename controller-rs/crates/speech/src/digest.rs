@@ -101,11 +101,6 @@ impl Sha256Digest {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
-
-    /// The digest as 64 lowercase hexadecimal digits.
-    pub fn to_hex(&self) -> String {
-        self.to_string()
-    }
 }
 
 impl fmt::Display for Sha256Digest {
@@ -203,7 +198,7 @@ mod tests {
     fn digest_round_trips_through_hex() {
         let hex = "6b99cbfd39246b6706f98ec13c7c50c6b299181f2474fa05cbc8046acc274396";
         let d = Sha256Digest::parse_hex(hex).unwrap();
-        assert_eq!(d.to_hex(), hex);
+        assert_eq!(d.to_string(), hex);
         assert_eq!(Sha256Digest::from_hex_const(hex), d);
         let json = serde_json::to_string(&d).unwrap();
         assert_eq!(json, format!("\"{hex}\""));
@@ -227,7 +222,7 @@ mod tests {
     #[test]
     fn digest_of_empty_input_is_the_known_value() {
         assert_eq!(
-            Sha256Digest::of_bytes(b"").to_hex(),
+            Sha256Digest::of_bytes(b"").to_string(),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
     }

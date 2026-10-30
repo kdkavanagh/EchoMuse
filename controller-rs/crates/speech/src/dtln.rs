@@ -32,8 +32,6 @@ pub const DTLN_BLOCK_LEN: usize = 512;
 pub const DTLN_BLOCK_SHIFT: usize = 128;
 /// How far output lags input: `block − shift` samples (24 ms at 16 kHz).
 pub const DTLN_LATENCY_SAMPLES: usize = DTLN_BLOCK_LEN - DTLN_BLOCK_SHIFT;
-/// The only sample rate the models were trained at.
-pub const DTLN_SAMPLE_RATE: u32 = 16_000;
 
 const BINS: usize = DTLN_BLOCK_LEN / 2 + 1;
 const STATE_LEN: usize = 2 * 128 * 2;

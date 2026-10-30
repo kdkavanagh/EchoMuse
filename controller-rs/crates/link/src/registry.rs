@@ -30,15 +30,6 @@ struct State {
     active: HashMap<LinkSessionId, Active>,
 }
 
-/// Why an audio or asset upgrade cannot join a session.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum JoinRefusal {
-    /// No live session has that id.
-    UnknownSession,
-    /// The session's audio socket has already joined.
-    AudioTaken,
-}
-
 #[derive(Default)]
 pub(crate) struct Registry {
     state: Mutex<State>,
@@ -103,27 +94,22 @@ impl Registry {
         (!active.core.stop.is_cancelled()).then(|| Arc::clone(&active.core))
     }
 
-    /// Takes the hand-off for `core`'s audio socket; each session takes one.
-    pub(crate) fn take_audio(
-        &self,
-        core: &Arc<SessionCore>,
-    ) -> Result<oneshot::Sender<Ws>, JoinRefusal> {
-        let mut state = self.lock();
-        let active = state
-            .active
-            .get_mut(&core.session_id)
-            .filter(|active| Arc::ptr_eq(&active.core, core) && !core.stop.is_cancelled())
-            .ok_or(JoinRefusal::UnknownSession)?;
-        active.audio.take().ok_or(JoinRefusal::AudioTaken)
+    /// Takes the hand-off for `core`'s audio socket; `None` once it was taken or the
+    /// session is no longer live. Each session takes one.
+    pub(crate) fn take_audio(&self, core: &Arc<SessionCore>) -> Option<oneshot::Sender<Ws>> {
+        live(&mut self.lock(), core)?.audio.take()
     }
 
     /// Whether `core` is still a live, routed session.
     pub(crate) fn is_live(&self, core: &Arc<SessionCore>) -> bool {
-        let state = self.lock();
-        state
-            .active
-            .get(&core.session_id)
-            .is_some_and(|active| Arc::ptr_eq(&active.core, core))
-            && !core.stop.is_cancelled()
+        live(&mut self.lock(), core).is_some()
     }
+}
+
+/// `core`'s routing entry, while it is the active session under its id and not ended.
+fn live<'a>(state: &'a mut State, core: &Arc<SessionCore>) -> Option<&'a mut Active> {
+    state
+        .active
+        .get_mut(&core.session_id)
+        .filter(|active| Arc::ptr_eq(&active.core, core) && !core.stop.is_cancelled())
 }

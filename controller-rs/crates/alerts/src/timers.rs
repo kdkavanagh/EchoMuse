@@ -1,45 +1,17 @@
 //! Display copies of a speaker's Home Assistant timers (§4.9, architecture §10.8).
 //!
-//! HA owns every timer and reports `started`, `updated`, `cancelled` and `finished` over
-//! the ESPHome API. The copy here ticks down for `timer.view` and the dashboard; it never
-//! decides that a timer finished. When a copy reaches zero and no `finished` arrives
-//! within a grace period, the timer is dropped and reported as `timer_finish_missed`.
+//! HA owns every timer and reports `started`, `updated`, `cancelled` and `finished` to the
+//! satellite ([`TimerEvent`]). The copy here ticks down for `timer.view` and the
+//! dashboard; it never decides that a timer finished. When a copy reaches zero and no
+//! `finished` arrives within a grace period, the timer is dropped and reported as
+//! `timer_finish_missed`.
 
 use std::collections::BTreeMap;
 
+use echomuse_core::services::{TimerEvent, TimerEventKind};
 use tokio::time::{Duration, Instant};
 
 use crate::wire::{TimerView, TimerViewEntry};
-
-/// What HA reported about a timer.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TimerEventKind {
-    /// It started.
-    Started,
-    /// It changed (paused, resumed, or time added or removed).
-    Updated,
-    /// It was cancelled.
-    Cancelled,
-    /// It finished; the speaker rings.
-    Finished,
-}
-
-/// One timer event of a speaker (ESPHome `VoiceAssistantTimerEventResponse`).
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TimerEvent {
-    /// What happened.
-    pub kind: TimerEventKind,
-    /// HA's timer id.
-    pub timer_id: String,
-    /// HA's name; `None` for an unnamed timer.
-    pub name: Option<String>,
-    /// The timer's whole length in seconds.
-    pub total_seconds: u32,
-    /// The time left in seconds when HA sent the event.
-    pub seconds_left: u32,
-    /// False while paused.
-    pub is_active: bool,
-}
 
 #[derive(Clone, Debug)]
 struct TimerCopy {

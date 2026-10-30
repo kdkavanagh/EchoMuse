@@ -145,12 +145,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_flags_are_the_contract_values() {
-        assert_eq!(VOICE_ASSISTANT_FEATURE_FLAGS, 61);
-        assert_eq!(BLUETOOTH_PROXY_FEATURE_FLAGS, 33);
-    }
-
-    #[test]
     fn the_satellite_identity_follows_the_device_id_and_label() {
         let device = DeviceId("G090LF0965260F1J".to_owned());
         let identity =

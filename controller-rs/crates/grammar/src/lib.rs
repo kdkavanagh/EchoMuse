@@ -48,7 +48,7 @@ mod intents;
 mod lines;
 mod local;
 mod matcher;
-pub mod normalize;
+mod normalize;
 mod program;
 mod reply;
 mod template;
@@ -65,8 +65,7 @@ pub use alarm::{
 pub use grammar::{
     CommandContext, Completeness, ContextCommand, Grammar, ReplyKind, RingingAlert, Route,
 };
-pub use intents::INTENTS_VERSION;
-pub use lines::{Line, SpokenAlarm, SpokenDay, SpokenTimer, spoken_day, spoken_time};
+pub use lines::{Line, SpokenAlarm, SpokenDay, SpokenTimer};
 pub use normalize::{Normalized, normalize};
 pub use program::CompileError;
 pub use reply::{Choice, TimerPick, WhichReply};

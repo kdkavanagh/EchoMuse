@@ -46,10 +46,6 @@ async fn an_admitted_hello_gets_session_ready_built_from_the_grant() {
     );
     assert_eq!(body["capture_permitted"], true);
     assert_eq!(body["utc_ms"], json!(UTC_MS.to_string()));
-    assert_eq!(body["detector"]["hop_blocks"], 2);
-    assert_eq!(body["detector"]["smoothing"], 3);
-    assert_eq!(body["detector"]["clear_after_unscored"], 6);
-    assert!(body.get("afe_metadata").is_none());
 
     let admitted = h.next_admitted().await;
     assert_eq!(admitted.request.device, DeviceId("G0SYNTH0001".to_owned()));

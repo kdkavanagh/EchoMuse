@@ -129,14 +129,6 @@ impl ReadQuery for DeviceRow {
     }
 }
 
-pub(crate) fn unknown_device() -> ApiError {
-    ApiError::new(
-        StatusCode::NOT_FOUND,
-        ErrorCode::NotFound,
-        "No device has this id",
-    )
-}
-
 /// The device's row, or 404.
 pub(crate) async fn known_device(
     state: &ApiState,
@@ -146,7 +138,7 @@ pub(crate) async fn known_device(
         .db()
         .read(DeviceRow(device.clone()))
         .await?
-        .ok_or_else(unknown_device)
+        .ok_or_else(ApiError::unknown_device)
 }
 
 /// `{id}` and a row id of `/api/devices/{id}/…/{row}…`. A row id that is not a number
@@ -175,10 +167,6 @@ impl<S: Send + Sync> FromRequestParts<S> for RowPath {
     }
 }
 
-pub(crate) fn no_such(what: &'static str) -> ApiError {
-    ApiError::new(StatusCode::NOT_FOUND, ErrorCode::NotFound, what)
-}
-
 /// The unparsed text of a JSON column, or `null` when the column is NULL. Text that does
 /// not parse is passed on as a string rather than dropped.
 fn json_column(text: Option<String>) -> Value {
@@ -198,7 +186,7 @@ fn windows_column(table: &str, id: i64, text: Option<String>) -> Value {
     match ClipWindows::parse(&text).and_then(|_| serde_json::from_str(&text).ok()) {
         Some(value) => value,
         None => {
-            eprintln!("api: {table} row {id} holds clip windows that cannot be read");
+            tracing::warn!("{table} row {id} holds clip windows that cannot be read");
             Value::Null
         }
     }
@@ -209,7 +197,7 @@ fn stored_object(table: &str, column: &str, id: i64, text: &str) -> Result<Value
     match serde_json::from_str::<Value>(text) {
         Ok(value @ Value::Object(_)) => Ok(value),
         _ => {
-            eprintln!("api: {table}.{column} of row {id} is not a JSON object");
+            tracing::error!("{table}.{column} of row {id} is not a JSON object");
             Err(ApiError::internal(format!(
                 "The stored {column} of this row cannot be read"
             )))
@@ -232,7 +220,7 @@ fn records_error(error: RecordsError, doing: &str) -> ApiError {
             ApiError::unavailable("This device's records are closed: it is being deleted")
         }
         error => {
-            eprintln!("api: {doing} failed: {error}");
+            tracing::error!(%error, "{doing} failed");
             ApiError::internal(format!("The controller could not {doing}"))
         }
     }
@@ -475,7 +463,7 @@ async fn set_verdict(
     match update {
         VerdictUpdate::Stored => {}
         VerdictUpdate::NoSuchNearMiss => {
-            return Err(no_such("No near miss of this device has this id"));
+            return Err(ApiError::no_such("No near miss of this device has this id"));
         }
         VerdictUpdate::NotRecorded => {
             return Err(ApiError::new(
@@ -497,7 +485,8 @@ async fn set_verdict(
 
 // ─── A turn's trace and the AFE series ──────────────────────────────────────────
 
-async fn turn_of_device(
+/// The turn of `path`, when it is this device's: 404 otherwise.
+pub(crate) async fn turn_of_device(
     state: &ApiState,
     path: &RowPath,
 ) -> Result<echomuse_records::StoredTurn, ApiError> {
@@ -506,7 +495,20 @@ async fn turn_of_device(
         .read(GetTurn(TurnRowId(path.row)))
         .await?
         .filter(|t| t.device_id == path.device.0)
-        .ok_or_else(|| no_such("No turn of this device has this id"))
+        .ok_or_else(|| ApiError::no_such("No turn of this device has this id"))
+}
+
+/// The near miss of `path`, when it is this device's: 404 otherwise.
+pub(crate) async fn near_miss_of_device(
+    state: &ApiState,
+    path: &RowPath,
+) -> Result<echomuse_records::StoredNearMiss, ApiError> {
+    state
+        .db()
+        .read(GetNearMiss(NearMissRowId(path.row)))
+        .await?
+        .filter(|n| n.device_id == path.device.0)
+        .ok_or_else(|| ApiError::no_such("No near miss of this device has this id"))
 }
 
 async fn turn_trace(
@@ -517,7 +519,7 @@ async fn turn_trace(
     let turn = turn_of_device(&state, &path).await?;
     let text = turn
         .decision_trace
-        .ok_or_else(|| no_such("No decision trace is kept for this turn"))?;
+        .ok_or_else(|| ApiError::no_such("No decision trace is kept for this turn"))?;
     Ok(Json(stored_object(
         "turns",
         "decision_trace",
@@ -534,7 +536,7 @@ async fn turn_afe(
     let turn = turn_of_device(&state, &path).await?;
     let text = turn
         .afe_series
-        .ok_or_else(|| no_such("No AFE series is kept for this turn"))?;
+        .ok_or_else(|| ApiError::no_such("No AFE series is kept for this turn"))?;
     Ok(Json(stored_object("turns", "afe_series", path.row, &text)?))
 }
 
@@ -543,15 +545,10 @@ async fn near_miss_afe(
     _user: AuthenticatedUser,
     path: RowPath,
 ) -> Result<Json<Value>, ApiError> {
-    let near_miss = state
-        .db()
-        .read(GetNearMiss(NearMissRowId(path.row)))
-        .await?
-        .filter(|n| n.device_id == path.device.0)
-        .ok_or_else(|| no_such("No near miss of this device has this id"))?;
+    let near_miss = near_miss_of_device(&state, &path).await?;
     let text = near_miss
         .afe_series
-        .ok_or_else(|| no_such("No AFE series is kept for this near miss"))?;
+        .ok_or_else(|| ApiError::no_such("No AFE series is kept for this near miss"))?;
     Ok(Json(stored_object(
         "near_misses",
         "afe_series",
@@ -723,7 +720,7 @@ async fn wake_shadow(
         let key = match open {
             Ok(open) => rule_key(&open),
             Err(error) => {
-                eprintln!("api: shadow rule {rule:?} of {device} has no key: {error}");
+                tracing::warn!(%error, "shadow rule {rule:?} of {device} has no key");
                 continue;
             }
         };

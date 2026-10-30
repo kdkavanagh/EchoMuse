@@ -38,17 +38,17 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     auth::{AdminUser, Role},
-    devices::{all_views, hide_secrets},
+    devices::all_views,
     error::ApiError,
     state::ApiState,
-    system::read_system,
+    system::{fleet_view, read_system},
     wake_models::model_json,
 };
 
 /// Log lines kept per device.
-pub const LOG_LINES: usize = 200;
+const LOG_LINES: usize = 200;
 /// What a blanked value becomes.
-pub const REDACTED: &str = "[redacted]";
+const REDACTED: &str = "[redacted]";
 
 pub(crate) fn routes() -> Router<ApiState> {
     Router::new().route("/api/support/bundle", get(bundle))
@@ -254,15 +254,7 @@ async fn bundle(
         })
         .await?;
     let snapshot = state.settings().snapshot();
-    let mut fleet = match serde_json::to_value(&**snapshot.fleet()) {
-        Ok(Value::Object(fleet)) => fleet,
-        _ => {
-            return Err(ApiError::internal(
-                "The fleet configuration could not be read",
-            ));
-        }
-    };
-    hide_secrets(&mut fleet, Role::Readonly);
+    let fleet = fleet_view(snapshot.fleet(), Role::Readonly)?;
     let models: Vec<Value> = snapshot
         .registry()
         .models()

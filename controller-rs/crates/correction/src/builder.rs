@@ -64,7 +64,7 @@ impl TableBuilder {
     }
 
     /// Starts the builder with another dictionary source (tests use a small one).
-    pub fn spawn_with(
+    pub(crate) fn spawn_with(
         lexicon: impl FnOnce() -> Lexicon + Send + 'static,
     ) -> std::io::Result<(Self, watch::Receiver<Option<Arc<Tables>>>)> {
         let (published, receiver) = watch::channel(None);
