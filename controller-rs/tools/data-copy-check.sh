@@ -11,8 +11,8 @@
 #      token through a wake turn on one of the copy's wake recordings, and compares every
 #      row the controller wrote with the stored rows column by column;
 #   3. restarts it, checking that the cutover backup is not rewritten;
-#   4. stops it and runs the previously deployed image on the same copy as a black box
-#      (rollback, §3.5.1 rule 9), reading what the Rust controller wrote through its API;
+#   4. when ROLLBACK_IMAGE is set, stops Rust and runs that previous image on the same copy
+#      as a black box, reading what the Rust controller wrote through its API;
 #   5. runs this tree's image (controller-rs/Dockerfile) the same way on a second copy.
 #
 # Isolation is by construction. The copy holds the real devices' tokens, and a controller
@@ -35,7 +35,7 @@
 #   --skip-rollback      skip the previous image's black-box run
 #
 # Environment:
-#   ROLLBACK_IMAGE   the previously deployed image (default hass-echomuse-controller:latest)
+#   ROLLBACK_IMAGE   explicitly select a previous image for an optional rollback check
 #   RS_IMAGE         the tag this tree's image is built as (default
 #                    echomuse-controller-rs:data-copy-check)
 #   SCRATCH_ROOT     where the scratch directory is made (default /var/tmp)
@@ -52,7 +52,10 @@ source "$(dirname "$0")/common.sh"
 KEEP=0
 BUILD=1
 BUILD_IMAGE=1
-ROLLBACK=1
+ROLLBACK=0
+if [ -n "${ROLLBACK_IMAGE:-}" ]; then
+    ROLLBACK=1
+fi
 while [ $# -gt 0 ]; do
     case "$1" in
         --keep) KEEP=1 ;;
@@ -74,7 +77,7 @@ SRC=$(cd "$1" && pwd) || die "$1 is not a directory"
 
 need docker sqlite3 jq curl openssl sha256sum od
 [ "$BUILD" = 0 ] || need cargo
-ROLLBACK_IMAGE=${ROLLBACK_IMAGE:-hass-echomuse-controller:latest}
+ROLLBACK_IMAGE=${ROLLBACK_IMAGE:-}
 RS_IMAGE=${RS_IMAGE:-echomuse-controller-rs:data-copy-check}
 TARGET=${CARGO_TARGET_DIR:-$RS_DIR/target}
 TZ_NAME=${TZ:-$(cat /etc/timezone 2>/dev/null || echo UTC)}
@@ -481,8 +484,7 @@ if [ "$ROLLBACK" = 1 ]; then
         fail "the previous image changed the database files:"
         diff "$SCRATCH/db-files-before.txt" "$SCRATCH/db-files-after.txt" || true
     fi
-    version=$(docker run --rm --network none -v "$RS_DATA:/data:ro" --entrypoint python3 "$ROLLBACK_IMAGE" -c \
-        "import sqlite3; print(sqlite3.connect('file:/data/echomuse.db?mode=ro', uri=True).execute(\"SELECT value FROM system_config WHERE key = 'schema_version'\").fetchone()[0])")
+    version=$(ns_sh "sqlite3 '$RS_DATA/echomuse.db' \"SELECT value FROM system_config WHERE key = 'schema_version'\"")
     [ "$version" = 40 ] && pass "schema_version is still 40" || fail "schema_version is now $version"
     echo "── the previous image's log: errors, tracebacks and migrations, verbatim ──"
     grep -n -i -E 'error|traceback|exception|migrat|refus|schema' "$ROLLBACK_LOG" | cut -c1-400 | head -n 80 || true

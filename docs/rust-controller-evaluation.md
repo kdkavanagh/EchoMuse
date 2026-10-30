@@ -375,14 +375,14 @@ A user's existing installation must keep working after the switch. The database 
 These rules are requirements for the whole rewrite and the cutover, not preferences.
 
 1. **Use the same SQLite file and the same schema.** The Rust controller opens the database at `DB_PATH` in place. The schema is the one deployed today at `schema_version` 40: 14 tables (`devices`, `users`, `sessions`, `system_config`, `turns`, `near_misses`, `device_logs`, `device_metrics`, `wake_counters`, `wake_shadow`, `wake_shadow_events`, `alert_ops`, `alert_delivery`, `alert_scripts`) and 8 indexes. Its definition is `controller-rs/crates/db/schema/v40.sql`, read from a real deployed database (schema only, no rows). It is regenerated only by reading a real database, never by hand or from controller code. The Rust controller does not introduce a new schema, copy data into a new database, or run an importer.
-2. **Require the contract version.** A database at `schema_version` 40 whose tables and indexes match the contract is opened. A lower version is refused with the instruction to upgrade it with the latest Python controller release first; the Rust controller carries no historical migrations. A higher version is refused with the instruction to restore a backup or run a newer controller. A schema that does not match the contract is refused with a precise report, never written into.
+2. **Require the contract version.** A database at `schema_version` 40 whose tables and indexes match the contract is opened. A lower version is refused and needs an explicit migration on a private copy or a compatible backup; Rust carries no historical migrations and never starts Python to perform one. A higher version is refused with the instruction to restore a backup or run a newer controller. A schema that does not match the contract is refused with a precise report, never written into.
 3. **Fresh installations** get the contract schema and their initial `system_config` rows in one transaction. Initial values are a product decision recorded in the database crate (for example `device_approval` created as `strict`, ESPHome ports allocated from 16001).
 4. **Do not delete, rewrite or reset data to cut over.** Every existing row stays where it is with the same row ID, including devices, tokens, ports, users, password hashes, sessions, system settings, turns, near misses, logs, hourly rollups and the alert journal. Recording files are named by row ID (§3.5.2), so IDs must never be renumbered. Ordinary updates, user-requested deletion and retention still apply.
 5. **Write values the way the existing data is shaped.** New rows and updates keep each column's meaning, units, JSON shapes and text encodings as they appear in real data. Where a column's encoding is not stated in this document, it is determined from real data and recorded in the database crate. NULL means "unknown" or "absent" and is never replaced by zero or an empty value. A column the Rust code does not use is preserved, not dropped or cleared.
 6. **Back up before the first write.** Before its first write to an existing installation, the Rust controller creates `<DB_PATH>.pre-rust.bak` through SQLite's online backup API. Publish it atomically and never overwrite a completed one on restart or after rollback. If it cannot be written, refuse to start.
 7. **Connection settings.** WAL journaling and `foreign_keys=ON`.
 8. **Schema changes.** The first Rust release changes no schema, so the previous Python image can still open the database. A later schema change is a deliberate versioned step (41 onward) owned by the Rust controller, and ends rollback to Python past that point.
-9. **Rollback must keep working until then.** The previous Python image must accept every value, journal transition and file the Rust controller writes; an unchanged schema alone does not prove that. §5.6 exercises rollback as a black-box check: stop Rust, start the Python image on a copy, and observe.
+9. **Recovery during the cutover.** Checking the schema alone does not establish compatibility for every value or journal transition. The copied-installation check proved that the saved Python image can read Rust-created turns and recordings, but pending alarm operations need manual recovery (§9.3.2). The user accepted that exception and subsequently chose Rust as the only normal runtime (§9.5). An explicitly selected previous image can still be checked on a copy; Python is not an automatic fallback.
 10. **Never test against a live database.** Development and tests use copies; committed fixtures never contain real rows.
 
 The alert journal deserves a specific note. Pending alert operations are retried with their original `op_id`, and the journal stores a digest of each request's canonical JSON. Because the canonical form is kept (§3.1.8) and the rows are untouched, a retry of a pending operation still matches its row.
@@ -663,10 +663,12 @@ Only the device actor mutates that session and policy state, including admission
 
 **Speech workers.** Each device also gets four dedicated threads: microphone analysis, reference scoring, wake verification and span decoding.
 - Each worker runs one job at a time from its own bounded channel, so state changes and work of one kind stay in order.
-- Each worker owns its mutable model sessions and stream state. An ONNX session runs through `&mut self`; Kroko's recognizer is the explicitly shared native handle described below.
+- Each worker owns its mutable model sessions and stream state. The voice executor chooses the worker from that state's type, not an integer or a separately ordered array. A job that asks an occupied worker for a different state fails instead of silently replacing its streams. An ONNX session runs through `&mut self`; Kroko's recognizer is the explicitly shared native handle described below.
 - The microphone analysis worker performs VAD, streaming ASR and echo attribution, including lag estimation and FFT correlation. Reference scoring remains separate. The device runtime joins their evidence by subscription, epoch and sample position before advancing the endpoint reducer (§6.1).
 - Reset, prime, open and close operations are ordered with that worker's jobs. Cancellation also invalidates queued work immediately; an in-progress native call is handled under §5.5.
 - Devices do not share a queue that serializes their inference jobs. This is an ownership and scheduling decision, not a guarantee of hardware isolation.
+
+The [decomposition of the session voice controller](rust-voice-decomposition.md) is implemented within this same executor and worker model. `Voice` coordinates private wake, conversation and output components and the shared session audio mechanisms. These are synchronous Rust values, not additional tasks, threads or channels.
 
 **Shared large models.** The implementation shares one Kroko recognizer through `Arc`, with distinct mutable streams on the speech workers. A stream keeps the recognizer alive until it is dropped. The wrapper's explicit `Send`/`Sync` implementations depend on the pinned sherpa-onnx C API and configuration described in `crates/speech/src/kroko.rs`; Rust ownership alone does not establish native thread safety. The concurrent-stream acceptance test in `crates/speech/tests/models.rs` requires real model files and is ignored by the default suite. Silero, DTLN and wake scorers are constructed separately where needed, often on a worker's first use. There is no application mutex that serializes all devices' inference.
 
@@ -688,7 +690,7 @@ Keep today's strict protocol behavior: a frame for an unannounced epoch is `unkn
 
 **Required bounds.** Ingress, speech-worker and socket-egress queues must have count and byte bounds. Ordinary ingress also has a finite queue-residence limit; backfill is judged by residence time, not by the age of its samples. A required enqueue that cannot succeed invalidates and closes that device's session, with an overload diagnostic in controller status/logs. It never silently drops a middle audio block or invents a new v1 protocol-error code. Health and bounded restart backoff (§5.7) prevent repeated admission to a runtime that is not ready.
 
-Speech-worker jobs have no residence limit: a job never expires by waiting. Every job belongs to a request. Cancellation invalidates its result immediately, but a cancelled queued job and its byte credits remain until the worker dequeues it; a running native call retains its input credits until it returns. The request's deadlines decide when the user stops waiting. Dropping evidence that an active request still needs would end it as interrupted, so a briefly busy host may answer late instead. Genuine overload cancels the submitting scope; an overload on session-scoped housekeeping ends that session. A device command may wait up to 400 ms: a late command is still applied, except an attach, which is refused so the device dials again.
+Speech-worker jobs have no residence limit: a job never expires by waiting. Every job belongs to a request. Cancellation invalidates its result immediately, but a cancelled queued job and its byte credits remain until the worker dequeues it; a running native call retains its input credits until it returns. The request's deadlines decide when the user stops waiting. Dropping evidence that an active request still needs would end it as interrupted, so a briefly busy host may answer late instead. Genuine overload cancels the submitting scope and returns a failure to its caller; it does not independently close a transport session. A device command may wait up to 400 ms: a late command is still applied, except an attach, which is refused so the device dials again.
 
 The span worker has a separate input budget because it receives whole committed utterances, not just live audio packets. The budget follows the 40 s microphone retention, includes any wake audio retained for gain calculation, and leaves room for a superseded native decode to finish while the next turn commits. It supports the normal 15 s utterance limit and the existing 30 s extended limit, including their leading audio. It does not allocate the full budget at startup or bound model state, output buffers or total process memory.
 
@@ -722,6 +724,10 @@ Each shared service owns its state and offers a typed handle:
 
 The HTTP API does not mutate the voice machine or its session state directly. It reads published snapshots and uses typed handles. Lifecycle and preview commands go to the device actor; adapters such as Wi-Fi and firmware delivery use shared services and the current session's transport handle. Not every dashboard operation passes through the actor's command queue.
 
+The API's runtime, firmware and model-qualification ports are object-safe contracts stored directly in `ApiDeps`; there is no second private trait that repeats each method to box it. The Home Assistant contract in `core` remains generic where calls do not need type erasure. Timer events share one semantic vocabulary in `core`, and alert previews use the protocol's alert-sound type rather than a second copy.
+
+The records service owns the rows and files it writes, including their deletion. Queued turns, continuations and log lines keep the device's records lifetime from submission; deleting and approving the same device id does not authorize old work to write again. A held continuation is answered only after its row's insert settles, and an uncertain insert remains a failure rather than a fabricated claim that no row exists.
+
 ### 5.5 Failures
 
 - **Health per device.** Each device has its own error window and availability. A recoverable speech-worker failure makes only that device refuse wakes. Native crashes and unrecoverable hangs are explicitly process-wide exceptions.
@@ -747,6 +753,8 @@ Tests assert contracts and user-visible behavior. Regression scenarios come from
 ### 5.7 Runtime lifecycle and stale work
 
 Each approved device has a runtime identity that changes on rebuild. Its lifecycle is `starting → ready → attached → ready`, with `draining → stopped` for shutdown/deletion and `failed` for supervised recovery. Transport sessions have their own identities; reconnecting need not rebuild the runtime.
+
+The controller creates the device directory and shell broker before their consumers and passes them through constructors. Startup keeps the controller registry in its cleanup owner while fallible service setup runs, so every failure after device runtimes start stops them before startup returns an error. Tests attach sessions through the production device link; there is no separate bare-session API that exists only for lifecycle tests.
 
 1. **Start and attach.** Distinguish executor readiness from speech readiness. The implementation publishes `Lifecycle::Ready` and `workers_ready` once the worker threads start; these do not mean the speech bundle or every per-worker model session is loaded. Bundle qualification and loading run in the background. Admission grants capture only when the speech status is ready, and the voice path refuses wakes while speech is unavailable. Settings are refreshed during admission, and small worker sessions are constructed lazily. Correction and listener readiness are separate; optional correction work must not block ordinary voice. Serialize admission per device, invalidate the old session before attaching its replacement, and install the new hello's privacy state before accepting capture. Buffer early traffic only within a finite bound and the existing handshake deadlines; otherwise close and let the device reconnect. Preserve the current ESPHome listener lifetime: advertise approved devices, but listen only while their device session is connected.
 2. **Identify every operation.** Speech-worker jobs/results, service requests, projections and lifecycle events carry the runtime/session and subscription, candidate, turn or render generation they concern. A receiver checks those identities before applying a result. `Lost(old)` cannot detach `Attached(new)`, and a late verifier cannot revive an ended candidate. Reset and close messages remain ordered with worker state changes even when earlier invalidated jobs are discarded.
@@ -898,13 +906,15 @@ Earlier verification recorded 1,170 workspace tests with simulated devices and a
 
 The 2026-10-29 architecture review fixed the span budget and returned-service-error handling. `cargo test --workspace --all-targets --offline --no-fail-fast` passed 1,177 tests with 19 ignored; workspace clippy with `-D warnings` and the rustfmt check also passed. New regressions decode a normal-limit wake span and the longest extended reply span through the real span worker with tone stand-in models, preserve room for a superseded running decode, and inject a panic into the real alert service to verify immediate fatal handling and clean intentional shutdown. Temporary runtime probes also processed full normal and extended spans, retained genuine overload rejection, and observed the fatal hook for a returned service error without firing it for a clean stop. The suite exposed an invalid elapsed-time assertion in the existing no-hello timeout test: its observation began after the server's deadline started. The disconnect check remains; the incidental elapsed-time comparison was removed. These checks did not use real speech models, an Echo device or a running Home Assistant.
 
+A later code review started from commit `46a0afb` and corrected ownership and test boundaries without retuning speech policy. It removed the test-only session API, replaced numbered worker dispatch with typed dispatch, removed duplicate API traits and sound/timer types, constructed service dependencies before their consumers, and made startup and actor failures use their cleanup paths. Record deletion now fences held turns and queued logs across re-approval, and recording-mode edits cannot cross the final device-row deletion. An acknowledged or unanswered alarm action is not dispatched again while its operation is unconfirmed. Relative media paths preserve the Supervisor's `/core` prefix. The startup thread leak, held-turn resurrection and media-prefix loss were reproduced on the committed baseline before correction. The reviewed workspace passed 1,150 tests with 19 ignored using `cargo test --workspace --all-targets --all-features --offline --no-fail-fast`; workspace clippy with all targets/features and `-D warnings`, and the rustfmt check, passed. Public device-link scenarios replaced lifecycle tests of a second session implementation; copied defaults, private counters, incidental wording and unused helper tests were removed. Temporary startup and media probes passed after the corrections. These checks did not use live devices, a running Home Assistant or real speech models.
+
 Capture windows are connected: an administrator arms a connected device's capture mode (pull, or a webhook POST that never follows redirects, with an `idle_s` dead-man), which holds the recording modes' diagnostic subscription through one fan-out shared with collection and ambient recording, so wakes are refused meanwhile; each window closes on its stop, at `max_ms` of audio or 2 s later on the wall clock, and comes back as a WAV with the `X-EM-*` headers. The mode is not persisted: it is cleared when the session ends or the device is deleted, a mute discards the open window, the dashboard's `captureMode` badge follows it, and all of this is tested end to end with a simulated device and webhook (`tests/capture.rs`).
 
-Clip windows are scored in the background (`src/clip_windows.rs`): one thread of its own scores each kept wake clip and near-miss recording with the graph that scored it on the device, every model call under the native-call watchdog (a late result is not stored), and stores them where the Activity routes and the cropped archives read them; `tests/clip_windows.rs` runs it end to end with the tone stand-in, and `crates/api/tests/diagnostics.rs` crops archives from stored windows over real HTTP beside the activity, speech-asset, release, Wyoming (against `crates/wyoming`'s simulated server), transcript-correction and support-bundle routes. Pause transcription by a Wyoming server (`pauseAsr`, §4.7) follows the deployed controller's rules: the microphone worker says when it starts a pause decode and the machine sends the same audio to the server at that moment (`crates/voice/src/pause_server.rs`); the turn policy takes the answer from the next recognizer result while that pause decode stands, judges the server's words in place of Kroko's, records each pause's `kroko` and `server` words, and gives the commit its `source` (`crates/turn/src/pause.rs`, `TurnPolicy::pause_server_answer`); a route B or fallback commit on the server's words is re-checked by the same server; the row's `policy_hash` gains `+wyoming:<model>`. Requests and answers are session-recorder steps, so decision replay feeds them back. Unit tests: `crates/turn/tests/endpoint.rs` (the precedence rules) and `crates/voice/src/tests/pause_server.rs` (requests, identity, failure, trace, the server re-check).
+Clip windows are scored in the background (`src/clip_windows.rs`): one thread of its own scores each kept wake clip and near-miss recording with the graph that scored it on the device, every model call under the native-call watchdog (a late result is not stored), and stores them where the Activity routes and the cropped archives read them; `tests/clip_windows.rs` runs it end to end with the tone stand-in, and `crates/api/tests/diagnostics.rs` crops archives from stored windows over real HTTP beside the activity, speech-asset, release, Wyoming (against `crates/wyoming`'s simulated server), transcript-correction and support-bundle routes. Pause transcription by a Wyoming server (`pauseAsr`, §4.7) follows the deployed controller's rules: the microphone worker says when it starts a pause decode and the machine sends the same audio to the server at that moment (`crates/voice/src/conversation/pause_server.rs`); the turn policy takes the answer from the next recognizer result while that pause decode stands, judges the server's words in place of Kroko's, records each pause's `kroko` and `server` words, and gives the commit its `source` (`crates/turn/src/pause.rs`, `TurnPolicy::pause_server_answer`); a route B or fallback commit on the server's words is re-checked by the same server; the row's `policy_hash` gains `+wyoming:<model>`. Requests and answers are session-recorder steps, so decision replay feeds them back. Unit tests: `crates/turn/tests/endpoint.rs` (the precedence rules) and `crates/voice/src/tests/pause_server.rs` (requests, identity, failure, trace, the server re-check).
 
 A copy of the real installation keeps working under the Rust controller (§3.5, §5.6 "Database and file preservation"). `controller-rs/tools/data-copy-check.sh` copies a data directory (the database through SQLite's backup API on a read-only mount), runs every process that touches the copy in a Docker network namespace with only a loopback interface and no route, and drives the ignored test `data_copy_check` (`controller-rs/tests/data_copy/check.rs`, using the simulated speaker and Home Assistant of `tests/voice.rs`). On the deployed installation's copy (schema 40; 6 devices, 970 turns, 602 near misses, 31,000 log rows, 18,600 shadow rows), the release binary and the image built from `controller-rs/Dockerfile` each opened the database in place, wrote `echomuse.db.pre-rust.bak` with the copy's row counts (a restart reported it `AlreadyPresent` and left it byte for byte), removed no stored row at startup or later, served the copy's own TLS certificate, and listed every device, turn and near miss through the dashboard API with JSON columns parsed; every stored decision trace and every kept wake clip, utterance, turn recording and near-miss recording came back byte for byte, and every other one answered 404. A simulated speaker using a copied Echo Dot's id and stored token, playing that Dot's own recording of a stored turn, was admitted and got a completed turn answered by Home Assistant, with its AFE series, its three recordings and a trace carrying what the dashboard reads (pauses, stable prefix, commit source). The new row matched the stored rows' storage types, NULLs and JSON shapes column by column, except `response_latency_ms`, which stays NULL there because the simulated speaker reports every playback at device time 1 ns (`tests/voice.rs`), and AFE series entries that are null where the simulated device reports no ERLE or a period had no record yet. The previous Python image, run on the same copy afterwards as a black box, started without migrating (schema 40, no new backup file) and listed and played that turn; it did not stop within 60 s of SIGTERM and was killed. In that run, with the load average near 50 on 16 cores, the turn's speech jobs waited past the 400 ms queue limit then in force (`queued operation expired`) and it ended `interrupted`; speech jobs no longer expire by waiting (§5.2), and the check has not been repeated under that load since.
 
-Not built or not connected yet: the session recorder's echo analyzer inputs (the analyzer is driven inside the microphone worker, which decides holes, overlaps and the VAD it feeds, so a faithful log has to come from the worker with its output; until then decision replay cannot recompute echo labels) and the early-answer watch's own policy; the verifier's `queued_ms` and `decode_ms` and Kroko's pause decode `ms` in the decision trace (stored null: the worker does not report its wait or decode time). Echo attribution is validated on synthetic signals only, because no recorded reference audio exists yet. Nothing has been run against a real Echo device.
+Not built or not connected yet: the session recorder's echo analyzer inputs (the analyzer is driven inside the microphone worker, which decides holes, overlaps and the VAD it feeds, so a faithful log has to come from the worker with its output; until then decision replay cannot recompute echo labels) and the early-answer watch's own policy; the verifier's `queued_ms` and `decode_ms` and Kroko's pause decode `ms` in the decision trace (stored null: the worker does not report its wait or decode time). Echo attribution is validated on synthetic signals only, because no recorded reference audio exists yet. The first real-device trial is recorded in §9.4.
 
 The pause server rules were replayed offline (`crates/turn/examples/evaluate_pause_server.rs`) on the deployed installation's copy: every stored wake turn with pause server words and a kept recording (220 of the 270 such turns; 29 button or reply turns have no recoverable recording start, 21 no recording), through Kroko and Silero from `crates/speech`, the real grammar and turn policy, with each pause's stored server words handed over at their stored block and HA's stored matcher classes, and no server or HA contacted. The recording is cut into the mic packets the device sent (§4.6: 1,280 samples from the mic start through the backfill, then the absolute 1,280-sample grid), the utterance starts at `support_start − 4800` as this controller starts it, a verified wake's held pre-roll runs to the first packet end 480 ms past the open (when its verifier has heard enough), and each commit decision is compared by the block it was made in, which is what the field's `since` records. Of the 100 turns the field committed under the current policy (`post_afe_10`), this controller commits all 100, every one in the same block as the field (64 of 93 with Kroko alone), with the same boundary for all 100 and the same `source` for 95; the other 5 (801, 906, 909, 928, 949) are the field's mislabelled `source` (§4.7), not a different decision. 111 of the 116 replayed current-policy turns make exactly the field's pause decodes; of the other 5, the field superseded one turn (933) and interrupted another (954) before the replay stopped, two are verified wakes whose real start came later than the replay's estimate (926, 958), and one made its decode one packet later on a VAD value at the threshold (945, a no-input turn). Over all 191 committed turns of every policy version: 189 committed, 176 in the same block, 185 within 200 ms, 180 boundaries, 178 sources (older policies had other rules). Before these fixes the same replay agreed in the same block for 33 current-policy turns, within 200 ms for 71, and on the source for 87, and no turn's pause decodes lined up exactly. Three causes made the difference. The blocks: the field evaluated after every mic packet, and every block boundary in its traces (2,129 samples in 274 wake turns) lies on a packet end, while this controller counted 80 ms blocks from the utterance start, which on most turns lies 320 samples before the live packet grid; moving the blocks to the packet ends alone took the same-block count from 33 to 68 (the way the decision was compared made no difference once the blocks agreed) and the exactly matching pause decodes from 0 to 102. The commit text: the field commits the text in force when the end was decided and asks HA about lookahead words only on a block that does not commit, while this controller took the text in force at the commit and asked HA on the commit block (811, 832, 852, §4.6 Commit). The pre-roll: the field never armed a pause decode on VAD it had scored before the utterance started, so its verified wakes have no pause decode after the wake word, while this controller made one in all 11 of them. The live controller also started a wake utterance at the cell-rounded mic start, up to 511 samples before the field's `support_start − 4800`; the replay had always used the stored start, so it did not show. The rest of the earlier differences were the grammar, below.
 
@@ -920,17 +930,17 @@ The table lists implemented product paths and their existing verification eviden
 
 | Area | How it was checked | Not checked yet |
 |---|---|---|
-| Device link (§3.1) | Against the Go firmware's encoders and test vectors; simulated devices | A real Echo device |
-| ESPHome satellite and Bluetooth proxy (§3.3.1–3.3.2) | Simulated; HA's own client library (aioesphomeapi 45.6.1) over loopback | A running Home Assistant |
-| Home Assistant API (§3.3.3–3.3.4) | Simulated HA | A real Home Assistant |
-| Dashboard API (§3.4) | Every request the shipped dashboard makes is served (`crates/api/ROUTES.md`), over real HTTP | The dashboard pages in a browser |
-| Stored data and rollback (§3.5) | A copy of the deployed installation; the previous Python image read what the Rust controller wrote | — |
-| Wake word (§4.1) | Simulated (idle wake, self-output refusal); the real models on a real wake clip | Echo attribution on real reference audio (none is recorded) |
+| Device link (§3.1) | Go encoders and test vectors; simulated devices; five real Dots connected over TLS; two Office wake turns completed (§9.4) | More real-device use and reconnect cases |
+| ESPHome satellite and Bluetooth proxy (§3.3.1–3.3.2) | Simulated; HA's own client library; the real HA reconnected to the Office satellite and completed an announcement | Real Bluetooth forwarding |
+| Home Assistant API (§3.3.3–3.3.4) | Simulated HA; real HA 2026.8.1 answered Office weather and time requests | Live calendar and script operations; transcript correction hit a null entity name (§9.4) |
+| Dashboard API (§3.4) | Every shipped dashboard request over real HTTP; the device list and Office status in a browser on the live Rust controller | The other pages in a browser |
+| Stored data and rollback (§3.5) | A copy of the deployed installation; the previous Python image read a turn Rust wrote; independent and cutover backups of the live installation passed integrity checks | Pending alarm operations remain incompatible; the user accepted manual recovery during this supervised trial |
+| Wake word (§4.1) | Simulated (idle wake, self-output refusal); real models on a saved wake clip; two live Office wakes | Echo attribution on real playback |
 | Several devices (§4.2) | Two simulated speakers | Real speakers in one room |
 | Button (§4.3) | Simulated | A real button |
 | Local commands (§4.4) | Simulated; timer routing and answers match the deployed controller on all 34 field timer turns | — |
 | Follow-up replies (§4.5) | Simulated, including early answers | — |
-| End of speech (§4.6) | Offline replay of real recordings: the same 80 ms packet as the deployed controller on all 100 field turns under the current policy | Live audio from a device |
+| End of speech (§4.6) | Offline replay matched all 100 current-policy field commits; two live Office requests completed | More quiet speech, pauses and playback cases |
 | Speech to text, pause transcription, correction (§4.7) | Simulated; pause transcription replayed offline against the field's stored server answers | A real Wyoming server |
 | Sounds, lights, displays (§4.8) | Simulated | A real LED ring and Echo Show screen |
 | Media, alarms, timers (§4.9) | Simulated, including HA's Local Calendar | Real HA calendars and scripts |
@@ -939,20 +949,184 @@ The table lists implemented product paths and their existing verification eviden
 
 Accepted differences from the deployed controller: after "Which alarm?" the controller keeps listening for the answer; when cancelling an alarm without AM or PM it asks "AM or PM?" only if both readings match an alarm; three small grammar differences ("set an alarm for tomorrow morning at 7", "snooze the alarm", "what alarms") are left for later; five commits are labelled with their true source where the deployed controller mislabels them (§4.7). The device object's new `health` field is not shown by the shipped dashboard. Not implemented, all diagnostic: the session recorder's echo analyzer inputs and the early-answer watch's own policy, and three timing fields in the decision trace (§9.1).
 
-**A supervised trial on the deployed installation is possible now.** The automatic backup, the in-place database and the rollback were checked on a copy of that installation. The image runs as root, as the Python image does, so the root-owned database and TLS files open where they are. The configuration the compose file sets (`SERVER_*`, `API_PORT`, `MDNS_NAME`, `HA_URL`, `HA_TOKEN`, `DB_PATH`, `DEVICE_APPROVAL`, `ESPHOME_PROJECT_VERSION`) is read under the same names. To run the trial:
+**The user approved a supervised live trial with manual alarm recovery if needed.** The existing check on a copy shows that the previous Python image can open the database and read a turn Rust wrote. Pending alarm recovery is not compatible: Rust writes `alert_ops.payload_json` as `{"plan": …, "request": …}`, but Python expects top-level `result`, `event`, `uid` and other action-specific fields. The user accepted exporting and removing affected records manually if this prevents rollback. This exception permits the supervised trial; it does not establish compatibility for an unattended deployment. §9.3 gives the evidence and procedure.
 
-1. In `~/git/hass/docker-compose.yml`, change the `echomuse-controller` build's `dockerfile` from `controller/Dockerfile` to `controller-rs/Dockerfile`. The build context stays the repository root; the network, ports, volume and environment stay as they are.
-2. Raise `mem_limit` and `memswap_limit` for the first run (for example to `2g`). The Rust controller's memory with six devices has never been measured, and the limit kills the container when it is exceeded.
-3. Deploy with `docker compose up -d --build echomuse-controller`. On its first start the controller writes `echomuse.db.pre-rust.bak` beside the database.
-4. Watch: every device reconnects and shows as available; a wake on each device is answered; a timer and an alarm ring on their speaker; the dashboard's pages load and update; the logs show no repeated HA or device errors; `docker stats` shows the memory in use.
-
-Rollback is the reverse of step 1 and the same deploy command. The Python image opens the database the Rust controller wrote without migrating it. Restoring `echomuse.db.pre-rust.bak` is a separate recovery step that discards everything written after the switch.
-
-No new device firmware is needed. The Rust controller admits the firmware the devices run now under the same protocol v1 rules, and it installs firmware only when someone asks or an update is queued. Both images compute the firmware version the same way, so one source tree gives one version. The Rust image built on 2026-10-29 bundles `fw-f5cc9e7563fd`, from commit `9b7bd34`, which renames things in the code only and changes nothing on the wire. Five devices run `fw-f7942dd6d10f`, from the Python image built just before that commit, so the dashboard will offer them the update after the switch, as a rebuilt Python image would. The Nursery has had an update queued since 2026-10-21 and installs it on its next connection under either controller; cancel the queue first to keep firmware changes out of the trial.
+No new device firmware is needed. Both controllers admit the existing protocol v1 firmware. Firmware changes only after an explicit request or a previously queued update. For this trial, mount the running Python image's exact firmware bundle read-only in Rust rather than relying on an operator not clicking an update.
 
 Only real use can check what the table lists as not checked: real devices and their timing, echo attribution on real playback, a real Home Assistant (pipelines, calendars, scripts, timers), the real Wyoming server, the dashboard in a browser, the LED ring and screen, and memory with six devices.
 
-**Not ready for a release to other installations.** CI (`.github/workflows/ci.yml`) builds and tests no Rust; the release workflow and the Home Assistant add-on still ship the Python image; the arm64 image has never been built or run (§7.3 step 6); and add-on mode (the Supervisor token and ingress) is tested only with simulated requests.
+**Distribution checks remain.** CI now checks Rust and the release workflow builds `controller-rs/Dockerfile` for future images. Existing published tags and the add-on's selected image are not replaced by a source change. An arm64 cross-build was recorded, but no native arm64 runtime has been exercised (§7.3 step 6); add-on mode (the Supervisor token and ingress) is checked only with simulated requests.
+
+### 9.3 Plan for the first real-device trial
+
+This plan covers the Office, Kitchen, Living Room, Master Bedroom and Master Bathroom Dots. The Nursery is outside the trial and its acceptance checks. On 2026-10-30 the user approved starting the trial while supervising in the Office, without changing the alarm journal code.
+
+Use one controller at a time. Keep the current database and the files beside it in place. Do not change device firmware, wake models, credentials, network addresses or Home Assistant identities as part of this trial.
+
+#### 9.3.1 What was checked on 2026-10-30
+
+- The running Python container uses image `sha256:10fa2c3267cf3dd06217ac84204156b624e1af8767ee66498d4edb6571d76a8f`. Preserve these bytes; rebuilding Python from today's tree is not the same rollback.
+- The live database is at schema 40. `alert_ops` is empty. All five Dots report `fw-f7942dd6d10f`, and none has an update queued.
+- The running controller's `/app/firmware/version` is `fw-f7942dd6d10f`. Its `server` has SHA-256 `aed2b82acc8768d5eb45b29b8a865b0cdc6acdd399e31c30f16298e039fc91b3`.
+- The service in `~/git/hass/docker-compose.yml` uses the macvlan address `192.168.3.211`, joins `mqtt_network` for Wyoming, and mounts `~/git/hass/echomuse/data` at `/app/data`. Keep both networks, the fixed address, all existing environment settings and the data mount.
+- The current memory and swap limits are both 1 GiB. A sample showed about 589 MiB in use. Rust's use with the real devices has not been measured.
+
+The fresh isolated run of `tools/data-copy-check.sh` finished with `every check passed`. It built the current release binary and image `echomuse-controller-rs:trial-preflight-20261030` (`sha256:db5ec8d9990aa4b5054c6243a4a29e9a71709d5be46874adff7921c80768ed06`), then checked private copies without a route to HA or the devices. Both Rust runs completed a turn from a saved recording and preserved existing rows and files. The exact Python image above then opened Rust's copy without migrating, authenticated the copied session, listed the new completed turn and served its wake clip, utterance, full recording and trace with HTTP 200. The cutover backup survived a Rust restart unchanged, schema 40 remained unchanged, and the served TLS certificate matched the existing one. Python again needed SIGKILL after the 60-second shutdown timeout (exit 137); Rust exited with status 0.
+
+That run had no pending alarm operations and does not remove the blocker in §9.3.2. It also reported differences in optional timing and trace fields, so it is not proof that every stored JSON shape is identical. The candidate bundles `fw-f5cc9e7563fd`, not the version the five Dots run; the firmware mount in §9.3.3 is therefore necessary.
+
+Recheck the database, queues and image identity immediately before the switch; these observations are not a permanent guarantee.
+
+#### 9.3.2 Known alarm recovery limit during the supervised trial
+
+The evidence is in `crates/alerts/src/journal.rs` and `controller/em_alerts.py:OpPayload`, `AlertEngine._apply`:
+
+- Rust stores a request and its plan under two top-level keys.
+- Python looks for top-level `event` when creating an alarm, `uid` when cancelling one, and `result` when finishing an operation.
+- A direct recovery probe in the exact running Python image, with networking disabled and synthetic rows, rejected a Rust-shaped create with `unsupported action create`. A Rust-shaped dismiss reached `KeyError: 'result'` after the occurrence deletion reported success. The same dismiss with Python's `result` field completed. The probe replaced the network and completion callbacks; it did not run a real calendar operation.
+
+**If automatic rollback to Python is supported again:** make Rust read and write the existing Python journal encoding, including the meaning of `step`, request digests, result fields and operation IDs. Do not add a migration, a second journal format or a conversion that requires the failed Rust controller to run before rollback. The user chose normal Rust operation with manual emergency recovery rather than requiring this change.
+
+Before accepting that change, interrupt each supported alarm operation at its durable boundaries and start the exact previous Python image on the copy. Include create, cancel, dismiss, snooze and expire; check update if either controller can journal it. Cover both an operation not yet sent to HA and one whose HA action succeeded before the controller recorded completion. Require the intended calendar state, no duplicate action, the same operation ID and digest, and a settled journal row. Also start Rust with Python-written pending rows. Use an isolated simulated HA; never replay these operations into the household's HA.
+
+The user accepted manual recovery for this supervised trial. If a crash leaves incompatible pending operations, first stop the controller and save a consistent database copy and the affected rows. Remove only the records that prevent recovery, then reconcile the actual HA calendar state before reissuing any operation. An alarm action might already have happened even if its journal record is pending. Do not clear the journal wholesale or assume that deleting a record undoes the HA action.
+
+#### 9.3.3 Prepare while Python still serves the devices
+
+1. **Preserve Python.** Give the running image a separate local tag, such as `echomuse-controller:python-before-rust-20261030`, verify that it resolves to the image ID above, and save it to an image archive. Do not let the Rust build overwrite that tag. Save the existing Compose service settings as well.
+2. **Freeze firmware.** Copy `/app/firmware` from the running Python container into a private trial directory outside `/app/data`. Verify its version and SHA-256 against §9.3.1. Mount that directory read-only over `/app/firmware` in the Rust service. Leave `FIRMWARE_DIR=/app/firmware`. All five Dots then already run the version Rust offers. This also pins the embedded companion bytes, although the Dots do not use the companion.
+3. **Build a separate candidate.** Set the service's `image` to a separate Rust trial tag and its build `dockerfile` to `controller-rs/Dockerfile`. Keep the repository root as the context. Build while Python is still running; building an image does not update devices.
+4. **Check a fresh copy.** Run `controller-rs/tools/data-copy-check.sh` with `ROLLBACK_IMAGE` set to the exact Python image ID and `RS_IMAGE` set to the candidate tag. It copies the live source read-only, uses SQLite's backup API, and runs the controllers with only loopback networking and a simulated HA. Require `every check passed`. This passed on 2026-10-30; it does not exercise pending alarm recovery. The additional recovery checks in §9.3.2 remain required before unattended deployment, not before this supervised trial.
+5. **Prepare the window.** Choose a time with no important timer, alarm or media playback in progress. Record the five devices' firmware, ports, capabilities, effective settings and HA identities, plus the existing HA calendars and scripts. Test one harmless request on each Dot under Python and retain its turn ID as the baseline. Leave all audio retention settings unchanged.
+6. **Check storage and memory.** Verify database integrity, schema 40 and free space for an independent backup of the whole data directory. Use `mem_limit: 2g` and `memswap_limit: 2g` for the first trial, keep `noswap.slice`, and check that the host has room before starting. This is an initial cap, not a measured requirement.
+
+Do not use firmware deploy, update, queue, device rollback, provisioning, debloat or secure-link actions during the controller trial. Do not change Wi-Fi, approve new devices or allocate new ESPHome ports. Those are separate tests.
+
+#### 9.3.4 Switch and check the basic path
+
+From `~/git/hass`, stop Python with `docker compose stop -t 60 echomuse-controller` and confirm it has exited. The earlier copy check needed SIGKILL after the Python shutdown timeout, so record the exit status and do not assume that SIGTERM always finishes cleanly.
+
+With both controllers stopped, take an independent SQLite backup and copy the adjacent files, especially `tls/`, the wake registry, sounds and recordings. Preserve ownership and permissions. Check that no alarm operation is pending. Keep any existing `echomuse.db.pre-rust.bak`: Rust never overwrites it, so an old one is not a fresh backup for this trial.
+
+Start the Rust service with `docker compose up -d --build echomuse-controller`. The build should already be cached. No second controller may run against this installation, even with a database copy, because it could still advertise itself and act on the same HA.
+
+Allow up to five minutes for startup and reconnects, then require:
+
+- Rust has opened schema 40 without changing it. The cutover backup exists and is usable. The existing TLS CA and device credentials are unchanged.
+- `GET /api/firmware` reports the pinned version and SHA-256. All five Dots still report their original firmware.
+- All five devices show `connected: true` and `health.available: true` through `GET /api/devices`; `health.restarting` is false and failure counts do not keep rising. The shipped dashboard does not display this health object, so inspect the API too.
+- HA reconnects to the existing satellites on the same ports. There are no duplicate devices or Local Calendars. `GET /api/ha/status` reports the required voice, timer, calendar, script and recognition features as available.
+- The real dashboard opens through the existing URL, signs in, receives live updates, lists old history and plays an existing recording.
+
+Start with the Office, then test the other Dots one at a time. All five will reconnect to Rust at the switch; testing the Office first does not isolate the other four from the new controller.
+
+#### 9.3.5 Exercise real behavior, then deliberately roll back
+
+Keep the first window supervised. Record each request, device, turn ID, expected result and observed result.
+
+| Check | Required result |
+|---|---|
+| Three harmless wake requests on each Dot, including quiet speech and a pause | One answer per request, complete words, sensible endpoint, and a stored turn with its trace and recordings where retention is enabled |
+| A follow-up answer and a wake with no command | The reply window works; the no-input behavior matches the enabled settings |
+| A wake heard by two Dots | Only one Dot handles the request; the other does not issue a duplicate HA action |
+| A button turn, privacy mute, then unmute | The button starts a turn; mute blocks microphone turns; unmute restores them |
+| HA announcement and media, then a wake and stop during playback | Audio and lights work, speech is not accepted merely because the Dot played it, and interruption stops the intended output |
+| Short timers on two different Dots | Each rings only on its own speaker; local stop or cancel affects the intended timer |
+| A short alarm, cancellation and snooze | HA and the device agree on the schedule and occurrence; the operation settles and does not create duplicate events |
+| Wyoming pause transcription, if enabled | The real server is reachable on the existing network and contributes to a completed turn |
+
+Then perform a planned rollback using §9.3.6. Python must answer on all five Dots, read a Rust-created turn and its recordings, and preserve a disposable future alarm created under Rust. Verify that the alarm still rings and can be dismissed under Python. This proves more than starting Python on a copy.
+
+After that drill passes, restart the same Rust candidate for a longer supervised session and then ordinary use. Include one Rust restart with a future test alarm, and observe reconnect and alert reconciliation without duplicate actions. Watch logs and `docker stats` through turns and idle periods. Do not leave the trial unattended until the drill and the checks above pass.
+
+Roll back immediately for a startup refusal, failed credentials, missing devices after the startup window, repeated runtime restarts, an OOM kill, lost or duplicate HA actions, an alarm on the wrong speaker, or serious speech regressions. Preserve logs, turn traces and the current data before investigating. Do not automatically repeat an action whose outcome is unknown.
+
+#### 9.3.6 Roll back without rebuilding or restoring the database
+
+1. Stop issuing test requests. If Rust still runs, let in-flight work settle and inspect pending alarm rows. If it crashed, preserve the database and affected rows before starting Python. If incompatible rows prevent recovery, use the manual procedure accepted in §9.3.2; do not mark uncertain operations applied or retry them without checking HA.
+2. Stop Rust with `docker compose stop -t 60 echomuse-controller` and confirm it has exited. Save its logs and a consistent copy of the current data for diagnosis.
+3. Set the Compose service's `image` to the preserved Python tag, restore `dockerfile: controller/Dockerfile` and the original resource settings, and remove the temporary firmware mount. Keep the same data mount, networks, address and environment.
+4. Run `docker compose up -d --no-build --pull never echomuse-controller`. Verify that the new container's image ID is exactly the preserved Python image. Do not rebuild Python from the current working tree as an emergency rollback.
+5. Require schema 40 with no migration; five connected Dots on unchanged firmware and ports; a successful wake on each; readable Rust-created history, traces and recordings; and correct alarm recovery without journal errors, lost operations or duplicate calendar events.
+
+**Normal rollback keeps the current database.** Restoring a backup is a separate disaster recovery action, not part of switching controllers. It loses newer history and journal state, and it does not undo HA actions or calendar edits made during the trial. If restoration becomes necessary, preserve the failed data first, keep both controllers stopped, restore the database and related files consistently without mixing old WAL files with the restored database, and reconcile HA calendars and device alert caches before resuming.
+
+### 9.4 First supervised live trial, 2026-10-30
+
+Rust started at 20:31:20 UTC through `cd ~/git/hass && docker compose up -d --build echomuse-controller`. The running image is `sha256:647b5b2380384380d35c8e05ddcb512cb8c3a3336fbe87deffeef81c53c94682`. Python had stopped first; it needed SIGKILL after 60 seconds. No database rows were deleted.
+
+All five Dots reconnected over TLS on their existing ports. Each reported `health.available: true`, zero recent failures and unchanged firmware `fw-f7942dd6d10f`. The firmware directory is a read-only mount of the exact Python bundle; its server SHA-256 is the value in §9.3.1. Speech models qualified and became ready. The controller connected to the real HA 2026.8.1. A memory sample after reconnect was about 275 MiB under the 2 GiB cap.
+
+The real dashboard rendered the five online devices and the Office status panel in a browser at the container's bridge address. An existing Office utterance recording returned HTTP 200 as a WAV. HA accepted an Office announcement, moved its satellite to `responding`, then returned it to `idle`. The Office subsequently completed two real wake turns: 988, "what's the weather", and 989, "what time is it?". Both have `outcome: ha`, `terminal_reason: completed` and `playback_reason: drained`; HA answered with the weather and "It's 3:32". Turn 989's trace, wake clip, utterance and full recording all returned HTTP 200. This verifies the first live voice path, not the remaining alarm, interruption or multi-device cases.
+
+The live database remained at schema 40. Both the independent SQLite backup and `echomuse.db.pre-rust.bak` passed integrity checks and contained the 987 turns present at the switch. The independent archive also preserves adjacent files and their permissions.
+
+Private rollback assets are under `~/git/hass/echomuse/trials/20261030-rust/`: `python-image.tar`, `firmware/`, `echomuse.before.db`, `data.before.tar`, the original Compose file, the device and alert baselines, and `trial.json`. The old Python image is tagged `echomuse-controller:python-before-rust-20261030`.
+
+To stop the trial and start the exact saved Python image against the current data:
+
+```sh
+~/git/hass/echomuse/trials/20261030-rust/rollback.sh
+```
+
+The script verifies the saved image ID, stops Rust, saves the current database and any pending alarm rows, and starts Python using the saved Compose configuration without rebuilding or pulling. It does not delete pending rows or restore the old database. Its shell syntax and Compose configuration were checked; the earlier isolated run exercised Python rollback, but this live trial has not yet exercised the complete script. After using it, restore the main Compose service's Python settings before a normal rebuild: the script leaves the main file selecting Rust.
+
+One integration warning is present: transcript correction cannot load HA's entity names because an entity registry entry contains null where the Rust decoder expects a string. The warning repeats every ten seconds. The trial leaves the code and correction settings unchanged.
+
+### 9.5 Rust is the supported controller
+
+After the real Office requests succeeded, the user confirmed that Rust works well
+and chose it for normal use. The Python implementation stays in the repository as
+historical reference, not as a second supported runtime. Its Dockerfile is removed.
+The source Compose file, CI, release workflow and device compiler helpers now use
+`controller-rs/Dockerfile`. The copied-installation check runs only Rust by default;
+checking an explicitly selected previous image remains optional.
+
+The local service keeps `restart: unless-stopped`, its existing networks and data,
+and the 2 GiB memory cap. Its normal image tag is `echomuse-controller:local`.
+The verified firmware bundle is now at `~/git/hass/echomuse/firmware`, mounted
+read-only at `/app/firmware`, so normal controller rebuilds do not change what the
+devices can install. The files under `trials/20261030-rust` remain recovery assets,
+not dependencies of normal startup.
+
+Normal updates use:
+
+```sh
+cd ~/git/hass
+docker compose up -d --build echomuse-controller
+```
+
+The preserved Python image is an explicit emergency recovery option only. The
+user accepted manual handling of incompatible pending alarm records; no automatic
+fallback to Python, schema migration or firmware update was added.
+
+No image has been published as part of this cutover. The release workflow will
+publish Rust when a future release is explicitly requested; existing published
+tags and the add-on's version still refer to their original images.
+
+Verification for this cutover: the workspace passed 1,154 tests with 19 opt-in cases
+ignored, and clippy and rustfmt passed. Nine speech-model checks passed with the real
+native libraries; the speech workers also decoded the test recording, verified its
+wake text and produced the STT copy. A stale full-packet count in the microphone
+model test was replaced by a check that ASR covers the final short packet; that
+check passed. The dashboard JavaScript checks, workflow validation with actionlint,
+and firmware export through `device/compile.sh` passed.
+
+The copied-installation check finished with `every check passed` against the current
+release binary and image. It also started the previous Rust image on the updated copy
+and read the new turn, its trace and recordings without a migration. That run used no
+Python controller and deleted its private scratch data afterwards.
+
+At 21:07:12 UTC the normal Compose command started `echomuse-controller:local`,
+image `sha256:8be98e5c8028bcbf4ac5304fa703e835f34537d86af6a4952a5817e04390ce19`.
+Its entrypoint is `/app/bin/echomuse-controller`, its restart policy is
+`unless-stopped`, and its firmware mount uses the permanent directory above.
+All five Dots became healthy on their original ports and firmware. HA connected,
+the live dashboard rendered in a browser, Office turn 989's trace and utterance
+remained readable, and the live database stayed at schema 40.
+
+
+
 
 ## 10. Open decisions
 

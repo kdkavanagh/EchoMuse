@@ -1,8 +1,9 @@
 version: 2
 
 # Four ecosystems, because the controller image is assembled from all four and
-# a gap in any one of them is invisible: Python wheels, the Debian base image,
-# the device's Go modules, and the actions this repo's own workflows run.
+# a gap in any one of them is invisible: the controller's Rust crates, the
+# base images in controller-rs/Dockerfile, the device's Go modules, and the
+# actions this repo's own workflows run.
 #
 # Everything is GROUPED into one PR per ecosystem per week. Ungrouped, this
 # config produces a dozen individual PRs against a repo maintained by one
@@ -11,45 +12,54 @@ version: 2
 #
 # Note what Dependabot structurally cannot see here, so nobody reads a green
 # board as "everything is covered":
-#   - openwakeword is installed in the Dockerfile with --no-deps, not from
-#     requirements.txt, so its pin is invisible to the pip ecosystem below.
-#   - SpeexDSP is vendored C source in device/internal/aec/ with no package
-#     metadata at all.
+#   - sherpa-onnx and ONNX Runtime, which the controller links and loads, are
+#     pinned by SHA-256 in controller-rs/crates/speech/src/pins.rs and fetched
+#     by controller-rs/tools/fetch-native.sh, not from any manifest.
+#   - The dashboard's esbuild and vendored libraries are pinned by SHA-256 in
+#     controller-rs/tools/build-dashboard.sh.
 #   - ONNX Runtime is dlopen'd on the device, pinned by AAR sha256 in the
 #     asset path rather than by any manifest.
-# Those three are tracked by reading the pins, which is a human job.
+# Those are tracked by reading the pins, which is a human job. controller/ is
+# the retired Python controller, kept as reference only; its requirements.txt
+# builds nothing and is not watched.
 
 updates:
-  # ── Controller Python dependencies ──────────────────────────────────────
-  - package-ecosystem: pip
-    directory: /controller
+  # ── Controller Rust crates ──────────────────────────────────────────────
+  - package-ecosystem: cargo
+    directory: /controller-rs
     schedule:
       interval: weekly
       day: monday
     open-pull-requests-limit: 3
     groups:
-      python-dependencies:
+      rust-dependencies:
         patterns: ["*"]
-    # Major bumps of these two are not routine maintenance and should not
-    # arrive as a weekly PR: numpy majors have broken openwakeword's array
-    # handling before, and an onnxruntime major changes inference behaviour
-    # on every device at once. Both want a deliberate upgrade with a wake
-    # word test behind it.
+    # sherpa-onnx-sys must match the native libraries pins.rs and
+    # fetch-native.sh pin (crates/speech holds it at =1.13.8), so a bump is a
+    # deliberate change to all three with a speech test behind it, not a
+    # weekly PR.
     ignore:
-      - dependency-name: numpy
-        update-types: ["version-update:semver-major"]
-      - dependency-name: onnxruntime
-        update-types: ["version-update:semver-major"]
+      - dependency-name: sherpa-onnx-sys
 
-  # ── Controller base image ───────────────────────────────────────────────
-  # python:3.12-slim is where ffmpeg, curl and the whole Debian layer come
-  # from — the majority of what any image scan reports.
+  # ── Controller base images ──────────────────────────────────────────────
+  # debian:bookworm-slim is where ffmpeg and the whole Debian layer come
+  # from — the majority of what any image scan reports. Every FROM is pinned
+  # by digest. The firmware compiler base has no tag, so it is never offered
+  # (moving it needs a real device in the loop; see CLAUDE.md). The rust
+  # base's version moves only together with controller-rs/rust-toolchain.toml,
+  # which Dependabot does not edit, so only its digest is refreshed here.
   - package-ecosystem: docker
-    directory: /controller
+    directory: /controller-rs
     schedule:
       interval: weekly
       day: monday
     open-pull-requests-limit: 2
+    ignore:
+      - dependency-name: rust
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
+          - "version-update:semver-patch"
 
   # ── Device Go modules ───────────────────────────────────────────────────
   # The GoTinyAlsa replace directive points at a submodule path, which

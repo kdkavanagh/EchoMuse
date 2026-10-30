@@ -6,80 +6,118 @@ on:
   pull_request:
 
 jobs:
-  controller-tests:
-    name: Controller unit tests
+  # ── Controller (controller-rs) ───────────────────────────────────────────
+  #
+  # The controller is the Rust workspace in controller-rs/. Each job installs
+  # the toolchain controller-rs/rust-toolchain.toml names, read from that file
+  # so the pin lives in one place (the image's rust:<version> base moves with
+  # it), and runs cargo with --locked so a Cargo.lock that does not match the
+  # manifests fails here instead of resolving afresh. controller/ keeps the old
+  # Python controller as reference only; nothing here builds or runs it.
+  controller-fmt:
+    name: Controller format (rustfmt)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      # Pure-logic modules plus the device link, HA client, auth and BT proxy,
-      # which need websockets, aiohttp, bcrypt, zeroconf and protobuf, and
-      # transcript correction, which expands HA's sentence templates with
-      # hassil and pronounces words with cmudict (both pinned as in
-      # requirements.txt). Model runtimes (onnxruntime, sherpa-onnx) are not
-      # installed; their tests skip via importorskip.
-      - name: Install test dependencies
-        run: >
-          pip install pytest numpy scipy websockets==16.0 aiohttp==3.13.5
-          bcrypt==5.0.0 zeroconf==0.149.17 "protobuf>=4.21.0" hassil==3.11.0 cmudict==1.1.3
-      - name: Run pytest
-        working-directory: controller
-        run: python -m pytest tests/ -v
-
-  controller-lint:
-    name: Controller lint (undefined names)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install pyflakes
-        run: pip install pyflakes
-      # pyflakes finds undefined names in milliseconds without importing
-      # anything. The controller's wiring modules (em_controller, em_api,
-      # em_esphome) are not imported by the test suite, so their rarely-taken
-      # branches are untested by construction; an undefined name there is
-      # silent until executed, then fatal.
-      #
-      # Scoped to undefined names ONLY, on purpose. The codebase has pre-existing
-      # unused-variable and f-string warnings that are not worth a churn commit,
-      # and a lint job that fails for style would get ignored or removed.
-      - name: Check for undefined names
-        working-directory: controller
+      - name: Install the pinned Rust toolchain
+        working-directory: controller-rs
         run: |
-          out=$(python -m pyflakes em_*.py echomuse_grammar/*.py tools/*.py tests/*.py esphome/*.py 2>&1 \
-                | grep -i "undefined name" || true)
-          if [ -n "$out" ]; then
-            echo "$out"
-            echo "::error::pyflakes found undefined name(s) -- see above"
-            exit 1
-          fi
-          echo "No undefined names."
+          channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --component rustfmt,clippy
+          rustc --version
+      - name: Run cargo fmt
+        working-directory: controller-rs
+        run: cargo fmt --all -- --check
 
-  controller-typecheck:
-    name: Controller type check (mypy)
+  controller-clippy:
+    name: Controller lint (clippy)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Install the pinned Rust toolchain
+        working-directory: controller-rs
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --component rustfmt,clippy
+          rustc --version
+      - uses: actions/cache@v4
         with:
-          python-version: "3.12"
-      # The typed runtime dependencies at their requirements.txt pins, so
-      # mypy checks against the APIs the image actually ships. The model
-      # runtimes (onnxruntime, sherpa-onnx) and scipy carry no type
-      # information and are ignored per-module in mypy.ini.
-      - name: Install mypy and typed dependencies
-        run: >
-          pip install mypy==2.3.1 numpy==2.4.4 websockets==16.0 aiohttp==3.13.5
-          bcrypt==5.0.0 cryptography==44.0.1 zeroconf==0.149.17
-          "protobuf>=4.21.0" types-protobuf hassil==3.11.0 cmudict==1.1.3
-      # Settings and the checked file set live in controller/mypy.ini.
-      - name: Run mypy
-        working-directory: controller
-        run: python -m mypy
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            controller-rs/native/.downloads
+          key: rs-deps-${{ runner.os }}-${{ hashFiles('controller-rs/Cargo.lock', 'controller-rs/tools/fetch-native.sh', 'controller-rs/crates/speech/src/pins.rs') }}
+          restore-keys: rs-deps-${{ runner.os }}-
+      # The controller links the pinned sherpa-onnx libraries; build.rs stops
+      # the build without them. The script checks every download and library
+      # against the SHA-256 in crates/speech/src/pins.rs, and
+      # .cargo/config.toml points SHERPA_ONNX_LIB_DIR at what it unpacks.
+      - name: Fetch the pinned native libraries
+        working-directory: controller-rs
+        run: tools/fetch-native.sh
+      - name: Run cargo clippy
+        working-directory: controller-rs
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+  controller-tests:
+    name: Controller tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned Rust toolchain
+        working-directory: controller-rs
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --component rustfmt,clippy
+          rustc --version
+      # The playback, sound-export and voice tests run the real decoder at
+      # /usr/bin/ffmpeg, as the image does.
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            controller-rs/native/.downloads
+          key: rs-deps-${{ runner.os }}-${{ hashFiles('controller-rs/Cargo.lock', 'controller-rs/tools/fetch-native.sh', 'controller-rs/crates/speech/src/pins.rs') }}
+          restore-keys: rs-deps-${{ runner.os }}-
+      - name: Fetch the pinned native libraries
+        working-directory: controller-rs
+        run: tools/fetch-native.sh
+      # Tests that need downloaded models, live multicast, a Python with
+      # aioesphomeapi or a copied installation are #[ignore]d and do not run
+      # here; controller-rs/README.md lists how to run them by hand.
+      - name: Run cargo test
+        working-directory: controller-rs
+        run: cargo test --locked --workspace --all-targets --all-features
+
+  controller-audit:
+    name: Controller dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      # The fast check against the RustSec advisory database, from Cargo.lock
+      # alone; nothing is compiled. The published image cannot stand in for it:
+      # the controller binary is not built with cargo-auditable, so an image
+      # scan sees the Debian layer but not the crates inside the binary. The
+      # weekly scan in security-scan.yml covers the same lockfile on unchanged
+      # code.
+      #
+      # Report-only, deliberately. A dependency audit that goes red on an
+      # advisory with no fix available teaches people to ignore a red X,
+      # which costs more than the job earns.
+      - name: Audit Cargo.lock
+        run: |
+          if ! cargo audit --file controller-rs/Cargo.lock; then
+            echo "::warning::cargo audit reported vulnerabilities — see the log"
+          fi
 
   dashboard-tests:
     name: Dashboard logic tests
@@ -131,36 +169,7 @@ jobs:
       # stage; the firmware and the controller image are not built here.
       # ubuntu-latest is x86-64, which aapt2 and zipalign need.
       - name: Build the companion stage
-        run: docker build -f controller/Dockerfile --target companion .
-
-  python-deps-audit:
-    name: Python dependency audit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install pip-audit
-        run: pip install pip-audit
-      # This is the FAST check, not the authoritative one. requirements.txt
-      # leaves scipy and protobuf unpinned, so what a user actually runs
-      # is decided at image build time, not here. The published image is the
-      # source of truth and is scanned in security-scan.yml; this job exists
-      # to fail on a PR that adds a known-vulnerable pin, minutes rather than
-      # a release later.
-      #
-      # Report-only for now, deliberately. A dependency audit that goes red
-      # on an advisory with no fix available teaches people to ignore a red
-      # X, which costs more than the job earns. Gate it on FIXABLE findings
-      # once a month of real output shows what the steady state looks like.
-      - name: Audit pinned dependencies
-        working-directory: controller
-        run: |
-          pip-audit -r requirements.txt --desc 2>&1 | tee audit.txt || true
-          if grep -qiE "^(Name|found [1-9])" audit.txt; then
-            echo "::warning::pip-audit reported findings — see the log"
-          fi
+        run: docker build -f controller-rs/Dockerfile --target companion .
 
   device-vulncheck:
     name: Device Go vulnerability check

@@ -3,27 +3,17 @@ services:
     build:
       # Root context is required for the deployed BCResNet registry seed.
       context: ..
-      dockerfile: controller/Dockerfile
-      args:
-        # CUDA controller inference on this host. The published image is CPU.
-        GPU: "1"
+      dockerfile: controller-rs/Dockerfile
     container_name: echomuse-controller
     restart: unless-stopped
     network_mode: host
     environment:
-      - DEBUG=1
+      - DB_PATH=/app/data/echomuse.db
     env_file:
       - .env
     volumes:
       # Persist database across container rebuilds
-      - ~EchoMuse/controller/data:/app/data
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+      - ./data:/app/data
     logging:
       driver: json-file
       options:

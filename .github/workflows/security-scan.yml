@@ -72,3 +72,44 @@ jobs:
         with:
           sarif_file: trivy-results.sarif
           category: trivy-image
+
+  # The controller binary is not built with cargo-auditable, so the image
+  # scan above cannot see the crates compiled into it. This reads them from
+  # controller-rs/Cargo.lock on the default branch instead, under the same
+  # rules: fixable HIGH/CRITICAL fails the run, and the SARIF goes to the
+  # Security tab regardless.
+  scan-lockfile:
+    name: Scan controller crates (Cargo.lock)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan for fixable HIGH/CRITICAL vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: controller-rs
+          scanners: vuln
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Scan again for SARIF
+        if: always()
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: controller-rs
+          scanners: vuln
+          format: sarif
+          output: trivy-cargo.sarif
+          severity: MEDIUM,HIGH,CRITICAL
+
+      - name: Upload results to code scanning
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-cargo.sarif
+          category: trivy-cargo

@@ -1,4 +1,4 @@
-# EchoMuse controller — deploy from the published image (no build needed).
+# EchoMuse Rust controller — deploy from the published image (no build needed).
 #
 #   mkdir echomuse && cd echomuse
 #   curl -O https://raw.githubusercontent.com/wilbowes/EchoMuse/main/controller/docker-compose.deploy.yml
@@ -12,8 +12,7 @@
 # mDNS and opens one ESPHome TCP port per device (16001+), which doesn't
 # work behind Docker's port mapping.
 #
-# The image runs wake word inference on CPU (fine for a handful of devices).
-# For NVIDIA GPU inference, build locally instead: see docker-compose.yml.
+# The controller runs speech inference on CPU; no GPU reservation is needed.
 
 services:
   echomuse-controller:

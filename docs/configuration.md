@@ -1049,13 +1049,14 @@ Set once on the server; a change needs a controller restart.
 | `ESPHOME_PROJECT_VERSION` | controller version | Project version each emulated ESPHome satellite reports to Home Assistant. |
 | `DB_PATH` | `echomuse.db` | The SQLite database. Everything the controller stores (wake models, sounds, recordings, TLS files) lives beside it. |
 
-`.env.example` lists them with comments. A bare-metal install also needs the
-files the Docker image downloads at build time: the speech bundle
-(`SPEECH_BUNDLE_DIR`, default `/app/speech`, fetched with
-`python tools/fetch_speech_bundle.py <dir>`), the Android ONNX Runtime the
-controller serves to devices (`ORT_ANDROID_LIB`), and the DTLN models for
-**Noise suppression** (`NS_MODEL_DIR`). See `controller/Dockerfile` for the
-exact sources.
+`controller/.env.example` lists them with comments. A bare-metal install also needs
+the native libraries and models that the Docker image downloads. From
+`controller-rs/`, run `tools/fetch-native.sh` and `tools/fetch-speech-assets.sh`.
+The latter provides the speech bundle (`SPEECH_BUNDLE_DIR`), Android ONNX Runtime
+served to devices (`ORT_ANDROID_LIB`) and DTLN models (`NS_MODEL_DIR`). The controller
+also loads its own ONNX Runtime library through `ONNXRUNTIME_LIB`. See
+[`controller-rs/README.md`](../controller-rs/README.md) for the full startup command
+and `controller-rs/Dockerfile` for the image.
 
 **Device approval note.** The approval policy in effect is the
 `device_approval` system setting in the database, which every new database

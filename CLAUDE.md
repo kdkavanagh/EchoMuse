@@ -7,9 +7,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 EchoMuse repurposes Amazon Echo Dot Gen 2 (Fire OS 6 / Android 7.1.2, codename "biscuit") and Echo Show 8 Gen 1 (codename "crown", on Fire OS 6 with the full Android framework or on our LineageOS 18.1 build) as open-source voice assistant satellites. Two components:
 
 - **`device/`** — Go binary that runs directly on the rooted Echo device; one binary for all three images
-- **`controller/`** — Python asyncio server that manages devices over the v1 device link (`docs/protocol-v1.md`), runs each device's session actor and the speech worker (VAD, streaming ASR, echo attribution, endpointing), and drives stock Home Assistant (Assist pipeline runs, native satellite timers, one Local Calendar per speaker for alarms). Wake detection is BCResNet on the Dot; the controller's content-addressed wake-model registry (`em_wake_registry`) names the graph each device loads. BCResNet training lives outside this repo (`~/git/bcresnet`).
+- **`controller-rs/`** — the supported Rust controller. It manages the v1 device link, runs each device's voice executor and speech workers, and drives stock Home Assistant pipelines, timers and alarm calendars. Wake detection is BCResNet on the device; the controller's registry selects the graph. Training lives outside this repo (`~/git/bcresnet`). The old Python implementation in `controller/` is historical reference only. Shared dashboard files, device payloads, the speech manifest, Compose files and add-on metadata remain there, but no normal build or deployment runs Python.
 
-`docs/post-afe-audio-architecture.md` describes the current architecture (§16 is the most detailed; §18 is the replace/keep inventory), and `docs/protocol-v1.md` the device link. They document the design; they do not freeze it. When a better design is chosen, change the code and update the documents to match.
+`docs/rust-controller-evaluation.md` describes the Rust controller and records real-device verification; `docs/rust-voice-decomposition.md` describes its voice components. `docs/protocol-v1.md` is the device link contract. `docs/post-afe-audio-architecture.md` retains the product requirements and the earlier implementation's architecture. Change code and the relevant documents together when the design changes.
 
 **Three device images, one firmware binary.** `internal/platform.Detect` picks the platform once at start (`libmixerAPI.so` present → Dot; `ro.product.device=crown` with `ro.lineage.version` set → LineageOS Show; `crown` at `ro.build.version.sdk=25` with `libOpenSLES.so` → Fire OS Show; anything else fails startup), and `cmd/server.go` chooses the audio backend and hardware bindings from it (its package doc holds the full matrix). There are no build tags.
 
@@ -40,14 +40,14 @@ git submodule update --init
 ```
 
 **The firmware is built inside the controller image, and the controller
-installs nothing else.** `controller/Dockerfile` has a `compiler` stage (the
+installs nothing else.** `controller-rs/Dockerfile` has a `compiler` stage (the
 toolchain), a `firmware` stage that compiles `device/` into `/out/server`
 plus `/out/version`, and the final image copies both to `/app/firmware/`
-(`em_firmware`, `FIRMWARE_DIR`). The wizard and every update push exactly
+(`crates/firmware`, `FIRMWARE_DIR`). The wizard and every update push exactly
 those bytes; there are no GitHub firmware releases and no uploads. The
 version is `fw-` plus a hash of the firmware sources, `device/companion`
 included (Go tests are kept out of the context by
-`controller/Dockerfile.dockerignore`), so it moves only when the firmware
+`controller-rs/Dockerfile.dockerignore`), so it moves only when the firmware
 does, and a controller-only change offers the Dots no update.
 
 **The companion app is built in the same image and embedded in the
@@ -101,67 +101,60 @@ go test ./...
 
 Tests only cover pure-Go logic — hardware-dependent code is not testable on the host.
 
-**Run controller tests (host):**
+**Run controller checks (host):**
 
 ```bash
-cd controller
-python -m pytest tests/        # needs: pytest numpy scipy websockets aiohttp bcrypt zeroconf protobuf hassil cmudict — not the full requirements.txt
+cd controller-rs
+tools/fetch-native.sh
+cargo test --locked --workspace --all-targets --all-features
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo fmt --all -- --check
 ```
 
-Controller tests cover pure-logic modules plus the device link, HA client, auth and BT proxy, which need `websockets`, `aiohttp`, `bcrypt`, `zeroconf` and `protobuf`, and transcript correction, which expands HA's sentence templates with `hassil` and pronounces words with `cmudict` (CI installs exactly `pytest numpy scipy websockets aiohttp bcrypt zeroconf protobuf hassil cmudict`, hassil at the version HA 2026.8.1 ships). Tests that load real models (`test_speech_worker`, parts of `test_wake_registry`/`test_wake_scorer`) skip without `onnxruntime`/`sherpa-onnx`. Keep new tests in that shape: evidence fixtures, not live models or a live HA. The suites (plus `go vet` and mypy) run in CI on every push/PR (`.github/workflows/ci.yml`).
+Use the pinned toolchain in `controller-rs/rust-toolchain.toml`. Run Cargo from
+`controller-rs/` so `.cargo/config.toml` selects the qualified native libraries.
+Model tests and copied-installation checks are opt-in; see `controller-rs/README.md`.
+CI checks Rust, the dashboard JavaScript, the Go device code and the companion app.
+Do not add normal runtime or CI dependencies on the historical Python controller.
 
-**Type check the controller (host):**
-
-```bash
-cd controller
-python -m mypy      # settings and file set in mypy.ini; needs mypy + the typed deps CI installs
-```
-
-The controller is held at zero mypy errors under `mypy.ini` (untyped defs disallowed, no bare generics, strict equality). Closed string vocabularies are `enum.StrEnum` (identical on the wire, since values serialize and compare as the raw string); structured data is a dataclass, or a `TypedDict` where a JSON dict passes through. `Any` stays at the genuinely dynamic boundary and is parsed into a typed object there.
-
-**Device/controller compatibility.** The two halves version independently, so any pairing can occur in the field. Guarded by `tests/test_capabilities.py`:
+**Device/controller compatibility.** The two halves version independently, so any pairing can occur in the field. Rust's protocol, settings and API tests cover capability negotiation. The inventory below also records historical Python symbol names; current code lives in the corresponding Rust crates.
 
 - **Negotiate by capability, not version.** The device announces what it implements in `session.hello` (`device/internal/proto/proto.go`): the eight protocol capabilities of SPEC §11.1 — `audio_timeline_v1`, `uplink_leases_v1`, `device_wake_v1`, `render_reference_v1`, `render_progress_v1`, `focus_leases_v1`, `alert_cache_v1`, `turn_protocol_v1` — plus the retained hardware ones `leds`, `led_anim`, `buttons`, `button_hold` (a Dot's ring and action button; a LineageOS Show announces them too, through its companion app's on-screen light bar and touch zones, and a Fire OS Show not at all), and `ambient_light` **only when the sensor is actually readable**, the optional `alert_prefetch` (the device installs the sounds `alert.prefetch` names), the optional `local_wake_chime` (the device plays the wake chime itself at idle candidate open when `config` `wakeSound` is true, and reports it in `wake.candidate.chimed`; the controller pushes `wakeSound` only to such devices), the optional `no_input_chime` (`render.start` accepts the earcon `builtin:no_input_chime`, which the controller plays, with `wakeSound` on, when a wake turn ends `no_input`; older firmware would reject the asset, so no other device gets it), the optional `announcement_chime` (`render.start` accepts the earcon `builtin:announcement_chime`, the Echo's announcement sound, which the controller plays before every HA announcement that asks for a preannounce sound, in place of HA's; other devices get HA's sound as before), the optional `open_rules_v1` (the device opens candidates on `session.ready` `detector.open_rules`, evaluates `detector.shadow_rules` without acting on them, credits the opening rule in `wake.candidate.rule` and reports `wake.stats.shadow`; the controller sends both lists only to such devices, and an absent `shadow` means no data, never zeros), the optional `near_miss_v1` (the device reports each near miss that opened no candidate in `wake.near_miss` as it closes and accepts an `uplink.open` of reason `near_miss`; the controller lists near misses in Activity only for such devices and, while `saveWakeClips` is on, opens an audio subscription to the near miss's few seconds of mic to record it), the optional `afe_metadata_v1` (only while its decoder is validating the native AFE metadata in bit 0 of the ASR capture: on `session.ready` `afe_metadata` the device serves the `afe` stream of per-80 ms AFE records, EMA1 kind 5, under subscriptions, and reports `wake.stats.afe`; the controller sends `afe_metadata` only to such devices, since older controllers end the session on an unknown EMA1 kind, and keeps the values as evidence that no decision reads — absent means no data, a device without it shows them `unavailable`), the Dot-only optional `wifi_control` (the controller sends `wifi_*` and allows the dashboard's Wi-Fi change/scan only to such devices), `ble_proxy` (`ble_adverts` from any other device are dropped and no HA Bluetooth proxy runs for it) and `privacy_mute` (without it mute is shown unavailable, never off), the Echo Show-only optional `screen_wake` (the controller pushes `screenWake`/`screenWakeUrl`/`screenWakePassword` only to such devices), and the LineageOS Show-only optionals `screen_overlay` (the companion app lights the screen and shows the ring compositor's frame, so the dashboard disables the kiosk URL and password, which the controller still pushes for older LineageOS firmware; whether the app is up is health in `stats.companion`, where null is unknown, not a capability), `turn_view_v1` (the device relays `turn.view` to its Kiosk Satellite plugin, which shows each turn full screen; the controller sends `turn.view` and `turnViewLinger` only to such devices), `timer_view_v1` (the device relays `timer.view`, the speaker's running timers, resent by the alert engine every second while any exists, to the same plugin, which draws each as a progress ring over the page; the controller sends `timer.view` only to such devices) and `kiosk_plugin` (the firmware installs that plugin through Kiosk Satellite's remote API; the controller pushes `kioskToken`/`kioskPort` only to such devices, keeps the token in the device row's `kiosk_token`, never the password, and reports it to the dashboard only as set or unset; the plugin's state is health in `stats.companion.kiosk`). The controller admits a v1 device only with all eight (`em_device.REQUIRED_CAPABILITIES`) and reads the rest from `em_device.Device.capabilities` via properties like `led_anim_capable` / `ambient_light_capable`. Never compare version strings — that puts release history in the controller and misjudges dev builds. A UI control whose feature the device lacks is shown **disabled with the reason**, never as a control that silently does nothing. Where the reason depends on the platform ("managed by the device" on an Echo Show, "no LED ring on this device" on a Fire OS Show, "firmware update available" on a Dot or LineageOS Show whose firmware predates a capability its platform's firmware announces), it is the controller's: `em_device.capability_gap`, sent to the dashboard as `capability_gaps`.
 - **Only the supported images are admitted.** The controller admits a v1 session only when `session.hello` carries `platform: fireos6` (Echo Dot 2nd gen), `platform: fireos6_crown` (Echo Show 8 1st gen on Fire OS 6) or `platform: lineage18_crown` (the same Echo Show 8 on LineageOS 18.1); one firmware binary runs on all three and picks its backends at runtime. An absent or other value is refused with `session.rejected` reason `protocol`. Pre-v1 firmware has no path at all: the legacy `/control` endpoint is gone.
 
 ### Schema migrations
 
-`em_db.MIGRATIONS` is **append-only** — the stored `schema_version` is an
-index into it, so appending to a deployed entry corrupts every database that
-already ran it. (Doing exactly that once broke every stats write and
-disconnect-looped the fleet.)
+Rust requires the existing schema at version 40 and checks it against
+`controller-rs/crates/db/schema/v40.sql`. It makes no migration during this cutover.
+It preserves the installation in place and creates a non-overwritten SQLite backup
+before its first write. Do not silently change the schema or a deployed row encoding.
 
-A controller applies everything it is missing in one startup, so **a user
-several releases behind jumping straight to latest is the normal case**. Each
-migration is its own transaction including its Python fixup, and a failure
-refuses startup rather than running on a half-migrated schema; re-running
-resumes from the last committed version.
+The historical `em_db.MIGRATIONS` list remains append-only: its stored schema version
+is an index, so editing an old entry would corrupt a database used for recovery.
+Do not start Python automatically to migrate a database or recover an operation.
+An older schema needs an explicit upgrade procedure before Rust can open it.
 
 ## Running the controller
 
-**Bare metal (Python 3.12):**
+**Bare metal (Rust):** follow `controller-rs/README.md` for native libraries, speech
+assets, firmware and environment settings, then run the built `echomuse-controller`
+binary. Do not launch `controller/em_controller.py` or install its requirements as
+part of a normal deployment.
 
-```bash
-cd controller
-cp .env.example .env   # fill in SERVER_IP, HA_URL, HA_TOKEN
-pip install -r requirements.txt
-python tools/fetch_speech_bundle.py ./speech   # hash-pinned Kroko ASR + Silero VAD (+ attribution)
-../device/compile.sh                            # the firmware it installs → ../device/build/
-SPEECH_BUNDLE_DIR=./speech FIRMWARE_DIR=../device/build python em_controller.py
-```
-
-The controller refuses to start without Home Assistant credentials, a verified speech bundle (`SPEECH_BUNDLE_DIR`, default `/app/speech`), the hash-checked armeabi-v7a `libonnxruntime.so` it serves to Dots as a speech asset (`ORT_ANDROID_LIB`, default `/app/models/ort_android/libonnxruntime.so`; the Dockerfile extracts it from the pinned `onnxruntime-android` 1.19.2 AAR), or the device firmware it installs (`FIRMWARE_DIR`, default `/app/firmware`, holding `server` and `version`). The deployed wake graph (`bcresnet_audio.onnx` + `.json` at the repo root) seeds the registry on first start.
+The image supplies the verified speech bundle, the controller's ONNX Runtime library,
+the Android ONNX Runtime asset served to devices, DTLN and the firmware. Keep `DB_PATH`
+and its adjacent TLS, registry, sound and recording files across rebuilds.
 
 **Docker:**
 
 ```bash
 cd controller
-docker-compose up --build   # build context is the repo root
+docker compose up -d --build   # Builds controller-rs/Dockerfile from the repo root.
 ```
 
 Dashboard available at `http://<SERVER_IP>:8768`. Devices connect to port 8767 (8770 for TLS): `/device/v1/control`, `/device/v1/audio`, `/device/v1/assets` and `/shell`.
 
-Key env vars in `.env` (see `.env.example` for the full list):
+Key env vars in `.env` (see `controller/.env.example` for the full list):
 
 - `SERVER_IP` — LAN IP advertised via mDNS (devices connect here)
 - `HA_URL` / `HA_TOKEN` — Home Assistant base URL and an **administrator** long-lived access token (the add-on uses the Supervisor token via `homeassistant_api: true` instead)

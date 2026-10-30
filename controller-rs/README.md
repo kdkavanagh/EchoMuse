@@ -1,8 +1,15 @@
 # EchoMuse controller (Rust)
 
-The Rust rewrite of the EchoMuse controller: one Cargo workspace, the controller binary at
-the root and its parts under `crates/`. What it covers and what is still being connected
-is in [`docs/rust-controller-evaluation.md`](../docs/rust-controller-evaluation.md) §9.1.
+The supported EchoMuse controller: one Cargo workspace, the controller binary at the
+root and its parts under `crates/`. The Python implementation in `controller/` remains
+for historical reference; normal builds, CI and releases use Rust. Current behavior
+and verification evidence are in
+[`docs/rust-controller-evaluation.md`](../docs/rust-controller-evaluation.md) §9.
+
+The voice crate keeps wake handling, conversation handling and playback in private
+components. `Voice` coordinates them synchronously on the existing device executor;
+`SessionAudio` provides their shared audio mechanisms. The boundaries and transition
+invariants are in [`docs/rust-voice-decomposition.md`](../docs/rust-voice-decomposition.md).
 
 Run every command below from `controller-rs/`. Cargo reads `.cargo/config.toml` only
 there, and that file is what points the build at the fetched native libraries.
@@ -49,8 +56,9 @@ In both cases, run `tools/fetch-native.sh`.
 
 ```sh
 cargo build --workspace
-cargo test --workspace --all-targets
-cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-targets --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo fmt --all -- --check
 cargo build --release
 ```
 
@@ -154,6 +162,12 @@ acts on the Home Assistant it is given. Only one controller may drive an install
 devices and Home Assistant at a time, so either stop the production controller first, or
 use a test Home Assistant on a network the devices cannot reach.
 
+The installation now runs Rust by default after the supervised real-device checks in
+[`docs/rust-controller-evaluation.md` §9.4](../docs/rust-controller-evaluation.md#94-first-supervised-live-trial-2026-10-30).
+Keep the current data directory, TLS credentials and device firmware across rebuilds.
+The saved Python image is only an emergency recovery option; pending alarm rows may
+need manual recovery as recorded there. No normal startup path selects Python.
+
 ## 4. Build the image
 
 The build context is the repository root, since the image also builds the device firmware
@@ -239,11 +253,11 @@ It needs Docker, the native libraries, speech assets and dashboard from §1 and 
    that disappears fails the run. The script also checks the certificate the device TLS
    port serves and that `echomuse.db.pre-rust.bak` holds the copy as it was;
 4. restarts the binary and checks that the backup is not rewritten;
-5. stops it and starts the previously deployed image (`ROLLBACK_IMAGE`, default
-   `hass-echomuse-controller:latest`) on the same copy as a black box: it must start, make
-   no migration, keep `schema_version` 40 and list the turn the Rust controller wrote. Its
-   errors, tracebacks and migration lines are printed verbatim (`--skip-rollback` skips
-   this);
+5. if `ROLLBACK_IMAGE` explicitly names a previous image, stops Rust and starts that
+   image on the same copy as a black box: it must start, make no migration, keep
+   `schema_version` 40 and list the new turn. Its errors, tracebacks and migration
+   lines are printed verbatim (`--skip-rollback` skips this). No previous image is
+   selected by default, and this check does not require a Python runtime;
 6. runs this tree's image the same way as step 3 on a second copy;
 7. deletes the scratch directory, which holds private data (`--keep` keeps it, and says
    where it is).

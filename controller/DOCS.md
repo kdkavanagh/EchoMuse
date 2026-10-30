@@ -6,6 +6,11 @@ devices — as a Home Assistant add-on instead of a separate docker-compose
 deployment. The add-on reaches Home Assistant through the Supervisor, so no
 access token is needed.
 
+The supported source build is now Rust (`controller-rs/Dockerfile`). The add-on
+still pulls the version selected in `config.yaml`; existing published images do
+not change when the source changes. Until a Rust image is published, use the
+source build in the Quickstart rather than installing an older Python image.
+
 ## Installation
 
 1. Install the add-on and set **Controller LAN IP address** to this Home

@@ -167,26 +167,29 @@ the features that failed.
 
 ## Step 3 — Start the controller
 
-On your always-on computer, using the prebuilt image (nothing to compile):
+On your always-on computer, build the supported Rust controller from source:
 
 ```bash
-mkdir echomuse && cd echomuse
-curl -O https://raw.githubusercontent.com/wilbowes/EchoMuse/main/controller/docker-compose.deploy.yml
-curl -o .env https://raw.githubusercontent.com/wilbowes/EchoMuse/main/controller/.env.example
+git clone https://github.com/wilbowes/EchoMuse.git
+cd EchoMuse/controller
+cp .env.example .env
 # Edit .env:
 #   SERVER_IP = this computer's LAN IP address
 #   HA_URL    = your Home Assistant address, e.g. http://homeassistant.local:8123
 #   HA_TOKEN  = the token from step 2
-docker compose -f docker-compose.deploy.yml up -d
+docker compose up -d --build
 ```
 
 The controller refuses to start without `HA_URL` and `HA_TOKEN`; the reason
 is in `docker logs echomuse-controller`.
 
-To upgrade later: `docker compose -f docker-compose.deploy.yml pull && docker compose -f docker-compose.deploy.yml up -d`. Your devices, users, settings and wake models live in `./data` and survive upgrades.
+To rebuild after updating the source, run `docker compose up -d --build` again. Your devices, users, settings and wake models live in `./data` and survive rebuilds.
 
 <details>
 <summary>Alternative: the Home Assistant add-on</summary>
+
+The add-on pulls a published image. Existing Python releases are not replaced by
+the source cutover; use the source build above until a Rust release is published.
 
 If Home Assistant runs the Supervisor (HA OS, or Supervised), add this
 repository in the Add-on Store, install **EchoMuse**, set **Controller LAN IP
@@ -198,21 +201,20 @@ dashboard with **Open Web UI**; the setup token in step 4 is in the add-on's
 </details>
 
 <details>
-<summary>Alternative: build from source</summary>
+<summary>Alternative: the published Rust image</summary>
 
 ```bash
-git clone https://github.com/wilbowes/EchoMuse.git
-cd EchoMuse/controller
-cp .env.example .env
-# Edit .env as above
-docker compose up -d --build
+mkdir echomuse && cd echomuse
+curl -O https://raw.githubusercontent.com/wilbowes/EchoMuse/main/controller/docker-compose.deploy.yml
+curl -o .env https://raw.githubusercontent.com/wilbowes/EchoMuse/main/controller/.env.example
+# Edit .env as above, then use a release that contains the Rust controller.
+docker compose -f docker-compose.deploy.yml up -d
 ```
 
-`docker-compose.yml` builds with the repository root as its context and
-requests an NVIDIA GPU (the `onnxruntime-gpu` build). On a machine without
-one, remove the `deploy:` block and the `GPU: "1"` build arg — or use the
-prebuilt image above, which is CPU-only. The build downloads the pinned,
-hash-checked speech models.
+Future image releases build `controller-rs/Dockerfile` and include the speech models,
+dashboard and device firmware. Existing published tags still contain the implementation
+they were released with; this source change does not update them. Until the first Rust
+image is published, use the source build above.
 
 </details>
 

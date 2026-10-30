@@ -4,12 +4,11 @@ name: "EchoMuse"
 # both together: Supervisor pulls `image:version`, so a version with no
 # matching tag on GHCR fails to install.
 version: "2.19.0"
-# Pull the published image for multiple architectures rather than building on the user's
-# machine. Without this Supervisor builds from this directory's Dockerfile,
-# which compiles onnxruntime and ffmpeg on whatever the user runs Home
-# Assistant on — long and prone to failure on a Pi, and it cannot pass the
-# EM_CONTROLLER_VERSION build arg, so the controller reports "dev" and the
-# update notice goes quiet. controller-release.yml already publishes
+# Pull the published multi-architecture image; this directory holds only the
+# add-on manifest and shared assets, with no Dockerfile for Supervisor to
+# build from. The image is built from controller-rs/Dockerfile by
+# controller-release.yml, which passes EM_CONTROLLER_VERSION (so the
+# dashboard and the update notice see the release) and publishes
 # linux/amd64 and linux/arm64, matching the arch list below.
 image: "ghcr.io/wilbowes/echomuse-controller"
 slug: "controller"

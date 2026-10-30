@@ -1,28 +1,22 @@
 name: Controller Release (Docker image)
 
-# Controller releases are tagged controller-vX.Y.Z (device firmware keeps
-# plain vX.Y.Z — see release.yml). This builds the controller image and
-# pushes it to GHCR as:
+# Controller releases are tagged controller-vX.Y.Z. This builds the controller
+# image from controller-rs/Dockerfile (the Rust controller) and pushes it to
+# GHCR as:
 #   ghcr.io/<owner>/echomuse-controller:X.Y.Z
 #   ghcr.io/<owner>/echomuse-controller:latest
 #
-# The image carries the device firmware too: controller/Dockerfile compiles
+# The image carries the device firmware too: controller-rs/Dockerfile compiles
 # it in its `firmware` stage, and the controller installs only that binary.
 # There is no separate firmware release. No GitHub Release is created either;
 # the controller-update advisory reads the controller-v* tags themselves.
 #
-# The image is CPU-only (onnxruntime). GPU users build locally with
-# --build-arg GPU=1 (see controller/docker-compose.yml).
-#
 # Built for linux/amd64 AND linux/arm64. A Raspberry Pi is a natural host for
 # this project, and an amd64-only manifest meant docker-compose.deploy.yml
-# could not work on one at all — building locally was the only route, and
-# until #81 even that failed on the hard-coded x86-64 esbuild download.
-# Every Python dependency resolves to a prebuilt aarch64 wheel on this base
-# image, including onnxruntime and sherpa-onnx, so the arm64 build compiles
-# nothing; it is emulated with QEMU, which costs time on the runner and
-# nothing at run time. The firmware stage is pinned to linux/amd64 (the NDK
-# is x86-64 only), so it compiles once, natively, for both platforms.
+# could not work on one at all. The controller is cross-compiled on the
+# runner for each architecture, and the firmware, companion, speech and
+# dashboard stages run on the runner's own platform once for both; only the
+# final stage (apt-get and the binary's start check) runs as arm64 under QEMU.
 
 on:
   push:
@@ -102,7 +96,7 @@ jobs:
           # Root context: the image seeds the wake registry from the
           # repository-root bcresnet_audio.onnx/.json (SPEC §5.1, §18.5).
           context: .
-          file: controller/Dockerfile
+          file: controller-rs/Dockerfile
           push: true
           platforms: linux/amd64,linux/arm64
           build-args: |
@@ -114,14 +108,15 @@ jobs:
 
       # ── Supply chain ────────────────────────────────────────────────────
       #
-      # The image is what users actually run, and it is the only place the
-      # full dependency set exists: requirements.txt leaves scipy and
-      # protobuf unpinned, and the Debian base contributes ffmpeg and curl.
-      # So the SBOM is generated from the
-      # built image, never from requirements.txt.
+      # The image is what users actually run, so the SBOM and scan below read
+      # the built image, which is where the Debian base and its ffmpeg are.
+      # The controller binary is not built with cargo-auditable, so an image
+      # scan cannot list the crates inside it; they come from Cargo.lock in a
+      # second SBOM. The native libraries (sherpa-onnx, ONNX Runtime) are
+      # pinned by SHA-256 in crates/speech/src/pins.rs and appear in neither.
       #
-      # amd64 only. The two architectures install the same wheels from the
-      # same base image, and scanning the arm64 variant under QEMU costs
+      # amd64 only. Both architectures are built from the same lockfile and
+      # the same Debian base, and scanning the arm64 variant under QEMU costs
       # runner minutes to restate the answer. Addressing the index by digest
       # keeps that: trivy resolves it to the runner's own platform.
       #
@@ -148,6 +143,18 @@ jobs:
           format: cyclonedx
           output: sbom-controller-${{ steps.version.outputs.version }}.cdx.json
 
+      # The crates compiled into the controller, from controller-rs/Cargo.lock,
+      # the lockfile the image built with (cargo build --locked), since the
+      # image scan above cannot see inside the binary.
+      - name: Generate crate SBOM
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: controller-rs
+          format: cyclonedx
+          output: sbom-controller-crates-${{ steps.version.outputs.version }}.cdx.json
+
       # Attached to the workflow run rather than to a Release, because
       # controller tags deliberately create no GitHub Release (see the top of
       # this file).
@@ -161,7 +168,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: sbom-controller-${{ steps.version.outputs.version }}
-          path: sbom-controller-${{ steps.version.outputs.version }}.cdx.json
+          path: |
+            sbom-controller-${{ steps.version.outputs.version }}.cdx.json
+            sbom-controller-crates-${{ steps.version.outputs.version }}.cdx.json
           if-no-files-found: warn
           retention-days: 365
 

@@ -14,9 +14,8 @@
 !device/pkg/
 !device/companion/
 !controller-rs/
-# The firmware's exclusions are controller/Dockerfile.dockerignore's, so the same tree
-# gives the same fw- version in both images. Go tests are not firmware; the companion
-# stage builds the app, so a stale local copy must not reach the image.
+# Go tests are not firmware and must not move its source hash. The companion stage
+# builds the app, so a stale local copy must not reach the image.
 device/**/*_test.go
 device/**/testdata
 device/internal/companion/app.apk

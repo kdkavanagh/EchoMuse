@@ -5,8 +5,8 @@ REPO_ROOT=$(git rev-parse --show-toplevel)
 BUILD_DIR="$(pwd)/build"
 
 # The tools build with the firmware's own toolchain: the `compiler` stage of
-# controller/Dockerfile, tagged echomuse-compiler. Cached after the first run.
-docker build -f "$REPO_ROOT/controller/Dockerfile" --target compiler \
+# controller-rs/Dockerfile, tagged echomuse-compiler. Cached after the first run.
+docker build -f "$REPO_ROOT/controller-rs/Dockerfile" --target compiler \
     -t echomuse-compiler "$REPO_ROOT"
 
 build_tool() {

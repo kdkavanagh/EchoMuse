@@ -16,8 +16,8 @@
 #                                 to Dots as a speech asset, never loaded here
 #
 # Hashes come from controller/speech_bundle.json (Kroko, Silero), crates/speech/src/pins.rs
-# (DTLN, the test WAV) and controller/Dockerfile (the ONNX Runtime Android archive); the
-# Android library's own hash is the one docs/post-afe-audio-architecture.md records.
+# (DTLN, the test WAV) and the archive and library hashes below (Android ONNX Runtime).
+# The Android library's hash is also recorded in docs/post-afe-audio-architecture.md.
 # The manifest's Python wheel is not fetched: the Rust controller links sherpa-onnx through
 # tools/fetch-native.sh instead. Downloads are kept in ROOT/.downloads.
 #
@@ -53,8 +53,8 @@ pinned_in_rust "$dtln1_sha" "DTLN model_1.onnx"
 pinned_in_rust "$dtln2_sha" "DTLN model_2.onnx"
 pinned_in_rust "$test_wav_sha" "the Kroko test WAV"
 
-# ONNX Runtime 1.19.2 for Android: the AAR as controller/Dockerfile pins it, and the
-# armeabi-v7a library inside it as the devices verify it.
+# ONNX Runtime 1.19.2 for Android: pin the AAR and the armeabi-v7a library inside it.
+# Devices verify the library's hash when they install this speech asset.
 aar_url=https://repo1.maven.org/maven2/com/microsoft/onnxruntime/onnxruntime-android/1.19.2/onnxruntime-android-1.19.2.aar
 aar_sha=84737dd1fdb715f0ee695c0a9864f6949b66ecb4c46ca733bc9211bf0c2a7b5f
 android_lib_sha=174233cf1a3f841f1eac82a4328f4f23f8819d5c62969c09e994a6b1abf498c1

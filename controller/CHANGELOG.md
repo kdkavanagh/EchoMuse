@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Rust controller
+
+- **Rust is the supported controller.** Source builds, CI, image releases and the
+  device compiler helpers now use `controller-rs/Dockerfile`. The Python implementation
+  stays in the repository as historical reference; its image recipe and normal CI
+  jobs are removed. Existing published image tags are not changed by this source
+  cutover. The local deployment keeps its database, TLS credentials and current
+  firmware, and no firmware update is required.
+- The real-model check now verifies that ASR covers the final short microphone
+  packet, rather than assuming every packet contains a full 80 ms of audio.
+
+- **Separate voice components.** Wake handling, conversations and playback now keep
+  their own private state behind the existing `Voice` API. Audio subscriptions and
+  released focus acknowledgements stay together under `SessionAudio`. The controller
+  still uses the same device executor and four speech workers; device messages,
+  Home Assistant behavior and database formats are unchanged.
+
 ### Post-AFE cutover (device protocol v1)
 
 This release replaces the voice, wake and alert stack. The architecture is

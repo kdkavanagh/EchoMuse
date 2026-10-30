@@ -4,10 +4,27 @@ Give your Amazon Echo Dot 2nd Generation a second life as a fully local,
 open-source voice assistant and media player for Home Assistant.
 
 EchoMuse replaces the Alexa firmware with a lightweight Go server and pairs
-it with a Python controller that presents each Dot to Home Assistant as a
+it with a Rust controller that presents each Dot to Home Assistant as a
 native **ESPHome voice satellite** — no cloud, no custom HA integration to
 install. Say the wake word, talk to [Assist](https://www.home-assistant.io/voice_control/),
 hear the answer through the Dot's speaker.
+
+The supported controller is in [`controller-rs/`](controller-rs/README.md).
+`controller/` keeps the old Python implementation for historical reference, together
+with the shared dashboard, device payloads and Home Assistant add-on metadata.
+Normal builds and releases use `controller-rs/Dockerfile`; they do not run Python.
+
+To build and run from source:
+
+```sh
+cd controller
+cp .env.example .env
+# Set SERVER_IP, HA_URL and HA_TOKEN in .env.
+docker compose up -d --build
+```
+
+The published image and add-on use the same Rust build for future releases. This
+source change does not replace images that have already been published.
 
 ## What you get
 

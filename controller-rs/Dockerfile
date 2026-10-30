@@ -26,10 +26,9 @@
 
 # ── Device firmware ──────────────────────────────────────────────────────────
 #
-# The compiler, companion and firmware stages are controller/Dockerfile's, unchanged, so
-# both images built from one tree carry the same firmware bytes' version (the fw- hash of
-# the sources). Change them there first and copy them here. The full rationale for each
-# pin is in controller/Dockerfile; in short:
+# This is the single image recipe for the Rust controller and its bundled firmware.
+# device/compile.sh and device/tools/build_tools.sh use these same stages, so their
+# firmware and hardware probes keep the pinned toolchain below.
 #
 # The compiler base is pinned by DIGEST, and must stay that way: it carries the Go
 # toolchain (1.24.0) and the NDK (21.4.7075529) that compile the firmware for Fire OS 6,
@@ -131,6 +130,10 @@ RUN set -e; \
     if [ "$SIZE" -gt 4194304 ]; then echo "ksplugin.zip is $SIZE bytes, over Kiosk Satellite's 4 MB" >&2; exit 1; fi; \
     echo "ksplugin.zip: plugin $VERSION, $SIZE bytes, sha256 $(sha256sum /out/ksplugin.zip | cut -c1-64)"
 
+# Export the companion for inspection without building the controller.
+FROM scratch AS companion-out
+COPY --from=companion /out/ /
+
 # The firmware this controller installs. Its version is `fw-` plus a hash of its own
 # sources (Go tests are kept out of the context), so it moves exactly when the firmware
 # does; the built app, its version and the plugin ZIP are not part of the hash.
@@ -155,6 +158,10 @@ RUN set -e; \
                 -X github.com/wilbowes/EchoMuse/internal/client.BuildUnix=$(date +%s)" \
       -o /out/server ./cmd/; \
     printf '%s\n' "$VERSION" > /out/version
+
+# Export the firmware for bare-metal controllers and ARM compile checks.
+FROM scratch AS firmware-out
+COPY --from=firmware /out/ /
 
 # ── Speech assets ────────────────────────────────────────────────────────────
 #
